@@ -2,7 +2,6 @@
 
 use crate::Op;
 use crate::load::{Checkpoint, Context, Load, LoadError};
-use crate::modules::generic::schedule::{IntoStream, RowWise, Stream};
 use crate::ops::attention;
 use crate::ops::index::gather::RowStorage;
 use crate::ops::index::table::{self, Access, Length, Offsets};
@@ -283,7 +282,7 @@ impl<R: AxisName, Capacity: AxisName, Chips: M + 'static>
     }
 }
 
-/// A tile's live rows into the place the node's state holds, so a stream stores each tile in turn.
+/// A tile's live rows into the place the state holds, so a launch stores its tiles in turn.
 impl<Width: AxisName, Rows: AxisName, Env, Chips: M + 'static>
     crate::Module<&Live<Spread<Width, Rows, Chips>, Rows>, Env, &mut HiddenRows<Chips, Width, Rows>>
     for Store
@@ -298,18 +297,6 @@ impl<Width: AxisName, Rows: AxisName, Env, Chips: M + 'static>
         input: &Live<Spread<Width, Rows, Chips>, Rows>,
     ) {
         Op::forward(self, device, ((input.value(), input.with(())), output));
-    }
-}
-
-/// A store streams one `forward` a tile into the place its slot holds.
-impl<'m, 's, U: Stream, E, S> IntoStream<U, E, &'s mut S> for &'m Store
-where
-    RowWise<'s, &'m Store, E, S, U>: Stream,
-{
-    type Stream = RowWise<'s, &'m Store, E, S, U>;
-
-    fn into_stream(self, env: E, state: &'s mut S, upstream: U) -> Self::Stream {
-        RowWise::new(self, env, state, upstream)
     }
 }
 
