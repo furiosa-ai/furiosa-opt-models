@@ -20,9 +20,7 @@ use furiosa_opt_models::models::decoder::form;
 use furiosa_opt_models::models::vision_language::gemma4_unified;
 use furiosa_opt_models::models::{Class, Implements};
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
-use furiosa_opt_models::tensor::cache;
 use furiosa_opt_models::tensor::memory::Hbm;
-use furiosa_opt_models::tensor::parallel::Parallel;
 
 /// Every upstream architecture name, by family level, with the decoders that implement it; a
 /// refused name has none.
@@ -287,80 +285,22 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
     (
         "Qwen3ForCausalLM",
         &[
-            Implementation::of::<
-                qwen3::ForCausalLM<
-                    qwen3::Size<"0.6B">,
-                    form::Affine,
-                    Parallel<1>,
-                    cache::Bf16,
-                    Hbm,
-                >,
-            >(),
-            Implementation::of::<
-                qwen3::ForCausalLM<
-                    qwen3::Size<"1.7B">,
-                    form::Affine,
-                    Parallel<1>,
-                    cache::Bf16,
-                    Hbm,
-                >,
-            >(),
-            Implementation::of::<
-                qwen3::ForCausalLM<qwen3::Size<"4B">, form::Affine, Parallel<1>, cache::Bf16, Hbm>,
-            >(),
+            Implementation::of::<launch::Model<qwen3::Size<"0.6B">, form::Affine>>(),
+            Implementation::of::<launch::Model<qwen3::Size<"1.7B">, form::Affine>>(),
+            Implementation::of::<launch::Model<qwen3::Size<"4B">, form::Affine>>(),
             Implementation::of::<launch::Model<qwen3::Size<"8B">, form::Affine>>(),
             Implementation::of::<qwen3::fp8::ForCausalLM>(),
-            Implementation::of::<
-                qwen3::ForCausalLM<
-                    qwen3::Size<"0.6B">,
-                    form::ChannelScaled,
-                    Parallel<1>,
-                    cache::Bf16,
-                    Hbm,
-                >,
-            >(),
-            Implementation::of::<
-                qwen3::ForCausalLM<
-                    qwen3::Size<"1.7B">,
-                    form::ChannelScaled,
-                    Parallel<1>,
-                    cache::Bf16,
-                    Hbm,
-                >,
-            >(),
-            Implementation::of::<
-                qwen3::ForCausalLM<
-                    qwen3::Size<"4B">,
-                    form::ChannelScaled,
-                    Parallel<1>,
-                    cache::Bf16,
-                    Hbm,
-                >,
-            >(),
+            Implementation::of::<launch::Model<qwen3::Size<"0.6B">, form::ChannelScaled>>(),
+            Implementation::of::<launch::Model<qwen3::Size<"1.7B">, form::ChannelScaled>>(),
+            Implementation::of::<launch::Model<qwen3::Size<"4B">, form::ChannelScaled>>(),
         ],
     ),
     ("Qwen3ForRewardModel", &[]),
     (
         "Qwen3ForSequenceClassification",
         &[
-            Implementation::of::<
-                qwen3::ForSequenceClassification<
-                    qwen3::Size<"0.6B">,
-                    form::Affine,
-                    Parallel<1>,
-                    cache::Bf16,
-                    Hbm,
-                >,
-            >(),
-            Implementation::of::<
-                qwen3::ForSequenceClassification<
-                    qwen3::Size<"1.7B">,
-                    form::Affine,
-                    Parallel<1>,
-                    cache::Bf16,
-                    Hbm,
-                >,
-            >(),
+            Implementation::of::<launch::Classifier<qwen3::Size<"0.6B">, form::Affine>>(),
+            Implementation::of::<launch::Classifier<qwen3::Size<"1.7B">, form::Affine>>(),
             Implementation::of::<launch::Classifier<qwen3::Size<"4B">, form::Affine>>(),
             Implementation::of::<launch::Classifier<qwen3::Size<"8B">, form::Affine>>(),
         ],
@@ -368,15 +308,9 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
     (
         "Qwen3Model",
         &[
-            Implementation::of::<
-                qwen3::Model<qwen3::Size<"0.6B">, form::Affine, Parallel<1>, cache::Bf16, Hbm>,
-            >(),
-            Implementation::of::<
-                qwen3::Model<qwen3::Size<"1.7B">, form::Affine, Parallel<1>, cache::Bf16, Hbm>,
-            >(),
-            Implementation::of::<
-                qwen3::Model<qwen3::Size<"4B">, form::Affine, Parallel<1>, cache::Bf16, Hbm>,
-            >(),
+            Implementation::of::<launch::Base<qwen3::Size<"0.6B">, form::Affine>>(),
+            Implementation::of::<launch::Base<qwen3::Size<"1.7B">, form::Affine>>(),
+            Implementation::of::<launch::Base<qwen3::Size<"4B">, form::Affine>>(),
             Implementation::of::<launch::Base<qwen3::Size<"8B">, form::Affine>>(),
         ],
     ),

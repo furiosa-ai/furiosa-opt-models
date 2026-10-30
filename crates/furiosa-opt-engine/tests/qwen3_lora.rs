@@ -10,10 +10,8 @@ use std::process::{Command, Stdio};
 use furiosa_opt_engine::decoder::{Cache, Decoder, Instance, Keep, Request, Rows};
 use furiosa_opt_engine::{AsyncModule, Checkpoint, Hbm, Load, LoadError, LoadOptions, Tiling};
 use furiosa_opt_models::load::Context;
-use furiosa_opt_models::models::decoder::attention::qwen3;
+use furiosa_opt_models::models::decoder::attention::qwen3::{self, launch};
 use furiosa_opt_models::models::decoder::form;
-use furiosa_opt_models::tensor::cache;
-use furiosa_opt_models::tensor::parallel::Parallel;
 use furiosa_opt_std::prelude::{Device, HostBufferSlice, M, Topology, bf16};
 use safetensors::Dtype;
 use safetensors::tensor::TensorView;
@@ -24,13 +22,13 @@ const REVISION: &str = "c1899de289a04d12100db370d81485cdf75e47ca";
 const BLOCK_SCALED: &str = "6124ba90c39c8e2299ddd57f4b4f0df5845480c8";
 
 /// Qwen3-0.6B's adapter tree.
-type Adapter = qwen3::Adapter<qwen3::Size<"0.6B">, Hbm>;
+type Adapter = launch::Adapter<qwen3::Size<"0.6B">, Hbm>;
 
 /// Qwen3-0.6B's base model, which returns the kept rows' hidden values.
-type Base = qwen3::Model<qwen3::Size<"0.6B">, form::Affine, Parallel<1>, cache::Bf16, Hbm>;
+type Base = launch::Base<qwen3::Size<"0.6B">, form::Affine>;
 
 /// Qwen3-0.6B's causal model, whose base model a test serves.
-type Causal = qwen3::ForCausalLM<qwen3::Size<"0.6B">, form::Affine, Parallel<1>, cache::Bf16, Hbm>;
+type Causal = launch::Model<qwen3::Size<"0.6B">, form::Affine>;
 
 const HIDDEN: usize = 1024;
 

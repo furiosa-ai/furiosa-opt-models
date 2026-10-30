@@ -20,7 +20,6 @@
 mod adapters;
 mod batch;
 mod cache;
-mod qwen3;
 
 pub use adapters::{Adapter, Binding, Loader, SLOTS};
 pub use batch::{Batch, Rows, Staged, Table};
@@ -412,6 +411,25 @@ where
     }
 }
 
+/// Channel-scaled projections add no update: their roots run no adapter.
+impl<S: Geometry + Decode + 'static> Adapting<S> for form::ChannelScaled {
+    type Adapter = Infallible;
+    type States<'t> = ();
+    const ADAPTERS: usize = 0;
+
+    fn adapter(checkpoint: &Checkpoint, device: &mut Device) -> Result<Infallible, LoadError> {
+        <Infallible as Adapting<S>>::adapter(checkpoint, device)
+    }
+
+    fn states<'t>(
+        held: [&'t Infallible; SLOTS],
+        _: usize,
+        _: &'t launch::Selections<S, SLOTS>,
+    ) -> Self::States<'t> {
+        match *held[0] {}
+    }
+}
+
 /// A root that runs no adapter refuses a load of one; no call holds one.
 impl<S: Geometry + Decode + 'static> Adapting<S> for Infallible {
     type Adapter = Infallible;
@@ -475,7 +493,7 @@ impl<E: M> Place for furiosa_opt_std::prelude::HbmTensor<f32, Chip, E> {
 /// Block IDs of a call of `R` rows whose every row is a request spanning the whole context of `W`
 /// windows.
 #[derive(Clone, Debug)]
-pub(super) struct Tables<R, W>(PhantomData<fn() -> (R, W)>);
+struct Tables<R, W>(PhantomData<fn() -> (R, W)>);
 
 impl<R: AxisName, W: AxisName> AxisName for Tables<R, W> {
     const NAME: Ident = Ident::new("Tables");
