@@ -15,7 +15,7 @@ use furiosa_opt_engine::decoder::{Cache, HbmTensor, Instance, Keep, Request, Row
 use furiosa_opt_engine::{Checkpoint, Hbm, Load, LoadError, LoadOptions, Tiling};
 use furiosa_opt_models::load::Context;
 use furiosa_opt_models::models::decoder::attention::{Geometry, qwen3};
-use furiosa_opt_models::models::decoder::form;
+use furiosa_opt_models::models::decoder::{form, launch};
 use furiosa_opt_std::prelude::{Device, HostBufferSlice, Symbol, Topology, bf16, m};
 use safetensors::Dtype;
 
@@ -150,7 +150,7 @@ const EXTENDED: [i32; 8] = [641, 1235, 25, 16246, 264, 3482, 2711, 3239];
 type Layer<const N: &'static str, X> = qwen3::Layer<qwen3::Size<N>, form::Affine, bf16, X>;
 
 /// The BF16 Qwen3 causal model of the size `N`, on one chip.
-type Causal<const N: &'static str> = qwen3::launch::Model<qwen3::Size<N>, form::Affine>;
+type Causal<const N: &'static str> = launch::Model<qwen3::Size<N>, form::Affine>;
 
 /// The directory of the files of hub checkpoint `repo` at `revision` that `include` matches,
 /// fetched into the hub cache once.

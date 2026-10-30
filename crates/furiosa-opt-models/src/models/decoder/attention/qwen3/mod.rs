@@ -21,8 +21,8 @@ use super::{Geometry, LlamaEmbeddingModel, Qwen2ForCausalLM};
 use crate::load::Named;
 use crate::models::Family;
 use crate::models::config::{self, scaling::Spectrum};
-use crate::models::decoder::Form;
 use crate::models::decoder::attention::{Chunks, Head, KvHeads, PaddedVocabulary, Windows};
+use crate::models::decoder::{Form, launch};
 use crate::modules::attention::{self, NormalizedQkv};
 use crate::modules::generic::collection::Array;
 use crate::modules::generic::collection::{Stack, View};
@@ -48,7 +48,6 @@ use catalog::Depth;
 use furiosa_opt_std::prelude::*;
 
 pub mod fp8;
-pub mod launch;
 
 /// A published Qwen3 checkpoint size, by its hub spelling.
 pub struct Size<const N: &'static str>;
@@ -566,7 +565,7 @@ pub type CatalogBody<S, P, C, X> = <<S as Geometry>::Layers<()> as Depth<S, P, C
 
 /// The wide tiles of the size `S`'s work: as many as a call of its rows takes when every row
 /// attends the whole context `S` is compiled for, so its call's work holds whatever it admits.
-const fn tiles<S: Geometry + Decode + 'static>() -> usize {
+pub(crate) const fn tiles<S: Geometry + Decode + 'static>() -> usize {
     paged::Plan::waves::<S::Groups>(S::Rows::SIZE, launch::Positions::<S>::SIZE)
 }
 

@@ -1,6 +1,6 @@
 //! Llama 3, by published size: Qwen3's catalog binding over a [`Size`] whose front takes each
 //! row's query, key and value heads as projected, e.g.
-//! `qwen3::launch::Model<Size<"8B">, form::Affine>`.
+//! `launch::Model<Size<"8B">, form::Affine>`.
 //!
 //! - A size's [`Geometry`] is what its checkpoints declare; its [`Decode`] is how a call of it is
 //!   compiled, that of the Qwen3 size of the same attention geometry.
@@ -210,7 +210,7 @@ where
 mod tests {
     use super::*;
     use crate::load::{Checkpoint, Load};
-    use crate::models::decoder::form;
+    use crate::models::decoder::{form, launch};
     use crate::tensor::memory::Hbm;
 
     /// Llama-3-8B's published config selects the size; a scaled spectrum is refused.
@@ -248,9 +248,9 @@ mod tests {
     #[test]
     fn causal_model_loads() {
         fn loads<T: for<'a> Load<&'a Checkpoint>>() {}
-        loads::<qwen3::launch::Model<Size<"8B">, form::Affine>>();
+        loads::<launch::Model<Size<"8B">, form::Affine>>();
         loads::<qwen3::Catalog<Size<"8B">, form::Affine, bf16, Hbm>>();
-        loads::<qwen3::launch::Model<Size<"Mistral-7B">, form::Affine>>();
+        loads::<launch::Model<Size<"Mistral-7B">, form::Affine>>();
         loads::<qwen3::Catalog<Size<"Mistral-7B">, form::Affine, bf16, Hbm>>();
     }
 }

@@ -9,7 +9,7 @@ use furiosa_opt_engine::LoadOptions;
 use furiosa_opt_models::load::{Context, Load, LoadError, Shapes};
 use furiosa_opt_models::models::Implements;
 use furiosa_opt_models::models::decoder::attention::qwen3;
-use furiosa_opt_models::models::decoder::form;
+use furiosa_opt_models::models::decoder::{form, launch};
 use furiosa_opt_std::prelude::bf16;
 use safetensors::Dtype;
 
@@ -28,7 +28,7 @@ const QWEN3_8B_FP8: Published = Published::new(
 type Catalog = qwen3::Catalog<qwen3::Size<"8B">, form::Affine, bf16, Shapes>;
 
 /// The BF16 Qwen3-8B causal line.
-type Causal = qwen3::launch::Model<qwen3::Size<"8B">, form::Affine>;
+type Causal = launch::Model<qwen3::Size<"8B">, form::Affine>;
 
 /// Qwen3-8B loads as its size with its own head.
 #[test]

@@ -1,7 +1,7 @@
 //! Qwen3-8B with block-scaled E4M3 projections: the checkpoint contract and the registry line of
 //! the catalog model a launch runs in that form.
 
-use super::{QueryHeads, Size, launch};
+use super::{QueryHeads, Size};
 use crate::load::{Checkpoint, Load, LoadError};
 use crate::models::config::decoder::Rotary;
 use crate::models::config::{
@@ -10,6 +10,7 @@ use crate::models::config::{
 use crate::models::decoder::attention::extra_large::QWidth;
 use crate::models::decoder::attention::{Geometry, Head};
 use crate::models::decoder::form::BlockScaled;
+use crate::models::decoder::launch;
 use crate::models::{Class, Implements};
 use furiosa_opt_std::prelude::*;
 use std::io;
