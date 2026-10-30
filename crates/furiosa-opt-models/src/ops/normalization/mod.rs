@@ -102,6 +102,33 @@ pub(crate) type Tile<D, R, W, const V: usize, Chips, E = TilePart<W, V>> = DmTen
     E,
 >;
 
+/// A per-feature BF16 vector in the slices of the rows it acts on, read into their vector
+/// registers in FP32.
+pub(crate) trait Widen {
+    type Output;
+
+    /// Each slice's part of the `W` features, `READ` of them a fetch.
+    fn widen<W: AxisName, const READ: usize>(
+        &self,
+        sub: &mut TuContext<{ Tu::Sub }>,
+    ) -> Self::Output;
+}
+
+impl<X: M, C: M, S: M, E: M> Widen for DmTensor<bf16, X, C, S, E> {
+    type Output = VrfTensor<f32, X, C, S, E>;
+
+    fn widen<W: AxisName, const READ: usize>(
+        &self,
+        sub: &mut TuContext<{ Tu::Sub }>,
+    ) -> Self::Output {
+        sub.begin(self.view())
+            .fetch::<m![{ E } / { READ }], m![W % { READ }]>()
+            .fetch_cast::<f32>()
+            .collect::<m![{ E } / 8], m![W % 8]>()
+            .to_vrf()
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use furiosa_opt_std::prelude::*;

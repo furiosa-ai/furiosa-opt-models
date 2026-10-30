@@ -1,6 +1,8 @@
 //! `x * w / sqrt(mean(x²) + epsilon)` per row, with FP32 statistics and one rounding.
 
-use super::{Chunk, Cluster, FeatureSlices, Lines, Spread, Tile, TilePart, TileParts, TileRows};
+use super::{
+    Chunk, Cluster, FeatureSlices, Lines, Spread, Tile, TilePart, TileParts, TileRows, Widen,
+};
 use crate::Op;
 use crate::load::{Checkpoint, Context, Load, LoadError};
 use crate::modules::generic::schedule::{self, IntoStream, RowWise};
@@ -119,13 +121,7 @@ pub type InDm<Width, Chips = m![1]> =
 
 impl<Width: AxisName, Chips: M> Learned<Width, Chips> for InDm<Width, Chips> {
     fn lanes(&self, device: &mut Device) -> Features<Width, Chips> {
-        device
-            .sub
-            .begin(self.view())
-            .fetch::<m![Width % ({ Symbol<Chunk<Width>> }) / 8], m![Width % 8]>()
-            .fetch_cast::<f32>()
-            .collect::<m![Width % ({ Symbol<Chunk<Width>> }) / 8], m![Width % 8]>()
-            .to_vrf()
+        self.widen::<Width, 8>(&mut device.sub)
     }
 }
 
@@ -283,13 +279,7 @@ where
                 .to_vrf();
         let weight: DmTensor<bf16, Chips, m![1 # 2], S, m![Head]> =
             self.weight.tensor().to_dm(&mut device.tdma);
-        let weight: VrfTensor<f32, Chips, m![1 # 2], S, m![Head]> = device
-            .sub
-            .begin(weight.view())
-            .fetch::<m![Head / 16], m![Head % 16]>()
-            .fetch_cast::<f32>()
-            .collect::<m![Head / 8], m![Head % 8]>()
-            .to_vrf();
+        let weight = weight.widen::<Head, 16>(&mut device.sub);
         input.with(
             Scale::<HeadLanes<P, Head>>::of(
                 &mut device.main,
@@ -358,13 +348,7 @@ where
         };
         let weight: Tile<bf16, R, Width, VECTORS, Chips> =
             self.weight.tensor().view().to_dm(&mut device.tdma);
-        let weight = device
-            .sub
-            .begin(weight.view())
-            .fetch::<m![{ TilePart<Width, VECTORS> } / 16], m![Width % 16]>()
-            .fetch_cast::<f32>()
-            .collect::<m![{ TilePart<Width, VECTORS> } / 8], m![Width % 8]>()
-            .to_vrf::<TilePart<Width, VECTORS>>();
+        let weight = weight.widen::<Width, 16>(&mut device.sub);
         let normalize =
             |device: &mut Device,
              rows: &Tile<D, R, Width, VECTORS, Chips>,

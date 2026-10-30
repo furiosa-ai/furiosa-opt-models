@@ -15,7 +15,7 @@ use super::rows::Narrow;
 use super::rows::Wide;
 use crate::Op;
 use crate::ops::index::packed::{Group, Join, Packed, Rows, Table};
-use crate::ops::normalization::{self, Root, Squares};
+use crate::ops::normalization::{self, Root, Squares, Widen};
 use crate::specialize::diffusion::Run;
 
 /// Rows of a block of packed rows: 512 when the rows come in whole 512-row blocks, else 256.
@@ -167,13 +167,7 @@ impl<R: AxisName, W: AxisName, X: M> Op<HbmTensorView<'_, bf16, X, m![W]>> for B
         vector: HbmTensorView<'_, bf16, X, m![W]>,
     ) -> Self::Output {
         let in_dm: Feature<R, W, X> = vector.to_dm(&mut device.tdma);
-        device
-            .sub
-            .begin(in_dm.view())
-            .fetch::<m![W % ({ E<W> }) / 8], m![W % 8]>()
-            .fetch_cast::<f32>()
-            .collect::<m![W % ({ E<W> }) / 8], m![W % 8]>()
-            .to_vrf()
+        in_dm.widen::<W, 8>(&mut device.sub)
     }
 }
 impl<R: AxisName> Block<R> {

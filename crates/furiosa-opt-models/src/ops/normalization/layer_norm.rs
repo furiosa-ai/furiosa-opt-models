@@ -1,6 +1,6 @@
 //! `(x - mean(x)) / sqrt(var(x) + epsilon) * w + b` per row.
 
-use super::{Lines, Tile, TilePart, TileParts, TileRows};
+use super::{Lines, Tile, TilePart, TileParts, TileRows, Widen};
 use crate::Op;
 use crate::load::{Checkpoint, Children, Context, Load, LoadError};
 use crate::tensor::scalar::F32;
@@ -130,13 +130,7 @@ where
         };
         let feature = |device: &mut Device, vector: &HbmTensor<bf16, Chips, m![W]>| {
             let in_dm: Tile<bf16, R, W, VECTORS, Chips> = vector.view().to_dm(&mut device.tdma);
-            device
-                .sub
-                .begin(in_dm.view())
-                .fetch::<m![{ TilePart<W, VECTORS> } / 16], m![W % 16]>()
-                .fetch_cast::<f32>()
-                .collect::<m![{ TilePart<W, VECTORS> } / 8], m![W % 8]>()
-                .to_vrf::<TilePart<W, VECTORS>>()
+            in_dm.widen::<W, 16>(&mut device.sub)
         };
         let (weight, bias) = (feature(device, self.weight), feature(device, self.bias));
         let epsilon: Tile<f32, R, W, VECTORS, Chips, m![1 # 8]> = self

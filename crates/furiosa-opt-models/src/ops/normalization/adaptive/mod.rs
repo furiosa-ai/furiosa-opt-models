@@ -7,7 +7,7 @@
 use crate::Op;
 use crate::load::Load;
 use crate::ops::index::packed::{Packed, Rows, Table};
-use crate::ops::normalization::{Lanes, Root, Scale, Squares};
+use crate::ops::normalization::{Lanes, Root, Scale, Squares, Widen};
 use crate::tensor::form::Weight;
 use furiosa_opt_std::prelude::*;
 use std::borrow::Borrow;
@@ -71,23 +71,6 @@ impl<R: AxisName, W: AxisName, X: M> Op<(&Tile<bf16, W, X>, &mut Rows<R, W, X>, 
                 W
             ]>(at),
         );
-    }
-}
-
-/// A written per-feature vector, widened.
-impl<Width: AxisName, const EPSILON: usize, X: M, T> Op<&Feature<bf16, Width, X>>
-    for FinalNorm<Width, EPSILON, X, T>
-{
-    type Output = Operand<Width, X>;
-
-    fn forward(&self, device: &mut Device, in_dm: &Feature<bf16, Width, X>) -> Self::Output {
-        device
-            .sub
-            .begin(in_dm.view())
-            .fetch::<m![Width % 128 / 8], m![Width % 8]>()
-            .fetch_cast::<f32>()
-            .collect::<m![Width % 128 / 8], m![Width % 8]>()
-            .to_vrf()
     }
 }
 
@@ -177,7 +160,7 @@ where
         (input, (shift, scale)): (&'x Rows<R, Width, X>, &'s Shift<Width, X>),
     ) -> Self::Output {
         let weight: Feature<bf16, Width, X> = self.weight.tensor().view().to_dm(&mut device.tdma);
-        let weight = self.forward(&mut *device, &weight);
+        let weight = weight.widen::<Width, 8>(&mut device.sub);
         let scale: Feature<bf16, Width, X> = scale.view().to_dm(&mut device.tdma);
         let gain: Operand<Width, X> = device
             .main
@@ -193,7 +176,7 @@ where
             .vector_final()
             .to_vrf(&mut device.sub);
         let shift: Feature<bf16, Width, X> = shift.view().to_dm(&mut device.tdma);
-        let shift = self.forward(&mut *device, &shift);
+        let shift = shift.widen::<Width, 8>(&mut device.sub);
         let mut output = HbmTensor::new();
         for tile in 0..Strips::<R>::SIZE {
             let rows: Tile<bf16, Width, X> = {

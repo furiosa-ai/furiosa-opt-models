@@ -15,7 +15,7 @@ use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
 
 use crate::ops::index::packed::{Group, Rows, Table};
-use crate::ops::normalization::{Lanes, Root, Squares};
+use crate::ops::normalization::{Lanes, Root, Squares, Widen};
 use crate::specialize::diffusion::{Run, Spread};
 
 /// A strip of `2 * ROWS` rows: `ROWS` rows a cluster, `SLICES` slices a row, each `E` features
@@ -163,13 +163,7 @@ impl<W: AxisName, X: M, E: AxisName, const ROWS: usize, const SLICES: usize>
         vector: HbmTensorView<'_, bf16, X, m![W]>,
     ) -> Self::Output {
         let in_dm: Part<bf16, W, X, E, ROWS, SLICES> = vector.to_dm(&mut device.tdma);
-        device
-            .sub
-            .begin(in_dm.view())
-            .fetch::<m![W % ({ Symbol<E> }) / 8], m![W % 8]>()
-            .fetch_cast::<f32>()
-            .collect::<m![W % ({ Symbol<E> }) / 8], m![W % 8]>()
-            .to_vrf()
+        in_dm.widen::<W, 8>(&mut device.sub)
     }
 }
 impl<
