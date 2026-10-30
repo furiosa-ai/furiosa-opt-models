@@ -8,26 +8,18 @@ mod common;
 
 use std::io;
 
-use furiosa_opt_engine::Checkpoint;
-use furiosa_opt_engine::registry::Implementation;
 use furiosa_opt_models::load::LoadError;
 use furiosa_opt_models::models::Family;
 use furiosa_opt_models::models::decoder::attention::olmoe::Size;
 use safetensors::Dtype;
 use serde_json::json;
 
-use common::Published;
+use common::{Published, size};
 
 const OLMOE_1B_7B: Published = Published::new(
     "allenai/OLMoE-1B-7B-0924",
     "6d84c48581ece794365f2b8e9cfb043c68ade9c5",
 );
-
-/// The size of the implementation the registry chooses under `architecture` for `source`.
-fn load(architecture: &str, source: &Checkpoint) -> Result<&'static str, LoadError> {
-    let (name, implementations) = Implementation::listed(&[architecture])?;
-    Implementation::choose(name, implementations, source).map(Implementation::size)
-}
 
 // # Strict loads of the published checkpoints
 
@@ -37,7 +29,7 @@ fn load(architecture: &str, source: &Checkpoint) -> Result<&'static str, LoadErr
 #[should_panic(expected = "Unsupported")]
 fn olmoe_1b_7b_loads_strictly() {
     let checkpoint = OLMOE_1B_7B.declared();
-    assert_eq!(load("OlmoeForCausalLM", &checkpoint).unwrap(), "1B-7B");
+    assert_eq!(size("OlmoeForCausalLM", &checkpoint).unwrap(), "1B-7B");
 }
 
 // # Strictness
@@ -50,7 +42,7 @@ fn missing_tensor_is_missing() {
     let mut checkpoint = OLMOE_1B_7B.declared();
     let name = "model.layers.3.mlp.experts.5.up_proj.weight";
     assert!(checkpoint.remove(name));
-    match load("OlmoeForCausalLM", &checkpoint) {
+    match size("OlmoeForCausalLM", &checkpoint) {
         Err(LoadError::Missing(names)) => assert_eq!(names, [name]),
         other => panic!("{other:?}"),
     }
@@ -66,7 +58,7 @@ fn extra_tensor_is_unexpected() {
     checkpoint
         .insert(name, Dtype::F32, &[1], vec![0; 4])
         .unwrap();
-    match load("OlmoeForCausalLM", &checkpoint) {
+    match size("OlmoeForCausalLM", &checkpoint) {
         Err(LoadError::Unexpected(names)) => assert_eq!(names, [name]),
         other => panic!("{other:?}"),
     }
