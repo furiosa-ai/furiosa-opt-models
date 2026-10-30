@@ -12,7 +12,7 @@ use furiosa_opt_models::models::Family;
 use furiosa_opt_models::models::encoder_decoder::whisper;
 use serde_json::{Value, json};
 
-use common::Published;
+use common::{Published, parse, refuses_by_difference};
 
 const WHISPER_TINY: Published = Published::new(
     "openai/whisper-tiny",
@@ -40,11 +40,6 @@ fn whisper_is_refused_until_its_root_exists() {
 
 // # Sizes by their published configs
 
-/// `S` parses `config`, the parsed size dropped.
-fn parse<S: Family>(config: &Value) -> io::Result<()> {
-    S::parse(config).map(drop)
-}
-
 /// Every published size: its checkpoint and its parser.
 const SIZES: [(Published, fn(&Value) -> io::Result<()>); 2] = [
     (WHISPER_TINY, parse::<whisper::Size<"tiny">>),
@@ -70,20 +65,6 @@ fn each_size_reads_its_published_config_alone() {
             }
         }
     }
-}
-
-/// That `error`, a size's refusal of `config`, names a field where `config` differs from `own`, the
-/// size's own config, with both values.
-fn refuses_by_difference(error: &io::Error, config: &serde_json::Value, own: &serde_json::Value) {
-    let reason = error.to_string();
-    let text = |value: &serde_json::Value| value.as_str().map_or(value.to_string(), str::to_owned);
-    let field = reason
-        .split_once(": ")
-        .map_or(reason.as_str(), |(field, _)| field);
-    let (found, held) = (text(&config[field]), text(&own[field]));
-    assert_ne!(found, held, "{reason}");
-    let named = reason.starts_with(&format!("{field}: {found}, ")) && reason.ends_with(&held);
-    assert!(named, "{reason}");
 }
 
 /// A config the tiny size does not serve is refused, each case by its kind and reason.

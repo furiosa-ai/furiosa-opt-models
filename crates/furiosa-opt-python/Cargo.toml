@@ -1,6 +1,6 @@
 # The engine's Python binding, which maturin builds as the extension module
-# `furiosa_opt_engine._native`: a package of its own, so that only its builds compile every kernel
-# the binding reaches, and an engine test compiles those its tests reach.
+# `furiosa_opt_engine._native`: a package of its own, so the engine stays a plain library that
+# links no Python.
 [package]
 name = "furiosa-opt-python"
 version = "0.1.0"

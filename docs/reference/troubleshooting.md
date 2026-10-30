@@ -74,10 +74,12 @@ If `/dev/rngd` is missing, install the RNGD driver as described in [Installing P
 ### A chip index is malformed
 
 ```text
+ValueError: Non-integer device ID 'a' is not supported by cpu.
+ValueError: invalid literal for int() with base 10: 'a'
 FURIOSA_VISIBLE_CHIPS: `a` is not a chip index
 ```
 
-`FURIOSA_VISIBLE_CHIPS` takes comma-separated chip numbers, such as `0,1` ([Environment variables](environment.md)).
+vLLM, the SGLang plugin and the runtime's automatic placement each read `FURIOSA_VISIBLE_CHIPS`, which takes comma-separated chip numbers, such as `0,1` ([Environment variables](environment.md)).
 
 ### Profiling records nothing
 

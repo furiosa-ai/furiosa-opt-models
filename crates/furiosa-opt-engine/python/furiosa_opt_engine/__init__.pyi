@@ -75,7 +75,7 @@ class Decoder:
         The dtype of the projection weights.
         """
     @property
-    def parallel(self) -> builtins.int:
+    def chips(self) -> builtins.int:
         r"""
         The chips the model runs on.
         """
@@ -117,10 +117,10 @@ class Decoder:
     ) -> HbmTensor:
         r"""
         The rows `requests` keep, in request order and then position order, as `output` names
-        them: one-dimensional I32 token IDs, `[rows, hidden]` BF16 hidden values or `[rows, 256]`
-        FP32 scores with the label columns first. They are returned once the device accepted the
-        call; reading them waits for it. A request with an `adapter` runs with that slot of
-        `adapters`, a list of at most `AdapterSpec.SLOTS`.
+        them: one-dimensional I32 token IDs, `[rows, hidden]` BF16 hidden values or
+        `[rows, columns]` FP32 scores with the label columns first. They are returned once the
+        device accepted the call; reading them waits for it. A request with an `adapter` runs with
+        that slot of `adapters`, a list of at most `AdapterSpec.SLOTS`.
 
         Raises:
             ValueError: A request breaks a rule of the call, names an empty slot, or a tensor or an

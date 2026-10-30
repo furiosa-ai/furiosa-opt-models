@@ -45,7 +45,7 @@ class Pages:
         size = decoder.pool.block * 2 * heads * width * dtype.itemsize
         if size != decoder.pool.bytes:
             raise ValueError(f"the engine pages {decoder.pool.bytes} bytes a block, SGLang {size}")
-        return cls(decoder.pool, decoder.layers, decoder.model.parallel, dtype, heads, width)
+        return cls(decoder.pool, decoder.layers, decoder.model.chips, dtype, heads, width)
 
 
 @final

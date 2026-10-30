@@ -12,7 +12,7 @@ use furiosa_opt_models::models::Family;
 use furiosa_opt_models::models::encoder_decoder::{mt5, t5};
 use serde_json::{Value, json};
 
-use common::Published;
+use common::{Published, parse, refuses_by_difference};
 
 const T5_SMALL: Published = Published::new(
     "google-t5/t5-small",
@@ -101,11 +101,6 @@ fn t5_encoder_is_refused_until_its_root_exists() {
 
 // # Sizes by their published configs
 
-/// `S` parses `config`, the parsed size dropped.
-fn parse<S: Family>(config: &Value) -> io::Result<()> {
-    S::parse(config).map(drop)
-}
-
 /// Every published size: its checkpoint and its parser.
 const SIZES: [(Published, fn(&Value) -> io::Result<()>); 11] = [
     (T5_SMALL, parse::<t5::Size<"small">>),
@@ -140,20 +135,6 @@ fn each_size_reads_its_published_config_alone() {
             }
         }
     }
-}
-
-/// That `error`, a size's refusal of `config`, names a field where `config` differs from `own`, the
-/// size's own config, with both values.
-fn refuses_by_difference(error: &io::Error, config: &serde_json::Value, own: &serde_json::Value) {
-    let reason = error.to_string();
-    let text = |value: &serde_json::Value| value.as_str().map_or(value.to_string(), str::to_owned);
-    let field = reason
-        .split_once(": ")
-        .map_or(reason.as_str(), |(field, _)| field);
-    let (found, held) = (text(&config[field]), text(&own[field]));
-    assert_ne!(found, held, "{reason}");
-    let named = reason.starts_with(&format!("{field}: {found}, ")) && reason.ends_with(&held);
-    assert!(named, "{reason}");
 }
 
 /// A config the v1.0 small size does not serve is refused, each case by its kind and reason.

@@ -1,7 +1,6 @@
 //! The requests and cache of a decoder's calls, as a framework builds them.
 //!
-//! - A `Request` appends token IDs to one sequence: row `i` is position `cached + i`, which writes
-//!   a slot of the blocks its `rows` name and attends to every position up to its own.
+//! - A `Request` appends token IDs to one sequence, in the cache blocks its `rows` name.
 //! - A loaded decoder describes its cache as a `CacheSpec` on its device; `Cache(spec, blocks)`
 //!   allocates `blocks` blocks of every layer there, which the framework assigns to sequences.
 //! - A decoder whose projections take LoRA adapters describes them as an `AdapterSpec`;

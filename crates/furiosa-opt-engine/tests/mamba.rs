@@ -9,15 +9,13 @@ mod common;
 
 use std::io;
 
-use furiosa_opt_engine::Checkpoint;
-use furiosa_opt_engine::registry::Implementation;
 use furiosa_opt_models::load::LoadError;
 use furiosa_opt_models::models::Family;
 use furiosa_opt_models::models::decoder::recurrent::mamba::Size;
 use safetensors::Dtype;
 use serde_json::json;
 
-use common::Published;
+use common::{Published, parse, refuses_by_difference, size};
 
 const MAMBA_130M: Published = Published::new(
     "state-spaces/mamba-130m-hf",
@@ -40,12 +38,6 @@ const MAMBA_1_4B: Published = Published::new(
     "6e46eae61c27280517feef46f536d16b91076f08",
 );
 
-/// The size of the implementation the registry chooses under `architecture` for `source`.
-fn load(architecture: &str, source: &Checkpoint) -> Result<&'static str, LoadError> {
-    let (name, implementations) = Implementation::listed(&[architecture])?;
-    Implementation::choose(name, implementations, source).map(Implementation::size)
-}
-
 // # Strict loads of the published checkpoints
 
 /// Mamba-130m selects its size and loads strictly, its head tied to the embedding.
@@ -54,7 +46,7 @@ fn load(architecture: &str, source: &Checkpoint) -> Result<&'static str, LoadErr
 #[should_panic(expected = "Unsupported")]
 fn mamba_130m_loads_strictly() {
     let checkpoint = MAMBA_130M.declared();
-    assert_eq!(load("MambaForCausalLM", &checkpoint).unwrap(), "130m");
+    assert_eq!(size("MambaForCausalLM", &checkpoint).unwrap(), "130m");
 }
 
 /// Mamba-2.8b selects its size and loads strictly, its head tied to the embedding.
@@ -63,7 +55,7 @@ fn mamba_130m_loads_strictly() {
 #[should_panic(expected = "Unsupported")]
 fn mamba_2_8b_loads_strictly() {
     let checkpoint = MAMBA_2_8B.declared();
-    assert_eq!(load("MambaForCausalLM", &checkpoint).unwrap(), "2.8b");
+    assert_eq!(size("MambaForCausalLM", &checkpoint).unwrap(), "2.8b");
 }
 
 // # Strictness
@@ -76,7 +68,7 @@ fn missing_tensor_is_missing() {
     let mut checkpoint = MAMBA_130M.declared();
     let name = "backbone.layers.3.mixer.x_proj.weight";
     assert!(checkpoint.remove(name));
-    match load("MambaForCausalLM", &checkpoint) {
+    match size("MambaForCausalLM", &checkpoint) {
         Err(LoadError::Missing(names)) => assert_eq!(names, [name]),
         other => panic!("{other:?}"),
     }
@@ -92,7 +84,7 @@ fn extra_tensor_is_unexpected() {
     checkpoint
         .insert(name, Dtype::F32, &[1], vec![0; 4])
         .unwrap();
-    match load("MambaForCausalLM", &checkpoint) {
+    match size("MambaForCausalLM", &checkpoint) {
         Err(LoadError::Unexpected(names)) => assert_eq!(names, [name]),
         other => panic!("{other:?}"),
     }
@@ -100,24 +92,16 @@ fn extra_tensor_is_unexpected() {
 
 // # Configs
 
-/// Whether the size `N` serves `config`.
-fn parse<const N: &'static str>(config: &serde_json::Value) -> io::Result<()>
-where
-    Size<N>: Family,
-{
-    Size::<N>::parse(config).map(drop)
-}
-
 /// Each size parses its published checkpoint's config and refuses every other size's by a field
 /// they differ in, with both values.
 #[test]
 fn sizes_read_their_published_configs() {
     let sizes = [
-        (parse::<"130m"> as fn(&_) -> _, MAMBA_130M.config()),
-        (parse::<"370m">, MAMBA_370M.config()),
-        (parse::<"790m">, MAMBA_790M.config()),
-        (parse::<"1.4b">, MAMBA_1_4B.config()),
-        (parse::<"2.8b">, MAMBA_2_8B.config()),
+        (parse::<Size<"130m">> as fn(&_) -> _, MAMBA_130M.config()),
+        (parse::<Size<"370m">>, MAMBA_370M.config()),
+        (parse::<Size<"790m">>, MAMBA_790M.config()),
+        (parse::<Size<"1.4b">>, MAMBA_1_4B.config()),
+        (parse::<Size<"2.8b">>, MAMBA_2_8B.config()),
     ];
     for (i, (parse, own)) in sizes.iter().enumerate() {
         for (j, (_, config)) in sizes.iter().enumerate() {
@@ -130,20 +114,6 @@ fn sizes_read_their_published_configs() {
             }
         }
     }
-}
-
-/// That `error`, a size's refusal of `config`, names a field where `config` differs from `own`, the
-/// size's own config, with both values.
-fn refuses_by_difference(error: &io::Error, config: &serde_json::Value, own: &serde_json::Value) {
-    let reason = error.to_string();
-    let text = |value: &serde_json::Value| value.as_str().map_or(value.to_string(), str::to_owned);
-    let field = reason
-        .split_once(": ")
-        .map_or(reason.as_str(), |(field, _)| field);
-    let (found, held) = (text(&config[field]), text(&own[field]));
-    assert_ne!(found, held, "{reason}");
-    let named = reason.starts_with(&format!("{field}: {found}, ")) && reason.ends_with(&held);
-    assert!(named, "{reason}");
 }
 
 /// A config the size does not serve is refused, each case by its kind and reason; a time step

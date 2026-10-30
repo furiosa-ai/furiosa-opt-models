@@ -34,15 +34,9 @@ A load returns a `Decoder`, which serves every model alike, as an object of its 
 Every `forward` returns its device outputs once the device accepted the call; a copy of pinned `HostBuffer` memory may return before it ends, and only `Transfer.wait`, every other copy, `HbmTensor.wait` and `Device.synchronize` wait for the device ([asynchronous calls](../engine/python.md#run-calls-asynchronously)).
 
 ::: furiosa_opt_engine.Decoder
-
-::: furiosa_opt_engine.qwen3.ForCausalLM
-
-::: furiosa_opt_engine.qwen3.Model
-
-::: furiosa_opt_engine.qwen3.ForSequenceClassification
-
-::: furiosa_opt_engine.llama.ForCausalLM
-
+{% for class in decoder_classes %}
+::: furiosa_opt_engine.{{ class }}
+{% endfor %}
 A load of a vision-language model's media encoder alone (`LoadOptions.encoder()`) returns an `Encoder`, whatever its model, whose calls turn the media below into rows of the language model's width.
 
 ::: furiosa_opt_engine.Encoder

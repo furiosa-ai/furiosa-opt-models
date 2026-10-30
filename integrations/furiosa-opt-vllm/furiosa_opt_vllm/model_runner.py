@@ -44,7 +44,7 @@ class FuriosaModelRunner(Runner):
         # holds.
         assert isinstance(connector, RNGDOffloadingConnector) and self.cache is not None
         assert isinstance(self.model, Decoder) and self.model.model is not None
-        connector.register(self.cache, self.model.model.parallel)
+        connector.register(self.cache, self.model.model.chips)
         # vLLM's attention layers, which the engine replaces, hold no cache tensors to register.
         self.kv_connector = get_kv_connector(self.vllm_config, {})
 
