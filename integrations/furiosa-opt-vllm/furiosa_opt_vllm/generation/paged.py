@@ -59,14 +59,15 @@ def forward(runner: Runner, entry: Entry, call: Call[str], feed: Feed) -> engine
     per run of a sequence's rows and one more for a run's device token, each with its sequence's
     adapter slot."""
     cache = runner.cache
-    if cache is None:
+    tables = runner.tables
+    if cache is None or tables is None:
         raise RuntimeError("initialize_kv_cache must precede paged execution")
     # --8<-- [start:execute]
     kept = set(call.kept)
     requests: list[engine.decoder.Request] = []
     for request in call.requests:
         run = list(request.rows)
-        blocks = runner.requests[request.sequence].block_ids
+        blocks = tables.rows(runner.requests[request.sequence].block_ids)
         last = engine.decoder.Keep.LAST if request.complete else engine.decoder.Keep.NONE
         slot = feed.slots.get(request.sequence)
         # Kept rows end a run, so a run kept from its first row returns every row.

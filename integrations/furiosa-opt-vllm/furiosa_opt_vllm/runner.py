@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
     from furiosa_opt_vllm import lora
     from furiosa_opt_vllm.admission import Speculative
+    from furiosa_opt_vllm.cache import Tables
     from furiosa_opt_vllm.generation import Collected
     from furiosa_opt_vllm.request import TokenScores
     from furiosa_opt_vllm.selection import Sampling, Speculation
@@ -92,6 +93,7 @@ class Runner:
         self.speculative: Speculative | None = speculative(vllm_config, Section.parse(vllm_config))
         self.model: Decoder | Media | None = None
         self.cache: engine.decoder.Cache | None = None
+        self.tables: Tables | None = None
         # vLLM's driver of the KV connector around each step, which does nothing without one.
         self.kv_connector: KVConnector = NO_OP_KV_CONNECTOR
         # The memory sleep mode released, by its tag, and what waking restores it from.

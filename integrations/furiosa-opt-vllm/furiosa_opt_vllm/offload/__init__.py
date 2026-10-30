@@ -31,6 +31,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
 )
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 
+from furiosa_opt_vllm.admission import Refused
 from furiosa_opt_vllm.offload.worker import Host, Worker
 
 if TYPE_CHECKING:
@@ -64,6 +65,12 @@ class RNGDOffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(
         self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig
     ) -> None:
+        if len(kv_cache_config.kv_cache_groups) > 1:
+            raise Refused(
+                "kv_offloading_size",
+                "offloads the KV cache of a model with one cache group: the host tier copies a "
+                + "block of every layer",
+            )
         super().__init__(vllm_config, role, kv_cache_config)
         self._spec = CPUOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
         self._scheduler = (

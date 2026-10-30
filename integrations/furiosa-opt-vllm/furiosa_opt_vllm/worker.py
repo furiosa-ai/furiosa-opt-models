@@ -27,7 +27,7 @@ from vllm.platforms.interface import set_assigned_physical_gpu_ids
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
-from furiosa_opt_vllm import cache, residency
+from furiosa_opt_vllm import cache, paging, residency
 from furiosa_opt_vllm.admission import Refused
 from furiosa_opt_vllm.decoder import Decoder
 from furiosa_opt_vllm.model_runner import FuriosaModelRunner
@@ -208,7 +208,8 @@ class FuriosaWorker(WorkerBase):
 
     @override
     def get_cache_block_size_bytes(self) -> int:
-        return sum(spec.page_size_bytes for spec in self.get_kv_cache_spec().values())
+        loaded = paging.paged(self._runner())
+        return 0 if loaded is None else paging.footprint(loaded.cache)
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         selection = self._runner().selection
