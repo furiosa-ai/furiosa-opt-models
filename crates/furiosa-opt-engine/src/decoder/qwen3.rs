@@ -102,7 +102,7 @@ macro_rules! decoders {
             type Layers = <$size as Geometry>::Layers<Blocks<KvHeads, Head>>;
             type Adapter = decoders!(@adapter $kind $size);
 
-            fn limits(&self) -> Limits {
+            fn limits(&self, _: Tiling) -> Limits {
                 limits::<$size>(Self::ADAPTERS)
             }
 
@@ -164,8 +164,8 @@ macro_rules! decoders {
             type Layers = <$size as Geometry>::Layers<Blocks<KvHeads, Head>>;
             type Adapter = decoders!(@adapter $kind $size);
 
-            fn limits(&self) -> Limits {
-                self.model.limits()
+            fn limits(&self, tiling: Tiling) -> Limits {
+                self.model.limits(tiling)
             }
 
             fn layers(storage: &[HbmBuffer]) -> io::Result<Self::Layers> {
@@ -303,10 +303,10 @@ macro_rules! classifiers {
             /// The base model's, of which a classifier's calls run none.
             type Adapter = <Base<$size> as Decoder>::Adapter;
 
-            fn limits(&self) -> Limits {
+            fn limits(&self, tiling: Tiling) -> Limits {
                 Limits {
                     adapters: Self::ADAPTERS,
-                    ..self.model.limits()
+                    ..self.model.limits(tiling)
                 }
             }
 
