@@ -93,6 +93,26 @@ impl<const N: usize> Projections<'_, N> {
     }
 }
 
+/// Another handle to the same codes and scales, so a module's copy can outlive the borrow of the
+/// tree.
+impl<In, Out, E, S, B, C, Chips> Clone for BlockScaled<In, Out, E, S, B, C, Chips>
+where
+    In: AxisName,
+    Out: AxisName,
+    E: MaterializableScalar,
+    S: MaterializableScalar,
+    B: M,
+    C: Copy,
+    Chips: M,
+{
+    fn clone(&self) -> Self {
+        // SAFETY: parameters are read-only; each alias names the same cells in the same order.
+        let (weight, weight_scale) =
+            unsafe { (self.weight.view().alias(), self.weight_scale.view().alias()) };
+        Self::new(weight, weight_scale, self.contract)
+    }
+}
+
 impl<In: AxisName, Out: AxisName, E: Scalar, S: Scalar, B: M, C, Chips: M, W, T>
     BlockScaled<In, Out, E, S, B, C, Chips, W, T>
 {
@@ -207,6 +227,56 @@ impl<In: AxisName, Out: AxisName, Chips: M + 'static, W, T>
     {
         let weight = context.field("weight", "weight", |cx| W::read(from, cx))?;
         from.channel_scaled::<In, Out, Chips>(context, weight)
+    }
+}
+
+/// E4M3 codes under no contract, one FP32 scale per output row, of the projections `names` as one
+/// weight whose output rows are theirs in order: each part's codes and scales as stored, or those
+/// a load quantizes its BF16 weight to.
+impl<'a, In: AxisName, Out: AxisName, Chips: M + 'static, W, T, const N: usize>
+    Load<Projections<'a, N>> for BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], (), Chips, W, T>
+where
+    W: Load<online::Codes<In, Out, Chips>>,
+    T: Load<online::Scales<Out, Chips>>,
+{
+    fn load(context: &mut Context<'_>, projections: Projections<'a, N>) -> Result<Self, LoadError> {
+        let parts = projections.read(context, |from, cx| match from.quantization() {
+            None => {
+                let mut children = Children::default();
+                let codes = cx.field("weight", "weight", |cx| {
+                    from.host::<f8e4m3, m![{ Symbol<Part<Out, N>> }, In], _>(cx)
+                });
+                let codes = children.ask(codes)?;
+                let scales = cx.field("weight_scale", "weight_scale", |cx| {
+                    from.host::<f32, m![{ Symbol<Part<Out, N>> }, 1 # 8], _>(cx)
+                });
+                let scales = children.ask(scales)?;
+                children.node(codes.zip(scales))
+            }
+            Some(_) => {
+                let weight = cx.field("weight", "weight", |cx| {
+                    from.unquantized::<In, Part<Out, N>>(cx)
+                })?;
+                from.channel_scaled::<In, Part<Out, N>, Chips>(cx, weight)
+            }
+        })?;
+        /// Each chip's rows of every part in turn, `share` values a part on a chip.
+        fn joined<D: Copy>(parts: &[Vec<D>], chips: usize, share: usize) -> Vec<D> {
+            (0..chips)
+                .flat_map(|chip| parts.iter().map(move |part| &part[chip * share..][..share]))
+                .flatten()
+                .copied()
+                .collect()
+        }
+        let (codes, scales): (Vec<_>, Vec<_>) = (parts.into_iter())
+            .map(|(codes, scales)| (codes.into_vec(), scales.into_vec()))
+            .unzip();
+        let rows = Part::<Out, N>::SIZE;
+        let codes = HostTensor::from_vec(joined(&codes, Chips::SIZE, rows * In::SIZE));
+        let scales = HostTensor::from_vec(joined(&scales, Chips::SIZE, rows * 8));
+        let weight = context.field("weight", "", |cx| W::load(cx, codes))?;
+        let scale = context.field("weight_scale", "", |cx| T::load(cx, scales))?;
+        Ok(Self::new(weight, scale, ()))
     }
 }
 
@@ -470,8 +540,8 @@ where
     }
 }
 
-/// Retained BF16 parameter of shape `S` on chips `Chips`, held as `T`: the HBM tensor, or a
-/// borrow of it in a borrowed tree.
+/// Retained parameter of shape `S` on chips `Chips`, held as `T`: its BF16 HBM tensor, a borrow
+/// of it in a borrowed tree, or the codes and scales of a quantized form.
 #[derive(DeviceSend, Load)]
 pub struct Weight<S: M, Chips: M = m![1], T = HbmTensor<bf16, Chips, S>> {
     #[load(rename = "")]
@@ -491,6 +561,11 @@ impl<S: M, Chips: M, T> Weight<S, Chips, T> {
     /// The retained tensor itself, for a parameter form that holds it directly.
     pub fn into_tensor(self) -> T {
         self.tensor
+    }
+
+    /// The form the parameter is held in.
+    pub fn held(&self) -> &T {
+        &self.tensor
     }
 
     /// Borrow the retained BF16 tensor, owned or borrowed by the tree.

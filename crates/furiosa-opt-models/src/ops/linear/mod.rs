@@ -15,7 +15,7 @@ use crate::Op;
 use crate::load::{self, Load, LoadError};
 use crate::ops::normalization::Spread;
 use crate::tensor::form::Weight;
-use crate::tensor::form::{Part, Projections};
+use crate::tensor::form::{BlockScaled, Part, Projections};
 use crate::tensor::mapping;
 use crate::tensor::{axis::Lanes, live::Live};
 
@@ -102,6 +102,21 @@ where
             })
             .copied();
         T::load(context, HostTensor::from_vec(rows)).map(|weight| Self::new(Weight::new(weight)))
+    }
+}
+
+/// The projections as one channel-scaled matrix, their rows in order on every chip.
+impl<'a, In: AxisName, Out: AxisName, Chips: M + 'static, W, T, const N: usize>
+    Load<Projections<'a, N>>
+    for Linear<In, Out, Chips, BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], (), Chips, W, T>>
+where
+    BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], (), Chips, W, T>: Load<Projections<'a, N>>,
+{
+    fn load(
+        context: &mut load::Context<'_>,
+        projections: Projections<'a, N>,
+    ) -> Result<Self, LoadError> {
+        Load::load(context, projections).map(|weight| Self::new(Weight::new(weight)))
     }
 }
 
