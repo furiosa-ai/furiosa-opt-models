@@ -944,6 +944,25 @@ impl<D: Implements + for<'a> Load<&'a Checkpoint> + Decoder + 'static> Listed fo
     }
 }
 
+/// The media encoder reads a load of the encoder part alone, and serves media; its rows are
+/// computed alone, so no tiling applies to them. It is listed by type: the decoders' impl takes
+/// every type parameter.
+impl Listed for gemma4_unified::Encoder<Hbm> {
+    fn reads(part: Part) -> Result<(), LoadError> {
+        match part {
+            Part::Encoder => Ok(()),
+            Part::Whole => Err(LoadError::Unsupported {
+                name: "encoder".into(),
+                reason: "a media encoder loads alone, so choose the encoder".into(),
+            }),
+        }
+    }
+
+    fn served(self, _: Tiling) -> Model {
+        Model::Encoder(Box::new(self))
+    }
+}
+
 impl Implementation {
     /// The implementation the type `T` is.
     pub const fn of<T: Listed>() -> Self {
