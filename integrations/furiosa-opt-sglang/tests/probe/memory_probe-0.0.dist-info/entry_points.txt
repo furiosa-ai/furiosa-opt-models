@@ -1,0 +1,2 @@
+[sglang.srt.plugins]
+memory_probe = memory_probe:register

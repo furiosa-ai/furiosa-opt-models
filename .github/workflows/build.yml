@@ -1,0 +1,185 @@
+name: build
+
+on:
+  workflow_call:
+    inputs:
+      build:
+        description: Build at all; a skipped build still reports its required statuses.
+        type: boolean
+        default: true
+      wheel:
+        description: Build the engine and plugin wheels, which only serving measurements install.
+        type: boolean
+        default: true
+
+permissions: {contents: read}
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+  CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'
+  CARGO_BUILD_FINGERPRINT: content
+  TOOLCHAIN: nightly-2026-05-01
+
+jobs:
+  # Building needs no RNGD, so every job here runs on a CPU runner and leaves the chips to the tests.
+  compiler:
+    if: inputs.build
+    runs-on: aks-kr-xlarge-m
+    timeout-minutes: 30
+    permissions: {actions: read, contents: write}
+    env:
+      CARGO_INCREMENTAL: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - id: compiler
+        uses: ./.github/actions/compiler
+    outputs:
+      revision: ${{ steps.compiler.outputs.revision }}
+
+  package:
+    name: ${{ matrix.package }}
+    needs: compiler
+    permissions: {contents: read}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {package: models, cache: kernels, packages: -p furiosa-opt-models}
+          # The engine's job also builds its binding's tests, which reach the kernels it serves.
+          - {package: engine, cache: serving, packages: -p furiosa-opt-engine -p furiosa-opt-python}
+    runs-on: aks-kr-xlarge-m
+    # A new compiler revision compiles every kernel once; later runs compile only changed kernels.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: ./.github/actions/kernels
+        with:
+          store: ${{ matrix.cache }}
+          revision: ${{ needs.compiler.outputs.revision }}
+      - uses: ./.github/actions/toolchain
+        with:
+          revision: ${{ needs.compiler.outputs.revision }}
+      - uses: ./.github/actions/sccache
+        with:
+          compilers: aarch64-linux-gnu-gcc
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: '3.11'
+          activate-environment: true
+          enable-cache: false
+      - run: |
+          mkdir -p products/tests
+          cargo furiosa-opt test $PACKAGES --release --no-run --message-format=json-render-diagnostics > tests.jsonl
+          jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' tests.jsonl |
+            while IFS= read -r binary; do cp "$binary" products/tests/; done
+        env:
+          PACKAGES: ${{ matrix.packages }}
+      - if: matrix.package == 'engine'
+        run: cargo furiosa-opt test -p furiosa-opt-engine --release --doc
+      # Pull requests build the reference too, so one that breaks it fails before it merges.
+      - if: matrix.package == 'engine'
+        # The engine's interface is its Python module, so its Rust reference documents internal items.
+        run: |
+          cargo furiosa-opt doc -p furiosa-opt-models --no-deps
+          # rustdoc takes RUSTDOCFLAGS, so it runs the old trait solver; on the next one its
+          # auto-trait synthesis aborts until https://github.com/rust-lang/rust/pull/149019.
+          RUSTDOCFLAGS=--document-private-items cargo furiosa-opt doc -p furiosa-opt-engine --no-deps
+      - if: matrix.package == 'engine' && github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-reference
+          path: target/doc
+          retention-days: 1
+      - if: matrix.package == 'engine'
+        name: Check generated Python stubs
+        run: |
+          export LD_LIBRARY_PATH="$(python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))'):$LD_LIBRARY_PATH"
+          cargo furiosa-opt run -p furiosa-opt-python --release --bin stub --locked
+          git diff --exit-code -- crates/furiosa-opt-engine/python
+      - run: tar -I 'gzip -1' -cf products.tar.gz -C products .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.package }}
+          path: products.tar.gz
+          compression-level: 0
+          retention-days: 1
+
+  # The wheel builds the engine's extension module, a build of its own, so it runs beside the
+  # tests' build rather than after it.
+  wheel:
+    if: inputs.build && inputs.wheel
+    needs: compiler
+    permissions: {contents: read}
+    runs-on: aks-kr-xlarge-m
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: ./.github/actions/kernels
+        with:
+          store: serving
+          revision: ${{ needs.compiler.outputs.revision }}
+      - uses: ./.github/actions/toolchain
+        with:
+          revision: ${{ needs.compiler.outputs.revision }}
+      - uses: ./.github/actions/sccache
+        with:
+          compilers: aarch64-linux-gnu-gcc
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: '3.11'
+          activate-environment: true
+          enable-cache: false
+      - run: uv build crates/furiosa-opt-engine --wheel --out-dir products
+        env:
+          CARGO: cargo-furiosa-opt
+          # PyPI takes only manylinux-tagged Linux wheels, and maturin's PEP 517 build reads the
+          # tag only from here; the extension needs glibc 2.34, which maturin checks.
+          MATURIN_PEP517_ARGS: --compatibility manylinux_2_34
+      - run: |
+          uv build integrations/furiosa-opt-vllm --wheel --out-dir products
+          uv build integrations/furiosa-opt-sglang --wheel --out-dir products
+      - name: Check Python stubs against the wheel
+        run: |
+          uv sync --only-group dev --locked
+          uv pip install --no-deps products/*.whl
+          uv run --only-group dev --no-sync python -m mypy.stubtest furiosa_opt_engine
+      - run: tar -I 'gzip -1' -cf products.tar.gz -C products .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-wheel
+          path: products.tar.gz
+          compression-level: 0
+          retention-days: 1
+
+  # The source order that ordered modules deny. clippy::all only warns: modules/ denies it over
+  # findings not fixed yet.
+  clippy:
+    needs: compiler
+    runs-on: aks-kr-xlarge-m
+    timeout-minutes: 30
+    env:
+      # cargo-furiosa-opt names the backend for its builds; a plain cargo build names it here.
+      RUSTFLAGS: -Znext-solver=globally -Ztrim-diagnostic-paths=false --cfg backend="npu"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: ./.github/actions/toolchain
+        with:
+          revision: ${{ needs.compiler.outputs.revision }}
+      # The SDK carries no clippy.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
+          components: clippy
+      - run: >-
+          cargo clippy -p furiosa-opt-models -p furiosa-opt-models-macros --lib --tests --locked
+          -- --force-warn clippy::all

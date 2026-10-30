@@ -1,0 +1,31 @@
+[package]
+name = "furiosa-opt-engine"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Serving-framework backend for FuriosaAI NPUs"
+repository = "https://github.com/furiosa-ai/furiosa-opt-models"
+homepage = "https://developer.furiosa.ai/furiosa-opt-models/"
+readme = "README.md"
+
+[package.metadata.furiosa-opt]
+
+[dependencies]
+futures-executor = "0.3"
+safetensors = "=0.4.5"
+furiosa-opt-models = { path = "../furiosa-opt-models", version = "0.1.0" }
+furiosa-opt-std = { workspace = true }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+tokio = { version = "1", features = ["rt"] }
+# Unused in code: the features the tests' tempfile and tracing enable, so the stub and the wheel
+# reuse the test build.
+rustix = "1"
+tracing-core = "0.1"
+
+[dev-dependencies]
+furiosa-opt-models = { path = "../furiosa-opt-models", features = ["test-support"] }
+tempfile = "3"
+tracing = "0.1"
+tracing-chrometrace = "0.2"
+tracing-subscriber = { version = "0.3", features = ["registry"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }

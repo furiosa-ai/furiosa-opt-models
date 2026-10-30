@@ -1,0 +1,143 @@
+{
+  "sweep": {"minimum_prompts": 16, "waves": 2, "warmup_waves": 1},
+  "budgets": {"kernel": 0.5, "forward": 3},
+  "cycles_per_ms": 2000000,
+  "tasks": {
+    "text": {
+      "serve": ["--dtype", "bfloat16", "--generation-config", "vllm"],
+      "bench": [
+        "--dataset-name", "random", "--temperature", "0", "--ignore-eos",
+        "--percentile-metrics", "ttft,tpot,e2el"
+      ],
+      "serving": {
+        "gate": [{"input": 128, "output": 128, "widths": [16]}],
+        "nightly": [
+          {"input": 1024, "output": 1024, "widths": [1, 2, 4, 8, 16, 32, 64]},
+          {"input": 1024, "output": 8192, "widths": [16]},
+          {"input": 8192, "output": 1024, "widths": [1, 4, 16]}
+        ]
+      }
+    },
+    "embedding": {
+      "serve": [
+        "--runner", "pooling", "--dtype", "bfloat16", "--hf-overrides",
+        "{\"is_matryoshka\":true}"
+      ],
+      "bench": ["--backend", "openai-embeddings", "--endpoint", "/v1/embeddings", "--dataset-name", "random"],
+      "serving": {"nightly": [{"input": 512, "widths": [1, 4, 16, 64]}]}
+    },
+    "reranking": {
+      "serve": [
+        "--runner", "pooling", "--dtype", "bfloat16", "--hf-overrides",
+        "{\"architectures\":[\"Qwen3ForSequenceClassification\"],\"classifier_from_token\":[\"no\",\"yes\"],\"is_original_qwen3_reranker\":true}",
+        "--chat-template", "{checkpoint}/chat_template.jinja"
+      ],
+      "bench": [
+        "--backend", "vllm-rerank", "--endpoint", "/v1/rerank", "--dataset-name", "random-rerank",
+        "--random-batch-size", "1"
+      ],
+      "serving": {"nightly": [{"input": 512, "widths": [1, 4, 16, 64]}]}
+    },
+    "classification": {
+      "serve": ["--runner", "pooling", "--convert", "classify", "--dtype", "bfloat16"],
+      "bench": [
+        "--backend", "vllm-rerank", "--endpoint", "/v1/rerank", "--dataset-name", "random-rerank",
+        "--random-batch-size", "1"
+      ],
+      "serving": {"nightly": [{"input": 512, "widths": [1, 4, 16, 64]}]}
+    }
+  },
+  "models": [
+    {
+      "id": "Qwen/Qwen3-0.6B", "tier": "gate", "task": "text", "doc": "qwen3-0.6b",
+      "forward": "qwen3_0_6b_forward"
+    },
+    {
+      "id": "Qwen/Qwen3-1.7B", "tier": "gate", "task": "text", "doc": "qwen3-1.7b",
+      "forward": "qwen3_1_7b_forward"
+    },
+    {
+      "id": "Qwen/Qwen3-4B", "tier": "gate", "task": "text", "doc": "qwen3-4b",
+      "forward": "qwen3_4b_forward"
+    },
+    {
+      "id": "Qwen/Qwen3-4B-Instruct-2507", "tier": "nightly", "task": "text", "doc": "qwen3-4b",
+      "serve": ["--max-model-len", "40960"], "measured_as": "Qwen/Qwen3-4B"
+    },
+    {
+      "id": "Qwen/Qwen3-4B-Thinking-2507", "tier": "nightly", "task": "text", "doc": "qwen3-4b",
+      "serve": ["--max-model-len", "40960"], "measured_as": "Qwen/Qwen3-4B"
+    },
+    {
+      "id": "Qwen/Qwen3-8B", "tier": "gate", "task": "text", "doc": "qwen3-8b",
+      "forward": "qwen3_8b_forward"
+    },
+    {
+      "id": "Qwen/Qwen3-Embedding-0.6B", "tier": "nightly", "task": "embedding",
+      "doc": "qwen3-embedding", "measured_as": "Qwen/Qwen3-0.6B"
+    },
+    {
+      "id": "Qwen/Qwen3-Embedding-4B", "tier": "nightly", "task": "embedding",
+      "doc": "qwen3-embedding", "measured_as": "Qwen/Qwen3-4B"
+    },
+    {
+      "id": "Qwen/Qwen3-Embedding-8B", "tier": "nightly", "task": "embedding",
+      "doc": "qwen3-embedding", "measured_as": "Qwen/Qwen3-8B"
+    },
+    {
+      "id": "Qwen/Qwen3-Reranker-0.6B", "tier": "nightly", "task": "reranking",
+      "doc": "qwen3-reranker", "measured_as": "Qwen/Qwen3-0.6B"
+    },
+    {
+      "id": "Qwen/Qwen3-Reranker-4B", "tier": "nightly", "task": "reranking",
+      "doc": "qwen3-reranker", "measured_as": "Qwen/Qwen3-4B"
+    },
+    {
+      "id": "Qwen/Qwen3-Reranker-8B", "tier": "nightly", "task": "reranking",
+      "doc": "qwen3-reranker", "measured_as": "Qwen/Qwen3-8B"
+    },
+    {
+      "id": "tomaarsen/Qwen3-Reranker-0.6B-seq-cls", "tier": "nightly", "task": "classification",
+      "doc": "qwen3-reranker", "measured_as": "Qwen/Qwen3-0.6B"
+    },
+    {
+      "id": "NousResearch/Meta-Llama-3-8B", "tier": "nightly",
+      "task": "text",
+      "doc": "llama3-8b",
+      "forward": "llama3_8b_forward",
+      "download": ["*.json", "*.safetensors", "*.model"]
+    },
+    {
+      "id": "mistralai/Mistral-7B-v0.3", "tier": "nightly",
+      "task": "text",
+      "doc": "mistral-7b",
+      "forward": "mistral_7b_v0_3_forward",
+      "download": ["*.json", "*.safetensors", "*.model"]
+    },
+    {
+      "id": "mistralai/Mistral-7B-v0.1", "tier": "nightly",
+      "task": "text",
+      "doc": "mistral-7b",
+      "download": ["*.json", "*.safetensors", "*.model"]
+    },
+    {
+      "id": "RedHatAI/Mistral-Nemo-Instruct-2407-FP8", "tier": "nightly",
+      "task": "text",
+      "doc": "mistral-nemo",
+      "quantization": {"weights": ["FP8"], "activations": ["Static FP8"]},
+      "serve": ["--kv-cache-dtype", "fp8_e4m3", "--max-model-len", "16384"],
+      "download": ["*.json", "*.safetensors", "*.model", "*.jinja"]
+    },
+    {
+      "id": "unsloth/gemma-4-12b-it-NVFP4", "tier": "nightly",
+      "task": "text",
+      "doc": "gemma4-12b",
+      "quantization": {
+        "weights": ["NVFP4 MLP", "FP8 attention"],
+        "activations": ["NVFP4 MLP", "Dynamic FP8 attention"]
+      },
+      "serve": ["--language-model-only", "--max-model-len", "-1"],
+      "download": ["*.json", "*.safetensors", "*.model", "*.jinja"]
+    }
+  ]
+}

@@ -1,0 +1,144 @@
+name: bench
+
+# Measures a tier's forward cases and serving workloads, and uploads the traces and sweep summaries
+# for the report to record.
+on:
+  workflow_call:
+    inputs:
+      tier: {description: '`gate` for a pull request, `nightly` for the nightly run.', type: string, required: true}
+      measure: {description: 'Measure at all; a skipped bench still reports its required status.', type: boolean, default: true}
+
+permissions: {contents: read}
+
+env:
+  # A fork's code, which a maintainer approved but nobody trusts, gets caches of its own, so it
+  # cannot change what later runs of this repository read.
+  HF_HOME: ${{ github.event.pull_request.head.repo.fork && '/tmp/fork-cache/huggingface' || '/root/.cache/huggingface' }}
+  UV_PYTHON_INSTALL_DIR: ${{ github.event.pull_request.head.repo.fork && '/tmp/fork-cache/python' || '/root/.cache/furiosa-opt-models/python' }}
+  XDG_CACHE_HOME: ${{ github.event.pull_request.head.repo.fork && '/tmp/fork-cache' || '/root/.cache' }}
+  TIER: ${{ inputs.tier }}
+
+jobs:
+  plan:
+    if: inputs.measure
+    runs-on: ubuntu-latest
+    outputs:
+      forward: ${{ steps.plan.outputs.forward }}
+      served: ${{ steps.plan.outputs.served }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - id: plan
+        run: |
+          inventory=.github/benchmarks.json
+          # The nightly run measures the gate tier's forward cases too, so one run holds every
+          # checkpoint's measurements.
+          echo "forward=$(jq -c '[.models[] | select(env.TIER == "nightly" or .tier == "gate")
+            | .forward // empty]' "$inventory")" >> "$GITHUB_OUTPUT"
+          # A pull request serves the gate tier's checkpoints of a task with gate workloads, the
+          # nightly run every checkpoint of a task with workloads; a checkpoint measured as another
+          # of its task compiles to its kernels and serves the same numbers.
+          echo "served=$(jq -c '. as $inventory | [.models[] | select(env.TIER == "nightly" or .tier == "gate")
+            | select($inventory.tasks[.task].serving[env.TIER]) | . as $row
+            | select(all($inventory.models[] | select(.id == $row.measured_as); .task != $row.task))
+            | .id]' "$inventory")" >> "$GITHUB_OUTPUT"
+
+  forward:
+    needs: plan
+    if: needs.plan.outputs.forward != '[]'
+    runs-on: arc-runner-benchmark-rngd4
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: '3.11'
+          activate-environment: true
+          enable-cache: false
+          cache-local-path: ${{ github.event.pull_request.head.repo.fork && '/tmp/fork-cache/uv' || '/root/.cache/furiosa-opt-models/uv' }}
+      - uses: ./.github/actions/checkpoints
+        with:
+          tier: ${{ inputs.tier == 'gate' && 'gate' || 'all' }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-engine
+          path: products
+      - run: |
+          tar xzf products/products.tar.gz -C products
+          mapfile -t cases < <(jq -r '.[]' <<< "$CASES")
+          # The binding's test binaries load the Python library; the forward tests start no interpreter.
+          export LD_LIBRARY_PATH="$(python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+          # Measured tests run alone so that no other test disturbs their timing; they open a
+          # device, so they run only when asked for.
+          for binary in products/tests/*; do
+            "$binary" "${cases[@]}" --include-ignored --test-threads 1
+          done
+        env:
+          CASES: ${{ needs.plan.outputs.forward }}
+          FURIOSA_OPT_PROFILE: info
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: trace-forward
+          path: trace/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # A job a checkpoint, so one checkpoint's failure keeps the others' numbers and the sweeps run
+  # side by side.
+  serving:
+    needs: plan
+    if: needs.plan.outputs.served != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        checkpoint: ${{ fromJSON(needs.plan.outputs.served) }}
+    runs-on: arc-runner-benchmark-rngd4
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: '3.11'
+          activate-environment: true
+          enable-cache: false
+          cache-local-path: ${{ github.event.pull_request.head.repo.fork && '/tmp/fork-cache/uv' || '/root/.cache/furiosa-opt-models/uv' }}
+      - uses: ./.github/actions/checkpoints
+        with:
+          tier: ${{ inputs.tier == 'gate' && 'gate' || 'all' }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-wheel
+          path: products
+      # triton-cpu and torch.compile build vLLM's host sampling kernels with a C compiler.
+      - run: command -v cc > /dev/null || { sudo apt-get update -qq; sudo apt-get install -yqq gcc; }
+      - run: |
+          tar xzf products/products.tar.gz -C products
+          # The serving sweep writes its summary with pandas, which vLLM does not install.
+          uv pip install --torch-backend cpu products/furiosa_opt_{engine,vllm}-*.whl pandas
+      - uses: ./.github/actions/serving
+        with:
+          tier: ${{ inputs.tier }}
+          checkpoints: ${{ matrix.checkpoint }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: sweep-${{ strategy.job-index }}
+          path: sweep/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The one status the branch requires of a bench: it passes when every measuring job passed or had
+  # nothing to measure.
+  run:
+    needs: [plan, forward, serving]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo '${{ toJSON(needs) }}' | jq -e 'all(.[]; .result == "success" or .result == "skipped")'

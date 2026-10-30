@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.9.4,<2"]
+build-backend = "maturin"
+
+[project]
+name = "furiosa-opt-engine"
+version = "0.1.0"
+description = "Serving-framework backend for FuriosaAI NPUs"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "typing-extensions>=4.12",
+]
+
+[tool.maturin]
+manifest-path = "../furiosa-opt-python/Cargo.toml"
+# The extension is the package's library, not its stub-writing binary.
+bindings = "pyo3"
+module-name = "furiosa_opt_engine._native"
+python-source = "python"
+exclude = ["**/__pycache__/**", "**/*.pyc"]

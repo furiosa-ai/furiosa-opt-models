@@ -1,0 +1,97 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+
+permissions: {contents: read}
+
+env:
+  HF_HOME: /root/.cache/huggingface
+  FURIOSA_OPT_REFERENCES: /root/.cache/furiosa-opt-models/references
+  UV_PYTHON_INSTALL_DIR: /root/.cache/furiosa-opt-models/python
+  XDG_CACHE_HOME: /root/.cache
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    permissions: {actions: read, contents: write}
+
+  bench:
+    needs: build
+    uses: ./.github/workflows/bench.yml
+    with:
+      tier: nightly
+
+  # vLLM and SGLang pin different torch and transformers versions, so each framework's contract
+  # tests have an environment of their own.
+  contracts:
+    name: contracts (${{ matrix.framework }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        framework: [vllm, sglang]
+    runs-on: arc-runner-benchmark-rngd4
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: '3.11'
+          activate-environment: true
+          enable-cache: false
+          cache-local-path: /root/.cache/furiosa-opt-models/uv
+      - uses: ./.github/actions/checkpoints
+        with:
+          tier: all
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-wheel
+          path: products
+      - run: tar xzf products/products.tar.gz -C products
+      # triton-cpu and torch.compile build vLLM's host sampling kernels with a C compiler, and the
+      # suffix extra builds arctic-inference's extension with a C++ one; g++ installs both.
+      - if: matrix.framework == 'vllm'
+        run: |
+          command -v c++ > /dev/null || { sudo apt-get update -qq; sudo apt-get install -yqq g++; }
+          # The omni extra installs vLLM-Omni, whose diffusion pipelines the contract tests also run,
+          # and the suffix extra arctic-inference (built from source), which suffix decoding's tests
+          # use.
+          wheel=(products/furiosa_opt_vllm-*.whl)
+          uv pip install --torch-backend cpu products/furiosa_opt_engine-*.whl "${wheel[0]}[omni,suffix]" pytest
+          # The omni extra's OpenCV loads libGL and GLib. When it cannot, it leaves its directory on
+          # sys.path, and every process vLLM spawns imports its `typing` module instead of Python's.
+          python -c 'import cv2' 2> /dev/null && exit
+          sudo apt-get update -qq
+          sudo apt-get install -yqq libgl1 libglib2.0-0t64
+          python -c 'import cv2'
+      # SGLang pins a pre-release dependency, which uv resolves only when allowed.
+      - if: matrix.framework == 'sglang'
+        run: uv pip install --prerelease=allow products/furiosa_opt_{engine,sglang}-*.whl pytest
+      # Run outside the checkout so the installed wheel, not the source package, is imported.
+      - working-directory: ${{ runner.temp }}
+        run: pytest -p no:cacheprovider "$GITHUB_WORKSPACE/integrations/furiosa-opt-$FRAMEWORK/tests"
+        env:
+          FRAMEWORK: ${{ matrix.framework }}
+      # A contract test of a task that `vllm bench serve` cannot send records its request latency.
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: trace-contracts-${{ matrix.framework }}
+          path: trace/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  report:
+    needs: [bench, contracts]
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/report.yml
+    permissions: {contents: read, pull-requests: write}
+    with:
+      tier: nightly
+      passed: ${{ needs.bench.result == 'success' && needs.contracts.result == 'success' }}
+    secrets:
+      DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+      DATADOG_APP_KEY: ${{ secrets.DATADOG_APP_KEY }}

@@ -1,0 +1,78 @@
+{
+  "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+  "data": {"name": "table1"},
+  "config": {
+    "legend": {"orient": "top", "columns": 3, "titleLimit": 0, "labelLimit": 320},
+    "axisX": {"title": null, "labelAngle": -45}
+  },
+  "transform": [
+    {"filter": "isValid(datum.value)"},
+    {"calculate": "isValid(datum.scenario) && lower(datum.scenario) != 'n/a' ? split(datum.scenario, '-') : null", "as": "lengths"},
+    {"calculate": "isValid(datum['case']) ? split(datum['case'], '-') : null", "as": "parts"},
+    {"filter": "!(isValid(datum.batch) && lower(datum.batch) != 'n/a') || datum.lengths"},
+    {"calculate": "datum.lengths ? toNumber(datum.lengths[0]) : datum.parts && datum.parts[0] == 'in' ? toNumber(datum.parts[1]) : null", "as": "input"},
+    {"calculate": "datum.lengths && length(datum.lengths) > 1 ? toNumber(datum.lengths[1]) : datum.parts && datum.parts[2] == 'out' ? toNumber(datum.parts[3]) : null", "as": "output"},
+    {"calculate": "isValid(datum.input) ? (datum.input % 1024 == 0 ? datum.input / 1024 + 'K' : '' + datum.input) : null", "as": "in"},
+    {"calculate": "isValid(datum.output) ? (datum.output % 1024 == 0 ? datum.output / 1024 + 'K' : '' + datum.output) : null", "as": "out"},
+    {"calculate": "datum.lengths ? datum.in + ' in' + (isValid(datum.out) ? ' / ' + datum.out + ' out' : '') + ' · ' + datum.batch + ' concurrent' : isValid(datum.test) && lower(datum.test) != 'n/a' ? upper(substring(datum.test, 0, 1)) + substring(datum.test, 1) : datum.parts && datum.parts[2] == 'prefill' ? 'Prefill · ' + datum.in + ' in · ' + datum.parts[4] + '-token chunk' : datum.parts && datum.parts[4] == 'decode' ? 'Decode · ' + datum.in + ' in / ' + datum.out + ' out · ' + datum.parts[6] + (datum.parts[6] == '1' ? ' request' : ' requests') : datum.parts && datum.parts[0] == 'rows' ? 'Decode · ' + datum.parts[1] + (datum.parts[1] == '1' ? ' request · ' : ' requests · ') + datum.parts[3] + ' cached' : isValid(datum['case']) ? replace(datum['case'], /-/g, ' ') : ''", "as": "label"},
+    {"calculate": "toNumber(datum.run) || 0", "as": "run"},
+    {"calculate": "toNumber(datum.attempt) || 0", "as": "attempt"},
+    {
+      "window": [{"op": "row_number", "as": "rank"}],
+      "sort": [
+        {"field": "_time", "order": "descending"},
+        {"field": "run", "order": "descending"},
+        {"field": "attempt", "order": "descending"}
+      ],
+      "groupby": ["commit", "label"]
+    },
+    {"filter": "datum.rank == 1"},
+    {"joinaggregate": [{"op": "min", "field": "_time", "as": "order"}], "groupby": ["commit"]},
+    {
+      "window": [{"op": "lag", "field": "value", "as": "previous"}],
+      "sort": [{"field": "order"}],
+      "groupby": ["label"]
+    },
+    {"filter": "isValid(datum.previous)"},
+    {"calculate": "(datum.value / datum.previous - 1) * 100", "as": "change"},
+    {"calculate": "'https://github.com/furiosa-ai/furiosa-opt-models/commit/' + datum.commit", "as": "url"}
+  ],
+  "layer": [
+    {
+      "data": {"values": [{}]},
+      "mark": {"type": "rule", "color": "#8a94a6"},
+      "encoding": {"y": {"datum": 0}}
+    },
+    {
+      "name": "series",
+      "params": [{"name": "focus", "select": {"type": "point", "fields": ["label"]}, "bind": "legend"}],
+      "mark": {"type": "line", "strokeWidth": 1.5, "point": {"filled": true, "strokeWidth": 0}},
+      "encoding": {
+        "x": {"field": "commit", "type": "ordinal", "sort": {"field": "order", "op": "min"}},
+        "y": {"field": "change", "type": "quantitative", "title": "Change vs previous commit (%)"},
+        "color": {"field": "label", "title": "Workload", "sort": {"field": "value", "op": "mean"}},
+        "opacity": {"condition": {"param": "focus", "value": 1}, "value": 0.1},
+        "href": {"field": "url"},
+        "tooltip": [
+          {"field": "commit", "title": "Commit"},
+          {"field": "label", "title": "Workload"},
+          {"field": "previous", "title": "Previous (ms)", "format": ",.3~f"},
+          {"field": "value", "title": "Commit (ms)", "format": ",.3~f"},
+          {"field": "change", "title": "Change (%)", "format": "+.2f"},
+          {"field": "run", "title": "CI run"}
+        ]
+      }
+    },
+    {
+      "data": {"values": [{}]},
+      "transform": [{"filter": "length(data('table1')) == 0"}],
+      "mark": {
+        "type": "text",
+        "color": "#8a94a6",
+        "x": {"expr": "width / 2"},
+        "y": {"expr": "height / 2"},
+        "text": "No measurement yet"
+      }
+    }
+  ]
+}

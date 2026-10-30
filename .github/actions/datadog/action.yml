@@ -1,0 +1,133 @@
+name: datadog
+description: Record measurements and, given a baseline Git revision, reject regressions against it
+  beyond the inventory's budget for each level.
+inputs:
+  path: {description: "JSONL records with metric, tags, and value.", required: true}
+  baseline: {description: Baseline Git commit; empty records without comparing., default: ''}
+  api-key: {description: Datadog API key., required: true}
+  app-key: {description: Datadog application key., required: true}
+outputs:
+  regressions:
+    description: Markdown list of measurements exceeding the budget.
+    value: ${{ steps.compare.outputs.regressions }}
+runs:
+  using: composite
+  steps:
+    - name: Publish
+      id: publish
+      shell: bash
+      env:
+        METRICS: ${{ inputs.path }}
+        DATADOG_API_KEY: ${{ inputs.api-key }}
+        COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      run: |
+        directory="$(mktemp -d)"
+        echo "path=$directory" >> "$GITHUB_OUTPUT"
+        jq -s --arg tree "$(git rev-parse HEAD^{tree})" '
+          def validate:
+            if length == 0 or (unique_by([.metric, (.tags | sort)]) | length) != length or
+              any(.[]; .value | type != "number" or . <= 0 or isinfinite or isnan)
+            then error("Invalid measurements") else . end;
+          def annotate:
+            .tags += ["commit:\(env.COMMIT[:7])", "tree:\($tree)",
+              "event:\(env.GITHUB_EVENT_NAME)", "run:\(env.GITHUB_RUN_ID)",
+              "attempt:\(env.GITHUB_RUN_ATTEMPT)"];
+          def encode:
+            {metric, type: 0, tags, points: [{timestamp: (now | floor), value}]};
+          validate | {series: map(annotate | encode)}
+        ' "$METRICS" > "$directory/series.json"
+        curl --fail-with-body -sS https://api.us3.datadoghq.com/api/v2/series \
+          -H "DD-API-KEY: $DATADOG_API_KEY" -H 'Content-Type: application/json' \
+          --data-binary @"$directory/series.json"
+    - name: Read
+      if: inputs.baseline != ''
+      shell: bash
+      env:
+        METRICS: ${{ inputs.path }}
+        DIRECTORY: ${{ steps.publish.outputs.path }}
+        BASE: ${{ inputs.baseline }}
+        DATADOG_API_KEY: ${{ inputs.api-key }}
+        DATADOG_APP_KEY: ${{ inputs.app-key }}
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        tree="$(curl --fail-with-body -sS -H "Authorization: Bearer $GITHUB_TOKEN" \
+          "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/commits/$BASE" | jq -er '.tree.sha')"
+        current="run:$GITHUB_RUN_ID AND attempt:$GITHUB_RUN_ATTEMPT"
+        baseline="tree:$tree OR commit:${BASE:0:7}"
+        for retry in {0..5}; do
+          if [ "$retry" -gt 0 ]; then sleep 10; fi
+          while read -r metric dimensions; do
+            query="avg:furiosa_opt.$metric{(($current) OR $baseline) AND NOT stage:sample}"
+            curl --fail-with-body -sS --get https://api.us3.datadoghq.com/api/v1/query \
+              -H "DD-API-KEY: $DATADOG_API_KEY" -H "DD-APPLICATION-KEY: $DATADOG_APP_KEY" \
+              --data-urlencode "from=$(date -d '30 days ago' +%s)" \
+              --data-urlencode "to=$(date +%s)" \
+              --data-urlencode "query=$query by {$dimensions,run,attempt}.fill(null)" |
+              jq -c --arg dimensions "$dimensions" '
+                def validate:
+                  if (.errors // [] | length) > 0
+                  then error("Datadog query failed") else . end;
+                def tags:
+                  .scope | split(",") |
+                  map(select(split(":")[0] | IN($dimensions | split(",")[]))) | sort;
+                def current:
+                  .scope | split(",") | index("run:\(env.GITHUB_RUN_ID)") != null
+                    and index("attempt:\(env.GITHUB_RUN_ATTEMPT)") != null;
+                def measure:
+                  [.pointlist[] | select(.[1] != null)] | last | select(. != null) |
+                  {timestamp: .[0], value: .[1]};
+                validate | .series[]? | {metric, tags: tags, current: current} + measure
+              '
+          done > "$DIRECTORY/points.jsonl" <<'QUERIES'
+        forward.step_ms model,test,case
+        kernel.cycles model,test,case,kernel
+        serving.ttft_ms model,batch,scenario
+        serving.tpot_ms model,batch,scenario
+        serving.request_ms model,batch,scenario
+        QUERIES
+          if jq -se --slurpfile expected "$METRICS" '
+            def key: [.metric, (.tags | sort)];
+            (map(select(.current) | key) | sort) == ($expected | map(key) | sort)
+          ' "$DIRECTORY/points.jsonl" > /dev/null; then break; fi
+          echo "Waiting for complete Datadog measurements (attempt $((retry + 1))/6)"
+          test "$retry" -lt 5
+        done
+        jq -s '
+          def key: [.metric, .tags] | tojson;
+          def baseline:
+            map(select(.current | not)) | sort_by(.timestamp) | INDEX(.[]; key);
+          def pair($baseline): {metric, tags, value, baseline: $baseline[key].value};
+          baseline as $baseline | map(select(.current) | pair($baseline))
+        ' "$DIRECTORY/points.jsonl" > "$DIRECTORY/comparison.json"
+    - name: Compare
+      id: compare
+      if: inputs.baseline != ''
+      shell: bash
+      env:
+        DIRECTORY: ${{ steps.publish.outputs.path }}
+      run: |
+        jq -r --slurpfile inventory .github/benchmarks.json '
+          # `furiosa_opt.<level>.<name>`: each level has its own percentage budget.
+          def budget: $inventory[0].budgets[.metric | split(".")[1]];
+          def rounded: . * 100 | round / 100;
+          def valid: type == "number" and . > 0 and (isinfinite | not) and (isnan | not);
+          def validate:
+            if (.value | valid) and (.baseline == null or (.baseline | valid)) then .
+            else error("Invalid measurement: \(.metric) \(.tags)") end;
+          def regression:
+            select(.value > .baseline * (1 + budget / 100)) |
+            . + {change: ((.value / .baseline - 1) * 100)};
+          def render:
+            "- \(.metric) · \(.tags | join(", ")): " +
+            "\(.baseline | rounded) → \(.value | rounded) (+\(.change | rounded)% > \(budget)%)";
+          # A level without a budget is recorded only; a measurement the baseline never recorded
+          # has nothing to regress against.
+          map(validate) | map(select(.baseline != null and budget != null) | regression)
+          | sort_by(-.change)[] | render
+        ' "$DIRECTORY/comparison.json" > "$DIRECTORY/regression.md"
+        {
+          echo 'regressions<<EOF'
+          cat "$DIRECTORY/regression.md"
+          echo EOF
+        } >> "$GITHUB_OUTPUT"
+        test ! -s "$DIRECTORY/regression.md"

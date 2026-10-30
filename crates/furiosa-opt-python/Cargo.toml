@@ -1,0 +1,24 @@
+# The engine's Python binding, which maturin builds as the extension module
+# `furiosa_opt_engine._native`: a package of its own, so that only its builds compile every kernel
+# the binding reaches, and an engine test compiles those its tests reach.
+[package]
+name = "furiosa-opt-python"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+# The extension module maturin builds into the furiosa-opt-engine wheel; no Rust crate depends on it.
+publish = false
+
+[dependencies]
+furiosa-opt-engine = { path = "../furiosa-opt-engine" }
+furiosa-opt-models = { path = "../furiosa-opt-models" }
+furiosa-opt-std = { workspace = true }
+half = "2"
+numpy = "0.27"
+pyo3 = { version = "0.27", features = ["abi3-py311"] }
+pyo3-log = "0.13"
+pyo3-stub-gen = "0.23.1"
+tokio = { version = "1", features = ["rt"] }
+# Unused in code: emits the engine's tracing events as `log` records, which `pyo3-log` passes to
+# Python's logging.
+tracing = { version = "0.1", features = ["log"] }

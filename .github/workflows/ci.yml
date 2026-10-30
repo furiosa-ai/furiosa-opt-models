@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # `labeled` lets the `bench` label start the measurements on a pull request already built.
+    types: [opened, synchronize, reopened, labeled]
+  merge_group:
+  workflow_dispatch:
+
+concurrency:
+  # A label other than `bench` starts a run of its own that does nothing, rather than cancel one.
+  group: >-
+    ${{ github.workflow }}-${{ github.ref }}${{ github.event.action == 'labeled' &&
+    github.event.label.name != 'bench' && format('-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {contents: read}
+
+# The RNGD runners are shared, so a pull request runs its tests and only a `bench`-labeled one its
+# measurements, which the nightly run takes otherwise. The merge queue lints only, as a pull
+# request built and tested the tree before it queued; its skipped jobs still report the statuses
+# the branch requires.
+jobs:
+  build:
+    if: >-
+      github.event_name != 'workflow_dispatch' &&
+      (github.event.action != 'labeled' || github.event.label.name == 'bench')
+    uses: ./.github/workflows/build.yml
+    with:
+      build: ${{ github.event_name != 'merge_group' }}
+      wheel: ${{ contains(github.event.pull_request.labels.*.name, 'bench') }}
+    permissions: {actions: read, contents: write}
+
+  lint:
+    if: >-
+      (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'bench')
+    uses: ./.github/workflows/lint.yml
+
+  # A build the merge queue skips leaves its dependents to report their statuses.
+  test:
+    needs: build
+    if: >-
+      !cancelled() && needs.build.result != 'failure' &&
+      (github.event.action != 'labeled' || github.event.label.name == 'bench')
+    uses: ./.github/workflows/test.yml
+
+  bench:
+    if: >-
+      !cancelled() && needs.build.result != 'failure' &&
+      (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'bench')
+    needs: build
+    uses: ./.github/workflows/bench.yml
+    with:
+      tier: gate
+      measure: ${{ contains(github.event.pull_request.labels.*.name, 'bench') }}
+
+  report:
+    needs: bench
+    if: >-
+      !cancelled() && github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork &&
+      contains(github.event.pull_request.labels.*.name, 'bench')
+    uses: ./.github/workflows/report.yml
+    permissions: {contents: read, pull-requests: write}
+    with:
+      tier: gate
+      passed: ${{ needs.bench.result == 'success' }}
+    secrets: &datadog
+      DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+      DATADOG_APP_KEY: ${{ secrets.DATADOG_APP_KEY }}
+
+  publish:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/publish.yml
+    secrets: *datadog
+
+  deploy:
+    if: github.event_name == 'push'
+    needs: build
+    uses: ./.github/workflows/deploy.yml
+    permissions: {actions: read, contents: read, pages: write, id-token: write}

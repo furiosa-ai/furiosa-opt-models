@@ -1,0 +1,24 @@
+name: publish
+description: Publish each model family's performance dashboard and its sharing settings.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        jq -s -f .github/dashboard/build.jq .github/benchmarks.json \
+          .github/dashboard/{dashboards,trend,capacity}.json > "$RUNNER_TEMP/dashboards.json"
+        jq -c '.[]' "$RUNNER_TEMP/dashboards.json" | while read -r dashboard; do
+          jq '.body' <<< "$dashboard" | curl --fail-with-body -sS -X PUT \
+            "https://api.us3.datadoghq.com/api/v1/dashboard/$(jq -r .id <<< "$dashboard")" \
+            -H "DD-API-KEY: $DATADOG_API_KEY" -H "DD-APPLICATION-KEY: $DATADOG_APP_KEY" \
+            -H 'Content-Type: application/json' -d @- | jq '{id, url, errors}'
+          # A shared dashboard accepts a template value from its URL only when the value is listed,
+          # so each model page's dashboard link needs its checkpoint listed; tags are lower case.
+          jq '{selectable_template_vars: [.body.template_variables[] as $v |
+                {name: $v.name, prefix: $v.prefix, default_value: $v.default, visible_tags: .models}],
+               global_time: {live_span: "1w"}, global_time_selectable_enabled: true}' <<< "$dashboard" |
+            curl --fail-with-body -sS -X PUT \
+              "https://api.us3.datadoghq.com/api/v1/dashboard/public/$(jq -r '.share | split("/") | last' <<< "$dashboard")" \
+              -H "DD-API-KEY: $DATADOG_API_KEY" -H "DD-APPLICATION-KEY: $DATADOG_APP_KEY" \
+              -H 'Content-Type: application/json' -d @- | jq '{selectable_template_vars, errors}'
+        done

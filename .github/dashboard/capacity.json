@@ -1,0 +1,62 @@
+{
+  "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+  "data": {"name": "table1"},
+  "config": {"legend": {"orient": "top", "titleLimit": 0}},
+  "transform": [
+    {"filter": "isValid(datum.value)"},
+    {"calculate": "toNumber(datum.run) || 0", "as": "run"},
+    {"calculate": "toNumber(datum.attempt) || 0", "as": "attempt"},
+    {
+      "window": [{"op": "row_number", "as": "rank"}],
+      "sort": [
+        {"field": "_time", "order": "descending"},
+        {"field": "run", "order": "descending"},
+        {"field": "attempt", "order": "descending"}
+      ],
+      "groupby": ["commit", "batch"]
+    },
+    {"filter": "datum.rank == 1"},
+    {"joinaggregate": [{"op": "max", "field": "_time", "as": "measured"}], "groupby": ["commit"]},
+    {"window": [{"op": "dense_rank", "as": "age"}], "sort": [{"field": "measured", "order": "descending"}]},
+    {"filter": "datum.age <= 4"},
+    {"calculate": "toNumber(datum.batch)", "as": "batch"},
+    {"calculate": "1000 / datum.value", "as": "interactivity"},
+    {"calculate": "datum.batch * datum.interactivity", "as": "throughput"},
+    {"calculate": "datum.age == 1 ? datum.commit + ' (latest)' : datum.commit", "as": "label"}
+  ],
+  "layer": [
+    {
+      "name": "series",
+      "mark": {"type": "line", "strokeWidth": 2, "point": {"filled": true, "size": 60, "strokeWidth": 0}},
+      "encoding": {
+        "x": {"field": "interactivity", "type": "quantitative", "title": "tok/s per user", "scale": {"zero": false}},
+        "y": {"field": "throughput", "type": "quantitative", "title": "tok/s per chip", "scale": {"zero": false}},
+        "color": {
+          "field": "label",
+          "title": "Nightly commit",
+          "sort": {"field": "age", "op": "min"},
+          "scale": {"range": ["#c41200", "#5b687c", "#a3acba", "#cfd5de"]}
+        },
+        "order": {"field": "batch", "type": "quantitative"},
+        "tooltip": [
+          {"field": "commit", "title": "Commit"},
+          {"field": "batch", "title": "Concurrency"},
+          {"field": "value", "title": "TPOT (ms)", "format": ".2f"},
+          {"field": "throughput", "title": "tok/s per chip", "format": ".0f"},
+          {"field": "interactivity", "title": "tok/s per user", "format": ".1f"}
+        ]
+      }
+    },
+    {
+      "data": {"values": [{}]},
+      "transform": [{"filter": "length(data('table1')) == 0"}],
+      "mark": {
+        "type": "text",
+        "color": "#8a94a6",
+        "x": {"expr": "width / 2"},
+        "y": {"expr": "height / 2"},
+        "text": "No measurement yet"
+      }
+    }
+  ]
+}

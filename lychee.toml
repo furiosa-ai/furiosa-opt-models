@@ -1,0 +1,5 @@
+offline = true
+include_fragments = "full"
+index_files = ["index.html"]
+# The Rust reference is built on push only.
+exclude = ["/api/rust/"]

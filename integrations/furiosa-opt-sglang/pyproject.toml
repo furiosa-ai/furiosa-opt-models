@@ -1,0 +1,42 @@
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[project]
+name = "furiosa-opt-sglang"
+version = "0.1.0"
+description = "SGLang platform plugin for FuriosaAI NPUs"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "furiosa-opt-engine",
+    "sglang==0.5.22",
+    "huggingface-hub>=0.34",
+    "typing-extensions>=4.12",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+diffusion = [
+    "addict==2.4.0",
+    "cache-dit==1.5.1",
+    "diffusers==0.37.0",
+    "imageio==2.36.0",
+    "imageio-ffmpeg==0.5.1",
+    "omegaconf==2.4.0",
+]
+
+# --8<-- [start:entry-points]
+[project.entry-points."sglang.srt.platforms"]
+furiosa = "furiosa_opt_sglang:activate"
+
+[project.entry-points."sglang.srt.plugins"]
+furiosa = "furiosa_opt_sglang:register"
+# --8<-- [end:entry-points]
+
+[tool.uv.build-backend]
+module-root = ""
+
+[tool.uv.sources]
+furiosa-opt-engine = { path = "../../crates/furiosa-opt-engine" }

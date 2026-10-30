@@ -1,0 +1,7 @@
+[unstable]
+bindeps = true
+
+[build]
+# The next solver keeps the nested compositions' monomorphization tractable; untrimmed paths
+# keep type_name from aborting a build. CI sets the same flags in RUSTFLAGS.
+rustflags = ["-Znext-solver=globally", "-Ztrim-diagnostic-paths=false"]

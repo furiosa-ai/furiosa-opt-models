@@ -1,0 +1,3600 @@
+//! Diffusion families, pipelines, codecs and the catalog of generation compositions.
+
+use super::decoder::attention::{
+    MiMoAudioLLMModel, MingLLMModel, MiniCPMO45OmniTTSForConditionalGeneration,
+    Qwen2_5OmniTalkerModel, Qwen3TTSTalkerForConditionalGeneration,
+};
+use super::encoder::clip::{CLIPTextModel, CLIPTextModelWithProjection};
+use super::encoder_decoder::t5::T5EncoderModel;
+use super::vision_language::{
+    MammothModa2ARForConditionalGeneration, MiMoV2OmniForCausalLM,
+    Qwen3OmniMoeThinkerForConditionalGeneration, StepAudio2ThinkerForConditionalGeneration,
+};
+use crate::load::Named;
+use crate::modules::{
+    attention, audio, convolution, diffusion, feedforward, language, residual, transformer,
+};
+use crate::{Each, First, Identity, Layers, Sequential, Then, Unrolled};
+
+pub mod autoencoder;
+pub mod dit;
+pub mod flux;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/pi0/modeling_pi0.py`.
+/// Image/text embedding → cached PaliGemma layers → final norm. No vocabulary head.
+pub(crate) type Pi0Observation<Embedding, Attention, Mlp, Norm, Add, const DEPTH: usize> =
+    language::Normalized<
+        language::Backbone<
+            Embedding,
+            Layers<[transformer::PreNorm<Attention, Mlp, Norm, Add>; DEPTH]>,
+        >,
+        Norm,
+    >;
+
+/// `(state, noisy_actions, time)` embedding → prefix-reading Gemma layers → velocity.
+pub(crate) type Pi0ActionExpert<
+    Embedding,
+    Attention,
+    Mlp,
+    Norm,
+    Add,
+    Velocity,
+    const DEPTH: usize,
+> = language::Decoder<
+    Embedding,
+    [transformer::PreNorm<Attention, Mlp, Norm, Add>; DEPTH],
+    Norm,
+    Velocity,
+>;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/pi0/modeling_pi0.py`.
+/// Observation encoder and action expert, called separately with their own inputs.
+pub type Pi0ForActionPrediction<
+    ObservationEmbedding,
+    ObservationAttention,
+    ObservationMlp,
+    ObservationNorm,
+    ObservationAdd,
+    ActionEmbedding,
+    ActionAttention,
+    ActionMlp,
+    ActionNorm,
+    ActionAdd,
+    Velocity,
+    const OBSERVATION_DEPTH: usize,
+    const ACTION_DEPTH: usize,
+> = (
+    Pi0Observation<
+        ObservationEmbedding,
+        ObservationAttention,
+        ObservationMlp,
+        ObservationNorm,
+        ObservationAdd,
+        OBSERVATION_DEPTH,
+    >,
+    Pi0ActionExpert<
+        ActionEmbedding,
+        ActionAttention,
+        ActionMlp,
+        ActionNorm,
+        ActionAdd,
+        Velocity,
+        ACTION_DEPTH,
+    >,
+);
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/pi05/modeling_pi05.py`.
+/// Time conditions each expert norm and residual gate, including the output normalization.
+pub(crate) type Pi05ActionExpert<
+    Embedding,
+    Time,
+    Modulation,
+    Attention,
+    Mlp,
+    Norm,
+    Gate,
+    Velocity,
+    const DEPTH: usize,
+> = diffusion::Denoiser<
+    Embedding,
+    Time,
+    [diffusion::Adaptive<Modulation, Attention, Mlp, Norm, Gate>; DEPTH],
+    Velocity,
+>;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/pi05/modeling_pi05.py`.
+/// Observation encoder and time-conditioned action expert, called separately.
+pub type Pi05ForActionPrediction<
+    ObservationEmbedding,
+    ObservationAttention,
+    ObservationMlp,
+    ObservationNorm,
+    ObservationAdd,
+    ActionEmbedding,
+    Time,
+    Modulation,
+    ActionAttention,
+    ActionMlp,
+    ActionNorm,
+    Gate,
+    Velocity,
+    const OBSERVATION_DEPTH: usize,
+    const ACTION_DEPTH: usize,
+> = (
+    Pi0Observation<
+        ObservationEmbedding,
+        ObservationAttention,
+        ObservationMlp,
+        ObservationNorm,
+        ObservationAdd,
+        OBSERVATION_DEPTH,
+    >,
+    Pi05ActionExpert<
+        ActionEmbedding,
+        Time,
+        Modulation,
+        ActionAttention,
+        ActionMlp,
+        ActionNorm,
+        Gate,
+        Velocity,
+        ACTION_DEPTH,
+    >,
+);
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/gr00t/modeling/modules/dit.py`.
+/// Attention alone uses the timestep norm; FF uses an ordinary norm, with ungated residuals.
+type Gr00tN1d7ActionHead<
+    Embedding,
+    Time,
+    AttentionNorm,
+    Attention,
+    MlpNorm,
+    Mlp,
+    Add,
+    Velocity,
+    const DEPTH: usize,
+> = diffusion::Denoiser<
+    Embedding,
+    Time,
+    [diffusion::Conditioned<AttentionNorm, Attention, MlpNorm, Mlp, Add>; DEPTH],
+    Velocity,
+>;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/gr00t/modeling/gr00t_n1d7.py`.
+/// Backbone/embodiment-state encoding prepares conditioning for the separately called action
+/// velocity.
+pub type Gr00tN1d7<
+    Backbone,
+    StateEncoder,
+    Embedding,
+    Time,
+    AttentionNorm,
+    Attention,
+    MlpNorm,
+    Mlp,
+    Add,
+    Velocity,
+    const DEPTH: usize,
+> = (
+    (Backbone, StateEncoder),
+    Gr00tN1d7ActionHead<
+        Embedding,
+        Time,
+        AttentionNorm,
+        Attention,
+        MlpNorm,
+        Mlp,
+        Add,
+        Velocity,
+        DEPTH,
+    >,
+);
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/internvla_a1/model_internvla_a1.py`.
+/// Serving writes observation KV, appends world-prediction KV, then evaluates actions against that
+/// history.
+pub type InternVLAA1<Observation, WorldPrediction, ActionVelocity, ImageEncoder, ImageDecoder> = (
+    (ImageEncoder, ImageDecoder),
+    (Observation, (WorldPrediction, ActionVelocity)),
+);
+
+/// Two normalized convolutions with time conditioning and a residual shortcut.
+pub(super) type SDXLResnet<Norm, Activation, First, Time, Merge, Second, Shortcut, Add> =
+    convolution::Conditioned<
+        convolution::Normalized<Norm, Activation, First>,
+        Then<Activation, Time>,
+        Merge,
+        convolution::Normalized<Norm, Activation, Second>,
+        Shortcut,
+        Add,
+    >;
+
+/// A conditioned residual block, then spatial attention, then another conditioned residual block.
+pub(super) type SDXLMiddle<Resnet, Attention> = Then<Sequential<Resnet, Attention>, Resnet>;
+
+/// Spatial projection around a stack of self-attention and cross-attention layers.
+pub(super) type SDXLAttention<
+    SpatialNorm,
+    Project,
+    SelfAttention,
+    CrossAttention,
+    Mlp,
+    Norm,
+    Restore,
+    Add,
+    const DEPTH: usize,
+> = convolution::Attention<
+    SpatialNorm,
+    Project,
+    Layers<[transformer::CrossLayer<SelfAttention, CrossAttention, Mlp, Norm, Add>; DEPTH]>,
+    Restore,
+    Add,
+>;
+
+/// Down stages retain two residual outputs and their input, which up stages consume in reverse; the
+/// env is the condition residual blocks read, beside the attention stages' reader.
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/sdxl/sdxl_unet.py`.
+pub type SDXLUNet2DConditionModel<
+    Embedding,
+    Conditioning,
+    DownNorm,
+    DownFirst,
+    DownTime,
+    DownMerge,
+    DownSecond,
+    DownShortcut,
+    DownSpatialNorm,
+    DownProject,
+    DownSelfAttention,
+    DownCrossAttention,
+    DownMlp,
+    DownLayerNorm,
+    DownRestore,
+    MiddleNorm,
+    Activation,
+    MiddleFirst,
+    MiddleTime,
+    MiddleMerge,
+    MiddleSecond,
+    MiddleShortcut,
+    MiddleSpatialNorm,
+    MiddleProject,
+    MiddleSelfAttention,
+    MiddleCrossAttention,
+    MiddleMlp,
+    MiddleLayerNorm,
+    MiddleRestore,
+    Add,
+    UpNorm,
+    UpFirst,
+    UpTime,
+    UpMerge,
+    UpSecond,
+    UpShortcut,
+    UpSpatialNorm,
+    UpProject,
+    UpSelfAttention,
+    UpCrossAttention,
+    UpMlp,
+    UpLayerNorm,
+    UpRestore,
+    Join,
+    Downsample0,
+    Downsample1,
+    Upsample1,
+    Upsample0,
+    Head,
+    const MIDDLE_DEPTH: usize,
+> = diffusion::Transformer<
+    Embedding,
+    Conditioning,
+    Then<
+        Identity,
+        convolution::UNet<
+            Down<
+                DownNorm,
+                Activation,
+                DownFirst,
+                DownTime,
+                DownMerge,
+                DownSecond,
+                DownShortcut,
+                Add,
+            >,
+            convolution::Scale<
+                Downsample0,
+                convolution::UNet<
+                    CrossDown<
+                        DownNorm,
+                        Activation,
+                        DownFirst,
+                        DownTime,
+                        DownMerge,
+                        DownSecond,
+                        DownShortcut,
+                        DownSpatialNorm,
+                        DownProject,
+                        DownSelfAttention,
+                        DownCrossAttention,
+                        DownMlp,
+                        DownLayerNorm,
+                        DownRestore,
+                        Add,
+                        2,
+                    >,
+                    convolution::Scale<
+                        Downsample1,
+                        convolution::UNet<
+                            CrossDown<
+                                DownNorm,
+                                Activation,
+                                DownFirst,
+                                DownTime,
+                                DownMerge,
+                                DownSecond,
+                                DownShortcut,
+                                DownSpatialNorm,
+                                DownProject,
+                                DownSelfAttention,
+                                DownCrossAttention,
+                                DownMlp,
+                                DownLayerNorm,
+                                DownRestore,
+                                Add,
+                                10,
+                            >,
+                            SDXLMiddle<
+                                SDXLResnet<
+                                    MiddleNorm,
+                                    Activation,
+                                    MiddleFirst,
+                                    MiddleTime,
+                                    MiddleMerge,
+                                    MiddleSecond,
+                                    MiddleShortcut,
+                                    Add,
+                                >,
+                                SDXLAttention<
+                                    MiddleSpatialNorm,
+                                    MiddleProject,
+                                    MiddleSelfAttention,
+                                    MiddleCrossAttention,
+                                    MiddleMlp,
+                                    MiddleLayerNorm,
+                                    MiddleRestore,
+                                    Add,
+                                    MIDDLE_DEPTH,
+                                >,
+                            >,
+                            CrossUp<
+                                UpNorm,
+                                Activation,
+                                UpFirst,
+                                UpTime,
+                                UpMerge,
+                                UpSecond,
+                                UpShortcut,
+                                UpSpatialNorm,
+                                UpProject,
+                                UpSelfAttention,
+                                UpCrossAttention,
+                                UpMlp,
+                                UpLayerNorm,
+                                UpRestore,
+                                Add,
+                                Join,
+                                10,
+                            >,
+                        >,
+                        Upsample1,
+                    >,
+                    CrossUp<
+                        UpNorm,
+                        Activation,
+                        UpFirst,
+                        UpTime,
+                        UpMerge,
+                        UpSecond,
+                        UpShortcut,
+                        UpSpatialNorm,
+                        UpProject,
+                        UpSelfAttention,
+                        UpCrossAttention,
+                        UpMlp,
+                        UpLayerNorm,
+                        UpRestore,
+                        Add,
+                        Join,
+                        2,
+                    >,
+                >,
+                Upsample0,
+            >,
+            Up<UpNorm, Activation, UpFirst, UpTime, UpMerge, UpSecond, UpShortcut, Add, Join>,
+        >,
+    >,
+    Head,
+>;
+
+pub(super) type Down<N, A, F, T, M, S, P, Add> =
+    convolution::Down<SDXLResnet<N, A, F, T, M, S, P, Add>, SDXLResnet<N, A, F, T, M, S, P, Add>>;
+
+pub(super) type Up<N, A, F, T, M, S, P, Add, Join> = convolution::Up<
+    SDXLResnet<N, A, F, T, M, S, P, Add>,
+    SDXLResnet<N, A, F, T, M, S, P, Add>,
+    SDXLResnet<N, A, F, T, M, S, P, Add>,
+    Join,
+>;
+
+type Cross<
+    N,
+    A,
+    F,
+    T,
+    M,
+    S,
+    P,
+    SpatialNorm,
+    Project,
+    SelfAttention,
+    CrossAttention,
+    Mlp,
+    LayerNorm,
+    Restore,
+    Add,
+    const DEPTH: usize,
+> = Sequential<
+    SDXLResnet<N, A, F, T, M, S, P, Add>,
+    SDXLAttention<
+        SpatialNorm,
+        Project,
+        SelfAttention,
+        CrossAttention,
+        Mlp,
+        LayerNorm,
+        Restore,
+        Add,
+        DEPTH,
+    >,
+>;
+
+pub(super) type CrossDown<
+    N,
+    A,
+    F,
+    T,
+    M,
+    S,
+    P,
+    SpatialNorm,
+    Project,
+    SelfAttention,
+    CrossAttention,
+    Mlp,
+    LayerNorm,
+    Restore,
+    Add,
+    const DEPTH: usize,
+> = convolution::Down<
+    Cross<
+        N,
+        A,
+        F,
+        T,
+        M,
+        S,
+        P,
+        SpatialNorm,
+        Project,
+        SelfAttention,
+        CrossAttention,
+        Mlp,
+        LayerNorm,
+        Restore,
+        Add,
+        DEPTH,
+    >,
+    Cross<
+        N,
+        A,
+        F,
+        T,
+        M,
+        S,
+        P,
+        SpatialNorm,
+        Project,
+        SelfAttention,
+        CrossAttention,
+        Mlp,
+        LayerNorm,
+        Restore,
+        Add,
+        DEPTH,
+    >,
+>;
+
+pub(super) type CrossUp<
+    N,
+    A,
+    F,
+    T,
+    M,
+    S,
+    P,
+    SpatialNorm,
+    Project,
+    SelfAttention,
+    CrossAttention,
+    Mlp,
+    LayerNorm,
+    Restore,
+    Add,
+    Join,
+    const DEPTH: usize,
+> = convolution::Up<
+    Cross<
+        N,
+        A,
+        F,
+        T,
+        M,
+        S,
+        P,
+        SpatialNorm,
+        Project,
+        SelfAttention,
+        CrossAttention,
+        Mlp,
+        LayerNorm,
+        Restore,
+        Add,
+        DEPTH,
+    >,
+    Cross<
+        N,
+        A,
+        F,
+        T,
+        M,
+        S,
+        P,
+        SpatialNorm,
+        Project,
+        SelfAttention,
+        CrossAttention,
+        Mlp,
+        LayerNorm,
+        Restore,
+        Add,
+        DEPTH,
+    >,
+    Cross<
+        N,
+        A,
+        F,
+        T,
+        M,
+        S,
+        P,
+        SpatialNorm,
+        Project,
+        SelfAttention,
+        CrossAttention,
+        Mlp,
+        LayerNorm,
+        Restore,
+        Add,
+        DEPTH,
+    >,
+    Join,
+>;
+
+/// Source: SGLang `python/sglang/multimodal_gen/runtime/models/dits/sana.py`.
+/// Each layer receives text-attention context and grid dimensions for its spatial GLUMBConv.
+pub type SanaTransformer2DModel<
+    Embedding,
+    Conditioning,
+    Modulation,
+    LinearAttention,
+    TextAttention,
+    SpatialMlp,
+    Norm,
+    Gate,
+    Add,
+    Head,
+    const DEPTH: usize,
+> = diffusion::Denoiser<
+    Embedding,
+    Conditioning,
+    [diffusion::Spatial<Modulation, LinearAttention, TextAttention, SpatialMlp, Norm, Gate, Add>;
+        DEPTH],
+    Head,
+>;
+
+/// Source: SGLang `python/sglang/multimodal_gen/runtime/models/dits/zimage.py`.
+/// Refined image/text embeddings feed layers with scale modulation, post-norm and tanh residual
+/// gates.
+pub type ZImageTransformer2DModel<
+    Embedding,
+    Conditioning,
+    Modulation,
+    Attention,
+    Mlp,
+    Norm,
+    PostNorm,
+    TanhGate,
+    ContextAttention,
+    ContextMlp,
+    ContextNorm,
+    Add,
+    Join,
+    Head,
+    Restore,
+    const IMAGE_DEPTH: usize,
+    const CONTEXT_DEPTH: usize,
+    const JOINT_DEPTH: usize,
+> = diffusion::Transformer<
+    Embedding,
+    Conditioning,
+    diffusion::Refined<
+        Layers<
+            [diffusion::Sandwich<Modulation, Attention, Mlp, Norm, PostNorm, TanhGate>;
+                IMAGE_DEPTH],
+            Unrolled,
+        >,
+        Layers<
+            [transformer::SandwichNorm<ContextAttention, ContextMlp, ContextNorm, Add>;
+                CONTEXT_DEPTH],
+        >,
+        Join,
+        Layers<
+            [diffusion::Sandwich<Modulation, Attention, Mlp, Norm, PostNorm, TanhGate>;
+                JOINT_DEPTH],
+            Unrolled,
+        >,
+    >,
+    diffusion::Unpatch<Head, Restore>,
+>;
+
+/// Source: SGLang `python/sglang/multimodal_gen/runtime/models/dits/causal_wanvideo.py`.
+pub type CausalWanTransformer3DModel<
+    Embedding,
+    Conditioning,
+    Modulation,
+    Qkv,
+    QueryNorm,
+    KeyNorm,
+    Position,
+    Write,
+    Read,
+    Attend,
+    Project,
+    CrossQuery,
+    CrossKeyValue,
+    CrossWrite,
+    CrossRead,
+    CrossAttend,
+    CrossProject,
+    Mlp,
+    Norm,
+    CrossNorm,
+    Gate,
+    Add,
+    OutputModulation,
+    OutputNorm,
+    OutputProjection,
+    const DEPTH: usize,
+> = diffusion::Denoiser<
+    Embedding,
+    Conditioning,
+    [diffusion::Cross<
+        Modulation,
+        attention::Cached<
+            attention::NormalizedQkv<Qkv, QueryNorm, KeyNorm>,
+            Position,
+            Write,
+            Read,
+            Attend,
+            Project,
+        >,
+        attention::Cross<
+            CrossQuery,
+            CrossKeyValue,
+            CrossWrite,
+            CrossRead,
+            CrossAttend,
+            CrossProject,
+        >,
+        Mlp,
+        Norm,
+        CrossNorm,
+        Gate,
+        Add,
+    >; DEPTH],
+    diffusion::Head<OutputModulation, OutputNorm, OutputProjection>,
+>;
+
+/// Input normalization and convolution, the `Stages` of upsampling, then the waveform head.
+pub type BigVGAN<Normalization, Convolution, Stages, Waveform> =
+    language::Readout<Then<Normalization, Then<Convolution, Stages>>, Waveform>;
+
+/// Upsampling feeds three residual stacks of different kernel widths, whose outputs are averaged.
+pub type BigVganStage<Upsample, Narrow, Medium, Wide, Average> =
+    Then<Upsample, Then<crate::Fork<(Narrow, crate::Fork<(Medium, Wide)>)>, Average>>;
+
+/// Three residual units of one kernel width at rising dilation, each closed by an undilated
+/// convolution: checkpoint `activations`, dilated `convs1` and undilated `convs2`, unit by unit.
+pub type AmpBlock<Activation, First, Second, Third, Undilated, Add> = Then<
+    AmpUnit<
+        Named<"activations.0", Activation>,
+        Named<"convs1.0", First>,
+        Named<"activations.1", Activation>,
+        Named<"convs2.0", Undilated>,
+        Add,
+    >,
+    Then<
+        AmpUnit<
+            Named<"activations.2", Activation>,
+            Named<"convs1.1", Second>,
+            Named<"activations.3", Activation>,
+            Named<"convs2.1", Undilated>,
+            Add,
+        >,
+        AmpUnit<
+            Named<"activations.4", Activation>,
+            Named<"convs1.2", Third>,
+            Named<"activations.5", Activation>,
+            Named<"convs2.2", Undilated>,
+            Add,
+        >,
+    >,
+>;
+
+/// An activation and dilated convolution, then the next activation and an undilated convolution,
+/// added to the input; the two activations differ in their checkpoint names only.
+pub type AmpUnit<Activation, Dilated, Next, Undilated, Add> =
+    residual::Residual<Activation, Then<Dilated, Then<Next, Undilated>>, Add>;
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/qwen2_5_omni/qwen2_5_omni_token2wav.py`.
+/// Mel convolution → six upsampling stages → output activation/convolution; no codebook lookup.
+pub type Qwen2_5OmniToken2WavBigVGANModel<
+    MelNormalization,
+    MelConvolution,
+    Upsample0,
+    Activation0,
+    Narrow0,
+    Medium0,
+    Wide0,
+    Upsample1,
+    Activation1,
+    Narrow1,
+    Medium1,
+    Wide1,
+    Upsample2,
+    Activation2,
+    Narrow2,
+    Medium2,
+    Wide2,
+    Upsample3,
+    Activation3,
+    Narrow3,
+    Medium3,
+    Wide3,
+    Upsample4,
+    Activation4,
+    Narrow4,
+    Medium4,
+    Wide4,
+    Upsample5,
+    Activation5,
+    Narrow5,
+    Medium5,
+    Wide5,
+    Add,
+    Average,
+    Waveform,
+> = BigVGAN<
+    MelNormalization,
+    MelConvolution,
+    Then<
+        UniformStage<Upsample0, Activation0, Narrow0, Medium0, Wide0, Add, Average>,
+        Then<
+            UniformStage<Upsample1, Activation1, Narrow1, Medium1, Wide1, Add, Average>,
+            Then<
+                UniformStage<Upsample2, Activation2, Narrow2, Medium2, Wide2, Add, Average>,
+                Then<
+                    UniformStage<Upsample3, Activation3, Narrow3, Medium3, Wide3, Add, Average>,
+                    Then<
+                        UniformStage<Upsample4, Activation4, Narrow4, Medium4, Wide4, Add, Average>,
+                        UniformStage<Upsample5, Activation5, Narrow5, Medium5, Wide5, Add, Average>,
+                    >,
+                >,
+            >,
+        >,
+    >,
+    Waveform,
+>;
+
+/// A stage whose residual units each use one convolution type for both of their convolutions.
+type UniformStage<Upsample, Activation, Narrow, Medium, Wide, Add, Average> = BigVganStage<
+    Upsample,
+    AmpBlock<Activation, Narrow, Narrow, Narrow, Narrow, Add>,
+    AmpBlock<Activation, Medium, Medium, Medium, Medium, Add>,
+    AmpBlock<Activation, Wide, Wide, Wide, Wide, Add>,
+    Average,
+>;
+
+/// Codebook lookups reduce to one hidden stream, which the stages decode to waveform features.
+type CodecDecoder<Codebook, Reduce, Stages, Waveform> =
+    language::Readout<language::Backbone<Sequential<Codebook, Reduce>, Stages>, Waveform>;
+
+/// An activation and transposed convolution upsample before `UNITS` residual units of activation,
+/// convolution, activation and pointwise convolution; widths and strides vary by stage.
+type DacStage<
+    Activation,
+    Resample,
+    UnitActivation,
+    Convolution,
+    Pointwise,
+    Add,
+    const UNITS: usize,
+> = Sequential<
+    Then<Identity, Then<Activation, Resample>>,
+    Layers<
+        [residual::Residual<
+            UnitActivation,
+            Then<Convolution, Then<UnitActivation, Pointwise>>,
+            Add,
+        >; UNITS],
+    >,
+>;
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/fish_speech/fish_speech_dac_decoder.py`.
+/// Summed codebooks pass a projected transformer and two ConvNeXt upsamplers, then four DAC stages.
+pub type FishSpeechDACDecoder<
+    Codebook,
+    Reduce,
+    InputProjection,
+    Attention,
+    Mlp,
+    Norm,
+    Add,
+    OutputProjection,
+    Upsample,
+    Depthwise,
+    UpsampleNorm,
+    Up,
+    UpsampleActivation,
+    Down,
+    Input,
+    Activation0,
+    Resample0,
+    UnitActivation0,
+    Convolution0,
+    Pointwise0,
+    Activation1,
+    Resample1,
+    UnitActivation1,
+    Convolution1,
+    Pointwise1,
+    Activation2,
+    Resample2,
+    UnitActivation2,
+    Convolution2,
+    Pointwise2,
+    Activation3,
+    Resample3,
+    UnitActivation3,
+    Convolution3,
+    Pointwise3,
+    Waveform,
+    const DEPTH: usize,
+> = CodecDecoder<
+    Codebook,
+    Reduce,
+    Sequential<
+        language::Readout<
+            language::Normalized<
+                Sequential<
+                    Then<Identity, InputProjection>,
+                    Layers<[transformer::PreNorm<Attention, Mlp, Norm, Add>; DEPTH]>,
+                >,
+                Norm,
+            >,
+            OutputProjection,
+        >,
+        Sequential<
+            Then<
+                Layers<
+                    [ConvNextStage<
+                        Upsample,
+                        Depthwise,
+                        UpsampleNorm,
+                        Up,
+                        UpsampleActivation,
+                        Down,
+                        Add,
+                        1,
+                    >; 2],
+                >,
+                Input,
+            >,
+            Sequential<
+                DacStage<Activation0, Resample0, UnitActivation0, Convolution0, Pointwise0, Add, 3>,
+                Sequential<
+                    DacStage<
+                        Activation1,
+                        Resample1,
+                        UnitActivation1,
+                        Convolution1,
+                        Pointwise1,
+                        Add,
+                        3,
+                    >,
+                    Sequential<
+                        DacStage<
+                            Activation2,
+                            Resample2,
+                            UnitActivation2,
+                            Convolution2,
+                            Pointwise2,
+                            Add,
+                            3,
+                        >,
+                        DacStage<
+                            Activation3,
+                            Resample3,
+                            UnitActivation3,
+                            Convolution3,
+                            Pointwise3,
+                            Add,
+                            3,
+                        >,
+                    >,
+                >,
+            >,
+        >,
+    >,
+    Waveform,
+>;
+
+/// Source: SGLang `python/sglang/multimodal_gen/runtime/models/dits/helios.py`.
+pub type HeliosTransformer3DModel<
+    Embedding,
+    Conditioning,
+    Modulation,
+    Qkv,
+    QueryNorm,
+    KeyNorm,
+    Attend,
+    Project,
+    CrossQuery,
+    CrossKeyValue,
+    CrossAttend,
+    CrossProject,
+    Mlp,
+    Norm,
+    CrossNorm,
+    Gate,
+    Add,
+    OutputModulation,
+    OutputNorm,
+    OutputProjection,
+    const DEPTH: usize,
+> = diffusion::Denoiser<
+    Embedding,
+    Conditioning,
+    [WanLayer<
+        Modulation,
+        Qkv,
+        QueryNorm,
+        KeyNorm,
+        Attend,
+        Project,
+        CrossQuery,
+        CrossKeyValue,
+        CrossAttend,
+        CrossProject,
+        Mlp,
+        Norm,
+        CrossNorm,
+        Gate,
+        Add,
+    >; DEPTH],
+    diffusion::Head<OutputModulation, OutputNorm, OutputProjection>,
+>;
+
+/// Gated self-attention, normalized cross-attention and gated feed-forward residuals.
+type WanLayer<
+    Modulation,
+    Qkv,
+    QueryNorm,
+    KeyNorm,
+    Attend,
+    Project,
+    CrossQuery,
+    CrossKeyValue,
+    CrossAttend,
+    CrossProject,
+    Mlp,
+    Norm,
+    CrossNorm,
+    Gate,
+    Add,
+> = diffusion::Cross<
+    Modulation,
+    attention::Full<attention::NormalizedQkv<Qkv, QueryNorm, KeyNorm>, Attend, Project>,
+    attention::Attention<CrossQuery, attention::Source<CrossKeyValue>, CrossAttend, CrossProject>,
+    Mlp,
+    Norm,
+    CrossNorm,
+    Gate,
+    Add,
+>;
+
+/// Source: SGLang `python/sglang/multimodal_gen/runtime/models/dits/ltx_2.py`.
+/// Gated self/text/FF residuals; cross branches normalize both source and target.
+/// Each head selects its time embedding from the shared condition product.
+pub type LTX2VideoTransformer3DModel<
+    Embedding,
+    Conditioning,
+    VideoSelf,
+    AudioSelf,
+    VideoText,
+    AudioText,
+    VideoCross,
+    AudioCross,
+    VideoMlp,
+    AudioMlp,
+    VideoHead,
+    AudioHead,
+    const DEPTH: usize,
+> = diffusion::Denoiser<
+    Embedding,
+    Conditioning,
+    [diffusion::Coupled<
+        VideoSelf,
+        AudioSelf,
+        VideoText,
+        AudioText,
+        VideoCross,
+        AudioCross,
+        VideoMlp,
+        AudioMlp,
+    >; DEPTH],
+    diffusion::PairedHead<VideoHead, AudioHead>,
+>;
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/moss_tts/modeling_moss_tts_codec.py`.
+/// Four projected transformers each precede a patch upsampler; the last upsampler emits samples.
+pub type MossTTSCodecDecoder<
+    Codebook,
+    Reduce,
+    Embedding0,
+    Attention0,
+    Mlp0,
+    Norm0,
+    Projection0,
+    Patch0,
+    Embedding1,
+    Attention1,
+    Mlp1,
+    Norm1,
+    Projection1,
+    Patch1,
+    Embedding2,
+    Attention2,
+    Mlp2,
+    Norm2,
+    Projection2,
+    Patch2,
+    Embedding3,
+    Attention3,
+    Mlp3,
+    Norm3,
+    Projection3,
+    Add,
+    Waveform,
+    const DEPTH0: usize,
+    const DEPTH1: usize,
+    const DEPTH2: usize,
+    const DEPTH3: usize,
+> = CodecDecoder<
+    Codebook,
+    Reduce,
+    Sequential<
+        Then<MossCodecStage<Embedding0, Attention0, Mlp0, Norm0, Add, Projection0, DEPTH0>, Patch0>,
+        Sequential<
+            Then<
+                MossCodecStage<Embedding1, Attention1, Mlp1, Norm1, Add, Projection1, DEPTH1>,
+                Patch1,
+            >,
+            Sequential<
+                Then<
+                    MossCodecStage<Embedding2, Attention2, Mlp2, Norm2, Add, Projection2, DEPTH2>,
+                    Patch2,
+                >,
+                MossCodecStage<Embedding3, Attention3, Mlp3, Norm3, Add, Projection3, DEPTH3>,
+            >,
+        >,
+    >,
+    Waveform,
+>;
+
+/// Input projection, pre-norm layers and output projection, with no final norm.
+type MossCodecStage<Embedding, Attention, Mlp, Norm, Add, Projection, const DEPTH: usize> =
+    language::Readout<
+        Sequential<
+            Then<Identity, Embedding>,
+            Layers<[transformer::PreNorm<Attention, Mlp, Norm, Add>; DEPTH]>,
+        >,
+        Projection,
+    >;
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/personaplex/personaplex_code2wav.py`.
+/// Upsampled codebook sums pass a projected transformer, then four SEANet stages of one unit each.
+pub type PersonaPlexCode2Wav<
+    Codebook,
+    Reduce,
+    Upsample,
+    Embedding,
+    Attention,
+    Mlp,
+    Norm,
+    Add,
+    Projection,
+    Input,
+    Activation,
+    Resample0,
+    Convolution0,
+    Pointwise0,
+    Resample1,
+    Convolution1,
+    Pointwise1,
+    Resample2,
+    Convolution2,
+    Pointwise2,
+    Resample3,
+    Convolution3,
+    Pointwise3,
+    Waveform,
+    const DEPTH: usize,
+> = CodecDecoder<
+    Codebook,
+    Reduce,
+    Sequential<
+        Then<Identity, Upsample>,
+        Sequential<
+            Then<MossCodecStage<Embedding, Attention, Mlp, Norm, Add, Projection, DEPTH>, Input>,
+            Sequential<
+                DacStage<Activation, Resample0, Activation, Convolution0, Pointwise0, Add, 1>,
+                Sequential<
+                    DacStage<Activation, Resample1, Activation, Convolution1, Pointwise1, Add, 1>,
+                    Sequential<
+                        DacStage<
+                            Activation,
+                            Resample2,
+                            Activation,
+                            Convolution2,
+                            Pointwise2,
+                            Add,
+                            1,
+                        >,
+                        DacStage<
+                            Activation,
+                            Resample3,
+                            Activation,
+                            Convolution3,
+                            Pointwise3,
+                            Add,
+                            1,
+                        >,
+                    >,
+                >,
+            >,
+        >,
+    >,
+    Waveform,
+>;
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/qwen2_5_omni/qwen2_5_omni_token2wav.py`.
+pub type Qwen2_5OmniDenoiser<
+    Embedding,
+    Conditioning,
+    Modulation,
+    Qkv,
+    QueryNorm,
+    KeyNorm,
+    Attend,
+    Project,
+    Mlp,
+    Norm,
+    Gate,
+    OutputModulation,
+    OutputNorm,
+    OutputProjection,
+    const DEPTH: usize,
+> = diffusion::Denoiser<
+    Embedding,
+    Conditioning,
+    [diffusion::Adaptive<
+        Modulation,
+        attention::Full<attention::NormalizedQkv<Qkv, QueryNorm, KeyNorm>, Attend, Project>,
+        Mlp,
+        Norm,
+        Gate,
+    >; DEPTH],
+    diffusion::Head<OutputModulation, OutputNorm, OutputProjection>,
+>;
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/qwen2_5_omni/qwen2_5_omni_token2wav.py`.
+pub type Qwen2_5OmniToken2WavDiTModel<
+    Embedding,
+    Conditioning,
+    Modulation,
+    Qkv,
+    QueryNorm,
+    KeyNorm,
+    Attend,
+    Project,
+    Mlp,
+    Norm,
+    Gate,
+    OutputModulation,
+    OutputNorm,
+    OutputProjection,
+    MelNormalization,
+    MelConvolution,
+    VocoderUpsample0,
+    VocoderActivation0,
+    VocoderNarrow0,
+    VocoderMedium0,
+    VocoderWide0,
+    VocoderUpsample1,
+    VocoderActivation1,
+    VocoderNarrow1,
+    VocoderMedium1,
+    VocoderWide1,
+    VocoderUpsample2,
+    VocoderActivation2,
+    VocoderNarrow2,
+    VocoderMedium2,
+    VocoderWide2,
+    VocoderUpsample3,
+    VocoderActivation3,
+    VocoderNarrow3,
+    VocoderMedium3,
+    VocoderWide3,
+    VocoderUpsample4,
+    VocoderActivation4,
+    VocoderNarrow4,
+    VocoderMedium4,
+    VocoderWide4,
+    VocoderUpsample5,
+    VocoderActivation5,
+    VocoderNarrow5,
+    VocoderMedium5,
+    VocoderWide5,
+    VocoderAdd,
+    VocoderAverage,
+    VocoderWaveform,
+    const DEPTH: usize,
+> = (
+    Qwen2_5OmniDenoiser<
+        Embedding,
+        Conditioning,
+        Modulation,
+        Qkv,
+        QueryNorm,
+        KeyNorm,
+        Attend,
+        Project,
+        Mlp,
+        Norm,
+        Gate,
+        OutputModulation,
+        OutputNorm,
+        OutputProjection,
+        DEPTH,
+    >,
+    Qwen2_5OmniToken2WavBigVGANModel<
+        MelNormalization,
+        MelConvolution,
+        VocoderUpsample0,
+        VocoderActivation0,
+        VocoderNarrow0,
+        VocoderMedium0,
+        VocoderWide0,
+        VocoderUpsample1,
+        VocoderActivation1,
+        VocoderNarrow1,
+        VocoderMedium1,
+        VocoderWide1,
+        VocoderUpsample2,
+        VocoderActivation2,
+        VocoderNarrow2,
+        VocoderMedium2,
+        VocoderWide2,
+        VocoderUpsample3,
+        VocoderActivation3,
+        VocoderNarrow3,
+        VocoderMedium3,
+        VocoderWide3,
+        VocoderUpsample4,
+        VocoderActivation4,
+        VocoderNarrow4,
+        VocoderMedium4,
+        VocoderWide4,
+        VocoderUpsample5,
+        VocoderActivation5,
+        VocoderNarrow5,
+        VocoderMedium5,
+        VocoderWide5,
+        VocoderAdd,
+        VocoderAverage,
+        VocoderWaveform,
+    >,
+);
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/qwen3_omni/pipeline.py`.
+/// The code-to-wave stage, `Qwen3OmniMoeCode2Wav`, is a DAC decoder.
+pub type Qwen3OmniStages<
+    Embedding,
+    AudioConv0,
+    AudioConv1,
+    AudioConv2,
+    AudioGelu,
+    AudioFlatten,
+    AudioInput,
+    AudioPosition,
+    AudioPack,
+    AudioQkv,
+    AudioAttend,
+    AudioProject,
+    AudioMlp,
+    AudioNorm,
+    AudioAdd,
+    AudioUp,
+    AudioActivation,
+    AudioDown,
+    VisionEncoder,
+    VideoEncoder,
+    ProjectMedia,
+    MergeMedia,
+    Inject,
+    Qkv,
+    Position,
+    Write,
+    Read,
+    Attend,
+    Project,
+    Router,
+    Experts,
+    Weighting,
+    Norm,
+    Add,
+    Head,
+    TalkerEmbedding,
+    TalkerConditionProjection,
+    TalkerAdd,
+    TalkerQkv,
+    TalkerQueryNorm,
+    TalkerKeyNorm,
+    TalkerPosition,
+    TalkerWrite,
+    TalkerRead,
+    TalkerAttend,
+    TalkerProject,
+    TalkerMlp,
+    TalkerNorm,
+    TalkerHead,
+    DepthEmbedding,
+    DepthQkv,
+    DepthQueryNorm,
+    DepthKeyNorm,
+    DepthPosition,
+    DepthWrite,
+    DepthRead,
+    DepthAttend,
+    DepthProject,
+    DepthMlp,
+    DepthNorm,
+    DepthAdd,
+    DepthHead,
+    CodecCodebook,
+    CodecReduce,
+    CodecInputProjection,
+    CodecAttention,
+    CodecMlp,
+    CodecNorm,
+    CodecAdd,
+    CodecOutputProjection,
+    CodecUpsample,
+    CodecDepthwise,
+    CodecUpsampleNorm,
+    CodecUp,
+    CodecUpsampleActivation,
+    CodecDown,
+    CodecInput,
+    CodecActivation0,
+    CodecResample0,
+    CodecUnitActivation0,
+    CodecConvolution0,
+    CodecPointwise0,
+    CodecActivation1,
+    CodecResample1,
+    CodecUnitActivation1,
+    CodecConvolution1,
+    CodecPointwise1,
+    CodecActivation2,
+    CodecResample2,
+    CodecUnitActivation2,
+    CodecConvolution2,
+    CodecPointwise2,
+    CodecActivation3,
+    CodecResample3,
+    CodecUnitActivation3,
+    CodecConvolution3,
+    CodecPointwise3,
+    CodecWaveform,
+    const DEEP_LAYERS: usize,
+    const TEXT_TAIL: usize,
+    const TALKER_DEPTH: usize,
+    const DECODER_DEPTH: usize,
+    const CODEC_DEPTH: usize,
+    const AUDIO_DEPTH: usize,
+> = Qwen3OmniPipeline<
+    Qwen3OmniMoeThinkerForConditionalGeneration<
+        Embedding,
+        AudioConv0,
+        AudioConv1,
+        AudioConv2,
+        AudioGelu,
+        AudioFlatten,
+        AudioInput,
+        AudioPosition,
+        AudioPack,
+        AudioQkv,
+        AudioAttend,
+        AudioProject,
+        AudioMlp,
+        AudioNorm,
+        AudioAdd,
+        AudioUp,
+        AudioActivation,
+        AudioDown,
+        VisionEncoder,
+        VideoEncoder,
+        ProjectMedia,
+        MergeMedia,
+        Inject,
+        Qkv,
+        Position,
+        Write,
+        Read,
+        Attend,
+        Project,
+        Router,
+        Experts,
+        Weighting,
+        Norm,
+        Add,
+        Head,
+        DEEP_LAYERS,
+        TEXT_TAIL,
+        AUDIO_DEPTH,
+    >,
+    Qwen3TTSTalkerForConditionalGeneration<
+        TalkerEmbedding,
+        TalkerConditionProjection,
+        TalkerAdd,
+        TalkerQkv,
+        TalkerQueryNorm,
+        TalkerKeyNorm,
+        TalkerPosition,
+        TalkerWrite,
+        TalkerRead,
+        TalkerAttend,
+        TalkerProject,
+        TalkerMlp,
+        TalkerNorm,
+        TalkerHead,
+        DepthEmbedding,
+        DepthQkv,
+        DepthQueryNorm,
+        DepthKeyNorm,
+        DepthPosition,
+        DepthWrite,
+        DepthRead,
+        DepthAttend,
+        DepthProject,
+        DepthMlp,
+        DepthNorm,
+        DepthAdd,
+        DepthHead,
+        TALKER_DEPTH,
+        DECODER_DEPTH,
+    >,
+    FishSpeechDACDecoder<
+        CodecCodebook,
+        CodecReduce,
+        CodecInputProjection,
+        CodecAttention,
+        CodecMlp,
+        CodecNorm,
+        CodecAdd,
+        CodecOutputProjection,
+        CodecUpsample,
+        CodecDepthwise,
+        CodecUpsampleNorm,
+        CodecUp,
+        CodecUpsampleActivation,
+        CodecDown,
+        CodecInput,
+        CodecActivation0,
+        CodecResample0,
+        CodecUnitActivation0,
+        CodecConvolution0,
+        CodecPointwise0,
+        CodecActivation1,
+        CodecResample1,
+        CodecUnitActivation1,
+        CodecConvolution1,
+        CodecPointwise1,
+        CodecActivation2,
+        CodecResample2,
+        CodecUnitActivation2,
+        CodecConvolution2,
+        CodecPointwise2,
+        CodecActivation3,
+        CodecResample3,
+        CodecUnitActivation3,
+        CodecConvolution3,
+        CodecPointwise3,
+        CodecWaveform,
+        CODEC_DEPTH,
+    >,
+>;
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_code2wav.py`.
+/// A causal convolution follows the codebook sum; the DAC decoder stages follow it.
+pub type Qwen3TTSCode2Wav<
+    Codebook,
+    Reduce,
+    PreConvolution,
+    InputProjection,
+    Attention,
+    Mlp,
+    Norm,
+    Add,
+    OutputProjection,
+    Upsample,
+    Depthwise,
+    UpsampleNorm,
+    Up,
+    UpsampleActivation,
+    Down,
+    Input,
+    Activation0,
+    Resample0,
+    UnitActivation0,
+    Convolution0,
+    Pointwise0,
+    Activation1,
+    Resample1,
+    UnitActivation1,
+    Convolution1,
+    Pointwise1,
+    Activation2,
+    Resample2,
+    UnitActivation2,
+    Convolution2,
+    Pointwise2,
+    Activation3,
+    Resample3,
+    UnitActivation3,
+    Convolution3,
+    Pointwise3,
+    Waveform,
+    const DEPTH: usize,
+> = FishSpeechDACDecoder<
+    Codebook,
+    Then<Reduce, PreConvolution>,
+    InputProjection,
+    Attention,
+    Mlp,
+    Norm,
+    Add,
+    OutputProjection,
+    Upsample,
+    Depthwise,
+    UpsampleNorm,
+    Up,
+    UpsampleActivation,
+    Down,
+    Input,
+    Activation0,
+    Resample0,
+    UnitActivation0,
+    Convolution0,
+    Pointwise0,
+    Activation1,
+    Resample1,
+    UnitActivation1,
+    Convolution1,
+    Pointwise1,
+    Activation2,
+    Resample2,
+    UnitActivation2,
+    Convolution2,
+    Pointwise2,
+    Activation3,
+    Resample3,
+    UnitActivation3,
+    Convolution3,
+    Pointwise3,
+    Waveform,
+    DEPTH,
+>;
+
+/// Source: SGLang `python/sglang/multimodal_gen/runtime/models/dits/qwen_image21.py`.
+/// The layers update both streams; the head reads the image stream.
+pub type QwenImage21Transformer2DModel<
+    Embedding,
+    Conditioning,
+    ImageModulation,
+    TextModulation,
+    ImageQkv,
+    ImageQueryNorm,
+    ImageKeyNorm,
+    TextQkv,
+    TextQueryNorm,
+    TextKeyNorm,
+    JoinQkv,
+    Position,
+    Attend,
+    Split,
+    ImageProjection,
+    TextProjection,
+    ImageMlp,
+    TextMlp,
+    ImageNorm,
+    TextNorm,
+    ImageGate,
+    TextGate,
+    OutputModulation,
+    OutputNorm,
+    OutputProjection,
+    const DEPTH: usize,
+> = diffusion::Transformer<
+    Embedding,
+    Conditioning,
+    Sequential<
+        Layers<
+            [diffusion::Dual<
+                diffusion::Stream<ImageModulation, ImageNorm, ImageMlp, ImageGate>,
+                diffusion::Stream<TextModulation, TextNorm, TextMlp, TextGate>,
+                attention::Joint<
+                    attention::NormalizedQkv<ImageQkv, ImageQueryNorm, ImageKeyNorm>,
+                    attention::NormalizedQkv<TextQkv, TextQueryNorm, TextKeyNorm>,
+                    JoinQkv,
+                    Position,
+                    Attend,
+                    Split,
+                    ImageProjection,
+                    TextProjection,
+                >,
+            >; DEPTH],
+            Unrolled,
+        >,
+        First,
+    >,
+    diffusion::Unpatch<diffusion::Head<OutputModulation, OutputNorm, OutputProjection>, First>,
+>;
+
+/// Source: Diffusers `src/diffusers/models/attention.py`.
+/// Joint layers update both streams; the final layer only returns image features.
+pub type SD3Transformer2DModel<
+    Embedding,
+    Conditioning,
+    ImageModulation,
+    TextModulation,
+    Attention,
+    ImageMlp,
+    TextMlp,
+    ImageNorm,
+    TextNorm,
+    ImageGate,
+    TextGate,
+    FinalTextNorm,
+    FinalAttention,
+    Head,
+    Restore,
+    Extra,
+    const DEPTH: usize,
+> = diffusion::Transformer<
+    Embedding,
+    Conditioning,
+    diffusion::Terminal<
+        Layers<
+            [diffusion::Dual<
+                diffusion::Stream<ImageModulation, ImageNorm, ImageMlp, ImageGate>,
+                diffusion::Stream<TextModulation, TextNorm, TextMlp, TextGate>,
+                Attention,
+                Extra,
+            >; DEPTH],
+            Unrolled,
+        >,
+        diffusion::JointFinal<
+            ImageModulation,
+            ImageNorm,
+            FinalTextNorm,
+            FinalAttention,
+            ImageMlp,
+            ImageGate,
+            Extra,
+        >,
+    >,
+    diffusion::Unpatch<Head, Restore>,
+>;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/wan2_2/wan2_2_vace_transformer.py`.
+/// The control branch projects every layer output; mapped main layers add the scaled residual
+/// afterward.
+pub type WanVACETransformer3DModel<
+    Embedding,
+    Conditioning,
+    ControlEmbedding,
+    ControlProjection,
+    ControlAdd,
+    VaceModulation,
+    VaceQkv,
+    VaceQueryNorm,
+    VaceKeyNorm,
+    VaceAttend,
+    VaceProject,
+    VaceCrossQuery,
+    VaceCrossKeyValue,
+    VaceCrossAttend,
+    VaceCrossProject,
+    VaceMlp,
+    VaceNorm,
+    VaceCrossNorm,
+    VaceGate,
+    VaceAdd,
+    ControlHead,
+    Modulation,
+    Qkv,
+    QueryNorm,
+    KeyNorm,
+    Attend,
+    Project,
+    CrossQuery,
+    CrossKeyValue,
+    CrossAttend,
+    CrossProject,
+    Mlp,
+    Norm,
+    CrossNorm,
+    Gate,
+    Add,
+    Inject,
+    OutputModulation,
+    OutputNorm,
+    OutputProjection,
+    const CONTROL_DEPTH: usize,
+    const DEPTH: usize,
+> = diffusion::Transformer<
+    Embedding,
+    Conditioning,
+    diffusion::Controlled<
+        diffusion::Control<
+            ControlEmbedding,
+            ControlProjection,
+            ControlAdd,
+            [(
+                WanLayer<
+                    VaceModulation,
+                    VaceQkv,
+                    VaceQueryNorm,
+                    VaceKeyNorm,
+                    VaceAttend,
+                    VaceProject,
+                    VaceCrossQuery,
+                    VaceCrossKeyValue,
+                    VaceCrossAttend,
+                    VaceCrossProject,
+                    VaceMlp,
+                    VaceNorm,
+                    VaceCrossNorm,
+                    VaceGate,
+                    VaceAdd,
+                >,
+                ControlHead,
+            ); CONTROL_DEPTH],
+        >,
+        [WanLayer<
+            Modulation,
+            Qkv,
+            QueryNorm,
+            KeyNorm,
+            Attend,
+            Project,
+            CrossQuery,
+            CrossKeyValue,
+            CrossAttend,
+            CrossProject,
+            Mlp,
+            Norm,
+            CrossNorm,
+            Gate,
+            Add,
+        >; DEPTH],
+        Inject,
+    >,
+    diffusion::Head<OutputModulation, OutputNorm, OutputProjection>,
+>;
+
+/// Source: vLLM-Omni
+/// `vllm_omni/model_executor/models/audex/speech_decoder/modeling_audex_causal_speech_decoder.py`.
+/// Code decomposition/projection → optional lookahead convolution → cached transformer → waveform
+/// patches.
+pub type AudexCode2Wav<Codes, Lookahead, Attention, Mlp, Norm, Add, Waveform, const DEPTH: usize> =
+    language::Decoder<
+        Sequential<Codes, Lookahead>,
+        [transformer::PreNorm<Attention, Mlp, Norm, Add>; DEPTH],
+        Norm,
+        Waveform,
+    >;
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/voxtral_tts/voxtral_tts_audio_generation.py`.
+/// `(noisy_acoustic, time, language_hidden)` → concatenated tokens → bidirectional layers →
+/// velocity.
+pub(crate) type VoxtralAcousticVelocity<
+    Embedding,
+    Qkv,
+    Attend,
+    Project,
+    Mlp,
+    Norm,
+    Add,
+    Velocity,
+    const DEPTH: usize,
+> = language::Decoder<
+    Embedding,
+    [transformer::PreNorm<attention::Full<Qkv, Attend, Project>, Mlp, Norm, Add>; DEPTH],
+    Norm,
+    Velocity,
+>;
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/voxtral_tts/voxtral_tts_audio_generation.py`.
+/// The language stage returns hidden features; semantic logits and acoustic velocity are separate
+/// calls.
+pub type VoxtralTTSAudioGeneration<
+    Language,
+    SemanticHead,
+    Embedding,
+    Qkv,
+    Attend,
+    Project,
+    Mlp,
+    Norm,
+    Add,
+    Velocity,
+    const DEPTH: usize,
+> = (
+    Language,
+    (
+        SemanticHead,
+        VoxtralAcousticVelocity<Embedding, Qkv, Attend, Project, Mlp, Norm, Add, Velocity, DEPTH>,
+    ),
+);
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/omnivoice/omnivoice_generator.py`.
+/// One masked-token refinement pass, with bidirectional attention and parallel codebook logits.
+pub type OmniVoiceGenerator<
+    Embedding,
+    Qkv,
+    Attend,
+    Project,
+    Mlp,
+    Norm,
+    Add,
+    CodeHeads,
+    const DEPTH: usize,
+> = language::Decoder<
+    Embedding,
+    [transformer::PreNorm<attention::Full<Qkv, Attend, Project>, Mlp, Norm, Add>; DEPTH],
+    Norm,
+    CodeHeads,
+>;
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/omnivoice/omnivoice_decoder.py`.
+/// RVQ lookup/projection/sum → channel projection → DAC acoustic decoder of five upsampling stages.
+pub type OmniVoiceDecoder<
+    Dequantize,
+    Projection,
+    Input,
+    Activation0,
+    Resample0,
+    UnitActivation0,
+    Convolution0,
+    Pointwise0,
+    Activation1,
+    Resample1,
+    UnitActivation1,
+    Convolution1,
+    Pointwise1,
+    Activation2,
+    Resample2,
+    UnitActivation2,
+    Convolution2,
+    Pointwise2,
+    Activation3,
+    Resample3,
+    UnitActivation3,
+    Convolution3,
+    Pointwise3,
+    Activation4,
+    Resample4,
+    UnitActivation4,
+    Convolution4,
+    Pointwise4,
+    Add,
+    Waveform,
+> = Sequential<
+    Dequantize,
+    Sequential<
+        Projection,
+        Then<
+            Input,
+            Then<
+                DacBlock<Activation0, Resample0, UnitActivation0, Convolution0, Pointwise0, Add>,
+                Then<
+                    DacBlock<
+                        Activation1,
+                        Resample1,
+                        UnitActivation1,
+                        Convolution1,
+                        Pointwise1,
+                        Add,
+                    >,
+                    Then<
+                        DacBlock<
+                            Activation2,
+                            Resample2,
+                            UnitActivation2,
+                            Convolution2,
+                            Pointwise2,
+                            Add,
+                        >,
+                        Then<
+                            DacBlock<
+                                Activation3,
+                                Resample3,
+                                UnitActivation3,
+                                Convolution3,
+                                Pointwise3,
+                                Add,
+                            >,
+                            Then<
+                                DacBlock<
+                                    Activation4,
+                                    Resample4,
+                                    UnitActivation4,
+                                    Convolution4,
+                                    Pointwise4,
+                                    Add,
+                                >,
+                                Waveform,
+                            >,
+                        >,
+                    >,
+                >,
+            >,
+        >,
+    >,
+>;
+
+/// An activation and transposed convolution upsample before three residual units.
+type DacBlock<Activation, Resample, UnitActivation, Convolution, Pointwise, Add> = Then<
+    Then<Activation, Resample>,
+    Then<
+        DacUnit<UnitActivation, Convolution, Pointwise, Add>,
+        Then<
+            DacUnit<UnitActivation, Convolution, Pointwise, Add>,
+            DacUnit<UnitActivation, Convolution, Pointwise, Add>,
+        >,
+    >,
+>;
+
+/// An activation, convolution, activation and pointwise convolution added to the input.
+type DacUnit<Activation, Convolution, Pointwise, Add> =
+    residual::Residual<Activation, Then<Convolution, Then<Activation, Pointwise>>, Add>;
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/omnivoice/omnivoice.py`.
+pub type OmniVoiceModel<
+    Embedding,
+    Qkv,
+    Attend,
+    Project,
+    Mlp,
+    Norm,
+    Add,
+    CodeHeads,
+    Dequantize,
+    Projection,
+    Input,
+    Activation0,
+    Resample0,
+    UnitActivation0,
+    Convolution0,
+    Pointwise0,
+    Activation1,
+    Resample1,
+    UnitActivation1,
+    Convolution1,
+    Pointwise1,
+    Activation2,
+    Resample2,
+    UnitActivation2,
+    Convolution2,
+    Pointwise2,
+    Activation3,
+    Resample3,
+    UnitActivation3,
+    Convolution3,
+    Pointwise3,
+    Activation4,
+    Resample4,
+    UnitActivation4,
+    Convolution4,
+    Pointwise4,
+    DecoderAdd,
+    Waveform,
+    const DEPTH: usize,
+> = (
+    OmniVoiceGenerator<Embedding, Qkv, Attend, Project, Mlp, Norm, Add, CodeHeads, DEPTH>,
+    OmniVoiceDecoder<
+        Dequantize,
+        Projection,
+        Input,
+        Activation0,
+        Resample0,
+        UnitActivation0,
+        Convolution0,
+        Pointwise0,
+        Activation1,
+        Resample1,
+        UnitActivation1,
+        Convolution1,
+        Pointwise1,
+        Activation2,
+        Resample2,
+        UnitActivation2,
+        Convolution2,
+        Pointwise2,
+        Activation3,
+        Resample3,
+        UnitActivation3,
+        Convolution3,
+        Pointwise3,
+        Activation4,
+        Resample4,
+        UnitActivation4,
+        Convolution4,
+        Pointwise4,
+        DecoderAdd,
+        Waveform,
+    >,
+);
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/minimax_music3/acoustic.py`.
+/// Alignment is reusable across velocity evaluations; vocoding consumes the integrated latent.
+pub type MiniMaxMusic3AcousticForConditionalGeneration<Alignment, Velocity, Vocoder> =
+    (Alignment, (Velocity, Vocoder));
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/step_audio2/step_audio2.py`.
+/// The thinker, then `StepAudio2Token2WavForConditionalGeneration`, a token-to-wave model.
+pub type StepAudio2ForConditionalGeneration<
+    Tokens,
+    Encoder,
+    Project,
+    Merge,
+    Attention,
+    Mlp,
+    Norm,
+    Add,
+    Head,
+    Conditioning,
+    AcousticVelocity,
+    Vocoder,
+    const DEPTH: usize,
+> = (
+    StepAudio2ThinkerForConditionalGeneration<
+        Tokens,
+        Encoder,
+        Project,
+        Merge,
+        Attention,
+        Mlp,
+        Norm,
+        Add,
+        Head,
+        DEPTH,
+    >,
+    StepAudio2Token2WavModel<Conditioning, AcousticVelocity, Vocoder>,
+);
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/voxtral_tts/voxtral_tts.py`.
+pub type VoxtralTTSForConditionalGeneration<
+    Language,
+    SemanticHead,
+    Embedding,
+    Qkv,
+    Attend,
+    Project,
+    Mlp,
+    Norm,
+    Add,
+    Velocity,
+    CodecFrames,
+    CodecEncoderAttention,
+    CodecEncoderMlp,
+    CodecEncoderNorm,
+    CodecDownsample0,
+    CodecDownsample1,
+    CodecDownsample2,
+    CodecLatent,
+    CodecQuantize,
+    CodecDequantize,
+    CodecDecoderProjection,
+    CodecDecoderAttention,
+    CodecDecoderMlp,
+    CodecDecoderNorm,
+    CodecUpsample0,
+    CodecUpsample1,
+    CodecUpsample2,
+    CodecAdd,
+    CodecWaveform,
+    CodecCodeEmbedding,
+    const DEPTH: usize,
+    const CODEC_DEPTH: usize,
+> = (
+    VoxtralTTSAudioGeneration<
+        Language,
+        SemanticHead,
+        Embedding,
+        Qkv,
+        Attend,
+        Project,
+        Mlp,
+        Norm,
+        Add,
+        Velocity,
+        DEPTH,
+    >,
+    VoxtralTTSAudioTokenizer<
+        CodecFrames,
+        CodecEncoderAttention,
+        CodecEncoderMlp,
+        CodecEncoderNorm,
+        CodecDownsample0,
+        CodecDownsample1,
+        CodecDownsample2,
+        CodecLatent,
+        CodecQuantize,
+        CodecDequantize,
+        CodecDecoderProjection,
+        CodecDecoderAttention,
+        CodecDecoderMlp,
+        CodecDecoderNorm,
+        CodecUpsample0,
+        CodecUpsample1,
+        CodecUpsample2,
+        CodecAdd,
+        CodecWaveform,
+        CodecCodeEmbedding,
+        CODEC_DEPTH,
+    >,
+);
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/mimo_audio/mimo_audio.py`.
+pub type MiMoAudioModel<
+    InputDepth,
+    Temporal,
+    OutputDepth,
+    Dequantize,
+    Upsample,
+    Attention,
+    Mlp,
+    Norm,
+    Add,
+    Mel,
+    VocoderEmbedding,
+    VocoderAttention,
+    VocoderMlp,
+    VocoderNorm,
+    VocoderAdd,
+    Projection,
+    Spectrum,
+    Inverse,
+    Trim,
+    const DEPTH: usize,
+    const LAYERS: usize,
+> = (
+    MiMoAudioLLMModel<InputDepth, Temporal, OutputDepth>,
+    MiMoAudioToken2WavModel<
+        Dequantize,
+        Upsample,
+        Attention,
+        Mlp,
+        Norm,
+        Add,
+        Mel,
+        VocoderEmbedding,
+        VocoderAttention,
+        VocoderMlp,
+        VocoderNorm,
+        VocoderAdd,
+        Projection,
+        Spectrum,
+        Inverse,
+        Trim,
+        DEPTH,
+        LAYERS,
+    >,
+);
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/ming_tts/ming_tts.py`.
+pub type MingTTSForConditionalGeneration<
+    Temporal,
+    AcousticVelocity,
+    Stop,
+    Speaker,
+    Frames,
+    EncoderAttention,
+    EncoderMlp,
+    EncoderNorm,
+    EncoderAdd,
+    Aggregate,
+    Distribution,
+    LatentProjection,
+    Upsample,
+    DecoderAttention,
+    DecoderMlp,
+    DecoderNorm,
+    DecoderAdd,
+    Waveform,
+    const ENCODER_DEPTH: usize,
+    const DECODER_LAYERS: usize,
+> = (
+    MingLLMModel<Temporal, AcousticVelocity, Stop, Speaker>,
+    MingAudioVAEModel<
+        Frames,
+        EncoderAttention,
+        EncoderMlp,
+        EncoderNorm,
+        EncoderAdd,
+        Aggregate,
+        Distribution,
+        LatentProjection,
+        Upsample,
+        DecoderAttention,
+        DecoderMlp,
+        DecoderNorm,
+        DecoderAdd,
+        Waveform,
+        ENCODER_DEPTH,
+        DECODER_LAYERS,
+    >,
+);
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/mammoth_moda2/mammoth_moda2.py`.
+/// The registered wrapper selects AR or diffusion; its VAE stage is unimplemented upstream.
+/// The diffusion stage, `MammothModa2DiTPipeline`, is the Qwen-Image pipeline.
+pub type MammothModa2ForConditionalGeneration<
+    Tokens,
+    Vision,
+    Project,
+    Merge,
+    Attention,
+    Norm,
+    RoutedMlp,
+    Add,
+    Heads,
+    Text,
+    Prepare,
+    Denoiser,
+    Guidance,
+    Update,
+    Decode,
+    const DEPTH: usize,
+> = (
+    MammothModa2ARForConditionalGeneration<
+        Tokens,
+        Vision,
+        Project,
+        Merge,
+        Attention,
+        Norm,
+        RoutedMlp,
+        Add,
+        Heads,
+        DEPTH,
+    >,
+    QwenImagePipeline<Text, Prepare, Denoiser, Guidance, Update, Decode>,
+);
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/step_audio2/step_audio2_token2wav.py`.
+/// Conditioning, a single acoustic velocity evaluation and vocoding are separately callable.
+pub type StepAudio2Token2WavModel<Conditioning, AcousticVelocity, Vocoder> =
+    (Conditioning, (AcousticVelocity, Vocoder));
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/cosyvoice3/cosyvoice3.py`.
+pub type CosyVoice3Model<Talker, Conditioning, AcousticVelocity, Vocoder> = (
+    Talker,
+    StepAudio2Token2WavModel<Conditioning, AcousticVelocity, Vocoder>,
+);
+
+/// Source: vLLM-Omni
+/// `vllm_omni/model_executor/models/nemotron_voicechat/nemo_vendored/ear_tts_vae_codec.py`.
+/// Three causal ConvNeXt stages follow their upsamplers; ISTFT receives a separate waveform
+/// history.
+pub type NemotronVoiceChatCode2Wav<
+    Dequantize,
+    Upsample0,
+    Depthwise0,
+    Norm0,
+    Up0,
+    Down0,
+    Upsample1,
+    Depthwise1,
+    Norm1,
+    Up1,
+    Down1,
+    Upsample2,
+    Depthwise2,
+    Norm2,
+    Up2,
+    Down2,
+    Activation,
+    Add,
+    Projection,
+    Spectrum,
+    Inverse,
+    Trim,
+    const DEPTH: usize,
+> = language::Pooler<
+    language::Backbone<
+        Dequantize,
+        Sequential<
+            ConvNextStage<Upsample0, Depthwise0, Norm0, Up0, Activation, Down0, Add, DEPTH>,
+            Sequential<
+                ConvNextStage<Upsample1, Depthwise1, Norm1, Up1, Activation, Down1, Add, DEPTH>,
+                ConvNextStage<Upsample2, Depthwise2, Norm2, Up2, Activation, Down2, Add, DEPTH>,
+            >,
+        >,
+    >,
+    audio::Waveform<Projection, Spectrum, Inverse, Trim>,
+>;
+
+/// Upsampling precedes the causal ConvNeXt stack at each resolution.
+pub(crate) type ConvNextStage<
+    Upsample,
+    Depthwise,
+    Norm,
+    Up,
+    Activation,
+    Down,
+    Add,
+    const DEPTH: usize,
+> = Sequential<
+    Then<Identity, Upsample>,
+    Layers<
+        [convolution::ConvNext<Depthwise, Norm, feedforward::Mlp<Up, Activation, Down>, Add>;
+            DEPTH],
+    >,
+>;
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/mimo_audio/modeling_audio_tokenizer.py`.
+/// Dequantization → transformer/convolution stages → waveform, with independently passed histories.
+pub type MiMoAudioToken2WavModel<
+    Dequantize,
+    Upsample,
+    Attention,
+    Mlp,
+    Norm,
+    Add,
+    Mel,
+    VocoderEmbedding,
+    VocoderAttention,
+    VocoderMlp,
+    VocoderNorm,
+    VocoderAdd,
+    Projection,
+    Spectrum,
+    Inverse,
+    Trim,
+    const DEPTH: usize,
+    const LAYERS: usize,
+> = language::Pooler<
+    language::Backbone<
+        Dequantize,
+        Sequential<
+            convolution::Stage<
+                language::Normalized<
+                    Sequential<
+                        Upsample,
+                        Layers<[transformer::PreNorm<Attention, Mlp, Norm, Add>; LAYERS]>,
+                    >,
+                    Norm,
+                >,
+                Mel,
+            >,
+            language::Normalized<
+                language::Backbone<
+                    VocoderEmbedding,
+                    Layers<
+                        [transformer::PreNorm<
+                            VocoderAttention,
+                            VocoderMlp,
+                            VocoderNorm,
+                            VocoderAdd,
+                        >; DEPTH],
+                    >,
+                >,
+                VocoderNorm,
+            >,
+        >,
+    >,
+    audio::Waveform<Projection, Spectrum, Inverse, Trim>,
+>;
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/voxtral_tts/voxtral_tts_audio_tokenizer.py`.
+/// Encoding/quantization, decoding and code-to-language embedding are separate functions.
+pub type VoxtralTTSAudioTokenizer<
+    Frames,
+    EncoderAttention,
+    EncoderMlp,
+    EncoderNorm,
+    Downsample0,
+    Downsample1,
+    Downsample2,
+    Latent,
+    Quantize,
+    Dequantize,
+    DecoderProjection,
+    DecoderAttention,
+    DecoderMlp,
+    DecoderNorm,
+    Upsample0,
+    Upsample1,
+    Upsample2,
+    Add,
+    Waveform,
+    CodeEmbedding,
+    const DEPTH: usize,
+> = (
+    language::Readout<
+        language::Backbone<
+            Frames,
+            Sequential<
+                VoxtralCodecStage<
+                    EncoderAttention,
+                    EncoderMlp,
+                    EncoderNorm,
+                    Add,
+                    Downsample0,
+                    DEPTH,
+                >,
+                Sequential<
+                    VoxtralCodecStage<
+                        EncoderAttention,
+                        EncoderMlp,
+                        EncoderNorm,
+                        Add,
+                        Downsample1,
+                        DEPTH,
+                    >,
+                    Sequential<
+                        VoxtralCodecStage<
+                            EncoderAttention,
+                            EncoderMlp,
+                            EncoderNorm,
+                            Add,
+                            Downsample2,
+                            DEPTH,
+                        >,
+                        VoxtralCodecStage<
+                            EncoderAttention,
+                            EncoderMlp,
+                            EncoderNorm,
+                            Add,
+                            Latent,
+                            DEPTH,
+                        >,
+                    >,
+                >,
+            >,
+        >,
+        Quantize,
+    >,
+    (
+        language::Readout<
+            language::Backbone<
+                Dequantize,
+                Sequential<
+                    Then<Identity, DecoderProjection>,
+                    Sequential<
+                        VoxtralCodecStage<
+                            DecoderAttention,
+                            DecoderMlp,
+                            DecoderNorm,
+                            Add,
+                            Upsample0,
+                            DEPTH,
+                        >,
+                        Sequential<
+                            VoxtralCodecStage<
+                                DecoderAttention,
+                                DecoderMlp,
+                                DecoderNorm,
+                                Add,
+                                Upsample1,
+                                DEPTH,
+                            >,
+                            Sequential<
+                                VoxtralCodecStage<
+                                    DecoderAttention,
+                                    DecoderMlp,
+                                    DecoderNorm,
+                                    Add,
+                                    Upsample2,
+                                    DEPTH,
+                                >,
+                                Layers<
+                                    [transformer::PreNorm<
+                                        DecoderAttention,
+                                        DecoderMlp,
+                                        DecoderNorm,
+                                        Add,
+                                    >; DEPTH],
+                                >,
+                            >,
+                        >,
+                    >,
+                >,
+            >,
+            Waveform,
+        >,
+        CodeEmbedding,
+    ),
+);
+
+/// Each transformer stack precedes its resampler; the final decoder stage has no upsampling.
+type VoxtralCodecStage<Attention, Mlp, Norm, Add, Resample, const DEPTH: usize> =
+    convolution::Stage<Layers<[transformer::PreNorm<Attention, Mlp, Norm, Add>; DEPTH]>, Resample>;
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/common/ming/audio_vae.py`.
+/// The encoder returns distribution parameters, the decoder takes a latent and ISTFT state;
+/// `Aggregate` is `Identity` for `patch_size` -1, else a [`MingAudioAggregator`] of encoder rows.
+pub type MingAudioVAEModel<
+    Frames,
+    EncoderAttention,
+    EncoderMlp,
+    EncoderNorm,
+    EncoderAdd,
+    Aggregate,
+    Distribution,
+    LatentProjection,
+    Upsample,
+    DecoderAttention,
+    DecoderMlp,
+    DecoderNorm,
+    DecoderAdd,
+    Waveform,
+    const ENCODER_DEPTH: usize,
+    const DECODER_LAYERS: usize,
+> = (
+    language::Readout<
+        language::Backbone<
+            Frames,
+            Sequential<
+                language::Normalized<
+                    Layers<
+                        [transformer::PreNorm<
+                            EncoderAttention,
+                            EncoderMlp,
+                            EncoderNorm,
+                            EncoderAdd,
+                        >; ENCODER_DEPTH],
+                    >,
+                    EncoderNorm,
+                >,
+                Aggregate,
+            >,
+        >,
+        Distribution,
+    >,
+    language::Pooler<
+        language::Normalized<
+            language::Backbone<
+                LatentProjection,
+                Sequential<
+                    Upsample,
+                    Layers<
+                        [transformer::PreNorm<
+                            DecoderAttention,
+                            DecoderMlp,
+                            DecoderNorm,
+                            DecoderAdd,
+                        >; DECODER_LAYERS],
+                    >,
+                >,
+            >,
+            DecoderNorm,
+        >,
+        Waveform,
+    >,
+);
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/common/ming/audio_vae.py`.
+/// Patches of rows, each closed by a learned row, pass their own layers; a patch keeps that row.
+pub type MingAudioAggregator<Patch, Attention, Mlp, Norm, Add, Select, const DEPTH: usize> =
+    language::Readout<
+        language::Normalized<
+            language::Backbone<
+                Patch,
+                Layers<[transformer::PreNorm<Attention, Mlp, Norm, Add>; DEPTH]>,
+            >,
+            Norm,
+        >,
+        Select,
+    >;
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/ming_flash_omni/ming_flash_omni.py`.
+/// The thinker (`MingFlashOmniThinkerForConditionalGeneration`), then the talker
+/// (`MingFlashOmniTalkerForConditionalGeneration`) and the image pipeline (`MingImagePipeline`).
+pub type MingFlashOmniForConditionalGeneration<
+    Tokens,
+    Vision,
+    Project,
+    Merge,
+    Attention,
+    Norm,
+    RoutedMlp,
+    Add,
+    Heads,
+    TalkerTemporal,
+    TalkerAcousticVelocity,
+    TalkerStop,
+    TalkerSpeaker,
+    TalkerFrames,
+    TalkerEncoderAttention,
+    TalkerEncoderMlp,
+    TalkerEncoderNorm,
+    TalkerEncoderAdd,
+    TalkerAggregate,
+    TalkerDistribution,
+    TalkerLatentProjection,
+    TalkerUpsample,
+    TalkerDecoderAttention,
+    TalkerDecoderMlp,
+    TalkerDecoderNorm,
+    TalkerDecoderAdd,
+    TalkerWaveform,
+    ImageText,
+    ImagePrepare,
+    ImageDenoiser,
+    ImageGuidance,
+    ImageUpdate,
+    ImageDecode,
+    const DEPTH: usize,
+    const TALKER_ENCODER_DEPTH: usize,
+    const TALKER_DECODER_LAYERS: usize,
+> = (
+    MammothModa2ARForConditionalGeneration<
+        Tokens,
+        Vision,
+        Project,
+        Merge,
+        Attention,
+        Norm,
+        RoutedMlp,
+        Add,
+        Heads,
+        DEPTH,
+    >,
+    (
+        MingTTSForConditionalGeneration<
+            TalkerTemporal,
+            TalkerAcousticVelocity,
+            TalkerStop,
+            TalkerSpeaker,
+            TalkerFrames,
+            TalkerEncoderAttention,
+            TalkerEncoderMlp,
+            TalkerEncoderNorm,
+            TalkerEncoderAdd,
+            TalkerAggregate,
+            TalkerDistribution,
+            TalkerLatentProjection,
+            TalkerUpsample,
+            TalkerDecoderAttention,
+            TalkerDecoderMlp,
+            TalkerDecoderNorm,
+            TalkerDecoderAdd,
+            TalkerWaveform,
+            TALKER_ENCODER_DEPTH,
+            TALKER_DECODER_LAYERS,
+        >,
+        QwenImagePipeline<
+            ImageText,
+            ImagePrepare,
+            ImageDenoiser,
+            ImageGuidance,
+            ImageUpdate,
+            ImageDecode,
+        >,
+    ),
+);
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/minicpmo_4_5/minicpmo_4_5_omni.py`.
+/// The language model, `MiniCPMO45OmniLLMForConditionalGeneration`, then the talker.
+pub type MiniCPMO45OmniForConditionalGeneration<
+    Tokens,
+    Encoder,
+    Project,
+    Merge,
+    Attention,
+    Mlp,
+    Norm,
+    Add,
+    Head,
+    TalkerEmbedding,
+    TalkerAttention,
+    TalkerMlp,
+    TalkerNorm,
+    TalkerAdd,
+    TalkerCodes,
+    const DEPTH: usize,
+    const TALKER_DEPTH: usize,
+> = (
+    StepAudio2ThinkerForConditionalGeneration<
+        Tokens,
+        Encoder,
+        Project,
+        Merge,
+        Attention,
+        Mlp,
+        Norm,
+        Add,
+        Head,
+        DEPTH,
+    >,
+    MiniCPMO45OmniTTSForConditionalGeneration<
+        TalkerEmbedding,
+        TalkerAttention,
+        TalkerMlp,
+        TalkerNorm,
+        TalkerAdd,
+        TalkerCodes,
+        TALKER_DEPTH,
+    >,
+);
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/qwen2_5_omni/pipeline.py`.
+/// vLLM registers the thinker under the same name that vLLM-Omni uses for the full stage bundle.
+/// Its thinker is `Qwen2_5OmniThinkerModel`, its token-to-wave stage `Qwen2_5OmniToken2WavModel`.
+pub type Qwen2_5OmniPipeline<
+    Embedding,
+    AudioEncoder,
+    VisionEncoder,
+    VideoEncoder,
+    ProjectMedia,
+    MergeMedia,
+    Qkv,
+    Position,
+    Write,
+    Read,
+    Attend,
+    Project,
+    Mlp,
+    Norm,
+    Add,
+    Head,
+    TalkerTokens,
+    TalkerCondition,
+    TalkerAttention,
+    TalkerMlp,
+    TalkerNorm,
+    TalkerAdd,
+    TalkerHead,
+    Code2WavEmbedding,
+    Code2WavConditioning,
+    Code2WavModulation,
+    Code2WavQkv,
+    Code2WavQueryNorm,
+    Code2WavKeyNorm,
+    Code2WavAttend,
+    Code2WavProject,
+    Code2WavMlp,
+    Code2WavNorm,
+    Code2WavGate,
+    Code2WavOutputModulation,
+    Code2WavOutputNorm,
+    Code2WavOutputProjection,
+    Code2WavMelNormalization,
+    Code2WavMelConvolution,
+    Code2WavVocoderUpsample0,
+    Code2WavVocoderActivation0,
+    Code2WavVocoderNarrow0,
+    Code2WavVocoderMedium0,
+    Code2WavVocoderWide0,
+    Code2WavVocoderUpsample1,
+    Code2WavVocoderActivation1,
+    Code2WavVocoderNarrow1,
+    Code2WavVocoderMedium1,
+    Code2WavVocoderWide1,
+    Code2WavVocoderUpsample2,
+    Code2WavVocoderActivation2,
+    Code2WavVocoderNarrow2,
+    Code2WavVocoderMedium2,
+    Code2WavVocoderWide2,
+    Code2WavVocoderUpsample3,
+    Code2WavVocoderActivation3,
+    Code2WavVocoderNarrow3,
+    Code2WavVocoderMedium3,
+    Code2WavVocoderWide3,
+    Code2WavVocoderUpsample4,
+    Code2WavVocoderActivation4,
+    Code2WavVocoderNarrow4,
+    Code2WavVocoderMedium4,
+    Code2WavVocoderWide4,
+    Code2WavVocoderUpsample5,
+    Code2WavVocoderActivation5,
+    Code2WavVocoderNarrow5,
+    Code2WavVocoderMedium5,
+    Code2WavVocoderWide5,
+    Code2WavVocoderAdd,
+    Code2WavVocoderAverage,
+    Code2WavVocoderWaveform,
+    const DEPTH: usize,
+    const TALKER_DEPTH: usize,
+    const CODE2WAV_DEPTH: usize,
+> = (
+    MiMoV2OmniForCausalLM<
+        Embedding,
+        AudioEncoder,
+        VisionEncoder,
+        VideoEncoder,
+        ProjectMedia,
+        MergeMedia,
+        Qkv,
+        Position,
+        Write,
+        Read,
+        Attend,
+        Project,
+        Mlp,
+        Norm,
+        Add,
+        Head,
+        DEPTH,
+    >,
+    (
+        Qwen2_5OmniTalkerModel<
+            TalkerTokens,
+            TalkerCondition,
+            TalkerAttention,
+            TalkerMlp,
+            TalkerNorm,
+            TalkerAdd,
+            TalkerHead,
+            TALKER_DEPTH,
+        >,
+        Qwen2_5OmniToken2WavDiTModel<
+            Code2WavEmbedding,
+            Code2WavConditioning,
+            Code2WavModulation,
+            Code2WavQkv,
+            Code2WavQueryNorm,
+            Code2WavKeyNorm,
+            Code2WavAttend,
+            Code2WavProject,
+            Code2WavMlp,
+            Code2WavNorm,
+            Code2WavGate,
+            Code2WavOutputModulation,
+            Code2WavOutputNorm,
+            Code2WavOutputProjection,
+            Code2WavMelNormalization,
+            Code2WavMelConvolution,
+            Code2WavVocoderUpsample0,
+            Code2WavVocoderActivation0,
+            Code2WavVocoderNarrow0,
+            Code2WavVocoderMedium0,
+            Code2WavVocoderWide0,
+            Code2WavVocoderUpsample1,
+            Code2WavVocoderActivation1,
+            Code2WavVocoderNarrow1,
+            Code2WavVocoderMedium1,
+            Code2WavVocoderWide1,
+            Code2WavVocoderUpsample2,
+            Code2WavVocoderActivation2,
+            Code2WavVocoderNarrow2,
+            Code2WavVocoderMedium2,
+            Code2WavVocoderWide2,
+            Code2WavVocoderUpsample3,
+            Code2WavVocoderActivation3,
+            Code2WavVocoderNarrow3,
+            Code2WavVocoderMedium3,
+            Code2WavVocoderWide3,
+            Code2WavVocoderUpsample4,
+            Code2WavVocoderActivation4,
+            Code2WavVocoderNarrow4,
+            Code2WavVocoderMedium4,
+            Code2WavVocoderWide4,
+            Code2WavVocoderUpsample5,
+            Code2WavVocoderActivation5,
+            Code2WavVocoderNarrow5,
+            Code2WavVocoderMedium5,
+            Code2WavVocoderWide5,
+            Code2WavVocoderAdd,
+            Code2WavVocoderAverage,
+            Code2WavVocoderWaveform,
+            CODE2WAV_DEPTH,
+        >,
+    ),
+);
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/qwen3_omni/pipeline.py`.
+pub(crate) type Qwen3OmniPipeline<Thinker, Talker, Code2Wav> = (Thinker, (Talker, Code2Wav));
+
+/// Source: vLLM-Omni `vllm_omni/model_executor/models/audex/audex_xcodec.py`.
+/// The registered adapter loads its codec from checkpoint configuration; no fixed stage topology is
+/// implied.
+pub type AudexXCodec1<Codec> = Codec;
+
+type Guided<Text, Prepare, Denoiser, Guidance, Update, Decode> = diffusion::Pipeline<
+    Text,
+    Prepare,
+    diffusion::Sampler<diffusion::Guider<Denoiser, Guidance>, Update>,
+    Decode,
+>;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py`.
+pub type QwenImagePipeline<Text, Prepare, Denoiser, Guidance, Update, Decode> =
+    Guided<Text, Prepare, Denoiser, Guidance, Update, Decode>;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/sdxl/pipeline_sdxl.py`.
+/// Two text encoders contribute token and pooled features to the time-conditioned U-Net.
+pub type StableDiffusionXLPipeline<
+    TextEmbedding,
+    TextQkv,
+    TextAttend,
+    TextProject,
+    TextMlp,
+    TextNorm,
+    TextAdd,
+    TextPool,
+    PooledTextEmbedding,
+    PooledTextQkv,
+    PooledTextAttend,
+    PooledTextProject,
+    PooledTextMlp,
+    PooledTextNorm,
+    PooledTextAdd,
+    PooledTextPool,
+    PooledTextProjection,
+    Fuse,
+    Prepare,
+    UNetEmbedding,
+    UNetConditioning,
+    UNetDownNorm,
+    UNetDownFirst,
+    UNetDownTime,
+    UNetDownMerge,
+    UNetDownSecond,
+    UNetDownShortcut,
+    UNetDownSpatialNorm,
+    UNetDownProject,
+    UNetDownSelfAttention,
+    UNetDownCrossAttention,
+    UNetDownMlp,
+    UNetDownLayerNorm,
+    UNetDownRestore,
+    UNetMiddleNorm,
+    UNetActivation,
+    UNetMiddleFirst,
+    UNetMiddleTime,
+    UNetMiddleMerge,
+    UNetMiddleSecond,
+    UNetMiddleShortcut,
+    UNetMiddleSpatialNorm,
+    UNetMiddleProject,
+    UNetMiddleSelfAttention,
+    UNetMiddleCrossAttention,
+    UNetMiddleMlp,
+    UNetMiddleLayerNorm,
+    UNetMiddleRestore,
+    UNetAdd,
+    UNetUpNorm,
+    UNetUpFirst,
+    UNetUpTime,
+    UNetUpMerge,
+    UNetUpSecond,
+    UNetUpShortcut,
+    UNetUpSpatialNorm,
+    UNetUpProject,
+    UNetUpSelfAttention,
+    UNetUpCrossAttention,
+    UNetUpMlp,
+    UNetUpLayerNorm,
+    UNetUpRestore,
+    UNetJoin,
+    UNetDownsample0,
+    UNetDownsample1,
+    UNetUpsample1,
+    UNetUpsample0,
+    UNetHead,
+    Guidance,
+    Update,
+    Decode,
+    const TEXT_DEPTH: usize,
+    const POOLED_TEXT_DEPTH: usize,
+    const UNET_MIDDLE_DEPTH: usize,
+> = Guided<
+    residual::Sum<
+        (
+            CLIPTextModel<
+                TextEmbedding,
+                TextQkv,
+                TextAttend,
+                TextProject,
+                TextMlp,
+                TextNorm,
+                TextAdd,
+                TextPool,
+                TEXT_DEPTH,
+            >,
+            CLIPTextModelWithProjection<
+                PooledTextEmbedding,
+                PooledTextQkv,
+                PooledTextAttend,
+                PooledTextProject,
+                PooledTextMlp,
+                PooledTextNorm,
+                PooledTextAdd,
+                PooledTextPool,
+                PooledTextProjection,
+                POOLED_TEXT_DEPTH,
+            >,
+        ),
+        Fuse,
+    >,
+    Prepare,
+    SDXLUNet2DConditionModel<
+        UNetEmbedding,
+        UNetConditioning,
+        UNetDownNorm,
+        UNetDownFirst,
+        UNetDownTime,
+        UNetDownMerge,
+        UNetDownSecond,
+        UNetDownShortcut,
+        UNetDownSpatialNorm,
+        UNetDownProject,
+        UNetDownSelfAttention,
+        UNetDownCrossAttention,
+        UNetDownMlp,
+        UNetDownLayerNorm,
+        UNetDownRestore,
+        UNetMiddleNorm,
+        UNetActivation,
+        UNetMiddleFirst,
+        UNetMiddleTime,
+        UNetMiddleMerge,
+        UNetMiddleSecond,
+        UNetMiddleShortcut,
+        UNetMiddleSpatialNorm,
+        UNetMiddleProject,
+        UNetMiddleSelfAttention,
+        UNetMiddleCrossAttention,
+        UNetMiddleMlp,
+        UNetMiddleLayerNorm,
+        UNetMiddleRestore,
+        UNetAdd,
+        UNetUpNorm,
+        UNetUpFirst,
+        UNetUpTime,
+        UNetUpMerge,
+        UNetUpSecond,
+        UNetUpShortcut,
+        UNetUpSpatialNorm,
+        UNetUpProject,
+        UNetUpSelfAttention,
+        UNetUpCrossAttention,
+        UNetUpMlp,
+        UNetUpLayerNorm,
+        UNetUpRestore,
+        UNetJoin,
+        UNetDownsample0,
+        UNetDownsample1,
+        UNetUpsample1,
+        UNetUpsample0,
+        UNetHead,
+        UNET_MIDDLE_DEPTH,
+    >,
+    Guidance,
+    Update,
+    Decode,
+>;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/sd3/pipeline_sd3.py`.
+/// CLIP/CLIP/T5 features are combined before the joint transformer is called.
+pub type StableDiffusion3Pipeline<
+    TextEmbedding,
+    TextQkv,
+    TextAttend,
+    TextProject,
+    TextMlp,
+    TextNorm,
+    TextAdd,
+    TextPool,
+    TextProjection,
+    PooledTextEmbedding,
+    PooledTextQkv,
+    PooledTextAttend,
+    PooledTextProject,
+    PooledTextMlp,
+    PooledTextNorm,
+    PooledTextAdd,
+    PooledTextPool,
+    PooledTextProjection,
+    TextFusion,
+    LongTextEmbedding,
+    LongTextQkv,
+    LongTextAttend,
+    LongTextProject,
+    LongTextMlp,
+    LongTextNorm,
+    LongTextAdd,
+    Fuse,
+    Prepare,
+    DenoiserEmbedding,
+    DenoiserConditioning,
+    DenoiserImageModulation,
+    DenoiserTextModulation,
+    DenoiserAttention,
+    DenoiserImageMlp,
+    DenoiserTextMlp,
+    DenoiserImageNorm,
+    DenoiserTextNorm,
+    DenoiserImageGate,
+    DenoiserTextGate,
+    DenoiserFinalTextNorm,
+    DenoiserFinalAttention,
+    DenoiserHead,
+    DenoiserRestore,
+    DenoiserExtra,
+    Guidance,
+    Update,
+    Decode,
+    const TEXT_DEPTH: usize,
+    const POOLED_TEXT_DEPTH: usize,
+    const LONG_TEXT_DEPTH: usize,
+    const DENOISER_DEPTH: usize,
+> = Guided<
+    residual::Sum<
+        (
+            residual::Sum<
+                (
+                    CLIPTextModelWithProjection<
+                        TextEmbedding,
+                        TextQkv,
+                        TextAttend,
+                        TextProject,
+                        TextMlp,
+                        TextNorm,
+                        TextAdd,
+                        TextPool,
+                        TextProjection,
+                        TEXT_DEPTH,
+                    >,
+                    CLIPTextModelWithProjection<
+                        PooledTextEmbedding,
+                        PooledTextQkv,
+                        PooledTextAttend,
+                        PooledTextProject,
+                        PooledTextMlp,
+                        PooledTextNorm,
+                        PooledTextAdd,
+                        PooledTextPool,
+                        PooledTextProjection,
+                        POOLED_TEXT_DEPTH,
+                    >,
+                ),
+                TextFusion,
+            >,
+            T5EncoderModel<
+                LongTextEmbedding,
+                LongTextQkv,
+                LongTextAttend,
+                LongTextProject,
+                LongTextMlp,
+                LongTextNorm,
+                LongTextAdd,
+                LONG_TEXT_DEPTH,
+            >,
+        ),
+        Fuse,
+    >,
+    Prepare,
+    SD3Transformer2DModel<
+        DenoiserEmbedding,
+        DenoiserConditioning,
+        DenoiserImageModulation,
+        DenoiserTextModulation,
+        DenoiserAttention,
+        DenoiserImageMlp,
+        DenoiserTextMlp,
+        DenoiserImageNorm,
+        DenoiserTextNorm,
+        DenoiserImageGate,
+        DenoiserTextGate,
+        DenoiserFinalTextNorm,
+        DenoiserFinalAttention,
+        DenoiserHead,
+        DenoiserRestore,
+        DenoiserExtra,
+        DENOISER_DEPTH,
+    >,
+    Guidance,
+    Update,
+    Decode,
+>;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image_edit.py`.
+/// Reference encoding participates in both initial-latent construction and denoiser conditioning.
+pub type QwenImageEditPipeline<Text, Reference, Fuse, Prepare, Denoiser, Guidance, Update, Decode> =
+    Guided<
+        residual::Sum<(Text, Each<Reference>), Fuse>,
+        Prepare,
+        Denoiser,
+        Guidance,
+        Update,
+        Decode,
+    >;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py`.
+/// The step input selects the high- or low-noise expert and its independently typed context.
+pub type WanPipeline<Encode, Prepare, High, Low, Guidance, Update, Decode> =
+    Guided<Encode, Prepare, diffusion::Experts<High, Low>, Guidance, Update, Decode>;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2_i2v.py`.
+pub type WanImageToVideoPipeline<
+    Text,
+    Vision,
+    Reference,
+    ImageFusion,
+    Fuse,
+    Prepare,
+    High,
+    Low,
+    Guidance,
+    Update,
+    Decode,
+> = WanPipeline<
+    residual::Sum<(Text, residual::Sum<(Vision, Reference), ImageFusion>), Fuse>,
+    Prepare,
+    High,
+    Low,
+    Guidance,
+    Update,
+    Decode,
+>;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/ltx2/pipeline_ltx2.py`.
+/// Audio/video latents and decoding histories remain separate throughout the paired function.
+pub type LTX2Pipeline<Encode, Prepare, Denoiser, Guidance, Update, Video, Audio> =
+    Guided<Encode, Prepare, Denoiser, Guidance, Update, (Video, Audio)>;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/ltx2/pipeline_ltx2_two_stage.py`.
+/// Resampling includes the supplied refinement noise; each trajectory receives its own schedule.
+pub type LTX2TwoStagePipeline<
+    Encode,
+    Prepare,
+    First,
+    FirstGuidance,
+    FirstUpdate,
+    Resample,
+    Second,
+    SecondGuidance,
+    SecondUpdate,
+    Video,
+    Audio,
+> = diffusion::Pipeline<
+    Encode,
+    Prepare,
+    diffusion::Cascade<
+        diffusion::Sampler<diffusion::Guider<First, FirstGuidance>, FirstUpdate>,
+        Resample,
+        diffusion::Sampler<diffusion::Guider<Second, SecondGuidance>, SecondUpdate>,
+    >,
+    (Video, Audio),
+>;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/pi0/pipeline_pi0.py`.
+/// Observation encoding initializes the prefix; repeated action prediction receives it read-only.
+pub type Pi0Pipeline<Observation, Prepare, Expert, Update, Actions> =
+    diffusion::Pipeline<Observation, Prepare, diffusion::Sampler<Expert, Update>, Actions>;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/hunyuan_video/pipeline_hunyuan_video_1_5.py`.
+/// Qwen and ByT5 features contribute independently to video conditioning.
+pub type HunyuanVideo15Pipeline<Text, Bytes, Fuse, Prepare, Denoiser, Guidance, Update, Decode> =
+    Guided<residual::Sum<(Text, Bytes), Fuse>, Prepare, Denoiser, Guidance, Update, Decode>;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/hunyuan_video/pipeline_hunyuan_video_1_5_i2v.py`.
+pub type HunyuanVideo15ImageToVideoPipeline<
+    Text,
+    Bytes,
+    TextFusion,
+    Vision,
+    Reference,
+    ImageFusion,
+    Fuse,
+    Prepare,
+    Denoiser,
+    Guidance,
+    Update,
+    Decode,
+> = Guided<
+    residual::Sum<
+        (
+            residual::Sum<(Text, Bytes), TextFusion>,
+            residual::Sum<(Vision, Reference), ImageFusion>,
+        ),
+        Fuse,
+    >,
+    Prepare,
+    Denoiser,
+    Guidance,
+    Update,
+    Decode,
+>;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/stable_audio/pipeline_stable_audio.py`.
+/// Projected text and start/end duration embeddings condition the audio transformer.
+pub type StableAudioPipeline<
+    TextEmbedding,
+    TextQkv,
+    TextAttend,
+    TextProject,
+    TextMlp,
+    TextNorm,
+    TextAdd,
+    Projection,
+    Duration,
+    Fuse,
+    Prepare,
+    Denoiser,
+    Guidance,
+    Update,
+    Decode,
+    const TEXT_DEPTH: usize,
+> = Guided<
+    residual::Sum<
+        (
+            language::Readout<
+                T5EncoderModel<
+                    TextEmbedding,
+                    TextQkv,
+                    TextAttend,
+                    TextProject,
+                    TextMlp,
+                    TextNorm,
+                    TextAdd,
+                    TEXT_DEPTH,
+                >,
+                Each<Projection>,
+            >,
+            Duration,
+        ),
+        Fuse,
+    >,
+    Prepare,
+    Denoiser,
+    Guidance,
+    Update,
+    Decode,
+>;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/hidream_image/pipeline_hidream_image.py`.
+/// Four independently parameterized encoders provide pooled, sequence and per-layer text features.
+pub type HiDreamImagePipeline<
+    TextEmbedding,
+    TextQkv,
+    TextAttend,
+    TextProject,
+    TextMlp,
+    TextNorm,
+    TextAdd,
+    TextPool,
+    TextProjection,
+    PooledTextEmbedding,
+    PooledTextQkv,
+    PooledTextAttend,
+    PooledTextProject,
+    PooledTextMlp,
+    PooledTextNorm,
+    PooledTextAdd,
+    PooledTextPool,
+    PooledTextProjection,
+    TextFusion,
+    LongTextEmbedding,
+    LongTextQkv,
+    LongTextAttend,
+    LongTextProject,
+    LongTextMlp,
+    LongTextNorm,
+    LongTextAdd,
+    Language,
+    LayerFusion,
+    Fuse,
+    Prepare,
+    Denoiser,
+    Guidance,
+    Update,
+    Decode,
+    const TEXT_DEPTH: usize,
+    const POOLED_TEXT_DEPTH: usize,
+    const LONG_TEXT_DEPTH: usize,
+> = Guided<
+    residual::Sum<
+        (
+            residual::Sum<
+                (
+                    CLIPTextModelWithProjection<
+                        TextEmbedding,
+                        TextQkv,
+                        TextAttend,
+                        TextProject,
+                        TextMlp,
+                        TextNorm,
+                        TextAdd,
+                        TextPool,
+                        TextProjection,
+                        TEXT_DEPTH,
+                    >,
+                    CLIPTextModelWithProjection<
+                        PooledTextEmbedding,
+                        PooledTextQkv,
+                        PooledTextAttend,
+                        PooledTextProject,
+                        PooledTextMlp,
+                        PooledTextNorm,
+                        PooledTextAdd,
+                        PooledTextPool,
+                        PooledTextProjection,
+                        POOLED_TEXT_DEPTH,
+                    >,
+                ),
+                TextFusion,
+            >,
+            residual::Sum<
+                (
+                    T5EncoderModel<
+                        LongTextEmbedding,
+                        LongTextQkv,
+                        LongTextAttend,
+                        LongTextProject,
+                        LongTextMlp,
+                        LongTextNorm,
+                        LongTextAdd,
+                        LONG_TEXT_DEPTH,
+                    >,
+                    Language,
+                ),
+                LayerFusion,
+            >,
+        ),
+        Fuse,
+    >,
+    Prepare,
+    Denoiser,
+    Guidance,
+    Update,
+    Decode,
+>;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2_s2v.py`.
+/// Speech-driven video uses audio features as well as text and reference-image latents.
+pub type WanS2VPipeline<
+    Text,
+    Audio,
+    TextAudio,
+    Reference,
+    Fuse,
+    Prepare,
+    Denoiser,
+    Guidance,
+    Update,
+    Decode,
+> = Guided<
+    residual::Sum<(residual::Sum<(Text, Audio), TextAudio>, Reference), Fuse>,
+    Prepare,
+    Denoiser,
+    Guidance,
+    Update,
+    Decode,
+>;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2_vace.py`.
+/// VACE's control projection and mapped residual additions are defined in
+/// `WanVACETransformer3DModel`.
+pub type WanVACEPipeline<Text, Conditions, Fuse, Prepare, Controlled, Guidance, Update, Decode> =
+    Guided<residual::Sum<(Text, Conditions), Fuse>, Prepare, Controlled, Guidance, Update, Decode>;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/helios/pipeline_helios.py`.
+/// A second trajectory follows latent resampling; its prediction parameterization can differ.
+pub type HeliosPipeline<
+    Encode,
+    Prepare,
+    First,
+    FirstGuidance,
+    FirstUpdate,
+    Resample,
+    Second,
+    SecondGuidance,
+    SecondUpdate,
+    Decode,
+> = diffusion::Pipeline<
+    Encode,
+    Prepare,
+    diffusion::Cascade<
+        diffusion::Sampler<diffusion::Guider<First, FirstGuidance>, FirstUpdate>,
+        Resample,
+        diffusion::Sampler<diffusion::Guider<Second, SecondGuidance>, SecondUpdate>,
+    >,
+    Decode,
+>;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/omnivoice/pipeline_omnivoice.py`.
+/// Masked codec prediction updates discrete tokens and confidence using supplied draws and quotas.
+/// The update preserves previously revealed tokens; it is not an ODE step.
+pub type OmniVoicePipeline<Text, Reference, Fuse, Mask, Logits, Guidance, Unmask, Codec> =
+    Guided<residual::Sum<(Text, Reference), Fuse>, Mask, Logits, Guidance, Unmask, Codec>;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/nextstep_1_1/pipeline_nextstep_1_1.py`.
+/// Each completed image patch updates the language prefix before the next flow trajectory.
+pub type NextStep11Pipeline<Prefix, Project, Prepare, Velocity, Guidance, Update, Append, Decode> =
+    language::Readout<
+        language::Backbone<
+            Prefix,
+            diffusion::Chunked<
+                Project,
+                Prepare,
+                diffusion::Sampler<diffusion::Guider<Velocity, Guidance>, Update>,
+                Append,
+            >,
+        >,
+        Each<Decode>,
+    >;
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/bagel/pipeline_bagel.py`.
+/// Token generation is an engine boundary; both stages can borrow the same `Generative` body.
+/// The image stage receives the selected read-only prefix and explicit branch/schedule inputs.
+pub type BagelPipeline<Understanding, Encode, Prepare, Denoiser, Guidance, Update, Decode> = (
+    Understanding,
+    Guided<Encode, Prepare, Denoiser, Guidance, Update, Decode>,
+);
+
+/// Source: vLLM-Omni `vllm_omni/diffusion/models/cosmos3/pipeline_cosmos3.py`.
+/// Separate mode inputs exclude unsupported sound+action and sound+transfer combinations.
+/// Shared encoder/transformer parameters may be borrowed by these independently callable functions.
+pub type Cosmos3OmniPipeline<Visual, Sound, Action, Transfer> =
+    (Visual, (Sound, (Action, Transfer)));

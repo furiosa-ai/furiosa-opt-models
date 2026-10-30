@@ -1,0 +1,90 @@
+name: metrics
+description: Convert traces and serving summaries to metric, tags, and value records.
+outputs:
+  path:
+    description: JSONL measurements.
+    value: ${{ steps.traces.outputs.path }}
+runs:
+  using: composite
+  steps:
+    - name: Traces
+      id: traces
+      shell: bash
+      run: |
+        path="$(mktemp)"
+        # A job that only serves records no traces.
+        shopt -s nullglob
+        for trace in trace/*/*.json; do
+          # A trace directory is `<org>--<checkpoint>`; the model tag is the checkpoint id.
+          model="$(basename "$(dirname "$trace")" | awk -F-- '{print $1 "/" $2}')"
+          # Steps run one at a time, so a step owns the events recorded inside its `forward` span.
+          # NPU events are timed on the device clock, so their position in the trace places them.
+          jq -c --arg model "$model" --arg test "$(basename "$trace" .json)" '
+            def median: sort | .[((length - 1) / 2 | floor)];
+            # Datadog stores tag values lowercased with other characters replaced by `_`.
+            def tag: ascii_downcase | gsub("[^a-z0-9_./-]"; "_");
+            def record($event):
+              if $event.name == "forward" and $event.ph == "B" then
+                .step = {case: $event.args.case, begin: $event.ts, launch: 0,
+                  kernels: [], warnings: []}
+              elif .step == null then .
+              elif $event.name == "forward" and $event.ph == "E" then
+                .steps += [.step + {end: $event.ts}] | .step = null
+              elif $event.name == "launch" and $event.ph == "B" then .step.launch += 1
+              elif $event.cat == "NPU" then
+                .step.kernels += [{kernel: ($event.name | tag), launch: .step.launch,
+                  cluster: $event.tid, begin: $event.args.begin_cycle, end: $event.args.end_cycle}]
+              elif $event.args.message then .step.warnings += [$event.args.message]
+              else . end;
+            def steps:
+              reduce .[] as $event ({steps: []}; record($event)) | .steps + [.step | values];
+            def cycles:
+              group_by(.cluster) | map((map(.end) | max) - (map(.begin) | min)) | max;
+            def validate:
+              if .end == null or (.kernels | length) == 0 or any(.kernels[]; .end < .begin)
+              then error("Incomplete step measurements \(.warnings | unique)") else . end;
+            def forward: {metric: "forward.step_ms", case, value: ((.end - .begin) / 1000)};
+            def kernels:
+              .case as $case | .kernels | group_by(.kernel)[] |
+              {metric: "kernel.cycles", case: $case, kernel: .[0].kernel,
+               value: (group_by(.launch) | map(cycles) | add)};
+            def tags:
+              ["model:\($model)", "test:\($test)", "case:\(.case)"] +
+              (if .kernel then ["kernel:\(.kernel)"] else [] end);
+            def aggregate:
+              group_by([.metric, .case, .kernel])[] |
+              {metric: "furiosa_opt.\(.[0].metric)", tags: (.[0] | tags),
+               value: (map(.value) | median)};
+            # A test of a task that `vllm bench serve` cannot send records each whole request it
+            # measures as a complete `request` event.
+            def requests:
+              [.[] | select(.name == "request" and .ph == "X") | .dur / 1000] | select(length > 0) |
+              {metric: "furiosa_opt.serving.request_ms", tags: ["model:\($model)", "test:\($test)"],
+               value: median};
+            (steps | map(validate | (forward, kernels)) | aggregate), requests
+          ' "$trace"
+        done > "$path"
+        echo "path=$path" >> "$GITHUB_OUTPUT"
+    - name: Serving
+      shell: bash
+      env:
+        METRICS: ${{ steps.traces.outputs.path }}
+      run: |
+        shopt -s nullglob
+        for summary in sweep/*/*/*/summary.json; do
+          # A sweep directory is `<org>--<checkpoint>/<lengths>/<widths>`, as for traces.
+          scenario="$(basename "$(dirname "$(dirname "$summary")")")"
+          model="$(basename "$(dirname "$(dirname "$(dirname "$summary")")")" | awk -F-- '{print $1 "/" $2}')"
+          jq -c --arg model "$model" --arg scenario "$scenario" '
+            def validate:
+              if .completed != .num_prompts or (.failed // 0) != 0
+              then error("Incomplete serving measurements") else . end;
+            # `vllm bench serve` calls a whole request end-to-end latency, `e2el`; a pooling
+            # request has neither a first token nor later ones.
+            def measure($metric; $field):
+              {metric: "furiosa_opt.serving.\($metric)_ms",
+               tags: ["model:\($model)", "batch:\(.max_concurrency)", "scenario:\($scenario)"],
+               value: .["median_\($field)_ms"]} | select(.value != null);
+            .[] | validate | (measure("ttft"; "ttft"), measure("tpot"; "tpot"), measure("request"; "e2el"))
+          ' "$summary"
+        done >> "$METRICS"

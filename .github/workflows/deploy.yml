@@ -1,0 +1,37 @@
+name: deploy
+
+on:
+  workflow_call:
+
+permissions: {actions: read, contents: read, pages: write, id-token: write}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      # Only a nightly run on main that passed every job uploads a summary; the latest one supplies
+      # the verified date and serving numbers, and without one the docs build without them. The
+      # summary is taken from this repository's nightly workflow only, which no pull request starts:
+      # a fork's run on a branch named main uploads artifacts here too.
+      - run: |
+          for run in $(gh run list --workflow nightly.yml --branch main --status success \
+              --limit 10 --json databaseId --jq '.[].databaseId'); do
+            gh run download "$run" --name nightly-summary --dir docs/theme/data && break
+          done
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - run: uv run --only-group dev mkdocs build --strict
+      - uses: actions/download-artifact@v4
+        with:
+          name: rust-reference
+          path: site/api/rust
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,41 @@
+name: checkpoints
+description: >-
+  Make the model checkpoints of a tier, and the reference outputs their tests compare with,
+  available on a measurement or test runner.
+inputs:
+  tier:
+    description: '`gate` downloads the checkpoints every pull request measures; `all` downloads every checkpoint.'
+    default: gate
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        jq -c --arg tier "$TIER" '.models[] | select($tier == "all" or .tier == $tier)' .github/benchmarks.json |
+          while IFS= read -r model; do
+            mapfile -t revision < <(jq -r '.revision // empty | "--revision", .' <<< "$model")
+            mapfile -t patterns < <(jq -r '.download // [] | .[] | "--include", .' <<< "$model")
+            uvx --from huggingface-hub hf download "$(jq -r .id <<< "$model")" "${revision[@]}" "${patterns[@]}"
+            reference="$(jq -r '.reference // empty' <<< "$model")"
+            if [ -n "$reference" ]; then
+              command -v gh > /dev/null || { sudo apt-get update -qq; sudo apt-get install -yqq gh; }
+              directory="${FURIOSA_OPT_REFERENCES:?}/$reference"
+              mkdir -p "$(dirname "$directory")"
+              (
+                flock 9
+                if [ ! -d "$directory" ]; then
+                  temporary="$(mktemp -d "$directory.XXXXXX")"
+                  trap 'rm -rf "$temporary"' EXIT
+                  gh release download "$reference" --dir "$temporary"
+                  # A release is immutable, so a file that differs from its manifest's digest is a
+                  # broken download and never enters the cache.
+                  (cd "$temporary" && jq -r '.sha256 | to_entries[] | "\(.value)  \(.key)"' manifest.json |
+                    sha256sum --check --strict --quiet)
+                  mv "$temporary" "$directory"
+                fi
+              ) 9> "$directory.lock"
+            fi
+          done
+      env:
+        TIER: ${{ inputs.tier }}
+        GH_TOKEN: ${{ github.token }}
