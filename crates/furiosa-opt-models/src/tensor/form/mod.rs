@@ -18,7 +18,8 @@ pub mod split;
 /// Codes of `E` in [output, input] order with one `S` scale for each block of them, the scales
 /// stored in mapping `B`, which returns them to the values a linear multiplies under contract `C`;
 /// the codes are held as `W` and the scales as `T`, owned or borrowed.
-#[derive(DeviceSend)]
+#[derive(DeviceSend, Load)]
+#[load(tree)]
 pub struct BlockScaled<
     In: AxisName,
     Out: AxisName,
@@ -35,6 +36,7 @@ pub struct BlockScaled<
     /// The scale of each block of codes.
     pub weight_scale: T,
     /// The operands of the contract.
+    #[load(rename = "")]
     pub contract: C,
     pub shape: PhantomData<fn() -> (In, Out, E, S, B, Chips)>,
 }
@@ -109,6 +111,7 @@ impl<In: AxisName, Out: AxisName, E: Scalar, S: Scalar, B: M, C, Chips: M, W, T>
 /// E4M3 codes under no contract, one FP32 scale per output row: its codes and scales as stored,
 /// under `weight` and `weight_scale`; in a checkpoint a load quantizes, the codes and scales of
 /// the BF16 weight stored under `weight`.
+/// By hand, with the update below: one impl per weight form, where a derived impl is generic.
 impl<'a, In: AxisName, Out: AxisName, Chips: M + 'static, W, T> Load<&'a Checkpoint>
     for BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], (), Chips, W, T>
 where
@@ -416,57 +419,6 @@ impl<In: AxisName, Out: AxisName, C, W, T> Nvfp4<In, Out, C, W, T> {
                 <&mut C as Load<_>>::load(cx, (&mut self.contract, from))
             })
             .map(drop)
-    }
-}
-
-impl<'a, In: AxisName, Out: AxisName, E: Scalar, S: Scalar, B: M, C, Chips: M, W, T, D, U, V>
-    Load<&'a BlockScaled<In, Out, E, S, B, D, Chips, U, V>>
-    for BlockScaled<In, Out, E, S, B, C, Chips, W, T>
-where
-    W: Load<&'a U>,
-    T: Load<&'a V>,
-    C: Load<&'a D>,
-{
-    fn load(
-        context: &mut Context<'_>,
-        from: &'a BlockScaled<In, Out, E, S, B, D, Chips, U, V>,
-    ) -> Result<Self, LoadError> {
-        let weight = context.field("weight", "weight", |cx| W::load(cx, &from.weight))?;
-        let scale = context.field("weight_scale", "weight_scale", |cx| {
-            T::load(cx, &from.weight_scale)
-        })?;
-        let contract = context.field("contract", "", |cx| C::load(cx, &from.contract))?;
-        Ok(Self::new(weight, scale, contract))
-    }
-}
-
-impl<'t, In: AxisName, Out: AxisName, E: Scalar, S: Scalar, B: M, C, Chips: M, W, T>
-    Load<(
-        &'t mut BlockScaled<In, Out, E, S, B, C, Chips, W, T>,
-        BlockScaled<In, Out, E, S, B, C, Chips, W, T>,
-    )> for &'t mut BlockScaled<In, Out, E, S, B, C, Chips, W, T>
-where
-    for<'u> &'u mut W: Load<(&'u mut W, W)>,
-    for<'u> &'u mut T: Load<(&'u mut T, T)>,
-    for<'u> &'u mut C: Load<(&'u mut C, C)>,
-{
-    fn load(
-        context: &mut Context<'_>,
-        (into, from): (
-            &'t mut BlockScaled<In, Out, E, S, B, C, Chips, W, T>,
-            BlockScaled<In, Out, E, S, B, C, Chips, W, T>,
-        ),
-    ) -> Result<Self, LoadError> {
-        context.field("weight", "weight", |cx| {
-            <&mut W as Load<_>>::load(cx, (&mut into.weight, from.weight))
-        })?;
-        context.field("weight_scale", "weight_scale", |cx| {
-            <&mut T as Load<_>>::load(cx, (&mut into.weight_scale, from.weight_scale))
-        })?;
-        context.field("contract", "", |cx| {
-            <&mut C as Load<_>>::load(cx, (&mut into.contract, from.contract))
-        })?;
-        Ok(into)
     }
 }
 
