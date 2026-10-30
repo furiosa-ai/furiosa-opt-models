@@ -25,80 +25,65 @@ type Indices<Chips, R> = HbmTensor<i32, Chips, m![{ Layout<R>::Lanes }]>;
 type Groups<R> = Layout<R>::Groups;
 type Write<W, R> = Layout<R>::GroupMut<m![W]>;
 
-impl<W: AxisName, R: AxisName, D: MaterializableScalar, Chips: M + 'static>
-    Op<(&RowStorage<W, D, Chips>, &HbmTensor<i32, Chips, m![R]>)> for Gather
-{
-    type Output = HbmTensor<D, Chips, m![R, W]>;
+/// Rows a gather reads whole at byte offsets: a row list, each row a tensor of its own, or a dense
+/// tensor, its rows any mapping before the features.
+pub trait Source<Chips: M> {
+    type Scalar: MaterializableScalar;
+    /// The features of a row.
+    type Width: AxisName;
 
-    fn forward(
+    /// The rows at the byte `offsets`, in data memory.
+    fn rows<C: M, S: M, E: M, I: M>(
         &self,
         device: &mut Device,
-        (input, offsets): (&RowStorage<W, D, Chips>, &HbmTensor<i32, Chips, m![R]>),
-    ) -> Self::Output {
-        if const { <Groups<R> as M>::SIZE == 1 } {
-            let selected: Selected<Chips, W, R, D> = input
-                .gather::<m![1], m![W]>()
-                .by_byte_offsets(offsets)
-                .to_dm(&mut device.tdma);
-            selected.to_hbm(&mut device.tdma)
-        } else {
-            let mut output = HbmTensor::new();
-            for group in 0..<Groups<R> as M>::SIZE {
-                let mut index: Indices<Chips, R> = HbmTensor::new();
-                offsets
-                    .view()
-                    .tile::<Groups<R>, 1, m![{ Layout<R>::Selected }, { Layout<R>::Lanes }]>(group)
-                    .to_hbm_view(&mut device.tdma, index.view_mut());
-                let selected: Selected<Chips, W, R, D> = input
-                    .gather::<m![1], m![W]>()
-                    .by_byte_offsets(&index)
-                    .to_dm(&mut device.tdma);
-                selected.view().to_hbm_view(
-                    &mut device.tdma,
-                    output.view_mut().tile::<Groups<R>, 1, Write<W, R>>(group),
-                );
-            }
-            output
-        }
+        offsets: &HbmTensor<i32, Chips, I>,
+    ) -> DmTensor<Self::Scalar, Chips, C, S, E>;
+}
+
+impl<W: AxisName, D: MaterializableScalar, Chips: M> Source<Chips> for RowStorage<W, D, Chips> {
+    type Scalar = D;
+    type Width = W;
+
+    fn rows<C: M, S: M, E: M, I: M>(
+        &self,
+        device: &mut Device,
+        offsets: &HbmTensor<i32, Chips, I>,
+    ) -> DmTensor<D, Chips, C, S, E> {
+        self.gather::<m![1], m![W]>()
+            .by_byte_offsets(offsets)
+            .to_dm(&mut device.tdma)
     }
 }
 
-impl<W: AxisName, R: AxisName, D: MaterializableScalar, Chips: M + 'static>
-    Op<&(RowStorage<W, D, Chips>, HbmTensor<i32, Chips, m![R]>)> for Gather
+impl<R: M, W: AxisName, D: MaterializableScalar, Chips: M> Source<Chips>
+    for HbmTensor<D, Chips, m![{ R }, W]>
 {
-    type Output = HbmTensor<D, Chips, m![R, W]>;
+    type Scalar = D;
+    type Width = W;
 
-    fn forward(
+    fn rows<C: M, S: M, E: M, I: M>(
         &self,
         device: &mut Device,
-        (input, offsets): &(RowStorage<W, D, Chips>, HbmTensor<i32, Chips, m![R]>),
-    ) -> Self::Output {
-        self.forward(device, (input, offsets))
+        offsets: &HbmTensor<i32, Chips, I>,
+    ) -> DmTensor<D, Chips, C, S, E> {
+        self.gather::<R, m![W]>()
+            .by_byte_offsets(offsets)
+            .to_dm(&mut device.tdma)
     }
 }
 
-/// Rows of a dense table, the table's rows any mapping before its features.
-impl<W: AxisName, R: M, D: MaterializableScalar, C: AxisName, Chips: M + 'static>
-    Op<(
-        &HbmTensor<D, Chips, m![{ R }, W]>,
-        &HbmTensor<i32, Chips, m![C]>,
-    )> for Gather
+impl<S: Source<Chips>, C: AxisName, Chips: M + 'static> Op<(&S, &HbmTensor<i32, Chips, m![C]>)>
+    for Gather
 {
-    type Output = HbmTensor<D, Chips, m![C, W]>;
+    type Output = HbmTensor<S::Scalar, Chips, m![C, { Symbol<S::Width> }]>;
 
     fn forward(
         &self,
         device: &mut Device,
-        (input, offsets): (
-            &HbmTensor<D, Chips, m![{ R }, W]>,
-            &HbmTensor<i32, Chips, m![C]>,
-        ),
+        (input, offsets): (&S, &HbmTensor<i32, Chips, m![C]>),
     ) -> Self::Output {
         if const { <Groups<C> as M>::SIZE == 1 } {
-            let selected: Selected<Chips, W, C, D> = input
-                .gather::<R, m![W]>()
-                .by_byte_offsets(offsets)
-                .to_dm(&mut device.tdma);
+            let selected: Selected<Chips, S::Width, C, S::Scalar> = input.rows(device, offsets);
             selected.to_hbm(&mut device.tdma)
         } else {
             let mut output = HbmTensor::new();
@@ -108,13 +93,12 @@ impl<W: AxisName, R: M, D: MaterializableScalar, C: AxisName, Chips: M + 'static
                     .view()
                     .tile::<Groups<C>, 1, m![{ Layout<C>::Selected }, { Layout<C>::Lanes }]>(group)
                     .to_hbm_view(&mut device.tdma, index.view_mut());
-                let selected: Selected<Chips, W, C, D> = input
-                    .gather::<R, m![W]>()
-                    .by_byte_offsets(&index)
-                    .to_dm(&mut device.tdma);
+                let selected: Selected<Chips, S::Width, C, S::Scalar> = input.rows(device, &index);
                 selected.view().to_hbm_view(
                     &mut device.tdma,
-                    output.view_mut().tile::<Groups<C>, 1, Write<W, C>>(group),
+                    output
+                        .view_mut()
+                        .tile::<Groups<C>, 1, Write<S::Width, C>>(group),
                 );
             }
             output
@@ -122,17 +106,17 @@ impl<W: AxisName, R: M, D: MaterializableScalar, C: AxisName, Chips: M + 'static
     }
 }
 
-impl<W: AxisName, N: AxisName, C: AxisName, D: MaterializableScalar, Chips: M + 'static>
-    Op<&(HbmTensor<D, Chips, m![N, W]>, HbmTensor<i32, Chips, m![C]>)> for Gather
+impl<S: Source<Chips>, C: AxisName, Chips: M + 'static> Op<&(S, HbmTensor<i32, Chips, m![C]>)>
+    for Gather
 {
-    type Output = HbmTensor<D, Chips, m![C, W]>;
+    type Output = HbmTensor<S::Scalar, Chips, m![C, { Symbol<S::Width> }]>;
 
     fn forward(
         &self,
         device: &mut Device,
-        (rows, offsets): &(HbmTensor<D, Chips, m![N, W]>, HbmTensor<i32, Chips, m![C]>),
+        (input, offsets): &(S, HbmTensor<i32, Chips, m![C]>),
     ) -> Self::Output {
-        self.forward(device, (rows, offsets))
+        self.forward(device, (input, offsets))
     }
 }
 
