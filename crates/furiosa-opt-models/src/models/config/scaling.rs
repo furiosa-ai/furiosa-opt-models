@@ -9,6 +9,8 @@
 //!   must agree.
 //! - A field that a configuration leaves out reads as its class's [`Defaults`]; read without a
 //!   class, a spectrum refuses a missing base.
+//! - What a spectrum's parameters declare beside it, a query temperature ([`Rope`]) or a
+//!   multimodal rotation's sections ([`Multimodal`]), a spectrum alone refuses.
 
 use super::{Positive, refuse};
 use crate::ops::pointwise::multiply::Temperature;
@@ -308,6 +310,59 @@ impl TryFrom<Map<String, Value>> for Rope {
     }
 }
 
+/// Transformers' names for the fields of a spectrum's parameters that give a multimodal
+/// rotation's sections; a [`Spectrum`] alone refuses them.
+const SECTIONS: [&str; 2] = ["mrope_section", "mrope_interleaved"];
+
+/// A multimodal rotation's sections: how many rotated pairs turn by each of a position's
+/// temporal, height and width components (`mrope_section`), the pairs of each interleaved across
+/// the head where `mrope_interleaved` holds and in one block each otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+pub struct Sections {
+    #[serde(rename = "mrope_section")]
+    pub pairs: [usize; 3],
+    #[serde(rename = "mrope_interleaved", default)]
+    pub interleaved: bool,
+}
+
+/// A spectrum, and the sections of a multimodal rotation where the spectrum's parameters declare
+/// them; a rotation by one position for every pair, as a text-only prompt gives, turns alike under
+/// any sections.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(try_from = "Map<String, Value>")]
+pub struct Multimodal {
+    pub spectrum: Spectrum,
+    pub sections: Option<Sections>,
+}
+
+impl TryFrom<Map<String, Value>> for Multimodal {
+    type Error = Refusal;
+
+    fn try_from(mut document: Map<String, Value>) -> Result<Self, Self::Error> {
+        // Both spellings of the parameters must agree, so each loses its sections, which must
+        // agree with the other's.
+        let malformed = |error: serde_json::Error| error.to_string();
+        let sections = ["rope_parameters", "rope_scaling"]
+            .into_iter()
+            .filter_map(|spelling| match document.get_mut(spelling) {
+                Some(Value::Object(parameters)) => {
+                    let fields = SECTIONS.map(|field| parameters.remove_entry(field));
+                    let fields = fields.into_iter().flatten().collect::<Map<_, _>>();
+                    (!fields.is_empty()).then(|| Sections::deserialize(Value::Object(fields)))
+                }
+                _ => None,
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(malformed)?
+            .into_iter()
+            .try_fold(None, |held, sections| {
+                agree(SECTIONS[0], held, Some(sections))
+            })?;
+        let spectrum = Spectrum::deserialize(Value::Object(document)).map_err(malformed)?;
+        Ok(Self { spectrum, sections })
+    }
+}
+
 /// What one spectrum's description defaults from the document around it, then from the
 /// configuration's class.
 struct Outer {
@@ -359,6 +414,12 @@ impl Outer {
             return Err(refuse(
                 format_args!("a query temperature ({TEMPERATURE})"),
                 "a rotation alone",
+            ));
+        }
+        if SECTIONS.iter().any(|field| parameters.contains_key(*field)) {
+            return Err(refuse(
+                format_args!("a multimodal rotation's sections ({})", SECTIONS[0]),
+                "a rotation by one position",
             ));
         }
         #[derive(Deserialize)]
@@ -1343,6 +1404,76 @@ mod tests {
             (
                 io::ErrorKind::InvalidData,
                 "partial_rotary_factor: found 0, expected a fraction in (0, 1]".into()
+            )
+        );
+    }
+
+    /// Qwen3-VL's text rotation.
+    fn sectioned() -> Value {
+        json!({
+            "rope_theta": 5e6,
+            "rope_scaling": {
+                "rope_type": "default", "mrope_section": [24, 20, 20], "mrope_interleaved": true,
+            },
+        })
+    }
+
+    /// A multimodal rotation's sections read beside its spectrum in either spelling, none where
+    /// the parameters name none; a spectrum alone refuses them, and two spellings must declare
+    /// the same.
+    #[test]
+    fn reads_multimodal_sections_beside_spectra() {
+        let multimodal: Multimodal = parse(sectioned()).unwrap();
+        assert_eq!(
+            multimodal.spectrum,
+            parse::<Spectrum>(json!({"rope_theta": 5e6})).unwrap()
+        );
+        let interleaved = Sections {
+            pairs: [24, 20, 20],
+            interleaved: true,
+        };
+        assert_eq!(multimodal.sections, Some(interleaved));
+        let mut transformers = sectioned()["rope_scaling"].clone();
+        transformers["rope_theta"] = json!(5e6);
+        let respelled: Multimodal = parse(json!({"rope_parameters": transformers})).unwrap();
+        assert_eq!(
+            (respelled.spectrum, respelled.sections),
+            (multimodal.spectrum, multimodal.sections)
+        );
+        let mut chunked = sectioned();
+        chunked["rope_scaling"]
+            .as_object_mut()
+            .unwrap()
+            .remove("mrope_interleaved");
+        let chunked: Multimodal = parse(chunked).unwrap();
+        let sections = Sections {
+            interleaved: false,
+            ..interleaved
+        };
+        assert_eq!(chunked.sections, Some(sections));
+        let plain: Multimodal = parse(json!({"rope_theta": 5e6})).unwrap();
+        assert_eq!(plain.sections, None);
+        let refusal = parse::<Spectrum>(sectioned()).unwrap_err();
+        assert_eq!(
+            (refusal.kind(), refusal.to_string()),
+            (
+                io::ErrorKind::Unsupported,
+                "found a multimodal rotation's sections (mrope_section), compiled a rotation by \
+                 one position"
+                    .into()
+            )
+        );
+        let mut differing = sectioned();
+        differing["rope_parameters"] = differing["rope_scaling"].clone();
+        differing["rope_parameters"]["mrope_section"] = json!([16, 24, 24]);
+        let refusal = parse::<Multimodal>(differing).unwrap_err();
+        assert_eq!(
+            (refusal.kind(), refusal.to_string()),
+            (
+                io::ErrorKind::InvalidData,
+                "mrope_section: found Sections { pairs: [16, 24, 24], interleaved: true } and \
+                 Sections { pairs: [24, 20, 20], interleaved: true }"
+                    .into()
             )
         );
     }

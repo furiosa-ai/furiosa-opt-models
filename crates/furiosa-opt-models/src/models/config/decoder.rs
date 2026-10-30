@@ -1,7 +1,7 @@
 //! The decoder schema that the transformer decoder families share: geometry, rotary part and the
 //! flags their compositions hold fixed.
 
-use super::scaling::{Kind, Spectrum};
+use super::scaling::{Kind, Multimodal, Sections, Spectrum};
 use super::{Disabled, Literal, PerLayer, Positive, flattened, refuse};
 use furiosa_opt_std::prelude::AxisName;
 use serde::{Deserialize, de};
@@ -205,6 +205,39 @@ impl<Head: AxisName, Rotated: AxisName> TryFrom<Spectrum> for Prefix<Head, Rotat
                     Head::SIZE
                 ),
             )),
+        }
+    }
+}
+
+/// A checkpoint's unscaled rotary base over the whole head, for a family whose kernels hold a
+/// multimodal rotation's sections interleaved across each `Head`-wide head: sections in one block
+/// each are refused as unsupported, and sections that do not cover a head's pairs as malformed.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(try_from = "Multimodal", bound = "Head: AxisName")]
+pub struct Interleaved<Head>(pub Positive, PhantomData<fn() -> Head>);
+
+impl<Head: AxisName> TryFrom<Multimodal> for Interleaved<Head> {
+    type Error = String;
+
+    fn try_from(Multimodal { spectrum, sections }: Multimodal) -> Result<Self, Self::Error> {
+        let Rotary(theta) = Rotary::try_from(spectrum)?;
+        match sections {
+            Some(Sections {
+                pairs,
+                interleaved: false,
+            }) => Err(refuse(
+                format_args!("sections {pairs:?} in one block each"),
+                "interleaved sections",
+            )),
+            Some(Sections { pairs, .. }) if pairs.iter().sum::<usize>() != Head::SIZE / 2 => {
+                Err(format!(
+                    "mrope_section: found {pairs:?}, expected sections of the {} pairs of a \
+                     {}-wide head",
+                    Head::SIZE / 2,
+                    Head::SIZE
+                ))
+            }
+            _ => Ok(Self(theta, PhantomData)),
         }
     }
 }
@@ -436,6 +469,57 @@ mod tests {
             assert_eq!(
                 (error.kind(), error.to_string()),
                 (io::ErrorKind::Unsupported, reason),
+                "{document}"
+            );
+        }
+    }
+
+    /// A family that interleaves a multimodal rotation's sections holds the unscaled spectrum
+    /// with sections, or none, interleaved over a head's pairs; sections in one block each and a
+    /// rescaled spectrum are unsupported, sections over another count of pairs malformed.
+    #[test]
+    fn holds_interleaved_sections_of_the_head() {
+        use furiosa_opt_std::prelude::*;
+        axes![Whole = 128];
+        let sections = |section: serde_json::Value, interleaved: bool| {
+            json!({"rope_theta": 5e6, "rope_scaling": {
+                "rope_type": "default", "mrope_section": section, "mrope_interleaved": interleaved,
+            }})
+        };
+        for document in [
+            sections(json!([24, 20, 20]), true),
+            json!({"rope_theta": 5e6}),
+        ] {
+            let Interleaved(theta, _) = parse::<Interleaved<Whole>>(&document).unwrap();
+            assert_eq!(theta.get(), 5e6, "{document}");
+        }
+        let linear = json!({"rope_theta": 5e6, "rope_scaling": {
+            "rope_type": "linear", "factor": 2.0, "mrope_section": [24, 20, 20],
+            "mrope_interleaved": true,
+        }});
+        for (document, kind, reason) in [
+            (
+                sections(json!([24, 20, 20]), false),
+                io::ErrorKind::Unsupported,
+                "found sections [24, 20, 20] in one block each, compiled interleaved sections",
+            ),
+            (
+                sections(json!([24, 20, 16]), true),
+                io::ErrorKind::InvalidData,
+                "mrope_section: found [24, 20, 16], expected sections of the 64 pairs of a \
+                 128-wide head",
+            ),
+            (
+                linear,
+                io::ErrorKind::Unsupported,
+                "found Linear { factor: 2.0 } rotating 1 of each head, compiled the unscaled \
+                 spectrum over the whole head",
+            ),
+        ] {
+            let error = parse::<Interleaved<Whole>>(&document).unwrap_err();
+            assert_eq!(
+                (error.kind(), error.to_string()),
+                (kind, reason.into()),
                 "{document}"
             );
         }
