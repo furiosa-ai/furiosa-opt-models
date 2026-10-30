@@ -6,8 +6,9 @@ The composition example is Mistral NeMo, and the later steps follow the Qwen3 fi
 | Step | File |
 |---|---|
 | Define the composition | `crates/furiosa-opt-models/src/models/<family>/<model type>.rs` |
+| Schedule it | [`schedule/decoder/mod.rs`](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/crates/furiosa-opt-models/src/schedule/decoder/mod.rs) |
 | Load its weights | the same file |
-| Serve it from the engine | `crates/furiosa-opt-engine/src/decoder/<model type>.rs`, `crates/furiosa-opt-python/src/model/<model type>.rs` |
+| Serve it from the engine | `crates/furiosa-opt-engine/src/decoder/mod.rs`, `crates/furiosa-opt-python/src/model/<model type>.rs` |
 | Add it to the registry | [`registry.rs`](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/crates/furiosa-opt-engine/src/registry.rs) |
 | List the checkpoint | `.github/benchmarks.json` |
 | Document it | `docs/models/<name>.md`, `nav` in `mkdocs.yml` |
@@ -38,6 +39,12 @@ Keep two conventions in model and catalog files:
     5. `Config` and its parsing.
     6. Tests.
 - Give every catalog template a `/// Source: <URL>` line that names the vLLM or Transformers file it follows, at a pinned commit.
+
+## Schedule it
+
+A decoder whose layer shape the schedule does not cut yet needs a `Cut` impl in [`schedule/decoder/mod.rs`](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/crates/furiosa-opt-models/src/schedule/decoder/mod.rs): the steps its leaves take over one row tile, up to its attention's store and from its attention to its next input rows. The `Tokenwise` impls run those steps between the embedded rows and the final norm.
+Reuse the leaves' own phases (a projection's landing, a cache stage's store and reads); a new phase belongs to the leaf, not to the schedule.
+A shape whose layers differ along the stack, such as a sliding-window layer between full ones, repeats one pattern of layer kinds; the loop runs the pattern unrolled and the periods rolled, so no branch picks a layer's kind at run time.
 
 ## Load its weights
 
