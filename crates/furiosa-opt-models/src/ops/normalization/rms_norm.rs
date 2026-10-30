@@ -1,7 +1,7 @@
 //! `x * w / sqrt(mean(x²) + epsilon)` per row, with FP32 statistics and one rounding.
 
 use super::{
-    Chunk, Cluster, FeatureSlices, Lines, Spread, Tile, TilePart, TileParts, Widen, tiles,
+    Chunk, Cluster, FeatureSlices, Lines, Part, Spread, Tile, TilePart, TileParts, Widen, tiles,
 };
 use crate::Op;
 use crate::load::{Checkpoint, Context, Load, LoadError};
@@ -661,9 +661,6 @@ type SpreadLanes<Width, Rows> = Lanes<
     m![{ Rows }, 1 # 8],
 >;
 
-/// The feature slices a row spans, whose sums the norm reduces.
-type Parts<Width> = m![Width / ({ Symbol<Chunk<Width>> })];
-
 impl<Width: AxisName, const EPSILON: usize, Chips: M, Parameter: Learned<Width, Chips>>
     RmsNorm<Width, EPSILON, Chips, Parameter>
 {
@@ -675,7 +672,7 @@ impl<Width: AxisName, const EPSILON: usize, Chips: M, Parameter: Learned<Width, 
         input: DmTensorView<'l, bf16, Chips, Cluster, FeatureSlices<Width>, E>,
     ) -> Commit<'l, Width, Rows, Chips> {
         let inverse =
-            Squares::<SpreadLanes<Width, Rows>, Width, Rows, Parts<Width>, EPSILON>::inverse(
+            Squares::<SpreadLanes<Width, Rows>, Width, Rows, Part<Width>, EPSILON>::inverse(
                 device,
                 input.clone(),
                 |square| square,
@@ -723,12 +720,11 @@ where
     let epsilon: DmTensor<f32, Chips, Cluster, FeatureSlices<Width>, m![1 # 8]> =
         epsilon.to_dm(&mut device.tdma);
     let epsilon = scalar::register(device, &epsilon);
-    let inverse =
-        Squares::<SpreadLanes<Width, m![Rows]>, Width, m![Rows], Parts<Width>, 0>::inverse(
-            device,
-            input.view(),
-            |square| square.vector_fp_binary(FpBinaryOp::AddF, &epsilon),
-        );
+    let inverse = Squares::<SpreadLanes<Width, m![Rows]>, Width, m![Rows], Part<Width>, 0>::inverse(
+        device,
+        input.view(),
+        |square| square.vector_fp_binary(FpBinaryOp::AddF, &epsilon),
+    );
     Scale::<SpreadLanes<Width, m![Rows]>>::of(&mut device.main, input.view(), &inverse, gain)
         .commit()
 }
