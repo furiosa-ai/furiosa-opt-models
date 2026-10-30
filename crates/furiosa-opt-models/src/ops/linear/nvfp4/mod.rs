@@ -134,10 +134,9 @@ where
                     .commit_trim::<m![1 # 8]>()
                     .commit();
             let value: DmTensor<bf16, Chip, Cluster, Reduced<O>, Elements<O>> =
-                Partials::<O, Elements<O>>::rounded(
-                    Partials::<O, Elements<O>>::reduced(&mut device.main, partial.view())
-                        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &scale),
-                )
+                Partials::<O, Elements<O>>::restored(&mut device.main, partial.view(), |sums| {
+                    sums.vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &scale)
+                })
                 .commit();
             value.view().to_dm_view(
                 &mut device.tdma,
