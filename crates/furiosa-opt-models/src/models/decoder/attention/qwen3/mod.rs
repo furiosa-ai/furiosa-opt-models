@@ -1,14 +1,13 @@
-//! Qwen3, by published size: the Hugging Face classes over a [`Size`], the [`Form`] of the
-//! projections, a placement, a KV cache form and a memory, e.g.
-//! `ForCausalLM<Size<"0.6B">, form::Affine, Parallel<1>, cache::Bf16, X>`.
+//! Qwen3, by published size: the [`Catalog`] binding over a [`Size`] and the [`Form`] of the
+//! projections, whose roots a launch runs, e.g. `launch::Model<Size<"0.6B">, form::Affine>`.
 //!
 //! - A size's [`Geometry`] is what its checkpoints declare; its [`Decode`] is how a call of it is
 //!   compiled today, the context it serves included.
 //! - [`Catalog`] is the one binding of `Qwen3ForCausalLM` every projection form instantiates: a
 //!   [`Form`] chooses only the six projection weights, BF16 dense matrices, channel-scaled E4M3 or
 //!   block-scaled E4M3.
-//! - A size's [`Front`] is how its family computes a row's query, key and value heads from their
-//!   projection; Llama's sizes instantiate these classes and the catalog with the plain projection.
+//! - A size's [`Front`] is whether its family normalizes each query and key head; Llama's sizes
+//!   instantiate the catalog without the head norms.
 //! - Every size has eight key and value heads of 128 features, and its vocabulary compiles as
 //!   152064 rows.
 
@@ -22,40 +21,29 @@ use super::{Geometry, LlamaEmbeddingModel, Qwen2ForCausalLM};
 use crate::load::Named;
 use crate::models::Family;
 use crate::models::config::{self, scaling::Spectrum};
-use crate::models::decoder::attention::{
-    Chunks, Head, KvHeads, PaddedVocabulary, Prompts, Windows,
-};
-use crate::models::decoder::{self, Form};
-use crate::modules::attention::{self, Cached, NormalizedQkv, key_value};
-use crate::modules::feedforward::glu::Glu;
+use crate::models::decoder::Form;
+use crate::models::decoder::attention::{Chunks, Head, KvHeads, PaddedVocabulary, Windows};
+use crate::modules::attention::{self, NormalizedQkv};
 use crate::modules::generic::collection::Array;
 use crate::modules::generic::collection::{Stack, View};
-use crate::modules::language::{Backbone, Classifier, Greedy, Normalized};
-use crate::modules::lora::{self, Rank, Term};
-use crate::modules::transformer::PreNorm;
-use crate::ops::attention::Attention;
+use crate::modules::language::Greedy;
 use crate::ops::attention::full::{self, head::Replicated, paged};
-use crate::ops::attention::geometry::{
-    self, HeadRows, ProjectionWidth, QueryGroups, QueryWidth, scale,
-};
-use crate::ops::attention::{Packed, Split};
+use crate::ops::attention::geometry::{self, QueryGroups, QueryWidth, scale};
 use crate::ops::embedding::Embedding;
 use crate::ops::index::gather::Gather;
-use crate::ops::index::scatter::{Scatter, Store};
+use crate::ops::index::scatter::Scatter;
 use crate::ops::linear::Affine;
-use crate::ops::linear::Linear;
 use crate::ops::normalization::{RmsNorm, span::Tiled};
-use crate::ops::pointwise::{activation::Silu, add::Add, multiply::Multiply};
+use crate::ops::pointwise::add::Add;
 use crate::ops::reduction::Argmax;
 use crate::ops::rotary::Rotary;
 use crate::ops::swiglu;
-use crate::specialize::attention::{Decode, Strategy};
+use crate::specialize::attention::Decode;
 use crate::tensor::axis::{self, Limit};
 use crate::tensor::form::Weight;
 use crate::tensor::memory::Memory;
-use crate::tensor::parallel::{Chip, Parallelism};
+use crate::tensor::parallel::Chip;
 use crate::tensor::scalar::F32;
-use crate::{Layers, Rolled, Sequential, Then};
 use catalog::Depth;
 use furiosa_opt_std::prelude::*;
 
@@ -64,21 +52,6 @@ pub mod launch;
 
 /// A published Qwen3 checkpoint size, by its hub spelling.
 pub struct Size<const N: &'static str>;
-
-/// HF `Qwen3ForCausalLM`: the base model, then the greedy vocabulary head.
-pub type ForCausalLM<S, P, Q, C, X> = super::ForCausalLM<S, Model<S, P, Q, C, X>, LmHead<S, X>, P>;
-
-/// HF `Qwen3ForSequenceClassification`: the base model, then the scores of its last row.
-pub type ForSequenceClassification<S, P, Q, C, X> =
-    super::ForSequenceClassification<S, Model<S, P, Q, C, X>, Classifier<Hidden<S>>, P>;
-
-/// HF `Qwen3Model`: the embedding, the layers and the final norm, and the constants that prepare a
-/// call's attention context.
-pub type Model<S, P, Q, C, X> = super::Model<S, Body<S, P, Q, C, X>, RotaryEmbedding<S, C, X>, P>;
-
-/// HF `Qwen3DecoderLayer`: one element of `model.layers`, a subtree that loads alone.
-pub type DecoderLayer<S, P, Q, C, X> =
-    PreNorm<SelfAttention<S, P, Q, C, X>, Mlp<S, P, Q, X>, Norm<S, Hidden<S>, X>, Add>;
 
 /// The greedy head over the vocabulary rows: the projection whose bias lowers the padded rows, and
 /// the first maximum of each row's scores.
@@ -96,150 +69,19 @@ type Hidden<S> = <S as Geometry>::Hidden;
 type Vocabulary<S> = <S as Geometry>::Vocabulary;
 type Groups<S> = <S as Geometry>::Groups;
 type Norm<S, W, X> = <S as Geometry>::Norm<W, X>;
-type Chips<Q> = <Q as Parallelism>::Chip;
-type Rows<S> = <S as Decode>::Rows;
 
-/// The embedding, the layers and the final norm, whose rows a call stores.
-type Body<S, P, Q, C, X> = Then<
-    Normalized<
-        Backbone<
-            Named<
-                "embed_tokens",
-                Embedding<
-                    Vocabulary<S>,
-                    Hidden<S>,
-                    Chips<Q>,
-                    <X as Memory>::Tensor<
-                        bf16,
-                        Chips<Q>,
-                        m![{ Symbol<Vocabulary<S>> }, { Symbol<Hidden<S>> }],
-                    >,
-                >,
-            >,
-            Layers<<S as Geometry>::Layers<DecoderLayer<S, P, Q, C, X>>, Rolled>,
-        >,
-        Norm<S, Hidden<S>, X>,
-    >,
-    Store,
->;
-
-/// The query, key and value heads of a row, as a family computes them from a `Projection`: Qwen3
-/// normalizes each query and key head by `Norm`, Llama takes them as projected.
+/// Whether a family normalizes each query and key head of a row: Qwen3 does by `Norm`, Llama
+/// takes the heads as projected.
 pub trait Front {
-    type Heads<Projection, Norm>;
     /// The norm of each query or key head of the catalog's layer: `Norm`, or none, `()`.
     type HeadNorm<Norm>;
 }
 
-/// The packed query, key and value projection of a size in form `P`, unpacked into heads.
-type Packing<S, P, X> = Sequential<
-    <P as Form>::Of<
-        Hidden<S>,
-        <S as Decode>::Width,
-        bf16,
-        Chip,
-        X,
-        Packed<<S as Geometry>::KvHeads, <S as Decode>::Packed, X, <P as Form>::Stored>,
-    >,
-    Split<<S as Decode>::Width, <S as Geometry>::KvHeads, Groups<S>, <S as Geometry>::Head>,
->;
-
 impl<const N: &'static str> Front for Size<N> {
-    type Heads<Projection, Norm> =
-        NormalizedQkv<Projection, Named<"q_norm", Norm>, Named<"k_norm", Norm>>;
     type HeadNorm<Norm> = Norm;
 }
 
-/// The size's query, key and value front, the rotation, the cache write, the attention over each
-/// row's whole history and the output projection.
-type SelfAttention<S, P, Q, C, X> = Cached<
-    <S as Front>::Heads<Packing<S, P, X>, Norm<S, <S as Geometry>::Head, X>>,
-    Rotary<<S as Geometry>::Head, <S as Geometry>::Head, C>,
-    Scatter,
-    (),
-    Attention<
-        PhantomData<(<S as Geometry>::KvHeads, Groups<S>, <S as Geometry>::Head)>,
-        F32<SCALE>,
-        { Strategy::Items },
-    >,
-    Named<"o_proj", Projection<P, <S as Geometry>::Queries, Hidden<S>, Q, X>>,
->;
-
-/// The gated feed-forward over the size's intermediate features.
-type Mlp<S, P, Q, X> = Glu<
-    Projection<P, Hidden<S>, Intermediate<S>, Q, X>,
-    Silu,
-    Projection<P, Hidden<S>, Intermediate<S>, Q, X>,
-    Multiply,
-    Projection<P, Intermediate<S>, Hidden<S>, Q, X>,
->;
-
-/// A projection in form `P` on the chips of placement `Q`, in memory `X`.
-type Projection<P, In, Out, Q, X> = decoder::Projection<P, In, Out, bf16, Chips<Q>, X>;
-
 type Intermediate<S> = <S as Geometry>::Intermediate;
-
-/// A LoRA adapter of the size `S` as PEFT saves it, over the memory `X`: each layer's update of
-/// its packed query, key and value projection, its output projection and its feed-forward's gate,
-/// up and down projections.
-pub type Adapter<S, X> = Named<
-    "base_model",
-    Named<
-        "model",
-        Named<
-            "model",
-            Named<
-                "layers",
-                <S as Geometry>::Layers<(
-                    Named<
-                        "self_attn",
-                        (
-                            lora::Packed<
-                                <S as Geometry>::KvHeads,
-                                <S as Geometry>::Queries,
-                                Factors<Rank<3>, Hidden<S>, <S as Decode>::Width, X>,
-                            >,
-                            Named<
-                                "o_proj",
-                                Factors<Rank<1>, <S as Geometry>::Queries, Hidden<S>, X>,
-                            >,
-                        ),
-                    >,
-                    Named<
-                        "mlp",
-                        (
-                            Named<"gate_proj", Factors<Rank<1>, Hidden<S>, Intermediate<S>, X>>,
-                            Named<"up_proj", Factors<Rank<1>, Hidden<S>, Intermediate<S>, X>>,
-                            Named<"down_proj", Factors<Rank<1>, Intermediate<S>, Hidden<S>, X>>,
-                        ),
-                    >,
-                )>,
-            >,
-        >,
-    >,
->;
-
-/// An update's `[K, In]` and `[Out, K]` factors in memory `X`.
-type Factors<K, In, Out, X> = Term<
-    <X as Memory>::Tensor<bf16, m![1], m![K, In]>,
-    <X as Memory>::Tensor<bf16, m![1], m![Out, K]>,
->;
-
-/// The constants that prepare a call's rotations, write slots and paged history reads, for the
-/// rows of a call and a cache of form `C`.
-type RotaryEmbedding<S, C, X> = key_value::Preparation<
-    Rows<S>,
-    key_value::Paging<
-        <S as Geometry>::KvHeads,
-        <S as Geometry>::Head,
-        Rows<S>,
-        <S as Decode>::Windows,
-        C,
-        X,
-    >,
-    Chip,
-    X,
->;
 
 /// The score multiplier of Qwen3's 128-feature heads.
 const SCALE: usize = scale(Head::SIZE);
@@ -433,20 +275,12 @@ where
     type Hf = Config;
 }
 
-/// The work a call's host plans for a size of `G` query heads a key and value head, in `WAVES`
-/// wide tiles; it plans no prompt chunk.
-type Work<G, const WAVES: usize> =
-    paged::Work<Prompts, KvHeads, G, Head, paged::Waves<WAVES>, Chunks>;
-
 // The rotary tiles of a launch's 1024 rows.
 axes![Slots = 8];
 
 impl Decode for Size<"0.6B"> {
     type Rows = Limit<16, 64>;
     type Windows = Windows<256>;
-    type Width = ProjectionWidth<4096>;
-    type Packed = m![{ Symbol<ProjectionWidth<4096>> }, { Symbol<geometry::Hidden<1024>> }];
-    type Work = Work<QueryGroups<2>, { tiles::<Self>() }>;
     type Capacity = axis::Rows<1024>;
     type Reach = axis::Rows<2048>;
     type Sequences = axis::Rows<8>;
@@ -461,9 +295,6 @@ impl Tiled for geometry::Hidden<1024> {
 impl Decode for Size<"1.7B"> {
     type Rows = Limit<16, 64>;
     type Windows = Windows<256>;
-    type Width = ProjectionWidth<4096>;
-    type Packed = m![{ Symbol<ProjectionWidth<4096>> }, { Symbol<geometry::Hidden<2048>> }];
-    type Work = Work<QueryGroups<2>, { tiles::<Self>() }>;
     type Capacity = axis::Rows<1024>;
     type Reach = axis::Rows<2048>;
     type Sequences = axis::Rows<8>;
@@ -478,9 +309,6 @@ impl Tiled for geometry::Hidden<2048> {
 impl Decode for Size<"4B"> {
     type Rows = Limit<16, 64>;
     type Windows = Windows<256>;
-    type Width = ProjectionWidth<6144>;
-    type Packed = m![{ Symbol<ProjectionWidth<6144>> }, { Symbol<geometry::Hidden<2560>> }];
-    type Work = Work<QueryGroups<4>, { tiles::<Self>() }>;
     type Capacity = axis::Rows<1024>;
     type Reach = axis::Rows<2048>;
     type Sequences = axis::Rows<8>;
@@ -497,9 +325,6 @@ impl Decode for Size<"8B"> {
     // The shared context its checkpoint declares, by choice: its call's 192 tiles would hold 96
     // windows a row, and more windows take more tiles, a kernel change to measure.
     type Windows = Chunks;
-    type Width = ProjectionWidth<6144>;
-    type Packed = m![KvHeads, { Symbol<HeadRows<6>> }, Head, { Symbol<geometry::Hidden<4096>> }];
-    type Work = Work<QueryGroups<4>, { tiles::<Self>() }>;
     type Capacity = axis::Rows<1024>;
     type Reach = axis::Rows<2048>;
     type Sequences = axis::Rows<8>;
@@ -750,63 +575,9 @@ pub(in crate::models) mod tests {
     use super::*;
     use crate::load::{Checkpoint, Load};
     use crate::models::decoder::form;
-    use crate::modules::generic::collection::Stacked;
-    use crate::modules::generic::schedule::{Begin, Fill, Spill};
-    use crate::modules::residual::{Residual, Sum};
     use crate::ops::index::table::FIELDS;
-    use crate::ops::linear::query::group::{Group, TilePair, Tiles};
-    use crate::ops::linear::query::{Tile, launch::Normalized};
-    use crate::ops::linear::{fp8, query};
-    use crate::ops::normalization::span::{Owned, Span};
-    use crate::ops::normalization::{Blocked, RowMajor, Spread, tests::random};
-    use crate::tensor::form::fp8::Granularity;
-    use crate::tensor::live::{self, Live};
     use crate::tensor::memory::Hbm;
-    use crate::tensor::parallel::Parallel;
-    use crate::tensor::{cache, scalar};
-    use crate::tests::DEVICE;
-    use crate::{Fork, Module};
-    use core::borrow::Borrow;
-    use core::task::Poll;
-    use furiosa_opt_std::runtime::launch;
-    use safetensors::Dtype;
     use serde_json::{Value, json};
-
-    /// Qwen3-4B, whose 32 query heads fill the slices the head projections lay their rows out in.
-    type Four = Size<"4B">;
-    type FourHidden = Hidden<Four>;
-    type FourQueries = <Four as Geometry>::Queries;
-    type FourIntermediate = Intermediate<Four>;
-    /// The rows of a launch of Qwen3-4B.
-    type Launch = <Four as Decode>::Capacity;
-    /// A launch's hidden rows, blocked as its span loops fill and spill them.
-    type Hiddens = HbmTensor<bf16, Chip, Blocked<FourHidden, Launch>>;
-    /// A launch's rows of `Heads` heads: its query heads, or its key or value heads.
-    type HeadRows<Heads> = HbmTensor<bf16, Chip, m![Launch, Heads, Head]>;
-    type QueryRows = HeadRows<QueryHeads<Four>>;
-    type KeyRows = HeadRows<KvHeads>;
-    /// A launch's attended rows, the output projection's input.
-    type Attended = HbmTensor<
-        bf16,
-        Chip,
-        m![{ Symbol<<Four as Decode>::Reach> }, KvHeads, { Symbol<Groups<Four>> }, Head],
-    >;
-    /// A span's rows of `W` features in HBM, as the MLP's projections give and take them.
-    type Lines<W> = HbmTensor<bf16, Chip, m![Span, W]>;
-    /// Sixteen rows of `W` features, as the decoder layer's projections give and take them.
-    type Sixteen<W> = HbmTensor<bf16, Chip, RowMajor<W, axis::Sixteen>>;
-    /// Two of the catalog's channel-scaled Qwen3-4B layers, stacked as the catalog stacks its
-    /// layers, and the two decoder layers of the same form.
-    type Catalogued = Stacked<Layer<Four, form::ChannelScaled, bf16, Hbm>, 2>;
-    type Decoded = (
-        Named<"0", DecoderLayer<Four, form::ChannelScaled, Parallel<1>, cache::Bf16, Hbm>>,
-        Named<"1", DecoderLayer<Four, form::ChannelScaled, Parallel<1>, cache::Bf16, Hbm>>,
-    );
-    type GateUp = <form::ChannelScaled as Form>::GateUp<FourHidden, FourIntermediate, Hbm>;
-    type Down = <form::ChannelScaled as Form>::Down<FourHidden, FourIntermediate, Hbm>;
-    type Output = <form::ChannelScaled as Form>::Output<FourQueries, FourHidden, Hbm>;
-    /// The live rows of each launch: a pair of tiles and part of a third, in one span.
-    const LIVE: usize = 300;
 
     /// The BF16 instance of the catalog loads from a checkpoint, as the FP8 one does.
     #[test]
@@ -896,7 +667,7 @@ pub(in crate::models) mod tests {
     }
 
     /// A call of a size's rows, each attending its whole compiled context, plans within the tiles
-    /// the size's work is compiled for, under either tiling.
+    /// the size's launch work is compiled for, under either tiling.
     #[test]
     fn plans_every_row_over_the_whole_context() {
         fn rows<S: Decode>(keys: usize) -> Vec<[i32; FIELDS]> {
@@ -907,16 +678,17 @@ pub(in crate::models) mod tests {
             launch::Positions::<S>::SIZE
         }
         let ids = vec![1; 1 << 18];
-        type Small = <Size<"0.6B"> as Decode>::Work;
-        type Grouped = <Size<"4B"> as Decode>::Work;
-        type Large = <Size<"8B"> as Decode>::Work;
+        type Rows<S> = <S as Decode>::Rows;
         let small = rows::<Size<"0.6B">>(context::<Size<"0.6B">>());
         let grouped = rows::<Size<"4B">>(context::<Size<"4B">>());
         let large = rows::<Size<"8B">>(context::<Size<"8B">>());
         for tiling in [paged::Tiling::Adaptive, paged::Tiling::Fixed] {
-            Small::sequential::<Rows<Size<"0.6B">>>(&small, &ids, tiling).unwrap();
-            Grouped::sequential::<Rows<Size<"4B">>>(&grouped, &ids, tiling).unwrap();
-            Large::sequential::<Rows<Size<"8B">>>(&large, &ids, tiling).unwrap();
+            launch::Work::<Size<"0.6B">>::sequential::<Rows<Size<"0.6B">>>(&small, &ids, tiling)
+                .unwrap();
+            launch::Work::<Size<"4B">>::sequential::<Rows<Size<"4B">>>(&grouped, &ids, tiling)
+                .unwrap();
+            launch::Work::<Size<"8B">>::sequential::<Rows<Size<"8B">>>(&large, &ids, tiling)
+                .unwrap();
         }
     }
 
@@ -1030,470 +802,5 @@ pub(in crate::models) mod tests {
         let mut widest = published();
         widest["vocab_size"] = json!(152064);
         parse(&widest).unwrap();
-    }
-
-    /// A launch's hidden rows through the catalog layer's query, key and value projections in the
-    /// steps the decoder loop takes them, each period's heads stored at its rows.
-    #[device(chip = 1)]
-    fn qkv(
-        device: &mut Device,
-        projections: &Qkv<Four, form::ChannelScaled, Hbm>,
-        input: &Hiddens,
-        count: &scalar::Value,
-    ) -> (QueryRows, KeyRows, KeyRows) {
-        type Pair = <TilePair as Group>::Period;
-        let live: Live<(), Launch> = Live::read(count);
-        let attention::Projection { query, key, value } = projections;
-        let value = value.forward(&mut *device, live, &mut (), Begin(()));
-        let mut launch = value.forward(&mut *device, live, &mut (), Begin(()));
-        let key = key.forward(&mut *device, live, &mut (), Begin(()));
-        let query = query.forward(&mut *device, live, &mut (), Begin(()));
-        let mut rows = Normalized::new();
-        for span in 0..live.count::<Span>() {
-            let tile = live.tile::<Span>(span);
-            let spanned = input.fill(&mut *device, tile);
-            rows.spill(&mut *device, &spanned, (tile, live.rows()));
-        }
-        let mut stored = (QueryRows::new(), KeyRows::new(), KeyRows::new());
-        let pairs = live.count::<Tile>() / 2;
-        for _ in 0..pairs.min(1) {
-            let begin = Begin(launch.period::<TilePair>(&rows, 0));
-            value.forward(&mut *device, live, &mut (), begin);
-        }
-        for at in 0..pairs {
-            let next = launch.period::<TilePair>(&rows, at);
-            let period = value.forward(&mut *device, live, &mut (), next);
-            let start = live.tile::<Pair>(at).start();
-            let queries = query.forward(&mut *device, live, &mut (), &period);
-            store(&mut *device, &queries, &mut stored.0, start);
-            let keys = key.forward(&mut *device, live, &mut (), &period);
-            store(&mut *device, &keys, &mut stored.1, start);
-            let values = value.forward(&mut *device, live, &mut (), &period);
-            store(&mut *device, &values, &mut stored.2, start);
-        }
-        for _ in 0..live.count::<Tile>() % 2 {
-            let next = launch.period::<Tiles<1>>(&rows, pairs);
-            let period = value.forward(&mut *device, live, &mut (), next);
-            let start = live.tile::<Tile>(2 * pairs).start();
-            let queries = query.forward(&mut *device, live, &mut (), &period);
-            store(&mut *device, &queries, &mut stored.0, start);
-            let keys = key.forward(&mut *device, live, &mut (), &period);
-            store(&mut *device, &keys, &mut stored.1, start);
-            let values = value.forward(&mut *device, live, &mut (), &period);
-            store(&mut *device, &values, &mut stored.2, start);
-        }
-        stored
-    }
-
-    /// A period's projected heads at the launch's rows from row `start`.
-    fn store<G: Group, Heads: AxisName, Spread: M, Local: M>(
-        device: &mut Device,
-        heads: &query::Output<G, Heads, Head, Spread, Local>,
-        rows: &mut HeadRows<Heads>,
-        start: usize,
-    ) {
-        // SAFETY: every form names Reduced's slices with the output's slice names.
-        let heads = unsafe {
-            heads.view().reshape::<Chip, query::Cluster<Heads>, query::Reduced<G, Heads, Spread>,
-                m![{ Local }, Tile % 8, Head]>()
-        };
-        heads.to_hbm_view(&mut device.tdma, G::window(rows.view_mut(), start));
-    }
-
-    /// A launch's attended rows through the catalog layer's output projection, a span at a time,
-    /// in the steps the decoder loop takes it.
-    #[device(chip = 1)]
-    fn output(
-        device: &mut Device,
-        projection: &Output,
-        attended: &Attended,
-        count: &scalar::Value,
-    ) -> Hiddens {
-        let live: Live<(), Launch> = Live::read(count);
-        projection.forward(&mut *device, (), &mut (), Begin(()));
-        projection.forward(&mut *device, (), &mut (), &mut ());
-        let mut rows = Hiddens::new();
-        for span in 0..live.count::<Span>() {
-            let tile = live.tile::<Span>(span);
-            let step = (&mut (), attended, tile);
-            let projected = match projection.forward(&mut *device, (), &mut (), step) {
-                Poll::Ready(projected) => projected,
-                Poll::Pending => Owned::new(),
-            };
-            rows.spill(&mut *device, &projected, tile);
-        }
-        rows
-    }
-
-    /// A launch's first span of hidden rows through the catalog layer's gate and up projections,
-    /// and its `product` rows through the down projection, in the steps the decoder loop takes them.
-    #[device(chip = 1)]
-    fn mlp(
-        device: &mut Device,
-        (gate_up, down): (&GateUp, &Down),
-        input: &Hiddens,
-        product: &Lines<FourIntermediate>,
-        count: &scalar::Value,
-    ) -> (Lines<swiglu::GateUp<FourIntermediate>>, Hiddens) {
-        let tile = Live::<(), Launch>::read(count).tile::<Span>(0);
-        let rows = input.fill(&mut *device, tile);
-        gate_up.forward(&mut *device, (), &mut (), Begin(()));
-        let projected = gate_up.forward(&mut *device, (), &mut (), ((), tile.with(&rows)));
-        // SAFETY: the product is read only, and only within this call.
-        let product = unsafe { product.view().alias() };
-        let staged = down.forward(&mut *device, (), &mut (), Begin(tile.with(product)));
-        let fed = down.forward(&mut *device, (), &mut (), tile.with(staged));
-        let mut rows = Hiddens::new();
-        rows.spill(&mut *device, &fed, tile);
-        (projected, rows)
-    }
-
-    /// Sixteen rows at most of `In` features through a channel-scaled projection of the decoder
-    /// layer, whose codes it holds as `W`.
-    #[device(chip = 1)]
-    fn sixteen<In: AxisName, Out: AxisName, W>(
-        device: &mut Device,
-        projection: &fp8::ChannelScaled<In, Out, W>,
-        input: &Sixteen<In>,
-        count: &scalar::Value,
-    ) -> Sixteen<Out>
-    where
-        W: Borrow<HbmTensor<f8e4m3, Chip, m![Out, In]>> + DeviceSend,
-    {
-        let rows = input.to_dm(&mut device.tdma);
-        let input: Live<Spread<In, axis::Sixteen>, axis::Sixteen> =
-            Live::<(), axis::Sixteen>::read(count).with(rows);
-        let projected = crate::Op::forward(projection, &mut *device, &input);
-        projected.value().to_hbm(&mut device.tdma)
-    }
-
-    /// Two Qwen3-4B layers' BF16 checkpoint, the layers' weights apart: each projection's rows up to
-    /// sixteen times apart, so that a tensor scale leaves the small rows subnormal.
-    fn four(directory: &std::path::Path) -> Checkpoint {
-        let mut checkpoint = Checkpoint::new(directory, Some(json!({}))).unwrap();
-        let (hidden, queries, pairs, intermediate) = (
-            FourHidden::SIZE,
-            FourQueries::SIZE,
-            KvHeads::SIZE * Head::SIZE,
-            FourIntermediate::SIZE,
-        );
-        let gains = [
-            ("input_layernorm", hidden),
-            ("post_attention_layernorm", hidden),
-            ("self_attn.q_norm", Head::SIZE),
-            ("self_attn.k_norm", Head::SIZE),
-        ];
-        let weights = [
-            ("self_attn.q_proj", [queries, hidden]),
-            ("self_attn.k_proj", [pairs, hidden]),
-            ("self_attn.v_proj", [pairs, hidden]),
-            ("self_attn.o_proj", [hidden, queries]),
-            ("mlp.gate_proj", [intermediate, hidden]),
-            ("mlp.up_proj", [intermediate, hidden]),
-            ("mlp.down_proj", [hidden, intermediate]),
-        ];
-        let tensors = (gains.into_iter())
-            .map(|(name, width)| (name, vec![width], 1.0, 1))
-            .chain(
-                weights.map(|(name, [rows, columns])| (name, vec![rows, columns], 0.0, columns)),
-            );
-        let layers = tensors.flat_map(|tensor| (0..2).map(move |layer| (layer, tensor.clone())));
-        for (seed, (layer, (name, shape, offset, row))) in layers.enumerate() {
-            let count = shape.iter().product();
-            let values = random(count, 0x5eed_0000 + seed as u64)
-                .into_iter()
-                .enumerate();
-            let data = values
-                .map(|(at, value)| offset + value.to_f32() / (1 << (at / row % 5)) as f32)
-                .flat_map(|value| bf16::from_f32(value).to_bits().to_le_bytes())
-                .collect();
-            let name = format!("{layer}.{name}.weight");
-            checkpoint.insert(&name, Dtype::BF16, &shape, data).unwrap();
-        }
-        checkpoint
-    }
-
-    /// A channel-scaled weight's codes and each of its rows' scales, read back.
-    async fn held<In: AxisName, Out: AxisName, W, T>(
-        device: &mut Device,
-        weight: &fp8::ChannelScaled<In, Out, W, T>,
-    ) -> (Vec<u8>, Vec<f32>)
-    where
-        W: Borrow<HbmTensor<f8e4m3, Chip, m![Out, In]>>,
-        T: Borrow<HbmTensor<f32, Chip, m![Out, 1 # 8]>>,
-    {
-        let codes = weight.codes().to_host::<m![Out, In]>(&mut device.pdma);
-        let codes = f8e4m3::to_buf(&codes.await.unwrap().into_vec());
-        let scales = weight.scales().to_host::<m![Out, 1 # 8]>(&mut device.pdma);
-        let scales = scales
-            .await
-            .unwrap()
-            .into_vec()
-            .into_iter()
-            .step_by(8)
-            .collect();
-        (codes, scales)
-    }
-
-    /// The row of the decoder layer's joined query, key and value weight that holds row `row` of
-    /// its query (`0`), key (`1`) or value (`2`) part: each key/value head's query rows, key row
-    /// and value row in turn.
-    fn joined(part: usize, row: usize) -> usize {
-        let (head, queries) = (Head::SIZE, Groups::<Four>::SIZE * Head::SIZE);
-        let block = queries + 2 * head;
-        match part {
-            0 => row / queries * block + row % queries,
-            part => row / head * block + queries + (part - 1) * head + row % head,
-        }
-    }
-
-    /// Sixteen rows of `values` from row `first`, `W` features a row, in HBM.
-    async fn window<W: AxisName>(device: &mut Device, values: &[bf16], first: usize) -> Sixteen<W> {
-        let rows = values[first * W::SIZE..][..axis::Sixteen::SIZE * W::SIZE].to_vec();
-        let rows = HostTensor::<bf16, RowMajor<W, axis::Sixteen>>::from_vec(rows);
-        rows.to_hbm(&mut device.pdma).await.unwrap()
-    }
-
-    /// The RMS of `got - want` relative to that of `want`: about BF16's rounding, 2^-9, for two
-    /// contractions that sum the same products in other orders.
-    fn error(got: &[bf16], want: &[bf16]) -> f64 {
-        let (difference, norm) = (got.iter().zip(want)).fold((0.0, 0.0), |(d, n), (g, w)| {
-            let (g, w) = (f64::from(g.to_f32()), f64::from(w.to_f32()));
-            (d + (g - w) * (g - w), n + w * w)
-        });
-        (difference / norm).sqrt()
-    }
-
-    /// Two Qwen3-4B layers read quantized load into the catalog's stack of channel-scaled layers
-    /// with the codes and row scales the decoder layers' joined and separate projections hold, and
-    /// each stacked layer's projection, in the steps the decoder loop takes it, gives a launch's
-    /// rows the values the decoder layer's projection gives the same rows.
-    #[tokio::test(flavor = "current_thread")]
-    async fn channel_scaled_catalog_layer_computes_the_decoder_layer() {
-        let _lease = DEVICE.lock().await;
-        let mut device = Device::new(qkv.topology()).unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        let source = four(directory.path());
-        let (hidden, queries) = (FourHidden::SIZE, FourQueries::SIZE);
-        let intermediate = FourIntermediate::SIZE;
-        let inputs = random(Launch::SIZE * hidden, 0x00f8_0a11);
-        let attended = random(<Four as Decode>::Reach::SIZE * queries, 0x00a7_7e4d);
-        let products = random(Span::SIZE * intermediate, 0x0d0b_0e11);
-        let count = live::tests::count(LIVE)
-            .to_hbm(&mut device.pdma)
-            .await
-            .unwrap();
-        let sixteen_rows = live::tests::count(axis::Sixteen::SIZE);
-        let sixteen_rows = sixteen_rows.to_hbm(&mut device.pdma).await.unwrap();
-        let rows = HostTensor::<bf16, m![Launch, FourHidden]>::from_vec(inputs.clone());
-        let rows: Hiddens = rows.to_hbm(&mut device.pdma).await.unwrap();
-        let attended_rows = HostTensor::<
-            bf16,
-            m![{ Symbol<<Four as Decode>::Reach> }, KvHeads, { Symbol<Groups<Four>> }, Head],
-        >::from_vec(attended.clone());
-        let attended_rows: Attended = attended_rows.to_hbm(&mut device.pdma).await.unwrap();
-        let product = HostTensor::<bf16, m![Span, FourIntermediate]>::from_vec(products.clone());
-        let product: Lines<FourIntermediate> = product.to_hbm(&mut device.pdma).await.unwrap();
-        let (mut exact, mut compared) = (0usize, 0usize);
-        let mut check = |got: &[bf16], want: &[bf16], what: &dyn Fn() -> String| {
-            let error = error(got, want);
-            assert!(error <= 0.004, "{}: relative error {error}", what());
-            let equal = got
-                .iter()
-                .zip(want)
-                .filter(|(g, w)| g.to_bits() == w.to_bits());
-            exact += equal.count();
-            compared += got.len();
-        };
-        for granularity in [Granularity::Tensor, Granularity::Channel] {
-            let quantized = source.quantized(granularity).unwrap();
-            let stack: Catalogued = quantized.load(&mut device).unwrap();
-            let layers: Decoded = quantized.load(&mut device).unwrap();
-            for (layer, decoded) in [&layers.0.0, &layers.1.0].into_iter().enumerate() {
-                let granularity = (granularity, layer);
-                let catalogued = stack.layer(layer);
-                let Sequential(Residual(_, attention, _), Residual(_, catalogued_mlp, _)) =
-                    &catalogued;
-                let attention::Attention {
-                    qkv:
-                        attention::Positioned {
-                            projection: NormalizedQkv { projection, .. },
-                            ..
-                        },
-                    output: catalogued_output,
-                    ..
-                } = &attention.0;
-                let (gate_up, down) = catalogued_mlp.0.parts();
-                let Sequential(Residual(_, attention, _), Residual(_, decoded_mlp, _)) = decoded;
-                let attention::Attention {
-                    qkv:
-                        attention::Positioned {
-                            projection:
-                                NormalizedQkv {
-                                    projection: Sequential(joint, _),
-                                    ..
-                                },
-                            ..
-                        },
-                    output: decoded_output,
-                    ..
-                } = &attention.0;
-                let Sum(Fork((Then(gate, _), up)), Then(_, decoded_down)) = &decoded_mlp.0;
-                // The same codes and scales, the joined rows by part.
-                let (joint_codes, joint_scales) = held(&mut device, joint).await;
-                let parts = [
-                    held(&mut device, projection.query.0.held()).await,
-                    held(&mut device, projection.key.0.0.held()).await,
-                    held(&mut device, projection.value.0.0.held()).await,
-                ];
-                for (part, (codes, scales)) in parts.iter().enumerate() {
-                    for (row, scale) in scales.iter().enumerate() {
-                        let at = joined(part, row);
-                        assert_eq!(
-                            *scale, joint_scales[at],
-                            "{granularity:?}: part {part} row {row}"
-                        );
-                        let (codes, joint) = (
-                            &codes[row * hidden..][..hidden],
-                            &joint_codes[at * hidden..][..hidden],
-                        );
-                        assert_eq!(codes, joint, "{granularity:?}: part {part} row {row}");
-                    }
-                }
-                let catalogued_output = &catalogued_output.0;
-                assert_eq!(
-                    held(&mut device, catalogued_output.held()).await,
-                    held(&mut device, &decoded_output.0).await,
-                    "{granularity:?}: output",
-                );
-                let (gates, ups) = (
-                    held(&mut device, &gate.0).await,
-                    held(&mut device, &up.0).await,
-                );
-                assert_eq!(
-                    held(&mut device, &gate_up.affine.weight).await,
-                    ([gates.0, ups.0].concat(), [gates.1, ups.1].concat()),
-                    "{granularity:?}: gate and up",
-                );
-                assert_eq!(
-                    held(&mut device, &down.affine.weight).await,
-                    held(&mut device, &decoded_down.0).await,
-                    "{granularity:?}: down",
-                );
-                // The same values: the catalog's launch against the decoder layer's sixteen rows.
-                let (queried, keyed, valued) =
-                    launch(qkv, (&mut device, projection, &rows, &count))
-                        .await
-                        .unwrap();
-                let queried = queried
-                    .to_host::<m![Launch, { Symbol<QueryHeads<Four>> }, Head]>(&mut device.pdma);
-                let queried = queried.await.unwrap().into_vec();
-                let keyed = keyed.to_host::<m![Launch, KvHeads, Head]>(&mut device.pdma);
-                let keyed = keyed.await.unwrap().into_vec();
-                let valued = valued.to_host::<m![Launch, KvHeads, Head]>(&mut device.pdma);
-                let parts = [queried, keyed, valued.await.unwrap().into_vec()];
-                let width = <Four as Decode>::Width::SIZE;
-                for first in [0, 2 * Tile::SIZE] {
-                    let input = window::<FourHidden>(&mut device, &inputs, first).await;
-                    let want = launch(sixteen, (&mut device, joint, &input, &sixteen_rows))
-                        .await
-                        .unwrap();
-                    let want = want
-                        .to_host::<RowMajor<<Four as Decode>::Width, axis::Sixteen>>(
-                            &mut device.pdma,
-                        )
-                        .await
-                        .unwrap()
-                        .into_vec();
-                    for row in 0..axis::Sixteen::SIZE {
-                        for (part, got) in parts.iter().enumerate() {
-                            let features = got.len() / Launch::SIZE;
-                            let got = &got[(first + row) * features..][..features];
-                            let joint = (0..features)
-                                .map(|feature| want[row * width + joined(part, feature)]);
-                            let what =
-                                || format!("{granularity:?}: part {part} row {}", first + row);
-                            check(got, &joint.collect::<Vec<_>>(), &what);
-                        }
-                    }
-                }
-                let projected = launch(
-                    output,
-                    (&mut device, catalogued_output, &attended_rows, &count),
-                )
-                .await
-                .unwrap();
-                let projected = projected
-                    .to_host::<m![Launch, FourHidden]>(&mut device.pdma)
-                    .await
-                    .unwrap()
-                    .into_vec();
-                let input = window::<FourQueries>(&mut device, &attended, 0).await;
-                let want = launch(
-                    sixteen,
-                    (&mut device, &decoded_output.0, &input, &sixteen_rows),
-                )
-                .await
-                .unwrap();
-                let want = want
-                    .to_host::<RowMajor<FourHidden, axis::Sixteen>>(&mut device.pdma)
-                    .await
-                    .unwrap()
-                    .into_vec();
-                for (row, want) in want.chunks_exact(hidden).enumerate() {
-                    let what = || format!("{granularity:?}: output row {row}");
-                    check(&projected[row * hidden..][..hidden], want, &what);
-                }
-                let (gated, fed) =
-                    launch(mlp, (&mut device, (gate_up, down), &rows, &product, &count))
-                        .await
-                        .unwrap();
-                let gated = gated
-                    .to_host::<m![Span, { Symbol<swiglu::GateUp<FourIntermediate>> }]>(
-                        &mut device.pdma,
-                    )
-                    .await
-                    .unwrap()
-                    .into_vec();
-                let fed = fed
-                    .to_host::<m![Launch, FourHidden]>(&mut device.pdma)
-                    .await
-                    .unwrap()
-                    .into_vec();
-                let input = window::<FourHidden>(&mut device, &inputs, 0).await;
-                for (half, projection) in [&gate.0, &up.0].into_iter().enumerate() {
-                    let want = launch(sixteen, (&mut device, projection, &input, &sixteen_rows))
-                        .await
-                        .unwrap();
-                    let want = want
-                        .to_host::<RowMajor<FourIntermediate, axis::Sixteen>>(&mut device.pdma)
-                        .await
-                        .unwrap()
-                        .into_vec();
-                    for (row, want) in want.chunks_exact(intermediate).enumerate() {
-                        let got = &gated[(2 * row + half) * intermediate..][..intermediate];
-                        let what = || format!("{granularity:?}: gate/up {half} row {row}");
-                        check(got, want, &what);
-                    }
-                }
-                let input = window::<FourIntermediate>(&mut device, &products, 0).await;
-                let want = launch(
-                    sixteen,
-                    (&mut device, &decoded_down.0, &input, &sixteen_rows),
-                )
-                .await
-                .unwrap();
-                let want = want
-                    .to_host::<RowMajor<FourHidden, axis::Sixteen>>(&mut device.pdma)
-                    .await
-                    .unwrap()
-                    .into_vec();
-                for (row, want) in want.chunks_exact(hidden).enumerate() {
-                    let what = || format!("{granularity:?}: down row {row}");
-                    check(&fed[row * hidden..][..hidden], want, &what);
-                }
-            }
-        }
-        eprintln!("{exact} of {compared} values equal bit for bit");
     }
 }
