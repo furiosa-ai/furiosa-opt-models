@@ -1,6 +1,6 @@
 //! `(x - mean(x)) / sqrt(var(x) + epsilon) * w + b` per row.
 
-use super::{Lines, Tile, TilePart, TileParts, TileRows, Widen};
+use super::{Lines, Tile, TilePart, TileParts, TileRows, Widen, tiles};
 use crate::Op;
 use crate::load::{Checkpoint, Children, Context, Load, LoadError};
 use crate::tensor::scalar::F32;
@@ -110,7 +110,7 @@ where
 }
 
 /// Rows of `D` as `bf16((x - mean) / sqrt(var + eps) * w + b)`, the variance of the centered rows,
-/// FP32 inside, tile `t` computing while `t + 1` arrives and `t - 1` is stored.
+/// FP32 inside, a tile at a time.
 impl<'w, D, W: AxisName, R: AxisName, Chips: M, const EPSILON: usize>
     Op<&HbmTensor<D, Chips, m![R, W]>>
     for LayerNorm<&'w HbmTensor<bf16, Chips, m![W]>, &'w HbmTensor<f32, Chips, m![1]>, EPSILON>
@@ -120,14 +120,6 @@ where
     type Output = HbmTensor<bf16, Chips, m![R, W]>;
 
     fn forward(&self, device: &mut Device, input: &HbmTensor<D, Chips, m![R, W]>) -> Self::Output {
-        type T<W> = Symbol<TileRows<W, VECTORS>>;
-        let tiles = const {
-            assert!(
-                R::SIZE.is_multiple_of(TileRows::<W, VECTORS>::SIZE),
-                "rows come in whole tiles"
-            );
-            R::SIZE / TileRows::<W, VECTORS>::SIZE
-        };
         let feature = |device: &mut Device, vector: &HbmTensor<bf16, Chips, m![W]>| {
             let in_dm: Tile<bf16, R, W, VECTORS, Chips> = vector.view().to_dm(&mut device.tdma);
             in_dm.widen::<W, 16>(&mut device.sub)
@@ -144,23 +136,7 @@ where
             .fetch::<m![1], m![1 # 8]>()
             .collect::<m![1], m![1 # 8]>()
             .to_vrf::<m![1 # 8]>();
-        let to_dm = |device: &mut Device, at: usize, tile: &mut Tile<D, R, W, VECTORS, Chips>| {
-            input
-                .view()
-                .tile::<m![R / ({ T<W> })], 1, m![R / ({ T<W> }) = 1 # (R / ({ T<W> })), R % ({ T<W> }), W]>(at)
-                .to_dm_view(&mut device.tdma, tile.view_mut());
-        };
         let mut output = HbmTensor::new();
-        let mut store = |device: &mut Device,
-                         tile: &Tile<bf16, R, W, VECTORS, Chips>,
-                         at: usize| {
-            tile.view().to_hbm_view(
-                &mut device.tdma,
-                output
-                    .view_mut()
-                    .tile::<m![R / ({ T<W> })], 1, m![R / ({ T<W> }) = 1 #{!} (R / ({ T<W> })), R % ({ T<W> }), W]>(at),
-            );
-        };
         type Statistic<R, W, Chips> = DmTensor<
             f32,
             Chips,
@@ -168,7 +144,10 @@ where
             m![R % ({ Symbol<Lines<W, VECTORS>> }), { Symbol<TileParts<W, VECTORS>> }],
             m![1 # 8],
         >;
-        let standardize =
+        tiles(
+            device,
+            input,
+            &mut output,
             |device: &mut Device,
              rows: &Tile<D, R, W, VECTORS, Chips>,
              normalized: &mut Tile<bf16, R, W, VECTORS, Chips>| {
@@ -258,32 +237,8 @@ where
                     .cast::<bf16, m![W % 8 # 16]>()
                     .commit_trim::<m![W % 8]>()
                     .commit_view(normalized.view_mut());
-            };
-        let (mut first, mut second): (
-            Tile<D, R, W, VECTORS, Chips>,
-            Tile<D, R, W, VECTORS, Chips>,
-        ) = (DmTensor::new(), DmTensor::new());
-        let (mut kept, mut held): (
-            Tile<bf16, R, W, VECTORS, Chips>,
-            Tile<bf16, R, W, VECTORS, Chips>,
-        ) = (DmTensor::new(), DmTensor::new());
-        to_dm(&mut *device, 0, &mut first);
-        if const { R::SIZE / TileRows::<W, VECTORS>::SIZE > 1 } {
-            to_dm(&mut *device, 1, &mut second);
-        }
-        for pair in 0..tiles / 2 {
-            let at = 2 * pair;
-            standardize(&mut *device, &first, &mut kept);
-            to_dm(&mut *device, (at + 2).min(tiles - 1), &mut first);
-            store(&mut *device, &kept, at);
-            standardize(&mut *device, &second, &mut held);
-            to_dm(&mut *device, (at + 3).min(tiles - 1), &mut second);
-            store(&mut *device, &held, at + 1);
-        }
-        if const { R::SIZE / TileRows::<W, VECTORS>::SIZE % 2 == 1 } {
-            standardize(&mut *device, &first, &mut kept);
-            store(&mut *device, &kept, tiles - 1);
-        }
+            },
+        );
         output
     }
 }

@@ -1,7 +1,7 @@
 //! `x * w / sqrt(mean(x²) + epsilon)` per row, with FP32 statistics and one rounding.
 
 use super::{
-    Chunk, Cluster, FeatureSlices, Lines, Spread, Tile, TilePart, TileParts, TileRows, Widen,
+    Chunk, Cluster, FeatureSlices, Lines, Spread, Tile, TilePart, TileParts, Widen, tiles,
 };
 use crate::Op;
 use crate::load::{Checkpoint, Context, Load, LoadError};
@@ -309,7 +309,7 @@ type TileLanes<R, W> = Lanes<
 >;
 
 /// Rows of `D` normalized by their RMS and the learned weight, rounded once to BF16, a tile at a
-/// time: tile t computes while tile t + 1 arrives and tile t - 1 is stored.
+/// time.
 impl<D, Width: AxisName, R: AxisName, const EPSILON: usize, Chips: M, T>
     Op<&HbmTensor<D, Chips, m![R, Width]>>
     for RmsNorm<Width, EPSILON, Chips, Weight<m![Width], Chips, T>>
@@ -324,75 +324,21 @@ where
         device: &mut Device,
         input: &HbmTensor<D, Chips, m![R, Width]>,
     ) -> Self::Output {
-        type T<Width> = Symbol<TileRows<Width, VECTORS>>;
-        let tiles = const {
-            assert!(
-                R::SIZE.is_multiple_of(TileRows::<Width, VECTORS>::SIZE),
-                "rows come in whole tiles"
-            );
-            R::SIZE / TileRows::<Width, VECTORS>::SIZE
-        };
-        let to_dm = |device: &mut Device,
-                     at: usize,
-                     tile: &mut Tile<D, R, Width, VECTORS, Chips>| {
-            input
-                .view()
-                .tile::<m![R / ({ T<Width> })], 1, m![R / ({ T<Width> }) = 1 # (R / ({ T<Width> })), R % ({ T<Width> }), Width]>(at)
-                .to_dm_view(&mut device.tdma, tile.view_mut());
-        };
         let mut output = HbmTensor::new();
-        let mut store = |device: &mut Device,
-                         tile: &Tile<bf16, R, Width, VECTORS, Chips>,
-                         at: usize| {
-            tile.view().to_hbm_view(
-                &mut device.tdma,
-                output
-                    .view_mut()
-                    .tile::<m![R / ({ T<Width> })], 1, m![R / ({ T<Width> }) = 1 #{!} (R / ({ T<Width> })), R % ({ T<Width> }), Width]>(at),
-            );
-        };
         let weight: Tile<bf16, R, Width, VECTORS, Chips> =
             self.weight.tensor().view().to_dm(&mut device.tdma);
         let weight = weight.widen::<Width, 16>(&mut device.sub);
-        let normalize =
-            |device: &mut Device,
-             rows: &Tile<D, R, Width, VECTORS, Chips>,
-             normalized: &mut Tile<bf16, R, Width, VECTORS, Chips>| {
-                let inverse = Squares::<
-                    TileLanes<R, Width>,
-                    Width,
-                    m![1],
-                    m![Width / (Width / ({ Symbol<TileParts<Width, VECTORS>> }))],
-                    EPSILON,
-                >::inverse(device, rows.view(), |square| square);
-                Scale::<TileLanes<R, Width>>::of(&mut device.main, rows.view(), &inverse, &weight)
-                    .commit_view(normalized.view_mut());
-            };
-        let (mut first, mut second): (
-            Tile<D, R, Width, VECTORS, Chips>,
-            Tile<D, R, Width, VECTORS, Chips>,
-        ) = (DmTensor::new(), DmTensor::new());
-        let (mut kept, mut held): (
-            Tile<bf16, R, Width, VECTORS, Chips>,
-            Tile<bf16, R, Width, VECTORS, Chips>,
-        ) = (DmTensor::new(), DmTensor::new());
-        to_dm(&mut *device, 0, &mut first);
-        if const { R::SIZE / TileRows::<Width, VECTORS>::SIZE > 1 } {
-            to_dm(&mut *device, 1, &mut second);
-        }
-        for pair in 0..tiles / 2 {
-            let at = 2 * pair;
-            normalize(&mut *device, &first, &mut kept);
-            to_dm(&mut *device, (at + 2).min(tiles - 1), &mut first);
-            store(&mut *device, &kept, at);
-            normalize(&mut *device, &second, &mut held);
-            to_dm(&mut *device, (at + 3).min(tiles - 1), &mut second);
-            store(&mut *device, &held, at + 1);
-        }
-        if const { R::SIZE / TileRows::<Width, VECTORS>::SIZE % 2 == 1 } {
-            normalize(&mut *device, &first, &mut kept);
-            store(&mut *device, &kept, tiles - 1);
-        }
+        tiles(device, input, &mut output, |device, rows, normalized| {
+            let inverse = Squares::<
+                TileLanes<R, Width>,
+                Width,
+                m![1],
+                m![Width / (Width / ({ Symbol<TileParts<Width, VECTORS>> }))],
+                EPSILON,
+            >::inverse(device, rows.view(), |square| square);
+            Scale::<TileLanes<R, Width>>::of(&mut device.main, rows.view(), &inverse, &weight)
+                .commit_view(normalized.view_mut());
+        });
         output
     }
 }

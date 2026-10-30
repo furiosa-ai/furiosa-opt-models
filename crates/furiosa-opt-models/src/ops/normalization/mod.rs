@@ -129,6 +129,59 @@ impl<X: M, C: M, S: M, E: M> Widen for DmTensor<bf16, X, C, S, E> {
     }
 }
 
+/// Rows `R` of `input` through `pass` into `output`, a tile at a time: tile t computes while tile
+/// t + 1 arrives and tile t - 1 is stored.
+fn tiles<D, R: AxisName, W: AxisName, const V: usize, Chips: M>(
+    device: &mut Device,
+    input: &HbmTensor<D, Chips, m![R, W]>,
+    output: &mut HbmTensor<bf16, Chips, m![R, W]>,
+    mut pass: impl FnMut(&mut Device, &Tile<D, R, W, V, Chips>, &mut Tile<bf16, R, W, V, Chips>),
+) where
+    D: MaterializableScalar,
+{
+    type T<W, const V: usize> = Symbol<TileRows<W, V>>;
+    let tiles = const {
+        assert!(
+            R::SIZE.is_multiple_of(TileRows::<W, V>::SIZE),
+            "rows come in whole tiles"
+        );
+        R::SIZE / TileRows::<W, V>::SIZE
+    };
+    let to_dm = |device: &mut Device, at: usize, tile: &mut Tile<D, R, W, V, Chips>| {
+        input
+            .view()
+            .tile::<m![R / ({ T<W, V> })], 1, m![R / ({ T<W, V> }) = 1 # (R / ({ T<W, V> })), R % ({ T<W, V> }), W]>(at)
+            .to_dm_view(&mut device.tdma, tile.view_mut());
+    };
+    let mut store = |device: &mut Device, tile: &Tile<bf16, R, W, V, Chips>, at: usize| {
+        tile.view().to_hbm_view(
+            &mut device.tdma,
+            output
+                .view_mut()
+                .tile::<m![R / ({ T<W, V> })], 1, m![R / ({ T<W, V> }) = 1 #{!} (R / ({ T<W, V> })), R % ({ T<W, V> }), W]>(at),
+        );
+    };
+    let (mut first, mut second) = (DmTensor::new(), DmTensor::new());
+    let (mut kept, mut held) = (DmTensor::new(), DmTensor::new());
+    to_dm(&mut *device, 0, &mut first);
+    if const { R::SIZE / TileRows::<W, V>::SIZE > 1 } {
+        to_dm(&mut *device, 1, &mut second);
+    }
+    for pair in 0..tiles / 2 {
+        let at = 2 * pair;
+        pass(&mut *device, &first, &mut kept);
+        to_dm(&mut *device, (at + 2).min(tiles - 1), &mut first);
+        store(&mut *device, &kept, at);
+        pass(&mut *device, &second, &mut held);
+        to_dm(&mut *device, (at + 3).min(tiles - 1), &mut second);
+        store(&mut *device, &held, at + 1);
+    }
+    if const { R::SIZE / TileRows::<W, V>::SIZE % 2 == 1 } {
+        pass(&mut *device, &first, &mut kept);
+        store(&mut *device, &kept, tiles - 1);
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use furiosa_opt_std::prelude::*;
