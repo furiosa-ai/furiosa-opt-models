@@ -3,6 +3,7 @@
 //! the span's rows.
 
 use super::*;
+use crate::modules::lora;
 
 /// A launch's attended rows in HBM: `Groups` query heads of `Head` features for each of `KvHeads`.
 type Attended<Reach, KvHeads, Groups, Head> =
@@ -121,6 +122,90 @@ where
             &mut (),
             (live, &attended, &mut lines),
         );
+        lines.to_dm(&mut device.tdma)
+    }
+}
+
+/// A tile's last step in a call that runs adapters: the tile's live rows projected, plus each
+/// adapter's update of them, through HBM into the span's rows.
+impl<
+    's,
+    'l,
+    'a,
+    't,
+    Hidden,
+    QWidth,
+    Capacity,
+    Reach,
+    KvHeads,
+    Groups,
+    Head,
+    Env,
+    A,
+    B,
+    K,
+    const N: usize,
+>
+    Module<
+        Tile<'l, 'a, Capacity, Reach, KvHeads, Groups, Head>,
+        Env,
+        &'s mut lora::Adapters<'t, lora::Term<A, B>, HbmTensor<bf16, Chip, m![Capacity, K]>, N>,
+    > for Affine<HbmTensor<bf16, Chip, m![Hidden, QWidth]>, ()>
+where
+    Hidden: AxisName,
+    QWidth: AxisName,
+    Capacity: AxisName,
+    Reach: AxisName,
+    KvHeads: AxisName,
+    Groups: AxisName,
+    Head: AxisName,
+    Env: Copy,
+    K: AxisName,
+    Affine<A, ()>: for<'i, 'o> crate::Op<
+            (
+                Live<(), Reach>,
+                &'i HbmTensor<bf16, Chip, m![Reach, QWidth]>,
+                &'o mut HbmTensor<bf16, Chip, m![Span, K]>,
+            ),
+            Output = (),
+        >,
+    Affine<B, ()>: for<'r, 'o> crate::Op<
+            (
+                Live<(), Span>,
+                &'r HbmTensor<bf16, Chip, m![Span, K]>,
+                &'o mut HbmTensor<bf16, Chip, m![Span, Hidden]>,
+            ),
+            Output = (),
+        >,
+{
+    type Output = Owned<Hidden, Span>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        env: Env,
+        adapters: &'s mut lora::Adapters<
+            't,
+            lora::Term<A, B>,
+            HbmTensor<bf16, Chip, m![Capacity, K]>,
+            N,
+        >,
+        ((), attended): Tile<'l, 'a, Capacity, Reach, KvHeads, Groups, Head>,
+    ) -> Self::Output {
+        const { assert!(KvHeads::SIZE * Groups::SIZE * Head::SIZE == QWidth::SIZE) };
+        let tile = attended.with(());
+        // SAFETY: as for the tile's projection without adapters.
+        let attended: HbmTensor<bf16, Chip, m![Reach, QWidth]> =
+            unsafe { attended.into_value().view().alias() };
+        let live = Live::<(), Reach>::all().subrange(tile.start(), tile.rows());
+        let mut lines = HbmTensor::<bf16, Chip, m![Span, Hidden]>::new();
+        Affine::new(&self.weight, ()).forward(
+            &mut *device,
+            env,
+            &mut (),
+            (live, &attended, &mut lines),
+        );
+        let lines = adapters.add(device, live, &attended, tile.start(), lines);
         lines.to_dm(&mut device.tdma)
     }
 }
