@@ -19,9 +19,9 @@ use safetensors::Dtype;
 use safetensors::tensor::TensorView;
 use serde_json::{Value, json};
 
-/// The hub revisions of Qwen/Qwen3-0.6B and Qwen/Qwen3-8B these tests read.
+/// The hub revisions of Qwen/Qwen3-0.6B and of the block-scaled E4M3 Qwen3-8B these tests read.
 const REVISION: &str = "c1899de289a04d12100db370d81485cdf75e47ca";
-const EIGHT: &str = "b968826d9c46dd6066d109eabc6255188de91218";
+const BLOCK_SCALED: &str = "6124ba90c39c8e2299ddd57f4b4f0df5845480c8";
 
 /// Qwen3-0.6B's adapter tree.
 type Adapter = qwen3::Adapter<qwen3::Size<"0.6B">, Hbm>;
@@ -340,8 +340,8 @@ fn loads_for_adapters_only_lines_that_take_them() {
     let options = LoadOptions::new().adapters();
     let small = options.parse(&config("Qwen/Qwen3-0.6B", REVISION)).unwrap();
     assert_eq!(small.size(), "0.6B");
-    match options.parse(&config("Qwen/Qwen3-8B", EIGHT)) {
+    match options.parse(&config("furiosa-ai/Qwen3-8B-FP8", BLOCK_SCALED)) {
         Err(LoadError::Unsupported { name, .. }) => assert_eq!(name, "adapters"),
-        other => panic!("Qwen3-8B for adapters: {other:?}"),
+        other => panic!("block-scaled Qwen3-8B for adapters: {other:?}"),
     }
 }

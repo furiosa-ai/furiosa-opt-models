@@ -26,14 +26,16 @@ pub use adapters::{Adapter, Binding, Loader, SLOTS};
 pub use batch::{Batch, Rows, Staged, Table};
 pub use cache::{Cache, CacheSpec, Group, Kind, Pool};
 
-use crate::{AsyncModule, Checkpoint, LoadError, forward};
+use crate::{AsyncModule, Checkpoint, Load, LoadError, forward};
 use furiosa_opt_models::Module;
 use furiosa_opt_models::models::decoder::attention::qwen3::{LmHead, fp8, launch};
 use furiosa_opt_models::models::decoder::attention::{
     Chunks, ForCausalLM, ForSequenceClassification, Geometry, Head, KvHeads,
 };
+use furiosa_opt_models::models::decoder::form;
 use furiosa_opt_models::modules::attention::key_value;
 use furiosa_opt_models::modules::language::{Classifier, Input, Selected};
+use furiosa_opt_models::modules::lora::{self, Rank, States};
 use furiosa_opt_models::ops::attention::full::paged::{Tiling, chunks::Masks};
 use furiosa_opt_models::ops::index::table::BlockIndex;
 use furiosa_opt_models::ops::linear::affine::Columns;
@@ -312,44 +314,123 @@ impl<D: Decoder> Served for Instance<D> {
 }
 
 /// A root of the decoder family's catalog, which a call launches once: of the size `Size`, writing
-/// each selected row's output, `Row` elements, into `Place` in order.
+/// each selected row's output, `Row` elements, into `Place` in order, its projections running
+/// with the adapters `Adapting` gives.
 pub trait Root {
     type Size: Geometry + Decode;
     type Place: Place;
     type Row: M;
+    type Adapting: Adapting<Self::Size>;
 }
 
-/// The causal model writes the selected rows' tokens.
-impl<S: Geometry + Decode, B, P> Root for ForCausalLM<S, launch::Over<S, B, P>, LmHead<S, Hbm>, P> {
+/// The causal model writes the selected rows' tokens; its projections' form runs its adapters.
+impl<S: Geometry + Decode, B, P: Adapting<S>> Root
+    for ForCausalLM<S, launch::Over<S, B, P>, LmHead<S, Hbm>, P>
+{
     type Size = S;
     type Place = launch::Tokens<S>;
     type Row = m![1];
+    type Adapting = P;
 }
 
-/// The base model writes the selected rows' hidden values.
-impl<S: Geometry + Decode, B, P> Root for launch::Over<S, B, P> {
+/// The base model writes the selected rows' hidden values; its projections' form runs its
+/// adapters.
+impl<S: Geometry + Decode, B, P: Adapting<S>> Root for launch::Over<S, B, P> {
     type Size = S;
     type Place = launch::Values<S>;
     type Row = m![{ Symbol<<S as Geometry>::Hidden> }];
+    type Adapting = P;
 }
 
-/// The sequence classifier writes the selected rows' scores, label columns first.
+/// The sequence classifier writes the selected rows' scores, label columns first; it runs no
+/// adapter.
 impl<S: Geometry + Decode, B, P> Root
     for ForSequenceClassification<S, launch::Over<S, B, P>, Classifier<<S as Geometry>::Hidden>, P>
 {
     type Size = S;
     type Place = launch::Scores<S>;
     type Row = m![{ Symbol<Columns> }];
+    type Adapting = Infallible;
 }
 
-/// Block-scaled FP8 Qwen3-8B writes the selected rows' tokens.
+/// Block-scaled FP8 Qwen3-8B writes the selected rows' tokens; it runs no adapter.
 impl Root for fp8::ForCausalLM {
     type Size = Size8B;
     type Place = launch::Tokens<Size8B>;
     type Row = m![1];
+    type Adapting = Infallible;
 }
 
 type Size8B = furiosa_opt_models::models::decoder::attention::qwen3::Size<"8B">;
+
+/// The adapters a call of a root of the size `S` may run its rows with: LoRA terms of every dense
+/// BF16 projection, or none.
+pub trait Adapting<S: Geometry + Decode> {
+    /// An adapter: a PEFT checkpoint loaded as the root's adapter tree, or `Infallible`.
+    type Adapter: Send + Sync + 'static;
+    /// Each layer's projections' states in a call that runs [`SLOTS`] adapters.
+    type States<'t>: States;
+    /// Adapters a call runs at most.
+    const ADAPTERS: usize;
+
+    /// `checkpoint`, a PEFT LoRA checkpoint, loaded onto `device` as an adapter.
+    fn adapter(checkpoint: &Checkpoint, device: &mut Device) -> Result<Self::Adapter, LoadError>;
+
+    /// Layer `layer`'s states with the call's adapters `held` and their `selections`.
+    fn states<'t>(
+        held: [&'t Self::Adapter; SLOTS],
+        layer: usize,
+        selections: &'t launch::Selections<S, SLOTS>,
+    ) -> Self::States<'t>;
+}
+
+/// Dense BF16 projections add each adapter's update of the rows it selects.
+impl<S: Geometry + Decode + 'static> Adapting<S> for form::Affine
+where
+    launch::Adapter<S, Hbm>:
+        Send + Sync + 'static + for<'h> Load<&'h launch::Adapter<S, lora::Staged>>,
+    launch::Adapter<S, lora::Staged>: for<'c> Load<&'c Checkpoint>,
+    <S as Geometry>::Layers<launch::Terms<S, Hbm>>: AsRef<[launch::Terms<S, Hbm>]>,
+{
+    type Adapter = launch::Adapter<S, Hbm>;
+    type States<'t> = launch::Adapted<'t, S, SLOTS>;
+    const ADAPTERS: usize = SLOTS;
+
+    // A PEFT checkpoint's terms are built on host from the checkpoint read once, then uploaded.
+    fn adapter(checkpoint: &Checkpoint, device: &mut Device) -> Result<Self::Adapter, LoadError> {
+        lora::load::<launch::Adapter<S, Hbm>, launch::Adapter<S, lora::Staged>>(checkpoint, device)
+    }
+
+    fn states<'t>(
+        held: [&'t Self::Adapter; SLOTS],
+        layer: usize,
+        selections: &'t launch::Selections<S, SLOTS>,
+    ) -> Self::States<'t> {
+        launch::adapted(held, layer, selections)
+    }
+}
+
+/// A root that runs no adapter refuses a load of one; no call holds one.
+impl<S: Geometry + Decode> Adapting<S> for Infallible {
+    type Adapter = Infallible;
+    type States<'t> = ();
+    const ADAPTERS: usize = 0;
+
+    fn adapter(_: &Checkpoint, _: &mut Device) -> Result<Infallible, LoadError> {
+        Err(LoadError::Unsupported {
+            name: "adapters".into(),
+            reason: "the decoder's projections take no adapter".into(),
+        })
+    }
+
+    fn states<'t>(
+        held: [&'t Infallible; SLOTS],
+        _: usize,
+        _: &'t launch::Selections<S, SLOTS>,
+    ) -> Self::States<'t> {
+        match *held[0] {}
+    }
+}
 
 /// What a launch writes of each selected row, named by its element type: a token in I32, hidden
 /// values in BF16, scores in FP32.
@@ -401,25 +482,39 @@ impl<R: AxisName, W: AxisName> AxisName for Tables<R, W> {
 
 /// A catalog root as a decoder: a call plans its rows' positions, cache slots, attention work and
 /// selected rows on the host, then launches the root once over every layer's own blocks, which
-/// writes the selected rows' outputs in kept order. Its prompt chunks attend apart from their
+/// writes the selected rows' outputs in kept order; a call that runs adapters passes each layer's
+/// projections their terms and selections of the rows. Its prompt chunks attend apart from their
 /// history, so it refuses a fixed tiling.
 impl<R> Decoder for R
 where
     R: Root + DeviceSend + Send + Sync,
-    R::Place: Place,
+    for<'b, 't> <R::Size as Geometry>::Layers<launch::Layer<'b, Held<'t, R>>>:
+        TryFrom<Vec<launch::Layer<'b, Held<'t, R>>>> + DeviceSend,
     for<'b> <R::Size as Geometry>::Layers<launch::Layer<'b>>:
         TryFrom<Vec<launch::Layer<'b>>> + DeviceSend,
     for<'i, 'a, 's, 'b> R: Module<
             &'i mut launch::Input<'a, R::Size>,
             (),
-            launch::State<'s, 'b, R::Size, R::Place>,
+            launch::State<'s, R::Size, <R::Size as Geometry>::Layers<launch::Layer<'b>>, R::Place>,
+            Output = (),
+        >,
+    for<'i, 'a, 's, 'b, 't> R: Module<
+            &'i mut launch::Input<'a, R::Size>,
+            (),
+            launch::State<
+                's,
+                R::Size,
+                <R::Size as Geometry>::Layers<launch::Layer<'b, Held<'t, R>>>,
+                R::Place,
+            >,
             Output = (),
         >,
 {
     const OUTPUT: Output = <R::Place as Place>::OUTPUT;
+    const ADAPTERS: usize = <R::Adapting as Adapting<R::Size>>::ADAPTERS;
     type Output = Rows<<R::Place as Place>::Scalar, R::Row>;
     type Layers = Vec<Blocks<KvHeads, Head>>;
-    type Adapter = Infallible;
+    type Adapter = <R::Adapting as Adapting<R::Size>>::Adapter;
 
     /// The rows of a launch, a request reaching the positions its rotary table covers at most.
     fn limits(&self) -> Limits {
@@ -448,13 +543,17 @@ where
             .collect()
     }
 
+    fn adapter(checkpoint: &Checkpoint, device: &mut Device) -> Result<Self::Adapter, LoadError> {
+        <R::Adapting as Adapting<R::Size>>::adapter(checkpoint, device)
+    }
+
     // The root is captured and launched in place, never held across an await: that `Send` check
     // erases lifetimes and cannot prove the root's higher-ranked bounds.
     fn call(
         &self,
         device: &mut Device,
         layers: &mut Self::Layers,
-        batch: Batch<'_, Infallible>,
+        batch: Batch<'_, Self::Adapter>,
         tiling: Tiling,
     ) -> impl Future<Output = io::Result<Self::Output>> + Send {
         let root = self;
@@ -465,7 +564,7 @@ where
                     "the launch model attends prompt chunks apart from their history",
                 ));
             }
-            let reads = batch.operands::<
+            let mut reads = batch.operands::<
                 launch::Capacity<R::Size>,
                 <R::Size as Decode>::Reach,
                 <R::Size as Decode>::Sequences,
@@ -474,6 +573,10 @@ where
                 Head,
                 WAVES,
             >(0)?;
+            if let Some(binding) = batch.adapters() {
+                reads.extend(binding.selections::<launch::Capacity<R::Size>, Rank<1>>());
+                reads.extend(binding.selections::<launch::Capacity<R::Size>, Rank<2>>());
+            }
             // ponytail: placed each call; a load-lifetime place would spare two small uploads a
             // call.
             let masks = Masks::new(device).await?;
@@ -502,22 +605,67 @@ where
             };
             let tokens: launch::Ids<R::Size> = alias(&staged.tokens, ..)?;
             let mut input: launch::Input<'_, R::Size> = Input::new(tokens, staged.count, &operands);
-            let slots: Vec<launch::Layer<'_>> = (layers.iter_mut())
-                .map(|blocks| ((Default::default(), blocks, ()), ()))
-                .collect();
-            let slots: <R::Size as Geometry>::Layers<launch::Layer<'_>> = (slots.try_into())
-                .unwrap_or_else(|_| unreachable!("a cache of the decoder's spec holds each layer"));
-            let hidden = DeviceOutput::alloc(device).map_err(io::Error::other)?;
-            let place: R::Place = DeviceOutput::alloc(device).map_err(io::Error::other)?;
-            let mut places = (((hidden, slots), ()), place);
-            let state: launch::State<'_, '_, R::Size, R::Place> = &mut places;
-            launch(forward, (&mut *device, root, (), state, &mut input))
-                .output(&mut ())
-                .submit()
-                .accepted()
-                .map(drop)
-                .map_err(io::Error::other)?;
-            Rows::new(&places.1.into_buffer(), 0..batch.kept().len())
+            let place = DeviceOutput::alloc(device).map_err(io::Error::other)?;
+            let place = match batch.adapters() {
+                None => {
+                    let slots = (layers.iter_mut())
+                        .map(|blocks| ((Default::default(), blocks, ()), ()))
+                        .collect();
+                    launched(device, root, &mut input, slots, place)?
+                }
+                Some(binding) => {
+                    let selections = (
+                        adapters::selected::<launch::Capacity<R::Size>, Rank<1>>(&mut next)?,
+                        adapters::selected::<launch::Capacity<R::Size>, Rank<2>>(&mut next)?,
+                    );
+                    let held = binding.held();
+                    let slots = (layers.iter_mut().enumerate())
+                        .map(|(at, blocks)| {
+                            let states =
+                                <R::Adapting as Adapting<R::Size>>::states(held, at, &selections);
+                            ((Default::default(), blocks, ()), states)
+                        })
+                        .collect();
+                    launched(device, root, &mut input, slots, place)?
+                }
+            };
+            Rows::new(&place.into_buffer(), 0..batch.kept().len())
         }
     }
+}
+
+/// What each layer's projections of the root `R` run with in a call of adapters.
+type Held<'t, R> = <<R as Root>::Adapting as Adapting<<R as Root>::Size>>::States<'t>;
+
+/// One launch of `root` over a call's `input` and its layers' `slots`, writing the selected rows'
+/// outputs into `place`, which it returns once the device accepted the launch.
+fn launched<'i, 'a, R, L>(
+    device: &mut Device,
+    root: &R,
+    input: &'i mut launch::Input<'a, R::Size>,
+    slots: Vec<L>,
+    place: R::Place,
+) -> io::Result<R::Place>
+where
+    R: Root + DeviceSend,
+    <R::Size as Geometry>::Layers<L>: TryFrom<Vec<L>> + DeviceSend,
+    for<'s> R: Module<
+            &'i mut launch::Input<'a, R::Size>,
+            (),
+            launch::State<'s, R::Size, <R::Size as Geometry>::Layers<L>, R::Place>,
+            Output = (),
+        >,
+{
+    let slots: <R::Size as Geometry>::Layers<L> = (slots.try_into())
+        .unwrap_or_else(|_| unreachable!("a cache of the decoder's spec holds each layer"));
+    let hidden = DeviceOutput::alloc(device).map_err(io::Error::other)?;
+    let mut places = (((hidden, slots), ()), place);
+    let state: launch::State<'_, R::Size, _, R::Place> = &mut places;
+    launch(forward, (&mut *device, root, (), state, input))
+        .output(&mut ())
+        .submit()
+        .accepted()
+        .map(drop)
+        .map_err(io::Error::other)?;
+    Ok(places.1)
 }
