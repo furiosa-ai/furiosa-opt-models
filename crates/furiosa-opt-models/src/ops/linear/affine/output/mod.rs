@@ -35,6 +35,7 @@ where
     E: Into<Live<(), Capacity>>,
     U: Stream<Item = Live<A, Capacity>>,
     Self: for<'s> Module<Begin<()>, (), &'s mut (), Output = L>
+        + for<'s, 'l> Module<&'l mut L, (), &'s mut (), Output = ()>
         + for<'s, 'l, 'a> Module<
             (&'l mut L, &'a A, Live<(), Capacity>),
             (),
@@ -56,6 +57,7 @@ where
     E: Into<Live<(), Capacity>>,
     U: Stream<Item = Live<A, Capacity>>,
     Affine<W, ()>: for<'s> Module<Begin<()>, (), &'s mut (), Output = L>
+        + for<'s, 'l> Module<&'l mut L, (), &'s mut (), Output = ()>
         + for<'s, 'l, 'a> Module<
             (&'l mut L, &'a A, Live<(), Capacity>),
             (),
@@ -109,6 +111,7 @@ where
     M: Borrow<Affine<W, ()>>,
     U: Stream<Item = Live<A, Capacity>>,
     Affine<W, ()>: for<'s> Module<Begin<()>, (), &'s mut (), Output = L>
+        + for<'s, 'l> Module<&'l mut L, (), &'s mut (), Output = ()>
         + for<'s, 'l, 'a> Module<
             (&'l mut L, &'a A, Live<(), Capacity>),
             (),
@@ -123,7 +126,9 @@ where
         if matches!(self.attended, None) {
             let polled = self.upstream.poll_next(&mut *context);
             if matches!(self.landed, None) {
-                self.landed = Some(projection.forward(&mut *context, (), &mut (), Begin(())));
+                let mut landed = projection.forward(&mut *context, (), &mut (), Begin(()));
+                projection.forward(&mut *context, (), &mut (), &mut landed);
+                self.landed = Some(landed);
             }
             match polled {
                 Poll::Ready(Some(attended)) => self.attended = Some(attended.into_value()),
