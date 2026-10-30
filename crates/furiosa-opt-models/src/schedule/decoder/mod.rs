@@ -14,9 +14,11 @@
 //!   Mistral's leave unnormed.
 //! - [`Decoder`] runs the loops: the first layer's stores over the embedded tiles, then for each
 //!   layer its attention and, tile by tile, the work up to the next store or the head.
-//! - Weights land one part ahead of their use: the next layer's projections while this layer's MLP
-//!   projects, the MLP's first weights while the output projection does; none during an attention,
-//!   whose working set fills most of data memory.
+//! - The DMA engine serves transfers in issue order, so weights issue one part ahead of their use
+//!   and behind the small transfers of the work they overlap: the MLP's first weights behind the
+//!   output projection's rows, its down weights behind the gate/up pairs, the next layer's
+//!   projections behind the down's inputs. An attention's working set fills most of data memory,
+//!   so only the output projection lands during one, once its last history is in flight.
 
 use crate::Module;
 use crate::load::Named;
