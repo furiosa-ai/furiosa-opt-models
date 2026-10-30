@@ -20,7 +20,6 @@ use crate::ops::rotary::Rotary;
 use crate::ops::{embedding::Embedding, normalization::RmsNorm, pointwise::add::Add};
 use crate::specialize::attention::Decode;
 use crate::tensor::{
-    axis,
     form::{Weight, nvfp4::W4A16},
     memory::{Hbm, Memory},
     parallel::Chip,
@@ -109,7 +108,6 @@ impl Decode for Size {
     type Reach = <Original as Decode>::Reach;
     type Sequences = <Original as Decode>::Sequences;
     type Slots = <Original as Decode>::Slots;
-    type Positions = axis::Rows<131072>;
 }
 impl Family for Size {
     type Hf = decoder::Config<Spectrum>;

@@ -68,7 +68,7 @@ impl TryFrom<&decoder::Config<Spectrum>> for Config {
         Ok(Self {
             theta: theta.get(),
             tied: config.tie_word_embeddings.unwrap_or(false),
-            window: config.capacity(launch::CONTEXT),
+            window: config.capacity(launch::Positions::<Size<"8B">>::SIZE),
         })
     }
 }

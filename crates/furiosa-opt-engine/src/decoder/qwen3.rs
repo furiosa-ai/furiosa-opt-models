@@ -16,13 +16,13 @@ use super::adapters::{self, SLOTS};
 use super::{Batch, CacheSpec, Decoder, Group, Kind, Limits, Output, Pool, Rows, Table, Tables};
 use crate::{AsyncModule, Checkpoint, Function, LoadError, forward};
 use furiosa_opt_models::load::{Context, Load};
+use furiosa_opt_models::models::decoder::attention::qwen3::launch;
+use furiosa_opt_models::models::decoder::attention::{Chunks, Head, KvHeads};
 use furiosa_opt_models::models::decoder::attention::{Geometry, qwen3};
-use furiosa_opt_models::models::decoder::attention::{Head, KvHeads};
 use furiosa_opt_models::models::decoder::form;
 use furiosa_opt_models::modules::language::Input;
 use furiosa_opt_models::modules::lora::{self, Adapters, Rank};
 use furiosa_opt_models::ops::attention::full::paged::{Tiling, chunks::Masks};
-use furiosa_opt_models::ops::attention::gqa::Cache as Window;
 use furiosa_opt_models::ops::embedding::Ids;
 use furiosa_opt_models::ops::index::gather;
 use furiosa_opt_models::ops::linear::affine::{self, Columns};
@@ -36,9 +36,9 @@ use std::{convert::Infallible, io};
 
 /// What a call of the size `S` holds: the compiled context, the size's rows, one paged group of
 /// every layer's blocks, and `adapters` adapters.
-fn limits<S: Geometry + Decode>(adapters: usize) -> Limits {
+fn limits<S: Geometry + Decode + 'static>(adapters: usize) -> Limits {
     Limits {
-        window: S::Windows::SIZE * Window::SIZE,
+        window: launch::Positions::<S>::SIZE,
         rows: S::Rows::SIZE,
         cache: CacheSpec {
             pools: vec![Pool {
@@ -136,7 +136,7 @@ macro_rules! decoders {
                     )
                     .await?;
                 // Placed each call: constants the calls could share, two small uploads a call.
-                let masks = Masks::new(device).await?;
+                let masks = Masks::<Chunks>::new(device).await?;
                 let mut views = views.into_iter();
                 let mut next =
                     || views.next().ok_or_else(|| io::Error::other("a read array is missing"));

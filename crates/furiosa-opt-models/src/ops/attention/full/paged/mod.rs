@@ -25,7 +25,7 @@ use crate::tensor::cache::Blocks;
 use gqa::items::SINKS;
 use gqa::items::Shape;
 use gqa::items::{GroupTile, Tiled};
-pub use gqa::items::{Items, Plan, Tiling};
+pub use gqa::items::{Items, Plan, Tiling, Waves};
 
 mod append;
 pub mod chunks;
@@ -41,19 +41,21 @@ mod gqa {
 type Attention<Heads, Groups, Head> = attention::Attention<PhantomData<(Heads, Groups, Head)>, f32>;
 
 /// A launch's attention work as its host planned it: heads of `Head` channels, `G` to each of
-/// `KvHeads`, items within `WAVES` wide waves and at most `Sequences` prompt chunks.
+/// `KvHeads`, items within `Waves` wide waves and at most `Sequences` prompt chunks, each over at
+/// most `W` 512-key windows of history.
 #[derive(DeviceSend)]
 pub struct Work<
     Sequences: AxisName,
     KvHeads: AxisName,
     G: AxisName,
     Head: AxisName,
-    const WAVES: usize,
+    Waves: AxisName,
+    W: AxisName,
 > {
     /// The rows from row 0, each attended over its own history in the pool.
-    pub items: Items<KvHeads, G, Head, WAVES>,
+    pub items: Items<KvHeads, G, Head, Waves>,
     /// The prompt chunks after them.
-    pub chunks: chunks::Invocation<Sequences>,
+    pub chunks: chunks::Invocation<Sequences, W>,
 }
 
 /// A launch's [`Work`] as its layers borrow it, with the counts its loops run read once.
@@ -63,23 +65,30 @@ pub struct Context<
     KvHeads: AxisName,
     G: AxisName,
     Head: AxisName,
-    const WAVES: usize,
+    Waves: AxisName,
+    W: AxisName,
     R,
 > {
-    work: &'a Work<Sequences, KvHeads, G, Head, WAVES>,
+    work: &'a Work<Sequences, KvHeads, G, Head, Waves, W>,
     items: Live<(), R>,
     shape: Shape,
     chunks: usize,
 }
 
-impl<Sequences: AxisName, KvHeads: AxisName, G: AxisName, Head: AxisName, const WAVES: usize>
-    Work<Sequences, KvHeads, G, Head, WAVES>
+impl<
+    Sequences: AxisName,
+    KvHeads: AxisName,
+    G: AxisName,
+    Head: AxisName,
+    Waves: AxisName,
+    W: AxisName,
+> Work<Sequences, KvHeads, G, Head, Waves, W>
 {
     /// The work whose arrays [`Plan::reads`], then [`chunks::Plan::reads`], list, as `next` names
     /// each in turn, with the chunks' `masks`.
     pub fn bind(
         mut next: impl FnMut() -> io::Result<HbmBuffer>,
-        masks: &chunks::Masks,
+        masks: &chunks::Masks<W>,
     ) -> io::Result<Self> {
         Ok(Self {
             items: Items::bind(&mut next)?,
@@ -94,9 +103,9 @@ impl<Sequences: AxisName, KvHeads: AxisName, G: AxisName, Head: AxisName, const 
         ids: &[i32],
         tiling: Tiling,
     ) -> io::Result<Vec<(Vec<i32>, usize)>> {
-        let items = Plan::new::<KvHeads, G, Head, WAVES, Sinked<R>>(segments, ids, tiling);
+        let items = Plan::new::<KvHeads, G, Head, Waves, Sinked<R>>(segments, ids, tiling);
         let items = items.reads().map(|(read, words)| (read.to_vec(), words));
-        let chunks = chunks::Plan::new::<Sequences>().reads()?;
+        let chunks = chunks::Plan::<W>::new::<Sequences>().reads()?;
         Ok(items.chain(chunks).collect())
     }
 
@@ -104,13 +113,13 @@ impl<Sequences: AxisName, KvHeads: AxisName, G: AxisName, Head: AxisName, const 
     /// `R` rows: its query and attended rows, and its items' outputs.
     pub const fn scratch<R: AxisName>() -> [usize; 4] {
         let rows = <m![{ Symbol<Sinked<R>> }, KvHeads, G, Head]>::SIZE * size_of::<bf16>();
-        let [outputs, scales] = Items::<KvHeads, G, Head, WAVES>::SCRATCH;
+        let [outputs, scales] = Items::<KvHeads, G, Head, Waves>::SCRATCH;
         [rows, rows, outputs, scales]
     }
 
     /// The work as a launch's layers read it: a read of launch metadata holds the command issue
     /// until the DMA queue drains, so a launch reads these at its start, once.
-    pub fn read<R: AxisName>(&self) -> Context<'_, Sequences, KvHeads, G, Head, WAVES, R> {
+    pub fn read<R: AxisName>(&self) -> Context<'_, Sequences, KvHeads, G, Head, Waves, W, R> {
         let chunks = self.chunks.live.extent::<m![Sequences]>();
         Context {
             work: self,
@@ -121,8 +130,15 @@ impl<Sequences: AxisName, KvHeads: AxisName, G: AxisName, Head: AxisName, const 
     }
 }
 
-impl<Sequences: AxisName, KvHeads: AxisName, G: AxisName, Head: AxisName, const WAVES: usize, R>
-    Context<'_, Sequences, KvHeads, G, Head, WAVES, R>
+impl<
+    Sequences: AxisName,
+    KvHeads: AxisName,
+    G: AxisName,
+    Head: AxisName,
+    Waves: AxisName,
+    W: AxisName,
+    R,
+> Context<'_, Sequences, KvHeads, G, Head, Waves, W, R>
 {
     /// The rows attended as items, from row 0.
     pub fn items(&self) -> Live<(), R> {
@@ -151,7 +167,8 @@ impl<
     Groups: AxisName,
     Head: AxisName,
     Scale: Copy + Into<f32>,
-    const WAVES: usize,
+    Waves: AxisName,
+    W: AxisName,
     L: AxisName,
     H,
     G,
@@ -161,7 +178,7 @@ impl<
         (
             &Rows<Reach, Heads, Groups, Head>,
             &Retained<'_, Reach, Heads, Head>,
-            &Context<'_, Sequences, Heads, Groups, Head, WAVES, L>,
+            &Context<'_, Sequences, Heads, Groups, Head, Waves, W, L>,
             (&H, &mut G),
             &mut Rows<Reach, Heads, Groups, Head>,
         ),
@@ -181,7 +198,7 @@ where
         (query, history, work, (boundary, state), attended): (
             &Rows<Reach, Heads, Groups, Head>,
             &Retained<'_, Reach, Heads, Head>,
-            &Context<'_, Sequences, Heads, Groups, Head, WAVES, L>,
+            &Context<'_, Sequences, Heads, Groups, Head, Waves, W, L>,
             (&H, &mut G),
             &mut Rows<Reach, Heads, Groups, Head>,
         ),
@@ -228,7 +245,8 @@ impl<
     Groups: AxisName,
     Head: AxisName,
     Scale: Copy + Into<f32>,
-    const WAVES: usize,
+    Waves: AxisName,
+    W: AxisName,
     L: AxisName,
     Env: Copy,
 >
@@ -236,7 +254,7 @@ impl<
         (
             &Rows<Reach, Heads, Groups, Head>,
             Retained<'a, Reach, Heads, Head>,
-            &Context<'_, Sequences, Heads, Groups, Head, WAVES, L>,
+            &Context<'_, Sequences, Heads, Groups, Head, Waves, W, L>,
         ),
         Env,
         &mut (),
@@ -252,7 +270,7 @@ impl<
         (query, history, work): (
             &Rows<Reach, Heads, Groups, Head>,
             Retained<'a, Reach, Heads, Head>,
-            &Context<'_, Sequences, Heads, Groups, Head, WAVES, L>,
+            &Context<'_, Sequences, Heads, Groups, Head, Waves, W, L>,
         ),
     ) -> Self::Output {
         let mut attended = Rows::new();
@@ -297,14 +315,15 @@ impl<
     Groups: AxisName,
     Head: AxisName,
     Scale: Copy + Into<f32>,
-    const WAVES: usize,
+    Waves: AxisName,
+    W: AxisName,
     Env: Copy,
 >
     Module<
         (
             &Live<attention::Heads<R, Heads, Groups, Head>, R>,
             &Blocks<Heads, Head>,
-            &Context<'_, Sequences, Heads, Groups, Head, WAVES, R>,
+            &Context<'_, Sequences, Heads, Groups, Head, Waves, W, R>,
         ),
         Env,
         &mut (),
@@ -320,7 +339,7 @@ impl<
         (query, pool, work): (
             &Live<attention::Heads<R, Heads, Groups, Head>, R>,
             &Blocks<Heads, Head>,
-            &Context<'_, Sequences, Heads, Groups, Head, WAVES, R>,
+            &Context<'_, Sequences, Heads, Groups, Head, Waves, W, R>,
         ),
     ) -> Self::Output {
         let attention = attention::Attention {
@@ -389,7 +408,7 @@ mod tests {
     fn attend_rows<R: AxisName, H: AxisName, G: AxisName, const WAVES: usize>(
         device: &mut Device,
         query: &Queries<R, H, G>,
-        work: &Work<Sequences, H, G, Head, WAVES>,
+        work: &Work<Sequences, H, G, Head, Waves<WAVES>, Windows>,
         pool: &mut items::Pool<H>,
         attended: &mut Queries<R, H, G>,
     ) {
@@ -488,7 +507,7 @@ mod tests {
     async fn errors<R: AxisName, G: AxisName, const WAVES: usize>(
         device: &mut Device,
         (pool, firsts): &mut Histories,
-        masks: &chunks::Masks,
+        masks: &chunks::Masks<Windows>,
         lengths: &[usize],
     ) -> [f64; 2] {
         let queries = items::queries::<KvHeads, G>(R::SIZE);
@@ -496,12 +515,12 @@ mod tests {
         let queries: Queries<R, KvHeads, G> = queries.to_hbm(&mut device.pdma).await.unwrap();
         let rows = lengths.iter().copied().enumerate();
         let plan = items::plan::<KvHeads, G, WAVES, Sinked<R>>(rows, firsts, Tiling::Adaptive);
-        let chunks = chunks::Plan::new::<Sequences>().reads().unwrap();
+        let chunks = chunks::Plan::<Windows>::new::<Sequences>().reads().unwrap();
         let reads = plan
             .reads()
             .chain(chunks.iter().map(|(read, words)| (&read[..], *words)));
         let mut buffers = items::place(device, reads).await;
-        let work: Work<Sequences, KvHeads, G, Head, WAVES> =
+        let work: Work<Sequences, KvHeads, G, Head, Waves<WAVES>, Windows> =
             Work::bind(|| Ok(buffers.next().expect("an array a buffer")), masks).unwrap();
         let pages = pages::<R>(device, lengths, firsts).await;
         let live = count(lengths.len()).to_hbm(&mut device.pdma).await.unwrap();
@@ -552,7 +571,7 @@ mod tests {
         let _lease = DEVICE.lock().await;
         let mut device = Device::new(attend_windows.topology()).unwrap();
         let mut pool = items::pool::<KvHeads>(&mut device).await;
-        let masks = chunks::Masks::new(&mut device).await.unwrap();
+        let masks = chunks::Masks::<Windows>::new(&mut device).await.unwrap();
         let device = &mut device;
         let cases = |rows: usize| {
             [
@@ -596,7 +615,7 @@ mod tests {
     async fn check<R: AxisName, G: AxisName, const WAVES: usize>(
         device: &mut Device,
         (pool, firsts): &mut Histories,
-        masks: &chunks::Masks,
+        masks: &chunks::Masks<Windows>,
         lengths: &[usize],
     ) {
         let queries = items::queries::<KvHeads, G>(R::SIZE);
@@ -604,12 +623,12 @@ mod tests {
         let queries: Queries<R, KvHeads, G> = queries.to_hbm(&mut device.pdma).await.unwrap();
         let rows = lengths.iter().copied().enumerate();
         let plan = items::plan::<KvHeads, G, WAVES, Sinked<R>>(rows, firsts, Tiling::Adaptive);
-        let chunks = chunks::Plan::new::<Sequences>().reads().unwrap();
+        let chunks = chunks::Plan::<Windows>::new::<Sequences>().reads().unwrap();
         let reads = plan
             .reads()
             .chain(chunks.iter().map(|(read, words)| (&read[..], *words)));
         let mut buffers = items::place(device, reads).await;
-        let work: Work<Sequences, KvHeads, G, Head, WAVES> =
+        let work: Work<Sequences, KvHeads, G, Head, Waves<WAVES>, Windows> =
             Work::bind(|| Ok(buffers.next().expect("an array a buffer")), masks).unwrap();
         let mut attended: Queries<R, KvHeads, G> =
             HostTensor::<bf16, Layout<R, KvHeads, G>>::zero()
@@ -637,7 +656,7 @@ mod tests {
         let _lease = DEVICE.lock().await;
         let mut device = Device::new(attend_rows.topology()).unwrap();
         let mut pool = items::pool::<KvHeads>(&mut device).await;
-        let masks = chunks::Masks::new(&mut device).await.unwrap();
+        let masks = chunks::Masks::<Windows>::new(&mut device).await.unwrap();
         let device = &mut device;
         let mixed: Vec<usize> = (0..64).map(|row| items::MIXED[row % 16]).collect();
         for lengths in [items::MIXED.to_vec(), vec![KEYS; 5], vec![LONG, 17, 1]] {
