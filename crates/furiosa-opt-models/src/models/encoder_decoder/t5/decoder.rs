@@ -5,11 +5,7 @@ use crate::modules::attention::relative;
 use crate::modules::{attention, language, transformer};
 use crate::ops;
 use crate::ops::{
-    index::{
-        gather::{Gather, RowStorage},
-        scatter::Scatter,
-        table::KeyValue,
-    },
+    index::{gather::Gather, scatter::Scatter},
     pointwise::{add::Add, multiply::Scale},
 };
 use crate::{First, Fork, Module, Sequential};
@@ -133,21 +129,3 @@ type CrossAttention<Width, KvWidth, Heads> = attention::Cross<
 
 /// Optional tied-embedding scaling followed by the vocabulary projection.
 pub type Head<Vocabulary, Width> = Sequential<Scale, Linear<Width, Vocabulary>>;
-
-/// Opaque F32 key/value row storage.
-pub type Cache<Width> = KeyValue<RowStorage<Width>>;
-
-/// Key/value byte offsets for each selected row.
-pub type Offsets<Count> = KeyValue<Ids<Count>>;
-
-/// Key/value write destinations and number of rows to write.
-pub type Write<Count> = (Offsets<Count>, HbmTensor<i32, m![1], m![1]>);
-
-/// Self-history write destinations and read offsets, with no rotary input.
-pub type History<Queries, Keys> = attention::Context<(), Write<Queries>, Offsets<Keys>>;
-
-/// Writable self-attention cache and its per-call history operands.
-pub type State<Width, Queries, Keys> = (Cache<Width>, History<Queries, Keys>);
-
-/// Projected source cache with the offsets used when creating or reading it.
-pub type Cross<Width, Source> = (Cache<Width>, Write<Source>);
