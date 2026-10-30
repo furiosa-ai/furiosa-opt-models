@@ -323,6 +323,7 @@ mod shapes {
     use furiosa_opt_std::prelude::{HostTensor, M, MaterializableScalar, Pair, m};
 
     use super::{Checkpoint, Context, Load, LoadError};
+    use crate::modules::generic::collection::View;
     use crate::tensor::memory::Memory;
 
     /// The memory whose leaves are [`Shape`]s.
@@ -353,6 +354,20 @@ mod shapes {
             context.checkpoint(source, |cx| {
                 cx.leaf(source, check, |_, _| Ok((shape(), shape())))
             })
+        }
+    }
+
+    /// A stack of shapes holds no value: one shape stands for every layer's.
+    impl<D, C, S, const N: usize> View<N> for Shape<D, C, S> {
+        type Storage = Self;
+        type Layer = Self;
+
+        fn view(_: &Self, _: usize) -> Self {
+            Self(PhantomData)
+        }
+
+        fn stack(_: [Self; N], _: &mut Context<'_>) -> Self {
+            Self(PhantomData)
         }
     }
 
