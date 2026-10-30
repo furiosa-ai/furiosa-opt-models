@@ -97,10 +97,16 @@ pub(crate) struct Counted<'a, Hidden: AxisName, G: Group, Heads: AxisName, Sprea
 pub(crate) type Squares<G, Heads, Spread, Local> =
     VrfTensor<f32, Chip, Cluster<Heads>, Rows<G, Heads, Spread>, m![{ Local }, { m![Tile % 8] }]>;
 
+/// [`Squares`] written in data memory, before the register file reads them.
+pub(crate) type Written<G, Heads, Spread, Local> =
+    DmTensor<f32, Chip, Cluster<Heads>, Rows<G, Heads, Spread>, m![{ Local }, Tile % 8]>;
+
+/// The projection of a period's rows; its heads' squares, written beforehand, are fetched once the
+/// contraction is issued, so the contraction does not wait for them.
 impl<Hidden: AxisName, Head: AxisName, G: Group, Heads: AxisName, Spread: M, Local: M>
     Op<(
         Counted<'_, Hidden, G, Heads, Spread, Local>,
-        &Squares<G, Heads, Spread, Local>,
+        &Written<G, Heads, Spread, Local>,
     )> for Affine<&Weight<Hidden, Heads, Head>, ()>
 {
     type Output = Scaled<Output<G, Heads, Head, Spread, Local>, Inverse<G, Heads, Spread, Local>>;
@@ -108,9 +114,9 @@ impl<Hidden: AxisName, Head: AxisName, G: Group, Heads: AxisName, Spread: M, Loc
     fn forward(
         &self,
         context: &mut Device,
-        (input, squares): (
+        (input, written): (
             Counted<'_, Hidden, G, Heads, Spread, Local>,
-            &Squares<G, Heads, Spread, Local>,
+            &Written<G, Heads, Spread, Local>,
         ),
     ) -> Self::Output {
         let (weight, lanes, rows, groups) = (self.weight, input.lanes, input.rows, input.groups);
@@ -149,22 +155,28 @@ impl<Hidden: AxisName, Head: AxisName, G: Group, Heads: AxisName, Spread: M, Loc
         } else {
             products.commit_view(output.view_mut())
         }
+        let squares: Squares<G, Heads, Spread, Local> = context
+            .sub
+            .begin(written.view())
+            .fetch::<m![{ Local }], m![Tile % 8]>()
+            .collect::<m![{ Local }], m![Tile % 8]>()
+            .to_vrf();
         // SAFETY: BF16's slice names for Reduced's slices, for the products and their rows' scales
         // alike; no sum moves.
         Scaled::new(
             context,
             unsafe { output.reshape() },
             unsafe { rows.reshape() },
-            squares,
+            &squares,
         )
     }
 }
 
-/// The squares of a projection's head scales, written into the slices of its output and fetched.
+/// The squares of a projection's head scales, written into the slices of its output.
 pub(crate) fn squares<G: Group, Heads: AxisName, Spread: M, Local: M>(
     context: &mut Device,
     stored: &Squared<Heads>,
-) -> Squares<G, Heads, Spread, Local> {
+) -> Written<G, Heads, Spread, Local> {
     let written: DmTensor<
         f32,
         Chip,
@@ -174,17 +186,5 @@ pub(crate) fn squares<G: Group, Heads: AxisName, Spread: M, Local: M>(
     > = stored.to_dm(&mut context.tdma);
     // SAFETY: BF16's slice names for Reduced's slices, as the products' are; row digits only
     // replicate each head's square.
-    let written: DmTensor<
-        f32,
-        Chip,
-        Cluster<Heads>,
-        Rows<G, Heads, Spread>,
-        m![{ Local }, Tile % 8],
-    > = unsafe { written.reshape() };
-    context
-        .sub
-        .begin(written.view())
-        .fetch::<m![{ Local }], m![Tile % 8]>()
-        .collect::<m![{ Local }], m![Tile % 8]>()
-        .to_vrf()
+    unsafe { written.reshape() }
 }
