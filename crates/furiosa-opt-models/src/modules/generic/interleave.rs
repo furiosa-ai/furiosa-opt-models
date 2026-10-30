@@ -1,11 +1,8 @@
 //! Layer collections applied in one fixed interleaved order, each layer with its own state slot.
 
 use super::Collection;
-use super::layers::start;
-use super::schedule::{IntoStream, Slot, Stream};
 use crate::load::{Checkpoint, Children, Context, Load, LoadError};
 use crate::{Module, Order};
-use core::task::Poll;
 use furiosa_opt_std::prelude::{Device, DeviceSend, unroll};
 use std::marker::ConstParamTy;
 
@@ -254,105 +251,6 @@ where
     }
 }
 
-/// The layers chained in the order over the upstream: a poll polls, in order, each layer whose last
-/// output the next one took, into its slot; the chain ends when its last layer does.
-impl<T, U, A, B, const FIRST: usize, const SECOND: usize, const ORDER: &'static [Branch]> Stream
-    for (Interleave<([A; FIRST], [B; SECOND]), ORDER>, U)
-where
-    U: Stream<Item = T>,
-    A: Stream<Item = T> + AsMut<Slot<T>>,
-    B: Stream<Item = T> + AsMut<Slot<T>>,
-{
-    type Item = T;
-
-    fn poll_next(&mut self, device: &mut Device) -> Poll<Option<T>> {
-        // Device code reads the order through constant positions; a slice constant does not lower.
-        let positions = Interleave::<([A; FIRST], [B; SECOND]), ORDER>::POSITIONS.0;
-        let (Interleave { layers }, upstream) = self;
-        let (first, second) = layers;
-        // Whether the layer at `position` took what it was last given, `a` and `b` layers of each
-        // branch before it.
-        let empty = |first: &mut [A; FIRST], second: &mut [B; SECOND], position, a, b| {
-            if a < FIRST && positions[a] == position {
-                AsMut::<Slot<T>>::as_mut(&mut first[a]).is_empty()
-            } else {
-                AsMut::<Slot<T>>::as_mut(&mut second[b]).is_empty()
-            }
-        };
-        let mut polled = if empty(first, second, 0, 0, 0) {
-            upstream.poll_next(device)
-        } else {
-            Poll::Pending
-        };
-        let (mut a, mut b) = (0, 0);
-        #[unroll]
-        for position in 0..FIRST + SECOND {
-            let leads = a < FIRST && positions[a] == position;
-            let (next_a, next_b) = if leads { (a + 1, b) } else { (a, b + 1) };
-            let free = position + 1 == FIRST + SECOND
-                || empty(first, second, position + 1, next_a, next_b);
-            if leads {
-                first[a].as_mut().put(polled);
-                polled = if free {
-                    first[a].poll_next(device)
-                } else {
-                    Poll::Pending
-                };
-            } else {
-                second[b].as_mut().put(polled);
-                polled = if free {
-                    second[b].poll_next(device)
-                } else {
-                    Poll::Pending
-                };
-            }
-            (a, b) = (next_a, next_b);
-        }
-        polled
-    }
-}
-
-impl<
-    'm,
-    's,
-    U: Stream,
-    AEnv: Copy,
-    BEnv: Copy,
-    AState,
-    BState,
-    A,
-    B,
-    AStream,
-    BStream,
-    const FIRST: usize,
-    const SECOND: usize,
-    const ORDER: &'static [Branch],
-> IntoStream<U, (AEnv, BEnv), &'s mut ([AState; FIRST], [BState; SECOND])>
-    for &'m Interleave<([A; FIRST], [B; SECOND]), ORDER>
-where
-    &'m A: IntoStream<Slot<U::Item>, AEnv, &'s mut AState, Stream = AStream>,
-    &'m B: IntoStream<Slot<U::Item>, BEnv, &'s mut BState, Stream = BStream>,
-    AStream: Stream<Item = U::Item> + AsMut<Slot<U::Item>>,
-    BStream: Stream<Item = U::Item> + AsMut<Slot<U::Item>>,
-{
-    type Stream = (Interleave<([AStream; FIRST], [BStream; SECOND]), ORDER>, U);
-
-    fn into_stream(
-        self,
-        (first_env, second_env): (AEnv, BEnv),
-        (first, second): &'s mut ([AState; FIRST], [BState; SECOND]),
-        upstream: U,
-    ) -> Self::Stream {
-        let layers = Interleave {
-            layers: (
-                start(&self.layers.0, first_env, first),
-                start(&self.layers.1, second_env, second),
-            ),
-        };
-        (layers, upstream)
-    }
-}
-
 impl<
     's,
     X,
@@ -458,8 +356,6 @@ fn placed<L, const N: usize>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::schedule::RowWise;
-    use super::super::schedule::tests::{Indices, Launch, Number, Record, drain};
     use super::*;
     use crate::tests::DEVICE;
     use furiosa_opt_std::prelude::Topology;
@@ -494,25 +390,6 @@ mod tests {
         }
     }
 
-    /// Adds the step its env holds to each number.
-    struct Shift;
-
-    impl Module<&Number, usize, &mut ()> for Shift {
-        type Output = Number;
-
-        fn forward(&self, _: &mut Device, step: usize, _: &mut (), at: &Number) -> Number {
-            at.with(at.value() + step)
-        }
-    }
-
-    impl<'m, 's, U: Stream<Item = Number>> IntoStream<U, usize, &'s mut ()> for &'m Shift {
-        type Stream = RowWise<'s, &'m Shift, usize, (), U>;
-
-        fn into_stream(self, step: usize, unit: &'s mut (), upstream: U) -> Self::Stream {
-            RowWise::new(self, step, unit, upstream)
-        }
-    }
-
     /// Interleaving gives each layer its collection's env and the next slot of its collection's
     /// state, in order.
     #[test]
@@ -543,23 +420,5 @@ mod tests {
         let mut state = ([1, 10], [2], [()]);
         assert_eq!(three.forward(device, ((), (), 1), &mut state, 3), 16);
         assert_eq!(state, ([4, 16], [6], [()]));
-    }
-
-    /// A streamed interleave gives each collection its own env and each layer the next slot of its
-    /// collection.
-    #[test]
-    fn streams_each_collection_with_its_env() {
-        let _lease = DEVICE.blocking_lock();
-        let device = &mut Device::new(Topology { chips: 1, pes: 8 }).unwrap();
-        let live = Launch::over(3);
-        const ORDER: &[Branch] = &[Branch::First, Branch::Second, Branch::First];
-        let layers = Interleave::<([Record; 2], [Shift; 1]), ORDER> {
-            layers: ([Record, Record], [Shift]),
-        };
-        let mut histories = [Vec::new(), Vec::new()];
-        let mut slots = (histories.each_mut(), [()]);
-        let stream = (&layers).into_stream((live, 10), &mut slots, Indices::new(live));
-        assert_eq!(drain(device, stream), [12, 13, 14]);
-        assert_eq!(histories, [[0, 1, 2], [11, 12, 13]]);
     }
 }
