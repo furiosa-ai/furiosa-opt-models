@@ -72,6 +72,19 @@ type Slices<S> = m![{ Width<S> } % ({ Extent<S> }) / ({ Segment<S> }) # 256];
 type Elements<S> = m![{ Width<S> } % ({ Segment<S> })];
 type Rows<D, S, Chips = m![1]> = DmTensor<D, Chips, m![1 # 2], Slices<S>, Elements<S>>;
 type Registers<S, Chips = m![1]> = VrfTensor<f32, Chips, m![1 # 2], Slices<S>, Elements<S>>;
+/// A window's FP32 values narrowed to four lanes, the stream a formula computes in.
+type Narrowed<'l, S, Chips> = VectorNarrowTensor<
+    'l,
+    { Tu::Main },
+    f32,
+    Chips,
+    m![1 # 2],
+    Slices<S>,
+    m![{ Width<S> } % ({ Segment<S> }) / 4],
+    m![{ Width<S> } % 4],
+    Fresh,
+    { stage::VeOrder::IntraFirst },
+>;
 
 /// Scalars widened to FP32 for arithmetic and converted back at the window boundary.
 pub(crate) trait Float: MaterializableScalar + FetchCast<f32> {
@@ -194,18 +207,7 @@ impl<S: M + 'static> Window<S> {
     fn stream<'l, D: Float, Chips: M>(
         main: &'l mut TuContext<{ Tu::Main }>,
         input: &'l Rows<D, S, Chips>,
-    ) -> VectorNarrowTensor<
-        'l,
-        { Tu::Main },
-        f32,
-        Chips,
-        m![1 # 2],
-        Slices<S>,
-        m![{ Width<S> } % ({ Segment<S> }) / 4],
-        m![{ Width<S> } % 4],
-        Fresh,
-        { stage::VeOrder::IntraFirst },
-    > {
+    ) -> Narrowed<'l, S, Chips> {
         main.begin(input.view())
             .fetch::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
             .fetch_cast::<f32>()

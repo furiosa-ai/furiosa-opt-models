@@ -1,6 +1,8 @@
 //! Activation functions: each one function of one element.
 
-use super::{Float, Registers, Rows, Segment, SpreadPacket, SpreadTime, Width, Window};
+use super::{
+    Float, Narrowed, Registers, Rows, Segment, Slices, SpreadPacket, SpreadTime, Width, Window,
+};
 use crate::Op;
 use crate::load::Load;
 use crate::ops::index::packed::Timestep;
@@ -45,8 +47,8 @@ impl<D: Float, S: M + 'static, Chips: M + 'static> Op<&HbmTensor<D, Chips, S>> f
 
     /// Each window's `x * sigmoid(1.702 x)` in FP32, `x` held in the stash.
     fn forward(&self, device: &mut Device, input: &HbmTensor<D, Chips, S>) -> Self::Output {
-        Window::<S>::map(device, [input], |device, [input]| {
-            Window::<S>::stream(&mut device.main, &input)
+        Window::<S>::unary(device, input, |stream| {
+            stream
                 .vector_stash()
                 .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), 1.702_f32)
                 .vector_fp_unary(FpUnaryOp::Sigmoid)
@@ -55,13 +57,6 @@ impl<D: Float, S: M + 'static, Chips: M + 'static> Op<&HbmTensor<D, Chips, S>> f
                     BinaryArgMode::Mode10,
                     Stash,
                 )
-                .vector_widen_concat::<
-                    m![{ Width<S> } % ({ Segment<S> }) / 8],
-                    m![{ Width<S> } % 8],
-                >()
-                .vector_final()
-                .commit_trim::<m![{ Width<S> } % 8]>()
-                .commit()
         })
     }
 }
@@ -206,17 +201,7 @@ impl<D: Float, S: M + 'static, Chips: M> Op<&HbmTensor<D, Chips, S>> for Silu {
 
     /// Each window's `x * sigmoid(x)` in FP32, `x` held in the stash.
     fn forward(&self, device: &mut Device, input: &HbmTensor<D, Chips, S>) -> Self::Output {
-        Window::<S>::map(device, [input], |device, [input]| {
-            Window::<S>::stream(&mut device.main, &input)
-                .vector_silu()
-                .vector_widen_concat::<
-                    m![{ Width<S> } % ({ Segment<S> }) / 8],
-                    m![{ Width<S> } % 8],
-                >()
-                .vector_final()
-                .commit_trim::<m![{ Width<S> } % 8]>()
-                .commit()
-        })
+        Window::<S>::unary(device, input, |stream| stream.vector_silu())
     }
 }
 
@@ -228,16 +213,8 @@ impl<D: Float, S: M + 'static, Chips: M> Op<&HbmTensor<D, Chips, S>> for Sigmoid
     type Output = HbmTensor<D, Chips, S>;
 
     fn forward(&self, device: &mut Device, input: &HbmTensor<D, Chips, S>) -> Self::Output {
-        Window::<S>::map(device, [input], |device, [input]| {
-            Window::<S>::stream(&mut device.main, &input)
-                .vector_fp_unary(FpUnaryOp::Sigmoid)
-                .vector_widen_concat::<
-                    m![{ Width<S> } % ({ Segment<S> }) / 8],
-                    m![{ Width<S> } % 8],
-                >()
-                .vector_final()
-                .commit_trim::<m![{ Width<S> } % 8]>()
-                .commit()
+        Window::<S>::unary(device, input, |stream| {
+            stream.vector_fp_unary(FpUnaryOp::Sigmoid)
         })
     }
 }
@@ -250,16 +227,8 @@ impl<D: Float, S: M + 'static, Chips: M + 'static> Op<&HbmTensor<D, Chips, S>> f
     type Output = HbmTensor<D, Chips, S>;
 
     fn forward(&self, device: &mut Device, input: &HbmTensor<D, Chips, S>) -> Self::Output {
-        Window::<S>::map(device, [input], |device, [input]| {
-            Window::<S>::stream(&mut device.main, &input)
-                .vector_fp_unary(FpUnaryOp::Tanh)
-                .vector_widen_concat::<
-                    m![{ Width<S> } % ({ Segment<S> }) / 8],
-                    m![{ Width<S> } % 8],
-                >()
-                .vector_final()
-                .commit_trim::<m![{ Width<S> } % 8]>()
-                .commit()
+        Window::<S>::unary(device, input, |stream| {
+            stream.vector_fp_unary(FpUnaryOp::Tanh)
         })
     }
 }
@@ -322,6 +291,40 @@ impl<In: AxisName, Chips: M> Op<HbmTensorView<'_, f32, Chips, m![Timestep, In]>>
             .commit()
     }
 }
+
+impl<S: M + 'static> Window<S> {
+    /// `function` of each FP32 value of `input`, in one DM round trip a window.
+    fn unary<D: Float, Chips: M, Stash: StashState>(
+        device: &mut Device,
+        input: &HbmTensor<D, Chips, S>,
+        function: impl for<'l> Fn(Narrowed<'l, S, Chips>) -> Computed<'l, S, Chips, Stash>,
+    ) -> HbmTensor<D, Chips, S> {
+        Self::map(device, [input], |device, [input]| {
+            function(Self::stream(&mut device.main, &input))
+                .vector_widen_concat::<
+                    m![{ Width<S> } % ({ Segment<S> }) / 8],
+                    m![{ Width<S> } % 8],
+                >()
+                .vector_final()
+                .commit_trim::<m![{ Width<S> } % 8]>()
+                .commit()
+        })
+    }
+}
+
+/// A window's stream after an activation's arithmetic, its stash in state `Stash`.
+type Computed<'l, S, Chips, Stash> = VectorFpTensor<
+    'l,
+    { Tu::Main },
+    f32,
+    Chips,
+    m![1 # 2],
+    Slices<S>,
+    m![{ Width<S> } % ({ Segment<S> }) / 4],
+    m![{ Width<S> } % 4],
+    Stash,
+    { stage::VeOrder::IntraFirst },
+>;
 
 #[cfg(test)]
 mod tests {
