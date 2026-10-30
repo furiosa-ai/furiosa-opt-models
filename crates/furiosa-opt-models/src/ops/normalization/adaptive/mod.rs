@@ -1,20 +1,24 @@
 //! RMS norms of packed rows whose gain and shift each row's modality and timestep select: the
-//! tiles they move rows in, beside one file per tiling.
+//! tiles they move rows in, beside one file per tiling and the passes over any of them.
 //!
 //! - A tile spreads its features over the slices and its two halves over the clusters; its row
 //!   statistics reduce across slices, and per-feature operands stay in the slices that use them.
 
 use crate::Op;
 use crate::load::Load;
-use crate::ops::index::packed::{Packed, Rows, Table};
+use crate::ops::index::packed::{Join, Packed, Rows, Table};
 use crate::ops::normalization::{Lanes, Scale, Squares, Widen};
 use crate::tensor::form::Weight;
+use blocks::Block;
 use furiosa_opt_std::prelude::*;
+use rows::{Narrow, Wide};
 use std::borrow::Borrow;
 use std::marker::PhantomData;
+use tiling::{Part, Tiling, row};
 
 pub(crate) mod blocks;
 pub(crate) mod rows;
+mod tiling;
 
 axes![Strip = 64];
 
@@ -128,6 +132,128 @@ where
         let mut output = HbmTensor::new();
         self.forward(device, (input, &mut output, modulation));
         output
+    }
+}
+
+/// Every span of a packed sequence, RMS-normalized with `weight` and modulated by its rows of
+/// `(shift, scale)`: its edge strips as strips, its whole blocks as blocks.
+impl<T: AxisName, A: AxisName, V: AxisName, Width: AxisName, Chips: M, const EPSILON: usize, G>
+    Op<(
+        &Rows<Packed<T, A, V>, Width, Chips>,
+        &mut Rows<Packed<T, A, V>, Width, Chips>,
+        &(Table<Width, Chips>, Table<Width, Chips>),
+    )> for AdaptiveRms<Width, EPSILON, Chips, G>
+where
+    G: Borrow<HbmTensor<bf16, Chips, m![Width]>>,
+{
+    type Output = ();
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (input, output, tables): (
+            &Rows<Packed<T, A, V>, Width, Chips>,
+            &mut Rows<Packed<T, A, V>, Width, Chips>,
+            &(Table<Width, Chips>, Table<Width, Chips>),
+        ),
+    ) {
+        // Each span's strips before its first whole block, its whole blocks, then its strips after;
+        // strips are 64 rows when every span comes in them, else 16.
+        let plan = const {
+            Block::<Packed<T, A, V>>::plan(Join::spans::<T, A, V>(), Packed::<T, A, V>::STRIP)
+        };
+        #[unroll]
+        for span in 0..3 {
+            #[unroll]
+            for region in 0..3 {
+                let (first, count, index) = plan[span][region];
+                if count > 0 {
+                    let rows = (input, &mut *output);
+                    if region == 1 {
+                        self.span::<Block<Packed<T, A, V>>, _>(
+                            device,
+                            rows,
+                            tables,
+                            (first, count, index),
+                        );
+                    } else if const { Packed::<T, A, V>::STRIP == 64 } {
+                        self.span::<Wide<Width>, _>(device, rows, tables, (first, count, index));
+                    } else {
+                        self.span::<Narrow<Width>, _>(device, rows, tables, (first, count, index));
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<W: AxisName, const EPSILON: usize, X: M, G> AdaptiveRms<W, EPSILON, X, G>
+where
+    G: Borrow<HbmTensor<bf16, X, m![W]>>,
+{
+    /// `tiles` tiles of `T` from tile `first` of `input` into `output`, normalized and modulated by
+    /// table row `index`.
+    fn span<T: Tiling<W>, R: AxisName>(
+        &self,
+        device: &mut Device,
+        (input, output): (&Rows<R, W, X>, &mut Rows<R, W, X>),
+        (shift, scale): &(Table<W, X>, Table<W, X>),
+        (first, tiles, index): (usize, usize, usize),
+    ) {
+        let gain: tiling::Operand<T, W, X> = {
+            let (weight, scale) = (self.weight.tensor().view(), row(scale, index));
+            let weight = T::operand(&mut *device, weight);
+            let scale: tiling::Feature<T, W, X> = scale.to_dm(&mut device.tdma);
+            device
+                .main
+                .begin(scale.view())
+                .fetch::<m![W % ({ <T as Tiling<W>>::Run }) / 8], m![W % 8]>()
+                .fetch_cast::<f32>()
+                .collect::<m![W % ({ <T as Tiling<W>>::Run }) / 8], m![W % 8]>()
+                .vector_init()
+                .vector_intra_slice_tag(TagMode::Zero)
+                .vector_narrow_split::<
+                    m![W % ({ <T as Tiling<W>>::Run }) / 8, W % 8 / 4 % 2],
+                    m![W % 4],
+                >()
+                .vector_fp_binary(FpBinaryOp::AddF, 1.0f32)
+                .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &weight)
+                .vector_widen_concat::<m![W % ({ <T as Tiling<W>>::Run }) / 8], m![W % 8]>()
+                .vector_final()
+                .to_vrf(&mut device.sub)
+        };
+        let shift = T::operand(&mut *device, row(shift, index));
+        let last = first + tiles - 1;
+        let (mut current, mut next): (Part<T, W, X>, Part<T, W, X>) =
+            (DmTensor::new(), DmTensor::new());
+        // Two results, so that a tile computes while the tile before it is stored.
+        let (mut kept, mut held): (Part<T, W, X>, Part<T, W, X>) =
+            (DmTensor::new(), DmTensor::new());
+        T::fill(&mut *device, input, first, &mut current);
+        T::fill(&mut *device, input, (first + 1).min(last), &mut next);
+        // An odd span's last pair normalizes its last tile twice.
+        for pair in 0..(tiles + 1) / 2 {
+            let at = first + 2 * pair;
+            // Both statistics first, so Main computes the second while Sub inverts the first.
+            let inverse = T::inverse::<EPSILON, X>(&mut *device, &current);
+            let following = T::inverse::<EPSILON, X>(&mut *device, &next);
+            T::modulate(
+                &mut *device,
+                (&current, &inverse),
+                (&gain, &shift),
+                &mut kept,
+            );
+            T::fill(&mut *device, input, (at + 2).min(last), &mut current);
+            T::spill(&mut *device, &kept, &mut *output, at);
+            T::modulate(
+                &mut *device,
+                (&next, &following),
+                (&gain, &shift),
+                &mut held,
+            );
+            T::fill(&mut *device, input, (at + 3).min(last), &mut next);
+            T::spill(&mut *device, &held, &mut *output, (at + 1).min(last));
+        }
     }
 }
 

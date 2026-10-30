@@ -1,21 +1,19 @@
-//! The modulated norm and the gated residual passes of packed rows in HBM in blocks of 512 rows
-//! (256 when the rows do not come in whole 512-row blocks), eight (four) rows a slice.
+//! The tiling of packed rows in HBM in blocks of 512 rows (256 when the rows do not come in whole
+//! 512-row blocks), eight (four) rows a slice, and its gated residual pass.
 //!
 //! - A block puts each cluster's half of its rows on 32 groups of slices, each slice one contiguous
 //!   run of each of its rows' features in whole 256-byte bursts; per-feature operands repeat over
 //!   a slice's rows, so a pass reads each operand vector for all of them in a row.
 //! - A span's strips before its first whole block and after its last run as strips.
 
-use core::borrow::Borrow;
 use core::marker::PhantomData;
 
 use furiosa_opt_std::prelude::*;
 
-use super::rows::Narrow;
-use super::rows::Wide;
+use super::tiling::{self, Tiling};
 use crate::Op;
-use crate::ops::index::packed::{Group, Join, Packed, Rows, Table};
-use crate::ops::normalization::{self, Squares, Widen};
+use crate::ops::index::packed::{Rows, Table};
+use crate::ops::normalization::{self, Squares};
 use crate::specialize::diffusion::Run;
 
 /// Rows of a block of packed rows: 512 when the rows come in whole 512-row blocks, else 256.
@@ -66,16 +64,11 @@ type E<W> = Symbol<Run<W>>;
 type Bk<R> = Symbol<Block<R>>;
 type Hb<R> = Symbol<Halves<R>>;
 type Ln<R> = Symbol<Lanes<R>>;
-type Bs<R> = Symbol<Blocks<R>>;
-type Blocked<R, W> = m![{ Bs<R> }, { Bk<R> }, W];
 type Half<R> = m![{ Bk<R> } / ({ Hb<R> })];
 type Slices<R, W> = m![{ Bk<R> } % ({ Hb<R> }) / ({ Ln<R> }), W / ({ E<W> }) # 8];
 pub(crate) type Part<D, R, W, X> =
     DmTensor<D, X, Half<R>, Slices<R, W>, m![{ Bk<R> } % ({ Ln<R> }), W % ({ E<W> })]>;
-type Feature<R, W, X> = DmTensor<bf16, X, Half<R>, Slices<R, W>, m![W % ({ E<W> })]>;
 type Operand<R, W, X> = VrfTensor<f32, X, Half<R>, Slices<R, W>, m![W % ({ E<W> })]>;
-type RowOperand<R, W, X> =
-    VrfTensor<f32, X, Half<R>, Slices<R, W>, m![{ Bk<R> } % ({ Ln<R> }), 1 # 8]>;
 /// How a slice's rows of a block move through a norm's statistic pass.
 type BlockLanes<R, W> = normalization::Lanes<
     m![{ Bk<R> } % ({ Ln<R> }), W % ({ E<W> }) / 8],
@@ -127,24 +120,79 @@ impl<R: AxisName> Block<R> {
         }
         plan
     }
+
+    /// Table row `index`.
+    pub(crate) fn row<W: AxisName, X: M>(
+        table: &Table<W, X>,
+        index: usize,
+    ) -> HbmTensorView<'_, bf16, X, m![W]> {
+        tiling::row(table, index)
+    }
 }
 
-impl<R: AxisName, W: AxisName, X: M> Op<(&Rows<R, W, X>, usize, &mut Part<bf16, R, W, X>)>
-    for Block<R>
+impl<R: AxisName, W: AxisName> Tiling<W> for Block<R> {
+    type Tiles<Q: AxisName> = Symbol<Blocks<Q>>;
+    type Rows = Bk<R>;
+    type Half = Half<R>;
+    type Slices = Slices<R, W>;
+    type Element = m![{ Bk<R> } % ({ Ln<R> }), W % ({ E<W> })];
+    type Run = E<W>;
+    type Statistic = m![{ Bk<R> } % ({ Ln<R> }), 1 # 8];
+    type Modulated = m![W % ({ E<W> }) / 8, { Bk<R> } % ({ Ln<R> })];
+    type Split = m![W % ({ E<W> }) / 8, { Bk<R> } % ({ Ln<R> }), W % 8 / 4 % 2];
+
+    fn inverse<const EPSILON: usize, X: M>(
+        device: &mut Device,
+        part: &Part<bf16, R, W, X>,
+    ) -> tiling::RowOperand<Self, W, X> {
+        Squares::<
+            BlockLanes<R, W>,
+            W,
+            m![{ Bk<R> } % ({ Ln<R> })],
+            m![W / ({ E<W> })],
+            EPSILON,
+        >::inverse(device, part.view(), |square| square)
+    }
+}
+
+/// A per-feature vector, in the vector registers of the slices that hold its features.
+impl<R: AxisName, W: AxisName, X: M> Op<HbmTensorView<'_, bf16, X, m![W]>> for Block<R> {
+    type Output = Operand<R, W, X>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        vector: HbmTensorView<'_, bf16, X, m![W]>,
+    ) -> Self::Output {
+        Self::operand(device, vector)
+    }
+}
+
+/// Block `at` of a residual and of its branch, each into its part.
+impl<R: AxisName, W: AxisName, X: M>
+    Op<(
+        (&Rows<R, W, X>, &Rows<R, W, X>),
+        usize,
+        &mut (Part<bf16, R, W, X>, Part<bf16, R, W, X>),
+    )> for Block<R>
 {
     type Output = ();
 
     fn forward(
         &self,
         device: &mut Device,
-        (rows, at, part): (&Rows<R, W, X>, usize, &mut Part<bf16, R, W, X>),
+        ((input, branch), at, (rows, update)): (
+            (&Rows<R, W, X>, &Rows<R, W, X>),
+            usize,
+            &mut (Part<bf16, R, W, X>, Part<bf16, R, W, X>),
+        ),
     ) {
-        // SAFETY: the blocks split the row axis in row order; every cell keeps its address.
-        unsafe { rows.view().reshape::<X, Blocked<R, W>>() }
-            .tile::<m![{ Bs<R> }], 1, m![{ Bs<R> } = 1 # ({ Bs<R> }), { Bk<R> }, W]>(at)
-            .to_dm_view(&mut device.tdma, part.view_mut());
+        Self::fill(&mut *device, input, at, rows);
+        Self::fill(device, branch, at, update);
     }
 }
+
+/// A part into block `at` of `rows`.
 impl<R: AxisName, W: AxisName, X: M> Op<(&Part<bf16, R, W, X>, &mut Rows<R, W, X>, usize)>
     for Block<R>
 {
@@ -155,213 +203,7 @@ impl<R: AxisName, W: AxisName, X: M> Op<(&Part<bf16, R, W, X>, &mut Rows<R, W, X
         device: &mut Device,
         (part, rows, at): (&Part<bf16, R, W, X>, &mut Rows<R, W, X>, usize),
     ) {
-        part.view().to_hbm_view(
-            &mut device.tdma,
-            // SAFETY: the blocks split the row axis in row order; every cell keeps its address.
-            unsafe { rows.view_mut().reshape::<X, Blocked<R, W>>() }
-                .tile::<m![{ Bs<R> }], 1, m![{ Bs<R> } = 1 #{!} ({ Bs<R> }), { Bk<R> }, W]>(at),
-        );
-    }
-}
-impl<R: AxisName, W: AxisName, X: M> Op<HbmTensorView<'_, bf16, X, m![W]>> for Block<R> {
-    type Output = Operand<R, W, X>;
-
-    fn forward(
-        &self,
-        device: &mut Device,
-        vector: HbmTensorView<'_, bf16, X, m![W]>,
-    ) -> Self::Output {
-        let in_dm: Feature<R, W, X> = vector.to_dm(&mut device.tdma);
-        in_dm.widen::<W, 8>(&mut device.sub)
-    }
-}
-impl<R: AxisName> Block<R> {
-    /// Table row `index`.
-    pub(crate) fn row<W: AxisName, X: M>(
-        table: &Table<W, X>,
-        index: usize,
-    ) -> HbmTensorView<'_, bf16, X, m![W]> {
-        // SAFETY: a table row is its features, contiguous.
-        unsafe {
-            table
-                .view()
-                .tile::<m![Group], 1, m![Group = 1 # Group, W]>(index)
-                .reshape::<X, m![W]>()
-        }
-    }
-}
-impl<R: AxisName, W: AxisName, X: M, const EPSILON: usize, G>
-    Op<(&Part<bf16, R, W, X>, &super::AdaptiveRms<W, EPSILON, X, G>)> for Block<R>
-{
-    type Output = RowOperand<R, W, X>;
-
-    fn forward(
-        &self,
-        device: &mut Device,
-        (part, _): (&Part<bf16, R, W, X>, &super::AdaptiveRms<W, EPSILON, X, G>),
-    ) -> Self::Output {
-        Squares::<
-            BlockLanes<R, W>,
-            W,
-            m![{ Bk<R> } % ({ Ln<R> })],
-            m![W / ({ E<W> })],
-            EPSILON,
-        >::inverse(device, part.view(), |square| square)
-    }
-}
-impl<R: AxisName, W: AxisName, X: M>
-    Op<(
-        &Part<bf16, R, W, X>,
-        (&RowOperand<R, W, X>, &Operand<R, W, X>, &Operand<R, W, X>),
-        &mut Part<bf16, R, W, X>,
-    )> for Block<R>
-{
-    type Output = ();
-
-    fn forward(
-        &self,
-        device: &mut Device,
-        (part, (inverse, gain, shift), output): (
-            &Part<bf16, R, W, X>,
-            (&RowOperand<R, W, X>, &Operand<R, W, X>, &Operand<R, W, X>),
-            &mut Part<bf16, R, W, X>,
-        ),
-    ) {
-        device
-        .main
-        .begin(part.view())
-        .fetch::<m![W % ({ E<W> }) / 8, { Bk<R> } % ({ Ln<R> })], m![W % 8]>()
-        .fetch_cast::<f32>()
-        .collect::<m![W % ({ E<W> }) / 8, { Bk<R> } % ({ Ln<R> })], m![W % 8]>()
-        .vector_init()
-        .vector_intra_slice_tag(TagMode::Zero)
-        .vector_narrow_split::<
-            m![W % ({ E<W> }) / 8, { Bk<R> } % ({ Ln<R> }), W % 8 / 4 % 2],
-            m![W % 4],
-        >()
-        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), inverse)
-        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), gain)
-        .vector_fp_binary(FpBinaryOp::AddF, shift)
-        .vector_widen_concat::<m![W % ({ E<W> }) / 8, { Bk<R> } % ({ Ln<R> })], m![W % 8]>()
-        .vector_final()
-        .cast::<bf16, m![W % 8 # 16]>()
-        .commit_trim::<m![W % 8]>()
-        .commit_view(output.view_mut());
-    }
-}
-
-/// Every span of a packed sequence, RMS-normalized with `weight` and modulated by its rows of
-/// `(shift, scale)`: its edge strips as strips, its whole blocks as blocks.
-impl<T: AxisName, A: AxisName, V: AxisName, Width: AxisName, Chips: M, const EPSILON: usize, G>
-    Op<(
-        &Rows<Packed<T, A, V>, Width, Chips>,
-        &mut Rows<Packed<T, A, V>, Width, Chips>,
-        &(Table<Width, Chips>, Table<Width, Chips>),
-    )> for super::AdaptiveRms<Width, EPSILON, Chips, G>
-where
-    G: Borrow<HbmTensor<bf16, Chips, m![Width]>>,
-{
-    type Output = ();
-
-    fn forward(
-        &self,
-        device: &mut Device,
-        (input, output, tables): (
-            &Rows<Packed<T, A, V>, Width, Chips>,
-            &mut Rows<Packed<T, A, V>, Width, Chips>,
-            &(Table<Width, Chips>, Table<Width, Chips>),
-        ),
-    ) {
-        let weight = self.weight.tensor();
-        // Each span's strips before its first whole block, its whole blocks, then its strips after;
-        // strips are 64 rows when every span comes in them, else 16.
-        let plan = const {
-            Block::<Packed<T, A, V>>::plan(Join::spans::<T, A, V>(), Packed::<T, A, V>::STRIP)
-        };
-        #[unroll]
-        for span in 0..3 {
-            #[unroll]
-            for region in 0..3 {
-                let (first, count, index) = plan[span][region];
-                if count > 0 {
-                    if region == 1 {
-                        type R<T, A, V> = Packed<T, A, V>;
-                        type B<T, A, V> = Block<R<T, A, V>>;
-                        let (shift, scale) = tables;
-                        let gain = {
-                            let (weight, scale) = (weight.view(), B::<T, A, V>::row(scale, index));
-                            let weight = B::<T, A, V>::new().forward(&mut *device, weight);
-                            let scale: Feature<R<T, A, V>, Width, Chips> =
-                                scale.to_dm(&mut device.tdma);
-                            device.main.begin(scale.view())
-                                .fetch::<m![Width % ({ E<Width> }) / 8], m![Width % 8]>()
-                                .fetch_cast::<f32>()
-                                .collect::<m![Width % ({ E<Width> }) / 8], m![Width % 8]>()
-                                .vector_init()
-                                .vector_intra_slice_tag(TagMode::Zero)
-                                .vector_narrow_split::<
-                                    m![Width % ({ E<Width> }) / 8, Width % 8 / 4 % 2],
-                                    m![Width % 4],
-                                >()
-                                .vector_fp_binary(FpBinaryOp::AddF, 1.0f32)
-                                .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &weight)
-                                .vector_widen_concat::<
-                                    m![Width % ({ E<Width> }) / 8],
-                                    m![Width % 8],
-                                >()
-                                .vector_final()
-                                .to_vrf(&mut device.sub)
-                        };
-                        let shift = B::<T, A, V>::new()
-                            .forward(&mut *device, B::<T, A, V>::row(shift, index));
-                        let last = first + count - 1;
-                        let (mut current, mut next): (
-                            Part<bf16, R<T, A, V>, Width, Chips>,
-                            Part<bf16, R<T, A, V>, Width, Chips>,
-                        ) = (DmTensor::new(), DmTensor::new());
-                        let (mut kept, mut held): (
-                            Part<bf16, R<T, A, V>, Width, Chips>,
-                            Part<bf16, R<T, A, V>, Width, Chips>,
-                        ) = (DmTensor::new(), DmTensor::new());
-                        B::<T, A, V>::new().forward(&mut *device, (input, first, &mut current));
-                        B::<T, A, V>::new()
-                            .forward(&mut *device, (input, (first + 1).min(last), &mut next));
-                        for pair in 0..(count + 1) / 2 {
-                            let at = first + 2 * pair;
-                            let inverse =
-                                B::<T, A, V>::new().forward(&mut *device, (&current, self));
-                            let following =
-                                B::<T, A, V>::new().forward(&mut *device, (&next, self));
-                            B::<T, A, V>::new().forward(
-                                &mut *device,
-                                (&current, (&inverse, &gain, &shift), &mut kept),
-                            );
-                            B::<T, A, V>::new()
-                                .forward(&mut *device, (input, (at + 2).min(last), &mut current));
-                            B::<T, A, V>::new().forward(&mut *device, (&kept, &mut *output, at));
-                            B::<T, A, V>::new().forward(
-                                &mut *device,
-                                (&next, (&following, &gain, &shift), &mut held),
-                            );
-                            B::<T, A, V>::new()
-                                .forward(&mut *device, (input, (at + 3).min(last), &mut next));
-                            B::<T, A, V>::new()
-                                .forward(&mut *device, (&held, &mut *output, (at + 1).min(last)));
-                        }
-                    } else if const { Packed::<T, A, V>::STRIP == 64 } {
-                        Wide::<Width>::new().forward(
-                            &mut *device,
-                            (input, &mut *output, self, tables, (first, count, index)),
-                        );
-                    } else {
-                        Narrow::<Width>::new().forward(
-                            &mut *device,
-                            (input, &mut *output, self, tables, (first, count, index)),
-                        );
-                    }
-                }
-            }
-        }
+        Self::spill(device, part, rows, at);
     }
 }
 
@@ -411,27 +253,5 @@ impl<R: AxisName, W: AxisName, X: M>
         .cast::<bf16, m![W % 8 # 16]>()
         .commit_trim::<m![W % 8]>()
         .commit_view(output.view_mut());
-    }
-}
-impl<R: AxisName, W: AxisName, X: M>
-    Op<(
-        (&Rows<R, W, X>, &Rows<R, W, X>),
-        usize,
-        &mut (Part<bf16, R, W, X>, Part<bf16, R, W, X>),
-    )> for Block<R>
-{
-    type Output = ();
-
-    fn forward(
-        &self,
-        device: &mut Device,
-        ((input, branch), at, (rows, update)): (
-            (&Rows<R, W, X>, &Rows<R, W, X>),
-            usize,
-            &mut (Part<bf16, R, W, X>, Part<bf16, R, W, X>),
-        ),
-    ) {
-        self.forward(&mut *device, (input, at, rows));
-        self.forward(device, (branch, at, update));
     }
 }
