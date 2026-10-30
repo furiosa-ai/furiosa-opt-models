@@ -685,7 +685,9 @@ type TileStatistic<T> = m![{ TileOf<T> }, Rows % 8, 1 # 8];
 type TileStatisticSlot<T> = m![{ TileSlot<T> }, Rows % 8, 1 # 8];
 type CachePanel<KvHeads, Head> = HbmTensor<bf16, Chip, m![Cache, KvHeads, Head]>;
 type Cluster<KvHeads> = m![KvHeads / 4];
-type Slice<KvHeads, Groups> = m![KvHeads % 4, Groups, Rows / 8];
+/// A slice's KV head of its cluster's four, its query group of four, and its eight rows of a tile;
+/// fewer query groups leave the slices of the absent ones empty.
+type Slice<KvHeads, Groups> = m![KvHeads % 4, Groups # 4, Rows / 8];
 type Scalar<KvHeads, Groups> =
     VrfTensor<f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, m![Rows % 8, 1 # 8]>;
 type Local<KvHeads, Groups> =
@@ -1844,16 +1846,16 @@ mod tests {
     use crate::tensor::live::tests::count;
     use crate::tests::DEVICE;
     use furiosa_opt_std::runtime::launch;
-    axes![KvHeads = 8, Groups = 4, Head = 128];
+    axes![KvHeads = 8, Groups = 4, Pairs = 2, Head = 128];
     type FixtureRows = Rows<1024>;
     type Sequences = Rows<1>;
-    type Queries = HbmTensor<bf16, Chip, m![Query, KvHeads, Groups, Head]>;
+    type Queries<G> = HbmTensor<bf16, Chip, m![Query, KvHeads, G, Head]>;
     type Fresh = HbmTensor<bf16, Chip, m![FixtureRows, KvHeads, Head]>;
-    type Output = HbmTensor<bf16, Chip, m![FixtureRows, KvHeads, Groups, Head]>;
+    type Output<G> = HbmTensor<bf16, Chip, m![FixtureRows, KvHeads, G, Head]>;
 
     #[derive(DeviceSend)]
-    struct Chunk {
-        query: Queries,
+    struct Chunk<G: AxisName> {
+        query: Queries<G>,
         key: Fresh,
         value: Fresh,
         causal: Causal,
@@ -1865,18 +1867,18 @@ mod tests {
     }
 
     #[device(chip = 1)]
-    fn attend_chunk(
+    fn attend_chunk<G: AxisName>(
         device: &mut Device,
-        chunk: &Chunk,
+        chunk: &Chunk<G>,
         blocks: &mut Blocks<KvHeads, Head>,
-        output: &mut Output,
+        output: &mut Output<G>,
     ) {
         // SAFETY: fixture query rows are contiguous and share the same length.
         let query = unsafe {
             chunk
                 .query
                 .view()
-                .reshape::<Chip, m![FixtureRows, KvHeads, Groups, Head]>()
+                .reshape::<Chip, m![FixtureRows, KvHeads, G, Head]>()
                 .alias()
         };
         // A local: device code cannot read the constant that `&Attention {..}` is promoted to.
@@ -1890,7 +1892,7 @@ mod tests {
             &mut (),
             (
                 (
-                    Input::<KvHeads, Groups, Head, FixtureRows> {
+                    Input::<KvHeads, G, Head, FixtureRows> {
                         attention: &attention,
                         query: &query,
                         key: &chunk.key,
@@ -1928,10 +1930,10 @@ mod tests {
         ((j + head * 3 + group * 5) % 15) as f32 / 32.0 - 0.21875
     }
 
-    /// The attended rows of a chunk of `q` rows over `h` keys of a poisoned, shuffled pool; scratch
-    /// rows past the chunk's hold `past`, or else a NaN query and the next key's key and value, and
-    /// live row `nan` holds a NaN value.
-    async fn attend(
+    /// The attended rows of a chunk of `q` rows of `G` query groups a KV head over `h` keys of a
+    /// poisoned, shuffled pool; scratch rows past the chunk's hold `past`, or else a NaN query and
+    /// the next key's key and value, and live row `nan` holds a NaN value.
+    async fn attend<G: AxisName>(
         context: &mut Device,
         (q, h): (usize, usize),
         (past, nan): (Option<f32>, Option<usize>),
@@ -1975,10 +1977,11 @@ mod tests {
             .to_hbm(&mut context.pdma)
             .await
             .expect("host transfer");
-        let query: Queries = HostTensor::<bf16, m![Query, KvHeads, Groups, Head]>::from_vec(
-            (0..1024 * 8 * 4 * 128).map(|at| {
-                let j = at / (8 * 4 * 128);
-                let own = query_value(j, at / (4 * 128) % 8, at / 128 % 4);
+        let groups = G::SIZE;
+        let query: Queries<G> = HostTensor::<bf16, m![Query, KvHeads, G, Head]>::from_vec(
+            (0..1024 * 8 * groups * 128).map(|at| {
+                let j = at / (8 * groups * 128);
+                let own = query_value(j, at / (groups * 128) % 8, at / 128 % groups);
                 scratch(j, own, f32::NAN)
             }),
         )
@@ -1990,13 +1993,13 @@ mod tests {
                 .to_hbm(&mut context.pdma)
                 .await
                 .expect("host transfer");
-        let mut output: HbmTensor<bf16, Chip, m![FixtureRows, KvHeads, Groups, Head]> =
-            HostTensor::<bf16, m![FixtureRows, KvHeads, Groups, Head]>::from_vec(vec![
+        let mut output: Output<G> =
+            HostTensor::<bf16, m![FixtureRows, KvHeads, G, Head]>::from_vec(vec![
                 bf16::from_f32(
                     f32::INFINITY
                 );
                 1024 * 8
-                    * 4
+                    * groups
                     * 128
             ])
             .to_hbm(&mut context.pdma)
@@ -2059,7 +2062,7 @@ mod tests {
         .await
         .expect("device launch");
         output
-            .to_host::<m![FixtureRows, KvHeads, Groups, Head]>(&mut context.pdma)
+            .to_host::<m![FixtureRows, KvHeads, G, Head]>(&mut context.pdma)
             .await
             .expect("host transfer")
             .into_vec()
@@ -2071,6 +2074,12 @@ mod tests {
     async fn ignores_scratch_rows_past_the_live_ones() {
         let _lease = DEVICE.lock().await;
         let mut context = Device::new(attend_chunk.topology()).unwrap();
+        ignores_scratch_rows::<Groups>(&mut context).await;
+        ignores_scratch_rows::<Pairs>(&mut context).await;
+    }
+
+    /// The scratch rows' check at `G` query groups a KV head.
+    async fn ignores_scratch_rows<G: AxisName>(context: &mut Device) {
         let cases = [
             (1, 0),
             (127, 130),
@@ -2080,28 +2089,30 @@ mod tests {
             (613, 2049),
             (1000, 0),
         ];
-        let row = 8 * 4 * 128;
+        let row = 8 * G::SIZE * 128;
         for (q, h) in cases {
-            let zeroed = attend(&mut context, (q, h), (Some(0.0), None)).await;
+            let zeroed = attend::<G>(&mut *context, (q, h), (Some(0.0), None)).await;
             let runs = [
                 (f32::NAN, None),
                 (f32::INFINITY, None),
                 (f32::NAN, Some(q - 1)),
             ];
             for (past, nan) in runs {
-                let got = attend(&mut context, (q, h), (Some(past), nan)).await;
+                let got = attend::<G>(&mut *context, (q, h), (Some(past), nan)).await;
                 let clean = nan.unwrap_or(q) * row;
                 for (at, (got, zeroed)) in got[..clean].iter().zip(&zeroed[..clean]).enumerate() {
                     let (got, zeroed) = (got.to_f32(), zeroed.to_f32());
                     assert!(
                         got.is_finite() && got == zeroed,
-                        "q={q} h={h} past={past} row={}: {got} != {zeroed}",
+                        "{} groups q={q} h={h} past={past} row={}: {got} != {zeroed}",
+                        G::SIZE,
                         at / row
                     );
                 }
                 assert!(
                     got[clean..q * row].iter().all(|got| got.to_f32().is_nan()),
-                    "q={q} h={h}: the last row's NaN value does not reach its output"
+                    "{} groups q={q} h={h}: the last row's NaN value does not reach its output",
+                    G::SIZE
                 );
             }
         }
@@ -2109,11 +2120,18 @@ mod tests {
 
     /// A chunk of any tile count attends causally over its own rows and every history block
     /// width (2048, 1024, 512 and 128 keys, a partial panel), below, at and above each width's
-    /// edge, the pool holding NaN or infinities past the history and its blocks out of order.
+    /// edge, the pool holding NaN or infinities past the history and its blocks out of order: at
+    /// four query groups a KV head, and at two, whose slices are half empty.
     #[tokio::test(flavor = "current_thread")]
     async fn attends_causally_with_poisoned_padding() {
         let _lease = DEVICE.lock().await;
         let mut context = Device::new(attend_chunk.topology()).unwrap();
+        attends_causally::<Groups>(&mut context).await;
+        attends_causally::<Pairs>(&mut context).await;
+    }
+
+    /// The causal check at `G` query groups a KV head.
+    async fn attends_causally<G: AxisName>(context: &mut Device) {
         let cases = [
             (128, 0),
             (256, 0),
@@ -2133,11 +2151,11 @@ mod tests {
             (1023, 2049),
         ];
         for (q, h) in cases {
-            let got = attend(&mut context, (q, h), (None, None)).await;
+            let got = attend::<G>(&mut *context, (q, h), (None, None)).await;
             let mut max_error = 0.0f32;
             for j in 0..q {
                 for head in 0..8 {
-                    for group in 0..4 {
+                    for group in 0..G::SIZE {
                         let scores: Vec<f32> = (0..=h + j)
                             .map(|k| {
                                 query_value(j, head, group) * kv(k, head) * 128.0 / 128.0f32.sqrt()
@@ -2153,22 +2171,25 @@ mod tests {
                         }
                         for channel in 0..128 {
                             let expected = weighted / sum * scale(channel);
-                            let actual = got[((j * 8 + head) * 4 + group) * 128 + channel].to_f32();
+                            let at = ((j * 8 + head) * G::SIZE + group) * 128 + channel;
+                            let actual = got[at].to_f32();
                             assert!(
                                 actual.is_finite(),
-                                "q={q} h={h} row={j} head={head} group={group}"
+                                "{} groups q={q} h={h} row={j} head={head} group={group}",
+                                G::SIZE
                             );
                             let error = (actual - expected).abs();
                             max_error = max_error.max(error);
                             assert!(
                                 error <= 0.004,
-                                "q={q} h={h} row={j}: {actual} != {expected}"
+                                "{} groups q={q} h={h} row={j}: {actual} != {expected}",
+                                G::SIZE
                             );
                         }
                     }
                 }
             }
-            println!("q={q} h={h} max_error={max_error}");
+            println!("{} groups q={q} h={h} max_error={max_error}", G::SIZE);
         }
     }
 }
