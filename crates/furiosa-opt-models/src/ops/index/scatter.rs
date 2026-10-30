@@ -95,6 +95,48 @@ impl Store {
             .commit_view(stored.view_mut());
         stored
     }
+
+    /// The live rows of a DM row table, `Inner` of each row a slice: all in one transfer when all
+    /// are live, else a whole packet, then a partial packet's row, at a time; later rows unwritten.
+    pub(crate) fn live<D, C: M, S: M, Inner: M, Width: AxisName, Rows: AxisName, Chips: M>(
+        device: &mut Device,
+        rows: &DmTensor<D, Chips, C, S, m![Rows, { Inner }]>,
+        live: Live<(), Rows>,
+        output: &mut HbmTensor<D, Chips, m![Rows, Width]>,
+    ) where
+        D: MaterializableScalar,
+    {
+        live.cover::<Lanes<Rows>, _>(
+            &mut (device, output),
+            (
+                |(device, output)| {
+                    rows.view().to_hbm_view(&mut device.tdma, output.view_mut());
+                },
+                |(device, output), packet| {
+                    rows.view()
+                        .tile::<Layout<Rows>::Groups, 1, Layout<Rows>::Elements<Inner>>(packet)
+                        .to_hbm_view(
+                            &mut device.tdma,
+                            output
+                                .view_mut()
+                                .tile::<Layout<Rows>::Groups, 1, Layout<Rows>::GroupMut<m![Width]>>(
+                                    packet,
+                                ),
+                        );
+                },
+                |(device, output), row| {
+                    rows.view()
+                        .tile::<m![Rows], 1, m![Rows = 1 # Rows, { Inner }]>(row)
+                        .to_hbm_view(
+                            &mut device.tdma,
+                            output
+                                .view_mut()
+                                .tile::<m![Rows], 1, m![Rows = 1 #{!} Rows, Width]>(row),
+                        );
+                },
+            ),
+        );
+    }
 }
 
 impl<Width: AxisName, Rows: AxisName, Chips: M + 'static> Op<&Spread<Width, Rows, Chips>>
@@ -111,8 +153,7 @@ impl<Width: AxisName, Rows: AxisName, Chips: M + 'static> Op<&Spread<Width, Rows
     }
 }
 
-/// Only the live rows: every row in one transfer when all are live, else each whole packet in
-/// one, then each row of a partial last packet alone; a later row of the output is left unwritten.
+/// Only the live rows, through the slices a store transfers whole.
 impl<Width: AxisName, Rows: AxisName, Chips: M + 'static>
     Op<(
         (&Spread<Width, Rows, Chips>, Live<(), Rows>),
@@ -130,42 +171,7 @@ impl<Width: AxisName, Rows: AxisName, Chips: M + 'static>
         ),
     ) {
         let rows = Self::rows(device, input);
-        live.cover::<Lanes<Rows>, _>(
-            &mut (device, output),
-            (
-                |(device, output)| {
-                    rows.view().to_hbm_view(&mut device.tdma, output.view_mut());
-                },
-                |(device, output), packet| {
-                    rows.view()
-                        .tile::<
-                            Layout<Rows>::Groups,
-                            1,
-                            Layout<Rows>::Elements<m![Width % ({ Spanned<Width> })]>,
-                        >(
-                            packet,
-                        )
-                        .to_hbm_view(
-                            &mut device.tdma,
-                            output
-                                .view_mut()
-                                .tile::<Layout<Rows>::Groups, 1, Layout<Rows>::GroupMut<m![Width]>>(
-                                    packet,
-                                ),
-                        );
-                },
-                |(device, output), row| {
-                    rows.view()
-                        .tile::<m![Rows], 1, m![Rows = 1 # Rows, Width % ({ Spanned<Width> })]>(row)
-                        .to_hbm_view(
-                            &mut device.tdma,
-                            output
-                                .view_mut()
-                                .tile::<m![Rows], 1, m![Rows = 1 #{!} Rows, Width]>(row),
-                        );
-                },
-            ),
-        );
+        Self::live(device, &rows, live, output);
     }
 }
 

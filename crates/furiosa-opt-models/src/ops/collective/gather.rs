@@ -31,8 +31,9 @@ impl<S: AxisName, const N: usize> AxisName for Pieces<S, N> {
     const SIZE: usize = N * S::SIZE;
 }
 
-impl<D: Scalar, W: AxisName> Op<HbmTensor<D, m![1], m![W]>> for AllGather<Parallel<1>> {
-    type Output = HbmTensor<D, m![1], m![W]>;
+/// One chip's tensor already holds every part.
+impl<D: Scalar, E: M> Op<HbmTensor<D, m![1], E>> for AllGather<Parallel<1>> {
+    type Output = HbmTensor<D, m![1], E>;
 
     fn forward(&self, _: &mut Device, input: Self::Output) -> Self::Output {
         input

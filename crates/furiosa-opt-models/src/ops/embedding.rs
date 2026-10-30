@@ -170,6 +170,11 @@ pub type Vectors<Hidden, Rows, Chips = Chip> = DmTensor<
     ],
 >;
 
+/// A tile's rows in DM as blocked rows store them: a slice for each 16 features of every row, the
+/// rows over clusters `Cluster`, `Rows` a slice.
+type Blocks<Hidden, Cluster, Rows, Chips> =
+    DmTensor<bf16, Chips, Cluster, m![Hidden / 16 # 256], m![{ Rows }, Hidden % 16]>;
+
 impl<Vocabulary: AxisName, Hidden: AxisName, Parameter, Chips: M + 'static>
     Embedding<Vocabulary, Hidden, Chips, Parameter>
 where
@@ -210,6 +215,37 @@ where
             );
         }
         output
+    }
+
+    /// Tile `at` of a launch's rows, `T` rows a tile at their byte `offsets`, gathered a feature
+    /// tile at a time and written through `Blocks`.
+    fn gather<T: AxisName, Cluster: M, Rows: M, Capacity: AxisName>(
+        &self,
+        device: &mut Device,
+        offsets: &HbmTensor<i32, Chips, Packets<Capacity>>,
+        output: &mut HbmTensor<bf16, Chips, Blocked<Hidden, Capacity>>,
+        at: usize,
+    ) {
+        let offset = offsets
+            .view()
+            .tile::<m![Capacity / T], 1, m![1, Capacity / T = 1 # (Capacity / T), Capacity % T]>(
+                at,
+            );
+        // SAFETY: the selected window owns exactly a tile of consecutive row indices.
+        let offset = unsafe { offset.alias::<Chips, m![Capacity % T]>() };
+        // SAFETY: packet groups reinterpret the same indices without changing their order.
+        let offset = unsafe { offset.reshape::<Chips, Packets<T>>() };
+        let embedded = self.tiles::<T, _>(&mut *device, &offset);
+        let mut rows: Blocks<Hidden, Cluster, Rows, Chips> = DmTensor::new();
+        embedded
+            .view()
+            .to_dm_view(&mut device.tdma, rows.view_mut());
+        rows.view().to_hbm_view(
+            &mut device.tdma,
+            output.view_mut().tile::<m![Capacity / T], 1, m![
+                Hidden / 16, Capacity / T = 1 #{!} (Capacity / T), Capacity % T, Hidden % 16,
+            ]>(at),
+        );
     }
 }
 
@@ -386,65 +422,19 @@ where
         // The block gathers after the whole spans; the difference saturates at zero blocks.
         let first = live / SPAN * (SPAN / BLOCK);
         for block in 0..live / BLOCK + (live % BLOCK + BLOCK - REST - 1) / BLOCK - first {
-            let block = first + block;
-            let offset = offsets.view().tile::<m![Capacity / Block], 1,
-                m![1, Capacity / Block = 1 # (Capacity / Block), Capacity % Block]
-            >(block);
-            // SAFETY: the selected window owns exactly a block of consecutive row indices.
-            let offset = unsafe { offset.alias::<Chips, m![Capacity % Block]>() };
-            // SAFETY: packet groups reinterpret the same indices without changing their order.
-            let offset = unsafe { offset.reshape::<Chips, Packets<Block>>() };
-            let embedded = self.tiles::<Block, _>(&mut *device, &offset);
-            let mut rows: DmTensor<
-                bf16,
-                Chips,
-                m![Capacity % Block / (Block / 2)],
-                m![Hidden / 16 # 256],
-                m![Capacity % (Block / 2), Hidden % 16],
-            > = DmTensor::new();
-            embedded
-                .view()
-                .to_dm_view(&mut device.tdma, rows.view_mut());
-            rows.view().to_hbm_view(
-                &mut device.tdma,
-                output.view_mut().tile::<m![Capacity / Block], 1, m![
-                    Hidden / 16, Capacity / Block = 1 #{!} (Capacity / Block),
-                    Capacity % Block, Hidden % 16,
-                ]>(block),
+            self.gather::<Block, m![Capacity % Block / (Block / 2)], m![Capacity % (Block / 2)], _>(
+                device,
+                &offsets,
+                output,
+                first + block,
             );
         }
         for _ in 0..(live % BLOCK + BLOCK - REST - 1) % BLOCK / (BLOCK - REST) {
-            let block = BLOCK / REST * (live / BLOCK);
-            let offset = offsets
-                .view()
-                .tile::<
-                    m![Capacity / Rest],
-                    1,
-                    m![1, Capacity / Rest = 1 # (Capacity / Rest), Capacity % Rest],
-                >(
-                    block,
-                );
-            // SAFETY: the selected window owns exactly a rest of consecutive row indices.
-            let offset = unsafe { offset.alias::<Chips, m![Capacity % Rest]>() };
-            // SAFETY: one packet group reinterprets the same indices in order.
-            let offset = unsafe { offset.reshape::<Chips, Packets<Rest>>() };
-            let embedded = self.tiles::<Rest, _>(&mut *device, &offset);
-            let mut rows: DmTensor<
-                bf16,
-                Chips,
-                m![1 # 2],
-                m![Hidden / 16 # 256],
-                m![Capacity % Rest, Hidden % 16],
-            > = DmTensor::new();
-            embedded
-                .view()
-                .to_dm_view(&mut device.tdma, rows.view_mut());
-            rows.view().to_hbm_view(
-                &mut device.tdma,
-                output.view_mut().tile::<m![Capacity / Rest], 1, m![
-                    Hidden / 16, Capacity / Rest = 1 #{!} (Capacity / Rest), Capacity % Rest,
-                    Hidden % 16,
-                ]>(block),
+            self.gather::<Rest, m![1 # 2], m![Capacity % Rest], _>(
+                device,
+                &offsets,
+                output,
+                BLOCK / REST * (live / BLOCK),
             );
         }
     }
