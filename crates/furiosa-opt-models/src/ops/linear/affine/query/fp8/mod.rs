@@ -9,6 +9,7 @@ use crate::tensor::parallel::Chip;
 use crate::{Op, ops::linear::Affine};
 pub(crate) use activation::{Fill, Quantize, RowScales};
 use furiosa_opt_std::prelude::*;
+pub(crate) use produce::Period;
 pub(crate) use spread::{PairRows, PairScales, Stage};
 use std::marker::PhantomData;
 pub(crate) use to_dm::ToDm;
