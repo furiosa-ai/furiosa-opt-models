@@ -423,7 +423,7 @@ impl<G: Shape, P: Forms, const S: usize, const F: usize, const O: &'static [Bran
         let unsupported = |message: &str| io::Error::new(io::ErrorKind::Unsupported, message);
         let quantization = match (P::REQUIREMENT, text.extra.quantization_config) {
             (Requirement::Unquantized | Requirement::Undeclared, _) => None,
-            (Requirement::Declared(Declaration::Nvfp4(_)), Some(declared)) => {
+            (Requirement::Declared(Declaration::Nvfp4), Some(declared)) => {
                 let declared: Quantization = config::parse(&declared)?;
                 if declared.scheme != Scheme::Nvfp4 {
                     return Err(unsupported(
@@ -432,7 +432,7 @@ impl<G: Shape, P: Forms, const S: usize, const F: usize, const O: &'static [Bran
                 }
                 Some(declared)
             }
-            (Requirement::Declared(Declaration::Nvfp4(_)), None) => {
+            (Requirement::Declared(Declaration::Nvfp4), None) => {
                 return Err(unsupported(
                     "quantization_config: missing, compiled NVFP4 projections",
                 ));
