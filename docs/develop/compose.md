@@ -35,7 +35,7 @@ Each argument has one role:
 | Leaf operation | `ops/` | `Add`, `RmsNorm`, `Linear` |
 | Generic combinator | `modules/generic/`, re-exported at the crate root | `Sequential`, `Then`, `Layers` |
 | Relation | `modules/` | `Attention`, `Residual` |
-| Model definition | `models/` | `mistral::Model`, `qwen3::ForCausalLM` |
+| Model definition | `models/` | `mistral::Model`, `qwen3::Catalog` |
 
 - Only leaves touch hardware.
 - A leaf is an `Op` unless it reads the call's env or has a module child; then it implements `Module` itself.

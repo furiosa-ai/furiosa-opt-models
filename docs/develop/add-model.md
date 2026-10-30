@@ -50,7 +50,7 @@ A checkpoint tensor that no field reads fails the load unless an `ignore` prefix
 
 A framework calls a model through its engine decoder and the Python class of its model type:
 
-- The decoder states what one call holds and returns, views each layer of the cache, and launches the call, as [`decoder/qwen3.rs`](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/crates/furiosa-opt-engine/src/decoder/qwen3.rs) does.
+- The engine's one decoder serves every `Root` in [`decoder/mod.rs`](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/crates/furiosa-opt-engine/src/decoder/mod.rs), launching the root once a call. A root the decoder family's loop runs, such as `qwen3::launch::Model`, is one already; another root implements `Root`: its size, where its rows land and the adapters it takes.
 - The Python class names the model: it derives from `Decoder`, which serves every decoder alike, and adds nothing of its own. `register` in the binding's [`lib.rs`](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/crates/furiosa-opt-python/src/lib.rs) adds its submodule, and `LoadOptions.load` in [`model.rs`](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/crates/furiosa-opt-python/src/model/mod.rs) names the class of each architecture.
 - Regenerate the Python type stubs with `cargo furiosa-opt run -p furiosa-opt-python --release --bin stub`, which loads the Python library: put its directory, `sysconfig.get_config_var("LIBDIR")`, on `LD_LIBRARY_PATH`. CI fails when the stubs differ from the code.
 

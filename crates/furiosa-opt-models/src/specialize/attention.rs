@@ -6,23 +6,16 @@
 
 use std::marker::ConstParamTy;
 
-use furiosa_opt_std::prelude::{AxisName, M};
+use furiosa_opt_std::prelude::AxisName;
 
 /// How a decode call of a model is compiled today, by the model's size: the rows of a call, the
-/// history each row attends, the packed query, key and value weight's rows and layout, the work a
-/// call's host plans, and the envelope one launch of the catalog model is compiled for.
+/// history each row attends, and the envelope one launch of the catalog model is compiled for.
 pub trait Decode {
     /// The rows a call runs at most when each attends its whole history as a work item.
     type Rows: AxisName;
     /// The 512-key windows of history a row attends at most: the context the model is compiled
     /// for.
     type Windows: AxisName;
-    /// The rows of the packed query, key and value weight.
-    type Width: AxisName;
-    /// The packed weight's layout: `[Width, Hidden]`, or each key and value head's rows together.
-    type Packed: M;
-    /// The work items a call's host plans.
-    type Work;
     /// The rows of a launch; a runtime count of them is live.
     type Capacity: AxisName;
     /// The rows attention reads and writes: a chunk's last query tile reaches up to one tile past

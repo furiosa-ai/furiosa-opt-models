@@ -9,12 +9,12 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use furiosa_opt_engine::decoder::{self, Cache, Keep, Request, Rows};
-use furiosa_opt_engine::{Checkpoint, Hbm, Load, LoadError, LoadOptions, Quantization};
+use furiosa_opt_engine::{Checkpoint, Load, LoadError, LoadOptions, Quantization};
 use furiosa_opt_models::load::Context;
 use furiosa_opt_models::models::Implements;
-use furiosa_opt_models::models::decoder::attention::{Geometry, KvHeads, qwen3};
-use furiosa_opt_models::models::decoder::{Form, form};
-use furiosa_opt_models::specialize::attention::Decode;
+use furiosa_opt_models::models::decoder::attention::{Geometry, Head, KvHeads, qwen3};
+use furiosa_opt_models::models::decoder::form;
+use furiosa_opt_models::ops::linear::query::matrix::Width;
 use furiosa_opt_models::tensor::form::fp8::Granularity;
 use furiosa_opt_std::prelude::*;
 use safetensors::Dtype;
@@ -61,7 +61,8 @@ type Size = qwen3::Size<"0.6B">;
 type Hidden = <Size as Geometry>::Hidden;
 type Intermediate = <Size as Geometry>::Intermediate;
 type Queries = <Size as Geometry>::Queries;
-type Width = <Size as Decode>::Width;
+/// The features of the key or of the value heads.
+type Pairs = Width<KvHeads, Head>;
 
 /// The Qwen3-0.6B causal line whose projections hold form `F`.
 type Line<F> = qwen3::launch::Model<Size, F>;
@@ -69,16 +70,6 @@ type Line<F> = qwen3::launch::Model<Size, F>;
 /// A channel-scaled projection of `In`-wide rows to `Out` features, in HBM.
 type Projection<In, Out> =
     furiosa_opt_models::models::decoder::Projection<form::ChannelScaled, In, Out>;
-
-/// The channel-scaled query, key and value projection joined into one.
-type Packed = <form::ChannelScaled as Form>::Of<
-    Hidden,
-    Width,
-    bf16,
-    m![1],
-    Hbm,
-    furiosa_opt_models::ops::attention::Packed<KvHeads, <Size as Decode>::Packed, Hbm, f8e4m3>,
->;
 
 /// The directory of Qwen3-0.6B's files that `include` matches, fetched into the hub cache once.
 fn snapshot(include: &[&str]) -> PathBuf {
@@ -118,8 +109,8 @@ fn digest(bytes: &[u8]) -> u64 {
     })
 }
 
-/// The digests of a channel-scaled weight's codes and of its row scales, read back from HBM.
-fn digests<Out: AxisName, In: AxisName, W, T>(
+/// A channel-scaled weight's codes and the FP32 bytes of its row scales, read back from HBM.
+fn held<Out: AxisName, In: AxisName, W, T>(
     device: &mut Device,
     projection: &furiosa_opt_models::tensor::form::BlockScaled<
         In,
@@ -132,7 +123,7 @@ fn digests<Out: AxisName, In: AxisName, W, T>(
         W,
         T,
     >,
-) -> (u64, u64)
+) -> (Vec<u8>, Vec<u8>)
 where
     W: core::borrow::Borrow<HbmTensor<f8e4m3, m![1], m![Out, In]>>,
     T: core::borrow::Borrow<HbmTensor<f32, m![1], m![Out, 1 # 8]>>,
@@ -154,13 +145,26 @@ where
                 .into_future(),
         )
         .unwrap();
-    let scales: Vec<u8> = (scales.into_vec().chunks_exact(8))
+    let scales = (scales.into_vec().chunks_exact(8))
         .flat_map(|lanes| lanes[0].to_le_bytes())
         .collect();
-    (
-        digest(&Vec::<u8>::from(codes.into_buffer())),
-        digest(&scales),
-    )
+    (Vec::from(codes.into_buffer()), scales)
+}
+
+/// The digests of a weight's codes and of its row scales' bytes.
+fn digests((codes, scales): &(Vec<u8>, Vec<u8>)) -> (u64, u64) {
+    (digest(codes), digest(scales))
+}
+
+/// The rows of the query, key and value projections' `parts` joined head by head, as vLLM joins
+/// them: each key and value head's query rows, then its key rows and its value rows.
+fn joined(parts: [&[u8]; 3]) -> Vec<u8> {
+    let heads = KvHeads::SIZE;
+    (0..heads)
+        .flat_map(|at| parts.map(|part| &part[at * part.len() / heads..][..part.len() / heads]))
+        .flatten()
+        .copied()
+        .collect()
 }
 
 /// One request a call: the token at `position` appended after the `position` cached ones.
@@ -225,8 +229,12 @@ fn holds_the_codes_and_scales_of_each_quantizer() {
         .zip(LAYER)
     {
         let quantized = checkpoint.quantized(granularity).unwrap();
-        let attention = ["o_proj", "q_norm", "k_norm"];
-        let joined: Packed = layer(&mut device, &quantized, "self_attn", &attention);
+        let query: Projection<Hidden, Queries> =
+            layer(&mut device, &quantized, "self_attn.q_proj", &[]);
+        let key: Projection<Hidden, Pairs> =
+            layer(&mut device, &quantized, "self_attn.k_proj", &[]);
+        let value: Projection<Hidden, Pairs> =
+            layer(&mut device, &quantized, "self_attn.v_proj", &[]);
         let output: Projection<Queries, Hidden> =
             layer(&mut device, &quantized, "self_attn.o_proj", &[]);
         let gate: Projection<Hidden, Intermediate> =
@@ -235,12 +243,22 @@ fn holds_the_codes_and_scales_of_each_quantizer() {
             layer(&mut device, &quantized, "mlp.up_proj", &[]);
         let down: Projection<Intermediate, Hidden> =
             layer(&mut device, &quantized, "mlp.down_proj", &[]);
+        let parts = [
+            held(&mut device, &query),
+            held(&mut device, &key),
+            held(&mut device, &value),
+        ];
+        let [query, key, value] = &parts;
+        let joint = (
+            joined([&query.0, &key.0, &value.0]),
+            joined([&query.1, &key.1, &value.1]),
+        );
         let held = [
-            digests(&mut device, &joined),
-            digests(&mut device, &output),
-            digests(&mut device, &gate),
-            digests(&mut device, &up),
-            digests(&mut device, &down),
+            digests(&joint),
+            digests(&held(&mut device, &output)),
+            digests(&held(&mut device, &gate)),
+            digests(&held(&mut device, &up)),
+            digests(&held(&mut device, &down)),
         ];
         assert_eq!(held, expected, "{granularity:?}");
     }
