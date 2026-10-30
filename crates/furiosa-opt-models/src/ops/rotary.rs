@@ -314,26 +314,6 @@ impl<Chips: M, C: M, Slice: M, Q: M, Lines: M, Row: AxisName, Input: M, Output: 
     }
 }
 
-impl<Head: AxisName> Rotation<Head> {
-    /// Host coefficients with FP32 angles rounded to BF16.
-    pub fn coefficients(position: usize, theta: f32) -> (Vec<bf16>, Vec<bf16>) {
-        let half = Head::SIZE / 2;
-        let angle = |index: usize| {
-            let inverse = 1.0f32 / theta.powf(2.0 * (index % half) as f32 / Head::SIZE as f32);
-            position as f32 * inverse
-        };
-        let row = |low: fn(f32) -> f32, high: fn(f32) -> f32| {
-            (0..Head::SIZE)
-                .map(|index| {
-                    let table = if index < half { low } else { high };
-                    bf16::from_f32(table(angle(index)))
-                })
-                .collect()
-        };
-        (row(f32::cos, f32::sin), row(|angle| -angle.sin(), f32::cos))
-    }
-}
-
 type Scalars<Rows, Rotated, Chips = Chip> = HbmTensor<f32, Chips, m![Rows, Rotated]>;
 type Parameters<Rotated, Chips = Chip> = HbmTensor<f32, Chips, m![Rotated]>;
 
