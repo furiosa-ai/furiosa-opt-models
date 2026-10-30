@@ -7,12 +7,14 @@
 //! - A checkpoint spells one spectrum as `rope_parameters`, or as `rope_theta` beside
 //!   `rope_scaling`; a description nested by layer type is [`Spectra`]. Two spellings of one value
 //!   must agree.
+//! - A field that a configuration leaves out reads as its class's [`Defaults`]; read without a
+//!   class, a spectrum refuses a missing base.
 
 use super::{Positive, refuse};
 use crate::ops::pointwise::multiply::Temperature;
 use crate::ops::rotary::PairFrequencies;
 use furiosa_opt_std::prelude::AxisName;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 use serde_json::{Map, Value};
 use std::fmt::Debug;
 use std::mem;
@@ -115,6 +117,25 @@ impl Spectrum {
     }
 }
 
+/// The values a configuration class gives the rotary fields that a configuration leaves out, as
+/// Transformers' class attributes give them: its `default_theta`, and the part of each head it
+/// rotates.
+pub trait Defaults {
+    /// The base of a configuration that names none.
+    const THETA: Positive;
+
+    /// The fraction of each head that a configuration naming none rotates.
+    const FRACTION: f64 = 1.0;
+
+    /// Deserializes a flattened spectrum as the class reads it.
+    fn spectrum<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Spectrum, D::Error> {
+        let document: Document = super::flattened(deserializer)?;
+        Spectra::read(document, Some(Self::THETA), Self::FRACTION)
+            .and_then(Spectrum::try_from)
+            .map_err(de::Error::custom)
+    }
+}
+
 /// The spectrum of every layer type: one for every layer, or one per layer type that a
 /// description nested by layer type names, `None` for a type that rotates nothing.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -160,23 +181,33 @@ impl TryFrom<Document> for Spectra {
     type Error = Refusal;
 
     fn try_from(document: Document) -> Result<Self, Self::Error> {
-        let defaults = Defaults {
+        Self::read(document, None, 1.0)
+    }
+}
+
+impl Spectra {
+    /// The spectra `document` spells, a description that names no base taking `theta` and one
+    /// that names no fraction rotating `fraction` of each head.
+    fn read(document: Document, theta: Option<Positive>, fraction: f64) -> Result<Self, Refusal> {
+        let outer = Outer {
             theta: document.rope_theta,
             fraction: document.partial_rotary_factor,
             original: document.original_max_position_embeddings,
             declared: document.max_position_embeddings,
+            default_theta: theta,
+            default_fraction: fraction,
         };
         // Transformers 5 nests the base among the rescaling's parameters; earlier releases keep
         // the base at the top and the rescaling under its own name.
         let layers = match (document.rope_parameters, document.rope_scaling) {
             (Some(parameters), Some(scaling)) => {
-                let layers = defaults.layers(parameters)?;
-                if defaults.layers(scaling)? != layers {
+                let layers = outer.layers(parameters)?;
+                if outer.layers(scaling)? != layers {
                     return Err("rope_scaling: differs from rope_parameters beside it".to_owned());
                 }
                 layers
             }
-            (parameters, scaling) => defaults.layers(parameters.or(scaling).unwrap_or_default())?,
+            (parameters, scaling) => outer.layers(parameters.or(scaling).unwrap_or_default())?,
         };
         Ok(Self(layers))
     }
@@ -262,19 +293,24 @@ impl TryFrom<Map<String, Value>> for Rope {
     }
 }
 
-/// What one spectrum's description defaults from the document around it.
-struct Defaults {
+/// What one spectrum's description defaults from the document around it, then from the
+/// configuration's class.
+struct Outer {
     theta: Option<Positive>,
     fraction: Option<f64>,
     original: Option<NonZeroUsize>,
     /// `max_position_embeddings`: the context the checkpoint declares.
     declared: Option<NonZeroUsize>,
+    /// The class's base, which a description naming none takes; without one it is refused.
+    default_theta: Option<Positive>,
+    /// The class's fraction of each head, which a description naming none rotates.
+    default_fraction: f64,
 }
 
 /// A refusal raised outside serde, which keeps the unsupported prefix of [`refuse`].
 type Refusal = String;
 
-impl Defaults {
+impl Outer {
     /// The spectra a description gives: one of its rotary fields, or one per layer type that
     /// keys an object, or null for no rotation, by the type's name.
     fn layers(&self, parameters: Map<String, Value>) -> Result<Layers, Refusal> {
@@ -339,13 +375,14 @@ impl Defaults {
             }
         };
         let theta = agree("rope_theta", common.rope_theta, self.theta)?
+            .or(self.default_theta)
             .ok_or("missing field `rope_theta`")?;
         let fraction = agree(
             "partial_rotary_factor",
             common.partial_rotary_factor,
             self.fraction,
         )?
-        .unwrap_or(1.0);
+        .unwrap_or(self.default_fraction);
         if !(fraction > 0.0 && fraction <= 1.0) {
             return Err(format!(
                 "partial_rotary_factor: found {fraction}, expected a fraction in (0, 1]"
@@ -1229,6 +1266,59 @@ mod tests {
             ratios
                 .map(|(halved, unscaled)| halved / unscaled)
                 .all(|ratio| ratio == 0.5)
+        );
+    }
+
+    /// A configuration class reads a spectrum's absent base and fraction as its own, under every
+    /// spelling the document gives none in; a base or fraction the document names wins over the
+    /// class's, at the top or nested.
+    #[test]
+    fn reads_absent_fields_as_the_class_defaults_them() {
+        struct Class;
+        impl Defaults for Class {
+            const THETA: Positive = Positive(5e5);
+            const FRACTION: f64 = 0.5;
+        }
+        #[derive(Debug, Deserialize)]
+        struct Part {
+            #[serde(flatten, deserialize_with = "Class::spectrum")]
+            rope: Spectrum,
+        }
+        let read = |document: Value| parse::<Part>(document).unwrap().rope;
+        let spectrum = |theta, fraction, kind| Spectrum {
+            theta: Positive(theta),
+            fraction,
+            kind,
+        };
+        let linear = Kind::Linear { factor: 2.0 };
+        for (document, expected) in [
+            (json!({}), spectrum(5e5, 0.5, Kind::Default)),
+            (
+                json!({"rope_scaling": {"rope_type": "linear", "factor": 2.0}}),
+                spectrum(5e5, 0.5, linear),
+            ),
+            (
+                json!({"rope_theta": 1e4}),
+                spectrum(1e4, 0.5, Kind::Default),
+            ),
+            (
+                nested(json!({"rope_type": "linear", "factor": 2.0}), 1e6),
+                spectrum(1e6, 0.5, linear),
+            ),
+            (
+                json!({"partial_rotary_factor": 1.0}),
+                spectrum(5e5, 1.0, Kind::Default),
+            ),
+        ] {
+            assert_eq!(read(document.clone()), expected, "{document}");
+        }
+        let refusal = parse::<Part>(json!({"partial_rotary_factor": 0.0})).unwrap_err();
+        assert_eq!(
+            (refusal.kind(), refusal.to_string()),
+            (
+                io::ErrorKind::InvalidData,
+                "partial_rotary_factor: found 0, expected a fraction in (0, 1]".into()
+            )
         );
     }
 }
