@@ -665,7 +665,7 @@ pub type ZImageTransformer2DModel<
             Unrolled,
         >,
     >,
-    diffusion::Unpatch<Head, Restore>,
+    Sequential<Head, Restore>,
 >;
 
 /// Source: SGLang `python/sglang/multimodal_gen/runtime/models/dits/causal_wanvideo.py`.
@@ -1701,7 +1701,7 @@ pub type QwenImage21Transformer2DModel<
         >,
         First,
     >,
-    diffusion::Unpatch<diffusion::Head<OutputModulation, OutputNorm, OutputProjection>, First>,
+    diffusion::Head<OutputModulation, OutputNorm, OutputProjection>,
 >;
 
 /// Source: Diffusers `src/diffusers/models/attention.py`.
@@ -1747,7 +1747,7 @@ pub type SD3Transformer2DModel<
             Extra,
         >,
     >,
-    diffusion::Unpatch<Head, Restore>,
+    Sequential<Head, Restore>,
 >;
 
 /// Source: vLLM-Omni `vllm_omni/diffusion/models/wan2_2/wan2_2_vace_transformer.py`.

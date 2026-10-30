@@ -3,13 +3,13 @@
 
 use crate::load::Load;
 use crate::tensor::image::Vector;
-use crate::{First, Layers, Module, Unrolled};
+use crate::{Layers, Module, Unrolled};
 use furiosa_opt_std::prelude::*;
 use std::marker::PhantomData;
 
 /// Embeds the latent, conditions a layer stack and applies its head without geometry restoration.
 pub type Denoiser<Embedding, Conditioning, Collection, Head> =
-    Transformer<Embedding, Conditioning, Layers<Collection, Unrolled>, Unpatch<Head, First>>;
+    Transformer<Embedding, Conditioning, Layers<Collection, Unrolled>, Head>;
 
 /// Embeds the input and the condition, runs the body and applies the head.
 #[derive(DeviceSend, Load)]
@@ -473,31 +473,6 @@ where
             .forward(&mut *device, (condition, body_env), body, hidden);
         self.last
             .forward(device, (condition, last_env), last, &hidden)
-    }
-}
-
-/// Applies a condition-bearing head and restores its output using caller-supplied geometry.
-#[derive(DeviceSend, Load)]
-pub struct Unpatch<Head, Restore> {
-    #[load(rename = "")]
-    pub head: Head,
-    #[load(rename = "")]
-    pub restore: Restore,
-}
-
-/// The env is the geometry the restore reads beside the head's output; the state is the head's
-/// slot.
-impl<X, E, G: Copy, S, Y, O, Head, Restore> Module<(&X, &E), G, S> for Unpatch<Head, Restore>
-where
-    Head: for<'x, 'e> Module<(&'x X, &'e E), G, S, Output = Y>,
-    Restore: for<'d> Module<(Y, G), G, &'d mut (), Output = O>,
-{
-    type Output = O;
-
-    fn forward(&self, device: &mut Device, shape: G, state: S, input: (&X, &E)) -> O {
-        let hidden = self.head.forward(&mut *device, shape, state, input);
-        self.restore
-            .forward(device, shape, &mut (), (hidden, shape))
     }
 }
 
