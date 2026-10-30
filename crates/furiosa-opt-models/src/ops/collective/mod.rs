@@ -141,38 +141,6 @@ impl<D: OutputScalar, R: AxisName, W: AxisName, const N: usize>
 }
 
 impl<const N: usize> AllReduce<Parallel<N>> {
-    /// Each chip's partner in each round: round `r` pairs the chips whose indices differ in bit
-    /// `r`. The first `rounds(N)` of the `N` rows are the rounds.
-    const fn partners() -> [[usize; N]; N] {
-        let mut partners = [[0; N]; N];
-        let (mut round, mut mask) = (0, 1);
-        while mask < N {
-            let mut chip = 0;
-            while chip < N {
-                partners[round][chip] = chip ^ mask;
-                chip += 1;
-            }
-            (round, mask) = (round + 1, mask * 2);
-        }
-        partners
-    }
-
-    /// Where each chip finds, in each round, the partial of the pair's chip whose round bit is
-    /// `high`: its own (0) or its partner's (1).
-    const fn selections(high: bool) -> [[usize; N]; N] {
-        let mut selections = [[0; N]; N];
-        let (mut round, mut mask) = (0, 1);
-        while mask < N {
-            let mut chip = 0;
-            while chip < N {
-                selections[round][chip] = if (chip & mask != 0) == high { 0 } else { 1 };
-                chip += 1;
-            }
-            (round, mask) = (round + 1, mask * 2);
-        }
-        selections
-    }
-
     /// The pairwise sums of round `round`.
     fn reduce<W: AxisName>(
         &self,
@@ -181,7 +149,7 @@ impl<const N: usize> AllReduce<Parallel<N>> {
         round: usize,
     ) -> Local<f32, ChipMap<N>, W> {
         let exchanged = input
-            .chip_shuffle(const { Self::partners() }[round])
+            .chip_shuffle(const { collective::partners::<N>() }[round])
             .to_dm::<m![W / 1024, W % 4]>(&mut device.tdma);
         let mut pair: DmTensor<
             f32,
@@ -201,10 +169,14 @@ impl<const N: usize> AllReduce<Parallel<N>> {
                 .tile::<m![Two], 1, m![Two = 1 #{!} 2, W / 1024, W % 4]>(1),
         );
         let low = pair
-            .chip_slice::<m![Two], m![W / 1024, W % 4]>(const { Self::selections(false) }[round])
+            .chip_slice::<m![Two], m![W / 1024, W % 4]>(
+                const { collective::selections::<N>(false) }[round],
+            )
             .to_dm::<m![W / 1024, W % 4]>(&mut device.tdma);
         let high = pair
-            .chip_slice::<m![Two], m![W / 1024, W % 4]>(const { Self::selections(true) }[round])
+            .chip_slice::<m![Two], m![W / 1024, W % 4]>(
+                const { collective::selections::<N>(true) }[round],
+            )
             .to_dm::<m![W / 1024, W % 4]>(&mut device.tdma);
         let high: VrfTensor<
             f32,
@@ -242,7 +214,7 @@ impl<const N: usize> AllReduce<Parallel<N>> {
         round: usize,
     ) -> RowsLocal<f32, ChipMap<N>, R, W> {
         let exchanged = input
-            .chip_shuffle(const { Self::partners() }[round])
+            .chip_shuffle(const { collective::partners::<N>() }[round])
             .to_dm::<m![R, W / 1024, W % 4]>(&mut device.tdma);
         let mut pair: DmTensor<
             f32,
@@ -262,10 +234,14 @@ impl<const N: usize> AllReduce<Parallel<N>> {
                 .tile::<m![Two], 1, m![Two = 1 #{!} 2, R, W / 1024, W % 4]>(1),
         );
         let low = pair
-            .chip_slice::<m![Two], m![R, W / 1024, W % 4]>(const { Self::selections(false) }[round])
+            .chip_slice::<m![Two], m![R, W / 1024, W % 4]>(
+                const { collective::selections::<N>(false) }[round],
+            )
             .to_dm::<m![R, W / 1024, W % 4]>(&mut device.tdma);
         let high = pair
-            .chip_slice::<m![Two], m![R, W / 1024, W % 4]>(const { Self::selections(true) }[round])
+            .chip_slice::<m![Two], m![R, W / 1024, W % 4]>(
+                const { collective::selections::<N>(true) }[round],
+            )
             .to_dm::<m![R, W / 1024, W % 4]>(&mut device.tdma);
         let high: VrfTensor<
             f32,
