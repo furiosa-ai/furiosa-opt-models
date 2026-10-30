@@ -281,7 +281,7 @@ fn adapted_rows_match_merged_weights() {
         .map(|(peft, directory)| base(&peft.merged(&checkpoint, directory.path()), &mut device))
         .collect();
     runtime().block_on(async {
-        let cache = Cache::new(&mut device, &model.decoder().limits().cache, 4).unwrap();
+        let cache = Cache::new(&mut device, &model.decoder().limits(Tiling::Adaptive).cache, 4).unwrap();
         let mut requests = Vec::new();
         for (index, adapter) in [None, Some(0), Some(1)].into_iter().enumerate() {
             requests.push(request(&mut device, index, adapter).await);
@@ -297,7 +297,7 @@ fn adapted_rows_match_merged_weights() {
                            model: &Instance<Base>,
                            index,
                            adapter: Option<&Adapter>| {
-            let cache = Cache::new(device, &model.decoder().limits().cache, 4).unwrap();
+            let cache = Cache::new(device, &model.decoder().limits(Tiling::Adaptive).cache, 4).unwrap();
             let request = request(device, index, adapter.map(|_| 0)).await;
             let slots = [adapter];
             let rows = model

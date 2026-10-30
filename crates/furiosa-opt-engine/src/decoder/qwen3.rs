@@ -10,7 +10,7 @@
 //! - The catalog's launch model, in dense BF16 or block-scaled FP8, streams its whole causal tree
 //!   in one launch: its host plans each row's position and cache slot, its work items and prompt
 //!   chunks and its selected rows, and the launch returns the selected rows' tokens in kept order.
-//!   Its prompt chunks attend apart from their history, so it refuses a fixed tiling.
+//!   Under a fixed tiling every row is a work item, so a launch holds the size's call rows.
 //! - Every root serves the context its size is compiled for.
 //! - A call whose rows run with adapters passes each layer's attention and feed-forward projections
 //!   the terms of the call's adapters and their selections of the rows. Only BF16 Qwen3 of 0.6B to
@@ -74,10 +74,16 @@ fn limits<S: Geometry + Decode + 'static>(adapters: usize) -> Limits {
     }
 }
 
-/// What a launch of the size `S` holds: the compiled context and the launch's rows.
-fn launched<S: Geometry + Decode + 'static>() -> Limits {
+/// What a launch of the size `S` holds, its rows tiled as `tiling` says: a fixed tiling attends
+/// every row as a work item, so it holds the size's call rows, which its items hold over the whole
+/// context; another holds the launch's rows.
+fn launched<S: Geometry + Decode + 'static>(tiling: Tiling) -> Limits {
+    let rows = match tiling {
+        Tiling::Fixed => S::Rows::SIZE,
+        Tiling::Adaptive => launch::Capacity::<S>::SIZE,
+    };
     Limits {
-        rows: launch::Capacity::<S>::SIZE,
+        rows,
         ..limits::<S>(0)
     }
 }
@@ -128,7 +134,7 @@ macro_rules! decoders {
             type Layers = <$size as Geometry>::Layers<Blocks<KvHeads, Head>>;
             type Adapter = decoders!(@adapter $kind $size);
 
-            fn limits(&self) -> Limits {
+            fn limits(&self, _: Tiling) -> Limits {
                 limits::<$size>(Self::ADAPTERS)
             }
 
@@ -190,8 +196,8 @@ macro_rules! decoders {
             type Layers = <$size as Geometry>::Layers<Blocks<KvHeads, Head>>;
             type Adapter = decoders!(@adapter $kind $size);
 
-            fn limits(&self) -> Limits {
-                self.model.limits()
+            fn limits(&self, tiling: Tiling) -> Limits {
+                self.model.limits(tiling)
             }
 
             fn layers(storage: &[HbmBuffer]) -> io::Result<Self::Layers> {
@@ -333,10 +339,10 @@ macro_rules! classifiers {
             /// The base model's, of which a classifier's calls run none.
             type Adapter = <Base<$size> as Decoder>::Adapter;
 
-            fn limits(&self) -> Limits {
+            fn limits(&self, tiling: Tiling) -> Limits {
                 Limits {
                     adapters: Self::ADAPTERS,
-                    ..self.model.limits()
+                    ..self.model.limits(tiling)
                 }
             }
 
@@ -402,8 +408,8 @@ macro_rules! launches {
             type Layers = <$size as Geometry>::Layers<Blocks<KvHeads, Head>>;
             type Adapter = Infallible;
 
-            fn limits(&self) -> Limits {
-                launched::<$size>()
+            fn limits(&self, tiling: Tiling) -> Limits {
+                launched::<$size>(tiling)
             }
 
             fn layers(storage: &[HbmBuffer]) -> io::Result<Self::Layers> {
@@ -421,12 +427,6 @@ macro_rules! launches {
             ) -> impl Future<Output = io::Result<Rows<i32, m![1]>>> + Send {
                 let model = self;
                 async move {
-                    if tiling == Tiling::Fixed {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            "the launch model attends prompt chunks apart from their history",
-                        ));
-                    }
                     type Capacity = launch::Capacity<$size>;
                     type Windows = <$size as Decode>::Windows;
                     let reads = batch.operands::<
@@ -438,7 +438,7 @@ macro_rules! launches {
                         Head,
                         launch::Waves<$size>,
                         Windows,
-                    >(0)?;
+                    >(0, tiling)?;
                     let (staged, views) = batch
                         .stage::<Capacity, Tables<Capacity, Windows>, Chip>(
                             device,
@@ -509,7 +509,7 @@ mod tests {
 
     /// A launch of Qwen3-4B admits and plans a call past the 40960 positions a Qwen3 checkpoint
     /// declares, up to the context its size is compiled for: decode rows and a prompt that end at
-    /// its last position.
+    /// its last position, under a fixed tiling as many as the launch admits.
     #[test]
     fn launches_plan_the_compiled_context() -> io::Result<()> {
         type S = qwen3::Size<"4B">;
@@ -535,27 +535,29 @@ mod tests {
                 overrides: Vec::new(),
             })
         };
-        let limits = launched::<S>();
-        let context = limits.window;
-        assert!(context > 40960, "{context} positions");
-        // The rows every row of which the items hold over the whole context.
-        let rows = <S as Decode>::Rows::SIZE;
-        let cache = Cache::new(&device, &limits.cache, 2 + rows)?;
-        let mut requests = vec![request(rows / 2, context, 0)?];
-        for row in 0..rows / 2 {
-            requests.push(request(1, context, 2 + row)?);
+        for tiling in [Tiling::Adaptive, Tiling::Fixed] {
+            let limits = launched::<S>(tiling);
+            let context = limits.window;
+            assert!(context > 40960, "{tiling:?}: {context} positions");
+            // The rows every row of which the items hold over the whole context.
+            let rows = limits.rows.min(<S as Decode>::Rows::SIZE);
+            let cache = Cache::new(&device, &limits.cache, 2 + rows)?;
+            let mut requests = vec![request(rows / 2, context, 0)?];
+            for row in 0..rows / 2 {
+                requests.push(request(1, context, 2 + row)?);
+            }
+            let batch = Batch::<Infallible>::new(&requests, &limits, &cache, &[])?;
+            batch.operands::<
+                launch::Capacity<S>,
+                <S as Decode>::Reach,
+                <S as Decode>::Sequences,
+                KvHeads,
+                <S as Geometry>::Groups,
+                Head,
+                launch::Waves<S>,
+                <S as Decode>::Windows,
+            >(0, tiling)?;
         }
-        let batch = Batch::<Infallible>::new(&requests, &limits, &cache, &[])?;
-        batch.operands::<
-            launch::Capacity<S>,
-            <S as Decode>::Reach,
-            <S as Decode>::Sequences,
-            KvHeads,
-            <S as Geometry>::Groups,
-            Head,
-            launch::Waves<S>,
-            <S as Decode>::Windows,
-        >(0)?;
         Ok(())
     }
 
