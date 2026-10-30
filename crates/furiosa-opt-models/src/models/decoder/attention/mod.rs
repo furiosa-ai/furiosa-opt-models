@@ -31,7 +31,7 @@ use crate::modules::{
     generic::collection::{Array, Collected},
     mixing, recurrent, residual, speculative, transformer,
 };
-use crate::ops::rotary::PairFrequencies;
+use crate::ops::rotary::{self, PairFrequencies, SplitHalf};
 use crate::tensor::{live::Live, memory::Memory};
 use crate::{Either, First, Fork, Identity, Interleave, Layers, Repeat, Then, Unrolled};
 use crate::{Module, Sequential};
@@ -192,6 +192,20 @@ where
             let frequencies = spectrum.bind::<Head, Rotated>().map_err(refusal)?;
             let positions = spectrum.context(trained);
             Load::load(cx, (&frequencies, positions))
+        })
+    }
+}
+
+/// The rotation of every position a table holds under the spectrum a checkpoint's config binds,
+/// as no checkpoint stores it.
+impl<'a, Head: AxisName, Position: AxisName> Load<&'a Checkpoint>
+    for SplitHalf<Head, rotary::group::Table<Position, rotary::Row<Head>>>
+{
+    fn load(context: &mut load::Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
+        context.checkpoint(from, |cx| {
+            let spectrum: Spectrum = config::parse(from.config()).map_err(refusal)?;
+            let frequencies = spectrum.bind::<Head, Head>().map_err(refusal)?;
+            Load::load(cx, &frequencies)
         })
     }
 }
