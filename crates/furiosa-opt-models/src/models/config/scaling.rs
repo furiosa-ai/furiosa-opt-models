@@ -79,6 +79,14 @@ impl Spectrum {
         (self.fraction * head as f64) as usize
     }
 
+    /// The amplitude every rotation scales by: a YaRN spectrum's attention factor, else one.
+    pub fn amplitude(&self) -> f64 {
+        match self.kind {
+            Kind::Yarn(yarn) => yarn.amplitude,
+            _ => 1.0,
+        }
+    }
+
     /// The frequency of each of the `rotated / 2` pairs of a `head`-wide head, as Transformers
     /// computes it; refused when it rotates part of a head, since `i` pairs with `i + head / 2`.
     pub fn frequencies(&self, head: usize, rotated: usize) -> io::Result<Vec<f64>> {
@@ -126,11 +134,10 @@ impl Spectrum {
     /// The frequencies of a `Head`-wide head's `Rotated` coordinates, at the spectrum's
     /// amplitude.
     pub fn bind<Head: AxisName, Rotated: AxisName>(&self) -> io::Result<PairFrequencies<Rotated>> {
-        let amplitude = match self.kind {
-            Kind::Yarn(yarn) => yarn.amplitude,
-            _ => 1.0,
-        };
-        PairFrequencies::new(&self.frequencies(Head::SIZE, Rotated::SIZE)?, amplitude)
+        PairFrequencies::new(
+            &self.frequencies(Head::SIZE, Rotated::SIZE)?,
+            self.amplitude(),
+        )
     }
 }
 

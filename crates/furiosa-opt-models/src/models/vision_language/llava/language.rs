@@ -1,5 +1,9 @@
 //! The language decoder uses the checkpoint's Llama namespace and dense projections.
 
+use crate::models::config::{
+    Positive,
+    scaling::{Defaults, Spectrum},
+};
 use crate::models::decoder::attention::Qwen2Layer;
 use crate::modules::{attention, feedforward::glu::Glu, language};
 use crate::ops::attention::gqa::Read;
@@ -17,7 +21,6 @@ use crate::tensor::mapping::Reshape;
 use crate::{Module, Sequential};
 use furiosa_opt_std::prelude::*;
 use serde::Deserialize;
-use serde_json::Value;
 use std::io;
 
 /// Token lookup, causal decoder stack, final normalization, and vocabulary head.
@@ -125,9 +128,6 @@ axes![Queries = 32, Vocabulary = 32064, Windows = 8];
 /// The `rms_norm_eps` the decoder is compiled with.
 pub(super) const EPSILON: f32 = 1e-5;
 
-/// `rope_theta`: the base of the decoder's rotation.
-const THETA: f64 = 10000.0;
-
 /// `max_position_embeddings`: the positions the decoder serves.
 const POSITIONS: usize = 4096;
 
@@ -146,20 +146,17 @@ pub struct Config {
     vocab_size: usize,
     rms_norm_eps: f64,
     max_position_embeddings: usize,
-    rope_theta: Option<f64>,
-    rope_scaling: Option<Value>,
-    rope_parameters: Option<Rope>,
+    #[serde(flatten, deserialize_with = "Config::spectrum")]
+    rope: Spectrum,
     hidden_act: String,
     attention_bias: bool,
     mlp_bias: bool,
     tie_word_embeddings: bool,
 }
 
-/// A rotation as Transformers 5 writes it: its type and its base.
-#[derive(Deserialize)]
-pub struct Rope {
-    rope_type: String,
-    rope_theta: Option<f64>,
+/// `LlamaConfig`'s: Transformers' default base.
+impl Defaults for Config {
+    const THETA: Positive = Positive::new(10000.0);
 }
 
 /// `LlamaConfig`'s defaults, the model type a LLaVA config's text half names when it names none.
@@ -176,9 +173,8 @@ impl Default for Config {
             vocab_size: 32000,
             rms_norm_eps: 1e-6,
             max_position_embeddings: 2048,
-            rope_theta: None,
-            rope_scaling: None,
-            rope_parameters: None,
+            rope: Self::spectrum(serde_json::Value::Object(Default::default()))
+                .expect("a configuration naming no rotary field rotates by its class's base"),
             hidden_act: "silu".into(),
             attention_bias: false,
             mlp_bias: false,
@@ -241,16 +237,6 @@ impl Config {
                 self.rms_norm_eps
             )));
         }
-        let rope = self.rope_parameters.as_ref();
-        let theta = rope
-            .and_then(|rope| rope.rope_theta)
-            .or(self.rope_theta)
-            .unwrap_or(THETA);
-        if theta != THETA {
-            return Err(invalid(format!(
-                "rope_theta: {theta}, the decoder holds {THETA}"
-            )));
-        }
         if self.tie_word_embeddings {
             return Err(invalid(
                 "tie_word_embeddings: true, the decoder's head is its own".into(),
@@ -261,22 +247,7 @@ impl Config {
                 "max_position_embeddings: past the decoder's 4096 positions",
             ));
         }
-        match (
-            self.rope_scaling.as_ref(),
-            rope.map(|rope| rope.rope_type.as_str()),
-        ) {
-            (Some(Value::Null) | None, None | Some("default")) => {}
-            (Some(Value::Null) | None, Some(_)) => {
-                return Err(unsupported(
-                    "rope_parameters.rope_type: the decoder rotates without scaling",
-                ));
-            }
-            (Some(_), _) => {
-                return Err(unsupported(
-                    "rope_scaling: the decoder rotates without scaling",
-                ));
-            }
-        }
+        self.rope.bind::<Head, Head>()?;
         match (self.hidden_act.as_str(), self.attention_bias, self.mlp_bias) {
             ("silu", false, false) => Ok(()),
             ("silu", true, _) => Err(unsupported(
