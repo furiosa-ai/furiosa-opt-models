@@ -56,20 +56,18 @@ pub(crate) type Pairs<G, Heads, Head> =
 mod tests {
     use super::fp8::{HeadScales, HeadSquares, Layout, Stored};
     use super::group::{TilePair, Tiles};
+    use super::launch::Normalized;
     use super::matrix::Dense;
     use super::*;
     use crate::Module;
     use crate::modules::attention::{KeyValue, Projection};
     use crate::modules::generic::Either;
-    use crate::modules::generic::schedule::{Begin, Fill, IntoStream, Stream};
+    use crate::modules::generic::schedule::{Begin, Fill, Spill};
     use crate::ops::attention::full::head;
     use crate::ops::attention::geometry::Hidden;
     use crate::ops::linear::Affine;
     use crate::ops::normalization::tests::random;
-    use crate::ops::normalization::{
-        Blocked, Scaled,
-        span::{Owned, Span},
-    };
+    use crate::ops::normalization::{Blocked, Scaled, span::Span};
     use crate::ops::rotary::group::{InputHalf, OutputHalf, Rotation};
     use crate::ops::rotary::{Rotary, Row, SplitHalf};
     use crate::tensor::form::Weight;
@@ -77,7 +75,6 @@ mod tests {
     use crate::tensor::scalar::{F32, Value};
     use crate::tests::DEVICE;
     use core::marker::PhantomData;
-    use core::task::Poll;
     use furiosa_opt_std::runtime::launch;
 
     axes![QueryHeads = 32, KvHeads = 8, Head = 128];
@@ -88,6 +85,8 @@ mod tests {
     type QueryRows = HbmTensor<bf16, Chip, m![All, QueryHeads, Head]>;
     type KeyRows = HbmTensor<bf16, Chip, m![All, KvHeads, Head]>;
     type Single = Tiles<1>;
+    /// A period's projected queries, keys and values: a pair's or a single tile's.
+    type Projected<QP, QS, KP, KS, VP, VS> = (Either<QP, QS>, Either<KP, KS>, Either<VP, VS>);
 
     type Matrices = Projection<
         Affine<Dense<H, QueryHeads, Head>, ()>,
@@ -129,71 +128,9 @@ mod tests {
         }
     }
 
-    /// A launch's spans from its rows in HBM, one a poll, then its end.
-    struct Spans<'i> {
-        input: &'i Input,
-        live: Live<(), All>,
-        given: usize,
-    }
-
-    impl Stream for Spans<'_> {
-        type Item = Live<Owned<H, Span>, All>;
-
-        fn poll_next(&mut self, device: &mut Device) -> Poll<Option<Self::Item>> {
-            if self.given < self.live.count::<Span>() {
-                let tile = self.live.tile::<Span>(self.given);
-                self.given += 1;
-                return Poll::Ready(Some(tile.with(self.input.fill(device, tile))));
-            }
-            Poll::Ready(None)
-        }
-    }
-
-    /// Each period its upstream gives, its queries, keys and values stored at its rows.
-    struct Store<'o, U> {
-        upstream: U,
-        outputs: &'o mut (QueryRows, KeyRows, KeyRows),
-    }
-
-    impl<U, QP, QS, KP, KS, VP, VS> Stream for Store<'_, U>
-    where
-        U: Stream<Item = Live<(Either<QP, QS>, Either<KP, KS>, Either<VP, VS>), All>>,
-        QP: Rows<Rows = Queries<TilePair, QueryHeads, Head>>,
-        QS: Rows<Rows = Queries<Single, QueryHeads, Head>>,
-        KP: Rows<Rows = Pairs<TilePair, KvHeads, Head>>,
-        KS: Rows<Rows = Pairs<Single, KvHeads, Head>>,
-        VP: Rows<Rows = Pairs<TilePair, KvHeads, Head>>,
-        VS: Rows<Rows = Pairs<Single, KvHeads, Head>>,
-    {
-        type Item = ();
-
-        fn poll_next(&mut self, device: &mut Device) -> Poll<Option<()>> {
-            let period = match self.upstream.poll_next(&mut *device) {
-                Poll::Ready(Some(period)) => period,
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Pending => return Poll::Pending,
-            };
-            let (queries, keys, values) = &mut *self.outputs;
-            let start = period.start();
-            let (query, key, value) = period.into_value();
-            match query {
-                Either::Left(rows) => store(&mut *device, &rows.rows(), queries, start),
-                Either::Right(rows) => store(&mut *device, &rows.rows(), queries, start),
-            }
-            match key {
-                Either::Left(rows) => store(&mut *device, &rows.rows(), keys, start),
-                Either::Right(rows) => store(&mut *device, &rows.rows(), keys, start),
-            }
-            match value {
-                Either::Left(rows) => store(&mut *device, &rows.rows(), values, start),
-                Either::Right(rows) => store(device, &rows.rows(), values, start),
-            }
-            Poll::Ready(Some(()))
-        }
-    }
-
-    /// The projections streamed over a launch's spans, each period's queries, keys and values
-    /// stored at its rows; `$live` binds the launch's live rows, a constant or the count `live`.
+    /// The projections over a launch's rows: each span stored where the periods land from, then
+    /// every period projected and stored at its rows; `$live` binds the launch's live rows from
+    /// the count `live`.
     macro_rules! project {
         ($name:ident, $projection:ty, |$count:ident| $live:expr) => {
             #[device(chip = 1)]
@@ -203,28 +140,48 @@ mod tests {
                 input: &Input,
                 $count: &Value,
             ) -> (QueryRows, KeyRows, KeyRows) {
+                type Pair = <TilePair as Group>::Period;
                 let live: Live<(), All> = $live;
-                let projection = Projection {
-                    query: &projection.query,
-                    key: &projection.key,
-                    value: &projection.value,
-                };
-                let mut state = ((), (), ());
+                let Projection { query, key, value } = projection;
+                let value = value.forward(&mut *device, live, &mut (), Begin(()));
+                let mut launch = value.forward(&mut *device, live, &mut (), Begin(()));
+                let key = key.forward(&mut *device, live, &mut (), Begin(()));
+                let query = query.forward(&mut *device, live, &mut (), Begin(()));
+                let mut rows = Normalized::new();
+                for span in 0..live.count::<Span>() {
+                    let tile = live.tile::<Span>(span);
+                    let spanned = input.fill(&mut *device, tile);
+                    rows.spill(&mut *device, &spanned, (tile, live.rows()));
+                }
                 let mut outputs = (QueryRows::new(), KeyRows::new(), KeyRows::new());
-                {
-                    let spans = Spans {
-                        input,
-                        live,
-                        given: 0,
-                    };
-                    let mut root = Store {
-                        upstream: projection.into_stream(live, &mut state, spans),
-                        outputs: &mut outputs,
-                    };
-                    let mut done = false;
-                    while !done {
-                        done = matches!(root.poll_next(&mut *device), Poll::Ready(None));
-                    }
+                let mut project = |device: &mut Device, period: Live<Either<_, _>, All>| {
+                    let rows = period.value();
+                    let projected = (
+                        query.forward(&mut *device, live, &mut (), rows),
+                        key.forward(&mut *device, live, &mut (), rows),
+                        value.forward(&mut *device, live, &mut (), rows),
+                    );
+                    put(device, &mut outputs, period.with(projected));
+                };
+                let pairs = live.count::<Tile>() / 2;
+                // The pairs begin in one step, if there are any.
+                for _ in 0..pairs.min(1) {
+                    let begin = Begin(launch.period::<TilePair>(&rows, 0));
+                    value.forward(&mut *device, live, &mut (), begin);
+                }
+                for at in 0..pairs {
+                    let next = launch.period::<TilePair>(&rows, at);
+                    let period = value.forward(&mut *device, live, &mut (), next);
+                    project(
+                        &mut *device,
+                        live.tile::<Pair>(at).with(Either::Left(period)),
+                    );
+                }
+                for _ in 0..live.count::<Tile>() % 2 {
+                    let next = launch.period::<Single>(&rows, pairs);
+                    let period = value.forward(&mut *device, live, &mut (), next);
+                    let single = live.tile::<Tile>(2 * pairs);
+                    project(&mut *device, single.with(Either::Right(period)));
                 }
                 outputs
             }
@@ -389,6 +346,35 @@ mod tests {
                 m![{ Local }, Tile % 8, Head]>()
         };
         rows.to_hbm_view(&mut device.tdma, G::window(into.view_mut(), start));
+    }
+
+    /// A period's queries, keys and values stored at its rows.
+    fn put<QP, QS, KP, KS, VP, VS>(
+        device: &mut Device,
+        (queries, keys, values): &mut (QueryRows, KeyRows, KeyRows),
+        period: Live<Projected<QP, QS, KP, KS, VP, VS>, All>,
+    ) where
+        QP: Rows<Rows = Queries<TilePair, QueryHeads, Head>>,
+        QS: Rows<Rows = Queries<Single, QueryHeads, Head>>,
+        KP: Rows<Rows = Pairs<TilePair, KvHeads, Head>>,
+        KS: Rows<Rows = Pairs<Single, KvHeads, Head>>,
+        VP: Rows<Rows = Pairs<TilePair, KvHeads, Head>>,
+        VS: Rows<Rows = Pairs<Single, KvHeads, Head>>,
+    {
+        let start = period.start();
+        let (query, key, value) = period.into_value();
+        match query {
+            Either::Left(rows) => store(&mut *device, &rows.rows(), queries, start),
+            Either::Right(rows) => store(&mut *device, &rows.rows(), queries, start),
+        }
+        match key {
+            Either::Left(rows) => store(&mut *device, &rows.rows(), keys, start),
+            Either::Right(rows) => store(&mut *device, &rows.rows(), keys, start),
+        }
+        match value {
+            Either::Left(rows) => store(&mut *device, &rows.rows(), values, start),
+            Either::Right(rows) => store(device, &rows.rows(), values, start),
+        }
     }
 
     /// `out` of each row `x` over `weights`, in FP64.
