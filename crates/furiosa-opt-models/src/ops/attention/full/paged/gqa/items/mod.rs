@@ -239,13 +239,14 @@ pub(crate) mod tests {
         Pairs as QueryPairs, Single as QuerySingle, Sixteens as QuerySixteens,
     };
     use super::*;
+    use crate::ops::attention::geometry;
     use crate::specialize::attention::{DECODES, HISTORY_WAVES, WAVES};
     use crate::tensor::axis::Rows;
     use crate::tensor::cache::{Block, Blocks};
-    use crate::tensor::{live::tests::count, scalar::Value};
+    use crate::tensor::live::tests::count;
+    use crate::tensor::scalar::{F32, Value};
     use crate::tests::DEVICE;
     use furiosa_opt_std::runtime::{HostBufferSlice, launch};
-    use std::f32::consts::FRAC_1_SQRT_2;
     use std::vec::IntoIter;
 
     axes![
@@ -262,12 +263,11 @@ pub(crate) mod tests {
 
     /// The attended rows: the decode rows, rows past them, and the columns' sinks last.
     type Reach = Rows<1280>;
-    type Layout<H, G> = m![{ Symbol<Tiled<Reach, G>> }, H, { Symbol<GroupTile<G>> }, Head];
-    type Queries<H, G> = HbmTensor<bf16, Chip, Layout<H, G>>;
-    pub(crate) type Pool<H = KvHeads> = Blocks<H, Head>;
+    type Layout<H, G, D> = m![{ Symbol<Tiled<Reach, G>> }, H, { Symbol<GroupTile<G>> }, D];
+    type Queries<H, G, D> = HbmTensor<bf16, Chip, Layout<H, G, D>>;
 
-    /// The score multiplier of 128-wide heads, `1 / sqrt(128)`.
-    pub(crate) const SCALE: f32 = FRAC_1_SQRT_2 / 8.0;
+    /// The score multiplier of 128-wide heads, `1 / sqrt(128)`, as FP32 bits.
+    pub(crate) const SCALE: usize = geometry::scale(Head::SIZE);
     /// Keys of each of 32 short histories, 1,088 cached and the current one, and of the long one
     /// that rows past them read.
     pub(crate) const KEYS: usize = 1089;
@@ -280,23 +280,30 @@ pub(crate) mod tests {
 
     const UNWRITTEN: f32 = 7.0;
 
-    /// Channels of a row of every (KV head, group) of `H` heads of `G` groups.
-    pub(crate) const fn stride<H: AxisName, G: AxisName>() -> usize {
-        <m![H, G, Head]>::SIZE
+    /// Channels of a row of every (KV head, group) of `H` heads of `G` groups of `D` channels.
+    pub(crate) const fn stride<H: AxisName, G: AxisName, D: AxisName>() -> usize {
+        <m![H, G, D]>::SIZE
     }
 
     #[device(chip = 1)]
-    fn attend_items<H: AxisName, G: AxisName, const WAVES: usize>(
+    fn attend_items<
+        H: AxisName,
+        G: AxisName,
+        D: AxisName,
+        const SCALE: usize,
+        const WAVES: usize,
+    >(
         device: &mut Device,
-        query: &Queries<H, G>,
-        items: &Items<H, G, Head, Waves<WAVES>>,
+        scale: &F32<SCALE>,
+        query: &Queries<H, G, D>,
+        items: &Items<H, G, D, Waves<WAVES>>,
         layers: &Value,
-        pool: &mut Pool<H>,
-        attended: &mut Queries<H, G>,
+        pool: &mut Blocks<H, D>,
+        attended: &mut Queries<H, G, D>,
     ) {
-        let attention: Attention<H, G, Head> = attention::Attention {
+        let attention: Attention<H, G, D> = attention::Attention {
             heads: PhantomData,
-            scale: SCALE,
+            scale: (*scale).into(),
         };
         let shape = items.shape();
         for _ in 0..layers.extent::<m![Layers]>() {
@@ -320,21 +327,23 @@ pub(crate) mod tests {
     }
 
     /// `rows` query rows of `H` KV heads of `G` groups each.
-    pub(crate) fn queries<H: AxisName, G: AxisName>(rows: usize) -> impl Iterator<Item = bf16> {
-        (0..rows * stride::<H, G>()).map(|at| {
-            let (row, at) = (at / stride::<H, G>(), at % stride::<H, G>() / Head::SIZE);
+    pub(crate) fn queries<H: AxisName, G: AxisName, D: AxisName>(
+        rows: usize,
+    ) -> impl Iterator<Item = bf16> {
+        (0..rows * stride::<H, G, D>()).map(|at| {
+            let (row, at) = (at / stride::<H, G, D>(), at % stride::<H, G, D>() / D::SIZE);
             bf16::from_f32(query(row, (at / G::SIZE, at % G::SIZE)))
         })
     }
 
     /// Where channel `at` of rows of `H` KV heads of `G` groups lies once each row is its group
     /// tiles: tile `t` of row `r` is item row `r T + t`, groups `4t..4t + 4` of every head.
-    fn tiled<H: AxisName, G: AxisName>(at: usize) -> usize {
+    fn tiled<H: AxisName, G: AxisName, D: AxisName>(at: usize) -> usize {
         let tile = GroupTile::<G>::SIZE;
-        let (row, head) = (at / stride::<H, G>(), at / (G::SIZE * Head::SIZE) % H::SIZE);
-        let (group, channel) = (at / Head::SIZE % G::SIZE, at % Head::SIZE);
+        let (row, head) = (at / stride::<H, G, D>(), at / (G::SIZE * D::SIZE) % H::SIZE);
+        let (group, channel) = (at / D::SIZE % G::SIZE, at % D::SIZE);
         let item = row * GroupTile::<G>::TILES + group / tile;
-        ((item * H::SIZE + head) * tile + group % tile) * Head::SIZE + channel
+        ((item * H::SIZE + head) * tile + group % tile) * D::SIZE + channel
     }
 
     /// Token `token`'s key or value of KV head `head` in history `history`; channel `c` of a value
@@ -374,12 +383,17 @@ pub(crate) mod tests {
         if length > KEYS { 32 } else { row % 32 }
     }
 
-    /// The f64 softmax of row `row` over its `length` keys, for KV head `head` and group `group`.
-    fn expected(row: usize, length: usize, (head, group): (usize, usize)) -> f64 {
-        let history = history(row, length);
+    /// The f64 softmax of row `row` over its `length` keys, for KV head `head` and group `group` of
+    /// `D`-wide heads whose scores the FP32 of bits `SCALE` multiplies.
+    fn expected<D: AxisName, const SCALE: usize>(
+        row: usize,
+        length: usize,
+        (head, group): (usize, usize),
+    ) -> f64 {
+        let (history, scale) = (history(row, length), f64::from(f32::from(F32::<SCALE>)));
         let score = |token| {
             let key = f64::from(key_value(history, token, (0, head)));
-            f64::from(query(row, (head, group))) * key * 128.0 * f64::from(SCALE)
+            f64::from(query(row, (head, group))) * key * D::SIZE as f64 * scale
         };
         let top = (0..length).map(score).fold(f64::NEG_INFINITY, f64::max);
         let (total, mass) = (0..length).fold((0.0, 0.0), |(total, mass), token| {
@@ -395,17 +409,19 @@ pub(crate) mod tests {
     /// The pool of 33 histories of `H` KV heads: 32 short ones, then the long one, each one's
     /// blocks in reverse order and holding NaN or infinities past its keys; and each history's
     /// first block.
-    pub(crate) async fn pool<H: AxisName>(device: &mut Device) -> (Pool<H>, Vec<usize>) {
+    pub(crate) async fn pool<H: AxisName, D: AxisName>(
+        device: &mut Device,
+    ) -> (Blocks<H, D>, Vec<usize>) {
         let blocks = |history: usize| keys(history).div_ceil(Block::SIZE);
         let firsts: Vec<usize> = (0..33)
             .map(|history| (0..history).map(blocks).sum())
             .collect();
-        let width = KeyValue::SIZE * H::SIZE * Head::SIZE;
+        let width = KeyValue::SIZE * H::SIZE * D::SIZE;
         let rows = (0..33).flat_map(|history| {
             (0..blocks(history)).rev().flat_map(move |block| {
                 (0..Block::SIZE * width).map(move |at| {
                     let (token, kind) = (block * Block::SIZE + at / width, at / (width / 2) % 2);
-                    let (head, channel) = (at / Head::SIZE % H::SIZE, at % Head::SIZE);
+                    let (head, channel) = (at / D::SIZE % H::SIZE, at % D::SIZE);
                     let poison = [f32::NAN, -f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
                     bf16::from_f32(match token < keys(history) {
                         true => {
@@ -417,13 +433,16 @@ pub(crate) mod tests {
                 })
             })
         });
-        (Pool::<H>::from_rows(device, rows.collect()).await, firsts)
+        (
+            Blocks::<H, D>::from_rows(device, rows.collect()).await,
+            firsts,
+        )
     }
 
     /// The items within `WAVES` wide waves of rows of `H` KV heads of `G` groups of `firsts`' pool,
     /// in `R`'s rows, tiled as `tiling` says: row `r` sees a prefix of `rows[r].1` keys of fixture
     /// row `rows[r].0`'s history, their block IDs padded to 16 with its last.
-    pub(crate) fn plan<H: AxisName, G: AxisName, const WAVES: usize, R: AxisName>(
+    pub(crate) fn plan<H: AxisName, G: AxisName, D: AxisName, const WAVES: usize, R: AxisName>(
         rows: impl IntoIterator<Item = (usize, usize)>,
         firsts: &[usize],
         tiling: Tiling,
@@ -436,21 +455,21 @@ pub(crate) mod tests {
             let last = firsts[history] + blocks(history) - 1;
             ids.extend((0..used.next_multiple_of(16)).map(|b| (last - b.min(used - 1)) as i32));
         }
-        Plan::new::<H, G, Head, Waves<WAVES>, R>(&segments, &ids, tiling)
+        Plan::new::<H, G, D, Waves<WAVES>, R>(&segments, &ids, tiling)
     }
 
     /// The largest distance of row `row`'s attention over its `length` keys for `H` KV heads of `G`
     /// groups from the f64 softmax.
-    pub(crate) fn error<H: AxisName, G: AxisName>(
+    pub(crate) fn error<H: AxisName, G: AxisName, D: AxisName, const SCALE: usize>(
         row: usize,
         length: usize,
         output: &[bf16],
     ) -> f64 {
         let means: Vec<f64> = (0..H::SIZE * G::SIZE)
-            .map(|at| expected(row, length, (at / G::SIZE, at % G::SIZE)))
+            .map(|at| expected::<D, SCALE>(row, length, (at / G::SIZE, at % G::SIZE)))
             .collect();
         let distance = |(at, found): (usize, &bf16)| {
-            let want = means[at / Head::SIZE] / f64::from(1u32 << (at % Head::SIZE % 4));
+            let want = means[at / D::SIZE] / f64::from(1u32 << (at % D::SIZE % 4));
             (f64::from(found.to_f32()) - want).abs()
         };
         output.iter().enumerate().map(distance).fold(0.0, f64::max)
@@ -458,19 +477,19 @@ pub(crate) mod tests {
 
     /// Row `row`'s attention over its `length` keys for `H` KV heads of `G` groups, as a host
     /// softmax gives it.
-    pub(crate) fn check<H: AxisName, G: AxisName>(
+    pub(crate) fn check<H: AxisName, G: AxisName, D: AxisName, const SCALE: usize>(
         row: usize,
         length: usize,
         output: &[bf16],
         live: usize,
     ) {
         let means: Vec<f64> = (0..H::SIZE * G::SIZE)
-            .map(|at| expected(row, length, (at / G::SIZE, at % G::SIZE)))
+            .map(|at| expected::<D, SCALE>(row, length, (at / G::SIZE, at % G::SIZE)))
             .collect();
         for (at, found) in output.iter().enumerate() {
-            let (head, group) = (at / Head::SIZE / G::SIZE, at / Head::SIZE % G::SIZE);
-            let channel = at % Head::SIZE;
-            let want = means[at / Head::SIZE] / f64::from(1u32 << (channel % 4));
+            let (head, group) = (at / D::SIZE / G::SIZE, at / D::SIZE % G::SIZE);
+            let channel = at % D::SIZE;
+            let want = means[at / D::SIZE] / f64::from(1u32 << (channel % 4));
             let found = found.to_f32();
             assert!(
                 (f64::from(found) - want).abs() <= 1.0 / 128.0,
@@ -492,8 +511,8 @@ pub(crate) mod tests {
     async fn attends_each_live_row_once_derived() {
         let _lease = DEVICE.lock().await;
         let mut device = Device::new(attend_items.topology()).unwrap();
-        let (mut eight, firsts) = pool::<KvHeads>(&mut device).await;
-        let (mut four, _) = pool::<FourHeads>(&mut device).await;
+        let (mut eight, firsts) = pool::<KvHeads, Head>(&mut device).await;
+        let (mut four, _) = pool::<FourHeads, Head>(&mut device).await;
         let cases = cases();
         let device = &mut device;
         let whole = [
@@ -504,15 +523,27 @@ pub(crate) mod tests {
         ];
         for tiling in [Tiling::Adaptive, Tiling::Fixed] {
             let cases = (&cases[..], tiling);
-            attends::<KvHeads, Groups, WAVES>(device, (&mut eight, &firsts), cases).await;
-            attends::<KvHeads, Pairs, WAVES>(device, (&mut eight, &firsts), cases).await;
-            attends::<KvHeads, Single, WAVES>(device, (&mut eight, &firsts), cases).await;
-            attends::<KvHeads, Eights, WAVES>(device, (&mut eight, &firsts), cases).await;
-            attends::<FourHeads, Groups, WAVES>(device, (&mut four, &firsts), cases).await;
-            attends::<FourHeads, Eights, WAVES>(device, (&mut four, &firsts), cases).await;
-            attends::<FourHeads, Sixteens, WAVES>(device, (&mut four, &firsts), cases).await;
+            attends::<KvHeads, Groups, Head, SCALE, WAVES>(device, (&mut eight, &firsts), cases)
+                .await;
+            attends::<KvHeads, Pairs, Head, SCALE, WAVES>(device, (&mut eight, &firsts), cases)
+                .await;
+            attends::<KvHeads, Single, Head, SCALE, WAVES>(device, (&mut eight, &firsts), cases)
+                .await;
+            attends::<KvHeads, Eights, Head, SCALE, WAVES>(device, (&mut eight, &firsts), cases)
+                .await;
+            attends::<FourHeads, Groups, Head, SCALE, WAVES>(device, (&mut four, &firsts), cases)
+                .await;
+            attends::<FourHeads, Eights, Head, SCALE, WAVES>(device, (&mut four, &firsts), cases)
+                .await;
+            attends::<FourHeads, Sixteens, Head, SCALE, WAVES>(device, (&mut four, &firsts), cases)
+                .await;
             let whole = (&whole[..], tiling);
-            attends::<KvHeads, Groups, HISTORY_WAVES>(device, (&mut eight, &firsts), whole).await;
+            attends::<KvHeads, Groups, Head, SCALE, HISTORY_WAVES>(
+                device,
+                (&mut eight, &firsts),
+                whole,
+            )
+            .await;
         }
     }
 
@@ -525,11 +556,11 @@ pub(crate) mod tests {
     async fn keeps_row_bits_under_fixed_tiling() {
         let _lease = DEVICE.lock().await;
         let mut device = Device::new(attend_items.topology()).unwrap();
-        let (mut pool, firsts) = pool::<KvHeads>(&mut device).await;
+        let (mut pool, firsts) = pool::<KvHeads, Head>(&mut device).await;
         let device = &mut device;
         let beside = [25, LONG, 1, 4097, 2048, 300, 17, 16385];
-        let stride = stride::<KvHeads, Groups>();
-        let fixture: Vec<bf16> = queries::<KvHeads, Groups>(Reach::SIZE).collect();
+        let stride = stride::<KvHeads, Groups, Head>();
+        let fixture: Vec<bf16> = queries::<KvHeads, Groups, Head>(Reach::SIZE).collect();
         // Each launch row's query is the one of the fixture row whose history it sees.
         let carried = |rows: &[(usize, usize)]| {
             let mut queries = fixture.clone();
@@ -552,9 +583,14 @@ pub(crate) mod tests {
             let rows = [(0, length)];
             let histories = (&mut pool, &firsts[..]);
             let fixed = (&rows[..], Tiling::Fixed);
-            let alone =
-                attend::<KvHeads, Groups, WAVES>(device, histories, fixed, carried(&rows)).await;
-            check::<KvHeads, Groups>(0, length, &alone[..stride], 1);
+            let alone = attend::<KvHeads, Groups, Head, SCALE, WAVES>(
+                device,
+                histories,
+                fixed,
+                carried(&rows),
+            )
+            .await;
+            check::<KvHeads, Groups, Head, SCALE>(0, length, &alone[..stride], 1);
             for at in [0, 7, 15] {
                 let rows: Vec<_> = (0..16)
                     .map(|row| match row == at {
@@ -563,9 +599,13 @@ pub(crate) mod tests {
                     })
                     .collect();
                 let (histories, fixed) = ((&mut pool, &firsts[..]), (&rows[..], Tiling::Fixed));
-                let shared =
-                    attend::<KvHeads, Groups, WAVES>(device, histories, fixed, carried(&rows))
-                        .await;
+                let shared = attend::<KvHeads, Groups, Head, SCALE, WAVES>(
+                    device,
+                    histories,
+                    fixed,
+                    carried(&rows),
+                )
+                .await;
                 let row = format!("{length} keys at row {at} of 16");
                 assert_eq!(bits(&shared, at), bits(&alone, 0), "{row}");
             }
@@ -577,7 +617,7 @@ pub(crate) mod tests {
                     })
                     .collect();
                 let (histories, fixed) = ((&mut pool, &firsts[..]), (&rows[..], Tiling::Fixed));
-                let shared = attend::<KvHeads, Groups, HISTORY_WAVES>(
+                let shared = attend::<KvHeads, Groups, Head, SCALE, HISTORY_WAVES>(
                     device,
                     histories,
                     fixed,
@@ -619,25 +659,31 @@ pub(crate) mod tests {
     /// Every case of `cases` whose rows' group tiles a launch holds, rows of `H` KV heads of `G`
     /// groups tiled as `tiling` says: each live row attends as a host softmax does, and rows past
     /// them keep their bytes.
-    async fn attends<H: AxisName, G: AxisName, const WAVES: usize>(
+    async fn attends<
+        H: AxisName,
+        G: AxisName,
+        D: AxisName,
+        const SCALE: usize,
+        const WAVES: usize,
+    >(
         device: &mut Device,
-        (pool, firsts): (&mut Pool<H>, &[usize]),
+        (pool, firsts): (&mut Blocks<H, D>, &[usize]),
         (cases, tiling): (&[Vec<usize>], Tiling),
     ) {
         let unwritten = bf16::from_f32(UNWRITTEN);
         let held = |lengths: &&Vec<usize>| lengths.len() * GroupTile::<G>::TILES <= DECODES;
         for lengths in cases.iter().filter(held) {
             let rows: Vec<_> = lengths.iter().copied().enumerate().collect();
-            let fixture = queries::<H, G>(Reach::SIZE).collect();
-            let histories = (&mut *pool, firsts);
-            let output = attend::<H, G, WAVES>(device, histories, (&rows, tiling), fixture).await;
+            let fixture = queries::<H, G, D>(Reach::SIZE).collect();
+            let (histories, rows) = ((&mut *pool, firsts), (&rows[..], tiling));
+            let output = attend::<H, G, D, SCALE, WAVES>(device, histories, rows, fixture).await;
             for (row, got) in output
-                .chunks_exact(stride::<H, G>())
+                .chunks_exact(stride::<H, G, D>())
                 .enumerate()
                 .take(Reach::SIZE - SINKS)
             {
                 match lengths.get(row) {
-                    Some(&length) => check::<H, G>(row, length, got, lengths.len()),
+                    Some(&length) => check::<H, G, D, SCALE>(row, length, got, lengths.len()),
                     None => assert!(
                         got.iter().all(|value| *value == unwritten),
                         "row {row} written"
@@ -649,33 +695,40 @@ pub(crate) mod tests {
 
     /// A launch's attended rows, twice over, tiled as `tiling` says: row `r` sees `rows[r].1` keys
     /// of fixture row `rows[r].0`'s history in `firsts`' pool; `queries` holds every row of `Reach`.
-    async fn attend<H: AxisName, G: AxisName, const WAVES: usize>(
+    async fn attend<
+        H: AxisName,
+        G: AxisName,
+        D: AxisName,
+        const SCALE: usize,
+        const WAVES: usize,
+    >(
         device: &mut Device,
-        (pool, firsts): (&mut Pool<H>, &[usize]),
+        (pool, firsts): (&mut Blocks<H, D>, &[usize]),
         (rows, tiling): (&[(usize, usize)], Tiling),
         queries: Vec<bf16>,
     ) -> Vec<bf16> {
         let mut tiles = queries.clone();
         for (at, value) in queries.into_iter().enumerate() {
-            tiles[tiled::<H, G>(at)] = value;
+            tiles[tiled::<H, G, D>(at)] = value;
         }
-        let queries: Queries<H, G> = HostTensor::<bf16, Layout<H, G>>::from_vec(tiles)
+        let queries: Queries<H, G, D> = HostTensor::<bf16, Layout<H, G, D>>::from_vec(tiles)
             .to_hbm(&mut device.pdma)
             .await
             .unwrap();
         let layers = count(2).to_hbm(&mut device.pdma).await.unwrap();
-        let plan = plan::<H, G, WAVES, Reach>(rows.iter().copied(), firsts, tiling);
+        let plan = plan::<H, G, D, WAVES, Reach>(rows.iter().copied(), firsts, tiling);
         let mut buffers = place(device, plan.reads()).await;
-        let items: Items<H, G, Head, Waves<WAVES>> =
+        let items: Items<H, G, D, Waves<WAVES>> =
             Items::bind(|| Ok(buffers.next().expect("an array a buffer"))).unwrap();
-        let unwritten_rows = vec![bf16::from_f32(UNWRITTEN); Reach::SIZE * stride::<H, G>()];
-        let mut attended: Queries<H, G> =
-            HostTensor::<bf16, Layout<H, G>>::from_vec(unwritten_rows)
+        let unwritten_rows = vec![bf16::from_f32(UNWRITTEN); Reach::SIZE * stride::<H, G, D>()];
+        let mut attended: Queries<H, G, D> =
+            HostTensor::<bf16, Layout<H, G, D>>::from_vec(unwritten_rows)
                 .to_hbm(&mut device.pdma)
                 .await
                 .unwrap();
         let arguments = (
             &mut *device,
+            &F32::<SCALE>,
             &queries,
             &items,
             &layers,
@@ -684,12 +737,12 @@ pub(crate) mod tests {
         );
         launch(attend_items, arguments).await.unwrap();
         let tiles = attended
-            .to_host::<Layout<H, G>>(&mut device.pdma)
+            .to_host::<Layout<H, G, D>>(&mut device.pdma)
             .await
             .unwrap()
             .into_vec();
         (0..tiles.len())
-            .map(|at| tiles[tiled::<H, G>(at)])
+            .map(|at| tiles[tiled::<H, G, D>(at)])
             .collect()
     }
 
@@ -698,7 +751,7 @@ pub(crate) mod tests {
     async fn ignores_query_rows_past_the_live_ones() {
         let _lease = DEVICE.lock().await;
         let mut device = Device::new(attend_items.topology()).unwrap();
-        let (mut pool, firsts) = pool::<KvHeads>(&mut device).await;
+        let (mut pool, firsts) = pool::<KvHeads, Head>(&mut device).await;
         let cases: [Vec<usize>; 4] = [
             vec![KEYS; 1],
             vec![25; 65],
@@ -706,11 +759,11 @@ pub(crate) mod tests {
             vec![16385, 1, LONG],
         ];
         for lengths in cases {
-            let live = lengths.len() * stride::<KvHeads, Groups>();
+            let live = lengths.len() * stride::<KvHeads, Groups, Head>();
             let seen: Vec<_> = lengths.iter().copied().enumerate().collect();
             let adaptive = (&seen[..], Tiling::Adaptive);
             let rows = |past: f32| {
-                let query = queries::<KvHeads, Groups>(Reach::SIZE).enumerate();
+                let query = queries::<KvHeads, Groups, Head>(Reach::SIZE).enumerate();
                 let fill = |(at, query): (usize, bf16)| match at < live {
                     true => query,
                     false => bf16::from_f32(past),
@@ -718,19 +771,28 @@ pub(crate) mod tests {
                 query.map(fill).collect()
             };
             let history = (&mut pool, &firsts[..]);
-            let zeroed =
-                attend::<KvHeads, Groups, WAVES>(&mut device, history, adaptive, rows(0.0)).await;
+            let zeroed = attend::<KvHeads, Groups, Head, SCALE, WAVES>(
+                &mut device,
+                history,
+                adaptive,
+                rows(0.0),
+            )
+            .await;
             for past in [f32::NAN, f32::INFINITY] {
                 let history = (&mut pool, &firsts[..]);
-                let got =
-                    attend::<KvHeads, Groups, WAVES>(&mut device, history, adaptive, rows(past))
-                        .await;
+                let got = attend::<KvHeads, Groups, Head, SCALE, WAVES>(
+                    &mut device,
+                    history,
+                    adaptive,
+                    rows(past),
+                )
+                .await;
                 for (at, (got, zeroed)) in got[..live].iter().zip(&zeroed[..live]).enumerate() {
                     let (got, zeroed) = (got.to_f32(), zeroed.to_f32());
                     assert!(
                         got.is_finite() && got == zeroed,
                         "{lengths:?} past={past} row={}: {got} != {zeroed}",
-                        at / stride::<KvHeads, Groups>()
+                        at / stride::<KvHeads, Groups, Head>()
                     );
                 }
             }

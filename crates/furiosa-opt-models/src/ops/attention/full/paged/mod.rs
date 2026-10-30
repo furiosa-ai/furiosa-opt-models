@@ -390,34 +390,39 @@ mod tests {
     use furiosa_opt_std::runtime::launch;
     use gqa::items::tests::{
         self as items, Heads as KvHeads, KEYS, LONG, QueryEights as Eights, QueryGroups as Groups,
-        QueryPairs as Pairs, QuerySingle as Single, QuerySixteens as Sixteens, Width as Head,
-        stride,
+        QueryPairs as Pairs, QuerySingle as Single, QuerySixteens as Sixteens, SCALE,
+        Width as Head, stride,
     };
 
     axes![Sequences = 1, Windows = 80];
 
-    /// The score multiplier the items' tests compile, `1 / sqrt(128)`, as FP32 bits.
-    const SCALE: usize = items::SCALE.to_bits() as usize;
-
-    type Layout<R, H, G> = m![R, H, G, Head];
-    type Queries<R, H, G> = HbmTensor<bf16, Chip, Layout<R, H, G>>;
-    /// The items' pool of eight KV heads, and each history's first block.
-    type Histories = (items::Pool, Vec<usize>);
+    type Layout<R, H, G, D> = m![R, H, G, D];
+    type Queries<R, H, G, D> = HbmTensor<bf16, Chip, Layout<R, H, G, D>>;
+    /// The items' pool of `H` KV heads of `D` channels, and each history's first block.
+    type Histories<H, D> = (Blocks<H, D>, Vec<usize>);
 
     #[device(chip = 1)]
-    fn attend_rows<R: AxisName, H: AxisName, G: AxisName, const WAVES: usize>(
+    fn attend_rows<
+        R: AxisName,
+        H: AxisName,
+        G: AxisName,
+        D: AxisName,
+        const SCALE: usize,
+        const WAVES: usize,
+    >(
         device: &mut Device,
-        query: &Queries<R, H, G>,
-        work: &Work<Sequences, H, G, Head, Waves<WAVES>, Windows>,
-        pool: &mut items::Pool<H>,
-        attended: &mut Queries<R, H, G>,
+        scale: &F32<SCALE>,
+        query: &Queries<R, H, G, D>,
+        work: &Work<Sequences, H, G, D, Waves<WAVES>, Windows>,
+        pool: &mut Blocks<H, D>,
+        attended: &mut Queries<R, H, G, D>,
     ) {
         let context = work.read::<R>();
         let attention = Attention {
-            heads: PhantomData::<(H, G, Head)>,
-            scale: items::SCALE,
+            heads: PhantomData::<(H, G, D)>,
+            scale: f32::from(*scale),
         };
-        let heads: Heads<R, H, G, Head> = query.to_dm(&mut device.tdma);
+        let heads: Heads<R, H, G, D> = query.to_dm(&mut device.tdma);
         let query = context.items().with(heads);
         let output = Module::forward(
             &attention,
@@ -433,20 +438,20 @@ mod tests {
     }
 
     #[device(chip = 1)]
-    fn attend_windows<R: AxisName, G: AxisName>(
+    fn attend_windows<R: AxisName, H: AxisName, G: AxisName, D: AxisName, const SCALE: usize>(
         device: &mut Device,
-        query: &Queries<R, KvHeads, G>,
+        scale: &F32<SCALE>,
+        query: &Queries<R, H, G, D>,
         pages: &Pages<R, Windows>,
         live: &Value,
-        pool: &mut items::Pool,
-        attended: &mut Queries<R, KvHeads, G>,
+        pool: &mut Blocks<H, D>,
+        attended: &mut Queries<R, H, G, D>,
     ) {
-        let attention = Attention::<
-            PhantomData<(KvHeads, G, Head)>,
-            F32<SCALE>,
-            { Strategy::Windows },
-        >::default();
-        let heads: Heads<R, KvHeads, G, Head> = query.to_dm(&mut device.tdma);
+        let attention = Attention::<PhantomData<(H, G, D)>, F32<SCALE>, { Strategy::Windows }> {
+            heads: PhantomData,
+            scale: *scale,
+        };
+        let heads: Heads<R, H, G, D> = query.to_dm(&mut device.tdma);
         let query = Live::<(), R>::read(live).with(heads);
         let output = Op::forward(&attention, &mut *device, (&query, &*pool, pages));
         output
@@ -457,7 +462,7 @@ mod tests {
 
     /// Rows of `lengths` keys of `firsts`' pool as the windowed leaf reads them, in `R`'s rows:
     /// each window's block offsets, block counts and mask, and the windows past the first.
-    async fn pages<R: AxisName>(
+    async fn pages<R: AxisName, H: AxisName, D: AxisName>(
         device: &mut Device,
         lengths: &[usize],
         firsts: &[usize],
@@ -470,7 +475,7 @@ mod tests {
             let history = items::history(row, length(row).max(1));
             let last = firsts[history] + items::keys(history).div_ceil(Block::SIZE) - 1;
             let used = length(row).div_ceil(Block::SIZE).max(1);
-            (last - at.min(used - 1)) as i32 * Blocks::<KvHeads, Head>::BLOCK_STRIDE
+            (last - at.min(used - 1)) as i32 * Blocks::<H, D>::BLOCK_STRIDE
         };
         let table: Vec<i32> = (0..rows * windows * slots).map(block).collect();
         let counts: Vec<i32> = (0..windows * rows)
@@ -501,65 +506,109 @@ mod tests {
         }
     }
 
-    /// The largest distance from the f64 softmax of the rows of `lengths` keys of a call of `R`
-    /// rows of `G` query groups a KV head, attended as work items within `WAVES` wide waves and by
-    /// the windowed leaf, the catalog's two attention forms.
-    async fn errors<R: AxisName, G: AxisName, const WAVES: usize>(
+    /// The rows of `lengths` keys of a call of `R` rows, attended as work items within `WAVES` wide
+    /// waves through the head layout the catalog's projection leaves.
+    async fn as_items<
+        R: AxisName,
+        H: AxisName,
+        G: AxisName,
+        D: AxisName,
+        const SCALE: usize,
+        const WAVES: usize,
+    >(
         device: &mut Device,
-        (pool, firsts): &mut Histories,
+        (pool, firsts): &mut Histories<H, D>,
         masks: &chunks::Masks<Windows>,
         lengths: &[usize],
-    ) -> [f64; 2] {
-        let queries = items::queries::<KvHeads, G>(R::SIZE);
-        let queries = HostTensor::<bf16, Layout<R, KvHeads, G>>::from_vec(queries);
-        let queries: Queries<R, KvHeads, G> = queries.to_hbm(&mut device.pdma).await.unwrap();
+    ) -> Vec<bf16> {
+        let queries = items::queries::<H, G, D>(R::SIZE);
+        let queries = HostTensor::<bf16, Layout<R, H, G, D>>::from_vec(queries);
+        let queries: Queries<R, H, G, D> = queries.to_hbm(&mut device.pdma).await.unwrap();
         let rows = lengths.iter().copied().enumerate();
-        let plan = items::plan::<KvHeads, G, WAVES, Sinked<R>>(rows, firsts, Tiling::Adaptive);
+        let plan = items::plan::<H, G, D, WAVES, Sinked<R>>(rows, firsts, Tiling::Adaptive);
         let chunks = chunks::Plan::<Windows>::new::<Sequences>().reads().unwrap();
         let reads = plan
             .reads()
             .chain(chunks.iter().map(|(read, words)| (&read[..], *words)));
         let mut buffers = items::place(device, reads).await;
-        let work: Work<Sequences, KvHeads, G, Head, Waves<WAVES>, Windows> =
+        let work: Work<Sequences, H, G, D, Waves<WAVES>, Windows> =
             Work::bind(|| Ok(buffers.next().expect("an array a buffer")), masks).unwrap();
-        let pages = pages::<R>(device, lengths, firsts).await;
+        let mut attended: Queries<R, H, G, D> = HostTensor::<bf16, Layout<R, H, G, D>>::zero()
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap();
+        let arguments = (
+            &mut *device,
+            &F32::<SCALE>,
+            &queries,
+            &work,
+            &mut *pool,
+            &mut attended,
+        );
+        launch(attend_rows, arguments).await.unwrap();
+        attended
+            .to_host::<Layout<R, H, G, D>>(&mut device.pdma)
+            .await
+            .unwrap()
+            .into_vec()
+    }
+
+    /// The rows of `lengths` keys of a call of `R` rows, attended by the windowed leaf over the
+    /// pages of their histories.
+    async fn by_windows<R: AxisName, H: AxisName, G: AxisName, D: AxisName, const SCALE: usize>(
+        device: &mut Device,
+        (pool, firsts): &mut Histories<H, D>,
+        lengths: &[usize],
+    ) -> Vec<bf16> {
+        let queries = items::queries::<H, G, D>(R::SIZE);
+        let queries = HostTensor::<bf16, Layout<R, H, G, D>>::from_vec(queries);
+        let queries: Queries<R, H, G, D> = queries.to_hbm(&mut device.pdma).await.unwrap();
+        let pages = pages::<R, H, D>(device, lengths, firsts).await;
         let live = count(lengths.len()).to_hbm(&mut device.pdma).await.unwrap();
-        let mut errors = [0.0; 2];
-        for (form, error) in errors.iter_mut().enumerate() {
-            let mut attended: Queries<R, KvHeads, G> =
-                HostTensor::<bf16, Layout<R, KvHeads, G>>::zero()
-                    .to_hbm(&mut device.pdma)
-                    .await
-                    .unwrap();
-            match form {
-                0 => {
-                    let arguments = (&mut *device, &queries, &work, &mut *pool, &mut attended);
-                    launch(attend_rows, arguments).await.unwrap();
-                }
-                _ => {
-                    let arguments = (
-                        &mut *device,
-                        &queries,
-                        &pages,
-                        &live,
-                        &mut *pool,
-                        &mut attended,
-                    );
-                    launch(attend_windows, arguments).await.unwrap();
-                }
-            }
-            let output = attended
-                .to_host::<Layout<R, KvHeads, G>>(&mut device.pdma)
-                .await
-                .unwrap()
-                .into_vec();
-            let width = stride::<KvHeads, G>();
+        let mut attended: Queries<R, H, G, D> = HostTensor::<bf16, Layout<R, H, G, D>>::zero()
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap();
+        let arguments = (
+            &mut *device,
+            &F32::<SCALE>,
+            &queries,
+            &pages,
+            &live,
+            &mut *pool,
+            &mut attended,
+        );
+        launch(attend_windows, arguments).await.unwrap();
+        attended
+            .to_host::<Layout<R, H, G, D>>(&mut device.pdma)
+            .await
+            .unwrap()
+            .into_vec()
+    }
+
+    /// The largest distance from the f64 softmax of the rows of `lengths` keys of a call of `R`
+    /// rows of `G` query groups a KV head, in each of the catalog's two attention forms.
+    async fn errors<R: AxisName, G: AxisName, const WAVES: usize>(
+        device: &mut Device,
+        histories: &mut Histories<KvHeads, Head>,
+        masks: &chunks::Masks<Windows>,
+        lengths: &[usize],
+    ) -> [f64; 2] {
+        let forms = [
+            as_items::<R, KvHeads, G, Head, SCALE, WAVES>(device, histories, masks, lengths).await,
+            by_windows::<R, KvHeads, G, Head, SCALE>(device, histories, lengths).await,
+        ];
+        let width = stride::<KvHeads, G, Head>();
+        forms.map(|output| {
             let row = |(row, &length): (usize, &usize)| {
-                items::error::<KvHeads, G>(row, length, &output[row * width..][..width])
+                items::error::<KvHeads, G, Head, SCALE>(
+                    row,
+                    length,
+                    &output[row * width..][..width],
+                )
             };
-            *error = lengths.iter().enumerate().map(row).fold(0.0, f64::max);
-        }
-        errors
+            lengths.iter().enumerate().map(row).fold(0.0, f64::max)
+        })
     }
 
     /// Attended as work items, the rows of the catalog's calls lie at most twice as far from the
@@ -570,7 +619,7 @@ mod tests {
     async fn errs_at_most_twice_the_windowed_leaf() {
         let _lease = DEVICE.lock().await;
         let mut device = Device::new(attend_windows.topology()).unwrap();
-        let mut pool = items::pool::<KvHeads>(&mut device).await;
+        let mut pool = items::pool::<KvHeads, Head>(&mut device).await;
         let masks = chunks::Masks::<Windows>::new(&mut device).await.unwrap();
         let device = &mut device;
         let cases = |rows: usize| {
@@ -614,37 +663,23 @@ mod tests {
     /// its own prefix of the pool as a host softmax does.
     async fn check<R: AxisName, G: AxisName, const WAVES: usize>(
         device: &mut Device,
-        (pool, firsts): &mut Histories,
+        histories: &mut Histories<KvHeads, Head>,
         masks: &chunks::Masks<Windows>,
         lengths: &[usize],
     ) {
-        let queries = items::queries::<KvHeads, G>(R::SIZE);
-        let queries = HostTensor::<bf16, Layout<R, KvHeads, G>>::from_vec(queries);
-        let queries: Queries<R, KvHeads, G> = queries.to_hbm(&mut device.pdma).await.unwrap();
-        let rows = lengths.iter().copied().enumerate();
-        let plan = items::plan::<KvHeads, G, WAVES, Sinked<R>>(rows, firsts, Tiling::Adaptive);
-        let chunks = chunks::Plan::<Windows>::new::<Sequences>().reads().unwrap();
-        let reads = plan
-            .reads()
-            .chain(chunks.iter().map(|(read, words)| (&read[..], *words)));
-        let mut buffers = items::place(device, reads).await;
-        let work: Work<Sequences, KvHeads, G, Head, Waves<WAVES>, Windows> =
-            Work::bind(|| Ok(buffers.next().expect("an array a buffer")), masks).unwrap();
-        let mut attended: Queries<R, KvHeads, G> =
-            HostTensor::<bf16, Layout<R, KvHeads, G>>::zero()
-                .to_hbm(&mut device.pdma)
-                .await
-                .unwrap();
-        let arguments = (&mut *device, &queries, &work, &mut *pool, &mut attended);
-        launch(attend_rows, arguments).await.unwrap();
-        let output = attended
-            .to_host::<Layout<R, KvHeads, G>>(&mut device.pdma)
-            .await
-            .unwrap()
-            .into_vec();
-        let rows = output.chunks_exact(stride::<KvHeads, G>());
+        let output =
+            as_items::<R, KvHeads, G, Head, SCALE, WAVES>(device, histories, masks, lengths);
+        check_rows::<KvHeads, G, Head, SCALE>(lengths, &output.await);
+    }
+
+    /// Each row `r` of `output` attends its `lengths[r]` keys as a host softmax does.
+    fn check_rows<H: AxisName, G: AxisName, D: AxisName, const SCALE: usize>(
+        lengths: &[usize],
+        output: &[bf16],
+    ) {
+        let rows = output.chunks_exact(stride::<H, G, D>());
         for ((row, &length), got) in lengths.iter().enumerate().zip(rows) {
-            items::check::<KvHeads, G>(row, length, got, lengths.len());
+            items::check::<H, G, D, SCALE>(row, length, got, lengths.len());
         }
     }
 
@@ -655,7 +690,7 @@ mod tests {
     async fn attends_every_live_row_of_a_sequential_layer() {
         let _lease = DEVICE.lock().await;
         let mut device = Device::new(attend_rows.topology()).unwrap();
-        let mut pool = items::pool::<KvHeads>(&mut device).await;
+        let mut pool = items::pool::<KvHeads, Head>(&mut device).await;
         let masks = chunks::Masks::<Windows>::new(&mut device).await.unwrap();
         let device = &mut device;
         let mixed: Vec<usize> = (0..64).map(|row| items::MIXED[row % 16]).collect();
