@@ -57,19 +57,20 @@ pub struct Operands<
     Heads: AxisName,
     Groups: AxisName,
     Head: AxisName,
-    const WAVES: usize,
+    Waves: AxisName,
+    W: AxisName,
     Chips: M + 'static = Chip,
 > {
     pub batch: Batch<Capacity, Reach, Chips>,
-    pub work: paged::Work<Sequences, Heads, Groups, Head, WAVES>,
+    pub work: paged::Work<Sequences, Heads, Groups, Head, Waves, W>,
     pub selected: Selected<Capacity>,
     pub slots: PhantomData<Slots>,
 }
 
-impl<'a, R, Reach, Sequences, Slots, Heads, Groups, Head, F, const WAVES: usize>
+impl<'a, R, Reach, Sequences, Slots, Heads, Groups, Head, F, Waves, W>
     crate::Op<(
         Live<(), R>,
-        &mut &'a Operands<R, Reach, Sequences, Slots, Heads, Groups, Head, WAVES>,
+        &mut &'a Operands<R, Reach, Sequences, Slots, Heads, Groups, Head, Waves, W>,
     )> for SplitHalf<Head, F>
 where
     F: group::Rotations<Half = rotary::Row<Head>>,
@@ -80,12 +81,14 @@ where
     Heads: AxisName,
     Groups: AxisName,
     Head: AxisName,
+    Waves: AxisName,
+    W: AxisName,
 {
     type Output = (
         Context<
             SplitHalf<Head, group::Rotation<Slots, rotary::Row<Head>>>,
             &'a HbmTensor<i32, Chip, m![Reach]>,
-            paged::Context<'a, Sequences, Heads, Groups, Head, WAVES, R>,
+            paged::Context<'a, Sequences, Heads, Groups, Head, Waves, W, R>,
         >,
         &'a Selected<R>,
     );
@@ -95,14 +98,14 @@ where
         device: &mut Device,
         (live, operands): (
             Live<(), R>,
-            &mut &'a Operands<R, Reach, Sequences, Slots, Heads, Groups, Head, WAVES>,
+            &mut &'a Operands<R, Reach, Sequences, Slots, Heads, Groups, Head, Waves, W>,
         ),
     ) -> Self::Output {
         const {
             assert!(Reach::SIZE >= R::SIZE);
             assert!(Slots::SIZE == R::SIZE.div_ceil(Tile::SIZE));
         };
-        let operands: &'a Operands<_, _, _, _, _, _, _, WAVES> = operands;
+        let operands: &'a Operands<_, _, _, _, _, _, _, Waves, W> = operands;
         let work = operands.work.read::<R>();
         let mut rotation = SplitHalf {
             frequency: HbmTensor::new(),
@@ -441,7 +444,8 @@ impl<
     X: Memory,
     S,
     G,
-    const WAVES: usize,
+    Waves,
+    W,
     Env: Copy,
     Chips: M + 'static,
     Rotated: AxisName,
@@ -454,7 +458,7 @@ impl<
                 A,
                 (
                     History<Rows, B, K, Chips>,
-                    &'x paged::Work<S, Heads, G, Head, WAVES>,
+                    &'x paged::Work<S, Heads, G, Head, Waves, W>,
                 ),
             ),
         ),
@@ -470,6 +474,8 @@ where
     D: Scalar,
     S: AxisName,
     G: AxisName,
+    Waves: AxisName,
+    W: AxisName,
     Derive<Rows, Chips, X>: for<'d, 'h> Module<
             (
                 &'h HbmTensor<i32, Chips, m![Rows, Fields]>,
@@ -485,7 +491,7 @@ where
     type Output = Context<
         Rotation<Rotated, Chips, Rows>,
         HbmTensor<i32, Chips, m![Rows]>,
-        paged::Context<'x, S, Heads, G, Head, WAVES, Rows>,
+        paged::Context<'x, S, Heads, G, Head, Waves, W, Rows>,
     >;
 
     fn forward(
@@ -499,7 +505,7 @@ where
                 A,
                 (
                     History<Rows, B, K, Chips>,
-                    &'x paged::Work<S, Heads, G, Head, WAVES>,
+                    &'x paged::Work<S, Heads, G, Head, Waves, W>,
                 ),
             ),
         ),

@@ -1086,7 +1086,7 @@ mod tests {
         type Layers = ();
         type Adapter = std::convert::Infallible;
 
-        fn limits(&self) -> Limits {
+        fn limits(&self, _: Tiling) -> Limits {
             unreachable!("a registry test calls no decoder")
         }
 

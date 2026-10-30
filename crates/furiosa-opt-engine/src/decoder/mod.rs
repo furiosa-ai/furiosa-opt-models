@@ -153,7 +153,8 @@ pub trait Decoder: Send + Sync {
     /// adapter tree, or `Infallible` for a decoder that runs none.
     type Adapter: Send + Sync + 'static;
 
-    fn limits(&self) -> Limits;
+    /// What one call holds when its rows' attention is tiled as `tiling` says.
+    fn limits(&self, tiling: Tiling) -> Limits;
 
     /// Views of `storage`, the layers of a cache allocated for this decoder.
     fn layers(storage: &[HbmBuffer]) -> io::Result<Self::Layers>;
@@ -227,7 +228,8 @@ impl<'r, 'c, 'l, 'a, D: Decoder>
         (cache, adapters): (&'c Cache, &'l [Option<&'a D::Adapter>]),
         requests: &'r [Request],
     ) -> io::Result<D::Output> {
-        let batch = Batch::new(requests, &Decoder::limits(&self.decoder), cache, adapters)?;
+        let limits = Decoder::limits(&self.decoder, self.tiling);
+        let batch = Batch::new(requests, &limits, cache, adapters)?;
         let mut layers = cache.lend(D::layers)?;
         self.decoder
             .call(device, &mut layers, batch, self.tiling)
@@ -263,7 +265,7 @@ pub trait Served: Send + Sync {
 /// `Adapter`s.
 impl<D: Decoder> Served for Instance<D> {
     fn limits(&self) -> Limits {
-        Decoder::limits(&self.decoder)
+        Decoder::limits(&self.decoder, self.tiling)
     }
 
     fn output(&self) -> Output {
