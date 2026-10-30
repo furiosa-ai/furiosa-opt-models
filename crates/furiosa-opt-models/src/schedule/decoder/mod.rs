@@ -286,7 +286,6 @@ fn end(
     let (gate_up, down) = mlp.0.parts();
     let tile = input.with(());
     let gain = crate::Op::forward(&Stage, &mut *device, &norm.0);
-    let ahead = gate_up.forward(&mut *device, (), &mut (), Begin(()));
     let mut step = |device: &mut Device| {
         output.forward(
             device,
@@ -295,7 +294,9 @@ fn end(
             (&mut *landed, &attended.value().0, tile),
         )
     };
+    // The first gate/up pair lands behind the output projection's rows, under its passes.
     let _ = step(&mut *device);
+    let ahead = gate_up.forward(&mut *device, (), &mut (), Begin(()));
     let _ = step(&mut *device);
     let projected = match step(&mut *device) {
         Poll::Ready(rows) => tile.with(rows),
