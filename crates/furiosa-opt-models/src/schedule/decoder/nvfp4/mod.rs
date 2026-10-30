@@ -4,7 +4,6 @@
 //! around the current layer's attention, using the same retained-row flow as Qwen FP8.
 use crate::models::decoder::attention::{Head, KvHeads, llama::nvfp4::*};
 use crate::models::decoder::launch;
-use crate::modules::generic::schedule::{Fill, Spill};
 use crate::modules::language::Backbone;
 use crate::modules::residual::Residual;
 use crate::ops::attention::full::paged::Retained;
@@ -15,7 +14,8 @@ use crate::ops::normalization::{
     span::{self, Span, Stage},
 };
 use crate::ops::pointwise::add::Add;
-use crate::tensor::{live::Live, parallel::Chip};
+use crate::tensor::live::{Fill, Live, Spill};
+use crate::tensor::parallel::Chip;
 use crate::{Module, Op, Sequential, Then};
 use furiosa_opt_std::prelude::*;
 

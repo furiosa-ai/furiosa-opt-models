@@ -1,8 +1,8 @@
 use super::HeadNorm;
+use crate::Begin;
 use crate::Op;
 use crate::load::{Context, Load, LoadError};
 use crate::modules::generic::Either;
-use crate::modules::generic::schedule::Begin;
 use crate::ops::normalization::span::kernel;
 use crate::ops::normalization::{self, Root, Scaled};
 use crate::specialize::normalization::whole;

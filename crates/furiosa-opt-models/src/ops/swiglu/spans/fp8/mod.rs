@@ -2,9 +2,9 @@
 //! by row scales, with the weights' channel scales folded into the results.
 
 use super::*;
+use crate::Begin;
 use crate::Op;
 use crate::load::{Context, Load, LoadError};
-use crate::modules::generic::schedule::Begin;
 use crate::ops::normalization::span::Owned;
 use crate::ops::pointwise::add::Add;
 use crate::ops::swiglu::Mlp;

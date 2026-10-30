@@ -3,8 +3,8 @@
 
 use furiosa_opt_std::prelude::*;
 
+use crate::Begin;
 use crate::Module;
-use crate::modules::generic::schedule::Begin;
 use crate::ops::linear::Affine;
 use crate::ops::normalization::span::{Owned, Span};
 use crate::ops::pointwise::add::{Add, Term};
@@ -30,12 +30,11 @@ pub(crate) struct ToDm<'a, QWidth: AxisName, Capacity: AxisName, Reach: AxisName
 mod tests {
     use super::fp8::{Blocked, Stored};
     use super::*;
-    use crate::modules::generic::schedule::Spill;
     use crate::ops::attention::geometry::{Hidden, QueryGroups, QueryWidth};
     use crate::ops::normalization::Blocked as Rows;
     use crate::ops::normalization::tests::random;
     use crate::tensor::axis;
-    use crate::tensor::live::tests::count;
+    use crate::tensor::live::{Spill, tests::count};
     use crate::tensor::scalar::Value;
     use crate::tests::DEVICE;
     use furiosa_opt_std::runtime::launch;

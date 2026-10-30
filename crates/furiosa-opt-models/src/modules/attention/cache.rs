@@ -10,11 +10,10 @@ use super::{Attention, Context, History, Paged, Positioned};
 
 use crate::Module;
 use crate::load::Load;
-use crate::modules::generic::schedule::Spill;
 use crate::ops::attention::full::paged;
 use crate::ops::index::scatter;
 use crate::tensor::cache::Blocks;
-use crate::tensor::live::Live;
+use crate::tensor::live::{Live, Spill};
 use crate::tensor::parallel::Chip;
 use core::ops::Deref;
 use furiosa_opt_std::prelude::*;

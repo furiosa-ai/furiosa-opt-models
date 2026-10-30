@@ -8,8 +8,8 @@
 
 use furiosa_opt_std::prelude::*;
 
+use crate::Begin;
 use crate::load::{Checkpoint, Children, Context, Load, LoadError};
-use crate::modules::generic::schedule::Begin;
 use crate::ops::normalization::span::Owned;
 use crate::ops::pointwise::SwiGlu;
 use crate::tensor::form::Projections;
