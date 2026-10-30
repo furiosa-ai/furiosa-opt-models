@@ -475,14 +475,6 @@ pub struct Config {
 }
 
 impl Config {
-    /// Llama 3 rescaled rotary frequency of each dimension pair of a `head`-wide attention head.
-    pub fn frequencies(&self, theta: Positive, head: usize) -> Vec<f32> {
-        let theta = f64::from(theta.get());
-        (0..head / 2)
-            .map(|pair| self.rescale(theta.powf(-2.0 * pair as f64 / head as f64)) as f32)
-            .collect()
-    }
-
     /// The rescaled value of an unscaled frequency.
     fn rescale(&self, frequency: f64) -> f64 {
         let (factor, low, high, original) = (
