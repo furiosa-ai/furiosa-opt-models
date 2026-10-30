@@ -1,10 +1,8 @@
 //! The HBM leaf: built from a checkpoint or from a value built on host (or a function making it),
 //! written in place, borrowed for a call.
 
-use std::future::IntoFuture;
-
 use furiosa_opt_std::prelude::{HbmTensor, HostTensor, M, MaterializableScalar, Pair, m};
-use tokio::task;
+use furiosa_opt_std::runtime::HostBuffer;
 
 use super::{Checkpoint, Context, Load, LoadError};
 
@@ -43,21 +41,14 @@ impl<'t, 's, D: MaterializableScalar, C: M + 'static, S: M + 'static>
                         let written = match Checkpoint::splits::<C, S>() {
                             true => {
                                 let host = from.host::<D, S, m![{ C }, { S }]>(cx)?;
-                                let write = host.to_hbm::<C, S>(&mut cx.device().pdma);
-                                let write = write.output(&mut *into).into_future();
-                                futures_executor::block_on(task::unconstrained(write))
+                                <&mut HbmTensor<D, C, S> as Load<_>>::load(cx, (&mut *into, host))
                             }
                             false => {
                                 let host = from.host::<D, S, S>(cx)?;
-                                let write = host.to_hbm::<C, S>(&mut cx.device().pdma);
-                                let write = write.output(&mut *into).into_future();
-                                futures_executor::block_on(task::unconstrained(write))
+                                <&mut HbmTensor<D, C, S> as Load<_>>::load(cx, (&mut *into, host))
                             }
                         };
-                        written.map_err(|source| LoadError::Device {
-                            path: cx.path(),
-                            source,
-                        })
+                        written.map(drop)
                     })
                 },
                 |_, ()| Ok(()),
@@ -76,16 +67,12 @@ impl<'t, D: MaterializableScalar, C: M + 'static, S: M + 'static>
         context: &mut Context<'_>,
         (into, from): (&'t mut HbmTensor<D, C, S>, HbmTensor<D, C, S>),
     ) -> Result<Self, LoadError> {
-        let path = context.path();
-        let device = context.device();
-        let copy = async {
-            let host = from.to_host::<m![{ C }, { S }]>(&mut device.pdma).await?;
-            host.to_hbm::<C, S>(&mut device.pdma)
-                .output(&mut *into)
-                .await
-        };
-        futures_executor::block_on(task::unconstrained(copy.into_future()))
-            .map_err(|source| LoadError::Device { path, source })?;
+        // A read into ordinary memory ends inside `submit`, so the write copies what it read.
+        let mut host = HostBuffer::from_vec(vec![0; HbmTensor::<D, C, S>::size()]);
+        let read = context.device().pdma.to_host([(&from, &mut host)]).submit();
+        context.submitted(read)?;
+        let write = context.device().pdma.to_hbm([(&host, &mut *into)]).submit();
+        context.submitted(write)?;
         Ok(into)
     }
 }
@@ -118,11 +105,9 @@ impl<'t, D: MaterializableScalar, C: M + 'static, S: M + 'static, E: M>
         context: &mut Context<'_>,
         (into, host): (&'t mut HbmTensor<D, C, S>, HostTensor<D, E>),
     ) -> Result<Self, LoadError> {
-        let path = context.path();
-        let device = context.device();
-        let write = host.to_hbm::<C, S>(&mut device.pdma).output(&mut *into);
-        futures_executor::block_on(task::unconstrained(write.into_future()))
-            .map_err(|source| LoadError::Device { path, source })?;
+        let write = host.to_hbm::<C, S>(&mut context.device().pdma);
+        let write = write.output(&mut *into).submit();
+        context.submitted(write)?;
         Ok(into)
     }
 }
@@ -180,6 +165,16 @@ mod tests {
         copies: X::Tensor<f32, m![{ Symbol<Shard<2>> }], m![O, I]>,
     }
 
+    /// An HBM leaf of the stored `[O, I]` tensor whose chips split its axis `I`, a share a chip.
+    type Split = HbmTensor<f32, m![I / 2], m![O, I % 2]>;
+
+    /// A leaf a function builds: the stored `[O, I]` tensor doubled.
+    #[derive(crate::load::Load)]
+    struct Built {
+        #[load(with = doubled)]
+        split: Split,
+    }
+
     /// A checkpoint of `values`, the `[O, I]` tensor in row-major order, under both names.
     fn stored(values: &[f32; 8]) -> Checkpoint {
         let bytes: Vec<u8> = values
@@ -190,20 +185,21 @@ mod tests {
         checkpoint(&[tensor("split"), tensor("copies")])
     }
 
-    /// Every chip's values of each leaf, read back chip after chip, against the stored values
-    /// indexed by chip: chip `c` holds `w[o][2c + j]` of the split leaf and all of `w` of the
-    /// copies.
-    fn assert_held(leaves: &Leaves<Hbm>, values: &[f32; 8], device: &mut Device) {
-        let w = |o: usize, i: usize| values[o * I::SIZE + i];
-        let shares: Vec<f32> = (0..2)
+    /// Each chip's share of `values`, the `[O, I]` tensor `w` in row-major order, chip after chip:
+    /// chip `c` holds `w[o][2c + j]`.
+    fn shares(values: &[f32; 8]) -> Vec<f32> {
+        (0..2)
             .flat_map(|chip| (0..2).flat_map(move |o| (0..2).map(move |j| (chip, o, j))))
-            .map(|(chip, o, j)| w(o, 2 * chip + j))
-            .collect();
-        let copies: Vec<f32> = (0..2)
-            .flat_map(|_| (0..2).flat_map(|o| (0..4).map(move |i| w(o, i))))
-            .collect();
+            .map(|(chip, o, j)| values[o * I::SIZE + 2 * chip + j])
+            .collect()
+    }
+
+    /// Every chip's values of each leaf, read back chip after chip, against the stored values
+    /// indexed by chip: each chip's share of the split leaf, and the whole tensor of the copies.
+    fn assert_held(leaves: &Leaves<Hbm>, values: &[f32; 8], device: &mut Device) {
+        let copies: Vec<f32> = values.repeat(2);
         let held = host::<f32, m![I / 2], m![O, I % 2], m![I / 2, O, I % 2]>(&leaves.split, device);
-        assert_eq!(held.into_vec(), shares);
+        assert_eq!(held.into_vec(), shares(values));
         let held = host::<f32, m![{ Symbol<Shard<2>> }], m![O, I], m![{ Symbol<Shard<2>> }, O, I]>(
             &leaves.copies,
             device,
@@ -228,5 +224,42 @@ mod tests {
             Err(Failed::Refused(_, error) | Failed::Poisoned(error)) => panic!("{error}"),
         }
         assert_held(&leaves, &written, &mut device);
+    }
+
+    fn doubled(from: &Checkpoint, context: &mut Context<'_>) -> Result<Split, LoadError> {
+        let values = from.host::<f32, m![O, I % 2], m![I / 2, O, I % 2]>(context)?;
+        let doubled = values.into_vec().into_iter().map(|value| 2.0 * value);
+        HbmTensor::load(
+            context,
+            HostTensor::<f32, m![I / 2, O, I % 2]>::from_vec(doubled),
+        )
+    }
+
+    /// An update writes a built leaf's new value into the storage its load allocated, each chip
+    /// its share.
+    #[test]
+    fn update_copies_a_built_leaf_into_its_storage() {
+        let _lease = DEVICE.blocking_lock();
+        let mut device = Device::new(Topology { chips: 2, pes: 8 }).unwrap();
+        let split = |values: &[f32; 8]| {
+            let bytes = values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect();
+            checkpoint(&[("split", Dtype::F32, &[2, 4][..], bytes)])
+        };
+        let mut built: Built = split(&[1.0; 8]).load(&mut device).unwrap();
+        let written = [11.0, 12.5, -13.0, 14.25, 15.0, -16.5, 17.0, 18.75];
+        match Update::new(&mut built, &mut device).load(&split(&written)) {
+            Ok(update) => update.finish().unwrap(),
+            Err(Failed::Refused(_, error) | Failed::Poisoned(error)) => panic!("{error}"),
+        }
+        let held =
+            host::<f32, m![I / 2], m![O, I % 2], m![I / 2, O, I % 2]>(&built.split, &mut device);
+        let doubled: Vec<f32> = shares(&written)
+            .into_iter()
+            .map(|value| 2.0 * value)
+            .collect();
+        assert_eq!(held.into_vec(), doubled);
     }
 }

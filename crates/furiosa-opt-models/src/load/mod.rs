@@ -12,9 +12,11 @@
 //! - Strict: the outermost checkpoint traversal fails with every name no rule read and no `ignore`
 //!   prefix covers ([`LoadError::Unexpected`]); absent names are reported together
 //!   ([`LoadError::Missing`]).
-//! - Leaves are HBM tensors the checkpoint converts and uploads one at a time; a leaf computed or
-//!   joined on host converts its host value with `Load<HostTensor<..>>`. Dropping a tree frees its
-//!   storage. A tree's [`Footprint`] is the bytes its leaves take there.
+//! - Leaves are HBM tensors the checkpoint converts one at a time; a leaf computed or joined on
+//!   host converts its host value with `Load<HostTensor<..>>`. Each leaf submits its copy into
+//!   HBM, and the outermost checkpoint traversal returns once every copy ended, failing with the
+//!   first that failed ([`LoadError::Device`]). Dropping a tree frees its storage. A tree's
+//!   [`Footprint`] is the bytes its leaves take there.
 //!
 //! Attributes: `rename = "s"`; `config = "key"` (the field reads its config under `key`, a leaf
 //! the value there, a subtree every config value it reads, as `text_config.vocab_size`);
