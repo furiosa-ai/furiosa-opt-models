@@ -43,8 +43,10 @@ impl<Head: AxisName> AxisName for Row<Head> {
 type Table<Slice, Count, Row, Chips = Chip> =
     DmTensor<bf16, Chips, Cluster, Slice, m![{ Count }, OutputHalf, Row]>;
 
-type Coefficient<Slice, Count, Row> =
-    VrfTensor<f32, Chip, Cluster, Slice, m![{ Count }, OutputHalf, Row]>;
+/// A coefficient table in the vector registers of the slices of its rows' heads, `Lines` rows a
+/// slice.
+type Coefficient<Chips, C, Slice, Lines, Row> =
+    VrfTensor<f32, Chips, C, Slice, m![{ Lines }, OutputHalf, Row]>;
 
 /// Row groups one pass rotates; each group's two coefficient tables take 1 KiB of the shared
 /// 8 KiB VRF.
@@ -137,93 +139,16 @@ impl<'a, Slice: M, Query: AxisName, Key: AxisName, Rows: AxisName, Head: AxisNam
         if live.count::<Lanes<Rows>>() == <Groups<Rows> as M>::SIZE {
             #[unroll]
             for tile in 0..<Tiles<Rows> as M>::SIZE {
-                let low = Fetch::<TileRows<Rows>, Row<Head>>(PhantomData).forward(
-                    device,
-                    low.view().tile::<Tiles<Rows>, 1, m![
-                        { Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, OutputHalf,
-                        { Symbol<Row<Head>> }
-                    ]>(tile),
-                );
-                let high = Fetch::<TileRows<Rows>, Row<Head>>(PhantomData).forward(
-                    device,
-                    high.view().tile::<Tiles<Rows>, 1, m![
-                        { Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, OutputHalf,
-                        { Symbol<Row<Head>> }
-                    ]>(tile),
-                );
-                RotateRows::<
-                    TileRows<Rows>,
-                    m![Query],
-                    Row<Head>,
-                >(PhantomData).forward(
-                    device, (
-                    query.clone().tile::<Tiles<Rows>, 1, m![
-                        { Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, Query, Half,
-                        { Symbol<Row<Head>> }
-                    ]>(tile),
-                    rotated_query.view_mut().tile::<Tiles<Rows>, 1, m![
-                        { Tiles<Rows> } = 1 #{!} ({ Tiles<Rows> }), { TileRows<Rows> }, Query,
-                        OutputHalf, { Symbol<Row<Head>> }
-                    ]>(tile),
-                    &low,
-                    &high,
-                ));
-                RotateRows::<TileRows<Rows>, m![Key], Row<Head>>(PhantomData).forward(
-                    device,
-                    (
-                        key.clone().tile::<Tiles<Rows>, 1, m![
-                            { Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, Key, Half,
-                            { Symbol<Row<Head>> }
-                        ]>(tile),
-                        rotated_key.view_mut().tile::<Tiles<Rows>, 1, m![
-                            { Tiles<Rows> } = 1 #{!} ({ Tiles<Rows> }), { TileRows<Rows> }, Key,
-                            OutputHalf, { Symbol<Row<Head>> }
-                        ]>(tile),
-                        &low,
-                        &high,
-                    ),
-                );
+                let input = (query.clone(), key.clone(), &low, &high);
+                let output = (&mut rotated_query, &mut rotated_key);
+                Pass::<Tiles<Rows>, TileRows<Rows>>(PhantomData)
+                    .forward(device, (input, output, tile));
             }
         } else {
             for group in 0..live.count::<Lanes<Rows>>() {
-                let low = Fetch::<m![1], Row<Head>>(PhantomData).forward(
-                    device,
-                    low.view().tile::<Groups<Rows>, 1, m![
-                        { Layout<Rows>::Selected }, OutputHalf, { Symbol<Row<Head>> }
-                    ]>(group),
-                );
-                let high = Fetch::<m![1], Row<Head>>(PhantomData).forward(
-                    device,
-                    high.view().tile::<Groups<Rows>, 1, m![
-                        { Layout<Rows>::Selected }, OutputHalf, { Symbol<Row<Head>> }
-                    ]>(group),
-                );
-                RotateRows::<m![1], m![Query], Row<Head>>(PhantomData).forward(
-                    device,
-                    (
-                        query.clone().tile::<Groups<Rows>, 1, m![
-                            { Layout<Rows>::Selected }, Query, Half, { Symbol<Row<Head>> }
-                        ]>(group),
-                        rotated_query.view_mut().tile::<Groups<Rows>, 1, m![
-                            { Layout<Rows>::SelectedMut }, Query, OutputHalf, { Symbol<Row<Head>> }
-                        ]>(group),
-                        &low,
-                        &high,
-                    ),
-                );
-                RotateRows::<m![1], m![Key], Row<Head>>(PhantomData).forward(
-                    device,
-                    (
-                        key.clone().tile::<Groups<Rows>, 1, m![
-                            { Layout<Rows>::Selected }, Key, Half, { Symbol<Row<Head>> }
-                        ]>(group),
-                        rotated_key.view_mut().tile::<Groups<Rows>, 1, m![
-                            { Layout<Rows>::SelectedMut }, Key, OutputHalf, { Symbol<Row<Head>> }
-                        ]>(group),
-                        &low,
-                        &high,
-                    ),
-                );
+                let input = (query.clone(), key.clone(), &low, &high);
+                let output = (&mut rotated_query, &mut rotated_key);
+                Pass::<Groups<Rows>, m![1]>(PhantomData).forward(device, (input, output, group));
             }
         }
         // SAFETY: output halves concatenate to Head within each unchanged row.
@@ -231,37 +156,131 @@ impl<'a, Slice: M, Query: AxisName, Key: AxisName, Rows: AxisName, Head: AxisNam
     }
 }
 
-struct Fetch<Count, Row>(PhantomData<(Count, Row)>);
+/// Each row group's heads `G`, a head's halves along `H`: apart to read, or rotated.
+type Halves<Rows, G, H, Head> = m![{ Groups<Rows> }, G, H, { Symbol<Row<Head>> }];
 
-impl<Slice: M, Count: M, Element: M, Row: AxisName>
-    crate::Op<DmTensorView<'_, bf16, Chip, Cluster, Slice, Element>> for Fetch<Count, Row>
+/// Tile `at` of the row groups, `Outer` tiles of `Inner` groups: the tile's coefficients fetched
+/// once, then its queries and keys rotated.
+struct Pass<Outer, Inner>(PhantomData<(Outer, Inner)>);
+
+impl<
+    Outer: Count,
+    Inner: M,
+    Slice: M,
+    Query: AxisName,
+    Key: AxisName,
+    Rows: AxisName,
+    Head: AxisName,
+>
+    crate::Op<(
+        (
+            DmTensorView<'_, bf16, Chip, Cluster, Slice, Halves<Rows, Query, Half, Head>>,
+            DmTensorView<'_, bf16, Chip, Cluster, Slice, Halves<Rows, Key, Half, Head>>,
+            &Table<Slice, Groups<Rows>, Row<Head>>,
+            &Table<Slice, Groups<Rows>, Row<Head>>,
+        ),
+        (
+            &mut DmTensor<bf16, Chip, Cluster, Slice, Halves<Rows, Query, OutputHalf, Head>>,
+            &mut DmTensor<bf16, Chip, Cluster, Slice, Halves<Rows, Key, OutputHalf, Head>>,
+        ),
+        usize,
+    )> for Pass<Outer, Inner>
 {
-    type Output = Coefficient<Slice, Count, Row>;
+    type Output = ();
 
     fn forward(
         &self,
         device: &mut Device,
-        table: DmTensorView<'_, bf16, Chip, Cluster, Slice, Element>,
-    ) -> Coefficient<Slice, Count, Row> {
+        ((query, key, low, high), (rotated_query, rotated_key), at): (
+            (
+                DmTensorView<'_, bf16, Chip, Cluster, Slice, Halves<Rows, Query, Half, Head>>,
+                DmTensorView<'_, bf16, Chip, Cluster, Slice, Halves<Rows, Key, Half, Head>>,
+                &Table<Slice, Groups<Rows>, Row<Head>>,
+                &Table<Slice, Groups<Rows>, Row<Head>>,
+            ),
+            (
+                &mut DmTensor<bf16, Chip, Cluster, Slice, Halves<Rows, Query, OutputHalf, Head>>,
+                &mut DmTensor<bf16, Chip, Cluster, Slice, Halves<Rows, Key, OutputHalf, Head>>,
+            ),
+            usize,
+        ),
+    ) {
+        let low = Fetch::<Inner, Row<Head>>(PhantomData).forward(
+            device,
+            low.view().tile::<Outer, 1, m![
+                { Outer } = 1 # ({ Outer }), { Inner }, OutputHalf, { Symbol<Row<Head>> }
+            ]>(at),
+        );
+        let high = Fetch::<Inner, Row<Head>>(PhantomData).forward(
+            device,
+            high.view().tile::<Outer, 1, m![
+                { Outer } = 1 # ({ Outer }), { Inner }, OutputHalf, { Symbol<Row<Head>> }
+            ]>(at),
+        );
+        RotateRows::<m![{ Inner }, Query]>(PhantomData).forward(
+            device,
+            (
+                query.tile::<Outer, 1, m![
+                    { Outer } = 1 # ({ Outer }), { Inner }, Query, Half, { Symbol<Row<Head>> }
+                ]>(at),
+                rotated_query.view_mut().tile::<Outer, 1, m![
+                    { Outer } = 1 #{!} ({ Outer }), { Inner }, Query, OutputHalf,
+                    { Symbol<Row<Head>> }
+                ]>(at),
+                &low,
+                &high,
+            ),
+        );
+        RotateRows::<m![{ Inner }, Key]>(PhantomData).forward(
+            device,
+            (
+                key.tile::<Outer, 1, m![
+                    { Outer } = 1 # ({ Outer }), { Inner }, Key, Half, { Symbol<Row<Head>> }
+                ]>(at),
+                rotated_key.view_mut().tile::<Outer, 1, m![
+                    { Outer } = 1 #{!} ({ Outer }), { Inner }, Key, OutputHalf, { Symbol<Row<Head>> }
+                ]>(at),
+                &low,
+                &high,
+            ),
+        );
+    }
+}
+
+/// A coefficient table of `Lines` rows a slice, from data memory into the vector registers.
+struct Fetch<Lines, Row>(PhantomData<(Lines, Row)>);
+
+impl<Chips: M, C: M, Slice: M, Lines: M, Element: M, Row: AxisName>
+    crate::Op<DmTensorView<'_, bf16, Chips, C, Slice, Element>> for Fetch<Lines, Row>
+{
+    type Output = Coefficient<Chips, C, Slice, Lines, Row>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        table: DmTensorView<'_, bf16, Chips, C, Slice, Element>,
+    ) -> Self::Output {
         device
             .sub
             .begin(table)
-            .fetch::<m![{ Count }, OutputHalf, Row / 16], m![Row % 16]>()
+            .fetch::<m![{ Lines }, OutputHalf, Row / 16], m![Row % 16]>()
             .fetch_cast::<f32>()
-            .collect::<m![{ Count }, OutputHalf, Row / 8], m![Row % 8]>()
+            .collect::<m![{ Lines }, OutputHalf, Row / 8], m![Row % 8]>()
             .to_vrf()
     }
 }
 
-struct RotateRows<Count, Group, Row>(PhantomData<(Count, Group, Row)>);
+/// The heads `Q` of the rows a slice holds, each rotated by its row's coefficients: both input
+/// halves times `low` and `high`, added in FP32 and rounded once.
+struct RotateRows<Q>(PhantomData<Q>);
 
-impl<Slice: M, Count: M, Group: M, Row: AxisName, Input: M, Output: M>
+impl<Chips: M, C: M, Slice: M, Q: M, Lines: M, Row: AxisName, Input: M, Output: M>
     crate::Op<(
-        DmTensorView<'_, bf16, Chip, Cluster, Slice, Input>,
-        DmTensorViewMut<'_, bf16, Chip, Cluster, Slice, Output>,
-        &Coefficient<Slice, Count, Row>,
-        &Coefficient<Slice, Count, Row>,
-    )> for RotateRows<Count, Group, Row>
+        DmTensorView<'_, bf16, Chips, C, Slice, Input>,
+        DmTensorViewMut<'_, bf16, Chips, C, Slice, Output>,
+        &Coefficient<Chips, C, Slice, Lines, Row>,
+        &Coefficient<Chips, C, Slice, Lines, Row>,
+    )> for RotateRows<Q>
 {
     type Output = ();
 
@@ -269,25 +288,25 @@ impl<Slice: M, Count: M, Group: M, Row: AxisName, Input: M, Output: M>
         &self,
         device: &mut Device,
         (input, output, low, high): (
-            DmTensorView<'_, bf16, Chip, Cluster, Slice, Input>,
-            DmTensorViewMut<'_, bf16, Chip, Cluster, Slice, Output>,
-            &Coefficient<Slice, Count, Row>,
-            &Coefficient<Slice, Count, Row>,
+            DmTensorView<'_, bf16, Chips, C, Slice, Input>,
+            DmTensorViewMut<'_, bf16, Chips, C, Slice, Output>,
+            &Coefficient<Chips, C, Slice, Lines, Row>,
+            &Coefficient<Chips, C, Slice, Lines, Row>,
         ),
     ) {
         device
             .main
             .begin_interleaved::<OutputHalf, _, _, _, _, _>(input.clone(), input)
-            .fetch::<m![{ Count }, { Group }, OutputHalf, Half, Row / 16], m![Row % 16]>()
+            .fetch::<m![{ Q }, OutputHalf, Half, Row / 16], m![Row % 16]>()
             .fetch_cast::<f32>()
-            .collect::<m![{ Count }, { Group }, OutputHalf, Half, Row / 8], m![Row % 8]>()
+            .collect::<m![{ Q }, OutputHalf, Half, Row / 8], m![Row % 8]>()
             .vector_init()
-            .vector_intra_slice_unzip::<Half, m![{ Count }, { Group }, OutputHalf, Row / 8]>()
-            .vector_narrow_split::<m![{ Count }, { Group }, OutputHalf, Row / 4], m![Row % 4]>()
+            .vector_intra_slice_unzip::<Half, m![{ Q }, OutputHalf, Row / 8]>()
+            .vector_narrow_split::<m![{ Q }, OutputHalf, Row / 4], m![Row % 4]>()
             .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), low, ())
             .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), (), high)
             .vector_fp_zip(FpBinaryOp::AddF)
-            .vector_widen_concat::<m![{ Count }, { Group }, OutputHalf, Row / 8], m![Row % 8]>()
+            .vector_widen_concat::<m![{ Q }, OutputHalf, Row / 8], m![Row % 8]>()
             .vector_final()
             .cast::<bf16, m![Row % 8 # 16]>()
             .commit_trim::<m![Row % 8]>()
@@ -1062,12 +1081,12 @@ struct Rotate<'r, Head: AxisName, R: AxisName, Chips: M> {
 }
 
 type Lines<Width, Head> = m![{ tiles::T<Width, Head> } % ({ tiles::D<Width, Head> })];
-type TileCoefficients<Width, Head, Chips> = VrfTensor<
-    f32,
+type TileCoefficients<Width, Head, Chips> = Coefficient<
     Chips,
     tiles::Half<Width, Head>,
     tiles::Slices<Width, Head>,
-    m![{ Lines<Width, Head> }, OutputHalf, { Symbol<Row<Head>> }],
+    Lines<Width, Head>,
+    Row<Head>,
 >;
 
 struct FetchTiles<Width, Head, R, Chips>(PhantomData<(Width, Head, R, Chips)>);
@@ -1112,18 +1131,7 @@ impl<Head: AxisName, R: AxisName, Chips: M, Width: AxisName>
                     { Symbol<Row<Head>> }
                 ]>(at)
                 .to_dm(&mut device.tdma);
-            let operand: TileCoefficients<Width, Head, Chips> = device.sub.begin(in_dm.view())
-                .fetch::<
-                    m![{ Lines<Width, Head> }, OutputHalf, { Symbol<Row<Head>> } / 16],
-                    m![{ Symbol<Row<Head>> } % 16],
-                >()
-                .fetch_cast::<f32>()
-                .collect::<
-                    m![{ Lines<Width, Head> }, OutputHalf, { Symbol<Row<Head>> } / 8],
-                    m![{ Symbol<Row<Head>> } % 8],
-                >()
-                .to_vrf();
-            operand
+            Fetch::<Lines<Width, Head>, Row<Head>>(PhantomData).forward(device, in_dm.view())
         };
         (rows(device, &rotation.low), rows(device, &rotation.high))
     }
@@ -1173,33 +1181,7 @@ impl<Head: AxisName, Chips: M, Width: AxisName, Q: M>
                 m![{ Q }, OutputHalf, { Symbol<Row<Head>> }],
             >()
         };
-        device.main.begin_interleaved::<OutputHalf, _, _, _, _, _>(halves.clone(), halves)
-            .fetch::<
-                m![{ Q }, OutputHalf, Half, { Symbol<Row<Head>> } / 16],
-                m![{ Symbol<Row<Head>> } % 16],
-            >()
-            .fetch_cast::<f32>()
-            .collect::<
-                m![{ Q }, OutputHalf, Half, { Symbol<Row<Head>> } / 8],
-                m![{ Symbol<Row<Head>> } % 8],
-            >()
-            .vector_init()
-            .vector_intra_slice_unzip::<Half, m![{ Q }, OutputHalf, { Symbol<Row<Head>> } / 8]>()
-            .vector_narrow_split::<
-                m![{ Q }, OutputHalf, { Symbol<Row<Head>> } / 4],
-                m![{ Symbol<Row<Head>> } % 4],
-            >()
-            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), low, ())
-            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), (), high)
-            .vector_fp_zip(FpBinaryOp::AddF)
-            .vector_widen_concat::<
-                m![{ Q }, OutputHalf, { Symbol<Row<Head>> } / 8],
-                m![{ Symbol<Row<Head>> } % 8],
-            >()
-            .vector_final()
-            .cast::<bf16, m![{ Symbol<Row<Head>> } % 8 # 16]>()
-            .commit_trim::<m![{ Symbol<Row<Head>> } % 8]>()
-            .commit_view(rotated);
+        RotateRows::<Q>(PhantomData).forward(device, (halves, rotated, low, high));
     }
 }
 
