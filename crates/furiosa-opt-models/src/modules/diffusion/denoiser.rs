@@ -1,15 +1,15 @@
-//! The denoising network: input embeddings, layer bodies sharing one condition, control branches
-//! and condition-bearing heads, including those of a sequence that packs several streams.
+//! The denoising network: input embeddings (one for a sequence that packs several streams), layer
+//! bodies sharing one condition, control branches and condition-bearing heads.
 
 use crate::load::Load;
 use crate::tensor::image::Vector;
-use crate::{First, Layers, Module, Unrolled};
+use crate::{Layers, Module, Unrolled};
 use furiosa_opt_std::prelude::*;
 use std::marker::PhantomData;
 
 /// Embeds the latent, conditions a layer stack and applies its head without geometry restoration.
 pub type Denoiser<Embedding, Conditioning, Collection, Head> =
-    Transformer<Embedding, Conditioning, Layers<Collection, Unrolled>, Unpatch<Head, First>>;
+    Transformer<Embedding, Conditioning, Layers<Collection, Unrolled>, Head>;
 
 /// Embeds the input and the condition, runs the body and applies the head.
 #[derive(DeviceSend, Load)]
@@ -83,70 +83,6 @@ where
             .forward(&mut *device, (&condition, env.0), body, hidden);
         self.head
             .forward(device, env.1, head, (&hidden, &condition))
-    }
-}
-
-/// Adds projected time and position features to the embedded input.
-#[derive(DeviceSend)]
-pub struct Embedding<Projection, Time, Position, Add> {
-    pub projection: Projection,
-    pub time: Time,
-    pub position: Position,
-    pub add: Add,
-}
-
-/// The state holds the projection's, the time's and the position's slots.
-impl<
-    's,
-    I,
-    T,
-    P,
-    X,
-    E,
-    R,
-    Y,
-    O,
-    ProjectionState,
-    TimeState,
-    PositionState,
-    Projection,
-    Time,
-    Position,
-    Add,
-    Env: Copy,
-> Module<(I, T, P), Env, &'s mut (ProjectionState, TimeState, PositionState)>
-    for Embedding<Projection, Time, Position, Add>
-where
-    Projection: Module<I, Env, &'s mut ProjectionState, Output = X>,
-    Time: Module<T, Env, &'s mut TimeState, Output = E>,
-    Position: Module<P, Env, &'s mut PositionState, Output = R>,
-    Add: for<'a, 'b, 'd> Module<(&'a X, &'b E), Env, &'d mut (), Output = Y>
-        + for<'a, 'b, 'd> Module<(&'a Y, &'b R), Env, &'d mut (), Output = O>,
-{
-    type Output = O;
-
-    fn forward(
-        &self,
-        device: &mut Device,
-        env: Env,
-        (projection, time_state, position_state): &'s mut (
-            ProjectionState,
-            TimeState,
-            PositionState,
-        ),
-        (input, time, position): (I, T, P),
-    ) -> O {
-        let hidden = self
-            .projection
-            .forward(&mut *device, env, projection, input);
-        let time = self.time.forward(&mut *device, env, time_state, time);
-        let position = self
-            .position
-            .forward(&mut *device, env, position_state, position);
-        let hidden = self
-            .add
-            .forward(&mut *device, env, &mut (), (&hidden, &time));
-        self.add.forward(device, env, &mut (), (&hidden, &position))
     }
 }
 
@@ -540,31 +476,6 @@ where
     }
 }
 
-/// Applies a condition-bearing head and restores its output using caller-supplied geometry.
-#[derive(DeviceSend, Load)]
-pub struct Unpatch<Head, Restore> {
-    #[load(rename = "")]
-    pub head: Head,
-    #[load(rename = "")]
-    pub restore: Restore,
-}
-
-/// The env is the geometry the restore reads beside the head's output; the state is the head's
-/// slot.
-impl<X, E, G: Copy, S, Y, O, Head, Restore> Module<(&X, &E), G, S> for Unpatch<Head, Restore>
-where
-    Head: for<'x, 'e> Module<(&'x X, &'e E), G, S, Output = Y>,
-    Restore: for<'d> Module<(Y, G), G, &'d mut (), Output = O>,
-{
-    type Output = O;
-
-    fn forward(&self, device: &mut Device, shape: G, state: S, input: (&X, &E)) -> O {
-        let hidden = self.head.forward(&mut *device, shape, state, input);
-        self.restore
-            .forward(device, shape, &mut (), (hidden, shape))
-    }
-}
-
 /// Modulates the final norm from the condition and projects normalized hidden values to output.
 #[derive(DeviceSend, Load)]
 pub struct Head<Modulation, Norm, Projection> {
@@ -627,34 +538,5 @@ where
             .audio
             .forward(device, env, audio_state, (audio, condition));
         (video, audio)
-    }
-}
-
-/// The heads on a packed sequence's media: its media spans split out, then each in rows of its
-/// own, then the heads with the condition.
-#[derive(DeviceSend, Load)]
-pub struct PackedHead<Split, Materialize, Head> {
-    #[load(rename = "")]
-    pub split: Split,
-    #[load(rename = "")]
-    pub materialize: Materialize,
-    #[load(rename = "")]
-    pub head: Head,
-}
-
-/// The state is the heads' slot.
-impl<X, C, P, Y, O, S, Split, Materialize, Head, Env: Copy> Module<(X, C), Env, S>
-    for PackedHead<Split, Materialize, Head>
-where
-    Split: for<'d> Module<X, Env, &'d mut (), Output = P>,
-    Materialize: for<'d, 'p> Module<&'p P, Env, &'d mut (), Output = Y>,
-    Head: for<'y> Module<(&'y Y, C), Env, S, Output = O>,
-{
-    type Output = O;
-
-    fn forward(&self, device: &mut Device, env: Env, state: S, (hidden, condition): (X, C)) -> O {
-        let spans = self.split.forward(&mut *device, env, &mut (), hidden);
-        let media = self.materialize.forward(&mut *device, env, &mut (), &spans);
-        self.head.forward(device, env, state, (&media, condition))
     }
 }

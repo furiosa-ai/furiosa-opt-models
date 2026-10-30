@@ -20,7 +20,7 @@ use crate::ops::{
 };
 use crate::tensor::image;
 use crate::tensor::image::Rows;
-use crate::{First, Identity, Module, Sequential, Then};
+use crate::{Identity, Module, Sequential, Then};
 use furiosa_opt_std::prelude::*;
 use pipeline::encode;
 use serde::Deserialize;
@@ -36,13 +36,10 @@ pub type Model<I, T, G> = diffusion::Transformer<
     Embedding,
     Conditioning<G>,
     Body<I, T>,
-    diffusion::Unpatch<
-        diffusion::Head<
-            Modulation<Width<6144>, SplitModulation<Width<3072>, ScaleFirst>>,
-            AdaptiveNorm,
-            Linear<Width<3072>, Latent>,
-        >,
-        First,
+    diffusion::Head<
+        Modulation<Width<6144>, SplitModulation<Width<3072>, ScaleFirst>>,
+        AdaptiveNorm,
+        Linear<Width<3072>, Latent>,
     >,
 >;
 
@@ -575,7 +572,7 @@ pub type Flux2Transformer2DModel<
         >,
         SplitTokens,
     >,
-    diffusion::Unpatch<diffusion::Head<OutputModulation, OutputNorm, OutputProjection>, Restore>,
+    Sequential<diffusion::Head<OutputModulation, OutputNorm, OutputProjection>, Restore>,
 >;
 
 /// Source: vLLM-Omni `vllm_omni/diffusion/models/flux/pipeline_flux.py`.

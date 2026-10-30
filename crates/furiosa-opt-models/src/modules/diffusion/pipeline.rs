@@ -139,7 +139,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modules::diffusion::{Denoiser, Guider, Sampler, Unpatch};
+    use crate::modules::diffusion::{Denoiser, Guider, Sampler};
     use crate::tests::DEVICE;
     use crate::{First, Identity, Layers, Unrolled};
     use furiosa_opt_std::prelude::Topology;
@@ -361,10 +361,7 @@ mod tests {
                             layers: [Layer],
                             kind: Unrolled,
                         },
-                        head: Unpatch {
-                            head: Head,
-                            restore: First,
-                        },
+                        head: Head,
                     }),
                     combine: Combine,
                 },
