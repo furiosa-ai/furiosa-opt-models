@@ -3,8 +3,8 @@
 pub use block::{Adaptive, Conditioned, Cross, Single, Spatial};
 pub use coupled::Coupled;
 pub use denoiser::{
-    Control, Controlled, Denoiser, DualStream, Embedding, Head, PackedEmbedding, PackedHead,
-    PairedHead, Refined, Terminal, Time, Transformer, Unpatch,
+    Control, Controlled, Denoiser, DualStream, Head, PackedEmbedding, PairedHead, Refined,
+    Terminal, Time, Transformer, Unpatch,
 };
 pub use modulation::{
     AdaptiveNorm, Gates, Modulated, Modulation, ScaleFirst, ShiftFirst, SplitGate, SplitGates,
