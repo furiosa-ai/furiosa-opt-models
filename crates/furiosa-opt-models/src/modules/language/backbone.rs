@@ -2,7 +2,6 @@
 
 use crate::Module;
 use crate::load::Load;
-use crate::modules::generic::schedule::{IntoStream, Stream};
 use furiosa_opt_std::prelude::*;
 
 /// Embeds the input, then passes the hidden values to the body; the body is its checkpoint's
@@ -60,49 +59,6 @@ where
     ) -> Y {
         let hidden = self.embedding.forward(&mut *device, env, embedding, input);
         self.body.forward(device, env, body, hidden)
-    }
-}
-
-/// The body's stream over the embedding's, which streams over the backbone's upstream.
-impl<'s, U: Stream, Env: Copy, EmbeddingState, BodyState, Embedding, Body>
-    IntoStream<U, Env, &'s mut (EmbeddingState, BodyState)> for Backbone<Embedding, Body>
-where
-    Embedding: IntoStream<U, Env, &'s mut EmbeddingState>,
-    Body: IntoStream<Embedding::Stream, Env, &'s mut BodyState>,
-{
-    type Stream = Body::Stream;
-
-    fn into_stream(
-        self,
-        env: Env,
-        (embedding, body): &'s mut (EmbeddingState, BodyState),
-        upstream: U,
-    ) -> Self::Stream {
-        let embedded = self.embedding.into_stream(env, embedding, upstream);
-        self.body.into_stream(env, body, embedded)
-    }
-}
-
-/// A borrowed backbone streams as the backbone of its borrowed parts.
-impl<'m, 's, U: Stream, Env, EmbeddingState, BodyState, Embedding, Body>
-    IntoStream<U, Env, &'s mut (EmbeddingState, BodyState)> for &'m Backbone<Embedding, Body>
-where
-    Backbone<&'m Embedding, &'m Body>: IntoStream<U, Env, &'s mut (EmbeddingState, BodyState)>,
-{
-    type Stream = <Backbone<&'m Embedding, &'m Body> as IntoStream<
-        U,
-        Env,
-        &'s mut (EmbeddingState, BodyState),
-    >>::Stream;
-
-    fn into_stream(
-        self,
-        env: Env,
-        state: &'s mut (EmbeddingState, BodyState),
-        upstream: U,
-    ) -> Self::Stream {
-        let Backbone { embedding, body } = self;
-        Backbone { embedding, body }.into_stream(env, state, upstream)
     }
 }
 
