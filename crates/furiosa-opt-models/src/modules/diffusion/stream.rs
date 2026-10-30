@@ -14,86 +14,6 @@ pub struct Stream<Modulation, Norm, FeedForward, Gate> {
     pub gate: Gate,
 }
 
-/// What a dual-stream layer asks of each stream, so it bounds the streams by these steps, not by
-/// their children: hidden `X`, condition `E`, env `Env`, modulation and feed-forward states.
-pub(crate) trait Modulate<Env, X, E, ModulationState, FeedForwardState> {
-    /// The shift and scale a norm reads.
-    type Norm;
-    /// The gate a residual reads.
-    type Gate;
-
-    /// The attention residual's and the feed-forward residual's modulation, in that order.
-    fn modulate(
-        &self,
-        device: &mut Device,
-        env: Env,
-        state: ModulationState,
-        condition: &E,
-    ) -> ((Self::Norm, Self::Gate), (Self::Norm, Self::Gate));
-
-    fn normalize(&self, device: &mut Device, env: Env, hidden: &X, modulation: &Self::Norm) -> X;
-
-    fn gate(&self, device: &mut Device, env: Env, input: &X, branch: &X, gate: &Self::Gate) -> X;
-
-    /// The modulated, gated feed-forward residual.
-    fn feedforward(
-        &self,
-        device: &mut Device,
-        env: Env,
-        state: FeedForwardState,
-        hidden: &X,
-        modulation: (&Self::Norm, &Self::Gate),
-    ) -> X;
-}
-
-impl<X, E, M, G, ModulationState, FeedForwardState, Modulation, Norm, FeedForward, Gate, Env: Copy>
-    Modulate<Env, X, E, ModulationState, FeedForwardState>
-    for Stream<Modulation, Norm, FeedForward, Gate>
-where
-    Modulation: for<'e> Module<&'e E, Env, ModulationState, Output = ((M, G), (M, G))>,
-    Norm: for<'d, 'x, 'm> Module<(&'x X, &'m M), Env, &'d mut (), Output = X>,
-    FeedForward: for<'x> Module<&'x X, Env, FeedForwardState, Output = X>,
-    Gate: for<'d, 'a, 'b, 'g> Module<(&'a X, &'b X, &'g G), Env, &'d mut (), Output = X>,
-{
-    type Norm = M;
-    type Gate = G;
-
-    fn modulate(
-        &self,
-        device: &mut Device,
-        env: Env,
-        state: ModulationState,
-        condition: &E,
-    ) -> ((M, G), (M, G)) {
-        self.modulation.forward(device, env, state, condition)
-    }
-
-    fn normalize(&self, device: &mut Device, env: Env, hidden: &X, modulation: &M) -> X {
-        self.norms[0].forward(device, env, &mut (), (hidden, modulation))
-    }
-
-    fn gate(&self, device: &mut Device, env: Env, input: &X, branch: &X, gate: &G) -> X {
-        self.gate
-            .forward(device, env, &mut (), (input, branch, gate))
-    }
-
-    fn feedforward(
-        &self,
-        device: &mut Device,
-        env: Env,
-        state: FeedForwardState,
-        hidden: &X,
-        modulation: (&M, &G),
-    ) -> X {
-        Modulated(&self.norms[1], &self.feedforward, &self.gate).forward(
-            device,
-            env,
-            state,
-            (hidden, modulation),
-        )
-    }
-}
-
 /// Updates two streams through one joint attention, then a modulated feed-forward per stream.
 #[derive(DeviceSend)]
 pub struct Dual<Left, Right, Attention, Extra = First> {
@@ -111,14 +31,24 @@ impl<
     Y,
     E,
     S: Copy,
+    LM,
+    LG,
+    RM,
+    RG,
     LeftModulationState,
     LeftFeedForwardState,
     RightModulationState,
     RightFeedForwardState,
     AttentionState,
     ExtraState,
-    Left,
-    Right,
+    LeftModulation,
+    LeftNorm,
+    LeftFeedForward,
+    LeftGate,
+    RightModulation,
+    RightNorm,
+    RightFeedForward,
+    RightGate,
     Attention,
     Extra,
     Env: Copy,
@@ -134,10 +64,23 @@ impl<
             AttentionState,
             ExtraState,
         ),
-    > for Dual<Left, Right, Attention, Extra>
+    >
+    for Dual<
+        Stream<LeftModulation, LeftNorm, LeftFeedForward, LeftGate>,
+        Stream<RightModulation, RightNorm, RightFeedForward, RightGate>,
+        Attention,
+        Extra,
+    >
 where
-    Left: Modulate<Env, X, E, &'s mut LeftModulationState, &'s mut LeftFeedForwardState>,
-    Right: Modulate<Env, Y, E, &'s mut RightModulationState, &'s mut RightFeedForwardState>,
+    LeftModulation: Module<&'e E, Env, &'s mut LeftModulationState, Output = ((LM, LG), (LM, LG))>,
+    LeftNorm: for<'d, 'x, 'm> Module<(&'x X, &'m LM), Env, &'d mut (), Output = X>,
+    LeftFeedForward: for<'x> Module<&'x X, Env, &'s mut LeftFeedForwardState, Output = X>,
+    LeftGate: for<'d, 'a, 'b, 'g> Module<(&'a X, &'b X, &'g LG), Env, &'d mut (), Output = X>,
+    RightModulation:
+        Module<&'e E, Env, &'s mut RightModulationState, Output = ((RM, RG), (RM, RG))>,
+    RightNorm: for<'d, 'y, 'm> Module<(&'y Y, &'m RM), Env, &'d mut (), Output = Y>,
+    RightFeedForward: for<'y> Module<&'y Y, Env, &'s mut RightFeedForwardState, Output = Y>,
+    RightGate: for<'d, 'a, 'b, 'g> Module<(&'a Y, &'b Y, &'g RG), Env, &'d mut (), Output = Y>,
     Attention: for<'a> Module<&'a (X, Y), Env, &'s mut AttentionState, Output = (X, Y)>,
     Extra: for<'a, 'b> Module<(X, (&'a X, &'b E, S)), Env, &'s mut ExtraState, Output = X>,
 {
@@ -163,26 +106,43 @@ where
     ) -> Self::Output {
         let (image, text) = &self.streams;
         let ((ln1, lg1), (ln2, lg2)) =
-            image.modulate(&mut *device, env, left_modulation, condition);
+            image
+                .modulation
+                .forward(&mut *device, env, left_modulation, condition);
         let ((rn1, rg1), (rn2, rg2)) =
-            text.modulate(&mut *device, env, right_modulation, condition);
+            text.modulation
+                .forward(&mut *device, env, right_modulation, condition);
         let normalized = (
-            image.normalize(&mut *device, env, &left, &ln1),
-            text.normalize(&mut *device, env, &right, &rn1),
+            image.norms[0].forward(&mut *device, env, &mut (), (&left, &ln1)),
+            text.norms[0].forward(&mut *device, env, &mut (), (&right, &rn1)),
         );
         let (attention, context) =
             self.attention
                 .forward(&mut *device, env, attention, &normalized);
-        let updated = image.gate(&mut *device, env, &left, &attention, &lg1);
+        let updated = image
+            .gate
+            .forward(&mut *device, env, &mut (), (&left, &attention, &lg1));
         let left = self.extra.forward(
             &mut *device,
             env,
             extra_state,
             (updated, (&left, condition, extra)),
         );
-        let right = text.gate(&mut *device, env, &right, &context, &rg1);
-        let left = image.feedforward(&mut *device, env, left_feedforward, &left, (&ln2, &lg2));
-        let right = text.feedforward(device, env, right_feedforward, &right, (&rn2, &rg2));
+        let right = text
+            .gate
+            .forward(&mut *device, env, &mut (), (&right, &context, &rg1));
+        let left = Modulated(&image.norms[1], &image.feedforward, &image.gate).forward(
+            &mut *device,
+            env,
+            left_feedforward,
+            (&left, (&ln2, &lg2)),
+        );
+        let right = Modulated(&text.norms[1], &text.feedforward, &text.gate).forward(
+            device,
+            env,
+            right_feedforward,
+            (&right, (&rn2, &rg2)),
+        );
         (left, right)
     }
 }
