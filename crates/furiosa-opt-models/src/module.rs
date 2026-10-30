@@ -1,4 +1,5 @@
-//! The `Module` trait every model piece implements, and `Op`, the module of device and input alone.
+//! The `Module` trait every model piece implements, `Op`, the module of device and input alone, and
+//! `Begin`, the input of a module's first phase.
 
 use furiosa_opt_std::prelude::Device;
 
@@ -22,6 +23,10 @@ pub trait Op<I> {
     /// Computes the output from the input.
     fn forward(&self, device: &mut Device, input: I) -> Self::Output;
 }
+
+/// A module's input taken up to its first boundary, where it returns its state; given back, the
+/// state runs the next step, and the state types refuse any other order at compile time.
+pub struct Begin<T>(pub T);
 
 /// Every op is a module: it ignores the env and holds the empty state.
 impl<T: Op<I>, I, E> Module<I, E, &mut ()> for T {

@@ -2,12 +2,11 @@
 
 use super::{InDm, Tree};
 use crate::Module;
-use crate::modules::generic::schedule::{Fill, Spill};
 use crate::ops::index::scatter::Store;
 use crate::ops::normalization::span::{Selection, Span, Tile};
 use crate::ops::normalization::{Blocked, Spread};
 use crate::ops::reduction;
-use crate::tensor::live::{Live, OnTile};
+use crate::tensor::live::{Fill, Live, OnTile, Spill};
 use crate::tensor::scalar::Value;
 use crate::tensor::{axis::Rows, parallel::Chip};
 use furiosa_opt_std::prelude::*;

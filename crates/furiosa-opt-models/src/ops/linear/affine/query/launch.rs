@@ -4,12 +4,12 @@
 
 use super::Tile;
 use super::group::TilePair;
+use crate::Begin;
 use crate::Module;
 use crate::modules::generic::Either;
-use crate::modules::generic::schedule::{Begin, Spill};
 use crate::ops::linear::Affine;
 use crate::ops::normalization::span::{Owned, Span};
-use crate::tensor::live::Live;
+use crate::tensor::live::{Live, Spill};
 use crate::tensor::parallel::Chip;
 use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;

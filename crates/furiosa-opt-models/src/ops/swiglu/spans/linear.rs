@@ -2,8 +2,8 @@
 //! restores by their rows' scales: the packed gate/up and the down projections run on a span's live
 //! rows a band at a time, through HBM, where their SwiGLU runs over rows.
 
+use crate::Begin;
 use crate::Module;
-use crate::modules::generic::schedule::Begin;
 use crate::modules::lora;
 use crate::ops::linear::{Affine, Linear, Matrix};
 use crate::ops::normalization::span::Owned;

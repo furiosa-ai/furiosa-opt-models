@@ -35,7 +35,6 @@ mod tests {
     use super::fp8::{self, QuantizedMlp};
     use super::*;
     use crate::Module;
-    use crate::modules::generic::schedule::{Fill, Spill};
     use crate::ops::attention::geometry::Hidden;
     use crate::ops::linear::Linear;
     use crate::ops::normalization::tests::random;
@@ -45,7 +44,7 @@ mod tests {
     };
     use crate::ops::swiglu::{Down, GateUp, Intermediate, Mlp};
     use crate::tensor::form::Weight;
-    use crate::tensor::live::{Live, tests::count};
+    use crate::tensor::live::{Fill, Live, Spill, tests::count};
     use crate::tensor::scalar::Value;
     use crate::tests::DEVICE;
     use furiosa_opt_std::runtime::launch;

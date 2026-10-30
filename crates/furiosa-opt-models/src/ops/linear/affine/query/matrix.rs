@@ -6,8 +6,8 @@
 use super::group::{Group, TilePair};
 use super::launch::{Launch, Next, Normalized};
 use super::{Cluster, Output, PairLocal, Pairs, Queries, QueryLocal, QuerySpread, Reduced, Tile};
+use crate::Begin;
 use crate::Module;
-use crate::modules::generic::schedule::Begin;
 use crate::modules::lora::{self, Term};
 use crate::ops::linear::{Affine, Matrix, fp8};
 use crate::tensor::form::Weight;

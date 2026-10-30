@@ -2,9 +2,8 @@
 //! a span loop fills them where it enters and spills them where it leaves.
 
 use super::{Owned, Span};
-use crate::modules::generic::schedule::{Fill, Spill};
 use crate::ops::normalization::{Blocked, Offset, Part, Spread};
-use crate::tensor::live::Live;
+use crate::tensor::live::{Fill, Live, Spill};
 use crate::tensor::{axis::Rows, parallel::Chip};
 use furiosa_opt_std::prelude::*;
 
