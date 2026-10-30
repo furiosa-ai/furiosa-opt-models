@@ -59,6 +59,30 @@ impl<R: AxisName> Strips<R> {
     }
 }
 
+impl<R: AxisName, W: AxisName> Tiling<W> for Strips<R> {
+    type Tiles<Q: AxisName> = Symbol<Strips<Q>>;
+    type Rows = m![Strip];
+    type Half = Half;
+    type Slices = Slices<W>;
+    type Element = m![Strip % 8, W % 128];
+    type Run = m![128];
+    type Statistic = m![Strip % 8, 1 # 8];
+    type Modulated = m![Strip % 8, W % 128 / 8];
+    type Split = m![Strip % 8, W % 128 / 8, W % 8 / 4 % 2];
+
+    fn inverse<const EPSILON: usize, X: M>(
+        device: &mut Device,
+        part: &Tile<bf16, W, X>,
+    ) -> RowOperand<W, X> {
+        Squares::<StripLanes<W>, W, m![Strip % 8], m![W / 128], EPSILON>::inverse(
+            device,
+            part.view(),
+            |square| square,
+        )
+    }
+}
+
+/// A tile into tile `at` of `rows`.
 impl<R: AxisName, W: AxisName, X: M> Op<(&Tile<bf16, W, X>, &mut Rows<R, W, X>, usize)>
     for Strips<R>
 {
@@ -69,17 +93,7 @@ impl<R: AxisName, W: AxisName, X: M> Op<(&Tile<bf16, W, X>, &mut Rows<R, W, X>, 
         device: &mut Device,
         (tile, rows, at): (&Tile<bf16, W, X>, &mut Rows<R, W, X>, usize),
     ) {
-        tile.view().to_hbm_view(
-            &mut device.tdma,
-            // SAFETY: the tiles split the row axis in row order; every cell keeps its address.
-            unsafe { rows.view_mut().reshape::<X, Banded<R, W>>() }.tile::<m![
-                { Symbol<Strips<R>> }
-            ], 1, m![
-                { Symbol<Strips<R>> } = 1 #{!} ({ Symbol<Strips<R>> }),
-                Strip,
-                W
-            ]>(at),
-        );
+        Self::spill(device, tile, rows, at);
     }
 }
 
@@ -310,23 +324,8 @@ where
         let shift = shift.widen::<Width, 8>(&mut device.sub);
         let mut output = HbmTensor::new();
         for tile in 0..Strips::<R>::SIZE {
-            let rows: Tile<bf16, Width, X> = {
-                // SAFETY: the tiles split the row axis in row order; every cell keeps its address.
-                unsafe { input.view().reshape::<X, Banded<R, Width>>() }
-                    .tile::<m![{ Symbol<Strips<R>> }], 1, m![
-                        { Symbol<Strips<R>> } = 1 # ({ Symbol<Strips<R>> }), Strip, Width
-                    ]>(tile)
-                    .to_dm(&mut device.tdma)
-            };
-            let inverse: RowOperand<Width, X> = Squares::<
-                StripLanes<Width>,
-                Width,
-                m![Strip % 8],
-                m![Width / 128],
-                EPSILON,
-            >::inverse(
-                device, rows.view(), |square| square
-            );
+            let rows: Tile<bf16, Width, X> = Strips::<R>::tile(input, tile).to_dm(&mut device.tdma);
+            let inverse = <Strips<R> as Tiling<Width>>::inverse::<EPSILON, X>(device, &rows);
             let normalized: Tile<bf16, Width, X> =
                 Scale::<StripLanes<Width>>::of(&mut device.main, rows.view(), &inverse, &weight)
                     .commit();
@@ -349,7 +348,7 @@ where
                 .cast::<bf16, m![Width % 8 # 16]>()
                 .commit_trim::<m![Width % 8]>()
                 .commit();
-            Strips::<R>::new().forward(&mut *device, (&modulated, &mut output, tile));
+            Strips::<R>::spill(&mut *device, &modulated, &mut output, tile);
         }
         output
     }
