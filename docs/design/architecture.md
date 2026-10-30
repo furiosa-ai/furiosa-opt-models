@@ -47,7 +47,7 @@ Numerical functions over device tensors, the weight trees they read and the regi
 
 - **Modules:** `ops/`, `modules/` and `models/` hold plain `Module`s, leaf `Op`s among them, composed by `Sequential`, `Then`, `Fork`, `Each`, `Layers` and tuples under one calling convention ([The `Module` contract](../develop/compose.md#the-module-contract)).
 - **Weights:** a tree loads from a checkpoint by its field names, tensor by tensor into HBM, and nothing stays on host ([Weights and loading](../develop/compose.md#weights-and-loading)).
-- **Streaming:** the same tree runs a tile of rows at a time, polled from the root ([Streaming execution](../develop/compose.md#streaming-execution)).
+- **Execution order:** a decoder runs as its family's schedule writes it, plain loops over its layers and row tiles that meet only at attention ([Execution order](../develop/compose.md#execution-order)).
 - **Checked:** shapes, dtypes and mappings at compile time, with no CPU fallback.
 
 ## 4. Engine host composition
