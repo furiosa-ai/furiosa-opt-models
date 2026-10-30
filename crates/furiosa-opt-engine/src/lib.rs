@@ -9,6 +9,9 @@
 //! - A `Function` runs a module of a loaded tree through a compiled entry, as an `AsyncModule`.
 //! - A `decoder` root serves requests on a `decoder::Cache`: a call validates and plans them, then
 //!   launches on the views the decoder keeps of the cache.
+//! - A load refuses with a `LoadError` and a call with an `io::Error`, the error the runtime's
+//!   calls fail with: each tells invalid data or input (`InvalidData`, `InvalidInput`) apart from
+//!   what no implementation serves (`Unsupported`).
 //! - A `vision_language` encoder turns images, video frames and audio into rows of its language
 //!   model's width.
 //! - The package `furiosa-opt-python` binds this API to Python, as the extension module of the
