@@ -4,11 +4,8 @@
 use crate::load::{Checkpoint, Context, Load, LoadError, Named};
 use crate::models::config::{Exclusion, Exclusions, Scheme, compiled, decoder, scaling::Spectrum};
 use crate::models::decoder::{
-    attention::{
-        self, Geometry, Head, KvHeads,
-        qwen3::{self, launch},
-    },
-    form,
+    attention::{self, Geometry, Head, KvHeads, qwen3},
+    form, launch,
 };
 use crate::models::{Class, Family, Implements};
 use crate::modules::attention::Projection;

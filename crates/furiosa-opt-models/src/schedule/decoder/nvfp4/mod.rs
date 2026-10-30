@@ -2,7 +2,8 @@
 //! overlapped with the preceding MLP, O weights with attention's last history transfer,
 //! and the first MLP operands with O. The native cache stage writes fresh BF16 K/V
 //! around the current layer's attention, using the same retained-row flow as Qwen FP8.
-use crate::models::decoder::attention::{Head, KvHeads, llama::nvfp4::*, qwen3::launch};
+use crate::models::decoder::attention::{Head, KvHeads, llama::nvfp4::*};
+use crate::models::decoder::launch;
 use crate::modules::generic::schedule::{Fill, Spill};
 use crate::modules::language::Backbone;
 use crate::modules::residual::Residual;

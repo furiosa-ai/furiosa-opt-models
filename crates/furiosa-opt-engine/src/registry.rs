@@ -14,9 +14,9 @@
 use crate::decoder::{Decoder, Instance, Served};
 use crate::vision_language::Encoder;
 use furiosa_opt_models::load::{Checkpoint, Context, Load, LoadError, Part};
-use furiosa_opt_models::models::decoder::attention::qwen3::launch;
 use furiosa_opt_models::models::decoder::attention::{llama, qwen3};
 use furiosa_opt_models::models::decoder::form;
+use furiosa_opt_models::models::decoder::launch;
 use furiosa_opt_models::models::vision_language::gemma4_unified;
 use furiosa_opt_models::models::{Class, Implements};
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
