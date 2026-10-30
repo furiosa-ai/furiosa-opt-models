@@ -279,9 +279,18 @@ pub struct Staging<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName> {
     first: Down<Hidden, Intermediate>,
 }
 
-/// A tile's product staged for the down projection: a span of more than two waves quantized by
-/// each row group's scales over all the slices of its panels (the vector path's scale floor), a
-/// smaller one kept in BF16 for its panels' block quantization.
+/// A [`Staging`] but its first down panel.
+type Spilled<Intermediate, Rows> = (
+    HbmTensor<bf16, Chip, Stores<Intermediate, Rows>>,
+    (
+        Staged<Intermediate, Rows>,
+        Staged<Intermediate, Rows>,
+        Staged<Intermediate, Rows>,
+    ),
+    StagedScales<Intermediate, Rows>,
+);
+
+/// A tile's product staged for the down projection, then the first down panel landed.
 impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>
     Op<Begin<Live<Halves<Intermediate, Rows>, Capacity>>> for DownWeights<Hidden, Intermediate>
 {
@@ -292,48 +301,73 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
         context: &mut Device,
         Begin(product): Begin<Live<Halves<Intermediate, Rows>, Capacity>>,
     ) -> Self::Output {
-        const { assert!(<m![{ Out<Intermediate> } / 64]>::SIZE == Panels::SIZE) };
-        let (live, rows) = (product.count::<axis::Rows<128>>(), product.rows());
-        let product = product.into_value();
-        let mut products = HbmTensor::<bf16, Chip, Stores<Intermediate, Rows>>::new();
-        let (mut h0, mut h1, mut h2) = (Staged::new(), Staged::new(), Staged::new());
-        let mut scales = StagedScales::<Intermediate, Rows>::new();
-        if live <= 2 {
-            StoreTiles.forward(&mut *context, (&product, rows, &mut products));
-        } else {
-            let mut chunks = ChunkMax::<Intermediate, Rows, Slice<Intermediate, Rows>>::new();
-            PanelMaxima::<0>.forward(&mut *context, (&product, &mut chunks));
-            PanelMaxima::<1>.forward(&mut *context, (&product, &mut chunks));
-            PanelMaxima::<2>.forward(&mut *context, (&product, &mut chunks));
-            let mut groups = SpreadScale::<Intermediate, Rows>::new();
-            let broadcast = GroupScales.forward(&mut *context, (&chunks, &mut groups));
-            let mut quantized = Spread::<Intermediate, Rows, f8e4m3>::new();
-            QuantizeSpread::<0>.forward(&mut *context, (&product, &broadcast, &mut quantized));
-            QuantizeSpread::<1>.forward(&mut *context, (&product, &broadcast, &mut quantized));
-            QuantizeSpread::<2>.forward(&mut *context, (&product, &broadcast, &mut quantized));
-            StagePanel.forward(&mut *context, (&quantized, 0, &mut h0));
-            StagePanel.forward(&mut *context, (&quantized, 1, &mut h1));
-            StagePanel.forward(&mut *context, (&quantized, 2, &mut h2));
-            StageScales.forward(&mut *context, (&groups, &mut scales));
-        }
+        let (products, panels, scales) = spill(&mut *context, product);
+        let first = self.forward(&mut *context, Begin(0));
         Staging {
             products,
-            panels: (h0, h1, h2),
+            panels,
             scales,
-            first: self.forward(&mut *context, Begin(0)),
+            first,
         }
     }
 }
 
-/// The down projection of a staged product: each of the three panels quantized, projected and
-/// rescaled in turn while the next weight panel lands, the panels' sums added, and each cluster's
-/// row half of the sums exchanged into the span's rows.
+/// A tile's product staged for the down projection whose first down panel landed beforehand.
+impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>
+    Op<
+        Begin<(
+            Live<Halves<Intermediate, Rows>, Capacity>,
+            Down<Hidden, Intermediate>,
+        )>,
+    > for DownWeights<Hidden, Intermediate>
+{
+    type Output = Staging<Hidden, Intermediate, Rows>;
+
+    fn forward(
+        &self,
+        context: &mut Device,
+        Begin((product, first)): Begin<(
+            Live<Halves<Intermediate, Rows>, Capacity>,
+            Down<Hidden, Intermediate>,
+        )>,
+    ) -> Self::Output {
+        let (products, panels, scales) = spill(context, product);
+        Staging {
+            products,
+            panels,
+            scales,
+            first,
+        }
+    }
+}
+
+/// The down channel scales in data memory.
+type Channels<Hidden, Intermediate> =
+    DmTensor<f32, Chip, Cluster<Intermediate>, m![Hidden / 16], m![Hidden % 16]>;
+
+/// A staged product's down projection with its three weight panels, their inputs in panel order and
+/// its channel scales landed: what is left is compute and the exchange of the row halves.
+pub struct Ready<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName> {
+    weights: (
+        Down<Hidden, Intermediate>,
+        Down<Hidden, Intermediate>,
+        Down<Hidden, Intermediate>,
+    ),
+    inputs: (
+        Landed<Hidden, Intermediate, Rows>,
+        Landed<Hidden, Intermediate, Rows>,
+        Landed<Hidden, Intermediate, Rows>,
+    ),
+    channels: Channels<Hidden, Intermediate>,
+}
+
+/// The down projection of a staged product, its second and third down panels landing between its
+/// first panels' work.
 impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>
     Op<Live<Staging<Hidden, Intermediate, Rows>, Capacity>> for DownWeights<Hidden, Intermediate>
 {
     type Output = Owned<Hidden, Rows>;
 
-    #[allow(clippy::too_many_lines)]
     fn forward(
         &self,
         context: &mut Device,
@@ -350,122 +384,277 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
         // SAFETY: the store's row digits are the span's rows in order.
         let products: HbmTensor<bf16, Chip, Chunks<Intermediate, Rows>> =
             unsafe { products.reshape() };
-        let down: DmTensor<f32, Chip, Cluster<Intermediate>, m![Hidden / 16], m![Hidden % 16]> =
-            self.1.to_dm(&mut context.tdma);
-        let channels: ChannelScales<Hidden, Intermediate> = context
-            .sub
-            .begin(down.view())
-            .fetch::<m![Hidden % 16 / 8], m![Hidden % 8]>()
-            .collect::<m![Hidden % 16 / 8], m![Hidden % 8]>()
-            .to_vrf();
-        let groups = (rows + 7) / 8;
+        let channels = self.1.to_dm(&mut context.tdma);
         // Every panel's input lands ahead of the projections, in the order they read it with their
-        // weight panels: a product of at most two waves as it is, of more its quantized panel.
-        let landed = |context: &mut Device,
-                      (panel, staged): (usize, &Staged<Intermediate, Rows>)| {
-            let mut product = Product::<Hidden, Intermediate, Rows>::new();
-            let mut activation = Activation::<Hidden, Intermediate, Rows>::new();
-            let mut scale = Scale::<Hidden, Intermediate, Rows>::new();
-            if live <= 2 {
-                product = LoadProduct::<Hidden>(PhantomData)
-                    .forward(&mut *context, (&products, panel, (live, rows)));
-            } else {
-                CopyPanel.forward(&mut *context, (staged, &mut activation));
-                CopyScales.forward(&mut *context, (&scales, panel, &mut scale));
-            }
-            (product, activation, scale)
-        };
-        let project = |context: &mut Device,
-                       (weight, (product, mut activation, mut scale)): (
-            &Down<Hidden, Intermediate>,
-            Landed<Hidden, Intermediate, Rows>,
-        )|
-         -> Partial<Hidden, Intermediate, Rows> {
-            if live <= 2 {
-                QuantizeProduct.forward(
-                    &mut *context,
-                    (&product, rows, (&mut activation, &mut scale)),
-                );
-            }
-            let projected = Project.forward(&mut *context, ((weight, &activation), (live, rows)));
-            let row = FetchScales.forward(&mut *context, &scale);
-            Rescale::<Rows>(PhantomData)
-                .forward(&mut *context, (&projected, (&row, &channels), groups))
-        };
-        let add = |context: &mut Device,
-                   (left, right): (
-            &Partial<Hidden, Intermediate, Rows>,
-            &Partial<Hidden, Intermediate, Rows>,
-        )|
-         -> Partial<Hidden, Intermediate, Rows> {
-            let mut sums = Partial::<Hidden, Intermediate, Rows>::new();
-            Add::of::<
-                m![{ Groups<Rows> }],
-                m![{ RowLanes<Rows> }, Hidden % 16 / 8],
-                m![Hidden % 8],
-                Term,
-                _,
-                _,
-                _,
-                _,
-            >(&mut *context, (left, right))
-            .commit_prefix::<m![{ Groups<Rows> }], _, _>(sums.view_mut(), groups);
-            sums
-        };
-        let (input0, input1) = (landed(context, (0, &h0)), landed(context, (1, &h1)));
+        // weight panels.
+        let stored = (&products, &scales);
+        let input0 = landed(&mut *context, stored, (0, &h0), (live, rows));
+        let input1 = landed(&mut *context, stored, (1, &h1), (live, rows));
         let second = self.forward(&mut *context, Begin(1));
-        let input2 = landed(context, (2, &h2));
-        let d0 = project(context, (&first, input0));
-        let third = self.forward(&mut *context, Begin(2));
-        let d1 = project(context, (&second, input1));
-        let sums = add(context, (&d0, &d1));
-        let d2 = project(context, (&third, input2));
-        let partial = add(context, (&sums, &d2));
-        let mut result: DmTensor<
-            bf16,
-            Chip,
-            Cluster<Intermediate>,
-            m![Hidden / 16],
-            m![Rows % (Rows / 2), Hidden % 16],
-        > = DmTensor::new();
-        if rows <= 8 {
-            let live_rows = || {
-                partial.view().tile::<m![Rows % (Rows / 2)], 8,
-                    m![Rows / (Rows / 2), Rows % (Rows / 2) = 8 # (Rows / 2), Hidden % 16]>(0)
-            };
-            let half = |context: &mut Device, indices| {
-                live_rows().asymmetric_cluster_slice::<
-                        m![Rows / (Rows / 2)],
-                        m![Rows % (Rows / 2) = 8, Hidden % 16],
-                    >(&mut context.sub, indices)
-            };
-            let (send, own) = (half(context, &[1, 0]), half(context, &[0, 1]));
-            let exchanged = send.view().cluster_swap().to_dm(&mut context.tdma);
-            Add::of::<m![Rows % (Rows / 2) = 8, Hidden % 16 / 8], m![1], m![Hidden % 8], Term, _, _, _, _>(&mut *context, (&own, &exchanged)).commit_prefix::<m![Rows % (Rows / 2) = 8], _, _>(result.view_mut().tile::<m![Rows % (Rows / 2)], 8,
-                    m![Rows % (Rows / 2) = 8 #{!} (Rows / 2), Hidden % 16]>(0), rows);
-        } else {
-            let half = |context: &mut Device, indices| {
-                partial.view().asymmetric_cluster_slice::<
-                        m![Rows / (Rows / 2)],
-                        m![Rows % (Rows / 2), Hidden % 16],
-                    >(&mut context.sub, indices)
-            };
-            let (send, own) = (half(context, &[1, 0]), half(context, &[0, 1]));
-            let exchanged = send.view().cluster_swap().to_dm(&mut context.tdma);
-            let reach = span::reach::<Rows>(rows);
-            Add::of::<
-                m![Rows % (Rows / 2) / 8],
-                m![Rows % 8, Hidden % 16 / 8],
-                m![Hidden % 8],
-                Term,
-                _,
-                _,
-                _,
-                _,
-            >(&mut *context, (&own, &exchanged))
-            .commit_prefix::<m![Rows % (Rows / 2) / 8], _, _>(result.view_mut(), reach.div_ceil(8));
-        }
-        // SAFETY: extraction and exchange give cluster c the complete sum for row half c.
-        unsafe { result.reshape() }
+        let input2 = landed(&mut *context, stored, (2, &h2), (live, rows));
+        let third = |context: &mut Device| self.forward(context, Begin(2));
+        let inputs = (input0, input1, input2);
+        projected(
+            context,
+            ((first, second), third),
+            (inputs, channels),
+            (live, rows),
+        )
     }
+}
+
+/// A staged product's down panels' inputs and channel scales landed, its later two weight panels
+/// landed beforehand.
+impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>
+    Op<
+        Live<
+            (
+                Staging<Hidden, Intermediate, Rows>,
+                (Down<Hidden, Intermediate>, Down<Hidden, Intermediate>),
+            ),
+            Capacity,
+        >,
+    > for DownWeights<Hidden, Intermediate>
+{
+    type Output = Ready<Hidden, Intermediate, Rows>;
+
+    fn forward(
+        &self,
+        context: &mut Device,
+        staged: Live<
+            (
+                Staging<Hidden, Intermediate, Rows>,
+                (Down<Hidden, Intermediate>, Down<Hidden, Intermediate>),
+            ),
+            Capacity,
+        >,
+    ) -> Self::Output {
+        const { assert!(<m![{ Out<Intermediate> } / 64]>::SIZE == Panels::SIZE) };
+        let (live, rows) = (staged.count::<axis::Rows<128>>(), staged.rows());
+        let (staging, (second, third)) = staged.into_value();
+        let Staging {
+            products,
+            panels: (h0, h1, h2),
+            scales,
+            first,
+        } = staging;
+        // SAFETY: the store's row digits are the span's rows in order.
+        let products: HbmTensor<bf16, Chip, Chunks<Intermediate, Rows>> =
+            unsafe { products.reshape() };
+        let channels = self.1.to_dm(&mut context.tdma);
+        let stored = (&products, &scales);
+        let inputs = (
+            landed(&mut *context, stored, (0, &h0), (live, rows)),
+            landed(&mut *context, stored, (1, &h1), (live, rows)),
+            landed(&mut *context, stored, (2, &h2), (live, rows)),
+        );
+        Ready {
+            weights: (first, second, third),
+            inputs,
+            channels,
+        }
+    }
+}
+
+/// The down projection of a staged product whose weights and inputs landed.
+impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>
+    Op<Live<Ready<Hidden, Intermediate, Rows>, Capacity>> for DownWeights<Hidden, Intermediate>
+{
+    type Output = Owned<Hidden, Rows>;
+
+    fn forward(
+        &self,
+        context: &mut Device,
+        ready: Live<Ready<Hidden, Intermediate, Rows>, Capacity>,
+    ) -> Self::Output {
+        let (live, rows) = (ready.count::<axis::Rows<128>>(), ready.rows());
+        let Ready {
+            weights: (first, second, third),
+            inputs,
+            channels,
+        } = ready.into_value();
+        let third = |_: &mut Device| third;
+        projected(
+            context,
+            ((first, second), third),
+            (inputs, channels),
+            (live, rows),
+        )
+    }
+}
+
+/// A tile's product staged for the down projection: a span of more than two waves quantized by
+/// each row group's scales over all the slices of its panels (the vector path's scale floor), a
+/// smaller one kept in BF16 for its panels' block quantization.
+fn spill<Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>(
+    context: &mut Device,
+    product: Live<Halves<Intermediate, Rows>, Capacity>,
+) -> Spilled<Intermediate, Rows> {
+    const { assert!(<m![{ Out<Intermediate> } / 64]>::SIZE == Panels::SIZE) };
+    let (live, rows) = (product.count::<axis::Rows<128>>(), product.rows());
+    let product = product.into_value();
+    let mut products = HbmTensor::<bf16, Chip, Stores<Intermediate, Rows>>::new();
+    let (mut h0, mut h1, mut h2) = (Staged::new(), Staged::new(), Staged::new());
+    let mut scales = StagedScales::<Intermediate, Rows>::new();
+    if live <= 2 {
+        StoreTiles.forward(&mut *context, (&product, rows, &mut products));
+    } else {
+        let mut chunks = ChunkMax::<Intermediate, Rows, Slice<Intermediate, Rows>>::new();
+        PanelMaxima::<0>.forward(&mut *context, (&product, &mut chunks));
+        PanelMaxima::<1>.forward(&mut *context, (&product, &mut chunks));
+        PanelMaxima::<2>.forward(&mut *context, (&product, &mut chunks));
+        let mut groups = SpreadScale::<Intermediate, Rows>::new();
+        let broadcast = GroupScales.forward(&mut *context, (&chunks, &mut groups));
+        let mut quantized = Spread::<Intermediate, Rows, f8e4m3>::new();
+        QuantizeSpread::<0>.forward(&mut *context, (&product, &broadcast, &mut quantized));
+        QuantizeSpread::<1>.forward(&mut *context, (&product, &broadcast, &mut quantized));
+        QuantizeSpread::<2>.forward(&mut *context, (&product, &broadcast, &mut quantized));
+        StagePanel.forward(&mut *context, (&quantized, 0, &mut h0));
+        StagePanel.forward(&mut *context, (&quantized, 1, &mut h1));
+        StagePanel.forward(&mut *context, (&quantized, 2, &mut h2));
+        StageScales.forward(&mut *context, (&groups, &mut scales));
+    }
+    (products, (h0, h1, h2), scales)
+}
+
+/// Panel `panel`'s input as it lands: a product of at most two waves as it is, of more its
+/// quantized panel and row scales.
+fn landed<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>(
+    context: &mut Device,
+    (products, scales): (
+        &HbmTensor<bf16, Chip, Chunks<Intermediate, Rows>>,
+        &StagedScales<Intermediate, Rows>,
+    ),
+    (panel, staged): (usize, &Staged<Intermediate, Rows>),
+    (live, rows): (usize, usize),
+) -> Landed<Hidden, Intermediate, Rows> {
+    let mut product = Product::<Hidden, Intermediate, Rows>::new();
+    let mut activation = Activation::<Hidden, Intermediate, Rows>::new();
+    let mut scale = Scale::<Hidden, Intermediate, Rows>::new();
+    if live <= 2 {
+        product = LoadProduct::<Hidden>(PhantomData)
+            .forward(&mut *context, (products, panel, (live, rows)));
+    } else {
+        CopyPanel.forward(&mut *context, (staged, &mut activation));
+        CopyScales.forward(&mut *context, (scales, panel, &mut scale));
+    }
+    (product, activation, scale)
+}
+
+/// The down projection of a staged product from its first two weight panels, the third taken
+/// from `third` once the first panel's work is issued, and its landed `inputs`: each panel
+/// quantized, projected and rescaled in turn, the panels' sums added, and each cluster's row half
+/// of the sums exchanged into the span's rows.
+#[allow(clippy::too_many_lines)]
+fn projected<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>(
+    context: &mut Device,
+    ((first, second), third): (
+        (Down<Hidden, Intermediate>, Down<Hidden, Intermediate>),
+        impl FnOnce(&mut Device) -> Down<Hidden, Intermediate>,
+    ),
+    ((input0, input1, input2), down): (
+        (
+            Landed<Hidden, Intermediate, Rows>,
+            Landed<Hidden, Intermediate, Rows>,
+            Landed<Hidden, Intermediate, Rows>,
+        ),
+        Channels<Hidden, Intermediate>,
+    ),
+    (live, rows): (usize, usize),
+) -> Owned<Hidden, Rows> {
+    let channels: ChannelScales<Hidden, Intermediate> = context
+        .sub
+        .begin(down.view())
+        .fetch::<m![Hidden % 16 / 8], m![Hidden % 8]>()
+        .collect::<m![Hidden % 16 / 8], m![Hidden % 8]>()
+        .to_vrf();
+    let groups = (rows + 7) / 8;
+    let project = |context: &mut Device,
+                   (weight, (product, mut activation, mut scale)): (
+        &Down<Hidden, Intermediate>,
+        Landed<Hidden, Intermediate, Rows>,
+    )|
+     -> Partial<Hidden, Intermediate, Rows> {
+        if live <= 2 {
+            QuantizeProduct.forward(
+                &mut *context,
+                (&product, rows, (&mut activation, &mut scale)),
+            );
+        }
+        let projected = Project.forward(&mut *context, ((weight, &activation), (live, rows)));
+        let row = FetchScales.forward(&mut *context, &scale);
+        Rescale::<Rows>(PhantomData).forward(&mut *context, (&projected, (&row, &channels), groups))
+    };
+    let add = |context: &mut Device,
+               (left, right): (
+        &Partial<Hidden, Intermediate, Rows>,
+        &Partial<Hidden, Intermediate, Rows>,
+    )|
+     -> Partial<Hidden, Intermediate, Rows> {
+        let mut sums = Partial::<Hidden, Intermediate, Rows>::new();
+        Add::of::<
+            m![{ Groups<Rows> }],
+            m![{ RowLanes<Rows> }, Hidden % 16 / 8],
+            m![Hidden % 8],
+            Term,
+            _,
+            _,
+            _,
+            _,
+        >(&mut *context, (left, right))
+        .commit_prefix::<m![{ Groups<Rows> }], _, _>(sums.view_mut(), groups);
+        sums
+    };
+    let d0 = project(context, (&first, input0));
+    let third = third(&mut *context);
+    let d1 = project(context, (&second, input1));
+    let sums = add(context, (&d0, &d1));
+    let d2 = project(context, (&third, input2));
+    let partial = add(context, (&sums, &d2));
+    let mut result: DmTensor<
+        bf16,
+        Chip,
+        Cluster<Intermediate>,
+        m![Hidden / 16],
+        m![Rows % (Rows / 2), Hidden % 16],
+    > = DmTensor::new();
+    if rows <= 8 {
+        let live_rows = || {
+            partial.view().tile::<m![Rows % (Rows / 2)], 8,
+                m![Rows / (Rows / 2), Rows % (Rows / 2) = 8 # (Rows / 2), Hidden % 16]>(0)
+        };
+        let half = |context: &mut Device, indices| {
+            live_rows().asymmetric_cluster_slice::<
+                    m![Rows / (Rows / 2)],
+                    m![Rows % (Rows / 2) = 8, Hidden % 16],
+                >(&mut context.sub, indices)
+        };
+        let (send, own) = (half(context, &[1, 0]), half(context, &[0, 1]));
+        let exchanged = send.view().cluster_swap().to_dm(&mut context.tdma);
+        Add::of::<m![Rows % (Rows / 2) = 8, Hidden % 16 / 8], m![1], m![Hidden % 8], Term, _, _, _, _>(&mut *context, (&own, &exchanged)).commit_prefix::<m![Rows % (Rows / 2) = 8], _, _>(result.view_mut().tile::<m![Rows % (Rows / 2)], 8,
+                m![Rows % (Rows / 2) = 8 #{!} (Rows / 2), Hidden % 16]>(0), rows);
+    } else {
+        let half = |context: &mut Device, indices| {
+            partial.view().asymmetric_cluster_slice::<
+                    m![Rows / (Rows / 2)],
+                    m![Rows % (Rows / 2), Hidden % 16],
+                >(&mut context.sub, indices)
+        };
+        let (send, own) = (half(context, &[1, 0]), half(context, &[0, 1]));
+        let exchanged = send.view().cluster_swap().to_dm(&mut context.tdma);
+        let reach = span::reach::<Rows>(rows);
+        Add::of::<
+            m![Rows % (Rows / 2) / 8],
+            m![Rows % 8, Hidden % 16 / 8],
+            m![Hidden % 8],
+            Term,
+            _,
+            _,
+            _,
+            _,
+        >(&mut *context, (&own, &exchanged))
+        .commit_prefix::<m![Rows % (Rows / 2) / 8], _, _>(result.view_mut(), reach.div_ceil(8));
+    }
+    // SAFETY: extraction and exchange give cluster c the complete sum for row half c.
+    unsafe { result.reshape() }
 }

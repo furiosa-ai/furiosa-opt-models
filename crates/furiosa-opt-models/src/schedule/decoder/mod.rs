@@ -14,9 +14,11 @@
 //!   Mistral's leave unnormed.
 //! - [`Decoder`] runs the loops: the first layer's stores over the embedded tiles, then for each
 //!   layer its attention and, tile by tile, the work up to the next store or the head.
-//! - Weights land one part ahead of their use: the next layer's projections while this layer's MLP
-//!   projects, the MLP's first weights while the output projection does; none during an attention,
-//!   whose working set fills most of data memory.
+//! - The DMA engine serves transfers in issue order, so weights issue one part ahead of their use
+//!   and behind the small transfers of the work they overlap: the MLP's first weights behind the
+//!   output projection's rows, its down weights behind the gate/up pairs, the next layer's
+//!   projections behind the down's inputs. An attention's working set fills most of data memory,
+//!   so only the output projection lands during one, once its last history is in flight.
 
 use crate::Module;
 use crate::load::Named;
@@ -32,16 +34,19 @@ use crate::ops::attention::full::{head, paged::Retained};
 use crate::ops::embedding;
 use crate::ops::linear::output::fp8::Landed;
 use crate::ops::linear::query::group::{Group, TilePair, Tiles};
-use crate::ops::linear::query::{Tile, launch::Normalized};
+use crate::ops::linear::query::{self, Tile, launch::Normalized};
 use crate::ops::normalization::Blocked;
 use crate::ops::normalization::span::{Owned, Span, Stage};
 use crate::ops::pointwise::SwiGlu;
-use crate::ops::swiglu::spans::fp8::Staging;
+use crate::ops::rotary::group::{self, ToDm};
+use crate::ops::rotary::{Row, SplitHalf};
+use crate::ops::swiglu::spans::fp8::Ready;
 use crate::specialize::attention::Decode;
 use crate::tensor::live::Live;
 use crate::tensor::memory::Hbm;
 use crate::tensor::parallel::Chip;
-use crate::{Either, Sequential, Then};
+use crate::{Sequential, Then};
+use core::marker::PhantomData;
 use core::task::Poll;
 use furiosa_opt_std::prelude::*;
 
@@ -139,6 +144,10 @@ type KeyProjection = <BlockScaled as Form>::Key<Width, KvHeads, Head, Hbm>;
 type ValueProjection = <BlockScaled as Form>::Value<Width, KvHeads, Head, Hbm>;
 /// The norm of each of a layer's query and key heads.
 type HeadNorm = head::Stored<Head, { <S as Geometry>::EPSILON }>;
+/// A launch's rotation: each slot's coefficients.
+type Rotation = SplitHalf<Head, group::Rotation<<S as Decode>::Slots, Row<Head>>>;
+/// A period's rotation coefficients in the slices of its queries, for periods of `G` tiles.
+type Coefficients<G> = <ToDm<G, QueryHeads<S>> as crate::Op<(&'static Rotation, usize)>>::Output;
 
 /// What a leaf `L` gives when begun for a tile of the launch's rows.
 type Begun<L> = <L as Module<Begin<()>, Live<(), Capacity>, &'static mut ()>>::Output;
@@ -156,10 +165,10 @@ struct Front {
     key_norm: Begun<HeadNorm>,
 }
 
-/// A tile between its MLP's two steps: its product staged for the down projection, and the rows
-/// of the attention residual, which the MLP residual adds to.
+/// A tile between its MLP's two steps: the down projection's inputs landed, and the rows of the
+/// attention residual, which the MLP residual adds to.
 struct Staged {
-    product: Staging<Width, Intermediate, Span>,
+    ready: Ready<Width, Intermediate, Span>,
     attended: Live<Owned<Width, Span>, Capacity>,
 }
 
@@ -204,72 +213,89 @@ fn start(
     device: &mut Device,
     call: Launched<'_, '_>,
     layer: &Layer,
-    front: Front,
+    mut front: Front,
     rows: Live<Owned<Width, Span>, Capacity>,
     stored: &mut Stored,
 ) -> Live<Owned<Width, Span>, Capacity> {
-    let Sequential(Residual(_, attention, _), _) = layer;
-    let Attention {
-        qkv: Positioned { positions, .. },
-        cache: stage,
-        ..
-    } = &attention.0;
-    let Front {
-        gain,
-        value,
-        mut launch,
-        key,
-        query,
-        query_norm,
-        key_norm,
-    } = front;
-    let Stored { queries, retained } = stored;
     let tile = rows.with(());
-    let normalized = gain.forward(&mut *device, (), &mut (), &rows);
+    let normalized = front.gain.forward(&mut *device, (), &mut (), &rows);
     // The rows the periods read lie apart from the launch, which the period loops carry.
     let mut home = Normalized::new();
     home.spill(&mut *device, normalized.value(), (tile, tile.rows()));
     let rotation = &call.context.0.positions;
-    let mut project = |device: &mut Device, period: Live<Either<_, _>, Capacity>| {
-        let at = period.with(());
-        let rows = period.value();
-        let projected = (
-            query.forward(&mut *device, tile, &mut (), rows),
-            key.forward(&mut *device, tile, &mut (), rows),
-            value.forward(&mut *device, tile, &mut (), rows),
-        );
-        let normalized = (
-            query_norm.forward(&mut *device, tile, &mut (), projected.0),
-            key_norm.forward(&mut *device, tile, &mut (), projected.1),
-        );
-        let (query, key) =
-            positions.forward(&mut *device, tile, &mut (), (normalized, &(rotation, at)));
-        let stored = at.with((query, key, projected.2));
-        let places = (&mut *queries, &mut *retained);
-        stage.forward(device, (), &mut &mut (), (places, stored));
-    };
     type Pair = <TilePair as Group>::Period;
     let pairs = tile.count::<Tile>() / 2;
     let most = <Capacity>::SIZE / Pair::SIZE;
     for _ in 0..(pairs + most - 1) / most {
-        let begin = Begin(launch.period::<TilePair>(&home, 0));
-        value.forward(&mut *device, tile, &mut (), begin);
+        let begin = Begin(front.launch.period::<TilePair>(&home, 0));
+        front.value.forward(&mut *device, tile, &mut (), begin);
     }
     for at in 0..pairs {
-        let next = launch.period::<TilePair>(&home, at);
-        let period = value.forward(&mut *device, tile, &mut (), next);
-        project(
-            &mut *device,
-            tile.tile::<Pair>(at).with(Either::Left(period)),
+        let start = tile.tile::<Pair>(at).start();
+        let landing = ToDm::<TilePair, QueryHeads<S>>(PhantomData);
+        let index = (rotation, start / Pair::SIZE);
+        let coefficients = crate::Op::forward(&landing, &mut *device, index);
+        let next = front.launch.period::<TilePair>(&home, at);
+        let landed = (
+            coefficients,
+            front.value.forward(&mut *device, tile, &mut (), next),
         );
+        period(device, layer, &front, tile, landed, start, stored);
     }
     for _ in 0..tile.count::<Tile>() % 2 {
-        let next = launch.period::<Tiles<1>>(&home, pairs);
-        let period = value.forward(&mut *device, tile, &mut (), next);
-        let single = tile.tile::<Tile>(2 * pairs);
-        project(&mut *device, single.with(Either::Right(period)));
+        let start = tile.tile::<Tile>(2 * pairs).start();
+        let landing = ToDm::<Tiles<1>, QueryHeads<S>>(PhantomData);
+        let index = (rotation, start / Tile::SIZE);
+        let coefficients = crate::Op::forward(&landing, &mut *device, index);
+        let next = front.launch.period::<Tiles<1>>(&home, pairs);
+        let landed = (
+            coefficients,
+            front.value.forward(&mut *device, tile, &mut (), next),
+        );
+        period(device, layer, &front, tile, landed, start, stored);
     }
     rows
+}
+
+/// A period of a tile's rows through `layer`'s projections, their forms in `front`, stored at row
+/// `start` of `stored`, its rows landed and its rotation's coefficients before them: the queries
+/// projected, normalized, rotated and stored while the keys and values project, then the keys
+/// normalized, rotated and stored with the values.
+fn period<G: Group>(
+    device: &mut Device,
+    layer: &Layer,
+    front: &Front,
+    tile: Live<(), Capacity>,
+    (coefficients, rows): (Coefficients<G>, query::fp8::Period<Width, G, KvHeads>),
+    start: usize,
+    stored: &mut Stored,
+) {
+    let Sequential(Residual(_, attention, _), _) = layer;
+    let Attention {
+        qkv: Positioned { positions, .. },
+        ..
+    } = &attention.0;
+    let Front {
+        query,
+        key,
+        value,
+        query_norm,
+        key_norm,
+        ..
+    } = front;
+    let Stored { queries, retained } = stored;
+    let projected = query.forward(&mut *device, tile, &mut (), &rows);
+    let normalized = query_norm.forward(&mut *device, tile, &mut (), projected);
+    let rotation = crate::Op::forward(&group::Stage, &mut *device, &coefficients);
+    let rotated = positions.forward(&mut *device, tile, &mut (), (&normalized, &rotation));
+    let projected = key.forward(&mut *device, tile, &mut (), &rows);
+    queries.spill(&mut *device, &rotated, start);
+    let values = value.forward(&mut *device, tile, &mut (), &rows);
+    let normalized = key_norm.forward(&mut *device, tile, &mut (), projected);
+    let heads = (&coefficients, PhantomData::<KvHeads>);
+    let rotation = crate::Op::forward(&group::Stage, &mut *device, heads);
+    let rotated = positions.forward(&mut *device, tile, &mut (), (&normalized, &rotation));
+    retained.spill(&mut *device, (&rotated, &values), start);
 }
 
 /// A tile through `layer` from its attention to its MLP's second step, given a tile of its
@@ -286,7 +312,6 @@ fn end(
     let (gate_up, down) = mlp.0.parts();
     let tile = input.with(());
     let gain = crate::Op::forward(&Stage, &mut *device, &norm.0);
-    let ahead = gate_up.forward(&mut *device, (), &mut (), Begin(()));
     let mut step = |device: &mut Device| {
         output.forward(
             device,
@@ -295,8 +320,11 @@ fn end(
             (&mut *landed, &attended.value().0, tile),
         )
     };
+    // The first gate/up pair lands behind the output projection's rows, under its passes.
     let _ = step(&mut *device);
+    let ahead = gate_up.forward(&mut *device, (), &mut (), Begin(()));
     let _ = step(&mut *device);
+    let first = down.forward(&mut *device, (), &mut (), Begin(0usize));
     let projected = match step(&mut *device) {
         Poll::Ready(rows) => tile.with(rows),
         Poll::Pending => tile.with(Owned::new()),
@@ -305,12 +333,17 @@ fn end(
     let normalized = gain.forward(&mut *device, (), &mut (), &attended);
     let rows = tile.with(normalized.value());
     let projected = gate_up.forward(&mut *device, (), &mut (), (ahead, rows));
+    // The later down panels land under the last gate/up pair and the gating, the next part's
+    // weights under the down projection once its inputs landed.
+    let later = (
+        down.forward(&mut *device, (), &mut (), Begin(1usize)),
+        down.forward(&mut *device, (), &mut (), Begin(2usize)),
+    );
     let product = SwiGlu.forward(&mut *device, (), &mut (), tile.with(projected));
-    let staged = down.forward(&mut *device, (), &mut (), Begin(tile.with(product)));
-    Staged {
-        product: staged,
-        attended,
-    }
+    let product = tile.with(product);
+    let staged = down.forward(&mut *device, (), &mut (), Begin((product, first)));
+    let ready = down.forward(&mut *device, (), &mut (), tile.with((staged, later)));
+    Staged { ready, attended }
 }
 
 /// A `staged` tile through the second step of `layer`'s MLP, the down projection, and the MLP
@@ -322,9 +355,9 @@ fn update(
 ) -> Live<Owned<Width, Span>, Capacity> {
     let Sequential(_, Residual(_, mlp, sum)) = layer;
     let (_, down) = mlp.0.parts();
-    let Staged { product, attended } = staged;
+    let Staged { ready, attended } = staged;
     let tile = attended.with(());
-    let fed = tile.with(down.forward(&mut *device, (), &mut (), tile.with(product)));
+    let fed = tile.with(down.forward(&mut *device, (), &mut (), tile.with(ready)));
     sum.forward(device, (), &mut (), (&attended, &fed))
 }
 
@@ -480,17 +513,17 @@ impl<'m, 'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, S>, Env, launch::
         for index in 0..LAYERS - 1 {
             let (layer, next) = (layers.layer(index), layers.layer(index + 1));
             let mut projecting = attend(&mut *device, &layer, &mut slots[index], &mut places);
-            let mut ahead = Places::new();
+            // In place, so the loop carries one state: a tile overwrites only its own rows, read just
+            // before, and the attention has read every store.
             for span in 0..spans {
                 let tile = live.tile::<Span>(span);
                 let input = tile.with(places.input.fill(&mut *device, tile));
                 let tokenwise = Tokenwise(&layer, &next);
                 let output = (tile.with(&places.attended), &mut projecting);
                 let rows =
-                    tokenwise.forward(&mut *device, call, &mut ahead.stored, (output, input));
-                ahead.input.spill(&mut *device, rows.value(), tile);
+                    tokenwise.forward(&mut *device, call, &mut places.stored, (output, input));
+                places.input.spill(&mut *device, rows.value(), tile);
             }
-            places = ahead;
         }
         let last = layers.layer(LAYERS - 1);
         let mut projecting = attend(&mut *device, &last, &mut slots[LAYERS - 1], &mut places);
