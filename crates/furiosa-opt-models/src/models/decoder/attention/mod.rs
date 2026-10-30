@@ -264,11 +264,17 @@ impl<G: Geometry + Family, Model, Score, P: Form> Implements
     }
 }
 
-/// A call's rows through the body, whose state's places take its hidden rows.
-impl<'x, R: AxisName, T, C, Chips: M, Env: Copy, S, P, G: Geometry, Body, Rotary, F>
-    Module<&'x mut Input<R, T, C, Chips>, Env, S> for Model<G, Body, Rotary, F>
+/// A call's rows through the body, whose state's places take its hidden rows, the call's context
+/// prepared by the constants of a key and value paging.
+impl<'x, R: AxisName, T, C, Chips: M, Env: Copy, S, P, G: Geometry, Body, Rows, Paging, Q, X, F>
+    Module<&'x mut Input<R, T, C, Chips>, Env, S>
+    for Model<G, Body, key_value::Preparation<Rows, Paging, Q, X>, F>
 where
-    Rotary: for<'d, 'c> Module<(Live<(), R>, &'c mut C), Env, &'d mut (), Output = P>,
+    Rows: AxisName,
+    Q: M + 'static,
+    X: Memory,
+    key_value::Preparation<Rows, Paging, Q, X>:
+        for<'d, 'c> Module<(Live<(), R>, &'c mut C), Env, &'d mut (), Output = P>,
     for<'m, 'c> &'m Body: IntoStream<Empty<()>, Call<'c, P, T, R>, S>,
 {
     type Output = ();
@@ -2616,14 +2622,10 @@ mod tests {
     use crate::Module;
     use crate::models::vision_language::MuseGlimmerForConditionalGeneration;
     use crate::modules::attention::{Attention, Context, KeyValue, NormalizedQkv, Positioned};
-    use crate::modules::generic::schedule;
     use crate::modules::language::{Backbone, Normalized};
     use crate::modules::multimodal::InputEmbedding;
     use crate::modules::residual::Sum;
-    use crate::tensor::live::tests::count;
-    use crate::tensor::parallel::Chip;
     use crate::tests::DEVICE;
-    use core::task::Poll;
     use furiosa_opt_std::prelude::{Device, Topology};
 
     /// Modulus of the toy arithmetic, so products stay exact.
@@ -2782,74 +2784,6 @@ mod tests {
         before_projection: true,
         output_norms: true,
     };
-
-    type Token = HbmTensor<i32, Chip, m![1]>;
-
-    /// A preparation whose context is a copy of the call's cache operand.
-    #[derive(DeviceSend)]
-    struct Echo;
-
-    impl<R, Env> Module<(Live<(), R>, &mut Token), Env, &mut ()> for Echo {
-        type Output = Token;
-
-        fn forward(
-            &self,
-            device: &mut Device,
-            _: Env,
-            _: &mut (),
-            (_, cache): (Live<(), R>, &mut Token),
-        ) -> Token {
-            cache.to_hbm(&mut device.tdma)
-        }
-    }
-
-    /// A body whose one poll writes its token into its cache slot and the context it reads into
-    /// its place.
-    #[derive(DeviceSend)]
-    struct Catalog;
-
-    /// The body's state: the cache it writes, and the place the context it read goes to.
-    type Slots<'r> = (&'r mut Token, Token);
-
-    /// The body's node over a call of `R` rows.
-    struct Writes<'c, 's, 'r, R> {
-        call: Call<'c, Token, Token, R>,
-        slots: &'s mut Slots<'r>,
-        done: usize,
-    }
-
-    impl<R> schedule::Stream for Writes<'_, '_, '_, R> {
-        type Item = ();
-
-        fn poll_next(&mut self, device: &mut Device) -> Poll<Option<()>> {
-            if self.done < 1 {
-                self.done += 1;
-                let (cache, place) = &mut *self.slots;
-                (self.call.tokens.view()).to_hbm_view(&mut device.tdma, cache.view_mut());
-                (self.call.context.view()).to_hbm_view(&mut device.tdma, place.view_mut());
-            }
-            Poll::Ready(None)
-        }
-    }
-
-    impl<'c, 's, 'r, R> IntoStream<Empty<()>, Call<'c, Token, Token, R>, &'s mut Slots<'r>>
-        for &Catalog
-    {
-        type Stream = Writes<'c, 's, 'r, R>;
-
-        fn into_stream(
-            self,
-            call: Call<'c, Token, Token, R>,
-            slots: &'s mut Slots<'r>,
-            _: Empty<()>,
-        ) -> Self::Stream {
-            Writes {
-                call,
-                slots,
-                done: 0,
-            }
-        }
-    }
 
     /// The state of a toy readout over one rotary and one NoPE layer: units beside each layer's
     /// view of its cache in `caches`, `layer` building a layer's slot around the view. An
@@ -3202,40 +3136,6 @@ mod tests {
         };
         assert_eq!(logit, merged(2 * (TOKEN + 10) + 9));
         assert_ne!(logit, merged(2 * (TOKEN + 10 + 9)));
-    }
-
-    /// The body reads the context prepared from the call's history, and writes its state.
-    #[tokio::test(flavor = "current_thread")]
-    async fn prepares_before_the_body() {
-        use crate::tests::forward;
-        use furiosa_opt_std::runtime::launch;
-        axes![Eight = 8];
-        let _lease = DEVICE.lock().await;
-        let mut device = Device::new(forward.topology()).unwrap();
-        let mut upload = async |value: i32| -> Token {
-            HostTensor::<i32, m![1]>::from_vec(vec![value])
-                .to_hbm(&mut device.pdma)
-                .await
-                .unwrap()
-        };
-        let (tokens, history) = (upload(5).await, upload(7).await);
-        let (mut cache, place) = (upload(0).await, upload(0).await);
-        let live = count(1).to_hbm(&mut device.pdma).await.unwrap();
-        let mut input = Input::<Eight, _, _>::new(tokens, live, history);
-        let model = Model {
-            size: PhantomData::<qwen3::Size<"0.6B">>,
-            form: PhantomData::<form::Affine>,
-            body: Catalog,
-            rotary_emb: Echo,
-        };
-        let mut slots = (&mut cache, place);
-        launch(forward, (&mut device, &model, (), &mut slots, &mut input))
-            .await
-            .unwrap();
-        let (cache, place) = slots;
-        let read = place.to_host::<m![1]>(&mut device.pdma).await.unwrap();
-        let cache = cache.to_host::<m![1]>(&mut device.pdma).await.unwrap();
-        assert_eq!((read.into_vec(), cache.into_vec()), (vec![7], vec![5]));
     }
 
     /// A base model is read at the root of a checkpoint of its own layout and under `model` of a
