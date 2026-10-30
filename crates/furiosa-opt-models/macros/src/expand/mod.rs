@@ -5,8 +5,8 @@ use proc_macro2::{Ident, Span, TokenStream};
 use quote::{ToTokens, format_ident, quote};
 use syn::ext::IdentExt;
 use syn::{
-    Data, DeriveInput, Error, Fields, GenericParam, Generics, Member, Result, Type, TypeParamBound,
-    WherePredicate,
+    Data, DeriveInput, Error, Fields, GenericParam, Generics, Member, Result, Type, TypeParam,
+    TypeParamBound, WherePredicate,
 };
 
 use crate::attribute::{self, Read};
@@ -98,30 +98,9 @@ impl<'a> Shape<'a> {
         // `G::TIED_EMBEDDINGS` of the one parameter bounded by `Geometry`.
         let decides = |span: Span| -> Result<TokenStream> {
             let generics = &input.generics;
-            let geometry = |bound: &TypeParamBound| match bound {
-                TypeParamBound::Trait(t) => t
-                    .path
-                    .segments
-                    .last()
-                    .is_some_and(|s| s.ident == "Geometry"),
-                _ => false,
-            };
-            let declared = generics
-                .where_clause
-                .iter()
-                .flat_map(|clause| &clause.predicates)
-                .filter_map(|predicate| match predicate {
-                    WherePredicate::Type(t) if t.bounds.iter().any(geometry) => Some(&t.bounded_ty),
-                    _ => None,
-                });
             let params: Vec<&Ident> = generics
                 .type_params()
-                .filter(|param| {
-                    param.bounds.iter().any(geometry)
-                        || declared
-                            .clone()
-                            .any(|ty| matches!(ty, Type::Path(p) if p.path.is_ident(&param.ident)))
-                })
+                .filter(|param| bounds(generics, param).any(|bound| names(bound, "Geometry")))
                 .map(|param| &param.ident)
                 .collect();
             match params.as_slice() {
@@ -254,6 +233,32 @@ impl<'a> Shape<'a> {
                 _ => None,
             })
             .collect()
+    }
+}
+
+/// The bounds `generics` puts on `param`: its own, then those of the where clause.
+fn bounds<'g>(
+    generics: &'g Generics,
+    param: &'g TypeParam,
+) -> impl Iterator<Item = &'g TypeParamBound> {
+    let declared = (generics.where_clause.iter())
+        .flat_map(|clause| &clause.predicates)
+        .filter_map(move |predicate| match predicate {
+            WherePredicate::Type(t)
+                if matches!(&t.bounded_ty, Type::Path(p) if p.path.is_ident(&param.ident)) =>
+            {
+                Some(&t.bounds)
+            }
+            _ => None,
+        });
+    param.bounds.iter().chain(declared.flatten())
+}
+
+/// Whether `bound` is the trait `name`, matched on the last segment of its path.
+fn names(bound: &TypeParamBound, name: &str) -> bool {
+    match bound {
+        TypeParamBound::Trait(t) => t.path.segments.last().is_some_and(|s| s.ident == name),
+        _ => false,
     }
 }
 
