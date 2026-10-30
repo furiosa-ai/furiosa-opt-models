@@ -8,8 +8,9 @@
 //! - The envelope a launch is compiled for is the size's [`Decode`].
 
 use super::{CatalogBody, Groups, Hidden, LmHead};
-use crate::models::decoder::attention::{ForCausalLM, Geometry, Head, KvHeads};
-use crate::models::decoder::form::Affine;
+use crate::models::decoder::attention::{
+    ForCausalLM, ForSequenceClassification, Geometry, Head, KvHeads,
+};
 use crate::modules::attention::{self, key_value};
 use crate::modules::language::{self, Call, Selected};
 use crate::ops::attention::full::paged::{
@@ -17,6 +18,7 @@ use crate::ops::attention::full::paged::{
     chunks::{Cache, Chunks as Windows},
 };
 use crate::ops::embedding;
+use crate::ops::linear::affine::Columns;
 use crate::ops::normalization::Blocked;
 use crate::ops::rotary::{
     self, SplitHalf,
@@ -37,6 +39,13 @@ pub type Ids<S> = embedding::Ids<Capacity<S>>;
 /// A launch's next tokens, one I32 for each selected row in order; rows past them are unspecified.
 pub type Tokens<S> = HbmTensor<i32, Chip, m![{ Symbol<Capacity<S>> }]>;
 
+/// A launch's hidden values, a row for each selected row in order; rows past them are unspecified.
+pub type Values<S> = HbmTensor<bf16, Chip, m![{ Symbol<Capacity<S>> }, { Symbol<Hidden<S>> }]>;
+
+/// A launch's scores, label columns first, a row for each selected row in order; rows past them
+/// are unspecified.
+pub type Scores<S> = HbmTensor<f32, Chip, m![{ Symbol<Capacity<S>> }, { Symbol<Columns> }]>;
+
 /// A launch's input: its token IDs, live count and the operands its preparation reads.
 pub type Input<'a, S> = language::Input<Capacity<S>, Ids<S>, &'a Operands<S>>;
 
@@ -56,18 +65,20 @@ pub type Operands<S> = key_value::Operands<
 /// The rotation of a launch's rows, gathered from the positions' table it loads from the config.
 type Position<S> = SplitHalf<Head, Table<<S as Decode>::Positions, rotary::Row<Head>>>;
 
-/// The catalog's causal model of size `S` in form `P`.
-pub type Model<S, P> = Over<S, CatalogBody<S, P, bf16, Hbm>, P>;
-
-/// The causal model of size `S` over the body `B` of projections in form `P`, with the rotary table
-/// its launches gather their rows' rotation from.
+/// The base model over the body `B`, with the rotary table its launches gather their rows'
+/// rotation from.
 // The decoder tree's `Model` is named by its path: this module's `Model` is the catalog's.
-pub type Over<S, B, P = Affine> = ForCausalLM<
-    S,
-    crate::models::decoder::attention::Model<S, B, Position<S>, P>,
-    LmHead<S, Hbm>,
-    P,
->;
+pub type Over<S, B, P> = crate::models::decoder::attention::Model<S, B, Position<S>, P>;
+
+/// The catalog's base model of size `S` in form `P`.
+pub type Base<S, P> = Over<S, CatalogBody<S, P, bf16, Hbm>, P>;
+
+/// The catalog's causal model of size `S` in form `P`: the base model and the greedy head.
+pub type Model<S, P> = ForCausalLM<S, Base<S, P>, LmHead<S, Hbm>, P>;
+
+/// The catalog's sequence classifier of size `S` in form `P`: the base model and its score head.
+pub type Classifier<S, P> =
+    ForSequenceClassification<S, Base<S, P>, language::Classifier<Hidden<S>>, P>;
 
 /// The slots of an attention's front: its projections', then its norms'; none holds anything.
 type Front = (((), (), ()), (), ());
@@ -76,9 +87,19 @@ type Front = (((), (), ()), (), ());
 /// reads, and its output projection's), then its MLP's, which holds none.
 pub type Layer<'b> = ((Front, &'b mut Blocks<KvHeads, Head>, ()), ());
 
-/// A launch's state, as its decoder's readout takes it: its body's (the hidden rows the embedding
-/// writes, each layer's slot, the final norm's, which holds none), then its tokens.
-pub type State<'s, 'b, S> = &'s mut (
+/// A launch's body's state: the hidden rows the embedding writes and each layer's slot, then the
+/// final norm's, which holds none.
+pub type Body<'s, 'b, S> = &'s mut (
+    (
+        HbmTensor<bf16, Chip, Blocked<Hidden<S>, Capacity<S>>>,
+        <S as Geometry>::Layers<Layer<'b>>,
+    ),
+    (),
+);
+
+/// A launch's state: its body's, then the place `O` its head writes the selected rows' outputs in,
+/// their tokens by default.
+pub type State<'s, 'b, S, O = Tokens<S>> = &'s mut (
     (
         (
             HbmTensor<bf16, Chip, Blocked<Hidden<S>, Capacity<S>>>,
@@ -86,7 +107,7 @@ pub type State<'s, 'b, S> = &'s mut (
         ),
         (),
     ),
-    Tokens<S>,
+    O,
 );
 
 /// What a launch's nodes read beside its token IDs and live rows, prepared once before its first

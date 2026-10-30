@@ -33,7 +33,12 @@ use std::{io, marker::PhantomData};
 #[derive(DeviceSend, Load)]
 pub struct ForCausalLM {
     #[load(rename = "")]
-    pub model: launch::Over<Size, Body, form::Nvfp4BlockScaled<W4A16>>,
+    pub model: attention::ForCausalLM<
+        Size,
+        launch::Over<Size, Body, form::Nvfp4BlockScaled<W4A16>>,
+        qwen3::LmHead<Size, Hbm>,
+        form::Nvfp4BlockScaled<W4A16>,
+    >,
     #[load(rename = "", with = calibration)]
     pub calibration: Calibration,
 }
