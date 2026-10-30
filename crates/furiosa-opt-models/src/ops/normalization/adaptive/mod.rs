@@ -7,7 +7,7 @@
 use crate::Op;
 use crate::load::Load;
 use crate::ops::index::packed::{Packed, Rows, Table};
-use crate::ops::normalization::{Lanes, Root, Scale, Squares, Widen};
+use crate::ops::normalization::{Lanes, Scale, Squares, Widen};
 use crate::tensor::form::Weight;
 use furiosa_opt_std::prelude::*;
 use std::borrow::Borrow;
@@ -42,6 +42,11 @@ type StripLanes<W> = Lanes<
     m![W % 8],
     m![Strip % 8, W % 128 / 8, W % 8 / 4 % 2],
     m![W % 4],
+    m![Strip % 8, W % 128 / 8],
+    m![W % 8],
+    m![W % 8],
+    m![Strip % 32 / 8, 64],
+    m![Strip % 8, 1 # 8],
 >;
 
 impl<R: AxisName> Strips<R> {
@@ -187,32 +192,15 @@ where
                     ]>(tile)
                     .to_dm(&mut device.tdma)
             };
-            let inverse: RowOperand<Width, X> = {
-                let variance: DmTensor<f32, X, Half, m![Strip % 32 / 8, 64], m![Strip % 8, 1 # 8]> =
-                    Squares::<
-                        StripLanes<Width>,
-                        Width,
-                        m![Strip % 8],
-                        m![Width / 128],
-                        EPSILON,
-                    >::of(
-                        &mut device.main,
-                        rows.view(),
-                    )
-                    .vector_inter_slice_reduce::<m![Strip % 32 / 8, 64], m![Strip % 8]>(
-                        InterSliceReduceOpF32::Add,
-                    )
-                    .vector_final()
-                    .commit_trim::<m![1 # 8]>()
-                    .commit();
-                // SAFETY: every slice holds the same row statistic; each row keeps its address.
-                let variance: DmTensor<f32, X, Half, Slices<Width>, m![Strip % 8, 1 # 8]> =
-                    unsafe { variance.reshape() };
-                Root::<m![Strip % 8], m![1 # 8]>::of(&mut device.sub, variance.view(), |square| {
-                    square
-                })
-                .to_vrf()
-            };
+            let inverse: RowOperand<Width, X> = Squares::<
+                StripLanes<Width>,
+                Width,
+                m![Strip % 8],
+                m![Width / 128],
+                EPSILON,
+            >::inverse(
+                device, rows.view(), |square| square
+            );
             let normalized: Tile<bf16, Width, X> =
                 Scale::<StripLanes<Width>>::of(&mut device.main, rows.view(), &inverse, &weight)
                     .commit();

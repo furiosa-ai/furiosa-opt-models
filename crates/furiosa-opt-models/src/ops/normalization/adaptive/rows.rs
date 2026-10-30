@@ -15,7 +15,7 @@ use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
 
 use crate::ops::index::packed::{Group, Rows, Table};
-use crate::ops::normalization::{Lanes, Root, Squares, Widen};
+use crate::ops::normalization::{Lanes, Squares, Widen};
 use crate::specialize::diffusion::{Run, Spread};
 
 /// A strip of `2 * ROWS` rows: `ROWS` rows a cluster, `SLICES` slices a row, each `E` features
@@ -65,11 +65,16 @@ type Operand<W, X, E, const ROWS: usize, const SLICES: usize> =
 type RowOperand<W, X, E, const ROWS: usize, const SLICES: usize> =
     VrfTensor<f32, X, Half<E, ROWS, SLICES>, Slices<W, E, ROWS, SLICES>, m![1 # 8]>;
 /// How a slice's run of a row's features moves through a norm's statistic pass.
-type Quarters<W, E> = Lanes<
+type Quarters<W, E, const ROWS: usize, const SLICES: usize> = Lanes<
     m![W % ({ Symbol<E> }) / 8],
     m![W % 8],
     m![W % ({ Symbol<E> }) / 8, W % 8 / 4 % 2],
     m![W % 4],
+    m![W % ({ Symbol<E> }) / 8],
+    m![W % 8],
+    m![W % 8],
+    m![{ Symbol<Lines<E, ROWS, SLICES>> } % { ROWS }, { Broadcast<SLICES> }],
+    m![1 # 8],
 >;
 
 impl<E, const ROWS: usize, const SLICES: usize> Lines<E, ROWS, SLICES> {
@@ -190,31 +195,11 @@ impl<
             &super::AdaptiveRms<W, EPSILON, X, G>,
         ),
     ) -> Self::Output {
-        let variance: DmTensor<
-            f32,
-            X,
-            Half<E, ROWS, SLICES>,
-            m![{ Symbol<Self> } % { ROWS }, { Broadcast<SLICES> }],
-            m![1 # 8],
-        > = Squares::<Quarters<W, E>, W, m![1], m![W / ({ Symbol<E> })], EPSILON>::of(
-            &mut device.main,
+        Squares::<Quarters<W, E, ROWS, SLICES>, W, m![1], m![W / ({ Symbol<E> })], EPSILON>::inverse(
+            device,
             part.view(),
+            |square| square,
         )
-        .vector_inter_slice_reduce::<m![{ Symbol<Self> } % { ROWS }, { Broadcast<SLICES> }], m![1]>(
-            InterSliceReduceOpF32::Add,
-        )
-        .vector_final()
-        .commit_trim::<m![1 # 8]>()
-        .commit();
-        // SAFETY: every slice of a group holds its row's statistic; each row keeps its address.
-        let variance: DmTensor<
-            f32,
-            X,
-            Half<E, ROWS, SLICES>,
-            Slices<W, E, ROWS, SLICES>,
-            m![1 # 8],
-        > = unsafe { variance.reshape() };
-        Root::<m![1], m![1 # 8]>::of(&mut device.sub, variance.view(), |square| square).to_vrf()
     }
 }
 impl<W: AxisName, X: M, E: AxisName, const ROWS: usize, const SLICES: usize>

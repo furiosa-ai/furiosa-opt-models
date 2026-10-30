@@ -15,7 +15,7 @@ use super::rows::Narrow;
 use super::rows::Wide;
 use crate::Op;
 use crate::ops::index::packed::{Group, Join, Packed, Rows, Table};
-use crate::ops::normalization::{self, Root, Squares, Widen};
+use crate::ops::normalization::{self, Squares, Widen};
 use crate::specialize::diffusion::Run;
 
 /// Rows of a block of packed rows: 512 when the rows come in whole 512-row blocks, else 256.
@@ -82,6 +82,11 @@ type BlockLanes<R, W> = normalization::Lanes<
     m![W % 8],
     m![{ Bk<R> } % ({ Ln<R> }), W % ({ E<W> }) / 8, W % 8 / 4 % 2],
     m![W % 4],
+    m![{ Bk<R> } % ({ Ln<R> }), W % ({ E<W> }) / 8],
+    m![W % 8],
+    m![W % 8],
+    m![{ Bk<R> } % ({ Hb<R> }) / ({ Ln<R> }), 8],
+    m![{ Bk<R> } % ({ Ln<R> }), 1 # 8],
 >;
 
 /// A span `(first strip, strips, table row)` as its strips before the first whole block, the
@@ -195,41 +200,13 @@ impl<R: AxisName, W: AxisName, X: M, const EPSILON: usize, G>
         device: &mut Device,
         (part, _): (&Part<bf16, R, W, X>, &super::AdaptiveRms<W, EPSILON, X, G>),
     ) -> Self::Output {
-        let variance: DmTensor<
-            f32,
-            X,
-            Half<R>,
-            m![{ Bk<R> } % ({ Hb<R> }) / ({ Ln<R> }), 8],
-            m![{ Bk<R> } % ({ Ln<R> }), 1 # 8],
-        > =
-            Squares::<
-                BlockLanes<R, W>,
-                W,
-                m![{ Bk<R> } % ({ Ln<R> })],
-                m![W / ({ E<W> })],
-                EPSILON,
-            >::of(
-                &mut device.main,
-                part.view(),
-            )
-        .vector_inter_slice_reduce::<
-            m![{ Bk<R> } % ({ Hb<R> }) / ({ Ln<R> }), 8],
+        Squares::<
+            BlockLanes<R, W>,
+            W,
             m![{ Bk<R> } % ({ Ln<R> })],
-        >(
-            InterSliceReduceOpF32::Add,
-        )
-        .vector_final()
-        .commit_trim::<m![1 # 8]>()
-        .commit();
-        // SAFETY: every slice of a group holds its rows' statistics; each row keeps its address.
-        let variance: DmTensor<f32, X, Half<R>, Slices<R, W>, m![{ Bk<R> } % ({ Ln<R> }), 1 # 8]> =
-            unsafe { variance.reshape() };
-        Root::<m![{ Bk<R> } % ({ Ln<R> })], m![1 # 8]>::of(
-            &mut device.sub,
-            variance.view(),
-            |square| square,
-        )
-        .to_vrf()
+            m![W / ({ E<W> })],
+            EPSILON,
+        >::inverse(device, part.view(), |square| square)
     }
 }
 impl<R: AxisName, W: AxisName, X: M>

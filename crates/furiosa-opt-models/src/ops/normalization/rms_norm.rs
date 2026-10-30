@@ -295,12 +295,17 @@ where
 /// The FP32 vectors of the features the scaling pass keeps in its registers: the weight.
 const VECTORS: usize = 1;
 
-/// How a slice's part of a row moves through a norm's passes.
-type TileLanes<W> = Lanes<
+/// How a slice's part of a row of `R` moves through a norm's passes.
+type TileLanes<R, W> = Lanes<
     m![{ TilePart<W, VECTORS> } / 8],
     m![W % 8],
     m![{ TilePart<W, VECTORS> } / 8, W % 8 / 4 % 2],
     m![W % 4],
+    m![{ TilePart<W, VECTORS> } / 8],
+    m![W % 8],
+    m![W % 8],
+    m![R % ({ Symbol<Lines<W, VECTORS>> }), { Symbol<TileParts<W, VECTORS>> }],
+    m![1 # 8],
 >;
 
 /// Rows of `D` normalized by their RMS and the learned weight, rounded once to BF16, a tile at a
@@ -353,33 +358,14 @@ where
             |device: &mut Device,
              rows: &Tile<D, R, Width, VECTORS, Chips>,
              normalized: &mut Tile<bf16, R, Width, VECTORS, Chips>| {
-                let mean: DmTensor<
-                f32,
-                Chips,
-                m![R % ({ Symbol<TileRows<Width, VECTORS>> }) / ({ Symbol<Lines<Width, VECTORS>> })],
-                m![R % ({ Symbol<Lines<Width, VECTORS>> }), { Symbol<TileParts<Width, VECTORS>> }],
-                m![1 # 8],
-            > = Squares::<
-                TileLanes<Width>,
-                Width,
-                m![1],
-                m![Width / (Width / ({ Symbol<TileParts<Width, VECTORS>> }))],
-                EPSILON,
-            >::of(&mut device.main, rows.view())
-            .vector_inter_slice_reduce::<
-                m![R % ({ Symbol<Lines<Width, VECTORS>> }), { Symbol<TileParts<Width, VECTORS>> }],
-                m![1],
-            >(InterSliceReduceOpF32::Add)
-            .vector_final()
-            .commit_trim::<m![1 # 8]>()
-            .commit();
-                // SAFETY: every slice of a row holds the same statistic.
-                let mean: Tile<f32, R, Width, VECTORS, Chips, m![1 # 8]> =
-                    unsafe { mean.reshape() };
-                let inverse =
-                    Root::<m![1], m![1 # 8]>::of(&mut device.sub, mean.view(), |square| square)
-                        .to_vrf::<m![1 # 8]>();
-                Scale::<TileLanes<Width>>::of(&mut device.main, rows.view(), &inverse, &weight)
+                let inverse = Squares::<
+                    TileLanes<R, Width>,
+                    Width,
+                    m![1],
+                    m![Width / (Width / ({ Symbol<TileParts<Width, VECTORS>> }))],
+                    EPSILON,
+                >::inverse(device, rows.view(), |square| square);
+                Scale::<TileLanes<R, Width>>::of(&mut device.main, rows.view(), &inverse, &weight)
                     .commit_view(normalized.view_mut());
             };
         let (mut first, mut second): (
@@ -470,7 +456,8 @@ type Stream<'l, const U: Tu, Stage, X, C, S, T, P> =
 type Row<'l, const U: Tu, Stage, X, C, S, Rows> = Stream<'l, U, Stage, X, C, S, Rows, m![1 # 4]>;
 
 /// How a norm's passes move rows: `FetchTime` packets of `FetchPacket` from DM, FP32 `Time` packets
-/// of `Packet`, four-lane `Narrow` packets of `Half` for arithmetic, `Stored` values back to DM.
+/// of `Packet`, four-lane `Narrow` packets of `Half` for arithmetic, `Stored` values back to DM; a
+/// row's sums over its slices reduce into `Reduced`, which leaves its statistic as `Statistic`.
 pub(crate) struct Lanes<
     Time,
     Packet,
@@ -479,7 +466,13 @@ pub(crate) struct Lanes<
     FetchTime = Time,
     FetchPacket = Packet,
     Stored = Packet,
->(PhantomData<(Time, Packet, Narrow, Half, FetchTime, FetchPacket, Stored)>);
+    Reduced = (),
+    Statistic = (),
+>(
+    PhantomData<(Time, Packet, Narrow, Half)>,
+    PhantomData<(FetchTime, FetchPacket, Stored)>,
+    PhantomData<(Reduced, Statistic)>,
+);
 
 /// `mean(x²) + EPSILON` of each of the `Rows` rows over `Reduce`, the rows moved in `Lanes`;
 /// `EPSILON` holds epsilon's FP32 bits, split over the `Parts` slices a caller's reduction adds.
@@ -495,13 +488,15 @@ impl<
     FetchTime: M,
     FetchPacket: M,
     Stored: M,
+    Reduced,
+    Statistic,
     Reduce: AxisName,
     Rows: M,
     Parts: M,
     const EPSILON: usize,
 >
     Squares<
-        Lanes<Time, Packet, Narrow, Half, FetchTime, FetchPacket, Stored>,
+        Lanes<Time, Packet, Narrow, Half, FetchTime, FetchPacket, Stored, Reduced, Statistic>,
         Reduce,
         Rows,
         Parts,
@@ -528,6 +523,31 @@ impl<
             rows.vector_narrow_split::<Narrow, Half>()
                 .vector_mean_square::<Reduce, Rows, Parts, EPSILON>()
         }
+    }
+
+    /// `1 / sqrt(mean(x²) + epsilon)` of each row of `input`, in every slice that holds part of
+    /// the row; `epsilon` adds a loaded epsilon, or passes on a square that holds `EPSILON`.
+    pub(crate) fn inverse<D, X: M, C: M, S: M, E: M, Added>(
+        device: &mut Device,
+        input: DmTensorView<'_, D, X, C, S, E>,
+        epsilon: impl for<'l> FnOnce(
+            Row<'l, { Tu::Sub }, stage::Narrow, X, C, S, Rows>,
+        ) -> Row<'l, { Tu::Sub }, Added, X, C, S, Rows>,
+    ) -> VrfTensor<f32, X, C, S, Statistic>
+    where
+        D: MaterializableScalar + FetchCast<f32>,
+        Reduced: M,
+        Statistic: M,
+        Added: stage::Stage + stage::CanTransitionTo<stage::Fp>,
+    {
+        let squares: DmTensor<f32, X, C, Reduced, Statistic> = Self::of(&mut device.main, input)
+            .vector_inter_slice_reduce::<Reduced, Rows>(InterSliceReduceOpF32::Add)
+            .vector_final()
+            .commit_trim::<m![1 # 8]>()
+            .commit();
+        // SAFETY: the reduction leaves each row's statistic in every slice of the row, in place.
+        let squares: DmTensor<f32, X, C, S, Statistic> = unsafe { squares.reshape() };
+        Root::<Rows, m![1 # 8]>::of(&mut device.sub, squares.view(), epsilon).to_vrf()
     }
 }
 
@@ -632,8 +652,17 @@ impl<Rows: M, Fetched: M> Root<Rows, Fetched> {
 /// Rows moved in `Lanes`, times their inverse root mean square and the gain, rounded once to BF16.
 pub(crate) struct Scale<Lanes>(PhantomData<Lanes>);
 
-impl<Time: M, Packet: M, Narrow: M, Half: M, FetchTime: M, FetchPacket: M, Stored: M>
-    Scale<Lanes<Time, Packet, Narrow, Half, FetchTime, FetchPacket, Stored>>
+impl<
+    Time: M,
+    Packet: M,
+    Narrow: M,
+    Half: M,
+    FetchTime: M,
+    FetchPacket: M,
+    Stored: M,
+    Reduced,
+    Statistic,
+> Scale<Lanes<Time, Packet, Narrow, Half, FetchTime, FetchPacket, Stored, Reduced, Statistic>>
 {
     /// Each row of `input` times its `inverse` and the `gain`, as the stream its caller commits.
     pub(crate) fn of<'l, D, X: M, C: M, S: M, E: M, R: M, G>(
@@ -674,8 +703,17 @@ impl<Time: M, Packet: M, Narrow: M, Half: M, FetchTime: M, FetchPacket: M, Store
 }
 
 /// How a [`Spread`]'s rows move through a norm's passes.
-type SpreadLanes<Width, Rows> =
-    Lanes<Time<Width, Rows>, m![Width % 8], Narrow<Width, Rows>, m![Width % 4]>;
+type SpreadLanes<Width, Rows> = Lanes<
+    Time<Width, Rows>,
+    m![Width % 8],
+    Narrow<Width, Rows>,
+    m![Width % 4],
+    Time<Width, Rows>,
+    m![Width % 8],
+    m![Width % 8],
+    Reduced,
+    m![{ Rows }, 1 # 8],
+>;
 
 /// The feature slices a row spans, whose sums the norm reduces.
 type Parts<Width> = m![Width / ({ Symbol<Chunk<Width>> })];
@@ -690,20 +728,12 @@ impl<Width: AxisName, const EPSILON: usize, Chips: M, Parameter: Learned<Width, 
         device: &'l mut Device,
         input: DmTensorView<'l, bf16, Chips, Cluster, FeatureSlices<Width>, E>,
     ) -> Commit<'l, Width, Rows, Chips> {
-        let variance: DmTensor<f32, Chips, Cluster, Reduced, m![{ Rows }, 1 # 8]> =
-            Squares::<SpreadLanes<Width, Rows>, Width, Rows, Parts<Width>, EPSILON>::of(
-                &mut device.main,
+        let inverse =
+            Squares::<SpreadLanes<Width, Rows>, Width, Rows, Parts<Width>, EPSILON>::inverse(
+                device,
                 input.clone(),
-            )
-            .vector_inter_slice_reduce::<Reduced, Rows>(InterSliceReduceOpF32::Add)
-            .vector_final()
-            .commit_trim::<m![1 # 8]>()
-            .commit();
-        // Every slice holds the same row scalar; each row keeps its original address.
-        let variance: DmTensor<f32, Chips, Cluster, FeatureSlices<Width>, m![{ Rows }, 1 # 8]> =
-            unsafe { variance.reshape() };
-        let inverse: VrfTensor<f32, Chips, Cluster, FeatureSlices<Width>, m![{ Rows }, 1 # 8]> =
-            Root::<Rows, m![1 # 8]>::of(&mut device.sub, variance.view(), |square| square).to_vrf();
+                |square| square,
+            );
         // The learned scale is shared by every row.
         let scale = self.weight.lanes(device);
         Scale::<SpreadLanes<Width, Rows>>::of(&mut device.main, input, &inverse, &scale)
@@ -747,23 +777,12 @@ where
     let epsilon: DmTensor<f32, Chips, Cluster, FeatureSlices<Width>, m![1 # 8]> =
         epsilon.to_dm(&mut device.tdma);
     let epsilon = scalar::register(device, &epsilon);
-    let variance: DmTensor<f32, Chips, Cluster, Reduced, m![Rows, 1 # 8]> =
-        Squares::<SpreadLanes<Width, m![Rows]>, Width, m![Rows], Parts<Width>, 0>::of(
-            &mut device.main,
+    let inverse =
+        Squares::<SpreadLanes<Width, m![Rows]>, Width, m![Rows], Parts<Width>, 0>::inverse(
+            device,
             input.view(),
-        )
-        .vector_inter_slice_reduce::<Reduced, m![Rows]>(InterSliceReduceOpF32::Add)
-        .vector_final()
-        .commit_trim::<m![1 # 8]>()
-        .commit();
-    // Every slice holds the same row scalar; each row keeps its original address.
-    let variance: DmTensor<f32, Chips, Cluster, FeatureSlices<Width>, m![Rows, 1 # 8]> =
-        unsafe { variance.reshape() };
-    let inverse: VrfTensor<f32, Chips, Cluster, FeatureSlices<Width>, m![Rows, 1 # 8]> =
-        Root::<m![Rows], m![1 # 8]>::of(&mut device.sub, variance.view(), |square| {
-            square.vector_fp_binary(FpBinaryOp::AddF, &epsilon)
-        })
-        .to_vrf();
+            |square| square.vector_fp_binary(FpBinaryOp::AddF, &epsilon),
+        );
     Scale::<SpreadLanes<Width, m![Rows]>>::of(&mut device.main, input.view(), &inverse, gain)
         .commit()
 }
