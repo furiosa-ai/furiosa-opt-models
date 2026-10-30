@@ -961,66 +961,39 @@ impl<Head: AxisName, Rotated: AxisName, D: Scalar, Chips: M> Rotary<Head, Rotate
     }
 }
 
-impl<'q, 'k, Head: AxisName, Width: AxisName, R: AxisName, Chips: M>
-    crate::Op<(
-        (
-            &'q HbmTensor<bf16, Chips, m![R, Width]>,
-            &'k HbmTensor<bf16, Chips, m![R, Width]>,
-        ),
-        &Rotation<Head, Chips, R>,
-    )> for Rotary<Head, Head, bf16, Chips>
-{
-    type Output = (
-        HbmTensor<bf16, Chips, m![R, Width]>,
-        HbmTensor<bf16, Chips, m![R, Width]>,
-    );
-
-    fn forward(
-        &self,
-        device: &mut Device,
-        ((query, key), rotation): (
-            (
-                &'q HbmTensor<bf16, Chips, m![R, Width]>,
-                &'k HbmTensor<bf16, Chips, m![R, Width]>,
-            ),
-            &Rotation<Head, Chips, R>,
-        ),
-    ) -> Self::Output {
-        (
-            Heads::<Width, R, Head, Chips, _>(PhantomData).forward(&mut *device, (query, rotation)),
-            Heads::<Width, R, Head, Chips, _>(PhantomData).forward(device, (key, rotation)),
-        )
-    }
+/// Head rows in HBM a rotation takes a tile at a time, row-major or head-major, `Width` features
+/// a row.
+trait Features {
+    type Width: AxisName;
 }
 
-impl<'q, 'k, Head: AxisName, Width: AxisName, R: AxisName, Chips: M>
-    crate::Op<(
-        (
-            &'q tiles::Major<R, Width, Head, Chips>,
-            &'k tiles::Major<R, Width, Head, Chips>,
-        ),
-        &Rotation<Head, Chips, R>,
-    )> for Rotary<Head, Head, bf16, Chips>
+impl<R: AxisName, Width: AxisName, Chips: M> Features for HbmTensor<bf16, Chips, m![R, Width]> {
+    type Width = Width;
+}
+
+impl<R: AxisName, Width: AxisName, Head: AxisName, Chips: M> Features
+    for tiles::Major<R, Width, Head, Chips>
 {
-    type Output = (
-        tiles::Major<R, Width, Head, Chips>,
-        tiles::Major<R, Width, Head, Chips>,
-    );
+    type Width = Width;
+}
+
+/// The query's and the key's rows each rotated on their own.
+impl<'q, 'k, Head: AxisName, R: AxisName, Chips: M, L>
+    crate::Op<((&'q L, &'k L), &Rotation<Head, Chips, R>)> for Rotary<Head, Head, bf16, Chips>
+where
+    L: Features + tiles::Layout<R, L::Width, Head, Chips>,
+{
+    type Output = (L, L);
 
     fn forward(
         &self,
         device: &mut Device,
-        ((query, key), rotation): (
-            (
-                &'q tiles::Major<R, Width, Head, Chips>,
-                &'k tiles::Major<R, Width, Head, Chips>,
-            ),
-            &Rotation<Head, Chips, R>,
-        ),
+        ((query, key), rotation): ((&'q L, &'k L), &Rotation<Head, Chips, R>),
     ) -> Self::Output {
         (
-            Heads::<Width, R, Head, Chips, _>(PhantomData).forward(&mut *device, (query, rotation)),
-            Heads::<Width, R, Head, Chips, _>(PhantomData).forward(device, (key, rotation)),
+            Heads::<L::Width, R, Head, Chips, _>(PhantomData)
+                .forward(&mut *device, (query, rotation)),
+            Heads::<L::Width, R, Head, Chips, _>(PhantomData).forward(device, (key, rotation)),
         )
     }
 }
@@ -1067,61 +1040,20 @@ where
     }
 }
 
-impl<Head: AxisName, Width: AxisName, R: AxisName, Chips: M>
-    crate::Op<(
-        &(
-            &HbmTensor<bf16, Chips, m![R, Width]>,
-            &HbmTensor<bf16, Chips, m![R, Width]>,
-        ),
-        &Rotation<Head, Chips, R>,
-    )> for Rotary<Head, Head, bf16, Chips>
+/// The query's and the key's rows rotated together, each tile's coefficients fetched once for both.
+impl<Head: AxisName, R: AxisName, Chips: M, L> crate::Op<(&(&L, &L), &Rotation<Head, Chips, R>)>
+    for Rotary<Head, Head, bf16, Chips>
+where
+    L: Features + tiles::Layout<R, L::Width, Head, Chips>,
 {
-    type Output = (
-        HbmTensor<bf16, Chips, m![R, Width]>,
-        HbmTensor<bf16, Chips, m![R, Width]>,
-    );
+    type Output = (L, L);
 
     fn forward(
         &self,
         device: &mut Device,
-        (rows, rotation): (
-            &(
-                &HbmTensor<bf16, Chips, m![R, Width]>,
-                &HbmTensor<bf16, Chips, m![R, Width]>,
-            ),
-            &Rotation<Head, Chips, R>,
-        ),
+        (rows, rotation): (&(&L, &L), &Rotation<Head, Chips, R>),
     ) -> Self::Output {
-        Heads::<Width, R, Head, Chips, _>(PhantomData).forward(device, (*rows, rotation))
-    }
-}
-
-impl<Head: AxisName, Width: AxisName, R: AxisName, Chips: M>
-    crate::Op<(
-        &(
-            &tiles::Major<R, Width, Head, Chips>,
-            &tiles::Major<R, Width, Head, Chips>,
-        ),
-        &Rotation<Head, Chips, R>,
-    )> for Rotary<Head, Head, bf16, Chips>
-{
-    type Output = (
-        tiles::Major<R, Width, Head, Chips>,
-        tiles::Major<R, Width, Head, Chips>,
-    );
-
-    fn forward(
-        &self,
-        device: &mut Device,
-        (rows, rotation): (
-            &(
-                &tiles::Major<R, Width, Head, Chips>,
-                &tiles::Major<R, Width, Head, Chips>,
-            ),
-            &Rotation<Head, Chips, R>,
-        ),
-    ) -> Self::Output {
-        Heads::<Width, R, Head, Chips, _>(PhantomData).forward(device, (*rows, rotation))
+        Heads::<L::Width, R, Head, Chips, _>(PhantomData).forward(device, (*rows, rotation))
     }
 }
 
