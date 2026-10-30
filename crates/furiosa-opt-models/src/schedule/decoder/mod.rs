@@ -480,17 +480,17 @@ impl<'m, 'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, S>, Env, launch::
         for index in 0..LAYERS - 1 {
             let (layer, next) = (layers.layer(index), layers.layer(index + 1));
             let mut projecting = attend(&mut *device, &layer, &mut slots[index], &mut places);
-            let mut ahead = Places::new();
+            // In place, so the loop carries one state: a tile overwrites only its own rows, read just
+            // before, and the attention has read every store.
             for span in 0..spans {
                 let tile = live.tile::<Span>(span);
                 let input = tile.with(places.input.fill(&mut *device, tile));
                 let tokenwise = Tokenwise(&layer, &next);
                 let output = (tile.with(&places.attended), &mut projecting);
                 let rows =
-                    tokenwise.forward(&mut *device, call, &mut ahead.stored, (output, input));
-                ahead.input.spill(&mut *device, rows.value(), tile);
+                    tokenwise.forward(&mut *device, call, &mut places.stored, (output, input));
+                places.input.spill(&mut *device, rows.value(), tile);
             }
-            places = ahead;
         }
         let last = layers.layer(LAYERS - 1);
         let mut projecting = attend(&mut *device, &last, &mut slots[LAYERS - 1], &mut places);
