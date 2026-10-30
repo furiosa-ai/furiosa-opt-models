@@ -47,7 +47,6 @@ use crate::tensor::memory::Hbm;
 use crate::tensor::parallel::Chip;
 use crate::{Sequential, Then};
 use core::marker::PhantomData;
-use core::task::Poll;
 use furiosa_opt_std::prelude::*;
 
 mod affine;
@@ -312,23 +311,18 @@ fn end(
     let (gate_up, down) = mlp.0.parts();
     let tile = input.with(());
     let gain = crate::Op::forward(&Stage, &mut *device, &norm.0);
-    let mut step = |device: &mut Device| {
-        output.forward(
-            device,
-            (),
-            &mut (),
-            (&mut *landed, &attended.value().0, tile),
-        )
-    };
+    let rows = attended.with(&attended.value().0);
     // The first gate/up pair lands behind the output projection's rows, under its passes.
-    let _ = step(&mut *device);
+    let begun = output.forward(
+        &mut *device,
+        (),
+        &mut (),
+        Begin(Begin((&mut *landed, rows))),
+    );
     let ahead = gate_up.forward(&mut *device, (), &mut (), Begin(()));
-    let _ = step(&mut *device);
+    let begun = output.forward(&mut *device, (), &mut (), begun);
     let first = down.forward(&mut *device, (), &mut (), Begin(0usize));
-    let projected = match step(&mut *device) {
-        Poll::Ready(rows) => tile.with(rows),
-        Poll::Pending => tile.with(Owned::new()),
-    };
+    let projected = tile.with(output.forward(&mut *device, (), &mut (), begun));
     let attended = sum.forward(&mut *device, (), &mut (), (&input, &projected));
     let normalized = gain.forward(&mut *device, (), &mut (), &attended);
     let rows = tile.with(normalized.value());
@@ -494,13 +488,13 @@ impl<'m, 'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, S>, Env, launch::
             };
             let rows = (&places.stored.queries, &history, &context.read);
             // The output projection's weights land while the attention's last history is in flight.
-            let mut staged = crate::ops::linear::output::fp8::Stored::<Width, Queries>::empty();
-            let boundary = (&output.0, &mut staged);
+            let mut projecting = output.forward(&mut *device, (), &mut (), Begin(()));
+            let boundary = (&output.0, &mut projecting);
             let rows = (rows.0, rows.1, rows.2, boundary, &mut places.attended.0);
             attend.forward(&mut *device, (), &mut (), rows);
             let rows = (deferred, &places.stored.retained, &context.write);
-            stage.forward(&mut *device, (), &mut *pool, rows);
-            output.forward(device, (), &mut (), Begin(staged))
+            stage.forward(device, (), &mut *pool, rows);
+            projecting
         };
         let mut places = Places::new();
         let first = layers.layer(0);
