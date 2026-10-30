@@ -12,7 +12,7 @@ use crate::tensor::form::{Projections, fp8};
 use crate::tensor::mapping;
 use activation::*;
 use contract::*;
-pub(crate) use down::Staging;
+pub(crate) use down::Ready;
 use input::*;
 use spread::*;
 use transfer::*;
