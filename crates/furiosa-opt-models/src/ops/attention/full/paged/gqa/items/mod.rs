@@ -200,9 +200,13 @@ where
                 Q::SIZE == GroupTile::<Groups>::SIZE,
                 "an item row holds one group tile of every KV head"
             );
+            let local = LocalHeads::<KvHeads>::SIZE;
             assert!(
-                KvHeads::SIZE >= 4 && KvHeads::SIZE <= 8,
-                "a launch's KV heads fill the two clusters, two to four a cluster"
+                KvHeads::SIZE.is_multiple_of(local)
+                    && KvHeads::SIZE / local <= 2
+                    && 4usize.is_multiple_of(local),
+                "a launch's KV heads split evenly over one or two clusters, a cluster's evenly \
+                 over a column's four head slices"
             );
         };
         let tile: Attention<KvHeads, Q, Head> = attention::Attention {
@@ -265,9 +269,12 @@ pub(crate) mod tests {
     type Reach = Rows<1280>;
     type Layout<H, G, D> = m![{ Symbol<Tiled<Reach, G>> }, H, { Symbol<GroupTile<G>> }, D];
     type Queries<H, G, D> = HbmTensor<bf16, Chip, Layout<H, G, D>>;
+    pub(crate) type Wide = geometry::Head<256>;
 
     /// The score multiplier of 128-wide heads, `1 / sqrt(128)`, as FP32 bits.
     pub(crate) const SCALE: usize = geometry::scale(Head::SIZE);
+    /// A unit score multiplier, as FP32 bits.
+    pub(crate) const UNIT: usize = 1.0_f32.to_bits() as usize;
     /// Keys of each of 32 short histories, 1,088 cached and the current one, and of the long one
     /// that rows past them read.
     pub(crate) const KEYS: usize = 1089;
@@ -796,6 +803,28 @@ pub(crate) mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Rows of 256-wide heads, two query groups to each of eight KV heads, under a unit score
+    /// multiplier attend as a host softmax does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn attends_each_live_row_of_wide_heads() {
+        let _lease = DEVICE.lock().await;
+        let mut device = Device::new(attend_items.topology()).unwrap();
+        let (mut eight, firsts) = pool::<KvHeads, Wide>(&mut device).await;
+        let device = &mut device;
+        let cases = [
+            Vec::new(),
+            vec![KEYS; 1],
+            (0..17).map(|row| MIXED[row % 16]).collect(),
+            vec![25; 32],
+            vec![16385, 1, LONG],
+        ];
+        for tiling in [Tiling::Adaptive, Tiling::Fixed] {
+            let cases = (&cases[..], tiling);
+            attends::<KvHeads, Pairs, Wide, UNIT, WAVES>(device, (&mut eight, &firsts), cases)
+                .await;
         }
     }
 }

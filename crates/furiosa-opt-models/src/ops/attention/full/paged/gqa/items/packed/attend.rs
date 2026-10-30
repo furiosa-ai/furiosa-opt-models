@@ -46,25 +46,30 @@ where
         // Wave `wave`'s history, in flight: a column's block rounds, each block's 16 tokens four
         // on each of its token slices.
         let history = |context: &mut Device, wave: usize| -> Self::PackedInDm {
-            let tables = &items.tables;
-            let indices = &Tables::wave(&tables.entries, wave);
+            let indices = &Tables::wave(&items.entries, wave);
             let read = Read {
                 pool: pool.1,
                 indices,
                 output: PhantomData,
             };
-            let lengths = &Tables::wave(&tables.lengths, wave);
+            let lengths = &Tables::wave(&items.tables.lengths, wave);
             let prefix = Prefix {
                 read,
                 lengths,
                 offset: 0,
-                sparse: PhantomData::<m![Round]>,
+                sparse: PhantomData::<Symbol<Round<KvHeads, Head>>>,
             };
             let in_dm: Self::PackedDm<
                 bf16,
-                m![Round, Block % 4, KeyValue, KvHeads % ({ Local<KvHeads> }), Head],
+                m![
+                    { Symbol<Round<KvHeads, Head>> },
+                    Block % 4,
+                    KeyValue,
+                    KvHeads % ({ Local<KvHeads> }),
+                    Head
+                ],
             > = pool.0.forward(&mut *context, env, &mut (), prefix);
-            // SAFETY: a slice's block rounds of four tokens each are its 64 slots in order.
+            // SAFETY: a slice's block rounds of four tokens each are its slots in order.
             unsafe { in_dm.reshape() }
         };
         // Pair `pair`'s queries and lane limits into their halves of `lanes`: a column's two rows
@@ -183,7 +188,7 @@ where
                 .fetch::<m![Pack], m![1 # 8]>()
                 .collect::<m![Pack], m![1 # 8]>()
                 .to_vrf();
-            self.attend::<m![Pack, Groups], m![Pack, Slot / 8], _, _, _, _, _, _>(
+            self.attend::<m![Pack, Groups], Self::PackedUnits, _, _, _, _, _, _>(
                 context,
                 ((&heads, &limit), (keys, in_dm)),
                 (shape.units, shape.depth),

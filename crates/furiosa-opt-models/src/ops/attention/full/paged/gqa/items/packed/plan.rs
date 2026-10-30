@@ -1,7 +1,7 @@
 //! A launch's packed rows as work items, planned on the host from the rows' compact history.
 //!
-//! - A row of `keys` keys holds `ceil(keys / 16)` blocks, at most 16384 keys: a cluster's
-//!   columns' every block round.
+//! - A row of `keys` keys holds `ceil(keys / 16)` blocks, at most a cluster's columns' every
+//!   block round: 16384 keys at 64 slots a slice.
 //! - A group of `C` columns holds one row a lane, in row order: column `c` of a group takes block
 //!   `b` of each of its lanes' rows when `b % C = c`, in block round `b / C`, lane one's rounds
 //!   from a launch-wide `half` on.
@@ -25,10 +25,6 @@ pub(in super::super) const ARRAYS: usize = 9;
 const FLIT: usize = 8;
 /// Tokens of a block on each token slice of its column.
 const QUAD: usize = 4;
-/// Keys one column holds: its every block round.
-pub(in super::super) const COLUMN: usize = Round::SIZE * Block::SIZE;
-/// Keys a packed row holds at most: every block round of every column of a cluster.
-const SEGMENT: usize = Column::SIZE * COLUMN;
 /// The key position of a slot its lane never reads: above every limit.
 const UNSEEN: i32 = i32::MAX / 2;
 
@@ -51,10 +47,11 @@ struct Placement {
 }
 
 impl Placement {
-    /// The placement of items of `blocks` blocks each tiled as `tiling` says: adaptively the span
-    /// and lanes of fewest waves, then fewest live lane slots, then the narrowest span, then one
-    /// lane; fixed, one column and one lane a group.
-    fn of(blocks: &[usize], tiling: Tiling) -> Self {
+    /// The placement of items of `blocks` blocks each tiled as `tiling` says, in the columns of
+    /// `KvHeads` KV heads of `Head` channels: adaptively the span and lanes of fewest waves, then
+    /// fewest live lane slots, then the narrowest span, then one lane; fixed, one column and one
+    /// lane a group.
+    fn of<KvHeads: AxisName, Head: AxisName>(blocks: &[usize], tiling: Tiling) -> Self {
         // Items in row order, one a lane of a group of `columns` columns, if every column holds
         // its lanes' rounds.
         let place = |columns: usize, lanes: usize| {
@@ -67,7 +64,7 @@ impl Placement {
             };
             let half = longest(0);
             let rounds = half + if lanes > 1 { longest(1) } else { 0 };
-            (rounds <= Round::SIZE).then_some(Self {
+            (rounds <= Round::<KvHeads, Head>::SIZE).then_some(Self {
                 columns,
                 lanes,
                 half,
@@ -92,7 +89,7 @@ impl Placement {
         };
         placements
             .min_by_key(cost)
-            .expect("a row of at most 16384 keys fits every column")
+            .expect("a row of at most a segment's keys fits every column")
     }
 
     /// The waves `rows` rows take in groups of `columns` columns holding `lanes` rows each.
@@ -107,6 +104,11 @@ impl Placement {
 }
 
 impl Plan {
+    /// Keys one column holds: its every block round.
+    pub(in super::super) const fn column<KvHeads: AxisName, Head: AxisName>() -> usize {
+        Round::<KvHeads, Head>::SIZE * Block::SIZE
+    }
+
     /// The items of packed rows `segments`, whose block IDs are `ids`, tiled as `tiling` says;
     /// `Reach` holds the attended rows, its last [`SINKS`] the column lanes' sinks.
     pub(in super::super) fn new<KvHeads: AxisName, G: AxisName, Head: AxisName, Reach: AxisName>(
@@ -116,12 +118,13 @@ impl Plan {
     ) -> Self {
         let int = |value: usize| i32::try_from(value).expect("a table value fits i32");
         let keys = Self::keys(segments);
+        let segment = Column::SIZE * Self::column::<KvHeads, Head>();
         assert!(
-            keys.iter().all(|&keys| keys <= SEGMENT),
+            keys.iter().all(|&keys| keys <= segment),
             "a packed row exceeds its columns"
         );
         let blocks: Vec<usize> = keys.iter().map(|keys| keys.div_ceil(Block::SIZE)).collect();
-        let placement = Placement::of(&blocks, tiling);
+        let placement = Placement::of::<KvHeads, Head>(&blocks, tiling);
         let Placement {
             columns,
             lanes,
@@ -134,7 +137,7 @@ impl Plan {
         // Every column lane of the waves rounded up to a pair: the packed body moves two waves'
         // queries, limits and rows a transfer.
         let cells = ((waves + 1) & !1) * Column::SIZE * Pack::SIZE;
-        let mut entries = vec![0; cells / Pack::SIZE * Round::SIZE];
+        let mut entries = vec![0; cells / Pack::SIZE * Round::<KvHeads, Head>::SIZE];
         let mut lengths = vec![0; cells / Pack::SIZE];
         let [mut queries, mut outputs] = [(); 2].map(|()| vec![0; cells]);
         let mut limits = vec![0; cells * FLIT];
@@ -162,7 +165,7 @@ impl Plan {
             );
             let table = usize::try_from(segments[row][TABLE]).expect("a table index");
             for round in 0..rounds {
-                entries[column * Round::SIZE + base + round] =
+                entries[column * Round::<KvHeads, Head>::SIZE + base + round] =
                     ids[table + round * columns + place] * Blocks::<KvHeads, Head>::BLOCK_STRIDE;
             }
             if rounds > 0 {
@@ -178,9 +181,9 @@ impl Plan {
         let slices = Block::SIZE / QUAD;
         let key = |at: usize| {
             let (lane, token, slot) = (
-                at / (slices * Slot::SIZE),
-                at / Slot::SIZE % slices,
-                at % Slot::SIZE,
+                at / (slices * Slot::<KvHeads, Head>::SIZE),
+                at / Slot::<KvHeads, Head>::SIZE % slices,
+                at % Slot::<KvHeads, Head>::SIZE,
             );
             let (round, base) = (slot / QUAD, lane * half);
             match lane < lanes && round >= base {
@@ -195,12 +198,12 @@ impl Plan {
                 1,
                 1,
                 1,
-                Waves::SIZE * Column::SIZE * Round::SIZE,
+                Waves::SIZE * Column::SIZE * Round::<KvHeads, Head>::SIZE,
                 Waves::SIZE * Column::SIZE,
                 capacity,
                 capacity,
                 capacity * FLIT,
-                <m![Pack, Block / 4, Slot]>::SIZE,
+                <m![Pack, Block / 4, { Symbol<Slot<KvHeads, Head>> }]>::SIZE,
             ]
         };
         Self {
@@ -219,13 +222,15 @@ impl Plan {
         }
     }
 
-    /// The waves packed rows `segments` fill.
-    pub(in super::super) fn waves(segments: &[&[i32; FIELDS]]) -> usize {
+    /// The waves packed rows `segments` of `KvHeads` KV heads of `Head` channels fill.
+    pub(in super::super) fn waves<KvHeads: AxisName, Head: AxisName>(
+        segments: &[&[i32; FIELDS]],
+    ) -> usize {
         let blocks: Vec<usize> = Self::keys(segments)
             .iter()
             .map(|keys| keys.div_ceil(Block::SIZE))
             .collect();
-        Placement::of(&blocks, Tiling::Adaptive).waves
+        Placement::of::<KvHeads, Head>(&blocks, Tiling::Adaptive).waves
     }
 
     /// Whether `rows` packed rows fit the compiled waves, tiled fixed: one column and one lane a
@@ -307,8 +312,9 @@ mod tests {
             let gathered = |column: usize| image(4)[wave * Column::SIZE + column] as usize;
             let longest = (0..Column::SIZE).map(gathered).max().unwrap_or(0);
             for column in 0..Column::SIZE {
-                let entry =
-                    |round: usize| image(3)[(wave * Column::SIZE + column) * Round::SIZE + round];
+                let entry = |round: usize| {
+                    image(3)[(wave * Column::SIZE + column) * Round::<KvHeads, Head>::SIZE + round]
+                };
                 for round in 0..longest {
                     let id = entry(round) / BLOCK_STRIDE;
                     assert!(
@@ -316,11 +322,13 @@ mod tests {
                         "column {column} reads block {id}"
                     );
                 }
-                let slots = (0..Block::SIZE / QUAD)
-                    .flat_map(|token| (0..Slot::SIZE).map(move |slot| (token, slot)));
+                let slots = (0..Block::SIZE / QUAD).flat_map(|token| {
+                    (0..Slot::<KvHeads, Head>::SIZE).map(move |slot| (token, slot))
+                });
                 for (token, slot) in slots {
                     let admits = |lane: usize| {
-                        image(8)[(lane * Block::SIZE / QUAD + token) * Slot::SIZE + slot]
+                        image(8)[(lane * Block::SIZE / QUAD + token) * Slot::<KvHeads, Head>::SIZE
+                            + slot]
                             < image(7)[cell(wave, column, lane) * FLIT]
                     };
                     let lanes: Vec<usize> = (0..Pack::SIZE).filter(|&lane| admits(lane)).collect();
@@ -391,8 +399,10 @@ mod tests {
             (1, 16384, (256, 1, 64, 1)),
         ];
         for (rows, keys, expected) in cells {
-            let placement =
-                Placement::of(&vec![keys.div_ceil(Block::SIZE); rows], Tiling::Adaptive);
+            let placement = Placement::of::<KvHeads, Head>(
+                &vec![keys.div_ceil(Block::SIZE); rows],
+                Tiling::Adaptive,
+            );
             let Placement {
                 columns,
                 lanes,
@@ -402,7 +412,10 @@ mod tests {
             let found = (QUAD * columns, lanes, 8 * placement.units(), waves);
             assert_eq!(found, expected, "{rows} rows of {keys} keys");
         }
-        assert_eq!(Placement::of(&[], Tiling::Adaptive).waves, 0);
+        assert_eq!(
+            Placement::of::<KvHeads, Head>(&[], Tiling::Adaptive).waves,
+            0
+        );
     }
 
     /// Row counts at and around every wave boundary of the gate's lengths, within the launch's

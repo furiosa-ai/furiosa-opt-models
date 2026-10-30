@@ -6,7 +6,8 @@
 
 use std::marker::ConstParamTy;
 
-use furiosa_opt_std::prelude::AxisName;
+use crate::tensor::cache::KeyValue;
+use furiosa_opt_std::prelude::{AxisName, bf16};
 
 /// How a decode call of a model is compiled today, by the model's size: the rows of a call, the
 /// history each row attends, and the envelope one launch of the catalog model is compiled for.
@@ -52,3 +53,18 @@ pub const DECODES: usize = 1024;
 
 /// Items a merge combines into one row.
 pub const INPUTS: usize = 64;
+
+/// Slots each slice holds of a work item's landed history, a key and a value of `heads` KV heads
+/// of `head` BF16 channels a slot: 64, or fewer so a landing takes at most a quarter of the slice's
+/// data memory and the two a domain keeps in flight leave half of it to the rest of the layer.
+pub(crate) const fn landing(head: usize, heads: usize) -> usize {
+    let mut slots = 64;
+    while slots * KeyValue::SIZE * heads * head * size_of::<bf16>() > super::DM / 4 {
+        slots /= 2;
+    }
+    assert!(
+        slots >= 16,
+        "a landing holds whole 16-slot probability packets"
+    );
+    slots
+}

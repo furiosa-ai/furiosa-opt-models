@@ -1,7 +1,8 @@
 //! A launch's wide rows as work items, planned on the host from the rows' compact history.
 //!
-//! - A row of `keys` keys holds `ceil(keys / 16)` blocks and takes `ceil(blocks / 64 C)`
-//!   consecutive items; `C` columns serve an item, `16 / C` items a wave.
+//! - A row of `keys` keys holds `ceil(keys / 16)` blocks and takes `ceil(blocks / T C)`
+//!   consecutive items, `T` the [`Time`] slots a slice; `C` columns serve an item, `16 / C` items a
+//!   wave.
 //! - Adaptively, `C` is the least that holds the longest row in four blocks a slice, widened while
 //!   the rows leave slices idle, at most half the launch's columns over the rows: the columns of
 //!   all items then fill at most the launch's waves. A fixed tiling takes [`FIXED`] columns.
@@ -18,15 +19,13 @@ use crate::ops::index::table::{CACHED, LEN, START, TABLE};
 use crate::tensor::cache::Blocks;
 use std::mem;
 
-/// `log2` of a fixed tiling's columns an item: four, 4,096 keys. Of the constant depths, its
-/// slowest call is the least slower than the adaptive tiling's.
+/// `log2` of a fixed tiling's columns an item: four, 4,096 keys at 64 slots a slice. Of the
+/// constant depths, its slowest call is the least slower than the adaptive tiling's.
 const FIXED: i32 = 2;
 
 /// The arrays of a launch's wide rows, which [`Wide::bind`] takes in turn.
 pub(in super::super) const ARRAYS: usize = 16;
 
-/// `log2` of the blocks an item holds a column, 16 quads of four.
-const ITEM_SHIFT: i32 = (Quads::SIZE * Quad::SIZE).ilog2() as i32;
 const BLOCK_SHIFT: i32 = Block::SIZE.ilog2() as i32;
 /// Byte stride of a quad of block IDs.
 const QUAD_STRIDE: i32 = (Quad::SIZE * size_of::<i32>()) as i32;
@@ -55,15 +54,18 @@ struct Layout {
 }
 
 impl Layout {
-    /// The layout of rows of `keys` keys over `Waves` waves of the wide domain, tiled as `tiling`
-    /// says.
-    fn new<Waves: AxisName>(keys: &[i32], tiling: Tiling) -> Self {
+    /// The layout of rows of `keys` keys over `Waves` waves of the wide domain of `KvHeads` KV
+    /// heads of `Head` channels, tiled as `tiling` says.
+    fn new<KvHeads: AxisName, Head: AxisName, Waves: AxisName>(
+        keys: &[i32],
+        tiling: Tiling,
+    ) -> Self {
         let blocks: Vec<i32> = keys.iter().map(|&keys| Self::blocks(keys)).collect();
         let ceil_log2 = |x: i32| (0..16).filter(|bit| (1 << bit) < x).count() as i32;
         let longest = blocks.iter().copied().max().unwrap_or(0);
         let (reach, spread) = (ceil_log2(longest), ceil_log2(keys.len() as i32));
         let half = Waves::SIZE * Column::SIZE / 2;
-        let widened = ((reach - 6).clamp(0, 4) + spread)
+        let widened = ((reach - Self::shift::<KvHeads, Head>()).clamp(0, 4) + spread)
             .max(reach.min(4))
             .min(half.ilog2() as i32);
         let depth = match tiling {
@@ -73,7 +75,7 @@ impl Layout {
         let (width, groups) = (1 << depth, Column::SIZE as i32 >> depth);
         let counts: Vec<i32> = blocks
             .iter()
-            .map(|&blocks| Self::items(blocks, depth))
+            .map(|&blocks| Self::items::<KvHeads, Head>(blocks, depth))
             .collect();
         let items: i32 = counts.iter().sum();
         let waves = Self::waves(items, depth);
@@ -93,10 +95,17 @@ impl Layout {
         (keys + (1 << BLOCK_SHIFT) - 1) >> BLOCK_SHIFT
     }
 
-    /// The items a row of `blocks` blocks takes at `depth`: `64 << depth` blocks an item.
-    const fn items(blocks: i32, depth: i32) -> i32 {
+    /// `log2` of the blocks an item holds a column, a block a slot.
+    const fn shift<KvHeads: AxisName, Head: AxisName>() -> i32 {
+        Time::<KvHeads, Head>::SIZE.ilog2() as i32
+    }
+
+    /// The items a row of `blocks` blocks takes at `depth`: `T << depth` blocks an item, `T` the
+    /// slots a slice.
+    const fn items<KvHeads: AxisName, Head: AxisName>(blocks: i32, depth: i32) -> i32 {
         let groups = Column::SIZE as i32 >> depth;
-        (blocks * groups + (1 << (ITEM_SHIFT + 4)) - 1) >> (ITEM_SHIFT + 4)
+        let shift = Self::shift::<KvHeads, Head>();
+        (blocks * groups + (1 << (shift + 4)) - 1) >> (shift + 4)
     }
 
     /// The waves `items` items of `1 << depth` columns fill.
@@ -121,24 +130,38 @@ impl Plan {
         (<m![KvHeads, G, Lane]>::SIZE * size_of::<f32>()) as i32
     }
 
-    /// The most waves a launch of at most `rows` rows of at most `keys` keys uses: a wave's 16
-    /// columns hold 64 blocks of a row each at any column count, and a launch uses whole pairs.
-    pub(in super::super) const fn most(rows: usize, keys: usize) -> usize {
-        (rows * keys.div_ceil(Column::SIZE * Quads::SIZE * Quad::SIZE * Block::SIZE))
+    /// The most waves a launch of at most `rows` rows of at most `keys` keys of `KvHeads` KV heads
+    /// of `Head` channels uses: a wave's 16 columns hold a slot's block of a row each at any column
+    /// count, and a launch uses whole pairs.
+    pub(in super::super) const fn most<KvHeads: AxisName, Head: AxisName>(
+        rows: usize,
+        keys: usize,
+    ) -> usize {
+        (rows * keys.div_ceil(Column::SIZE * Time::<KvHeads, Head>::SIZE * Block::SIZE))
             .next_multiple_of(PAIR)
     }
 
-    /// Whether `rows` wide rows of at most `keys` keys each fit `waves` waves and the item slots,
-    /// tiled fixed.
-    pub(in super::super) const fn fixes(rows: usize, keys: usize, waves: usize) -> bool {
-        let items = rows as i32 * Layout::items(Layout::blocks(keys as i32), FIXED);
-        rows <= Decodes::SIZE && Layout::fits(Layout::waves(items, FIXED), items, waves)
+    /// Whether `rows` wide rows of at most `keys` keys each of `KvHeads` KV heads of `Head`
+    /// channels fit `waves` waves, the item slots and a merge's inputs, tiled fixed.
+    pub(in super::super) const fn fixes<KvHeads: AxisName, Head: AxisName>(
+        rows: usize,
+        keys: usize,
+        waves: usize,
+    ) -> bool {
+        let row = Layout::items::<KvHeads, Head>(Layout::blocks(keys as i32), FIXED);
+        let items = rows as i32 * row;
+        rows <= Decodes::SIZE
+            && row as usize <= Input::SIZE
+            && Layout::fits(Layout::waves(items, FIXED), items, waves)
     }
 
-    /// The waves of `Waves` wide rows `segments` fill, tiled adaptively.
-    pub(in super::super) fn waves<Waves: AxisName>(segments: &[&[i32; FIELDS]]) -> usize {
+    /// The waves of `Waves` wide rows `segments` of `KvHeads` KV heads of `Head` channels fill,
+    /// tiled adaptively.
+    pub(in super::super) fn waves<KvHeads: AxisName, Head: AxisName, Waves: AxisName>(
+        segments: &[&[i32; FIELDS]],
+    ) -> usize {
         let keys: Vec<i32> = segments.iter().map(|row| row[LEN] + row[CACHED]).collect();
-        Layout::new::<Waves>(&keys, Tiling::Adaptive).waves as usize
+        Layout::new::<KvHeads, Head, Waves>(&keys, Tiling::Adaptive).waves as usize
     }
 
     /// The items of wide rows `segments` with block IDs `ids`, each row padded to whole runs, tiled
@@ -165,7 +188,7 @@ impl Plan {
             groups,
             counts,
             waves,
-        } = Layout::new::<Waves>(&keys, tiling);
+        } = Layout::new::<KvHeads, Head, Waves>(&keys, tiling);
         let firsts: Vec<i32> = counts
             .iter()
             .scan(0, |sum, count| Some(mem::replace(sum, *sum + count)))
@@ -179,10 +202,14 @@ impl Plan {
             Layout::fits(waves, items, Waves::SIZE),
             "items exceed the envelope"
         );
+        assert!(
+            peak as usize <= Input::SIZE,
+            "a row's items exceed a merge's inputs"
+        );
         let wave = |cells: usize| paired * cells;
         let (waving, merging) = (usize::from(waves > 0), usize::from(merges > 0));
         let jobs_read = merges as usize * Eight::SIZE * FLIT;
-        let mut entries = vec![0; wave(Column::SIZE * Time::SIZE)];
+        let mut entries = vec![0; wave(Column::SIZE * Time::<KvHeads, Head>::SIZE)];
         let [
             mut lengths,
             mut queries,
@@ -201,13 +228,14 @@ impl Plan {
             let item = (k * groups) >> Column::SIZE.ilog2();
             let present = i32::from(item < items);
             let row = firsts.partition_point(|first| first * width <= k) - 1;
-            let before = ((item - firsts[row]) * width) << ITEM_SHIFT;
+            let before = ((item - firsts[row]) * width) << Layout::shift::<KvHeads, Head>();
             let used = blocks[row] - before;
             let first = segments[row][TABLE] + before;
             let column = k - item * width;
             let rounds = (used * groups) >> (Column::SIZE * Quad::SIZE).ilog2();
             let partial = (used - (((rounds * width) + column) << 2)).clamp(0, 4);
-            let length = (((rounds << 2) + partial) * present).min(Time::SIZE as i32);
+            let length =
+                (((rounds << 2) + partial) * present).min(Time::<KvHeads, Head>::SIZE as i32);
             let skipped = ((column * 4) + before) << BLOCK_SHIFT;
             let query = segments[row][START] * row_stride;
             let sink =
@@ -230,7 +258,7 @@ impl Plan {
             for slot in 0..length as usize {
                 let quad = (((slot as i32 / 4) * width) << QUAD_STRIDE.ilog2()) + origin;
                 let id = (quad.min(bound).max(0) >> 2) as usize + slot % 4;
-                entries[(wave * Time::SIZE + slot) * Column::SIZE + at] =
+                entries[(wave * Time::<KvHeads, Head>::SIZE + slot) * Column::SIZE + at] =
                     ids[id] * Blocks::<KvHeads, Head>::BLOCK_STRIDE;
             }
         }
@@ -248,14 +276,17 @@ impl Plan {
             *flit = (at % Input::SIZE) as i32;
         }
         let key = |at: usize| {
-            let (token, slot) = (at / Time::SIZE, at % Time::SIZE);
+            let (token, slot) = (
+                at / Time::<KvHeads, Head>::SIZE,
+                at % Time::<KvHeads, Head>::SIZE,
+            );
             (token + 16 * (slot % 4) + 64 * (1 << depth) * (slot / 4)) as i32
         };
         Self {
             images: [
                 vec![waves],
                 vec![depth],
-                vec![units.min((Time::SIZE / 8) as i32)],
+                vec![units.min((Time::<KvHeads, Head>::SIZE / 8) as i32)],
                 vec![merges],
                 entries,
                 lengths,
@@ -264,7 +295,9 @@ impl Plan {
                 partials,
                 scales,
                 limits,
-                (0..waving * Block::SIZE * Time::SIZE).map(key).collect(),
+                (0..waving * Block::SIZE * Time::<KvHeads, Head>::SIZE)
+                    .map(key)
+                    .collect(),
                 jobs(&|row| firsts[row]),
                 jobs(&|row| counts[row]),
                 jobs(&|row| segments[row][START]),
@@ -279,14 +312,14 @@ impl Plan {
                     1,
                     1,
                     1,
-                    capacity * Time::SIZE,
+                    capacity * Time::<KvHeads, Head>::SIZE,
                     capacity,
                     capacity,
                     capacity,
                     capacity,
                     capacity,
                     capacity * FLIT,
-                    Block::SIZE * Time::SIZE,
+                    Block::SIZE * Time::<KvHeads, Head>::SIZE,
                     decodes,
                     decodes,
                     decodes,

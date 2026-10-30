@@ -2,9 +2,9 @@
 //!
 //! - A row of more than four query groups a KV head is its group tiles, each an item row over the
 //!   row's history: tile `t` of row `r` is item row `r T + t` of `T` tiles a row.
-//! - An item row of at most [`SHORT`] keys may be packed: an adaptive launch packs them all when
-//!   that takes fewer waves in all than the wide domain alone would, and none otherwise; a fixed
-//!   one packs them all. Each domain keeps its rows in row order and plans them alone.
+//! - An item row of at most one packed column's keys may be packed: an adaptive launch packs them
+//!   all when that takes fewer waves in all than the wide domain alone would, and none otherwise; a
+//!   fixed one packs them all. Each domain keeps its rows in row order and plans them alone.
 //! - The arrays are the launch's row count, then the packed domain's, then the wide domain's.
 
 use super::*;
@@ -13,13 +13,6 @@ use crate::ops::index::table::{CACHED, LEN, START};
 use crate::specialize::attention::DECODES;
 use std::iter;
 use std::slice;
-
-/// The longest history a packed row has.
-const SHORT: usize = 256;
-const _: () = assert!(
-    SHORT <= packed::plan::COLUMN,
-    "a short row exceeds a column"
-);
 
 /// How a call's host tiles each row's history into items.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -60,13 +53,16 @@ impl Plan {
             })
             .collect();
         assert!(tiled.len() <= DECODES, "decode rows exceed the envelope");
+        // The longest history a packed row has: a column's, so a fixed tiling packs it in one.
+        let short = packed::plan::Plan::column::<KvHeads, Head>();
         let keys = |row: &[i32; FIELDS]| usize::try_from(row[LEN] + row[CACHED]);
         let (packed, wide): (Vec<_>, Vec<_>) = tiled
             .iter()
-            .partition(|row| keys(row).is_ok_and(|keys| keys <= SHORT));
+            .partition(|row| keys(row).is_ok_and(|keys| keys <= short));
+        let wide_waves = wide::plan::Plan::waves::<KvHeads, Head, Waves>;
         let packs = tiling == Tiling::Fixed || {
-            let alone = wide::plan::Plan::waves::<Waves>(&tiled.iter().collect::<Vec<_>>());
-            packed::plan::Plan::waves(&packed) + wide::plan::Plan::waves::<Waves>(&wide) < alone
+            let alone = wide_waves(&tiled.iter().collect::<Vec<_>>());
+            packed::plan::Plan::waves::<KvHeads, Head>(&packed) + wide_waves(&wide) < alone
         };
         let (packed, wide) = match packs {
             true => (packed, wide),
@@ -83,16 +79,20 @@ impl Plan {
         }
     }
 
-    /// The most wide waves a launch of at most `rows` rows of `G` query groups a KV head uses when
-    /// each row attends at most `keys` keys, either tiled: the capacity that holds any such launch.
-    pub const fn waves<G: AxisName>(rows: usize, keys: usize) -> usize {
+    /// The most wide waves a launch of at most `rows` rows of `G` query groups to each of `KvHeads`
+    /// KV heads of `Head` channels uses when each row attends at most `keys` keys, either tiled:
+    /// the capacity that holds any such launch.
+    pub const fn waves<KvHeads: AxisName, G: AxisName, Head: AxisName>(
+        rows: usize,
+        keys: usize,
+    ) -> usize {
         let rows = rows * GroupTile::<G>::TILES;
-        let waves = wide::plan::Plan::most(rows, keys);
+        let waves = wide::plan::Plan::most::<KvHeads, Head>(rows, keys);
         // A batch-invariant load serves every call its line admits.
         assert!(
             rows <= DECODES
                 && packed::plan::Plan::fixes(rows)
-                && wide::plan::Plan::fixes(rows, keys, waves),
+                && wide::plan::Plan::fixes::<KvHeads, Head>(rows, keys, waves),
             "a fixed tiling of every row over the whole context exceeds the compiled items"
         );
         waves
@@ -183,7 +183,7 @@ mod tests {
     #[test]
     fn holds_a_launch_of_odd_waves() {
         const KEYS: usize = 16384;
-        const CAPACITY: usize = Plan::waves::<Pairs>(1, KEYS);
+        const CAPACITY: usize = Plan::waves::<Heads, Pairs, Head>(1, KEYS);
         assert_eq!(waves::<Pairs, CAPACITY>(&[KEYS], Tiling::Adaptive), [0, 1]);
     }
 }

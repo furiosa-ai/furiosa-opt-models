@@ -54,19 +54,18 @@ where
     ) {
         // Wave `wave`'s history, in flight.
         let history = |context: &mut Device, wave: usize| -> Self::WideInDm {
-            let tables = &items.tables;
-            let indices = &Tables::wave(&tables.entries, wave);
+            let indices = &Tables::wave(&items.entries, wave);
             let read = Read {
                 pool: pool.1,
                 indices,
                 output: PhantomData,
             };
-            let lengths = &Tables::wave(&tables.lengths, wave);
+            let lengths = &Tables::wave(&items.tables.lengths, wave);
             let prefix = Prefix {
                 read,
                 lengths,
                 offset: 0,
-                sparse: PhantomData::<m![Time]>,
+                sparse: PhantomData::<Self::WideTime>,
             };
             pool.0.forward(&mut *context, env, &mut (), prefix)
         };
@@ -215,7 +214,7 @@ where
                     .fetch::<m![1], m![1 # 8]>()
                     .collect::<m![1], m![1 # 8]>()
                     .to_vrf();
-                self.attend::<m![Groups], m![Time / 8], _, _, _, _, _, _>(
+                self.attend::<m![Groups], Self::WideUnits, _, _, _, _, _, _>(
                     context,
                     ((&heads, &limit), (keys, in_dm)),
                     (shape.units, shape.depth),

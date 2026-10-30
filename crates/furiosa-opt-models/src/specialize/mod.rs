@@ -1,5 +1,6 @@
 //! Values that specialize an op to the hardware, starting with the hardware's own limits: the
-//! slices of a cluster and the register bytes of a slice, which an op's tiles budget against.
+//! slices of a cluster and the register and data memory bytes of a slice, which an op's tiles
+//! budget against.
 
 pub mod attention;
 pub(crate) mod contraction;
@@ -18,6 +19,9 @@ pub(crate) const VRF: usize = 8192;
 
 /// Bytes of the tensor register file a slice holds.
 pub(crate) const TRF: usize = 65_536;
+
+/// Bytes of the data memory a slice holds.
+pub(crate) const DM: usize = 524_288;
 
 /// The plan of a pairwise all-reduce: one round for each bit of a chip's index, each adding a
 /// chip's partial sum to the partial of the chip whose index differs in that bit.

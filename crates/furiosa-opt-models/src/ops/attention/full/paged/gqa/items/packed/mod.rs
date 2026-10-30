@@ -1,7 +1,7 @@
 //! The packed domain: rows of short histories, two rows a group of four-slice columns.
 //!
 //! - A cluster's 256 slices are 64 columns of four token slices; a block's 16 tokens go four to
-//!   each token slice of one column, so a slice holds 64 slots of the cluster's four KV heads.
+//!   each token slice of one column, so a slice holds a [`Slot`] of the cluster's KV heads.
 //! - A launch picks one group span for every packed item, from 4 to 256 slices, and every group
 //!   holds two query lanes, two rows' queries scored against the group's one key stream; the host
 //!   may leave a lane empty. A lane's item deals its blocks to its group's columns a block round
@@ -14,13 +14,32 @@
 //! - A packed row is one item: a row longer than a cluster's columns hold is wide.
 
 use super::*;
-use crate::specialize::attention::WAVES;
+use crate::specialize::attention::{WAVES, landing};
 use std::io;
 
 mod attend;
 pub(super) mod plan;
 
-axes![Column = 64, Round = 16, Slot = 64, Pack = 2, Depth = 6];
+axes![Column = 64, Pack = 2, Depth = 6];
+
+/// A slice's slots of a wave's history, as many as [`landing`] leaves a cluster's KV heads.
+#[derive(Clone, Debug)]
+pub(super) struct Slot<KvHeads, Head>(PhantomData<(KvHeads, Head)>);
+
+impl<KvHeads: AxisName, Head: AxisName> AxisName for Slot<KvHeads, Head> {
+    const NAME: Ident = Ident::new("Slot");
+    const SIZE: usize = landing(Head::SIZE, LocalHeads::<KvHeads>::SIZE);
+}
+
+/// A column's block rounds: a round takes four slots of each token slice, a token of its block
+/// each.
+#[derive(Clone, Debug)]
+pub(super) struct Round<KvHeads, Head>(PhantomData<(KvHeads, Head)>);
+
+impl<KvHeads: AxisName, Head: AxisName> AxisName for Round<KvHeads, Head> {
+    const NAME: Ident = Ident::new("Round");
+    const SIZE: usize = Slot::<KvHeads, Head>::SIZE / <m![Block % 4]>::SIZE;
+}
 
 /// `log2` of the smallest group, one column.
 const LEAST: usize = 2;
@@ -35,18 +54,23 @@ pub(super) struct Packed<KvHeads: AxisName, Head: AxisName> {
     waves: Value,
     depth: Value,
     units: Value,
+    /// Each wave's columns' pool byte offset of every block round they fill.
+    entries: Entries<KvHeads, Head>,
     tables: Tables<Waves>,
     /// Each lane's key position of every slot of each token slice, which each layer writes for its
     /// waves: a lane sees a slot whose position is below its column's limit.
-    keys: HbmTensor<i32, Chip, m![Pack, Block / 4, Slot]>,
+    keys: Keys<KvHeads, Head>,
     /// Every wave's limit of each column lane, a flit each, which a pair of waves writes together.
     limits: Limits<Waves>,
-    geometry: PhantomData<(KvHeads, Head)>,
 }
 
 /// The waves of every launch's packed domain.
 type Waves = super::Waves<WAVES>;
 
+type Entries<KvHeads, Head> =
+    HbmTensor<i32, Chip, m![Waves, Column, { Symbol<Round<KvHeads, Head>> }]>;
+type Keys<KvHeads, Head> =
+    HbmTensor<i32, Chip, m![Pack, Block / 4, { Symbol<Slot<KvHeads, Head>> }]>;
 type Limits<Waves> = HbmTensor<i32, Chip, m![Waves, Column, Pack, 1 # 8]>;
 
 /// The counts of a [`Packed`], which a launch reads once, at its start.
@@ -59,11 +83,10 @@ pub(crate) struct Shape {
     pub units: usize,
 }
 
-/// Each wave's columns: the pool byte offset of every block round they fill and the rounds they
-/// fill, and for each lane the byte offsets of its query and output rows.
+/// Each wave's columns: the rounds they fill, and for each lane the byte offsets of its query and
+/// output rows.
 #[derive(DeviceSend)]
 pub(crate) struct Tables<Waves: AxisName> {
-    pub entries: HbmTensor<i32, Chip, m![Waves, Column, Round]>,
     pub lengths: HbmTensor<i32, Chip, m![Waves, Column]>,
     pub queries: HbmTensor<i32, Chip, m![Waves, Column, Pack]>,
     pub outputs: HbmTensor<i32, Chip, m![Waves, Column, Pack]>,
@@ -77,15 +100,14 @@ impl<KvHeads: AxisName, Head: AxisName> Packed<KvHeads, Head> {
             waves: alias(&next()?, ..)?,
             depth: alias(&next()?, ..)?,
             units: alias(&next()?, ..)?,
+            entries: alias(&next()?, ..)?,
             tables: Tables {
-                entries: alias(&next()?, ..)?,
                 lengths: alias(&next()?, ..)?,
                 queries: alias(&next()?, ..)?,
                 outputs: alias(&next()?, ..)?,
             },
             limits: alias(&next()?, ..)?,
             keys: alias(&next()?, ..)?,
-            geometry: PhantomData,
         })
     }
 
@@ -94,7 +116,9 @@ impl<KvHeads: AxisName, Head: AxisName> Packed<KvHeads, Head> {
         Shape {
             waves: self.waves.extent::<m![Waves]>(),
             depth: self.depth.extent::<m![Depth]>() + LEAST,
-            units: self.units.extent::<m![Slot / 8]>(),
+            units: self
+                .units
+                .extent::<m![{ Symbol<Slot<KvHeads, Head>> } / 8]>(),
         }
     }
 }
@@ -135,9 +159,14 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> Attention<KvHeads, Gro
     /// An item tensor on the token slices of a cluster's 64 columns, `E` its elements.
     type PackedDm<D: Scalar, E: M> = Self::ItemDm<m![Column, Block / 4], D, E>;
     type PackedVrf<D: MaterializableScalar, E: M> = Self::ItemVrf<m![Column, Block / 4], D, E>;
-    type PackedInDm =
-        Self::PackedDm<bf16, m![Slot, KeyValue, KvHeads % ({ Local<KvHeads> }), Head]>;
-    type PackedKeys = Self::PackedDm<i32, m![Pack, Slot]>;
+    type PackedSlot = Symbol<Slot<KvHeads, Head>>;
+    /// The eight-slot units a slice scores.
+    type PackedUnits = m![Pack, { Self::PackedSlot } / 8];
+    type PackedInDm = Self::PackedDm<
+        bf16,
+        m![{ Self::PackedSlot }, KeyValue, KvHeads % ({ Local<KvHeads> }), Head],
+    >;
+    type PackedKeys = Self::PackedDm<i32, m![Pack, { Self::PackedSlot }]>;
     /// Four consecutive waves' lane limits of each column, wave `w`'s at `w % 4`, on each of its
     /// token slices: a pair of waves arrives while the pair before it is still being read.
     type PackedLimits<Waves: AxisName> = Self::PackedDm<i32, m![Waves % 4, Pack, 1 # 8]>;

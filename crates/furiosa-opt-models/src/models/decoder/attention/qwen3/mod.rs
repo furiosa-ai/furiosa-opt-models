@@ -599,7 +599,7 @@ pub type CatalogBody<S, P, C, X> = <<S as Geometry>::Layers<()> as Depth<S, P, C
 /// The wide tiles of the size `S`'s work: as many as a call of its rows takes when every row
 /// attends the whole context `S` is compiled for, so its call's work holds whatever it admits.
 pub(crate) const fn tiles<S: decoder::Attention + Decode + 'static>() -> usize {
-    paged::Plan::waves::<S::Groups>(S::Rows::SIZE, launch::Positions::<S>::SIZE)
+    paged::Plan::waves::<S::Heads, S::Groups, S::Head>(S::Rows::SIZE, launch::Positions::<S>::SIZE)
 }
 
 #[cfg(test)]

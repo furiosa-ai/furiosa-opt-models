@@ -1,7 +1,7 @@
 //! The wide domain: rows of longer histories, an item a group of 16-slice columns.
 //!
 //! - A launch picks one group span for every wide item from its longest row and its row count, from
-//!   16 to 256 slices; each slice holds the item's four KV heads and at most 64 keys a cluster.
+//!   16 to 256 slices; each slice holds the item's KV heads of a cluster and a [`Time`] of keys.
 //! - A group of `s` slices is `s / 16` columns of 16 token slices; an item deals its blocks to its
 //!   columns four at a time in turn, each block's 16 tokens on the column's 16 slices.
 //! - Every wave runs one body: 16 columns gathered, scored, normalized over each item's group and
@@ -12,7 +12,7 @@
 //!   their outputs into the row.
 
 use super::*;
-use crate::specialize::attention::{DECODES, INPUTS, SLOTS};
+use crate::specialize::attention::{DECODES, INPUTS, SLOTS, landing};
 use crate::tensor::axis::Rows;
 use std::io;
 
@@ -22,15 +22,17 @@ mod attend;
 mod merge;
 pub(super) mod plan;
 
-axes![
-    Column = 16,
-    Time = 64,
-    Depth = 5,
-    Quads = 16,
-    Quad = 4,
-    Eight = 8,
-    Lane = 8
-];
+axes![Column = 16, Depth = 5, Quad = 4, Eight = 8, Lane = 8];
+
+/// A slice's slots of a wave's history, a token of each of its column's blocks a slot: as many as
+/// [`landing`] leaves a cluster's KV heads.
+#[derive(Clone, Debug)]
+pub(super) struct Time<KvHeads, Head>(PhantomData<(KvHeads, Head)>);
+
+impl<KvHeads: AxisName, Head: AxisName> AxisName for Time<KvHeads, Head> {
+    const NAME: Ident = Ident::new("Time");
+    const SIZE: usize = landing(Head::SIZE, LocalHeads::<KvHeads>::SIZE);
+}
 
 /// Every column's `Inner` slices, a PE's four columns bit-reversed: a history gather then visits a
 /// slot's columns in table order, so each PE copies its index list in runs.
@@ -63,16 +65,20 @@ pub(super) struct Wide<KvHeads: AxisName, Head: AxisName, Waves: AxisName> {
     depth: Value,
     units: Value,
     merges: Value,
+    /// Each wave's columns' pool byte offset of every block they fill.
+    entries: Entries<KvHeads, Head, Waves>,
     tables: Tables<Waves>,
     jobs: Jobs<Decodes, Input>,
     /// Each token slice's key positions, which each layer writes for its waves.
-    keys: HbmTensor<i32, Chip, m![Block, Time]>,
+    keys: Keys<KvHeads, Head>,
     /// Every wave's column limits, a flit a column and each column's waves contiguous, which each
     /// layer writes at once; a launch writes and its chains read only its pairs of waves.
     limits: Limits<Waves>,
-    geometry: PhantomData<(KvHeads, Head, Waves)>,
 }
 
+type Entries<KvHeads, Head, Waves> =
+    HbmTensor<i32, Chip, m![Waves, { Symbol<Time<KvHeads, Head>> }, Column]>;
+type Keys<KvHeads, Head> = HbmTensor<i32, Chip, m![Block, { Symbol<Time<KvHeads, Head>> }]>;
 type Limits<Waves> = HbmTensor<i32, Chip, m![Column, Waves, 1 # 8]>;
 
 /// The counts of a [`Wide`], which a launch reads once, at its start.
@@ -86,11 +92,10 @@ pub(crate) struct Shape {
     pub merges: usize,
 }
 
-/// Each wave's columns: their blocks' pool offsets, filled slots, keys past their own offset, query
-/// and output row offsets, and their item's f32 output and log-sum-exp offsets for a merge.
+/// Each wave's columns: their filled slots, keys past their own offset, query and output row
+/// offsets, and their item's f32 output and log-sum-exp offsets for a merge.
 #[derive(DeviceSend)]
 pub(crate) struct Tables<Waves: AxisName> {
-    pub entries: HbmTensor<i32, Chip, m![Waves, Time, Column]>,
     pub lengths: HbmTensor<i32, Chip, m![Waves, Column]>,
     pub queries: HbmTensor<i32, Chip, m![Waves, Column]>,
     pub outputs: HbmTensor<i32, Chip, m![Waves, Column]>,
@@ -116,8 +121,8 @@ impl<KvHeads: AxisName, Head: AxisName, Waves: AxisName> Wide<KvHeads, Head, Wav
             depth: alias(&next()?, ..)?,
             units: alias(&next()?, ..)?,
             merges: alias(&next()?, ..)?,
+            entries: alias(&next()?, ..)?,
             tables: Tables {
-                entries: alias(&next()?, ..)?,
                 lengths: alias(&next()?, ..)?,
                 queries: alias(&next()?, ..)?,
                 outputs: alias(&next()?, ..)?,
@@ -132,7 +137,6 @@ impl<KvHeads: AxisName, Head: AxisName, Waves: AxisName> Wide<KvHeads, Head, Wav
                 rows: alias(&next()?, ..)?,
                 inputs: alias(&next()?, ..)?,
             },
-            geometry: PhantomData,
         })
     }
 
@@ -150,7 +154,9 @@ impl<KvHeads: AxisName, Head: AxisName, Waves: AxisName> Wide<KvHeads, Head, Wav
         Shape {
             waves: self.waves.extent::<m![Waves]>(),
             depth: self.depth.extent::<m![Depth]>() + LEAST,
-            units: self.units.extent::<m![Time / 8]>(),
+            units: self
+                .units
+                .extent::<m![{ Symbol<Time<KvHeads, Head>> } / 8]>(),
             merges: self.merges.extent::<m![Decodes / 8]>(),
         }
     }
@@ -192,8 +198,12 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> Attention<KvHeads, Gro
     /// An item tensor on the token slices of a cluster's 16 columns, `E` its elements.
     type WideDm<D: Scalar, E: M> = Self::ItemDm<ColumnSlices<m![Block]>, D, E>;
     type WideVrf<D: MaterializableScalar, E: M> = Self::ItemVrf<ColumnSlices<m![Block]>, D, E>;
-    type WideInDm = Self::WideDm<bf16, m![Time, KeyValue, KvHeads % ({ Local<KvHeads> }), Head]>;
-    type WideKeys = Self::WideDm<i32, m![Time]>;
+    type WideTime = Symbol<Time<KvHeads, Head>>;
+    /// The eight-slot units a slice scores.
+    type WideUnits = m![{ Self::WideTime } / 8];
+    type WideInDm =
+        Self::WideDm<bf16, m![{ Self::WideTime }, KeyValue, KvHeads % ({ Local<KvHeads> }), Head]>;
+    type WideKeys = Self::WideDm<i32, Self::WideTime>;
     /// A column's limit on each of its token slices.
     type WideLimit = Self::WideDm<i32, m![1 # 8]>;
     /// Every wave's column limits on each column's first slice.
