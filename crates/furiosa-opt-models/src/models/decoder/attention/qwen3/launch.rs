@@ -126,7 +126,7 @@ mod tests {
     use super::super::Size;
     use super::*;
     use crate::load::{Checkpoint, Load};
-    use crate::models::decoder::form::{Affine, BlockScaled};
+    use crate::models::decoder::form::{Affine, BlockScaled, ChannelScaled};
 
     /// Each size's BF16 catalog model runs its whole tree on its launch's input and state.
     #[test]
@@ -145,8 +145,8 @@ mod tests {
         runs!("8B");
     }
 
-    /// Each size's catalog model loads from a checkpoint in dense BF16, and Qwen3-8B also in
-    /// block-scaled FP8.
+    /// Each size's catalog model loads from a checkpoint in dense BF16, the sizes up to 4B also
+    /// channel-scaled from one a load quantizes, and Qwen3-8B also in block-scaled E4M3.
     #[test]
     fn loads_from_a_checkpoint() {
         fn loads<T: for<'a> Load<&'a Checkpoint>>() {}
@@ -155,5 +155,8 @@ mod tests {
         loads::<Model<Size<"4B">, Affine>>();
         loads::<Model<Size<"1.7B">, Affine>>();
         loads::<Model<Size<"0.6B">, Affine>>();
+        loads::<Model<Size<"4B">, ChannelScaled>>();
+        loads::<Model<Size<"1.7B">, ChannelScaled>>();
+        loads::<Model<Size<"0.6B">, ChannelScaled>>();
     }
 }
