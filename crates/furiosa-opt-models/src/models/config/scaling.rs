@@ -61,15 +61,20 @@ impl Spectrum {
         self.fraction
     }
 
+    /// The coordinates of a `head`-wide head that the spectrum rotates, truncated as Transformers
+    /// truncates them, `int(head * fraction)`.
+    pub(super) fn rotated(&self, head: usize) -> usize {
+        (self.fraction * head as f64) as usize
+    }
+
     /// The frequency of each of the `rotated / 2` pairs of a `head`-wide head, as Transformers
     /// computes it; refused when it rotates part of a head, since `i` pairs with `i + head / 2`.
     pub fn frequencies(&self, head: usize, rotated: usize) -> io::Result<Vec<f64>> {
         let theta = f64::from(self.theta.get());
         let unscaled = |pair: usize| theta.powf(-2.0 * pair as f64 / head as f64);
-        // Transformers truncates the rotated width, `int(head * fraction)`.
         let width = match self.kind {
             Kind::Proportional { .. } => 2 * (self.fraction * head as f64 / 2.0) as usize,
-            _ => (self.fraction * head as f64) as usize,
+            _ => self.rotated(head),
         };
         let holds = match self.kind {
             Kind::Proportional { .. } => width == rotated,

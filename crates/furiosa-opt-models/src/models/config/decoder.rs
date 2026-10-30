@@ -3,8 +3,9 @@
 
 use super::scaling::{Kind, Spectrum};
 use super::{Disabled, Literal, PerLayer, Positive, flattened, refuse};
+use furiosa_opt_std::prelude::AxisName;
 use serde::{Deserialize, de};
-use std::{collections::BTreeMap, io, num::NonZeroUsize};
+use std::{collections::BTreeMap, io, marker::PhantomData, num::NonZeroUsize};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Geometry {
@@ -175,6 +176,34 @@ impl TryFrom<Spectrum> for Rotary {
                     spectrum.fraction()
                 ),
                 "the unscaled spectrum over the whole head",
+            )),
+        }
+    }
+}
+
+/// A checkpoint's unscaled rotary base, for a family whose kernels rotate the leading `Rotated`
+/// coordinates of each `Head`-wide head as one rotation at that width's frequencies, pair `i` with
+/// pair `i + Rotated / 2`: any other spectrum is refused as unsupported.
+#[derive(Clone, Copy, Debug)]
+pub struct Prefix<Head, Rotated>(pub Positive, PhantomData<fn() -> (Head, Rotated)>);
+
+impl<Head: AxisName, Rotated: AxisName> TryFrom<Spectrum> for Prefix<Head, Rotated> {
+    type Error = String;
+
+    fn try_from(spectrum: Spectrum) -> Result<Self, Self::Error> {
+        match spectrum.kind() == Kind::Default && spectrum.rotated(Head::SIZE) == Rotated::SIZE {
+            true => Ok(Self(spectrum.theta(), PhantomData)),
+            false => Err(refuse(
+                format_args!(
+                    "{:?} rotating {} of each head",
+                    spectrum.kind(),
+                    spectrum.fraction()
+                ),
+                format_args!(
+                    "the unscaled spectrum over the first {} of {} coordinates",
+                    Rotated::SIZE,
+                    Head::SIZE
+                ),
             )),
         }
     }
@@ -357,6 +386,52 @@ mod tests {
             let error = parse::<Rotary>(&document).unwrap_err();
             let reason = format!(
                 "found {found} of each head, compiled the unscaled spectrum over the whole head"
+            );
+            assert_eq!(
+                (error.kind(), error.to_string()),
+                (io::ErrorKind::Unsupported, reason),
+                "{document}"
+            );
+        }
+    }
+
+    /// A family that rotates a head's prefix holds the unscaled spectrum whose rotated width is
+    /// the prefix; a spectrum over another width, or a rescaled one, is refused as unsupported,
+    /// naming the spectrum it found.
+    #[test]
+    fn refuses_spectra_off_the_rotated_prefix() {
+        use furiosa_opt_std::prelude::*;
+        axes![Whole = 128, Half = 64];
+        let prefix = |document: serde_json::Value| {
+            let spectrum: Spectrum = parse(&document).unwrap();
+            Prefix::<Whole, Half>::try_from(spectrum).map_err(super::super::refusal)
+        };
+        let theta = prefix(json!({"rope_theta": 1e4, "partial_rotary_factor": 0.5})).unwrap();
+        assert_eq!(theta.0.get(), 1e4);
+        for (document, found) in [
+            (json!({"rope_theta": 1e4}), "Default rotating 1"),
+            (
+                json!({"rope_theta": 1e4, "partial_rotary_factor": 0.25}),
+                "Default rotating 0.25",
+            ),
+            (
+                json!({"rope_parameters": {
+                    "rope_type": "linear", "factor": 2.0, "rope_theta": 1e4,
+                    "partial_rotary_factor": 0.5,
+                }}),
+                "Linear { factor: 2.0 } rotating 0.5",
+            ),
+            (
+                json!({"rope_parameters": {
+                    "rope_type": "proportional", "rope_theta": 1e4, "partial_rotary_factor": 0.5,
+                }}),
+                "Proportional { factor: Positive(1.0) } rotating 0.5",
+            ),
+        ] {
+            let error = prefix(document.clone()).unwrap_err();
+            let reason = format!(
+                "found {found} of each head, compiled the unscaled spectrum over the first 64 of \
+                 128 coordinates"
             );
             assert_eq!(
                 (error.kind(), error.to_string()),

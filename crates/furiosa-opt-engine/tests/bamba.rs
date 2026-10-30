@@ -40,10 +40,19 @@ fn bamba_9b_loads_strictly() {
 
 // # Configs
 
-/// The size parses its published checkpoint's config.
+/// The size parses its published checkpoint's config, which names no rotary field, the same
+/// rotation in Transformers 5's spelling, and another base, which its kernels read at load.
 #[test]
 fn size_reads_its_published_config() {
-    Size::<"9B">::parse(&BAMBA_9B.config()).unwrap();
+    let published = BAMBA_9B.config();
+    Size::<"9B">::parse(&published).unwrap();
+    let mut respelled = published.clone();
+    respelled["rope_parameters"] =
+        json!({"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.5});
+    Size::<"9B">::parse(&respelled).unwrap();
+    let mut rebased = published;
+    rebased["rope_theta"] = json!(1000000.0);
+    Size::<"9B">::parse(&rebased).unwrap();
 }
 
 /// A config the size does not serve is refused, each case by its kind and reason.
@@ -188,7 +197,28 @@ fn size_refuses_what_it_does_not_serve() {
             "rope_scaling",
             json!({"rope_type": "linear", "factor": 2.0}),
             Unsupported,
-            "rope_scaling: Bamba rotates without scaling",
+            "found Linear { factor: 2.0 } rotating 0.5 of each head, compiled the unscaled \
+             spectrum over the first 64 of 128 coordinates",
+        ),
+        (
+            "rope_parameters",
+            json!({"rope_type": "linear", "factor": 2.0, "rope_theta": 10000.0}),
+            Unsupported,
+            "found Linear { factor: 2.0 } rotating 0.5 of each head, compiled the unscaled \
+             spectrum over the first 64 of 128 coordinates",
+        ),
+        (
+            "partial_rotary_factor",
+            json!(1.0),
+            Unsupported,
+            "found Default rotating 1 of each head, compiled the unscaled spectrum over the first \
+             64 of 128 coordinates",
+        ),
+        (
+            "rope_theta",
+            json!(0),
+            InvalidData,
+            "rope_theta: found 0, expected a positive finite value",
         ),
     ];
     for (field, value, kind, reason) in cases {
