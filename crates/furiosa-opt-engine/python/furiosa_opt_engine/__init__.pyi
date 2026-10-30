@@ -75,7 +75,7 @@ class Decoder:
         The dtype of the projection weights.
         """
     @property
-    def parallel(self) -> builtins.int:
+    def chips(self) -> builtins.int:
         r"""
         The chips the model runs on.
         """

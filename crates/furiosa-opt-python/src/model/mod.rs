@@ -286,7 +286,7 @@ impl Decoder {
 
     /// The chips the model runs on.
     #[getter]
-    fn parallel(&self) -> usize {
+    fn chips(&self) -> usize {
         self.config.chips()
     }
 
