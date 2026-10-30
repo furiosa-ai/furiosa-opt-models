@@ -81,6 +81,8 @@ type Launched<'c, 'a, Z = S> = Call<
         <Z as Decode>::Sequences,
         <Z as Decode>::Slots,
         Groups<Z>,
+        launch::Waves<Z>,
+        <Z as Decode>::Windows,
     >,
     launch::Ids<Z>,
     Capacity<Z>,

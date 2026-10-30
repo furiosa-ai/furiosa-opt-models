@@ -11,6 +11,7 @@
 //!   in one launch: its host plans each row's position and cache slot, its work items and prompt
 //!   chunks and its selected rows, and the launch returns the selected rows' tokens in kept order.
 //!   Its prompt chunks attend apart from their history, so it refuses a fixed tiling.
+//! - Every root serves the context its size is compiled for.
 //! - A call whose rows run with adapters passes each layer's attention and feed-forward projections
 //!   the terms of the call's adapters and their selections of the rows. Only BF16 Qwen3 of 0.6B to
 //!   4B runs adapters: the sizes of 8B geometry, Qwen3's, Llama's and Mistral's, lay their query,
@@ -29,12 +30,11 @@ use furiosa_opt_models::modules::attention::key_value;
 use furiosa_opt_models::modules::language::{Input, Selected};
 use furiosa_opt_models::modules::lora::{self, Adapters, Rank};
 use furiosa_opt_models::ops::attention::full::paged::{Tiling, chunks::Masks};
-use furiosa_opt_models::ops::attention::gqa::Cache as Window;
 use furiosa_opt_models::ops::embedding::Ids;
 use furiosa_opt_models::ops::index::gather;
 use furiosa_opt_models::ops::index::table::BlockIndex;
 use furiosa_opt_models::ops::linear::affine::{self, Columns};
-use furiosa_opt_models::specialize::attention::{Decode, WAVES};
+use furiosa_opt_models::specialize::attention::Decode;
 use furiosa_opt_models::tensor::cache::{self, Block, Blocks};
 use furiosa_opt_models::tensor::memory::{Hbm, alias};
 use furiosa_opt_models::tensor::parallel::{Chip, Parallel};
@@ -54,9 +54,9 @@ impl<R: AxisName, W: AxisName> AxisName for Tables<R, W> {
 
 /// What a call of the size `S` holds: the compiled context, the size's rows, one paged group of
 /// every layer's blocks, and `adapters` adapters.
-fn limits<S: Geometry + Decode>(adapters: usize) -> Limits {
+fn limits<S: Geometry + Decode + 'static>(adapters: usize) -> Limits {
     Limits {
-        window: S::Windows::SIZE * Window::SIZE,
+        window: launch::Positions::<S>::SIZE,
         rows: S::Rows::SIZE,
         cache: CacheSpec {
             pools: vec![Pool {
@@ -71,6 +71,14 @@ fn limits<S: Geometry + Decode>(adapters: usize) -> Limits {
             }],
         },
         adapters,
+    }
+}
+
+/// What a launch of the size `S` holds: the compiled context and the launch's rows.
+fn launched<S: Geometry + Decode + 'static>() -> Limits {
+    Limits {
+        rows: launch::Capacity::<S>::SIZE,
+        ..limits::<S>(0)
     }
 }
 
@@ -154,7 +162,7 @@ macro_rules! decoders {
                     )
                     .await?;
                 // Placed each call: constants the calls could share, two small uploads a call.
-                let masks = Masks::new(device).await?;
+                let masks = Masks::<Chunks>::new(device).await?;
                 let mut views = views.into_iter();
                 let mut next =
                     || views.next().ok_or_else(|| io::Error::other("a read array is missing"));
@@ -394,26 +402,8 @@ macro_rules! launches {
             type Layers = <$size as Geometry>::Layers<Blocks<KvHeads, Head>>;
             type Adapter = Infallible;
 
-            /// The rows of a launch, a request reaching the positions its rotary table covers at
-            /// most.
             fn limits(&self) -> Limits {
-                Limits {
-                    window: launch::CONTEXT.min(<$size as Decode>::Positions::SIZE),
-                    rows: launch::Capacity::<$size>::SIZE,
-                    cache: CacheSpec {
-                        pools: vec![Pool {
-                            block: Block::SIZE,
-                            bytes: Blocks::<KvHeads, Head>::BLOCK_STRIDE as usize,
-                        }],
-                        groups: vec![Group {
-                            pool: 0,
-                            layers: 0..<$size as Geometry>::LAYERS,
-                            kind: Kind::Paged,
-                            window: None,
-                        }],
-                    },
-                    adapters: Self::ADAPTERS,
-                }
+                launched::<$size>()
             }
 
             fn layers(storage: &[HbmBuffer]) -> io::Result<Self::Layers> {
@@ -438,6 +428,7 @@ macro_rules! launches {
                         ));
                     }
                     type Capacity = launch::Capacity<$size>;
+                    type Windows = <$size as Decode>::Windows;
                     let reads = batch.operands::<
                         Capacity,
                         <$size as Decode>::Reach,
@@ -445,10 +436,11 @@ macro_rules! launches {
                         KvHeads,
                         <$size as Geometry>::Groups,
                         Head,
-                        WAVES,
+                        launch::Waves<$size>,
+                        Windows,
                     >(0)?;
                     let (staged, views) = batch
-                        .stage::<Capacity, Tables<Capacity, Chunks>, Chip>(
+                        .stage::<Capacity, Tables<Capacity, Windows>, Chip>(
                             device,
                             &reads,
                             (0, Table::Blocks),
@@ -456,7 +448,7 @@ macro_rules! launches {
                         .await?;
                     // ponytail: placed each call; a load-lifetime place would spare two small
                     // uploads a call.
-                    let masks = Masks::new(device).await?;
+                    let masks = Masks::<Windows>::new(device).await?;
                     let mut views = views.into_iter();
                     let mut next = || {
                         views
@@ -511,8 +503,61 @@ launches!(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decoder::{Cache, Instance, Request};
+    use crate::decoder::{Cache, Instance, Keep, Request};
     use furiosa_opt_models::models::decoder::form::Affine;
+    use furiosa_opt_std::prelude::Topology;
+
+    /// A launch of Qwen3-4B admits and plans a call past the 40960 positions a Qwen3 checkpoint
+    /// declares, up to the context its size is compiled for: decode rows and a prompt that end at
+    /// its last position.
+    #[test]
+    fn launches_plan_the_compiled_context() -> io::Result<()> {
+        type S = qwen3::Size<"4B">;
+        let device = Device::new(Topology { chips: 1, pes: 8 }).map_err(io::Error::other)?;
+        // A request of `rows` rows ending at position `end`: its history reads block 0, and its
+        // rows write their own blocks from `first`.
+        let request = |rows: usize, end: usize, first: usize| -> io::Result<Request> {
+            let cached = end - rows;
+            let blocks = (0..end.div_ceil(Block::SIZE))
+                .map(|at| (at.checked_sub(cached / Block::SIZE)).map_or(0, |own| first + own))
+                .map(|block| block as u32)
+                .collect();
+            let ids = HbmBuffer::alloc(&device, rows * Rows::<i32, m![1]>::bytes())
+                .map_err(io::Error::other)?;
+            Ok(Request {
+                rows: vec![blocks],
+                cached,
+                tokens: Rows::new(&ids, 0..rows)?,
+                keep: Keep::Last,
+                adapter: None,
+                positions: None,
+                mask: None,
+                overrides: Vec::new(),
+            })
+        };
+        let limits = launched::<S>();
+        let context = limits.window;
+        assert!(context > 40960, "{context} positions");
+        // The rows every row of which the items hold over the whole context.
+        let rows = <S as Decode>::Rows::SIZE;
+        let cache = Cache::new(&device, &limits.cache, 2 + rows)?;
+        let mut requests = vec![request(rows / 2, context, 0)?];
+        for row in 0..rows / 2 {
+            requests.push(request(1, context, 2 + row)?);
+        }
+        let batch = Batch::<Infallible>::new(&requests, &limits, &cache, &[])?;
+        batch.operands::<
+            launch::Capacity<S>,
+            <S as Decode>::Reach,
+            <S as Decode>::Sequences,
+            KvHeads,
+            <S as Geometry>::Groups,
+            Head,
+            launch::Waves<S>,
+            <S as Decode>::Windows,
+        >(0)?;
+        Ok(())
+    }
 
     /// An instance of the catalog's launch model serves requests on a cache in dense BF16 and in
     /// block-scaled FP8, returning the kept rows' tokens.

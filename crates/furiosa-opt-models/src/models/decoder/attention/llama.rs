@@ -18,7 +18,7 @@ use crate::ops::attention::geometry::{self, HeadRows, ProjectionWidth, QueryGrou
 use crate::ops::normalization::RmsNorm;
 use crate::ops::swiglu;
 use crate::specialize::attention::Decode;
-use crate::tensor::axis::{self, Limit};
+use crate::tensor::axis::Limit;
 use crate::tensor::form::Weight;
 use crate::tensor::memory::Memory;
 use furiosa_opt_std::prelude::*;
@@ -74,7 +74,6 @@ impl Decode for Size<"8B"> {
     type Reach = <qwen3::Size<"8B"> as Decode>::Reach;
     type Sequences = <qwen3::Size<"8B"> as Decode>::Sequences;
     type Slots = <qwen3::Size<"8B"> as Decode>::Slots;
-    type Positions = axis::Rows<8192>;
 }
 
 /// Mistral 7B, whose tree is Llama's: Llama 3 8B's geometry over a 32768-token vocabulary.
@@ -106,7 +105,6 @@ impl Decode for Size<"Mistral-7B"> {
     type Reach = <Size<"8B"> as Decode>::Reach;
     type Sequences = <Size<"8B"> as Decode>::Sequences;
     type Slots = <Size<"8B"> as Decode>::Slots;
-    type Positions = <Size<"8B"> as Decode>::Positions;
 }
 
 /// Llama projects each row's query, key and value heads and rotates them unnormalized.

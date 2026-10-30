@@ -181,7 +181,8 @@ impl<
     KvHeads: AxisName,
     Groups: AxisName,
     Head: AxisName,
-    const WAVES: usize,
+    Waves: AxisName,
+    Windows: AxisName,
     L: AxisName,
     WI: Deref<Target = HbmTensor<i32, Chip, m![Reach]>>,
     W,
@@ -191,7 +192,7 @@ impl<
     Module<
         Begin<(
             &'w WI,
-            &'w paged::Context<'e, Sequences, KvHeads, Groups, Head, WAVES, L>,
+            &'w paged::Context<'e, Sequences, KvHeads, Groups, Head, Waves, Windows, L>,
         )>,
         Env,
         &'s mut &'b mut Blocks<KvHeads, Head>,
@@ -209,7 +210,7 @@ impl<
         _: &'s mut &'b mut Blocks<KvHeads, Head>,
         _: Begin<(
             &'w WI,
-            &'w paged::Context<'e, Sequences, KvHeads, Groups, Head, WAVES, L>,
+            &'w paged::Context<'e, Sequences, KvHeads, Groups, Head, Waves, Windows, L>,
         )>,
     ) -> Self::Output {
         (HbmTensor::new(), (HbmTensor::new(), HbmTensor::new()))
@@ -253,7 +254,8 @@ impl<
     KvHeads: AxisName,
     Groups: AxisName,
     Head: AxisName,
-    const WAVES: usize,
+    Waves: AxisName,
+    Windows: AxisName,
     L: AxisName,
     WI: Deref<Target = HbmTensor<i32, Chip, m![Reach]>>,
     W,
@@ -265,7 +267,7 @@ impl<
             &'p Retention<Reach, KvHeads, Head>,
             (
                 &'w WI,
-                &'w paged::Context<'e, Sequences, KvHeads, Groups, Head, WAVES, L>,
+                &'w paged::Context<'e, Sequences, KvHeads, Groups, Head, Waves, Windows, L>,
             ),
             Live<(), L>,
         ),
@@ -286,7 +288,7 @@ where
             &'p Retention<Reach, KvHeads, Head>,
             (
                 &'w WI,
-                &'w paged::Context<'e, Sequences, KvHeads, Groups, Head, WAVES, L>,
+                &'w paged::Context<'e, Sequences, KvHeads, Groups, Head, Waves, Windows, L>,
             ),
             Live<(), L>,
         ),
