@@ -94,18 +94,19 @@ pub trait Geometry {
 /// A causal language model of size `G` whose projections hold form `P`: the base model, then the
 /// head that reads its rows.
 #[derive(DeviceSend, Load)]
+#[load(tree)]
 pub struct ForCausalLM<G: Geometry, Model, Head, P = form::Affine> {
     pub size: PhantomData<G>,
     /// The form of the body's projections, by which a line's scope admits a checkpoint.
     pub form: PhantomData<P>,
     pub model: Model,
-    #[load(tied = "model.embed_tokens", config = "tie_word_embeddings")]
     pub lm_head: Head,
 }
 
 /// The base model of size `G` whose projections hold form `P`: the body, and the constants that
 /// prepare each call's attention context.
 #[derive(DeviceSend, Load)]
+#[load(tree)]
 pub struct Model<G: Geometry, Body, Rotary, P = form::Affine> {
     pub size: PhantomData<G>,
     /// The form of the body's projections, by which a line's scope admits a checkpoint.
@@ -118,6 +119,7 @@ pub struct Model<G: Geometry, Body, Rotary, P = form::Affine> {
 /// A sequence classifier of size `G` whose projections hold form `P`: the base model, then the
 /// scores of its last row.
 #[derive(DeviceSend, Load)]
+#[load(tree)]
 pub struct ForSequenceClassification<G: Geometry, Model, Score, P = form::Affine> {
     pub size: PhantomData<G>,
     /// The form of the body's projections, by which a line's scope admits a checkpoint.
@@ -126,9 +128,182 @@ pub struct ForSequenceClassification<G: Geometry, Model, Score, P = form::Affine
     pub score: Score,
 }
 
-/// The scope a decoder's base model is read at in a checkpoint of a class with a head: Hugging
-/// Face's `base_model_prefix`.
-const PREFIX: &str = "model";
+/// A causal model reads the base model where its family keeps it, then the head at `lm_head`, or
+/// at the base model's embedding when the size ties, the head's config in the family's.
+impl<'a, G: Geometry + Family, Model, Head, P> Load<&'a Checkpoint>
+    for ForCausalLM<G, Model, Head, P>
+where
+    Model: Load<&'a Checkpoint>,
+    Head: Load<&'a Checkpoint>,
+{
+    fn load(context: &mut load::Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
+        class::<G, _>(context, from, |cx| {
+            cx.ties(&[embedding::<G>().as_str()], |cx| {
+                let mut children = load::Children::default();
+                let model = cx.field("model", G::MODEL, |cx| Model::load(cx, from));
+                let model = children.ask(model)?;
+                let head = Self::head(cx, |cx| {
+                    cx.tying(from, "tie_word_embeddings", G::TIED_EMBEDDINGS)?;
+                    Head::load(cx, from)
+                });
+                let head = children.ask(head)?;
+                children.node(model.zip(head).map(|(model, lm_head)| Self {
+                    size: PhantomData,
+                    form: PhantomData,
+                    model,
+                    lm_head,
+                }))
+            })
+        })
+    }
+}
+
+impl<'t, 's, G: Geometry + Family, Model, Head, P>
+    Load<(&'t mut ForCausalLM<G, Model, Head, P>, &'s Checkpoint)>
+    for &'t mut ForCausalLM<G, Model, Head, P>
+where
+    for<'u> &'u mut Model: Load<(&'u mut Model, &'s Checkpoint)>,
+    for<'u> &'u mut Head: Load<(&'u mut Head, &'s Checkpoint)>,
+{
+    fn load(
+        context: &mut load::Context<'_>,
+        (into, from): (&'t mut ForCausalLM<G, Model, Head, P>, &'s Checkpoint),
+    ) -> Result<Self, LoadError> {
+        class::<G, _>(context, from, |cx| {
+            cx.ties(&[embedding::<G>().as_str()], |cx| {
+                cx.field("model", G::MODEL, |cx| {
+                    <&mut Model as Load<_>>::load(cx, (&mut into.model, from))
+                })?;
+                ForCausalLM::<G, Model, Head, P>::head(cx, |cx| {
+                    <&mut Head as Load<_>>::load(cx, (&mut into.lm_head, from))
+                })?;
+                Ok(())
+            })
+        })?;
+        Ok(into)
+    }
+}
+
+impl<G: Geometry + Family, Model, Head, P> ForCausalLM<G, Model, Head, P> {
+    /// Runs `visit` where the head reads: `lm_head`, or the base model's embedding when the size
+    /// ties, in the family's config.
+    fn head<R>(
+        context: &mut load::Context<'_>,
+        visit: impl FnOnce(&mut load::Context<'_>) -> R,
+    ) -> R {
+        context.config(G::CONFIG, |cx| match G::TIED_EMBEDDINGS {
+            true => cx.tied("lm_head", "lm_head", &embedding::<G>(), visit),
+            false => cx.field("lm_head", "lm_head", visit),
+        })
+    }
+}
+
+/// A base model reads its body and the constants of its calls, their config in the family's.
+impl<'a, G: Geometry + Family, Body, Rotary, P> Load<&'a Checkpoint> for Model<G, Body, Rotary, P>
+where
+    Body: Load<&'a Checkpoint>,
+    Rotary: Load<&'a Checkpoint>,
+{
+    fn load(context: &mut load::Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
+        context.checkpoint(from, |cx| {
+            cx.config(G::CONFIG, |cx| {
+                let mut children = load::Children::default();
+                let body = children.ask(cx.field("body", "", |cx| Body::load(cx, from)))?;
+                let rotary = cx.field("rotary_emb", "rotary_emb", |cx| Rotary::load(cx, from));
+                let rotary = children.ask(rotary)?;
+                children.node(body.zip(rotary).map(|(body, rotary_emb)| Self {
+                    size: PhantomData,
+                    form: PhantomData,
+                    body,
+                    rotary_emb,
+                }))
+            })
+        })
+    }
+}
+
+impl<'t, 's, G: Geometry + Family, Body, Rotary, P>
+    Load<(&'t mut Model<G, Body, Rotary, P>, &'s Checkpoint)> for &'t mut Model<G, Body, Rotary, P>
+where
+    for<'u> &'u mut Body: Load<(&'u mut Body, &'s Checkpoint)>,
+    for<'u> &'u mut Rotary: Load<(&'u mut Rotary, &'s Checkpoint)>,
+{
+    fn load(
+        context: &mut load::Context<'_>,
+        (into, from): (&'t mut Model<G, Body, Rotary, P>, &'s Checkpoint),
+    ) -> Result<Self, LoadError> {
+        context.checkpoint(from, |cx| {
+            cx.config(G::CONFIG, |cx| {
+                cx.field("body", "", |cx| {
+                    <&mut Body as Load<_>>::load(cx, (&mut into.body, from))
+                })?;
+                cx.field("rotary_emb", "rotary_emb", |cx| {
+                    <&mut Rotary as Load<_>>::load(cx, (&mut into.rotary_emb, from))
+                })?;
+                Ok(())
+            })
+        })?;
+        Ok(into)
+    }
+}
+
+/// A sequence classifier reads the base model where its family keeps it, then the score, its
+/// config in the family's.
+impl<'a, G: Geometry + Family, Model, Score, P> Load<&'a Checkpoint>
+    for ForSequenceClassification<G, Model, Score, P>
+where
+    Model: Load<&'a Checkpoint>,
+    Score: Load<&'a Checkpoint>,
+{
+    fn load(context: &mut load::Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
+        class::<G, _>(context, from, |cx| {
+            let mut children = load::Children::default();
+            let model = cx.field("model", G::MODEL, |cx| Model::load(cx, from));
+            let model = children.ask(model)?;
+            let score = cx.config(G::CONFIG, |cx| {
+                cx.field("score", "score", |cx| Score::load(cx, from))
+            });
+            let score = children.ask(score)?;
+            children.node(model.zip(score).map(|(model, score)| Self {
+                size: PhantomData,
+                form: PhantomData,
+                model,
+                score,
+            }))
+        })
+    }
+}
+
+impl<'t, 's, G: Geometry + Family, Model, Score, P>
+    Load<(
+        &'t mut ForSequenceClassification<G, Model, Score, P>,
+        &'s Checkpoint,
+    )> for &'t mut ForSequenceClassification<G, Model, Score, P>
+where
+    for<'u> &'u mut Model: Load<(&'u mut Model, &'s Checkpoint)>,
+    for<'u> &'u mut Score: Load<(&'u mut Score, &'s Checkpoint)>,
+{
+    fn load(
+        context: &mut load::Context<'_>,
+        (into, from): (
+            &'t mut ForSequenceClassification<G, Model, Score, P>,
+            &'s Checkpoint,
+        ),
+    ) -> Result<Self, LoadError> {
+        class::<G, _>(context, from, |cx| {
+            cx.field("model", G::MODEL, |cx| {
+                <&mut Model as Load<_>>::load(cx, (&mut into.model, from))
+            })?;
+            cx.config(G::CONFIG, |cx| {
+                cx.field("score", "score", |cx| {
+                    <&mut Score as Load<_>>::load(cx, (&mut into.score, from))
+                })
+            })?;
+            Ok(())
+        })?;
+        Ok(into)
+    }
+}
 
 /// The HF layer type whose rotary spectrum and attention window a paging load binds.
 pub trait LayerType {
@@ -234,7 +409,7 @@ impl<G: Geometry + Family, Model, Head, P: Form> Implements for ForCausalLM<G, M
 }
 
 /// A base model reads its own layout at a checkpoint's root, and a causal or classifier
-/// checkpoint's under `model`, not both, if its form admits the checkpoint.
+/// checkpoint's where its family keeps it, not both, if its form admits the checkpoint.
 impl<G: Geometry + Family, Body, Rotary, P: Form> Implements for Model<G, Body, Rotary, P> {
     const SIZE: &'static str = G::SIZE;
     const CLASS: Class = Class {
@@ -247,15 +422,16 @@ impl<G: Geometry + Family, Body, Rotary, P: Form> Implements for Model<G, Body, 
         P::REQUIREMENT.admits(source)?;
         let names = source.names();
         let holds = |name: &str| names.iter().any(|stored| stored == name);
-        match (
-            holds("embed_tokens.weight"),
-            holds("model.embed_tokens.weight"),
-        ) {
+        let nested = format!("{}.weight", embedding::<G>());
+        match (holds("embed_tokens.weight"), holds(&nested)) {
             (true, true) => Err(LoadError::InvalidData {
                 name: "embed_tokens.weight".into(),
-                reason: format!("the checkpoint holds a base model at its root and under {PREFIX}"),
+                reason: format!(
+                    "the checkpoint holds a base model at its root and under {}",
+                    G::MODEL
+                ),
             }),
-            (false, true) => Ok(PREFIX),
+            (false, true) => Ok(G::MODEL),
             _ => Ok(""),
         }
     }
@@ -2566,6 +2742,23 @@ fn check<G: Family>(config: &serde_json::Value) -> Result<(), LoadError> {
     G::parse(config).map(drop).map_err(refusal)
 }
 
+/// Runs `visit` over `from` as a class of the family `G` reads its checkpoint, the siblings of the
+/// base model that `G` names left unread.
+fn class<G: Family, R>(
+    context: &mut load::Context<'_>,
+    from: &Checkpoint,
+    visit: impl FnOnce(&mut load::Context<'_>) -> Result<R, LoadError>,
+) -> Result<R, LoadError> {
+    context.checkpoint(from, |cx| {
+        G::IGNORE.iter().for_each(|prefix| cx.ignore(prefix));
+        visit(cx)
+    })
+}
+
+fn embedding<G: Family>() -> String {
+    format!("{}.embed_tokens", G::MODEL)
+}
+
 /// A config parse's refusal as a load's: unsupported, or invalid data.
 fn refusal(error: io::Error) -> LoadError {
     let (name, reason) = ("config.json".into(), error.to_string());
@@ -2744,6 +2937,58 @@ mod tests {
         before_projection: true,
         output_norms: true,
     };
+
+    axes![Tokens = 8, Features = 4];
+
+    /// A size of a family whose checkpoints keep the base model as a vision-language checkpoint
+    /// keeps its language model: below `model`, beside media encoders, configured in `text_config`.
+    struct Nested;
+
+    impl Geometry for Nested {
+        type Hidden = Features;
+        type Intermediate = Features;
+        type Vocabulary = Tokens;
+        type KvHeads = Features;
+        type Groups = Features;
+        type Head = Features;
+        type Queries = Features;
+        type Layers<L> = [L; 1];
+        type Norm<W: AxisName, X: Memory> = ();
+
+        const SIZE: &'static str = "nested";
+        const FAMILY: &'static str = "nested";
+        const LAYERS: usize = 1;
+        const EPSILON: usize = 0;
+        const TIED_EMBEDDINGS: bool = true;
+    }
+
+    impl Family for Nested {
+        type Hf = serde_json::Value;
+
+        const MODEL: &'static str = "model.language_model";
+        const CONFIG: &'static str = "text_config";
+        const IGNORE: &'static [&'static str] = &["model.vision_embedder", "model.embed_audio"];
+    }
+
+    impl TryFrom<serde_json::Value> for Nested {
+        type Error = io::Error;
+
+        fn try_from(_: serde_json::Value) -> io::Result<Self> {
+            Ok(Self)
+        }
+    }
+
+    #[derive(Load)]
+    struct Table<X: Memory> {
+        weight: X::Tensor<bf16, m![1], m![Tokens, Features]>,
+    }
+
+    #[derive(Load)]
+    struct Body<X: Memory> {
+        embed_tokens: Table<X>,
+        #[load(config = "rms_norm_eps")]
+        epsilon: X::Tensor<f32, m![1], m![1 # 8]>,
+    }
 
     /// The state of a toy readout over one rotary and one NoPE layer: units beside each layer's
     /// view of its cache in `caches`, `layer` building a layer's slot around the view. An
@@ -3147,6 +3392,50 @@ mod tests {
                 other => panic!("{other:?}"),
             };
             assert_eq!(refusal, expected);
+        }
+    }
+
+    /// The roots read the base model, its tied head and their config where the family keeps them,
+    /// beside the siblings it names; another sibling, or a config value at the root, is refused.
+    #[test]
+    fn reads_the_base_model_where_the_family_keeps_it() {
+        type Causal =
+            ForCausalLM<Nested, Model<Nested, Body<load::Shapes>, ()>, Table<load::Shapes>>;
+        let directory = tempfile::tempdir().unwrap();
+        let checkpoint = |config: serde_json::Value, names: &[&str]| {
+            let mut source = Checkpoint::new(directory.path(), Some(config)).unwrap();
+            let shape = [Tokens::SIZE, Features::SIZE];
+            for name in names {
+                let bytes = vec![0; 2 * Tokens::SIZE * Features::SIZE];
+                (source.insert(name, safetensors::Dtype::BF16, &shape, bytes)).unwrap();
+            }
+            source
+        };
+        let read = |source: &Checkpoint| Causal::load(&mut load::Context::new(None), source);
+        let text = serde_json::json!({"rms_norm_eps": 1e-6, "tie_word_embeddings": true});
+        let nested = serde_json::json!({ "text_config": text });
+        let stored = [
+            "model.language_model.embed_tokens.weight",
+            "model.vision_embedder.patch_dense.weight",
+            "model.embed_audio.embedding_projection.weight",
+        ];
+        read(&checkpoint(nested.clone(), &stored)).unwrap();
+        let scope = Model::<Nested, (), ()>::scope(&checkpoint(nested.clone(), &stored));
+        assert_eq!(scope.unwrap(), "model.language_model");
+        let projector = "model.multi_modal_projector.weight";
+        match read(&checkpoint(nested, &[&stored[..], &[projector]].concat())) {
+            Err(LoadError::Unexpected(names)) => assert_eq!(names, [projector]),
+            other => panic!("{:?}", other.map(drop)),
+        }
+        match read(&checkpoint(text, &stored)) {
+            Err(LoadError::Missing(names)) => assert_eq!(
+                names,
+                [
+                    "config.json:text_config.rms_norm_eps",
+                    "config.json:text_config.tie_word_embeddings"
+                ]
+            ),
+            other => panic!("{:?}", other.map(drop)),
         }
     }
 }

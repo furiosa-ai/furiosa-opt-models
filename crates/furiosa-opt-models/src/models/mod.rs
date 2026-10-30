@@ -46,6 +46,18 @@ pub trait Family: Sized {
     /// The checkpoint configuration's schema, which `try_into` narrows to this family.
     type Hf: DeserializeOwned + TryInto<Self, Error = io::Error>;
 
+    /// Where a checkpoint of a class with a head keeps the base model: Hugging Face's
+    /// `base_model_prefix`, or deeper, as a vision-language checkpoint keeps its language model.
+    const MODEL: &'static str = "model";
+
+    /// The config object that holds the fields of the base model and its head: the root, or a
+    /// vision-language checkpoint's `text_config`.
+    const CONFIG: &'static str = "";
+
+    /// The checkpoint prefixes beside the base model that its classes read none of, such as a
+    /// vision-language checkpoint's media encoders.
+    const IGNORE: &'static [&'static str] = &[];
+
     /// Parse a checkpoint configuration, refusing values the compiled composition cannot hold.
     fn parse(document: &serde_json::Value) -> io::Result<Self> {
         config::parse::<Self::Hf>(document)?.try_into()
