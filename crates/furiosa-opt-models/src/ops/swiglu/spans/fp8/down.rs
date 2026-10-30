@@ -290,40 +290,6 @@ type Spilled<Intermediate, Rows> = (
     StagedScales<Intermediate, Rows>,
 );
 
-/// A tile's product staged for the down projection: a span of more than two waves quantized by
-/// each row group's scales over all the slices of its panels (the vector path's scale floor), a
-/// smaller one kept in BF16 for its panels' block quantization.
-fn spill<Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>(
-    context: &mut Device,
-    product: Live<Halves<Intermediate, Rows>, Capacity>,
-) -> Spilled<Intermediate, Rows> {
-    const { assert!(<m![{ Out<Intermediate> } / 64]>::SIZE == Panels::SIZE) };
-    let (live, rows) = (product.count::<axis::Rows<128>>(), product.rows());
-    let product = product.into_value();
-    let mut products = HbmTensor::<bf16, Chip, Stores<Intermediate, Rows>>::new();
-    let (mut h0, mut h1, mut h2) = (Staged::new(), Staged::new(), Staged::new());
-    let mut scales = StagedScales::<Intermediate, Rows>::new();
-    if live <= 2 {
-        StoreTiles.forward(&mut *context, (&product, rows, &mut products));
-    } else {
-        let mut chunks = ChunkMax::<Intermediate, Rows, Slice<Intermediate, Rows>>::new();
-        PanelMaxima::<0>.forward(&mut *context, (&product, &mut chunks));
-        PanelMaxima::<1>.forward(&mut *context, (&product, &mut chunks));
-        PanelMaxima::<2>.forward(&mut *context, (&product, &mut chunks));
-        let mut groups = SpreadScale::<Intermediate, Rows>::new();
-        let broadcast = GroupScales.forward(&mut *context, (&chunks, &mut groups));
-        let mut quantized = Spread::<Intermediate, Rows, f8e4m3>::new();
-        QuantizeSpread::<0>.forward(&mut *context, (&product, &broadcast, &mut quantized));
-        QuantizeSpread::<1>.forward(&mut *context, (&product, &broadcast, &mut quantized));
-        QuantizeSpread::<2>.forward(&mut *context, (&product, &broadcast, &mut quantized));
-        StagePanel.forward(&mut *context, (&quantized, 0, &mut h0));
-        StagePanel.forward(&mut *context, (&quantized, 1, &mut h1));
-        StagePanel.forward(&mut *context, (&quantized, 2, &mut h2));
-        StageScales.forward(&mut *context, (&groups, &mut scales));
-    }
-    (products, (h0, h1, h2), scales)
-}
-
 /// A tile's product staged for the down projection, then the first down panel landed.
 impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>
     Op<Begin<Live<Halves<Intermediate, Rows>, Capacity>>> for DownWeights<Hidden, Intermediate>
@@ -393,30 +359,6 @@ pub struct Ready<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName> {
         Landed<Hidden, Intermediate, Rows>,
     ),
     channels: Channels<Hidden, Intermediate>,
-}
-
-/// Panel `panel`'s input as it lands: a product of at most two waves as it is, of more its
-/// quantized panel and row scales.
-fn landed<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>(
-    context: &mut Device,
-    (products, scales): (
-        &HbmTensor<bf16, Chip, Chunks<Intermediate, Rows>>,
-        &StagedScales<Intermediate, Rows>,
-    ),
-    (panel, staged): (usize, &Staged<Intermediate, Rows>),
-    (live, rows): (usize, usize),
-) -> Landed<Hidden, Intermediate, Rows> {
-    let mut product = Product::<Hidden, Intermediate, Rows>::new();
-    let mut activation = Activation::<Hidden, Intermediate, Rows>::new();
-    let mut scale = Scale::<Hidden, Intermediate, Rows>::new();
-    if live <= 2 {
-        product = LoadProduct::<Hidden>(PhantomData)
-            .forward(&mut *context, (products, panel, (live, rows)));
-    } else {
-        CopyPanel.forward(&mut *context, (staged, &mut activation));
-        CopyScales.forward(&mut *context, (scales, panel, &mut scale));
-    }
-    (product, activation, scale)
 }
 
 /// The down projection of a staged product, its second and third down panels landing between its
@@ -539,6 +481,64 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
             (live, rows),
         )
     }
+}
+
+/// A tile's product staged for the down projection: a span of more than two waves quantized by
+/// each row group's scales over all the slices of its panels (the vector path's scale floor), a
+/// smaller one kept in BF16 for its panels' block quantization.
+fn spill<Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>(
+    context: &mut Device,
+    product: Live<Halves<Intermediate, Rows>, Capacity>,
+) -> Spilled<Intermediate, Rows> {
+    const { assert!(<m![{ Out<Intermediate> } / 64]>::SIZE == Panels::SIZE) };
+    let (live, rows) = (product.count::<axis::Rows<128>>(), product.rows());
+    let product = product.into_value();
+    let mut products = HbmTensor::<bf16, Chip, Stores<Intermediate, Rows>>::new();
+    let (mut h0, mut h1, mut h2) = (Staged::new(), Staged::new(), Staged::new());
+    let mut scales = StagedScales::<Intermediate, Rows>::new();
+    if live <= 2 {
+        StoreTiles.forward(&mut *context, (&product, rows, &mut products));
+    } else {
+        let mut chunks = ChunkMax::<Intermediate, Rows, Slice<Intermediate, Rows>>::new();
+        PanelMaxima::<0>.forward(&mut *context, (&product, &mut chunks));
+        PanelMaxima::<1>.forward(&mut *context, (&product, &mut chunks));
+        PanelMaxima::<2>.forward(&mut *context, (&product, &mut chunks));
+        let mut groups = SpreadScale::<Intermediate, Rows>::new();
+        let broadcast = GroupScales.forward(&mut *context, (&chunks, &mut groups));
+        let mut quantized = Spread::<Intermediate, Rows, f8e4m3>::new();
+        QuantizeSpread::<0>.forward(&mut *context, (&product, &broadcast, &mut quantized));
+        QuantizeSpread::<1>.forward(&mut *context, (&product, &broadcast, &mut quantized));
+        QuantizeSpread::<2>.forward(&mut *context, (&product, &broadcast, &mut quantized));
+        StagePanel.forward(&mut *context, (&quantized, 0, &mut h0));
+        StagePanel.forward(&mut *context, (&quantized, 1, &mut h1));
+        StagePanel.forward(&mut *context, (&quantized, 2, &mut h2));
+        StageScales.forward(&mut *context, (&groups, &mut scales));
+    }
+    (products, (h0, h1, h2), scales)
+}
+
+/// Panel `panel`'s input as it lands: a product of at most two waves as it is, of more its
+/// quantized panel and row scales.
+fn landed<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>(
+    context: &mut Device,
+    (products, scales): (
+        &HbmTensor<bf16, Chip, Chunks<Intermediate, Rows>>,
+        &StagedScales<Intermediate, Rows>,
+    ),
+    (panel, staged): (usize, &Staged<Intermediate, Rows>),
+    (live, rows): (usize, usize),
+) -> Landed<Hidden, Intermediate, Rows> {
+    let mut product = Product::<Hidden, Intermediate, Rows>::new();
+    let mut activation = Activation::<Hidden, Intermediate, Rows>::new();
+    let mut scale = Scale::<Hidden, Intermediate, Rows>::new();
+    if live <= 2 {
+        product = LoadProduct::<Hidden>(PhantomData)
+            .forward(&mut *context, (products, panel, (live, rows)));
+    } else {
+        CopyPanel.forward(&mut *context, (staged, &mut activation));
+        CopyScales.forward(&mut *context, (scales, panel, &mut scale));
+    }
+    (product, activation, scale)
 }
 
 /// The down projection of a staged product from its first two weight panels, the third taken
