@@ -9,6 +9,7 @@
 //!   rotary table, prompt chunks and work items cover, its windows' [`Positions`].
 
 use crate::load::Named;
+use crate::models::decoder;
 use crate::models::decoder::attention::qwen3::{CatalogBody, LmHead, QueryHeads, tiles};
 use crate::models::decoder::attention::{
     ForCausalLM, ForSequenceClassification, Geometry, Head, KvHeads,
@@ -51,7 +52,7 @@ impl<S: Decode + 'static> AxisName for Positions<S> {
 /// context under either tiling.
 pub struct Waves<S>(PhantomData<fn() -> S>);
 
-impl<S: Geometry + Decode + 'static> AxisName for Waves<S> {
+impl<S: decoder::Attention + Decode + 'static> AxisName for Waves<S> {
     const NAME: Ident = Ident::new("Waves");
     const SIZE: usize = tiles::<S>();
 }
@@ -178,7 +179,7 @@ pub type Terms<S, X> = (
                 Named<"k_proj", Factors<Rank<1>, Hidden<S>, Width<KvHeads, Head>, X>>,
                 Named<"v_proj", Factors<Rank<1>, Hidden<S>, Width<KvHeads, Head>, X>>,
             ),
-            Named<"o_proj", Factors<Rank<1>, <S as Geometry>::Queries, Hidden<S>, X>>,
+            Named<"o_proj", Factors<Rank<1>, <S as decoder::Attention>::QueryWidth, Hidden<S>, X>>,
         ),
     >,
     Named<
@@ -198,7 +199,7 @@ type Factors<K, In, Out, X> = lora::Term<
 
 type Intermediate<S> = <S as Geometry>::Intermediate;
 type Hidden<S> = <S as Geometry>::Hidden;
-type Groups<S> = <S as Geometry>::Groups;
+type Groups<S> = <S as decoder::Attention>::Groups;
 
 /// A selection of a launch's rows over `K` rank columns: one on the rows that run with its
 /// adapter, zero on every other.
@@ -214,7 +215,7 @@ pub type Adapted<'t, S, const N: usize> = lora::Layer<
     Projected<'t, S, Width<QueryHeads<S>, Head>, Hidden<S>, Rank<1>, N>,
     Projected<'t, S, Width<KvHeads, Head>, Hidden<S>, Rank<1>, N>,
     Projected<'t, S, Width<KvHeads, Head>, Hidden<S>, Rank<1>, N>,
-    Projected<'t, S, Hidden<S>, <S as Geometry>::Queries, Rank<1>, N>,
+    Projected<'t, S, Hidden<S>, <S as decoder::Attention>::QueryWidth, Rank<1>, N>,
     Projected<'t, S, GateUp<Intermediate<S>>, Hidden<S>, Rank<2>, N>,
     Projected<'t, S, Hidden<S>, Intermediate<S>, Rank<1>, N>,
 >;
@@ -235,7 +236,7 @@ pub type Context<'a, Capacity, Reach, Sequences, Slots, Groups, Waves, W> = (
 );
 
 /// Layer `layer`'s adapters of `held`, a call's adapters, with their `selections`.
-pub fn adapted<'t, S: Geometry + Decode + 'static, const N: usize>(
+pub fn adapted<'t, S: Geometry + decoder::Attention + Decode + 'static, const N: usize>(
     held: [&'t Adapter<S, Hbm>; N],
     layer: usize,
     (one, two): &'t Selections<S, N>,

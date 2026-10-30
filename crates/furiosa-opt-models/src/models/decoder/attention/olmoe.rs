@@ -5,8 +5,8 @@
 //!   row to 8 of 64 SwiGLU experts, weighed by their router probabilities as they are.
 //! - [`Model`] is the catalog's composition, over the [`DbrxForCausalLM`] template.
 
-use crate::models::decoder::attention::{Geometry, mixtral::DbrxForCausalLM};
-use crate::models::{Family, config, vocabulary};
+use crate::models::decoder::attention::{Chunks, Geometry, mixtral::DbrxForCausalLM};
+use crate::models::{Family, config, decoder, vocabulary};
 use crate::modules::feedforward::moe::Reduce;
 use crate::modules::feedforward::moe::TopK;
 use crate::modules::{attention, feedforward};
@@ -136,13 +136,9 @@ const EPSILON: usize = 1e-5_f32.to_bits() as usize;
 impl Geometry for Size<"1B-7B"> {
     const SIZE: &'static str = "1B-7B";
     const FAMILY: &'static str = "olmoe";
-    type Queries = QueryWidth;
     type Hidden = Hidden;
     type Intermediate = Intermediate;
     type Vocabulary = Vocabulary;
-    type KvHeads = Heads;
-    type Groups = Groups;
-    type Head = Head;
     type Layers<L> = [L; LAYERS];
     type Norm<W: AxisName, X: Memory> =
         RmsNorm<W, EPSILON, m![1], Weight<m![W], m![1], <X as Memory>::Tensor<bf16, m![1], m![W]>>>;
@@ -150,6 +146,16 @@ impl Geometry for Size<"1B-7B"> {
     const LAYERS: usize = LAYERS;
     const EPSILON: usize = EPSILON;
     const TIED_EMBEDDINGS: bool = false;
+}
+
+impl decoder::Attention for Size<"1B-7B"> {
+    type Heads = Heads;
+    type Head = Head;
+    type Groups = Groups;
+    type QueryWidth = QueryWidth;
+    type KvWidth = KvWidth;
+    type Rotated = Head;
+    type Windows = Chunks;
 }
 
 /// What an OLMoE checkpoint's config declares that its size fixes, and the features OLMoE does not
@@ -188,14 +194,14 @@ pub struct Config {
 /// compiled one.
 impl<const N: &'static str> TryFrom<Config> for Size<N>
 where
-    Self: Geometry,
+    Self: Geometry + decoder::Attention,
 {
     type Error = io::Error;
 
     fn try_from(config: Config) -> io::Result<Self> {
         let unsupported = |reason: &str| io::Error::new(io::ErrorKind::Unsupported, reason);
-        let heads = <Self as Geometry>::KvHeads::SIZE;
-        let head = <Self as Geometry>::Head::SIZE;
+        let heads = <Self as decoder::Attention>::Heads::SIZE;
+        let head = <Self as decoder::Attention>::Head::SIZE;
         let fixed = [
             (
                 "hidden_size",
@@ -212,7 +218,7 @@ where
             (
                 "num_attention_heads",
                 config.num_attention_heads,
-                heads * <Self as Geometry>::Groups::SIZE,
+                heads * <Self as decoder::Attention>::Groups::SIZE,
             ),
             ("head_dim", config.head_dim.unwrap_or(head), head),
             ("num_experts", config.num_experts, ExpertCount::SIZE),
@@ -274,7 +280,7 @@ where
 
 impl<const N: &'static str> Family for Size<N>
 where
-    Self: Geometry,
+    Self: Geometry + decoder::Attention,
 {
     type Hf = Config;
 }

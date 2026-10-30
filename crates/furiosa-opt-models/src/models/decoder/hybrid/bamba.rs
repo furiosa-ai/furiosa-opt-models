@@ -8,7 +8,7 @@
 use crate::models::decoder::attention::{Chunks, Geometry};
 use crate::models::decoder::recurrent::mamba::{self, Ids, Rows};
 use crate::models::decoder::recurrent::mamba2;
-use crate::models::{Family, Scalar};
+use crate::models::{Family, Scalar, decoder};
 use crate::modules::attention;
 use crate::modules::recurrent::GateFirst;
 use crate::modules::{feedforward::glu::Glu, language, transformer};
@@ -199,17 +199,12 @@ pub struct Size<const N: &'static str>;
 /// `rms_norm_eps` 1e-5, as the bits of the FP32 nearest to it.
 const EPSILON: usize = 1e-5_f32.to_bits() as usize;
 
-/// The attention layers' geometry, which the size's attention decoder template holds.
 impl Geometry for Size<"9B"> {
     const SIZE: &'static str = "9B";
     const FAMILY: &'static str = "bamba";
-    type Queries = QueryWidth<{ AttentionHeads::SIZE * AttentionHead::SIZE }>;
     type Hidden = Width;
     type Intermediate = FeedForward;
     type Vocabulary = Vocabulary;
-    type KvHeads = KvHeads;
-    type Groups = QueryGroups<{ AttentionHeads::SIZE / KvHeads::SIZE }>;
-    type Head = AttentionHead;
     type Layers<L> = [L; ORDER.len()];
     type Norm<W: AxisName, X: Memory> =
         RmsNorm<W, EPSILON, m![1], Weight<m![W], m![1], <X as Memory>::Tensor<bf16, m![1], m![W]>>>;
@@ -217,6 +212,17 @@ impl Geometry for Size<"9B"> {
     const LAYERS: usize = ORDER.len();
     const EPSILON: usize = EPSILON;
     const TIED_EMBEDDINGS: bool = false;
+}
+
+/// The attention layers' heads, not the mixer layers'.
+impl decoder::Attention for Size<"9B"> {
+    type Heads = KvHeads;
+    type Head = AttentionHead;
+    type Groups = QueryGroups<{ AttentionHeads::SIZE / KvHeads::SIZE }>;
+    type QueryWidth = QueryWidth<{ AttentionHeads::SIZE * AttentionHead::SIZE }>;
+    type KvWidth = KvWidth;
+    type Rotated = Rotated;
+    type Windows = Chunks;
 }
 
 /// What a Bamba checkpoint's config declares that its size fixes, and the features Bamba does not
@@ -265,14 +271,14 @@ pub struct Config {
 /// vocabulary rows and context, and none of the features Bamba does not serve.
 impl<const N: &'static str> TryFrom<Config> for Size<N>
 where
-    Self: Geometry,
+    Self: Geometry + decoder::Attention,
 {
     type Error = io::Error;
 
     fn try_from(config: Config) -> io::Result<Self> {
         let invalid = |reason: String| io::Error::new(io::ErrorKind::InvalidData, reason);
         let unsupported = |reason: &str| io::Error::new(io::ErrorKind::Unsupported, reason);
-        let heads = <Self as Geometry>::KvHeads::SIZE;
+        let heads = <Self as decoder::Attention>::Heads::SIZE;
         let hidden = <Self as Geometry>::Hidden::SIZE;
         let head = match &config.mamba_d_head {
             Some(Value::String(auto)) if auto == "auto" => {
@@ -303,7 +309,7 @@ where
             (
                 "num_attention_heads",
                 Some(config.num_attention_heads),
-                heads * <Self as Geometry>::Groups::SIZE,
+                heads * <Self as decoder::Attention>::Groups::SIZE,
             ),
             (
                 "attn_rotary_emb",
@@ -404,7 +410,7 @@ where
 
 impl<const N: &'static str> Family for Size<N>
 where
-    Self: Geometry,
+    Self: Geometry + decoder::Attention,
 {
     type Hf = Config;
 }

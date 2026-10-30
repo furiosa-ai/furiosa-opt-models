@@ -20,8 +20,8 @@ use furiosa_opt_std::prelude::*;
 use serde::Deserialize;
 use std::io;
 
-use crate::models::Family;
 use crate::models::decoder::attention::Geometry;
+use crate::models::{Family, decoder};
 use crate::ops::attention::geometry::QueryGroups;
 use crate::ops::normalization::RmsNorm;
 use crate::tensor::cache::Blocks;
@@ -140,10 +140,6 @@ impl Geometry for Size<"1.5-7b"> {
     type Hidden = Hidden;
     type Intermediate = language::Intermediate;
     type Vocabulary = Vocabulary;
-    type KvHeads = Heads;
-    type Groups = QueryGroups<1>;
-    type Head = Head;
-    type Queries = language::QueryWidth;
     type Layers<L> = [L; LAYERS];
     type Norm<W: AxisName, X: Memory> = RmsNorm<
         W,
@@ -157,6 +153,16 @@ impl Geometry for Size<"1.5-7b"> {
     const LAYERS: usize = LAYERS;
     const EPSILON: usize = language::EPSILON.to_bits() as usize;
     const TIED_EMBEDDINGS: bool = false;
+}
+
+impl decoder::Attention for Size<"1.5-7b"> {
+    type Heads = Heads;
+    type Head = Head;
+    type Groups = QueryGroups<1>;
+    type QueryWidth = language::QueryWidth;
+    type KvWidth = language::KvWidth;
+    type Rotated = Head;
+    type Windows = Windows;
 }
 
 /// The image placeholder's token, `image_token_index`.

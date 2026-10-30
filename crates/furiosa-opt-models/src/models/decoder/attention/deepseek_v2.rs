@@ -21,7 +21,7 @@ use crate::ops::pointwise::add;
 use crate::ops::pointwise::multiply::Multiply;
 use crate::ops::swiglu;
 use crate::ops::{
-    attention::{geometry::QueryGroups, latent},
+    attention::latent,
     linear::{Affine, Experts},
     normalization::RmsNorm,
     rotary,
@@ -226,18 +226,12 @@ pub struct Size<const N: &'static str>;
 /// `rms_norm_eps` 1e-6, as the bits of the FP32 nearest to it.
 const EPSILON: usize = 1e-6_f32.to_bits() as usize;
 
-/// A head's features are its value's (`v_head_dim`), so its heads' together are the output
-/// projection's input; its queries and keys add the rotated features.
 impl Geometry for Size<"Lite"> {
     const SIZE: &'static str = "Lite";
     const FAMILY: &'static str = "deepseek_v2";
-    type Queries = OutputWidth;
     type Hidden = Hidden;
     type Intermediate = DenseWidth;
     type Vocabulary = Vocabulary;
-    type KvHeads = Heads;
-    type Groups = QueryGroups<1>;
-    type Head = Value;
     type Layers<L> = [L; LAYERS];
     type Norm<W: AxisName, X: Memory> =
         RmsNorm<W, EPSILON, m![1], Weight<m![W], m![1], <X as Memory>::Tensor<bf16, m![1], m![W]>>>;
@@ -312,7 +306,7 @@ where
     fn try_from(config: Config) -> io::Result<Self> {
         let invalid = |reason: String| io::Error::new(io::ErrorKind::InvalidData, reason);
         let unsupported = |reason: &str| io::Error::new(io::ErrorKind::Unsupported, reason);
-        let heads = <Self as Geometry>::KvHeads::SIZE;
+        let heads = Heads::SIZE;
         let fixed = [
             (
                 "hidden_size",
@@ -331,19 +325,11 @@ where
             ),
             ("num_hidden_layers", config.num_hidden_layers, Self::LAYERS),
             ("num_key_value_heads", config.num_key_value_heads, heads),
-            (
-                "num_attention_heads",
-                config.num_attention_heads,
-                heads * <Self as Geometry>::Groups::SIZE,
-            ),
+            ("num_attention_heads", config.num_attention_heads, heads),
             ("kv_lora_rank", config.kv_lora_rank, Latent::SIZE),
             ("qk_nope_head_dim", config.qk_nope_head_dim, Content::SIZE),
             ("qk_rope_head_dim", config.qk_rope_head_dim, Rotary::SIZE),
-            (
-                "v_head_dim",
-                config.v_head_dim,
-                <Self as Geometry>::Head::SIZE,
-            ),
+            ("v_head_dim", config.v_head_dim, Value::SIZE),
             (
                 "n_routed_experts",
                 config.n_routed_experts,

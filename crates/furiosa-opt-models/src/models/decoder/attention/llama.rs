@@ -2,8 +2,9 @@
 //! row's query, key and value heads as projected, e.g.
 //! `launch::Model<Size<"8B">, form::Affine>`.
 //!
-//! - A size's [`Geometry`] is what its checkpoints declare; its [`Decode`] is how a call of it is
-//!   compiled, that of the Qwen3 size of the same attention geometry.
+//! - A size's [`Geometry`] and the [`decoder::Attention`] of its heads are what its checkpoints
+//!   declare; its [`Decode`] is how a call of it is compiled, that of the Qwen3 size of the same
+//!   attention geometry.
 //! - The vocabulary compiles as 131072 rows, `vocab_size` 128256 padded; the head's bias lowers the
 //!   padded rows.
 
@@ -13,7 +14,7 @@ use serde::Deserialize;
 
 use super::qwen3::{self, Front};
 use super::{Geometry, Head, KvHeads};
-use crate::models::{Family, config, vocabulary};
+use crate::models::{Family, config, decoder, vocabulary};
 use crate::ops::attention::geometry::{self, QueryGroups, QueryWidth};
 use crate::ops::normalization::RmsNorm;
 use crate::ops::swiglu;
@@ -39,19 +40,25 @@ const EPSILON: usize = 1e-5_f32.to_bits() as usize;
 impl Geometry for Size<"8B"> {
     const SIZE: &'static str = "8B";
     const FAMILY: &'static str = "llama";
-    type Queries = QueryWidth<4096>;
     type Hidden = geometry::Hidden<4096>;
     type Intermediate = swiglu::Intermediate<14336>;
     type Vocabulary = Vocabulary;
-    type KvHeads = KvHeads;
-    type Groups = QueryGroups<4>;
-    type Head = Head;
     type Layers<L> = [L; Self::LAYERS];
     type Norm<W: AxisName, X: Memory> = LlamaNorm<W, X>;
 
     const LAYERS: usize = 32;
     const EPSILON: usize = EPSILON;
     const TIED_EMBEDDINGS: bool = false;
+}
+
+impl decoder::Attention for Size<"8B"> {
+    type Heads = KvHeads;
+    type Head = Head;
+    type Groups = QueryGroups<4>;
+    type QueryWidth = QueryWidth<4096>;
+    type KvWidth = geometry::KvWidth<{ KvHeads::SIZE * Head::SIZE }>;
+    type Rotated = Head;
+    type Windows = <Self as Decode>::Windows;
 }
 
 impl Decode for Size<"8B"> {
@@ -67,19 +74,25 @@ impl Decode for Size<"8B"> {
 impl Geometry for Size<"Mistral-7B"> {
     const SIZE: &'static str = "Mistral-7B";
     const FAMILY: &'static str = "mistral";
-    type Queries = QueryWidth<4096>;
     type Hidden = geometry::Hidden<4096>;
     type Intermediate = swiglu::Intermediate<14336>;
     type Vocabulary = MistralVocabulary;
-    type KvHeads = KvHeads;
-    type Groups = QueryGroups<4>;
-    type Head = Head;
     type Layers<L> = [L; Self::LAYERS];
     type Norm<W: AxisName, X: Memory> = LlamaNorm<W, X>;
 
     const LAYERS: usize = 32;
     const EPSILON: usize = EPSILON;
     const TIED_EMBEDDINGS: bool = false;
+}
+
+impl decoder::Attention for Size<"Mistral-7B"> {
+    type Heads = <Size<"8B"> as decoder::Attention>::Heads;
+    type Head = <Size<"8B"> as decoder::Attention>::Head;
+    type Groups = <Size<"8B"> as decoder::Attention>::Groups;
+    type QueryWidth = <Size<"8B"> as decoder::Attention>::QueryWidth;
+    type KvWidth = <Size<"8B"> as decoder::Attention>::KvWidth;
+    type Rotated = <Size<"8B"> as decoder::Attention>::Rotated;
+    type Windows = <Size<"8B"> as decoder::Attention>::Windows;
 }
 
 impl Decode for Size<"Mistral-7B"> {
@@ -125,13 +138,13 @@ pub struct Config {
 /// compiled one, the window the paging constants hold.
 impl<const N: &'static str> TryFrom<Config> for Size<N>
 where
-    Self: Geometry,
+    Self: Geometry + decoder::Attention,
 {
     type Error = io::Error;
 
     fn try_from(config: Config) -> io::Result<Self> {
         let unsupported = |reason: &str| io::Error::new(io::ErrorKind::Unsupported, reason);
-        let heads = <Self as Geometry>::KvHeads::SIZE;
+        let heads = <Self as decoder::Attention>::Heads::SIZE;
         // Transformers derives an absent `head_dim` from the hidden width.
         let head =
             (config.head_dim).unwrap_or(config.hidden_size / config.num_attention_heads.max(1));
@@ -151,9 +164,9 @@ where
             (
                 "num_attention_heads",
                 config.num_attention_heads,
-                heads * <Self as Geometry>::Groups::SIZE,
+                heads * <Self as decoder::Attention>::Groups::SIZE,
             ),
-            ("head_dim", head, <Self as Geometry>::Head::SIZE),
+            ("head_dim", head, <Self as decoder::Attention>::Head::SIZE),
         ];
         if let Some((key, declared, held)) = fixed
             .into_iter()
@@ -194,7 +207,7 @@ where
 
 impl<const N: &'static str> Family for Size<N>
 where
-    Self: Geometry,
+    Self: Geometry + decoder::Attention,
 {
     type Hf = Config;
 }

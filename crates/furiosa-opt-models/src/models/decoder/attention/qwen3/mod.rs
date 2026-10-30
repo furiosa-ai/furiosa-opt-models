@@ -1,8 +1,8 @@
 //! Qwen3, by published size: the [`Catalog`] binding over a [`Size`] and the [`Form`] of the
 //! projections, whose roots a launch runs, e.g. `launch::Model<Size<"0.6B">, form::Affine>`.
 //!
-//! - A size's [`Geometry`] is what its checkpoints declare; its [`Decode`] is how a call of it is
-//!   compiled today, the context it serves included.
+//! - A size's [`Geometry`] and the [`decoder::Attention`] of its heads are what its checkpoints
+//!   declare; its [`Decode`] is how a call of it is compiled today, the context it serves included.
 //! - [`Catalog`] is the one binding of `Qwen3ForCausalLM` every projection form instantiates: a
 //!   [`Form`] chooses only the six projection weights, BF16 dense matrices, channel-scaled E4M3 or
 //!   block-scaled E4M3.
@@ -22,7 +22,7 @@ use crate::load::Named;
 use crate::models::Family;
 use crate::models::config::{self, scaling::Spectrum};
 use crate::models::decoder::attention::{Chunks, Head, KvHeads, PaddedVocabulary, Windows};
-use crate::models::decoder::{Form, launch};
+use crate::models::decoder::{self, Form, launch};
 use crate::modules::attention::{self, NormalizedQkv};
 use crate::modules::generic::collection::Array;
 use crate::modules::generic::collection::{Stack, View};
@@ -66,7 +66,7 @@ pub type LmHead<S, X> = Greedy<
 
 type Hidden<S> = <S as Geometry>::Hidden;
 type Vocabulary<S> = <S as Geometry>::Vocabulary;
-type Groups<S> = <S as Geometry>::Groups;
+type Groups<S> = <S as decoder::Attention>::Groups;
 type Norm<S, W, X> = <S as Geometry>::Norm<W, X>;
 
 /// Whether a family normalizes each query and key head of a row: Qwen3 does by `Norm`, Llama
@@ -94,31 +94,33 @@ const EPSILON: usize = 1e-6_f32.to_bits() as usize;
 impl Geometry for Size<"0.6B"> {
     const SIZE: &'static str = "0.6B";
     const FAMILY: &'static str = "qwen3";
-    type Queries = QueryWidth<2048>;
     type Hidden = geometry::Hidden<1024>;
     type Intermediate = swiglu::Intermediate<3072>;
     type Vocabulary = PaddedVocabulary;
-    type KvHeads = KvHeads;
-    type Groups = QueryGroups<2>;
-    type Head = Head;
     type Layers<L> = [L; Self::LAYERS];
     type Norm<W: AxisName, X: Memory> = QwenNorm<W, X>;
 
     const LAYERS: usize = 28;
     const EPSILON: usize = EPSILON;
     const TIED_EMBEDDINGS: bool = true;
+}
+
+impl decoder::Attention for Size<"0.6B"> {
+    type Heads = KvHeads;
+    type Head = Head;
+    type Groups = QueryGroups<2>;
+    type QueryWidth = QueryWidth<2048>;
+    type KvWidth = geometry::KvWidth<{ KvHeads::SIZE * Head::SIZE }>;
+    type Rotated = Head;
+    type Windows = <Self as Decode>::Windows;
 }
 
 impl Geometry for Size<"1.7B"> {
     const SIZE: &'static str = "1.7B";
     const FAMILY: &'static str = "qwen3";
-    type Queries = QueryWidth<2048>;
     type Hidden = geometry::Hidden<2048>;
     type Intermediate = swiglu::Intermediate<6144>;
     type Vocabulary = PaddedVocabulary;
-    type KvHeads = KvHeads;
-    type Groups = QueryGroups<2>;
-    type Head = Head;
     type Layers<L> = [L; Self::LAYERS];
     type Norm<W: AxisName, X: Memory> = QwenNorm<W, X>;
 
@@ -127,16 +129,22 @@ impl Geometry for Size<"1.7B"> {
     const TIED_EMBEDDINGS: bool = true;
 }
 
+impl decoder::Attention for Size<"1.7B"> {
+    type Heads = KvHeads;
+    type Head = Head;
+    type Groups = QueryGroups<2>;
+    type QueryWidth = QueryWidth<2048>;
+    type KvWidth = geometry::KvWidth<{ KvHeads::SIZE * Head::SIZE }>;
+    type Rotated = Head;
+    type Windows = <Self as Decode>::Windows;
+}
+
 impl Geometry for Size<"4B"> {
     const SIZE: &'static str = "4B";
     const FAMILY: &'static str = "qwen3";
-    type Queries = QueryWidth<4096>;
     type Hidden = geometry::Hidden<2560>;
     type Intermediate = swiglu::Intermediate<9728>;
     type Vocabulary = PaddedVocabulary;
-    type KvHeads = KvHeads;
-    type Groups = QueryGroups<4>;
-    type Head = Head;
     type Layers<L> = [L; Self::LAYERS];
     type Norm<W: AxisName, X: Memory> = QwenNorm<W, X>;
 
@@ -145,22 +153,38 @@ impl Geometry for Size<"4B"> {
     const TIED_EMBEDDINGS: bool = true;
 }
 
+impl decoder::Attention for Size<"4B"> {
+    type Heads = KvHeads;
+    type Head = Head;
+    type Groups = QueryGroups<4>;
+    type QueryWidth = QueryWidth<4096>;
+    type KvWidth = geometry::KvWidth<{ KvHeads::SIZE * Head::SIZE }>;
+    type Rotated = Head;
+    type Windows = <Self as Decode>::Windows;
+}
+
 impl Geometry for Size<"8B"> {
     const SIZE: &'static str = "8B";
     const FAMILY: &'static str = "qwen3";
-    type Queries = QueryWidth<4096>;
     type Hidden = geometry::Hidden<4096>;
     type Intermediate = swiglu::Intermediate<12288>;
     type Vocabulary = PaddedVocabulary;
-    type KvHeads = KvHeads;
-    type Groups = QueryGroups<4>;
-    type Head = Head;
     type Layers<L> = [L; Self::LAYERS];
     type Norm<W: AxisName, X: Memory> = QwenNorm<W, X>;
 
     const LAYERS: usize = 36;
     const EPSILON: usize = EPSILON;
     const TIED_EMBEDDINGS: bool = false;
+}
+
+impl decoder::Attention for Size<"8B"> {
+    type Heads = KvHeads;
+    type Head = Head;
+    type Groups = QueryGroups<4>;
+    type QueryWidth = QueryWidth<4096>;
+    type KvWidth = geometry::KvWidth<{ KvHeads::SIZE * Head::SIZE }>;
+    type Rotated = Head;
+    type Windows = <Self as Decode>::Windows;
 }
 
 /// What a Qwen3 checkpoint's config declares that its size fixes, and the features Qwen3 does not
@@ -192,14 +216,14 @@ pub struct Config {
 /// context is served up to the compiled one, the window the paging constants hold.
 impl<const N: &'static str> TryFrom<Config> for Size<N>
 where
-    Self: Geometry,
+    Self: Geometry + decoder::Attention,
 {
     type Error = io::Error;
 
     fn try_from(config: Config) -> io::Result<Self> {
         let invalid = |reason: String| io::Error::new(io::ErrorKind::InvalidData, reason);
         let unsupported = |reason: &str| io::Error::new(io::ErrorKind::Unsupported, reason);
-        let heads = <Self as Geometry>::KvHeads::SIZE;
+        let heads = <Self as decoder::Attention>::Heads::SIZE;
         let fixed = [
             (
                 "hidden_size",
@@ -216,9 +240,13 @@ where
             (
                 "num_attention_heads",
                 config.num_attention_heads,
-                heads * <Self as Geometry>::Groups::SIZE,
+                heads * <Self as decoder::Attention>::Groups::SIZE,
             ),
-            ("head_dim", config.head_dim, <Self as Geometry>::Head::SIZE),
+            (
+                "head_dim",
+                config.head_dim,
+                <Self as decoder::Attention>::Head::SIZE,
+            ),
         ];
         if let Some((key, declared, held)) = fixed
             .into_iter()
@@ -256,7 +284,7 @@ where
         // The load binds this spectrum, so one it cannot bind is refused before a weight is read.
         config
             .rope
-            .bind::<<Self as Geometry>::Head, <Self as Geometry>::Head>()?;
+            .bind::<<Self as decoder::Attention>::Head, <Self as decoder::Attention>::Head>()?;
         match (config.use_sliding_window, config.attention_bias) {
             (true, _) => Err(unsupported(
                 "use_sliding_window: Qwen3 attends the whole history",
@@ -269,7 +297,7 @@ where
 
 impl<const N: &'static str> Family for Size<N>
 where
-    Self: Geometry,
+    Self: Geometry + decoder::Attention,
 {
     type Hf = Config;
 }
@@ -457,22 +485,22 @@ impl<S> fmt::Debug for QueryHeads<S> {
     }
 }
 
-impl<S: Geometry + 'static> AxisName for QueryHeads<S> {
+impl<S: decoder::Attention> AxisName for QueryHeads<S> {
     const NAME: Ident = Ident::new("QueryHeads");
-    const SIZE: usize = S::KvHeads::SIZE * S::Groups::SIZE;
+    const SIZE: usize = S::Heads::SIZE * S::Groups::SIZE;
 }
 
-type HeadOf<S> = <S as Geometry>::Head;
-type KvHeadsOf<S> = <S as Geometry>::KvHeads;
+type HeadOf<S> = <S as decoder::Attention>::Head;
+type KvHeadsOf<S> = <S as decoder::Attention>::Heads;
 
 /// The norm of each query and key head, its gain replicated over the slices.
 type HeadNorm<S, X> = full::HeadNorm<
-    <S as Geometry>::Head,
+    <S as decoder::Attention>::Head,
     Chip,
     Weight<
-        Replicated<<S as Geometry>::Head>,
+        Replicated<<S as decoder::Attention>::Head>,
         Chip,
-        <X as Memory>::Tensor<bf16, Chip, Replicated<<S as Geometry>::Head>>,
+        <X as Memory>::Tensor<bf16, Chip, Replicated<<S as decoder::Attention>::Head>>,
     >,
     F32<EPSILON>,
 >;
@@ -505,7 +533,11 @@ type Qkv<S, P, X> = attention::Projection<
 >;
 
 type Attend<S> = full::Attention<
-    PhantomData<(<S as Geometry>::KvHeads, Groups<S>, <S as Geometry>::Head)>,
+    PhantomData<(
+        <S as decoder::Attention>::Heads,
+        Groups<S>,
+        <S as decoder::Attention>::Head,
+    )>,
     F32<SCALE>,
 >;
 
@@ -523,7 +555,7 @@ pub type Layer<S, P, C, X> = super::Qwen2Layer<
     Scatter,
     Gather,
     Attend<S>,
-    Named<"o_proj", <P as Form>::Output<<S as Geometry>::Queries, Hidden<S>, X>>,
+    Named<"o_proj", <P as Form>::Output<<S as decoder::Attention>::QueryWidth, Hidden<S>, X>>,
     Ffn<S, P, X>,
     Norm<S, Hidden<S>, X>,
     Add,
@@ -538,7 +570,7 @@ type Bound<S, P, C, X, const N: usize> = Qwen2ForCausalLM<
     Scatter,
     Gather,
     Attend<S>,
-    Named<"o_proj", <P as Form>::Output<<S as Geometry>::Queries, Hidden<S>, X>>,
+    Named<"o_proj", <P as Form>::Output<<S as decoder::Attention>::QueryWidth, Hidden<S>, X>>,
     Ffn<S, P, X>,
     Norm<S, Hidden<S>, X>,
     Add,
@@ -550,6 +582,7 @@ type Bound<S, P, C, X, const N: usize> = Qwen2ForCausalLM<
 impl<S: Geometry + Front + 'static, P: Form, C: Scalar, X: Memory, const N: usize> Depth<S, P, C, X>
     for [(); N]
 where
+    S: decoder::Attention,
     swiglu::Down<Intermediate<S>>: AxisName,
     Layer<S, P, C, X>: View<N>,
 {
@@ -565,7 +598,7 @@ pub type CatalogBody<S, P, C, X> = <<S as Geometry>::Layers<()> as Depth<S, P, C
 
 /// The wide tiles of the size `S`'s work: as many as a call of its rows takes when every row
 /// attends the whole context `S` is compiled for, so its call's work holds whatever it admits.
-pub(crate) const fn tiles<S: Geometry + Decode + 'static>() -> usize {
+pub(crate) const fn tiles<S: decoder::Attention + Decode + 'static>() -> usize {
     paged::Plan::waves::<S::Groups>(S::Rows::SIZE, launch::Positions::<S>::SIZE)
 }
 

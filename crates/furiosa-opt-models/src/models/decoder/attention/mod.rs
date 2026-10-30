@@ -46,7 +46,8 @@ pub mod olmoe;
 pub mod qwen3;
 pub mod qwen3_moe;
 
-/// A published size of an attention decoder: its axes and the config values its type fixes.
+/// A published size of an attention decoder: the axes and config values its type fixes for the
+/// whole model; a size of one attention group also implements [`Attention`](super::Attention).
 pub trait Geometry {
     /// Features of a row: `hidden_size`.
     type Hidden: AxisName;
@@ -56,18 +57,6 @@ pub trait Geometry {
 
     /// Rows of the embedding and of the head as compiled: `vocab_size` tokens at most.
     type Vocabulary: AxisName;
-
-    /// Key and value heads: `num_key_value_heads`.
-    type KvHeads: AxisName;
-
-    /// Query heads each key and value head serves: `num_attention_heads / num_key_value_heads`.
-    type Groups: AxisName;
-
-    /// Features of a head: `head_dim`.
-    type Head: AxisName;
-
-    /// Features of every query head together: `num_attention_heads * head_dim`.
-    type Queries: AxisName;
 
     /// `num_hidden_layers` layers of `L`.
     type Layers<L>;
@@ -2948,10 +2937,6 @@ mod tests {
         type Hidden = Features;
         type Intermediate = Features;
         type Vocabulary = Tokens;
-        type KvHeads = Features;
-        type Groups = Features;
-        type Head = Features;
-        type Queries = Features;
         type Layers<L> = [L; 1];
         type Norm<W: AxisName, X: Memory> = ();
 

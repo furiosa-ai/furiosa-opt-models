@@ -11,7 +11,7 @@ use serde::Deserialize;
 use crate::models::Family;
 use crate::models::decoder::attention::{Geometry, Head, KvHeads, PaddedVocabulary};
 use crate::modules::{attention, language, multimodal, transformer};
-use crate::ops::attention::geometry::{self, QueryGroups, QueryWidth};
+use crate::ops::attention::geometry::{self, QueryGroups};
 use crate::ops::normalization::RmsNorm;
 use crate::ops::swiglu;
 use crate::tensor::form::Weight;
@@ -30,13 +30,9 @@ const EPSILON: usize = 1e-6_f32.to_bits() as usize;
 impl Geometry for Size<"32B"> {
     const SIZE: &'static str = "32B";
     const FAMILY: &'static str = "qwen3_vl";
-    type Queries = QueryWidth<8192>;
     type Hidden = geometry::Hidden<5120>;
     type Intermediate = swiglu::Intermediate<25600>;
     type Vocabulary = PaddedVocabulary;
-    type KvHeads = KvHeads;
-    type Groups = QueryGroups<8>;
-    type Head = Head;
     type Layers<L> = [L; Self::LAYERS];
     type Norm<W: AxisName, X: Memory> = Norm<W, X>;
 
@@ -44,6 +40,10 @@ impl Geometry for Size<"32B"> {
     const EPSILON: usize = EPSILON;
     const TIED_EMBEDDINGS: bool = false;
 }
+
+/// Query heads each key and value head serves. A `decoder::Attention` would also name the windows
+/// of a compiled call, and no call of the size is compiled.
+type Groups = QueryGroups<8>;
 
 /// What a Qwen3-VL checkpoint's config declares that its size fixes, and the features its text
 /// model does not serve.
@@ -92,7 +92,7 @@ where
         let invalid = |reason: String| io::Error::new(io::ErrorKind::InvalidData, reason);
         let unsupported = |reason: &str| io::Error::new(io::ErrorKind::Unsupported, reason);
         let text = config.text_config;
-        let heads = <Self as Geometry>::KvHeads::SIZE;
+        let heads = KvHeads::SIZE;
         let fixed = [
             (
                 "hidden_size",
@@ -109,9 +109,9 @@ where
             (
                 "num_attention_heads",
                 text.num_attention_heads,
-                heads * <Self as Geometry>::Groups::SIZE,
+                heads * Groups::SIZE,
             ),
-            ("head_dim", text.head_dim, <Self as Geometry>::Head::SIZE),
+            ("head_dim", text.head_dim, Head::SIZE),
         ];
         if let Some((key, declared, held)) = fixed
             .into_iter()

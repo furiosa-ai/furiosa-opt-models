@@ -26,7 +26,7 @@ The same file holds the config, which checks `config.json` against the compiled 
 A model type that the engine serves also declares each published size, as [`qwen3.rs`](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/crates/furiosa-opt-models/src/models/decoder/attention/qwen3/mod.rs) does:
 
 - Its classes are aliases over a size, the form of its projections, a placement, a KV cache form and a memory, such as `ForCausalLM<Size<"0.6B">, form::Affine, Parallel<1>, cache::Bf16, X>`.
-- Each size implements `Geometry`, the values its checkpoints declare, and `Decode`, how a call of it compiles.
+- Each size implements `Geometry`, the model-wide values its checkpoints declare, `decoder::Attention`, the axes of its attention heads, and `Decode`, how a call of it compiles.
 - Converting the parsed `Config` to a size checks every value the size fixes, and refuses a feature the model type does not serve as `Unsupported`.
 
 Keep two conventions in model and catalog files:

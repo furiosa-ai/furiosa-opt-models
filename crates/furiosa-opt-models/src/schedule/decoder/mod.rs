@@ -27,13 +27,13 @@
 use crate::Begin;
 use crate::Module;
 use crate::load::Named;
-use crate::models::decoder::Form;
 use crate::models::decoder::attention::qwen3::{self, LmHead, QueryHeads, fp8};
 use crate::models::decoder::attention::{
     ForCausalLM, ForSequenceClassification, Geometry, Head, KvHeads, Qwen2Layer,
 };
 use crate::models::decoder::form::BlockScaled;
 use crate::models::decoder::launch;
+use crate::models::decoder::{self, Form};
 use crate::modules::attention::{Attention, NormalizedQkv, Positioned, Projection};
 use crate::modules::generic::collection::View;
 use crate::modules::language::{Backbone, Call, Classifier, Selected};
@@ -84,12 +84,13 @@ type Layer<Z, Q, K, V, QN, KN, A, O, G, D> = Qwen2Layer<
     Add,
 >;
 /// The catalog layer's output projection in form `P`.
-type OutputProjection<P, Z> = <P as Form>::Output<<Z as Geometry>::Queries, Width<Z>, Hbm>;
+type OutputProjection<P, Z> =
+    <P as Form>::Output<<Z as decoder::Attention>::QueryWidth, Width<Z>, Hbm>;
 type Capacity<Z> = launch::Capacity<Z>;
 type Reach<Z> = <Z as Decode>::Reach;
 type Width<Z> = <Z as Geometry>::Hidden;
 type Intermediate<Z> = <Z as Geometry>::Intermediate;
-type Groups<Z> = <Z as Geometry>::Groups;
+type Groups<Z> = <Z as decoder::Attention>::Groups;
 /// A launch's rows of the hidden width in HBM: the embedded rows, a layer's input, the head's rows.
 type Rows<Z> = HbmTensor<bf16, Chip, Blocked<Width<Z>, Capacity<Z>>>;
 /// A launch's rows of each KV head and query group: its queries, or what its attention gives.
@@ -134,26 +135,26 @@ type Landing<'r, G, Z> = (ToDm<G, QueryHeads<Z>>, (&'r Rotation<Z>, usize));
 type Projecting<'o, 'r, Z, L> = (&'o mut L, Live<&'r QueryRows<Z>, Capacity<Z>>);
 
 /// What a layer's attention stores of a launch's tiles: their queries, keys and values.
-pub struct Stored<Z: Geometry + Decode> {
+pub struct Stored<Z: decoder::Attention + Decode> {
     queries: QueryRows<Z>,
     retained: (KeyRows<Z>, KeyRows<Z>),
 }
 
 /// The rows a layer's attention attends of a launch.
-pub struct Attended<Z: Geometry + Decode>(QueryRows<Z>);
+pub struct Attended<Z: decoder::Attention + Decode>(QueryRows<Z>);
 
 /// A tile of a layer's attention output: the attended rows and the output projection over them,
 /// `L` as its form lands it.
 type Output<'p, Z, L> = (Live<&'p Attended<Z>, Capacity<Z>>, &'p mut L);
 
 /// One layer's places of a launch: its input rows, what its attention stores and what it attends.
-struct Places<Z: Geometry + Decode> {
+struct Places<Z: Geometry + decoder::Attention + Decode> {
     input: Rows<Z>,
     stored: Stored<Z>,
     attended: Attended<Z>,
 }
 
-impl<Z: Geometry + Decode> Places<Z> {
+impl<Z: Geometry + decoder::Attention + Decode> Places<Z> {
     fn new() -> Self {
         Self {
             input: HbmTensor::new(),
@@ -171,7 +172,7 @@ impl<Z: Geometry + Decode> Places<Z> {
 /// A layer of the size `Z` cut at its attention: the steps of the work between two attentions
 /// that run its leaves, each over one row tile. The work's order is [`Tokenwise`]'s; a layer shape
 /// gives the steps.
-trait Cut<Z: Geometry + Decode + 'static, A: States> {
+trait Cut<Z: Geometry + decoder::Attention + Decode + 'static, A: States> {
     /// Its front landed for a tile's rows.
     type Front;
     /// Its output projection as its form lands it at its attention's boundary.
@@ -221,7 +222,7 @@ struct Front<G, Q, QN, KN> {
 
 /// A tile between its MLP's two steps: the down projection's inputs `R` landed, and the rows of the
 /// attention residual, which the MLP residual adds to.
-struct Staged<R, Z: Geometry + Decode> {
+struct Staged<R, Z: Geometry + decoder::Attention + Decode> {
     ready: R,
     attended: RowTile<Z>,
 }
@@ -272,7 +273,8 @@ impl<
 > Cut<Z, T> for Layer<Z, Q, K, V, QN, KN, A, O, G, D>
 where
     T: States,
-    Z: Geometry<KvHeads = KvHeads, Head = Head, Hidden = H, Norm<H, Hbm> = RmsNorm<H, E, Chip>>
+    Z: Geometry<Hidden = H, Norm<H, Hbm> = RmsNorm<H, E, Chip>>
+        + decoder::Attention<Heads = KvHeads, Head = Head>
         + Decode
         + 'static,
     H: Tiled<Capacity = axis::Rows<C>, Last = axis::Rows<L>>,
@@ -527,7 +529,7 @@ fn period<Z, G, P, GN, V, K, Q, QN, KN, QH, KH, T: States>(
     start: usize,
     (stored, adapters): (&mut Stored<Z>, &mut T),
 ) where
-    Z: Geometry<KvHeads = KvHeads, Head = Head> + Decode + 'static,
+    Z: decoder::Attention<Heads = KvHeads, Head = Head> + Decode + 'static,
     G: Group,
     V: for<'r, 'x> Module<&'r P, Live<(), Capacity<Z>>, &'x mut T::Value, Output = Pairs<G>>,
     K: for<'r, 'x> Module<&'r P, Live<(), Capacity<Z>>, &'x mut T::Key, Output = KH>,
@@ -560,7 +562,7 @@ fn period<Z, G, P, GN, V, K, Q, QN, KN, QH, KH, T: States>(
 
 /// A tile of the embedded rows through the first layer up to its attention's store, its
 /// projections running with `adapters`; the tile's rows, the first layer's input.
-impl<'l, 'c, 'a, 's, Z: Geometry + Decode + 'static, T: States, X: Cut<Z, T>>
+impl<'l, 'c, 'a, 's, Z: Geometry + decoder::Attention + Decode + 'static, T: States, X: Cut<Z, T>>
     Module<Live<(), Capacity<Z>>, Launched<'c, 'a, Z>, (&'s mut Stored<Z>, &'s mut T)>
     for Tokenwise<&'l Rows<Z>, &'l X>
 where
@@ -585,7 +587,17 @@ where
 /// A tile through a layer from its attention and the next layer up to its attention's store, each
 /// layer's projections running with its adapters; the next layer's input rows. The next layer's
 /// front lands while this one's MLP projects.
-impl<'l, 'c, 'a, 'p, 's, Z: Geometry + Decode + 'static, T: States, X: Cut<Z, T, Landed = L>, L>
+impl<
+    'l,
+    'c,
+    'a,
+    'p,
+    's,
+    Z: Geometry + decoder::Attention + Decode + 'static,
+    T: States,
+    X: Cut<Z, T, Landed = L>,
+    L,
+>
     Module<
         (Output<'p, Z, L>, RowTile<Z>),
         Launched<'c, 'a, Z>,
@@ -612,8 +624,17 @@ impl<'l, 'c, 'a, 'p, 's, Z: Geometry + Decode + 'static, T: States, X: Cut<Z, T,
 
 /// A tile through the last layer from its attention, its projections running with `adapters`, and
 /// the final norm; the head's rows.
-impl<'l, 'c, 'a, 'p, 's, Z: Geometry + Decode + 'static, T: States, X: Cut<Z, T, Landed = L>, L>
-    Module<(Output<'p, Z, L>, RowTile<Z>), Launched<'c, 'a, Z>, &'s mut T>
+impl<
+    'l,
+    'c,
+    'a,
+    'p,
+    's,
+    Z: Geometry + decoder::Attention + Decode + 'static,
+    T: States,
+    X: Cut<Z, T, Landed = L>,
+    L,
+> Module<(Output<'p, Z, L>, RowTile<Z>), Launched<'c, 'a, Z>, &'s mut T>
     for Tokenwise<&'l X, &'l FinalNorm<Z>>
 where
     FinalNorm<Z>: for<'r, 'x> Module<&'r RowTile<Z>, (), &'x mut (), Output = RowTile<Z>>,
@@ -659,13 +680,9 @@ impl<
 > Module<&'i mut launch::Input<'a, Z>, Env, launch::Body<'s, Z, [launch::Layer<'b, T>; DEPTH]>>
     for Decoder<&'m launch::Base<Z, P>>
 where
-    Z: Geometry<
-            KvHeads = KvHeads,
-            Head = Head,
-            Hidden = H,
-            Norm<H, Hbm> = RmsNorm<H, E, Chip>,
-            Layers<()> = [(); DEPTH],
-        > + Decode
+    Z: Geometry<Hidden = H, Norm<H, Hbm> = RmsNorm<H, E, Chip>, Layers<()> = [(); DEPTH]>
+        + decoder::Attention<Heads = KvHeads, Head = Head>
+        + Decode
         + qwen3::Front
         + 'static,
     H: Tiled<Capacity = axis::Rows<C>, Last = axis::Rows<L>>,
@@ -786,7 +803,7 @@ type Loops<'a, Z> = (Rows<Z>, &'a Selected<Capacity<Z>>);
 
 /// A launch of the catalog's causal model: its base model's loops, then the selected rows' greedy
 /// tokens.
-impl<'i, 'a, 's, Z: Geometry + Decode + 'static, B, P: Form, L, Env>
+impl<'i, 'a, 's, Z: Geometry + decoder::Attention + Decode + 'static, B, P: Form, L, Env>
     Module<&'i mut launch::Input<'a, Z>, Env, launch::State<'s, Z, L>>
     for ForCausalLM<Z, launch::Over<Z, B, P>, LmHead<Z, Hbm>, P>
 where
@@ -809,7 +826,7 @@ where
 }
 
 /// A launch of the catalog's base model: its loops, then the selected rows' hidden values.
-impl<'i, 'a, 's, Z: Geometry + Decode + 'static, B, P: Form, L, Env>
+impl<'i, 'a, 's, Z: Geometry + decoder::Attention + Decode + 'static, B, P: Form, L, Env>
     Module<&'i mut launch::Input<'a, Z>, Env, launch::State<'s, Z, L, launch::Values<Z>>>
     for launch::Over<Z, B, P>
 where
@@ -833,7 +850,7 @@ where
 
 /// A launch of the catalog's sequence classifier: its base model's loops, then the selected rows'
 /// scores.
-impl<'i, 'a, 's, Z: Geometry + Decode + 'static, B, P: Form, L, Env>
+impl<'i, 'a, 's, Z: Geometry + decoder::Attention + Decode + 'static, B, P: Form, L, Env>
     Module<&'i mut launch::Input<'a, Z>, Env, launch::State<'s, Z, L, launch::Scores<Z>>>
     for ForSequenceClassification<Z, launch::Over<Z, B, P>, Classifier<Width<Z>>, P>
 where
@@ -894,7 +911,7 @@ mod tests {
     /// writes: the causal model's tokens, the base model's hidden values, the classifier's scores.
     #[test]
     fn every_root_runs_by_the_loop() {
-        fn runs<R, Z: Geometry + Decode, O>()
+        fn runs<R, Z: Geometry + decoder::Attention + Decode, O>()
         where
             for<'i, 'a, 's, 'b> R: Module<
                     &'i mut launch::Input<'a, Z>,

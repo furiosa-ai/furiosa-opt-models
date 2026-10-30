@@ -31,8 +31,8 @@ use furiosa_opt_models::models::decoder::attention::qwen3::{LmHead, fp8};
 use furiosa_opt_models::models::decoder::attention::{
     ForCausalLM, ForSequenceClassification, Geometry, Head, KvHeads,
 };
-use furiosa_opt_models::models::decoder::form;
 use furiosa_opt_models::models::decoder::launch;
+use furiosa_opt_models::models::decoder::{Attention, form};
 use furiosa_opt_models::modules::attention::key_value;
 use furiosa_opt_models::modules::language::{Classifier, Input, Selected};
 use furiosa_opt_models::modules::lora::{self, Rank, States};
@@ -319,14 +319,14 @@ impl<D: Decoder> Served for Instance<D> {
 /// each selected row's output, `Row` elements, into `Place` in order, its projections running
 /// with the adapters `Adapting` gives.
 pub trait Root {
-    type Size: Geometry + Decode + 'static;
+    type Size: Geometry + Attention + Decode + 'static;
     type Place: Place;
     type Row: M;
     type Adapting: Adapting<Self::Size>;
 }
 
 /// The causal model writes the selected rows' tokens; its projections' form runs its adapters.
-impl<S: Geometry + Decode + 'static, B, P: Adapting<S>> Root
+impl<S: Geometry + Attention + Decode + 'static, B, P: Adapting<S>> Root
     for ForCausalLM<S, launch::Over<S, B, P>, LmHead<S, Hbm>, P>
 {
     type Size = S;
@@ -337,7 +337,7 @@ impl<S: Geometry + Decode + 'static, B, P: Adapting<S>> Root
 
 /// The base model writes the selected rows' hidden values; its projections' form runs its
 /// adapters.
-impl<S: Geometry + Decode + 'static, B, P: Adapting<S>> Root for launch::Over<S, B, P> {
+impl<S: Geometry + Attention + Decode + 'static, B, P: Adapting<S>> Root for launch::Over<S, B, P> {
     type Size = S;
     type Place = launch::Values<S>;
     type Row = m![{ Symbol<<S as Geometry>::Hidden> }];
@@ -346,7 +346,7 @@ impl<S: Geometry + Decode + 'static, B, P: Adapting<S>> Root for launch::Over<S,
 
 /// The sequence classifier writes the selected rows' scores, label columns first; it runs no
 /// adapter.
-impl<S: Geometry + Decode + 'static, B, P> Root
+impl<S: Geometry + Attention + Decode + 'static, B, P> Root
     for ForSequenceClassification<S, launch::Over<S, B, P>, Classifier<<S as Geometry>::Hidden>, P>
 {
     type Size = S;
@@ -367,7 +367,7 @@ type Size8B = furiosa_opt_models::models::decoder::attention::qwen3::Size<"8B">;
 
 /// The adapters a call of a root of the size `S` may run its rows with: LoRA terms of every dense
 /// BF16 projection, or none.
-pub trait Adapting<S: Geometry + Decode + 'static> {
+pub trait Adapting<S: Geometry + Attention + Decode + 'static> {
     /// An adapter: a PEFT checkpoint loaded as the root's adapter tree, or `Infallible`.
     type Adapter: Send + Sync + 'static;
     /// Each layer's projections' states in a call that runs [`SLOTS`] adapters.
@@ -387,7 +387,7 @@ pub trait Adapting<S: Geometry + Decode + 'static> {
 }
 
 /// Dense BF16 projections add each adapter's update of the rows it selects.
-impl<S: Geometry + Decode + 'static> Adapting<S> for form::Affine
+impl<S: Geometry + Attention + Decode + 'static> Adapting<S> for form::Affine
 where
     launch::Adapter<S, Hbm>:
         Send + Sync + 'static + for<'h> Load<&'h launch::Adapter<S, lora::Staged>>,
@@ -413,7 +413,7 @@ where
 }
 
 /// Channel-scaled projections add no update: their roots run no adapter.
-impl<S: Geometry + Decode + 'static> Adapting<S> for form::ChannelScaled {
+impl<S: Geometry + Attention + Decode + 'static> Adapting<S> for form::ChannelScaled {
     type Adapter = Infallible;
     type States<'t> = ();
     const ADAPTERS: usize = 0;
@@ -432,7 +432,7 @@ impl<S: Geometry + Decode + 'static> Adapting<S> for form::ChannelScaled {
 }
 
 /// A root that runs no adapter refuses a load of one; no call holds one.
-impl<S: Geometry + Decode + 'static> Adapting<S> for Infallible {
+impl<S: Geometry + Attention + Decode + 'static> Adapting<S> for Infallible {
     type Adapter = Infallible;
     type States<'t> = ();
     const ADAPTERS: usize = 0;
@@ -567,7 +567,7 @@ where
                 <R::Size as Decode>::Reach,
                 <R::Size as Decode>::Sequences,
                 KvHeads,
-                <R::Size as Geometry>::Groups,
+                <R::Size as Attention>::Groups,
                 Head,
                 launch::Waves<R::Size>,
                 <R::Size as Decode>::Windows,
@@ -640,7 +640,7 @@ type Held<'t, R> = <<R as Root>::Adapting as Adapting<<R as Root>::Size>>::State
 /// compiled for, one paged group of every layer's blocks, `adapters` adapters, and the launch's
 /// rows; a fixed tiling attends every row as a work item, so it holds the size's call rows, which
 /// its items hold over the whole context.
-fn limits<S: Geometry + Decode + 'static>(adapters: usize, tiling: Tiling) -> Limits {
+fn limits<S: Geometry + Attention + Decode + 'static>(adapters: usize, tiling: Tiling) -> Limits {
     let rows = match tiling {
         Tiling::Fixed => S::Rows::SIZE,
         Tiling::Adaptive => launch::Capacity::<S>::SIZE,
@@ -748,7 +748,7 @@ mod tests {
                 <S as Decode>::Reach,
                 <S as Decode>::Sequences,
                 KvHeads,
-                <S as Geometry>::Groups,
+                <S as Attention>::Groups,
                 Head,
                 launch::Waves<S>,
                 <S as Decode>::Windows,

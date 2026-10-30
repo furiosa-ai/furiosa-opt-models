@@ -13,7 +13,7 @@ use furiosa_opt_engine::{Checkpoint, Load, LoadError, LoadOptions, Quantization}
 use furiosa_opt_models::load::Context;
 use furiosa_opt_models::models::Implements;
 use furiosa_opt_models::models::decoder::attention::{Geometry, Head, KvHeads, qwen3};
-use furiosa_opt_models::models::decoder::{form, launch};
+use furiosa_opt_models::models::decoder::{Attention, form, launch};
 use furiosa_opt_models::ops::linear::query::matrix::Width;
 use furiosa_opt_models::tensor::form::fp8::Granularity;
 use furiosa_opt_std::prelude::*;
@@ -60,7 +60,7 @@ const BLOCKS: [u32; 3] = [2, 0, 3];
 type Size = qwen3::Size<"0.6B">;
 type Hidden = <Size as Geometry>::Hidden;
 type Intermediate = <Size as Geometry>::Intermediate;
-type Queries = <Size as Geometry>::Queries;
+type Queries = <Size as Attention>::QueryWidth;
 /// The features of the key or of the value heads.
 type Pairs = Width<KvHeads, Head>;
 

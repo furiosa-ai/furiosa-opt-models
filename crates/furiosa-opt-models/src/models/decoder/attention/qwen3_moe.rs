@@ -6,8 +6,8 @@
 //! - Every size normalizes its queries and keys head by head, over 128-feature heads.
 //! - [`Model`] and [`Body`] are the catalog's composition, over the [`Qwen3Moe`] template.
 
-use crate::models::decoder::attention::{Geometry, mixtral::DbrxForCausalLM};
-use crate::models::{Family, config, vocabulary};
+use crate::models::decoder::attention::{Chunks, Geometry, mixtral::DbrxForCausalLM};
+use crate::models::{Family, config, decoder, vocabulary};
 use crate::modules::feedforward::moe::Normalize;
 use crate::modules::feedforward::moe::Reduce;
 use crate::modules::feedforward::moe::TopK;
@@ -193,13 +193,9 @@ const EPSILON: usize = 1e-6_f32.to_bits() as usize;
 impl Geometry for Size<"30B-A3B"> {
     const SIZE: &'static str = "30B-A3B";
     const FAMILY: &'static str = "qwen3_moe";
-    type Queries = QueryWidth<Queries<32>>;
     type Hidden = Hidden;
     type Intermediate = Intermediate;
     type Vocabulary = Vocabulary;
-    type KvHeads = Heads;
-    type Groups = Groups<Queries<32>, Heads>;
-    type Head = Head;
     type Layers<L> = [L; Self::LAYERS];
     type Norm<W: AxisName, X: Memory> = MoeNorm<W, X>;
 
@@ -208,22 +204,38 @@ impl Geometry for Size<"30B-A3B"> {
     const TIED_EMBEDDINGS: bool = false;
 }
 
+impl decoder::Attention for Size<"30B-A3B"> {
+    type Heads = Heads;
+    type Head = Head;
+    type Groups = Groups<Queries<32>, Heads>;
+    type QueryWidth = QueryWidth<Queries<32>>;
+    type KvWidth = KvWidth<Heads>;
+    type Rotated = Head;
+    type Windows = Chunks;
+}
+
 impl Geometry for Size<"235B-A22B"> {
     const SIZE: &'static str = "235B-A22B";
     const FAMILY: &'static str = "qwen3_moe";
-    type Queries = QueryWidth<Queries<64>>;
     type Hidden = geometry::Hidden<4096>;
     type Intermediate = swiglu::Intermediate<1536>;
     type Vocabulary = Vocabulary;
-    type KvHeads = Heads;
-    type Groups = Groups<Queries<64>, Heads>;
-    type Head = Head;
     type Layers<L> = [L; Self::LAYERS];
     type Norm<W: AxisName, X: Memory> = MoeNorm<W, X>;
 
     const LAYERS: usize = 94;
     const EPSILON: usize = EPSILON;
     const TIED_EMBEDDINGS: bool = false;
+}
+
+impl decoder::Attention for Size<"235B-A22B"> {
+    type Heads = Heads;
+    type Head = Head;
+    type Groups = Groups<Queries<64>, Heads>;
+    type QueryWidth = QueryWidth<Queries<64>>;
+    type KvWidth = KvWidth<Heads>;
+    type Rotated = Head;
+    type Windows = Chunks;
 }
 
 /// What a Qwen3 MoE checkpoint's config declares that its size fixes, and the features Qwen3 MoE
@@ -264,13 +276,13 @@ pub struct Config {
 /// compiled one.
 impl<const N: &'static str> TryFrom<Config> for Size<N>
 where
-    Self: Geometry,
+    Self: Geometry + decoder::Attention,
 {
     type Error = io::Error;
 
     fn try_from(config: Config) -> io::Result<Self> {
         let unsupported = |reason: &str| io::Error::new(io::ErrorKind::Unsupported, reason);
-        let heads = <Self as Geometry>::KvHeads::SIZE;
+        let heads = <Self as decoder::Attention>::Heads::SIZE;
         let fixed = [
             (
                 "hidden_size",
@@ -287,9 +299,13 @@ where
             (
                 "num_attention_heads",
                 config.num_attention_heads,
-                heads * <Self as Geometry>::Groups::SIZE,
+                heads * <Self as decoder::Attention>::Groups::SIZE,
             ),
-            ("head_dim", config.head_dim, <Self as Geometry>::Head::SIZE),
+            (
+                "head_dim",
+                config.head_dim,
+                <Self as decoder::Attention>::Head::SIZE,
+            ),
             (
                 "num_experts",
                 config.num_experts,
@@ -361,7 +377,7 @@ where
 
 impl<const N: &'static str> Family for Size<N>
 where
-    Self: Geometry,
+    Self: Geometry + decoder::Attention,
 {
     type Hf = Config;
 }
