@@ -892,7 +892,7 @@ where
 mod tests {
     use super::*;
     use crate::models::decoder::attention::llama;
-    use crate::models::decoder::form::Affine;
+    use crate::models::decoder::form::{Affine, ChannelScaled};
 
     /// Each catalog root, of every size and projection form a registry row serves, runs by the
     /// decoder family's one loop on its launch's input and the state ending in the place its head
@@ -921,6 +921,9 @@ mod tests {
         runs::<launch::Model<Q<"8B">, Affine>, Q<"8B">, launch::Tokens<Q<"8B">>>();
         runs::<launch::Base<Q<"8B">, Affine>, Q<"8B">, launch::Values<Q<"8B">>>();
         runs::<launch::Classifier<Q<"8B">, Affine>, Q<"8B">, launch::Scores<Q<"8B">>>();
+        runs::<launch::Model<Q<"0.6B">, ChannelScaled>, Q<"0.6B">, launch::Tokens<Q<"0.6B">>>();
+        runs::<launch::Model<Q<"1.7B">, ChannelScaled>, Q<"1.7B">, launch::Tokens<Q<"1.7B">>>();
+        runs::<launch::Model<Q<"4B">, ChannelScaled>, Q<"4B">, launch::Tokens<Q<"4B">>>();
         runs::<fp8::ForCausalLM, Q<"8B">, launch::Tokens<Q<"8B">>>();
         type Llama = llama::Size<"8B">;
         runs::<launch::Model<Llama, Affine>, Llama, launch::Tokens<Llama>>();

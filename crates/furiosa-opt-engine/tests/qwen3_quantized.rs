@@ -15,9 +15,7 @@ use furiosa_opt_models::models::Implements;
 use furiosa_opt_models::models::decoder::attention::{Geometry, KvHeads, qwen3};
 use furiosa_opt_models::models::decoder::{Form, form};
 use furiosa_opt_models::specialize::attention::Decode;
-use furiosa_opt_models::tensor::cache;
 use furiosa_opt_models::tensor::form::fp8::Granularity;
-use furiosa_opt_models::tensor::parallel::Parallel;
 use furiosa_opt_std::prelude::*;
 use safetensors::Dtype;
 
@@ -66,7 +64,7 @@ type Queries = <Size as Geometry>::Queries;
 type Width = <Size as Decode>::Width;
 
 /// The Qwen3-0.6B causal line whose projections hold form `F`.
-type Line<F> = qwen3::ForCausalLM<Size, F, Parallel<1>, cache::Bf16, Hbm>;
+type Line<F> = qwen3::launch::Model<Size, F>;
 
 /// A channel-scaled projection of `In`-wide rows to `Out` features, in HBM.
 type Projection<In, Out> =

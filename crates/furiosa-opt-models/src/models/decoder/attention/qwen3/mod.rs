@@ -692,8 +692,8 @@ type Ffn<S, P, X> = swiglu::Mlp<
     <P as Form>::Down<Hidden<S>, Intermediate<S>, X>,
 >;
 
-/// One layer of the catalog binding.
-pub(crate) type Layer<S, P, C, X> = super::Qwen2Layer<
+/// One layer of the catalog binding, `model.layers.N`: a subtree that loads alone.
+pub type Layer<S, P, C, X> = super::Qwen2Layer<
     Heads<S, P, X>,
     Rotary<HeadOf<S>, HeadOf<S>, C>,
     Scatter,

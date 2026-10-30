@@ -16,8 +16,6 @@ use furiosa_opt_engine::{Checkpoint, Hbm, Load, LoadError, LoadOptions, Tiling};
 use furiosa_opt_models::load::Context;
 use furiosa_opt_models::models::decoder::attention::{Geometry, qwen3};
 use furiosa_opt_models::models::decoder::form;
-use furiosa_opt_models::tensor::cache;
-use furiosa_opt_models::tensor::parallel::Parallel;
 use furiosa_opt_std::prelude::{Device, HostBufferSlice, Symbol, Topology, bf16, m};
 use safetensors::Dtype;
 
@@ -149,15 +147,10 @@ const REPEATS: usize = 1660;
 const EXTENDED: [i32; 8] = [641, 1235, 25, 16246, 264, 3482, 2711, 3239];
 
 /// The BF16 Qwen3 layer of the size `N` over the memory `X`.
-type Layer<const N: &'static str, X> =
-    qwen3::DecoderLayer<qwen3::Size<N>, form::Affine, Parallel<1>, cache::Bf16, X>;
+type Layer<const N: &'static str, X> = qwen3::Layer<qwen3::Size<N>, form::Affine, bf16, X>;
 
 /// The BF16 Qwen3 causal model of the size `N`, on one chip.
-type Causal<const N: &'static str> =
-    qwen3::ForCausalLM<qwen3::Size<N>, form::Affine, Parallel<1>, cache::Bf16, Hbm>;
-
-/// The catalog's BF16 Qwen3 causal model of the size `N`, one launch of the decoder's loops.
-type Launched<const N: &'static str> = qwen3::launch::Model<qwen3::Size<N>, form::Affine>;
+type Causal<const N: &'static str> = qwen3::launch::Model<qwen3::Size<N>, form::Affine>;
 
 /// The directory of the files of hub checkpoint `repo` at `revision` that `include` matches,
 /// fetched into the hub cache once.
@@ -528,7 +521,7 @@ fn a_new_load_continues_on_the_cache_of_a_dropped_one() {
 /// The base model of each size, selected by name on a causal checkpoint, reads its names under
 /// `model` and returns the rows the causal model's body computes, byte for byte.
 macro_rules! body_rows {
-    ($($test:ident: $published:ident selects ($causal:ty) of $hidden:literal;)*) => {$(
+    ($($test:ident: $published:ident selects $size:literal of $hidden:literal;)*) => {$(
         #[test]
         #[ignore = "opens a device"]
         fn $test() {
@@ -536,7 +529,8 @@ macro_rules! body_rows {
             let mut device = device();
             let options = LoadOptions::new().architecture("Qwen3Model").unwrap();
             let base = options.load(&mut device, &checkpoint).unwrap().decoder().unwrap();
-            let causal: $causal = Load::load(&mut Context::new(&mut device), &checkpoint).unwrap();
+            let causal: Causal<$size> =
+                Load::load(&mut Context::new(&mut device), &checkpoint).unwrap();
             let body = Instance::new(causal.model, Tiling::Adaptive);
             runtime().block_on(async {
                 let mut hidden = Vec::new();
@@ -564,10 +558,10 @@ macro_rules! body_rows {
 }
 
 body_rows! {
-    qwen3_model_returns_the_body_rows: QWEN3_0_6B selects (Causal<"0.6B">) of 1024;
-    qwen3_1_7b_model_returns_the_body_rows: QWEN3_1_7B selects (Causal<"1.7B">) of 2048;
-    qwen3_4b_model_returns_the_body_rows: QWEN3_4B selects (Causal<"4B">) of 2560;
-    qwen3_8b_model_returns_the_body_rows: QWEN3_8B selects (Launched<"8B">) of 4096;
+    qwen3_model_returns_the_body_rows: QWEN3_0_6B selects "0.6B" of 1024;
+    qwen3_1_7b_model_returns_the_body_rows: QWEN3_1_7B selects "1.7B" of 2048;
+    qwen3_4b_model_returns_the_body_rows: QWEN3_4B selects "4B" of 2560;
+    qwen3_8b_model_returns_the_body_rows: QWEN3_8B selects "8B" of 4096;
 }
 
 /// A layer loads alone from the checkpoint under its own names, as a streamed layer does: strict
