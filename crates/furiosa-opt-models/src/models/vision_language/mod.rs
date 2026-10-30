@@ -1,17 +1,50 @@
 //! Vision-language families and the catalog of multimodal compositions.
+//!
+//! - An [`Encoder`] is a media encoder: a tree whose launches turn image and video patches, each
+//!   at its position, and audio frames into rows of its language model's width.
 
 use super::decoder::attention::MuseGlimmerBody;
+use crate::load::Load;
 use crate::modules::{
     attention, feedforward, language, mixing, multimodal, recurrent, residual, speculative,
     transformer,
 };
 use crate::{Branch, Each, Either, Fork, Identity, Interleave, Layers, Sequential, Then};
+use furiosa_opt_std::prelude::{AxisName, DeviceSend};
 use mllama::CrossLanguage;
 
 pub mod gemma4_unified;
 pub mod llava;
 pub mod mllama;
 pub mod qwen3_vl;
+
+/// A media encoder: its launches compute every row alone, so a launch holds the rows of several
+/// items, and each runs at one of two compiled row counts. Its axes are markers, shared freely.
+pub trait Encoder {
+    /// The rows of a launch whose items fit in them.
+    type Short: AxisName + Send + Sync;
+    /// The rows of any other launch, the most a launch holds.
+    type Long: AxisName + Send + Sync;
+    /// A patch's features.
+    type Patch: AxisName + Send + Sync;
+    /// The positions a patch's coordinate takes.
+    type Positions: AxisName + Send + Sync;
+    /// An audio frame's samples.
+    type Samples: AxisName + Send + Sync;
+    /// A row of the language model's width, a launch's output.
+    type Text: AxisName + Send + Sync;
+    /// The state a launch of patches runs on.
+    type Vision: Default + DeviceSend + Send;
+    /// The state a launch of audio frames runs on.
+    type Audio: Default + DeviceSend + Send;
+    /// The tree a launch reads: a load's tensors, borrowed.
+    type View<'a>: Load<&'a Self>
+    where
+        Self: 'a;
+
+    /// The operand of a patch's `coordinate`, 0 for x and 1 for y, at `position`.
+    fn offset(position: usize, coordinate: usize) -> i32;
+}
 
 /// Source: Transformers `src/transformers/models/emu3/modeling_emu3.py`.
 pub type Emu3ForConditionalGeneration<
