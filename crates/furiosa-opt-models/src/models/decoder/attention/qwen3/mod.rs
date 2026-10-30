@@ -37,7 +37,6 @@ use crate::ops::attention::full::{self, head::Replicated, paged};
 use crate::ops::attention::geometry::{
     self, HeadRows, ProjectionWidth, QueryGroups, QueryWidth, scale,
 };
-use crate::ops::attention::gqa::Cache;
 use crate::ops::attention::{Packed, Split};
 use crate::ops::embedding::Embedding;
 use crate::ops::index::gather::Gather;
@@ -434,8 +433,9 @@ where
 }
 
 /// The work a call's host plans for a size of `G` query heads a key and value head, in `WAVES`
-/// wide tiles.
-type Work<G, const WAVES: usize> = paged::Work<Prompts, KvHeads, G, Head, WAVES>;
+/// wide tiles; it plans no prompt chunk.
+type Work<G, const WAVES: usize> =
+    paged::Work<Prompts, KvHeads, G, Head, paged::Waves<WAVES>, Chunks>;
 
 // The rotary tiles of a launch's 1024 rows.
 axes![Slots = 8];
@@ -450,7 +450,6 @@ impl Decode for Size<"0.6B"> {
     type Reach = axis::Rows<2048>;
     type Sequences = axis::Rows<8>;
     type Slots = Slots;
-    type Positions = axis::Rows<32768>;
 }
 
 impl Tiled for geometry::Hidden<1024> {
@@ -468,7 +467,6 @@ impl Decode for Size<"1.7B"> {
     type Reach = axis::Rows<2048>;
     type Sequences = axis::Rows<8>;
     type Slots = Slots;
-    type Positions = axis::Rows<32768>;
 }
 
 impl Tiled for geometry::Hidden<2048> {
@@ -486,7 +484,6 @@ impl Decode for Size<"4B"> {
     type Reach = axis::Rows<2048>;
     type Sequences = axis::Rows<8>;
     type Slots = Slots;
-    type Positions = axis::Rows<32768>;
 }
 
 impl Tiled for geometry::Hidden<2560> {
@@ -506,7 +503,6 @@ impl Decode for Size<"8B"> {
     type Reach = axis::Rows<2048>;
     type Sequences = axis::Rows<8>;
     type Slots = Slots;
-    type Positions = axis::Rows<32768>;
 }
 
 impl Tiled for geometry::Hidden<4096> {
@@ -744,8 +740,8 @@ pub type CatalogBody<S, P, C, X> = <<S as Geometry>::Layers<()> as Depth<S, P, C
 
 /// The wide tiles of the size `S`'s work: as many as a call of its rows takes when every row
 /// attends the whole context `S` is compiled for, so its call's work holds whatever it admits.
-const fn tiles<S: Geometry + Decode>() -> usize {
-    paged::Plan::waves::<S::Groups>(S::Rows::SIZE, S::Windows::SIZE * Cache::SIZE)
+const fn tiles<S: Geometry + Decode + 'static>() -> usize {
+    paged::Plan::waves::<S::Groups>(S::Rows::SIZE, launch::Positions::<S>::SIZE)
 }
 
 #[cfg(test)]
@@ -852,8 +848,8 @@ pub(in crate::models) mod tests {
             let row = |at: usize| [at, 1, keys - 1, 0, keys.div_ceil(16)].map(|f| f as i32);
             (0..S::Rows::SIZE).map(row).collect()
         }
-        fn context<S: Decode>() -> usize {
-            S::Windows::SIZE * Cache::SIZE
+        fn context<S: Decode + 'static>() -> usize {
+            launch::Positions::<S>::SIZE
         }
         let ids = vec![1; 1 << 18];
         type Small = <Size<"0.6B"> as Decode>::Work;

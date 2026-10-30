@@ -12,7 +12,7 @@ use furiosa_opt_std::prelude::{AxisName, M};
 /// history each row attends, the packed query, key and value weight's rows and layout, the work a
 /// call's host plans, and the envelope one launch of the catalog model is compiled for.
 pub trait Decode {
-    /// The rows a call runs at most.
+    /// The rows a call runs at most when each attends its whole history as a work item.
     type Rows: AxisName;
     /// The 512-key windows of history a row attends at most: the context the model is compiled
     /// for.
@@ -32,8 +32,6 @@ pub trait Decode {
     type Sequences: AxisName;
     /// The rotary tiles of a launch's rows.
     type Slots: AxisName;
-    /// The positions the rotary table covers.
-    type Positions: AxisName;
 }
 
 /// How a decode attends each row's history in the pool.

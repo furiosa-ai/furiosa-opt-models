@@ -29,9 +29,9 @@ pub(super) struct Appended {
 }
 
 /// A launch's rows as the host plans them, at the capacities of `Capacity` rows, `Reach` written
-/// rows and the chunk plan's chunks.
+/// rows and the chunk plan's chunks, each over at most `W` windows of history.
 #[derive(Debug)]
-struct Plans {
+struct Plans<W> {
     /// Each row's position; a padding row keeps its index.
     positions: Vec<i32>,
     /// The pool byte offset each live row's keys and values are written to.
@@ -41,12 +41,12 @@ struct Plans {
     decode: Vec<[i32; FIELDS]>,
     /// The one-row requests' block IDs, each padded to whole runs with its last.
     history: Vec<i32>,
-    chunks: chunks::Plan,
+    chunks: chunks::Plan<W>,
     /// The blocked hidden-row byte offset of each row the launch returns, in order.
     selected: Vec<i32>,
 }
 
-impl Plans {
+impl<W: AxisName> Plans<W> {
     /// The launch of `appended`, in call row order, returning the call rows `kept`, for the cache
     /// blocks of `KvHeads` heads of `Head` features; refuses what the launch cannot hold.
     fn new<
@@ -135,10 +135,10 @@ impl Plans {
 
 impl<A> Batch<'_, A> {
     /// The arrays a launch's attention front reads, in the order its operands bind them: positions,
-    /// write slots, the work items of `KvHeads` heads grouped `G` of `Head` features in `WAVES`,
-    /// the prompt chunks, the count of selected rows and the selected rows of cache group `group`;
-    /// each as the values the launch uses and all its words. Refuses a call the launch cannot hold
-    /// before anything moves.
+    /// write slots, the work items of `KvHeads` heads grouped `G` of `Head` features in `Waves`,
+    /// the prompt chunks over at most `W` windows, the count of selected rows and the selected rows
+    /// of cache group `group`; each as the values the launch uses and all its words. Refuses a call
+    /// the launch cannot hold before anything moves.
     pub fn operands<
         Capacity: AxisName,
         Reach: AxisName,
@@ -146,18 +146,19 @@ impl<A> Batch<'_, A> {
         KvHeads: AxisName,
         G: AxisName,
         Head: AxisName,
-        const WAVES: usize,
+        Waves: AxisName,
+        W: AxisName,
     >(
         &self,
         group: usize,
     ) -> io::Result<Vec<(Vec<i32>, usize)>> {
-        let plans = Plans::new::<Capacity, Reach, Sequences, KvHeads, Head>(
+        let plans = Plans::<W>::new::<Capacity, Reach, Sequences, KvHeads, Head>(
             &self.appended[group],
             &self.kept,
         )?;
         // A step attends its prompt chunks apart from their history, so no tiling makes it batch
         // invariant.
-        let items = Plan::new::<KvHeads, G, Head, WAVES, Reach>(
+        let items = Plan::new::<KvHeads, G, Head, Waves, Reach>(
             &plans.decode,
             &plans.history,
             Tiling::Adaptive,
@@ -194,7 +195,8 @@ mod tests {
         Reach = 128,
         Sequences = 2,
         KvHeads = 8,
-        Head = 128
+        Head = 128,
+        Windows = 80
     ];
 
     const SLOT: i32 = Blocks::<KvHeads, Head>::ROW_STRIDE;
@@ -202,7 +204,10 @@ mod tests {
     const ROW: i32 = ROW_BYTES as i32;
 
     /// The plans of requests `(rows, cached, blocks)` in call row order, keeping `kept`.
-    fn plan(requests: &[(Range<usize>, usize, &[u32])], kept: &[usize]) -> io::Result<Plans> {
+    fn plan(
+        requests: &[(Range<usize>, usize, &[u32])],
+        kept: &[usize],
+    ) -> io::Result<Plans<Windows>> {
         let appended: Vec<_> = (requests.iter())
             .map(|(rows, cached, blocks)| Appended {
                 rows: rows.clone(),

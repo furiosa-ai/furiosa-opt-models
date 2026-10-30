@@ -108,6 +108,8 @@ type Launched<'c, 'a, Z> = Call<
         <Z as Decode>::Sequences,
         <Z as Decode>::Slots,
         Groups<Z>,
+        launch::Waves<Z>,
+        <Z as Decode>::Windows,
     >,
     launch::Ids<Z>,
     Capacity<Z>,
@@ -168,7 +170,7 @@ impl<Z: Geometry + Decode> Places<Z> {
 /// A layer of the size `Z` cut at its attention: the steps of the work between two attentions
 /// that run its leaves, each over one row tile. The work's order is [`Tokenwise`]'s; a layer shape
 /// gives the steps.
-trait Cut<Z: Geometry + Decode, A: States> {
+trait Cut<Z: Geometry + Decode + 'static, A: States> {
     /// Its front landed for a tile's rows.
     type Front;
     /// Its output projection as its form lands it at its attention's boundary.
@@ -562,7 +564,7 @@ fn period<Z, G, P, GN, V, LA, K, Q, QN, KN, QH, KH, T: States>(
 
 /// A tile of the embedded rows through the first layer up to its attention's store, its
 /// projections running with `adapters`; the tile's rows, the first layer's input.
-impl<'l, 'c, 'a, 's, Z: Geometry + Decode, T: States, X: Cut<Z, T>>
+impl<'l, 'c, 'a, 's, Z: Geometry + Decode + 'static, T: States, X: Cut<Z, T>>
     Module<Live<(), Capacity<Z>>, Launched<'c, 'a, Z>, (&'s mut Stored<Z>, &'s mut T)>
     for Tokenwise<&'l Rows<Z>, &'l X>
 where
@@ -587,7 +589,7 @@ where
 /// A tile through a layer from its attention and the next layer up to its attention's store, each
 /// layer's projections running with its adapters; the next layer's input rows. The next layer's
 /// front lands while this one's MLP projects.
-impl<'l, 'c, 'a, 'p, 's, Z: Geometry + Decode, T: States, X: Cut<Z, T, Landed = L>, L>
+impl<'l, 'c, 'a, 'p, 's, Z: Geometry + Decode + 'static, T: States, X: Cut<Z, T, Landed = L>, L>
     Module<
         (Output<'p, Z, L>, RowTile<Z>),
         Launched<'c, 'a, Z>,
@@ -614,7 +616,7 @@ impl<'l, 'c, 'a, 'p, 's, Z: Geometry + Decode, T: States, X: Cut<Z, T, Landed = 
 
 /// A tile through the last layer from its attention, its projections running with `adapters`, and
 /// the final norm; the head's rows.
-impl<'l, 'c, 'a, 'p, 's, Z: Geometry + Decode, T: States, X: Cut<Z, T, Landed = L>, L>
+impl<'l, 'c, 'a, 'p, 's, Z: Geometry + Decode + 'static, T: States, X: Cut<Z, T, Landed = L>, L>
     Module<(Output<'p, Z, L>, RowTile<Z>), Launched<'c, 'a, Z>, &'s mut T>
     for Tokenwise<&'l X, &'l FinalNorm<Z>>
 where

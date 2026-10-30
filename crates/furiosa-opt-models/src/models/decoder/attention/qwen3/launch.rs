@@ -5,9 +5,10 @@
 //!   work's counts read, the rows' rotation gathered); the body and head then stream over spans of
 //!   the live rows, each layer on its own cache blocks, and the head reads the selected rows'
 //!   tokens out tile by tile.
-//! - The envelope a launch is compiled for is the size's [`Decode`].
+//! - The envelope a launch is compiled for is the size's [`Decode`]: its rows, and the context its
+//!   rotary table, prompt chunks and work items cover, its windows' [`Positions`].
 
-use super::{CatalogBody, Groups, Hidden, LmHead, QueryHeads};
+use super::{CatalogBody, Groups, Hidden, LmHead, QueryHeads, tiles};
 use crate::load::Named;
 use crate::models::decoder::attention::{
     ForCausalLM, ForSequenceClassification, Geometry, Head, KvHeads,
@@ -15,10 +16,8 @@ use crate::models::decoder::attention::{
 use crate::modules::attention::{self, key_value};
 use crate::modules::language::{self, Call, Selected};
 use crate::modules::lora::{self, Rank};
-use crate::ops::attention::full::paged::{
-    self,
-    chunks::{Cache, Chunks as Windows},
-};
+use crate::ops::attention::full::paged;
+use crate::ops::attention::gqa::Cache;
 use crate::ops::embedding;
 use crate::ops::linear::affine::Columns;
 use crate::ops::linear::query::matrix::Width;
@@ -28,16 +27,67 @@ use crate::ops::rotary::{
     group::{self, Table},
 };
 use crate::ops::swiglu::GateUp;
-use crate::specialize::attention::{Decode, WAVES};
+use crate::specialize::attention::Decode;
 use crate::tensor::cache::Blocks;
 use crate::tensor::memory::{Hbm, Memory};
 use crate::tensor::parallel::Chip;
 use furiosa_opt_std::prelude::*;
+use std::fmt;
+use std::marker::PhantomData;
 
 /// The rows of a launch of size `S`; a runtime count of them is live.
 pub type Capacity<S> = <S as Decode>::Capacity;
 
-pub type Work<S> = paged::Work<<S as Decode>::Sequences, KvHeads, Groups<S>, Head, WAVES>;
+/// The positions a launch of size `S` covers: the context its size is compiled for, the keys of
+/// its windows.
+pub struct Positions<S>(PhantomData<fn() -> S>);
+
+impl<S: Decode + 'static> AxisName for Positions<S> {
+    const NAME: Ident = Ident::new("Positions");
+    const SIZE: usize = <S as Decode>::Windows::SIZE * Cache::SIZE;
+}
+
+/// The wide waves of a launch of size `S`: those its size's rows take when each attends the whole
+/// context under either tiling.
+pub struct Waves<S>(PhantomData<fn() -> S>);
+
+impl<S: Geometry + Decode + 'static> AxisName for Waves<S> {
+    const NAME: Ident = Ident::new("Waves");
+    const SIZE: usize = tiles::<S>();
+}
+
+impl<S> Clone for Positions<S> {
+    fn clone(&self) -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<S> fmt::Debug for Positions<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Positions")
+    }
+}
+
+impl<S> Clone for Waves<S> {
+    fn clone(&self) -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<S> fmt::Debug for Waves<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Waves")
+    }
+}
+
+pub type Work<S> = paged::Work<
+    <S as Decode>::Sequences,
+    KvHeads,
+    Groups<S>,
+    Head,
+    Waves<S>,
+    <S as Decode>::Windows,
+>;
 pub type Ids<S> = embedding::Ids<Capacity<S>>;
 
 /// A launch's next tokens, one I32 for each selected row in order; rows past them are unspecified.
@@ -63,11 +113,12 @@ pub type Operands<S> = key_value::Operands<
     KvHeads,
     Groups<S>,
     Head,
-    WAVES,
+    Waves<S>,
+    <S as Decode>::Windows,
 >;
 
 /// The rotation of a launch's rows, gathered from the positions' table it loads from the config.
-type Position<S> = SplitHalf<Head, Table<<S as Decode>::Positions, rotary::Row<Head>>>;
+type Position<S> = SplitHalf<Head, Table<Positions<S>, rotary::Row<Head>>>;
 
 /// The base model over the body `B`, with the rotary table its launches gather their rows'
 /// rotation from.
@@ -211,18 +262,18 @@ where
 
 /// What a launch's nodes read beside its token IDs and live rows, prepared once before its first
 /// node runs: its rows' rotation and cache slots, its attention work and the rows it returns.
-pub type Context<'a, Capacity, Reach, Sequences, Slots, Groups> = (
+pub type Context<'a, Capacity, Reach, Sequences, Slots, Groups, Waves, W> = (
     attention::Context<
         SplitHalf<Head, group::Rotation<Slots, rotary::Row<Head>>>,
         &'a HbmTensor<i32, Chip, m![Reach]>,
-        paged::Context<'a, Sequences, KvHeads, Groups, Head, WAVES, Capacity>,
+        paged::Context<'a, Sequences, KvHeads, Groups, Head, Waves, W, Capacity>,
     >,
     &'a Selected<Capacity>,
 );
 
 /// The rows the readout reads tokens of.
-impl<'c, T, Capacity, Reach, Sequences, Slots, Groups>
-    From<Call<'c, Context<'_, Capacity, Reach, Sequences, Slots, Groups>, T, Capacity>>
+impl<'c, T, Capacity, Reach, Sequences, Slots, Groups, Waves, W>
+    From<Call<'c, Context<'_, Capacity, Reach, Sequences, Slots, Groups, Waves, W>, T, Capacity>>
     for &'c Selected<Capacity>
 where
     Capacity: AxisName,
@@ -230,16 +281,20 @@ where
     Sequences: AxisName,
     Slots: AxisName,
     Groups: AxisName,
+    Waves: AxisName,
+    W: AxisName,
 {
     fn from(
-        call: Call<'c, Context<'_, Capacity, Reach, Sequences, Slots, Groups>, T, Capacity>,
+        call: Call<
+            'c,
+            Context<'_, Capacity, Reach, Sequences, Slots, Groups, Waves, W>,
+            T,
+            Capacity,
+        >,
     ) -> Self {
         call.context.1
     }
 }
-
-/// Positions of the longest context a launch's tables cover.
-pub const CONTEXT: usize = Windows::SIZE * Cache::SIZE;
 
 #[cfg(test)]
 mod tests {

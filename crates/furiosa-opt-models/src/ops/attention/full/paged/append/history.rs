@@ -90,7 +90,7 @@ type PanelSlot<P> = m![{ Symbol<<P as Panel>::Span> } = 1 #{!} ({ Symbol<<P as P
 type KeyTile<Head, P> = m![{ PanelOf<P> }, Cache % 2, Head];
 type ValueTile<Head, P> = m![{ PanelOf<P> }, Cache % 16, Head % 16];
 type Keys<P> = m![{ Symbol<<P as Panel>::Keys> }];
-type PanelCount<P> = m![{ Symbol<<P as Panel>::Count> }];
+type PanelCount<P, W> = m![{ Symbol<<P as Panel>::Count<W>> }];
 type Tiles<T> = m![{ Symbol<T> }];
 pub(crate) type Group<KvHeads, Groups, Head, T> = DmTensor<
     bf16,
@@ -127,15 +127,15 @@ pub(crate) struct Gathered<P>(pub(crate) PhantomData<P>);
 
 /// Whole history block `at` of width `P`, every row of it committed history: read whole, so no
 /// length is staged for it.
-impl<KvHeads: AxisName, Head: AxisName, P: Panel>
-    Op<((&Table, (&Gather, &Blocks<KvHeads, Head>)), usize)> for Gathered<P>
+impl<KvHeads: AxisName, Head: AxisName, P: Panel, W: AxisName>
+    Op<((&Table<W>, (&Gather, &Blocks<KvHeads, Head>)), usize)> for Gathered<P>
 {
     type Output = InDm<KvHeads, Head, P>;
 
     fn forward(
         &self,
         context: &mut Device,
-        ((table, pool), at): ((&Table, (&Gather, &Blocks<KvHeads, Head>)), usize),
+        ((table, pool), at): ((&Table<W>, (&Gather, &Blocks<KvHeads, Head>)), usize),
     ) -> Self::Output {
         // SAFETY: a whole block lies below h, so every gathered row is committed history.
         Op::forward(
@@ -151,15 +151,21 @@ impl<KvHeads: AxisName, Head: AxisName, P: Panel>
 }
 
 /// History block `at` of width `P` up to the history's `length`: the rows past it are unspecified.
-impl<KvHeads: AxisName, Head: AxisName, P: Panel>
-    Op<((&Table, (&Gather, &Blocks<KvHeads, Head>), &Value), usize)> for Gathered<P>
+impl<KvHeads: AxisName, Head: AxisName, P: Panel, W: AxisName>
+    Op<(
+        (&Table<W>, (&Gather, &Blocks<KvHeads, Head>), &Value),
+        usize,
+    )> for Gathered<P>
 {
     type Output = InDm<KvHeads, Head, P>;
 
     fn forward(
         &self,
         context: &mut Device,
-        ((table, pool, length), at): ((&Table, (&Gather, &Blocks<KvHeads, Head>), &Value), usize),
+        ((table, pool, length), at): (
+            (&Table<W>, (&Gather, &Blocks<KvHeads, Head>), &Value),
+            usize,
+        ),
     ) -> Self::Output {
         // SAFETY: the prefix reads committed history only; the table stays readable past it.
         Op::forward(
@@ -181,17 +187,20 @@ impl<KvHeads: AxisName, Head: AxisName, P: Panel>
 
 impl<P: Panel> Gathered<P> {
     /// The table's entries of block `at` of width `P`.
-    fn entries(table: &Table, at: usize) -> HbmTensor<i32, Chip, m![{ Keys<P> } / Block]> {
+    fn entries<W: AxisName>(
+        table: &Table<W>,
+        at: usize,
+    ) -> HbmTensor<i32, Chip, m![{ Keys<P> } / Block]> {
         // SAFETY: the table's rows, read as consecutive blocks of this width, keep the entry order;
         // read in place, so no device copy of them makes the processor wait before checking them.
         unsafe {
             table
                 .view()
-                .reshape::<Chip, m![{ PanelCount<P> }, { Keys<P> } / Block]>()
+                .reshape::<Chip, m![{ PanelCount<P, W> }, { Keys<P> } / Block]>()
                 .tile::<
-                    PanelCount<P>,
+                    PanelCount<P, W>,
                     1,
-                    m![{ PanelCount<P> } = 1 # ({ PanelCount<P> }), { Keys<P> } / Block],
+                    m![{ PanelCount<P, W> } = 1 # ({ PanelCount<P, W> }), { Keys<P> } / Block],
                 >(at)
                 .alias()
         }
@@ -364,10 +373,10 @@ impl<KvHeads: AxisName, Groups: AxisName, P: Panel, T: AxisName> Op<&Keyed<KvHea
 /// and one register-file fill per panel serve every tile, and each tile normalizes one row.
 pub(crate) struct FoldBlock<P>(pub(crate) PhantomData<P>);
 
-impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName>
+impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName, W: AxisName>
     Op<(
         &Attention<KvHeads, Groups, Head>,
-        (&Table, (&Gather, &Blocks<KvHeads, Head>)),
+        (&Table<W>, (&Gather, &Blocks<KvHeads, Head>)),
         usize,
         &Group<KvHeads, Groups, Head, T>,
         (
@@ -383,7 +392,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName>
         context: &mut Device,
         (attention, input, at, query, state): (
             &Attention<KvHeads, Groups, Head>,
-            (&Table, (&Gather, &Blocks<KvHeads, Head>)),
+            (&Table<W>, (&Gather, &Blocks<KvHeads, Head>)),
             usize,
             &Group<KvHeads, Groups, Head, T>,
             (
@@ -872,23 +881,15 @@ pub(crate) type TailMask<KvHeads, Groups> =
 
 pub(crate) struct LastKeys<KvHeads, Groups>(pub(crate) PhantomData<(KvHeads, Groups)>);
 
-impl<KvHeads: AxisName, Groups: AxisName>
-    Op<(
-        &HbmTensor<i32, Chip, m![Cache]>,
-        &HbmTensor<i32, Chip, m![Chunks, Cache]>,
-        usize,
-    )> for LastKeys<KvHeads, Groups>
+impl<KvHeads: AxisName, Groups: AxisName, W: AxisName>
+    Op<(&HbmTensor<i32, Chip, m![Cache]>, &SlotTable<W>, usize)> for LastKeys<KvHeads, Groups>
 {
     type Output = TailMask<KvHeads, Groups>;
 
     fn forward(
         &self,
         context: &mut Device,
-        (length, slots, at): (
-            &HbmTensor<i32, Chip, m![Cache]>,
-            &HbmTensor<i32, Chip, m![Chunks, Cache]>,
-            usize,
-        ),
+        (length, slots, at): (&HbmTensor<i32, Chip, m![Cache]>, &SlotTable<W>, usize),
     ) -> Self::Output {
         let length: DmTensor<i32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, m![Cache]> =
             length.to_dm(&mut context.tdma);
@@ -901,7 +902,8 @@ impl<KvHeads: AxisName, Groups: AxisName>
                 .to_vrf();
         let slots: DmTensor<i32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, m![Cache]> = slots
             .view()
-            .tile::<m![Chunks], 1, m![Chunks = 1 # Chunks, Cache]>(at)
+            .tile::<m![{ Symbol<Chunks<W>> }], 1,
+                m![{ Symbol<Chunks<W>> } = 1 # ({ Symbol<Chunks<W>> }), Cache]>(at)
             .to_dm(&mut context.tdma);
         let distance: DmTensor<i32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, m![Cache]> =
             context
@@ -983,14 +985,10 @@ impl<KvHeads: AxisName, Groups: AxisName> Op<(&Scores<KvHeads, Groups>, &TailMas
 /// zeroed: both read one mask.
 pub(crate) struct Clean;
 
-impl<KvHeads: AxisName, Head: AxisName>
+impl<KvHeads: AxisName, Head: AxisName, W: AxisName>
     Op<(
         (&Tokens<KvHeads, Head>, &Tokens<KvHeads, Head>),
-        (
-            &HbmTensor<i32, Chip, m![Chunks, Cache]>,
-            &HbmTensor<i32, Chip, m![Cache]>,
-            usize,
-        ),
+        (&SlotTable<W>, &HbmTensor<i32, Chip, m![Cache]>, usize),
     )> for Clean
 {
     type Output = (
@@ -1003,11 +1001,7 @@ impl<KvHeads: AxisName, Head: AxisName>
         context: &mut Device,
         ((key, value), input): (
             (&Tokens<KvHeads, Head>, &Tokens<KvHeads, Head>),
-            (
-                &HbmTensor<i32, Chip, m![Chunks, Cache]>,
-                &HbmTensor<i32, Chip, m![Cache]>,
-                usize,
-            ),
+            (&SlotTable<W>, &HbmTensor<i32, Chip, m![Cache]>, usize),
         ),
     ) -> Self::Output {
         let (slots, length, at) = input;
@@ -1023,7 +1017,8 @@ impl<KvHeads: AxisName, Head: AxisName>
         let slots: DmTensor<i32, Chip, Cluster<KvHeads>, DmSlices<KvHeads>, m![Cache % Block]> =
             slots
                 .view()
-                .tile::<m![Chunks], 1, m![Chunks = 1 # Chunks, Cache]>(at)
+                .tile::<m![{ Symbol<Chunks<W>> }], 1,
+                    m![{ Symbol<Chunks<W>> } = 1 # ({ Symbol<Chunks<W>> }), Cache]>(at)
                 .to_dm(&mut context.tdma);
         let distance: Distance<KvHeads> = context
             .main

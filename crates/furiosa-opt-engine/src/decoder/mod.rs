@@ -30,7 +30,7 @@ use crate::{AsyncModule, Checkpoint, Load, LoadError, forward};
 use furiosa_opt_models::Module;
 use furiosa_opt_models::models::decoder::attention::qwen3::{LmHead, fp8, launch};
 use furiosa_opt_models::models::decoder::attention::{
-    Chunks, ForCausalLM, ForSequenceClassification, Geometry, Head, KvHeads,
+    ForCausalLM, ForSequenceClassification, Geometry, Head, KvHeads,
 };
 use furiosa_opt_models::models::decoder::form;
 use furiosa_opt_models::modules::attention::key_value;
@@ -39,7 +39,7 @@ use furiosa_opt_models::modules::lora::{self, Rank, States};
 use furiosa_opt_models::ops::attention::full::paged::{Tiling, chunks::Masks};
 use furiosa_opt_models::ops::index::table::BlockIndex;
 use furiosa_opt_models::ops::linear::affine::Columns;
-use furiosa_opt_models::specialize::attention::{Decode, WAVES};
+use furiosa_opt_models::specialize::attention::Decode;
 use furiosa_opt_models::tensor::cache::{Block, Blocks};
 use furiosa_opt_models::tensor::memory::{Dtype, Hbm, alias, dtype};
 use furiosa_opt_models::tensor::parallel::Chip;
@@ -317,14 +317,14 @@ impl<D: Decoder> Served for Instance<D> {
 /// each selected row's output, `Row` elements, into `Place` in order, its projections running
 /// with the adapters `Adapting` gives.
 pub trait Root {
-    type Size: Geometry + Decode;
+    type Size: Geometry + Decode + 'static;
     type Place: Place;
     type Row: M;
     type Adapting: Adapting<Self::Size>;
 }
 
 /// The causal model writes the selected rows' tokens; its projections' form runs its adapters.
-impl<S: Geometry + Decode, B, P: Adapting<S>> Root
+impl<S: Geometry + Decode + 'static, B, P: Adapting<S>> Root
     for ForCausalLM<S, launch::Over<S, B, P>, LmHead<S, Hbm>, P>
 {
     type Size = S;
@@ -335,7 +335,7 @@ impl<S: Geometry + Decode, B, P: Adapting<S>> Root
 
 /// The base model writes the selected rows' hidden values; its projections' form runs its
 /// adapters.
-impl<S: Geometry + Decode, B, P: Adapting<S>> Root for launch::Over<S, B, P> {
+impl<S: Geometry + Decode + 'static, B, P: Adapting<S>> Root for launch::Over<S, B, P> {
     type Size = S;
     type Place = launch::Values<S>;
     type Row = m![{ Symbol<<S as Geometry>::Hidden> }];
@@ -344,7 +344,7 @@ impl<S: Geometry + Decode, B, P: Adapting<S>> Root for launch::Over<S, B, P> {
 
 /// The sequence classifier writes the selected rows' scores, label columns first; it runs no
 /// adapter.
-impl<S: Geometry + Decode, B, P> Root
+impl<S: Geometry + Decode + 'static, B, P> Root
     for ForSequenceClassification<S, launch::Over<S, B, P>, Classifier<<S as Geometry>::Hidden>, P>
 {
     type Size = S;
@@ -365,7 +365,7 @@ type Size8B = furiosa_opt_models::models::decoder::attention::qwen3::Size<"8B">;
 
 /// The adapters a call of a root of the size `S` may run its rows with: LoRA terms of every dense
 /// BF16 projection, or none.
-pub trait Adapting<S: Geometry + Decode> {
+pub trait Adapting<S: Geometry + Decode + 'static> {
     /// An adapter: a PEFT checkpoint loaded as the root's adapter tree, or `Infallible`.
     type Adapter: Send + Sync + 'static;
     /// Each layer's projections' states in a call that runs [`SLOTS`] adapters.
@@ -411,7 +411,7 @@ where
 }
 
 /// A root that runs no adapter refuses a load of one; no call holds one.
-impl<S: Geometry + Decode> Adapting<S> for Infallible {
+impl<S: Geometry + Decode + 'static> Adapting<S> for Infallible {
     type Adapter = Infallible;
     type States<'t> = ();
     const ADAPTERS: usize = 0;
@@ -516,25 +516,8 @@ where
     type Layers = Vec<Blocks<KvHeads, Head>>;
     type Adapter = <R::Adapting as Adapting<R::Size>>::Adapter;
 
-    /// The rows of a launch, a request reaching the positions its rotary table covers at most.
     fn limits(&self) -> Limits {
-        Limits {
-            window: launch::CONTEXT.min(<R::Size as Decode>::Positions::SIZE),
-            rows: launch::Capacity::<R::Size>::SIZE,
-            cache: CacheSpec {
-                pools: vec![Pool {
-                    block: Block::SIZE,
-                    bytes: Blocks::<KvHeads, Head>::BLOCK_STRIDE as usize,
-                }],
-                groups: vec![Group {
-                    pool: 0,
-                    layers: 0..<R::Size as Geometry>::LAYERS,
-                    kind: Kind::Paged,
-                    window: None,
-                }],
-            },
-            adapters: Self::ADAPTERS,
-        }
+        limits::<R::Size>(Self::ADAPTERS)
     }
 
     fn layers(storage: &[HbmBuffer]) -> io::Result<Self::Layers> {
@@ -571,7 +554,8 @@ where
                 KvHeads,
                 <R::Size as Geometry>::Groups,
                 Head,
-                WAVES,
+                launch::Waves<R::Size>,
+                <R::Size as Decode>::Windows,
             >(0)?;
             if let Some(binding) = batch.adapters() {
                 reads.extend(binding.selections::<launch::Capacity<R::Size>, Rank<1>>());
@@ -579,12 +563,12 @@ where
             }
             // ponytail: placed each call; a load-lifetime place would spare two small uploads a
             // call.
-            let masks = Masks::new(device).await?;
+            let masks = Masks::<<R::Size as Decode>::Windows>::new(device).await?;
             // Staged last, so nothing of the size's axes is held across an await.
             let (staged, views) = batch
                 .stage::<
                     launch::Capacity<R::Size>,
-                    Tables<launch::Capacity<R::Size>, Chunks>,
+                    Tables<launch::Capacity<R::Size>, <R::Size as Decode>::Windows>,
                     Chip,
                 >(device, &reads, (0, Table::Blocks))
                 .await?;
@@ -611,7 +595,7 @@ where
                     let slots = (layers.iter_mut())
                         .map(|blocks| ((Default::default(), blocks, ()), ()))
                         .collect();
-                    launched(device, root, &mut input, slots, place)?
+                    submit(device, root, &mut input, slots, place)?
                 }
                 Some(binding) => {
                     let selections = (
@@ -626,7 +610,7 @@ where
                             ((Default::default(), blocks, ()), states)
                         })
                         .collect();
-                    launched(device, root, &mut input, slots, place)?
+                    submit(device, root, &mut input, slots, place)?
                 }
             };
             Rows::new(&place.into_buffer(), 0..batch.kept().len())
@@ -637,9 +621,31 @@ where
 /// What each layer's projections of the root `R` run with in a call of adapters.
 type Held<'t, R> = <<R as Root>::Adapting as Adapting<<R as Root>::Size>>::States<'t>;
 
+/// What a launch of the size `S` holds: the context its size is compiled for, the launch's rows,
+/// one paged group of every layer's blocks, and `adapters` adapters.
+fn limits<S: Geometry + Decode + 'static>(adapters: usize) -> Limits {
+    Limits {
+        window: launch::Positions::<S>::SIZE,
+        rows: launch::Capacity::<S>::SIZE,
+        cache: CacheSpec {
+            pools: vec![Pool {
+                block: Block::SIZE,
+                bytes: Blocks::<KvHeads, Head>::BLOCK_STRIDE as usize,
+            }],
+            groups: vec![Group {
+                pool: 0,
+                layers: 0..S::LAYERS,
+                kind: Kind::Paged,
+                window: None,
+            }],
+        },
+        adapters,
+    }
+}
+
 /// One launch of `root` over a call's `input` and its layers' `slots`, writing the selected rows'
 /// outputs into `place`, which it returns once the device accepted the launch.
-fn launched<'i, 'a, R, L>(
+fn submit<'i, 'a, R, L>(
     device: &mut Device,
     root: &R,
     input: &'i mut launch::Input<'a, R::Size>,
@@ -668,4 +674,63 @@ where
         .map(drop)
         .map_err(io::Error::other)?;
     Ok(places.1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use furiosa_opt_models::models::decoder::attention::qwen3;
+    use furiosa_opt_std::prelude::Topology;
+
+    /// A launch of Qwen3-4B admits and plans a call past the 40960 positions a Qwen3 checkpoint
+    /// declares, up to the context its size is compiled for: decode rows and a prompt that end at
+    /// its last position.
+    #[test]
+    fn launches_plan_the_compiled_context() -> io::Result<()> {
+        type S = qwen3::Size<"4B">;
+        let device = Device::new(Topology { chips: 1, pes: 8 }).map_err(io::Error::other)?;
+        // A request of `rows` rows ending at position `end`: its history reads block 0, and its
+        // rows write their own blocks from `first`.
+        let request = |rows: usize, end: usize, first: usize| -> io::Result<Request> {
+            let cached = end - rows;
+            let blocks = (0..end.div_ceil(Block::SIZE))
+                .map(|at| (at.checked_sub(cached / Block::SIZE)).map_or(0, |own| first + own))
+                .map(|block| block as u32)
+                .collect();
+            let ids = HbmBuffer::alloc(&device, rows * Rows::<i32, m![1]>::bytes())
+                .map_err(io::Error::other)?;
+            Ok(Request {
+                rows: vec![blocks],
+                cached,
+                tokens: Rows::new(&ids, 0..rows)?,
+                keep: Keep::Last,
+                adapter: None,
+                positions: None,
+                mask: None,
+                overrides: Vec::new(),
+            })
+        };
+        let limits = limits::<S>(0);
+        let context = limits.window;
+        assert!(context > 40960, "{context} positions");
+        // The rows every row of which the items hold over the whole context.
+        let rows = <S as Decode>::Rows::SIZE;
+        let cache = Cache::new(&device, &limits.cache, 2 + rows)?;
+        let mut requests = vec![request(rows / 2, context, 0)?];
+        for row in 0..rows / 2 {
+            requests.push(request(1, context, 2 + row)?);
+        }
+        let batch = Batch::<Infallible>::new(&requests, &limits, &cache, &[])?;
+        batch.operands::<
+            launch::Capacity<S>,
+            <S as Decode>::Reach,
+            <S as Decode>::Sequences,
+            KvHeads,
+            <S as Geometry>::Groups,
+            Head,
+            launch::Waves<S>,
+            <S as Decode>::Windows,
+        >(0)?;
+        Ok(())
+    }
 }
