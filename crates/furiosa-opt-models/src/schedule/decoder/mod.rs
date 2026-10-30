@@ -25,12 +25,15 @@
 use crate::Module;
 use crate::load::Named;
 use crate::models::decoder::Form;
-use crate::models::decoder::attention::qwen3::{self, QueryHeads, fp8, launch};
-use crate::models::decoder::attention::{Geometry, Head, KvHeads, Qwen2Layer};
+use crate::models::decoder::attention::qwen3::{self, LmHead, QueryHeads, fp8, launch};
+use crate::models::decoder::attention::{
+    ForCausalLM, ForSequenceClassification, Geometry, Head, KvHeads, Qwen2Layer,
+};
+use crate::models::decoder::form::BlockScaled;
 use crate::modules::attention::{Attention, NormalizedQkv, Positioned, Projection};
 use crate::modules::generic::collection::View;
 use crate::modules::generic::schedule::{Begin, Fill, Spill};
-use crate::modules::language::{Backbone, Call};
+use crate::modules::language::{Backbone, Call, Classifier, Selected};
 use crate::modules::residual::Residual;
 use crate::ops::attention::full::paged::Retained;
 use crate::ops::embedding;
@@ -598,11 +601,11 @@ where
     }
 }
 
-/// A launch's rows through the catalog tree's leaves in the family's order, at any size and in any
-/// projection form whose leaves run the cut: embedded, the first layer's stores over every tile,
-/// then each layer attended and, tile by tile, its work up to the next layer's store or the head,
-/// from whose rows the selected rows' tokens are read. Generic in its env, so only the launches
-/// that run it compile it.
+/// A launch's rows through the catalog base model's leaves in the family's order, at any size and
+/// in any projection form whose leaves run the cut: embedded, the first layer's stores over every
+/// tile, then each layer attended and, tile by tile, its work up to the next layer's store or the
+/// head; the head's rows and the rows the launch selects among them. Generic in its env, so only
+/// the launches that run it compile it.
 impl<
     'm,
     'i,
@@ -618,8 +621,8 @@ impl<
     const L: usize,
     OL,
     Env,
-> Module<&'i mut launch::Input<'a, Z>, Env, launch::State<'s, 'b, Z>>
-    for Decoder<&'m launch::Model<Z, P>>
+> Module<&'i mut launch::Input<'a, Z>, Env, launch::Body<'s, 'b, Z>>
+    for Decoder<&'m launch::Base<Z, P>>
 where
     Z: Geometry<
             KvHeads = KvHeads,
@@ -638,29 +641,26 @@ where
     OutputProjection<P, Z>: for<'x> Module<Begin<()>, (), &'x mut (), Output = OL>
         + for<'d, 'g> Module<&'g mut OL, (), &'d mut (), Output = ()>,
 {
-    type Output = ();
+    type Output = (Rows<Z>, &'a Selected<Capacity<Z>>);
 
     fn forward(
         &self,
         device: &mut Device,
         _: Env,
-        state: launch::State<'s, 'b, Z>,
+        body: launch::Body<'s, 'b, Z>,
         input: &'i mut launch::Input<'a, Z>,
-    ) {
-        let causal = self.0;
+    ) -> Self::Output {
+        let model = self.0;
         let live = Live::<(), Capacity<Z>>::read(&input.count);
         let context =
-            causal
-                .model
-                .rotary_emb
-                .forward(&mut *device, (), &mut (), (live, &mut input.cache));
+            (model.rotary_emb).forward(&mut *device, (), &mut (), (live, &mut input.cache));
         let call = Call {
             context: &context,
             tokens: &input.tokens,
             live,
         };
-        let (((embedded, slots), ()), tokens) = state;
-        let Then(Backbone { embedding, body }, norm) = &causal.model.body;
+        let ((embedded, slots), ()) = body;
+        let Then(Backbone { embedding, body }, norm) = &model.body;
         let launch = embedding::Launch {
             ids: call.tokens,
             count: live,
@@ -738,20 +738,21 @@ where
             let rows = Tokenwise(&last, norm).forward(&mut *device, call, &mut (), (output, input));
             head.spill(&mut *device, rows.value(), tile);
         }
-        causal.lm_head.read(device, &head, call.context.1, tokens);
+        (head, call.context.1)
     }
 }
 
-/// A launch of the catalog's causal model runs by the decoder family's loops.
-impl<'i, 'a, 's, 'b, Z, P, const DEPTH: usize, Env>
-    Module<&'i mut launch::Input<'a, Z>, Env, launch::State<'s, 'b, Z>> for launch::Model<Z, P>
+/// The base model's loops over a launch of size `Z`: the head's rows and the rows it selects.
+type Loops<'a, Z> = (Rows<Z>, &'a Selected<Capacity<Z>>);
+
+/// A launch of the catalog's causal model: its base model's loops, then the selected rows' greedy
+/// tokens.
+impl<'i, 'a, 's, 'b, Z: Geometry + Decode + 'static, B, P: Form, Env>
+    Module<&'i mut launch::Input<'a, Z>, Env, launch::State<'s, 'b, Z>>
+    for ForCausalLM<Z, launch::Over<Z, B, P>, LmHead<Z, Hbm>, P>
 where
-    Z: Geometry<Layers<()> = [(); DEPTH]> + Decode + qwen3::Front + 'static,
-    P: Form,
-    swiglu::Down<Intermediate<Z>>: AxisName,
-    Catalog<P, Z>: View<DEPTH>,
-    for<'m> Decoder<&'m Self>:
-        Module<&'i mut launch::Input<'a, Z>, Env, launch::State<'s, 'b, Z>, Output = ()>,
+    for<'m> Decoder<&'m launch::Over<Z, B, P>>:
+        Module<&'i mut launch::Input<'a, Z>, Env, launch::Body<'s, 'b, Z>, Output = Loops<'a, Z>>,
 {
     type Output = ();
 
@@ -762,17 +763,73 @@ where
         state: launch::State<'s, 'b, Z>,
         input: &'i mut launch::Input<'a, Z>,
     ) {
-        Decoder(self).forward(device, env, state, input)
+        let (body, tokens) = state;
+        let (head, selected) = Decoder(&self.model).forward(&mut *device, env, body, input);
+        self.lm_head.read(device, &head, selected, tokens);
     }
 }
 
-/// Block-scaled FP8 Qwen3-8B's launch runs its catalog model by the decoder family's loops.
+/// A launch of the catalog's base model: its loops, then the selected rows' hidden values.
+impl<'i, 'a, 's, 'b, Z: Geometry + Decode + 'static, B, P: Form, Env>
+    Module<&'i mut launch::Input<'a, Z>, Env, launch::State<'s, 'b, Z, launch::Values<Z>>>
+    for launch::Over<Z, B, P>
+where
+    for<'m> Decoder<&'m Self>:
+        Module<&'i mut launch::Input<'a, Z>, Env, launch::Body<'s, 'b, Z>, Output = Loops<'a, Z>>,
+{
+    type Output = ();
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        env: Env,
+        state: launch::State<'s, 'b, Z, launch::Values<Z>>,
+        input: &'i mut launch::Input<'a, Z>,
+    ) {
+        let (body, rows) = state;
+        let (head, selected) = Decoder(self).forward(&mut *device, env, body, input);
+        selected.hidden(device, &head, rows);
+    }
+}
+
+/// A launch of the catalog's sequence classifier: its base model's loops, then the selected rows'
+/// scores.
+impl<'i, 'a, 's, 'b, Z: Geometry + Decode + 'static, B, P: Form, Env>
+    Module<&'i mut launch::Input<'a, Z>, Env, launch::State<'s, 'b, Z, launch::Scores<Z>>>
+    for ForSequenceClassification<Z, launch::Over<Z, B, P>, Classifier<Width<Z>>, P>
+where
+    for<'m> Decoder<&'m launch::Over<Z, B, P>>:
+        Module<&'i mut launch::Input<'a, Z>, Env, launch::Body<'s, 'b, Z>, Output = Loops<'a, Z>>,
+{
+    type Output = ();
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        env: Env,
+        state: launch::State<'s, 'b, Z, launch::Scores<Z>>,
+        input: &'i mut launch::Input<'a, Z>,
+    ) {
+        let (body, scores) = state;
+        let (head, selected) = Decoder(&self.model).forward(&mut *device, env, body, input);
+        self.score.read(device, &head, selected, scores);
+    }
+}
+
+/// Block-scaled FP8 Qwen3-8B's launch runs its catalog model.
 impl<'i, 'a, 's, 'b, Env>
     Module<
         &'i mut launch::Input<'a, qwen3::Size<"8B">>,
         Env,
         launch::State<'s, 'b, qwen3::Size<"8B">>,
     > for fp8::ForCausalLM
+where
+    launch::Model<qwen3::Size<"8B">, BlockScaled>: Module<
+            &'i mut launch::Input<'a, qwen3::Size<"8B">>,
+            Env,
+            launch::State<'s, 'b, qwen3::Size<"8B">>,
+            Output = (),
+        >,
 {
     type Output = ();
 
@@ -783,7 +840,7 @@ impl<'i, 'a, 's, 'b, Env>
         state: launch::State<'s, 'b, qwen3::Size<"8B">>,
         input: &'i mut launch::Input<'a, qwen3::Size<"8B">>,
     ) {
-        Decoder(&self.model).forward(device, env, state, input)
+        self.model.forward(device, env, state, input)
     }
 }
 
@@ -791,24 +848,36 @@ impl<'i, 'a, 's, 'b, Env>
 mod tests {
     use super::*;
     use crate::models::decoder::attention::llama;
-    use crate::models::decoder::form::{Affine, BlockScaled};
+    use crate::models::decoder::form::Affine;
 
-    /// Each catalog launch, of every size and projection form a root serves, runs by the decoder
-    /// family's one loop on its launch's input and state.
+    /// Each catalog root, of every size and projection form a registry row serves, runs by the
+    /// decoder family's one loop on its launch's input and the state ending in the place its head
+    /// writes: the causal model's tokens, the base model's hidden values, the classifier's scores.
     #[test]
     fn every_root_runs_by_the_loop() {
-        fn runs<Z: Geometry + Decode, P: Form>()
+        fn runs<R, Z: Geometry + Decode, O>()
         where
-            for<'m, 'i, 'a, 's, 'b> Decoder<&'m launch::Model<Z, P>>:
-                Module<&'i mut launch::Input<'a, Z>, (), launch::State<'s, 'b, Z>>,
+            for<'i, 'a, 's, 'b> R:
+                Module<&'i mut launch::Input<'a, Z>, (), launch::State<'s, 'b, Z, O>>,
         {
         }
-        runs::<qwen3::Size<"0.6B">, Affine>();
-        runs::<qwen3::Size<"1.7B">, Affine>();
-        runs::<qwen3::Size<"4B">, Affine>();
-        runs::<qwen3::Size<"8B">, Affine>();
-        runs::<qwen3::Size<"8B">, BlockScaled>();
-        runs::<llama::Size<"8B">, Affine>();
-        runs::<llama::Size<"Mistral-7B">, Affine>();
+        type Q<const N: &'static str> = qwen3::Size<N>;
+        runs::<launch::Model<Q<"0.6B">, Affine>, Q<"0.6B">, launch::Tokens<Q<"0.6B">>>();
+        runs::<launch::Base<Q<"0.6B">, Affine>, Q<"0.6B">, launch::Values<Q<"0.6B">>>();
+        runs::<launch::Classifier<Q<"0.6B">, Affine>, Q<"0.6B">, launch::Scores<Q<"0.6B">>>();
+        runs::<launch::Model<Q<"1.7B">, Affine>, Q<"1.7B">, launch::Tokens<Q<"1.7B">>>();
+        runs::<launch::Base<Q<"1.7B">, Affine>, Q<"1.7B">, launch::Values<Q<"1.7B">>>();
+        runs::<launch::Classifier<Q<"1.7B">, Affine>, Q<"1.7B">, launch::Scores<Q<"1.7B">>>();
+        runs::<launch::Model<Q<"4B">, Affine>, Q<"4B">, launch::Tokens<Q<"4B">>>();
+        runs::<launch::Base<Q<"4B">, Affine>, Q<"4B">, launch::Values<Q<"4B">>>();
+        runs::<launch::Classifier<Q<"4B">, Affine>, Q<"4B">, launch::Scores<Q<"4B">>>();
+        runs::<launch::Model<Q<"8B">, Affine>, Q<"8B">, launch::Tokens<Q<"8B">>>();
+        runs::<launch::Base<Q<"8B">, Affine>, Q<"8B">, launch::Values<Q<"8B">>>();
+        runs::<launch::Classifier<Q<"8B">, Affine>, Q<"8B">, launch::Scores<Q<"8B">>>();
+        runs::<fp8::ForCausalLM, Q<"8B">, launch::Tokens<Q<"8B">>>();
+        type Llama = llama::Size<"8B">;
+        runs::<launch::Model<Llama, Affine>, Llama, launch::Tokens<Llama>>();
+        type Mistral = llama::Size<"Mistral-7B">;
+        runs::<launch::Model<Mistral, Affine>, Mistral, launch::Tokens<Mistral>>();
     }
 }

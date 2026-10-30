@@ -1,56 +1,38 @@
-//! Qwen3's and Llama's listed roots as decoders: a call stages its requests, streams the base
-//! model's body over every layer's own blocks into the call's rows, then keeps the rows its
-//! requests keep.
+//! Qwen3's and Llama's listed roots of the packed tree as decoders: a call stages its requests,
+//! streams the base model's body over every layer's own blocks into the call's rows, then keeps the
+//! rows its requests keep.
 //!
 //! - The base model returns the kept rows' hidden values; the causal model runs its greedy head
 //!   on them and returns their tokens; the sequence classifier runs its score head on them and
 //!   returns their scores.
 //! - A row of a BF16 or channel-scaled line attends its whole history as a work item of the size's
 //!   attention, tiled as the call says.
-//! - The catalog's launch model, in dense BF16 or block-scaled FP8, streams its whole causal tree
-//!   in one launch: its host plans each row's position and cache slot, its work items and prompt
-//!   chunks and its selected rows, and the launch returns the selected rows' tokens in kept order.
-//!   Its prompt chunks attend apart from their history, so it refuses a fixed tiling.
 //! - A call whose rows run with adapters passes each layer's attention and feed-forward projections
 //!   the terms of the call's adapters and their selections of the rows. Only BF16 Qwen3 of 0.6B to
 //!   4B runs adapters: the sizes of 8B geometry, Qwen3's, Llama's and Mistral's, lay their query,
 //!   key and value rows out head-major, and a channel-scaled projection adds no update.
 
 use super::adapters::{self, SLOTS};
-use super::{Batch, CacheSpec, Decoder, Group, Kind, Limits, Output, Pool, Rows, Table};
+use super::{Batch, CacheSpec, Decoder, Group, Kind, Limits, Output, Pool, Rows, Table, Tables};
 use crate::{AsyncModule, Checkpoint, Function, LoadError, forward};
-use furiosa_opt_models::Module;
 use furiosa_opt_models::load::{Context, Load};
-use furiosa_opt_models::models::decoder::attention::qwen3::{fp8, launch};
-use furiosa_opt_models::models::decoder::attention::{Chunks, Head, KvHeads};
 use furiosa_opt_models::models::decoder::attention::{Geometry, llama, qwen3};
+use furiosa_opt_models::models::decoder::attention::{Head, KvHeads};
 use furiosa_opt_models::models::decoder::form;
-use furiosa_opt_models::modules::attention::key_value;
-use furiosa_opt_models::modules::language::{Input, Selected};
+use furiosa_opt_models::modules::language::Input;
 use furiosa_opt_models::modules::lora::{self, Adapters, Rank};
 use furiosa_opt_models::ops::attention::full::paged::{Tiling, chunks::Masks};
 use furiosa_opt_models::ops::attention::gqa::Cache as Window;
 use furiosa_opt_models::ops::embedding::Ids;
 use furiosa_opt_models::ops::index::gather;
-use furiosa_opt_models::ops::index::table::BlockIndex;
 use furiosa_opt_models::ops::linear::affine::{self, Columns};
-use furiosa_opt_models::specialize::attention::{Decode, WAVES};
+use furiosa_opt_models::specialize::attention::Decode;
 use furiosa_opt_models::tensor::cache::{self, Block, Blocks};
 use furiosa_opt_models::tensor::memory::{Hbm, alias};
 use furiosa_opt_models::tensor::parallel::{Chip, Parallel};
 use furiosa_opt_std::prelude::*;
 use furiosa_opt_std::runtime::DeviceOutput;
-use std::{convert::Infallible, io, marker::PhantomData};
-
-/// Block IDs of a call of `R` rows whose every row is a request spanning the whole context of `W`
-/// windows.
-#[derive(Clone, Debug)]
-struct Tables<R, W>(PhantomData<fn() -> (R, W)>);
-
-impl<R: AxisName, W: AxisName> AxisName for Tables<R, W> {
-    const NAME: Ident = Ident::new("Tables");
-    const SIZE: usize = R::SIZE * W::SIZE * BlockIndex::SIZE;
-}
+use std::{convert::Infallible, io};
 
 /// What a call of the size `S` holds: the compiled context, the size's rows, one paged group of
 /// every layer's blocks, and `adapters` adapters.
@@ -374,157 +356,3 @@ classifiers!(
     qwen3::Size<"4B">,
     qwen3::Size<"8B">,
 );
-
-/// The kept rows' greedy tokens of each listed launch model `$model` of size `$size`, from one
-/// launch of its causal tree: every form of the catalog shares it.
-macro_rules! launches {
-    ($([$($generics:tt)*] $model:ty, $size:ty);+ $(;)?) => {$(
-        impl<$($generics)*> Decoder for $model
-        where
-            Self: Send + Sync + DeviceSend,
-            for<'i, 'a, 's, 'b> Self: Module<
-                    &'i mut launch::Input<'a, $size>,
-                    (),
-                    launch::State<'s, 'b, $size>,
-                    Output = (),
-                >,
-        {
-            const OUTPUT: Output = Output::Tokens;
-            type Output = Rows<i32, m![1]>;
-            type Layers = <$size as Geometry>::Layers<Blocks<KvHeads, Head>>;
-            type Adapter = Infallible;
-
-            /// The rows of a launch, a request reaching the positions its rotary table covers at
-            /// most.
-            fn limits(&self) -> Limits {
-                Limits {
-                    window: launch::CONTEXT.min(<$size as Decode>::Positions::SIZE),
-                    rows: launch::Capacity::<$size>::SIZE,
-                    cache: CacheSpec {
-                        pools: vec![Pool {
-                            block: Block::SIZE,
-                            bytes: Blocks::<KvHeads, Head>::BLOCK_STRIDE as usize,
-                        }],
-                        groups: vec![Group {
-                            pool: 0,
-                            layers: 0..<$size as Geometry>::LAYERS,
-                            kind: Kind::Paged,
-                            window: None,
-                        }],
-                    },
-                    adapters: Self::ADAPTERS,
-                }
-            }
-
-            fn layers(storage: &[HbmBuffer]) -> io::Result<Self::Layers> {
-                views(storage)
-            }
-
-            // The model is captured and launched in place, never held across an await: that `Send`
-            // check erases lifetimes and cannot prove the tree's higher-ranked stream bounds.
-            fn call(
-                &self,
-                device: &mut Device,
-                layers: &mut Self::Layers,
-                batch: Batch<'_, Infallible>,
-                tiling: Tiling,
-            ) -> impl Future<Output = io::Result<Rows<i32, m![1]>>> + Send {
-                let model = self;
-                async move {
-                    if tiling == Tiling::Fixed {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            "the launch model attends prompt chunks apart from their history",
-                        ));
-                    }
-                    type Capacity = launch::Capacity<$size>;
-                    let reads = batch.operands::<
-                        Capacity,
-                        <$size as Decode>::Reach,
-                        <$size as Decode>::Sequences,
-                        KvHeads,
-                        <$size as Geometry>::Groups,
-                        Head,
-                        WAVES,
-                    >(0)?;
-                    let (staged, views) = batch
-                        .stage::<Capacity, Tables<Capacity, Chunks>, Chip>(
-                            device,
-                            &reads,
-                            (0, Table::Blocks),
-                        )
-                        .await?;
-                    // ponytail: placed each call; a load-lifetime place would spare two small
-                    // uploads a call.
-                    let masks = Masks::new(device).await?;
-                    let mut views = views.into_iter();
-                    let mut next = || {
-                        views
-                            .next()
-                            .ok_or_else(|| io::Error::other("a read array is missing"))
-                    };
-                    let operands: launch::Operands<$size> = key_value::Operands {
-                        batch: key_value::Batch {
-                            positions: alias(&next()?, ..)?,
-                            slot: alias(&next()?, ..)?,
-                        },
-                        work: launch::Work::<$size>::bind(&mut next, &masks)?,
-                        selected: Selected {
-                            live: alias(&next()?, ..)?,
-                            rows: alias(&next()?, ..)?,
-                        },
-                        slots: PhantomData,
-                    };
-                    let tokens: launch::Ids<$size> = alias(&staged.tokens, ..)?;
-                    let mut input: launch::Input<'_, $size> =
-                        Input::new(tokens, staged.count, &operands);
-                    let slots = layers
-                        .each_mut()
-                        .map(|blocks| ((Default::default(), blocks, ()), ()));
-                    let hidden = DeviceOutput::alloc(device).map_err(io::Error::other)?;
-                    let tokens: launch::Tokens<$size> =
-                        DeviceOutput::alloc(device).map_err(io::Error::other)?;
-                    let mut places = (((hidden, slots), ()), tokens);
-                    let state: launch::State<'_, '_, $size> = &mut places;
-                    launch(forward, (&mut *device, model, (), state, &mut input))
-                        .output(&mut ())
-                        .submit()
-                        .accepted()
-                        .map(drop)
-                        .map_err(io::Error::other)?;
-                    Rows::new(&places.1.into_buffer(), 0..batch.kept().len())
-                }
-            }
-        }
-    )+};
-}
-
-// Block-scaled FP8 Qwen3-8B runs its own root, the catalog tree's leaves in the decode order.
-launches!(
-    [B] launch::Over<qwen3::Size<"0.6B">, B>, qwen3::Size<"0.6B">;
-    [B] launch::Over<qwen3::Size<"1.7B">, B>, qwen3::Size<"1.7B">;
-    [B] launch::Over<qwen3::Size<"4B">, B>, qwen3::Size<"4B">;
-    [B] launch::Over<qwen3::Size<"8B">, B>, qwen3::Size<"8B">;
-    [] fp8::ForCausalLM, qwen3::Size<"8B">;
-);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::decoder::{Cache, Instance, Request};
-    use furiosa_opt_models::models::decoder::form::Affine;
-
-    /// An instance of the catalog's launch model serves requests on a cache in dense BF16 and in
-    /// block-scaled FP8, returning the kept rows' tokens.
-    #[test]
-    fn launches_serve_requests() {
-        fn serves<D>()
-        where
-            Instance<D>:
-                for<'r, 'c> AsyncModule<&'r [Request], (), &'c Cache, Output = Rows<i32, m![1]>>,
-        {
-        }
-        serves::<fp8::ForCausalLM>();
-        serves::<launch::Model<qwen3::Size<"8B">, Affine>>();
-    }
-}

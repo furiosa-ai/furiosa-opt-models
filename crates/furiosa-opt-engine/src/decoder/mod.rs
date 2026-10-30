@@ -13,6 +13,9 @@
 //!   attention: under `Tiling::Fixed` a row's values do not depend on the other rows of its calls.
 //! - A call may run its requests with LoRA adapters: the caller's list of them, which a request
 //!   names an adapter of by its index (`adapter`); the batch keeps the list it checked.
+//! - A `Root` of the decoder family's catalog is a decoder of one launch a call: the host plans
+//!   the rows' positions, cache slots, attention work and selected rows, and the launch writes the
+//!   selected rows' outputs in kept order.
 
 mod adapters;
 mod batch;
@@ -23,11 +26,26 @@ pub use adapters::{Adapter, Binding, Loader, SLOTS};
 pub use batch::{Batch, Rows, Staged, Table};
 pub use cache::{Cache, CacheSpec, Group, Kind, Pool};
 
-use crate::{AsyncModule, Checkpoint, LoadError};
-use furiosa_opt_models::ops::attention::full::paged::Tiling;
-use furiosa_opt_models::tensor::memory::{Dtype, dtype};
-use furiosa_opt_std::prelude::{Broadcast, Device, HbmBuffer, M, Scalar, m};
+use crate::{AsyncModule, Checkpoint, LoadError, forward};
+use furiosa_opt_models::Module;
+use furiosa_opt_models::models::decoder::attention::qwen3::{LmHead, fp8, launch};
+use furiosa_opt_models::models::decoder::attention::{
+    Chunks, ForCausalLM, ForSequenceClassification, Geometry, Head, KvHeads,
+};
+use furiosa_opt_models::modules::attention::key_value;
+use furiosa_opt_models::modules::language::{Classifier, Input, Selected};
+use furiosa_opt_models::ops::attention::full::paged::{Tiling, chunks::Masks};
+use furiosa_opt_models::ops::index::table::BlockIndex;
+use furiosa_opt_models::ops::linear::affine::Columns;
+use furiosa_opt_models::specialize::attention::{Decode, WAVES};
+use furiosa_opt_models::tensor::cache::{Block, Blocks};
+use furiosa_opt_models::tensor::memory::{Dtype, Hbm, alias, dtype};
+use furiosa_opt_models::tensor::parallel::Chip;
+use furiosa_opt_std::prelude::*;
+use furiosa_opt_std::runtime::DeviceOutput;
+use std::convert::Infallible;
 use std::io;
+use std::marker::PhantomData;
 use std::pin::Pin;
 
 /// One sequence chunk: `tokens` appended after the `cached` positions already in the cache.
@@ -290,5 +308,216 @@ impl<D: Decoder> Served for Instance<D> {
             let rows = AsyncModule::forward(self, device, (), call, requests).await?;
             rows.try_into()
         })
+    }
+}
+
+/// A root of the decoder family's catalog, which a call launches once: of the size `Size`, writing
+/// each selected row's output, `Row` elements, into `Place` in order.
+pub trait Root {
+    type Size: Geometry + Decode;
+    type Place: Place;
+    type Row: M;
+}
+
+/// The causal model writes the selected rows' tokens.
+impl<S: Geometry + Decode, B, P> Root for ForCausalLM<S, launch::Over<S, B, P>, LmHead<S, Hbm>, P> {
+    type Size = S;
+    type Place = launch::Tokens<S>;
+    type Row = m![1];
+}
+
+/// The base model writes the selected rows' hidden values.
+impl<S: Geometry + Decode, B, P> Root for launch::Over<S, B, P> {
+    type Size = S;
+    type Place = launch::Values<S>;
+    type Row = m![{ Symbol<<S as Geometry>::Hidden> }];
+}
+
+/// The sequence classifier writes the selected rows' scores, label columns first.
+impl<S: Geometry + Decode, B, P> Root
+    for ForSequenceClassification<S, launch::Over<S, B, P>, Classifier<<S as Geometry>::Hidden>, P>
+{
+    type Size = S;
+    type Place = launch::Scores<S>;
+    type Row = m![{ Symbol<Columns> }];
+}
+
+/// Block-scaled FP8 Qwen3-8B writes the selected rows' tokens.
+impl Root for fp8::ForCausalLM {
+    type Size = Size8B;
+    type Place = launch::Tokens<Size8B>;
+    type Row = m![1];
+}
+
+type Size8B = furiosa_opt_models::models::decoder::attention::qwen3::Size<"8B">;
+
+/// What a launch writes of each selected row, named by its element type: a token in I32, hidden
+/// values in BF16, scores in FP32.
+pub trait Place: DeviceOutput {
+    /// The element type of the rows a call returns.
+    type Scalar: Scalar;
+    /// What a call returns of each kept row.
+    const OUTPUT: Output;
+
+    fn into_buffer(self) -> HbmBuffer;
+}
+
+impl<E: M> Place for furiosa_opt_std::prelude::HbmTensor<i32, Chip, E> {
+    type Scalar = i32;
+    const OUTPUT: Output = Output::Tokens;
+
+    fn into_buffer(self) -> HbmBuffer {
+        furiosa_opt_std::prelude::HbmTensor::into_buffer(self)
+    }
+}
+
+impl<E: M> Place for furiosa_opt_std::prelude::HbmTensor<bf16, Chip, E> {
+    type Scalar = bf16;
+    const OUTPUT: Output = Output::Hidden;
+
+    fn into_buffer(self) -> HbmBuffer {
+        furiosa_opt_std::prelude::HbmTensor::into_buffer(self)
+    }
+}
+
+impl<E: M> Place for furiosa_opt_std::prelude::HbmTensor<f32, Chip, E> {
+    type Scalar = f32;
+    const OUTPUT: Output = Output::Scores;
+
+    fn into_buffer(self) -> HbmBuffer {
+        furiosa_opt_std::prelude::HbmTensor::into_buffer(self)
+    }
+}
+
+/// Block IDs of a call of `R` rows whose every row is a request spanning the whole context of `W`
+/// windows.
+#[derive(Clone, Debug)]
+pub(super) struct Tables<R, W>(PhantomData<fn() -> (R, W)>);
+
+impl<R: AxisName, W: AxisName> AxisName for Tables<R, W> {
+    const NAME: Ident = Ident::new("Tables");
+    const SIZE: usize = R::SIZE * W::SIZE * BlockIndex::SIZE;
+}
+
+/// A catalog root as a decoder: a call plans its rows' positions, cache slots, attention work and
+/// selected rows on the host, then launches the root once over every layer's own blocks, which
+/// writes the selected rows' outputs in kept order. Its prompt chunks attend apart from their
+/// history, so it refuses a fixed tiling.
+impl<R> Decoder for R
+where
+    R: Root + DeviceSend + Send + Sync,
+    R::Place: Place,
+    for<'b> <R::Size as Geometry>::Layers<launch::Layer<'b>>:
+        TryFrom<Vec<launch::Layer<'b>>> + DeviceSend,
+    for<'i, 'a, 's, 'b> R: Module<
+            &'i mut launch::Input<'a, R::Size>,
+            (),
+            launch::State<'s, 'b, R::Size, R::Place>,
+            Output = (),
+        >,
+{
+    const OUTPUT: Output = <R::Place as Place>::OUTPUT;
+    type Output = Rows<<R::Place as Place>::Scalar, R::Row>;
+    type Layers = Vec<Blocks<KvHeads, Head>>;
+    type Adapter = Infallible;
+
+    /// The rows of a launch, a request reaching the positions its rotary table covers at most.
+    fn limits(&self) -> Limits {
+        Limits {
+            window: launch::CONTEXT.min(<R::Size as Decode>::Positions::SIZE),
+            rows: launch::Capacity::<R::Size>::SIZE,
+            cache: CacheSpec {
+                pools: vec![Pool {
+                    block: Block::SIZE,
+                    bytes: Blocks::<KvHeads, Head>::BLOCK_STRIDE as usize,
+                }],
+                groups: vec![Group {
+                    pool: 0,
+                    layers: 0..<R::Size as Geometry>::LAYERS,
+                    kind: Kind::Paged,
+                    window: None,
+                }],
+            },
+            adapters: Self::ADAPTERS,
+        }
+    }
+
+    fn layers(storage: &[HbmBuffer]) -> io::Result<Self::Layers> {
+        (storage.iter())
+            .map(|layer| Blocks::from_buffer(layer.alias(..).map_err(io::Error::other)?))
+            .collect()
+    }
+
+    // The root is captured and launched in place, never held across an await: that `Send` check
+    // erases lifetimes and cannot prove the root's higher-ranked bounds.
+    fn call(
+        &self,
+        device: &mut Device,
+        layers: &mut Self::Layers,
+        batch: Batch<'_, Infallible>,
+        tiling: Tiling,
+    ) -> impl Future<Output = io::Result<Self::Output>> + Send {
+        let root = self;
+        async move {
+            if tiling == Tiling::Fixed {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "the launch model attends prompt chunks apart from their history",
+                ));
+            }
+            let reads = batch.operands::<
+                launch::Capacity<R::Size>,
+                <R::Size as Decode>::Reach,
+                <R::Size as Decode>::Sequences,
+                KvHeads,
+                <R::Size as Geometry>::Groups,
+                Head,
+                WAVES,
+            >(0)?;
+            // ponytail: placed each call; a load-lifetime place would spare two small uploads a
+            // call.
+            let masks = Masks::new(device).await?;
+            // Staged last, so nothing of the size's axes is held across an await.
+            let (staged, views) = batch
+                .stage::<
+                    launch::Capacity<R::Size>,
+                    Tables<launch::Capacity<R::Size>, Chunks>,
+                    Chip,
+                >(device, &reads, (0, Table::Blocks))
+                .await?;
+            let mut views = views.into_iter();
+            let mut next =
+                || (views.next()).ok_or_else(|| io::Error::other("a read array is missing"));
+            let operands: launch::Operands<R::Size> = key_value::Operands {
+                batch: key_value::Batch {
+                    positions: alias(&next()?, ..)?,
+                    slot: alias(&next()?, ..)?,
+                },
+                work: launch::Work::<R::Size>::bind(&mut next, &masks)?,
+                selected: Selected {
+                    live: alias(&next()?, ..)?,
+                    rows: alias(&next()?, ..)?,
+                },
+                slots: PhantomData,
+            };
+            let tokens: launch::Ids<R::Size> = alias(&staged.tokens, ..)?;
+            let mut input: launch::Input<'_, R::Size> = Input::new(tokens, staged.count, &operands);
+            let slots: Vec<launch::Layer<'_>> = (layers.iter_mut())
+                .map(|blocks| ((Default::default(), blocks, ()), ()))
+                .collect();
+            let slots: <R::Size as Geometry>::Layers<launch::Layer<'_>> = (slots.try_into())
+                .unwrap_or_else(|_| unreachable!("a cache of the decoder's spec holds each layer"));
+            let hidden = DeviceOutput::alloc(device).map_err(io::Error::other)?;
+            let place: R::Place = DeviceOutput::alloc(device).map_err(io::Error::other)?;
+            let mut places = (((hidden, slots), ()), place);
+            let state: launch::State<'_, '_, R::Size, R::Place> = &mut places;
+            launch(forward, (&mut *device, root, (), state, &mut input))
+                .output(&mut ())
+                .submit()
+                .accepted()
+                .map(drop)
+                .map_err(io::Error::other)?;
+            Rows::new(&places.1.into_buffer(), 0..batch.kept().len())
+        }
     }
 }
