@@ -3,7 +3,7 @@
 
 pub use cross::EncoderDecoder;
 pub use embedding::{InputEmbedding, Replace, TokenEmbedding};
-pub use fusion::{DeepFusion, Injection};
+pub use fusion::DeepFusion;
 pub use generative::Generative;
 
 /// Fuses token and media embeddings before running a context-bearing language body.

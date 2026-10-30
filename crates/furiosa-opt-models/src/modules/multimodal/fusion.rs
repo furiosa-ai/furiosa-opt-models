@@ -3,40 +3,6 @@
 use crate::Module;
 use furiosa_opt_std::prelude::{Device, DeviceSend, unroll};
 
-/// Runs a computation and optionally injects selected external features.
-#[derive(DeviceSend)]
-pub struct Injection<Compute, Add> {
-    pub module: Compute,
-    pub add: Add,
-}
-
-/// The state is the computation's slot.
-impl<'x, X, Y, S, ComputeState, Compute, Add, Env: Copy>
-    Module<(X, Option<(&'x Y, &'x S)>), Env, ComputeState> for Injection<Compute, Add>
-where
-    Compute: Module<X, Env, ComputeState, Output = X>,
-    Add: for<'b, 'd> Module<(&'b X, &'x Y, &'x S), Env, &'d mut (), Output = X>,
-{
-    type Output = X;
-
-    fn forward(
-        &self,
-        device: &mut Device,
-        env: Env,
-        state: ComputeState,
-        (input, injection): (X, Option<(&'x Y, &'x S)>),
-    ) -> Self::Output {
-        let hidden = self.module.forward(&mut *device, env, state, input);
-        match injection {
-            Some((features, spans)) => {
-                self.add
-                    .forward(device, env, &mut (), (&hidden, features, spans))
-            }
-            None => hidden,
-        }
-    }
-}
-
 /// Merges media into token embeddings and adds deep visual features after each prefix layer.
 #[derive(DeviceSend)]
 pub struct DeepFusion<
@@ -53,7 +19,8 @@ pub struct DeepFusion<
     pub encoder: Encoder,
     pub projector: Project,
     pub merge: Merge,
-    pub prefix: [(Injection<Layer, Add>, Project); K],
+    /// Each prefix layer, the add of the features injected after it and their projection.
+    pub prefix: [(Layer, Add, Project); K],
     pub layers: [Layer; TAIL],
 }
 
@@ -97,20 +64,16 @@ impl<Embedding, Encoder, Project, Merge, Layer, Add, const K: usize, const TAIL:
         if K > 0 {
             #[unroll]
             for (index, (slot, projection)) in prefix.iter_mut().enumerate() {
-                let (layer, project) = &self.prefix[index];
-                hidden = layer.module.forward(&mut *device, env, slot, hidden);
+                let (layer, add, project) = &self.prefix[index];
+                hidden = layer.forward(&mut *device, env, slot, hidden);
                 if MEDIA > 0 {
                     #[unroll]
                     for media in 0..MEDIA {
                         let (features, spans) = &features[media];
                         let feature =
                             project.forward(&mut *device, env, &mut *projection, &features[index]);
-                        hidden = layer.add.forward(
-                            &mut *device,
-                            env,
-                            &mut (),
-                            (&hidden, &feature, *spans),
-                        );
+                        hidden =
+                            add.forward(&mut *device, env, &mut (), (&hidden, &feature, *spans));
                     }
                 }
             }
@@ -240,7 +203,6 @@ where
             for (index, (slot, _)) in prefix.iter_mut().enumerate() {
                 hidden = self.prefix[index]
                     .0
-                    .module
                     .forward(&mut *device, env, slot, hidden);
             }
         }
