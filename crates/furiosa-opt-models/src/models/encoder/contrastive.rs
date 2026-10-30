@@ -201,13 +201,6 @@ impl TryFrom<Hf> for Config {
     }
 }
 
-impl Config {
-    /// Checkpoint family used by both retrieval towers.
-    pub fn family(&self) -> vision::Family {
-        self.family
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
