@@ -608,7 +608,9 @@ impl Declaration {
 
 /// The projection parameter forms a checkpoint can store.
 pub mod form {
-    use super::{Declaration, Form, Inputs, Memory, PhantomData, Requirement, fp8, linear};
+    use super::{
+        Declaration, Form, Inputs, Memory, PhantomData, Projection, Requirement, fp8, linear,
+    };
     use crate::models::config::Scheme;
     use crate::ops::linear::{output, query};
     use crate::ops::swiglu;
@@ -668,6 +670,27 @@ pub mod form {
 
         type Of<In: AxisName, Out: AxisName, D: Scalar, Chips: M + 'static, X: Memory, V> =
             fp8::ChannelScaled<In, Out, V, X::Tensor<f32, Chip, m![Out, 1 # 8]>>;
+
+        type Query<Hidden: AxisName, Heads: AxisName, Head: AxisName, X: Memory> =
+            query::matrix::ChannelScaled<Hidden, Heads, Head, X>;
+        type Key<Hidden: AxisName, Heads: AxisName, Head: AxisName, X: Memory> =
+            (Self::Query<Hidden, Heads, Head, X>, ());
+        type Value<Hidden: AxisName, Heads: AxisName, Head: AxisName, X: Memory> =
+            Self::Key<Hidden, Heads, Head, X>;
+        type Output<Queries: AxisName, Hidden: AxisName, X: Memory> =
+            output::matrix::ChannelScaled<Queries, Hidden, X>;
+        type GateUp<Hidden: AxisName, Intermediate: AxisName, X: Memory> = linear::Linear<
+            Hidden,
+            swiglu::GateUp<Intermediate>,
+            Chip,
+            Projection<Self, Hidden, swiglu::GateUp<Intermediate>, bf16, Chip, X>,
+        >;
+        type Down<Hidden: AxisName, Intermediate: AxisName, X: Memory> = linear::Linear<
+            Intermediate,
+            Hidden,
+            Chip,
+            Projection<Self, Intermediate, Hidden, bf16, Chip, X>,
+        >;
 
         const REQUIREMENT: Requirement = Requirement::Undeclared;
 

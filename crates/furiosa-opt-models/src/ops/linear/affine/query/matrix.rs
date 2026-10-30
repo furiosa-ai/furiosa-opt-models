@@ -1,14 +1,17 @@
-//! The BF16 forms of the query, key and value projections: each weight a dense matrix the
-//! contraction reads where it is stored, each period's live rows read where the launch stored
-//! them, and each output moved through HBM into the slices its head norm and rotation read.
+//! The dense forms of the query, key and value projections: each weight a matrix the contraction
+//! reads as BF16 tiles where it is stored, BF16 coefficients or E4M3 codes it restores by their
+//! rows' scales; each period's live rows read where the launch stored them, and each output moved
+//! through HBM into the slices its head norm and rotation read.
 
 use super::group::{Group, TilePair};
 use super::launch::{Launch, Next, Normalized};
 use super::{Cluster, Output, PairLocal, Pairs, Queries, QueryLocal, QuerySpread, Reduced, Tile};
 use crate::Module;
 use crate::modules::generic::schedule::Begin;
-use crate::ops::linear::Affine;
+use crate::ops::linear::{Affine, Matrix, fp8};
+use crate::tensor::form::Weight;
 use crate::tensor::live::Live;
+use crate::tensor::memory::{Hbm, Memory};
 use crate::tensor::parallel::Chip;
 use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
@@ -28,6 +31,30 @@ pub type Dense<Hidden, Heads, Head> = HbmTensor<bf16, Chip, m![Heads, Head, Hidd
 /// A dense weight as the contraction reads it, its heads' rows one output axis.
 type Flat<Hidden, Heads, Head> = HbmTensor<bf16, Chip, m![{ Symbol<Width<Heads, Head>> }, Hidden]>;
 
+/// A projection's channel-scaled weight: `Heads` heads of `Head` rows over `Hidden` inputs, the
+/// E4M3 codes and the FP32 scale of each row in memory `X`.
+pub type ChannelScaled<Hidden, Heads, Head, X = Hbm> = Weight<
+    m![Heads, Head, Hidden],
+    Chip,
+    Coded<
+        Hidden,
+        Heads,
+        Head,
+        <X as Memory>::Tensor<f8e4m3, Chip, m![{ Symbol<Width<Heads, Head>> }, Hidden]>,
+        <X as Memory>::Tensor<f32, Chip, m![{ Symbol<Width<Heads, Head>> }, 1 # 8]>,
+    >,
+>;
+
+/// A channel-scaled weight as the contraction reads it, its heads' rows one output axis, the codes
+/// held as `W` and the scales as `T`.
+type Coded<
+    Hidden,
+    Heads,
+    Head,
+    W = HbmTensor<f8e4m3, Chip, m![{ Symbol<Width<Heads, Head>> }, Hidden]>,
+    T = HbmTensor<f32, Chip, m![{ Symbol<Width<Heads, Head>> }, 1 # 8]>,
+> = fp8::ChannelScaled<Hidden, Width<Heads, Head>, W, T>;
+
 /// A period's live rows where the launch stored them, as the dense contraction reads them.
 #[must_use]
 pub struct Period<Hidden: AxisName, G: Group, All: AxisName> {
@@ -40,12 +67,15 @@ impl<Hidden: AxisName, P: AxisName, G: Group<Period = P>, All: AxisName> Period<
     /// The period's rows projected by `weight` into the output of `Heads`, `Local` of a slice's
     /// run in each slice and the rest spread over `Spread`. The contraction projects the period's
     /// live rows, and its output lands through HBM, as its rows are not the output's slices.
-    fn project<Heads: AxisName, Head: AxisName, Spread: M, Local: M, Env: Copy>(
+    fn project<Heads: AxisName, Head: AxisName, Spread: M, Local: M, Env: Copy, W>(
         &self,
         device: &mut Device,
         env: Env,
-        weight: &Flat<Hidden, Heads, Head>,
-    ) -> Output<G, Heads, Head, Spread, Local> {
+        weight: &W,
+    ) -> Output<G, Heads, Head, Spread, Local>
+    where
+        W: Matrix<In = Hidden, Out = Width<Heads, Head>>,
+    {
         const { assert!(G::SIZE * Tile::SIZE == P::SIZE) };
         let mut lines = HbmTensor::<bf16, Chip, m![P, { Symbol<Width<Heads, Head>> }]>::new();
         Affine::new(weight, ()).forward(
@@ -95,10 +125,33 @@ impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, Env> Module<Begin<()>, E
     }
 }
 
+/// Nor does the channel-scaled query projection: the contraction restores each period's weight
+/// slabs from their codes where they are stored.
+impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, Env> Module<Begin<()>, Env, &mut ()>
+    for ChannelScaled<Hidden, Heads, Head>
+{
+    type Output = Affine<Coded<Hidden, Heads, Head>, ()>;
+
+    fn forward(&self, _: &mut Device, _: Env, _: &mut (), _: Begin<()>) -> Self::Output {
+        Affine::new(self.held().clone(), ())
+    }
+}
+
+/// Nor the channel-scaled key or value projection.
+impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, Env> Module<Begin<()>, Env, &mut ()>
+    for (ChannelScaled<Hidden, Heads, Head>, ())
+{
+    type Output = Affine<(Coded<Hidden, Heads, Head>, ()), ()>;
+
+    fn forward(&self, _: &mut Device, _: Env, _: &mut (), _: Begin<()>) -> Self::Output {
+        Affine::new((self.0.held().clone(), ()), ())
+    }
+}
+
 /// The value projection begins the input its siblings read: the launch's live rows `live`,
 /// before any span arrives; dense periods keep nothing between them.
-impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, All: AxisName>
-    Module<Begin<()>, Live<(), All>, &mut ()> for Affine<(Flat<Hidden, Heads, Head>, ()), ()>
+impl<Hidden: AxisName, All: AxisName, W: Matrix<In = Hidden>>
+    Module<Begin<()>, Live<(), All>, &mut ()> for Affine<(W, ()), ()>
 {
     type Output = Launch<Hidden, (), All>;
 
@@ -114,15 +167,14 @@ impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, All: AxisName>
 }
 
 /// A period's live rows, read where the launch stored them.
-impl<G, P, Hidden, Heads, Head, All, Env> Module<Next<'_, G, Hidden, (), All>, Env, &mut ()>
-    for Affine<(Flat<Hidden, Heads, Head>, ()), ()>
+impl<G, P, Hidden, All, W, Env> Module<Next<'_, G, Hidden, (), All>, Env, &mut ()>
+    for Affine<(W, ()), ()>
 where
     G: Group<Period = P>,
     P: AxisName,
     Hidden: AxisName,
-    Heads: AxisName,
-    Head: AxisName,
     All: AxisName,
+    W: Matrix<In = Hidden>,
 {
     type Output = Period<Hidden, G, All>;
 
@@ -144,16 +196,16 @@ where
 }
 
 /// A period's queries, their heads spread over the slices.
-impl<
+impl<Hidden, Heads, Head, G, P, All, W, Env> Module<&Period<Hidden, G, All>, Env, &mut ()>
+    for Affine<W, ()>
+where
     Hidden: AxisName,
     Heads: AxisName,
     Head: AxisName,
     G: Group<Period = P>,
     P: AxisName,
     All: AxisName,
-    Env,
-> Module<&Period<Hidden, G, All>, Env, &mut ()> for Affine<Flat<Hidden, Heads, Head>, ()>
-where
+    W: Matrix<In = Hidden, Out = Width<Heads, Head>>,
     Env: Copy,
 {
     type Output = Queries<G, Heads, Head>;
@@ -165,7 +217,7 @@ where
         _: &mut (),
         rows: &Period<Hidden, G, All>,
     ) -> Self::Output {
-        rows.project::<Heads, Head, QuerySpread<G, Heads>, QueryLocal<G, Heads>, _>(
+        rows.project::<Heads, Head, QuerySpread<G, Heads>, QueryLocal<G, Heads>, _, _>(
             device,
             env,
             &self.weight,
@@ -174,16 +226,16 @@ where
 }
 
 /// A period's keys or values, each run of heads copied over the slices.
-impl<
+impl<Hidden, Heads, Head, G, P, All, W, Env> Module<&Period<Hidden, G, All>, Env, &mut ()>
+    for Affine<(W, ()), ()>
+where
     Hidden: AxisName,
     Heads: AxisName,
     Head: AxisName,
     G: Group<Period = P>,
     P: AxisName,
     All: AxisName,
-    Env,
-> Module<&Period<Hidden, G, All>, Env, &mut ()> for Affine<(Flat<Hidden, Heads, Head>, ()), ()>
-where
+    W: Matrix<In = Hidden, Out = Width<Heads, Head>>,
     Env: Copy,
 {
     type Output = Pairs<G, Heads, Head>;
@@ -195,6 +247,6 @@ where
         _: &mut (),
         rows: &Period<Hidden, G, All>,
     ) -> Self::Output {
-        rows.project::<Heads, Head, G::Copies, PairLocal<Heads>, _>(device, env, &self.weight.0)
+        rows.project::<Heads, Head, G::Copies, PairLocal<Heads>, _, _>(device, env, &self.weight.0)
     }
 }

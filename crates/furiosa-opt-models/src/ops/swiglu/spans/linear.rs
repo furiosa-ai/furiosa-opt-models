@@ -1,9 +1,10 @@
-//! The BF16 forms of the span MLP's weights: the packed gate/up and the down projections run on a
-//! span's live rows a band at a time, through HBM, where their SwiGLU runs over rows.
+//! The dense forms of the span MLP's weights, BF16 coefficients or E4M3 codes the contraction
+//! restores by their rows' scales: the packed gate/up and the down projections run on a span's live
+//! rows a band at a time, through HBM, where their SwiGLU runs over rows.
 
 use crate::Module;
 use crate::modules::generic::schedule::Begin;
-use crate::ops::linear::Linear;
+use crate::ops::linear::{Linear, Matrix};
 use crate::ops::normalization::span::Owned;
 use crate::ops::pointwise::SwiGlu;
 use crate::ops::swiglu::GateUp;
@@ -18,8 +19,10 @@ type Lines<Rows, Width> = HbmTensor<bf16, Chip, m![Rows, Width]>;
 type Grouped<Rows, Width> = HbmTensor<bf16, Chip, m![Rows / 8, Width / 16, Rows % 8, Width % 16]>;
 
 /// The packed gate/up weights need nothing landed before a span's rows arrive.
-impl<Hidden: AxisName, Intermediate: AxisName, Env> Module<Begin<()>, Env, &mut ()>
-    for Linear<Hidden, GateUp<Intermediate>, Chip>
+impl<Hidden: AxisName, Intermediate: AxisName, T, Env> Module<Begin<()>, Env, &mut ()>
+    for Linear<Hidden, GateUp<Intermediate>, Chip, T>
+where
+    T: Matrix<In = Hidden, Out = GateUp<Intermediate>>,
 {
     type Output = ();
 
@@ -27,9 +30,15 @@ impl<Hidden: AxisName, Intermediate: AxisName, Env> Module<Begin<()>, Env, &mut 
 }
 
 /// The packed gate/up projection of a span's live rows, which move to HBM for it.
-impl<'t, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName, Env: Copy>
+impl<'t, Hidden, Intermediate, Rows, Capacity, T, Env: Copy>
     Module<((), Live<&'t Owned<Hidden, Rows>, Capacity>), Env, &mut ()>
-    for Linear<Hidden, GateUp<Intermediate>, Chip>
+    for Linear<Hidden, GateUp<Intermediate>, Chip, T>
+where
+    Hidden: AxisName,
+    Intermediate: AxisName,
+    Rows: AxisName,
+    Capacity: AxisName,
+    T: Matrix<In = Hidden, Out = GateUp<Intermediate>>,
 {
     type Output = Lines<Rows, GateUp<Intermediate>>;
 
@@ -78,9 +87,15 @@ impl<Intermediate: AxisName, Rows: AxisName, Capacity: AxisName, Env: Copy>
 }
 
 /// The product, already in HBM, waits there for the down projection.
-impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName, Env>
+impl<Hidden, Intermediate, Rows, Capacity, T, Env>
     Module<Begin<Live<Lines<Rows, Intermediate>, Capacity>>, Env, &mut ()>
-    for Linear<Intermediate, Hidden, Chip>
+    for Linear<Intermediate, Hidden, Chip, T>
+where
+    Hidden: AxisName,
+    Intermediate: AxisName,
+    Rows: AxisName,
+    Capacity: AxisName,
+    T: Matrix<In = Intermediate, Out = Hidden>,
 {
     type Output = Lines<Rows, Intermediate>;
 
@@ -96,9 +111,15 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
 }
 
 /// The down projection of a span's live product rows, landed back on chip as the span's rows.
-impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName, Env: Copy>
+impl<Hidden, Intermediate, Rows, Capacity, T, Env: Copy>
     Module<Live<Lines<Rows, Intermediate>, Capacity>, Env, &mut ()>
-    for Linear<Intermediate, Hidden, Chip>
+    for Linear<Intermediate, Hidden, Chip, T>
+where
+    Hidden: AxisName,
+    Intermediate: AxisName,
+    Rows: AxisName,
+    Capacity: AxisName,
+    T: Matrix<In = Intermediate, Out = Hidden>,
 {
     type Output = Owned<Hidden, Rows>;
 
