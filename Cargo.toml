@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/furiosa-opt-engine",
+    "crates/furiosa-opt-models",
+    "crates/furiosa-opt-models/macros",
+    "crates/furiosa-opt-python",
+]
+
+# The one place the kernel compiler's revision is named: the tip of furiosa-opt-preview's default
+# branch `next`. CI and the install guide install the tip with `cargo binstall --git`, which takes no
+# revision, so a snapshot cut to `next` and the bump of this pin land together.
+[workspace.dependencies]
+furiosa-opt-std = { git = "https://github.com/furiosa-ai/furiosa-opt-preview", rev = "0dc3ceab827a859882860c32eae51d02aa2e2634" }
+
+# The engine's monomorphized debug info overflows the linker's 4 GiB debug sections.
+[profile.dev.package.furiosa-opt-engine]
+debug = false

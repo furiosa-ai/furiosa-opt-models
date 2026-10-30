@@ -1,0 +1,78 @@
+name: report
+
+# Records the traces and sweep summaries a run uploaded. A pull request compares them with its base
+# commit and comments; the nightly run writes the summary the docs show once every job passed.
+on:
+  workflow_call:
+    inputs:
+      tier: {description: '`gate` for a pull request, `nightly` for the nightly run.', type: string, required: true}
+      passed: {description: Whether every measuring job of the run passed., type: boolean, required: true}
+    secrets:
+      DATADOG_API_KEY: {required: true}
+      DATADOG_APP_KEY: {required: true}
+
+permissions: {contents: read, pull-requests: write}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      # The actions that hold the Datadog keys come from the base commit, not the pull request.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: trace-*
+          path: trace
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sweep-*
+          path: sweep
+          merge-multiple: true
+      - id: metrics
+        uses: ./.github/actions/metrics
+      - id: performance
+        uses: ./.github/actions/datadog
+        with:
+          path: ${{ steps.metrics.outputs.path }}
+          baseline: ${{ github.event.pull_request.base.sha }}
+          api-key: ${{ secrets.DATADOG_API_KEY }}
+          app-key: ${{ secrets.DATADOG_APP_KEY }}
+      - id: budgets
+        if: ${{ !cancelled() && inputs.tier == 'gate' }}
+        run: |
+          echo "budgets=$(jq -r '.budgets | to_entries | map("\(.key) \(.value)%") | join(", ")' .github/benchmarks.json)" >> "$GITHUB_OUTPUT"
+          # A pull request measures text generation only.
+          echo "history=$(jq -r '.["text-generation"].share' .github/dashboard/dashboards.json)" >> "$GITHUB_OUTPUT"
+      - uses: marocchino/sticky-pull-request-comment@v2
+        if: ${{ !cancelled() && inputs.tier == 'gate' }}
+        with:
+          message: |
+            **Performance: ${{ inputs.passed && job.status || 'failure' }}** · budgets: ${{ steps.budgets.outputs.budgets }}
+
+            [CI](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) · [History](${{ steps.budgets.outputs.history }})
+
+            ${{ steps.performance.outputs.regressions || ((job.status != 'success' || !inputs.passed) && 'Measurements or comparison unavailable; see CI.' || '') }}
+      # The docs show the latest serving numbers of a nightly run that passed every job.
+      - if: inputs.tier == 'nightly' && inputs.passed
+        run: |
+          shopt -s nullglob
+          for summary in sweep/*/*/*/summary.json; do
+            # A sweep directory is `<org>--<checkpoint>/<input>-<output>/<widths>`.
+            scenario="$(basename "$(dirname "$(dirname "$summary")")")"
+            model="$(basename "$(dirname "$(dirname "$(dirname "$summary")")")" | awk -F-- '{print $1 "/" $2}')"
+            jq -c --arg model "$model" --arg scenario "$scenario" '.[] | {model: $model, scenario: $scenario,
+              concurrency: .max_concurrency, ttft_ms: .median_ttft_ms, tpot_ms: .median_tpot_ms,
+              output_tokens_per_s: .output_throughput}' "$summary"
+          done | jq -s . > serving.json
+          jq -n --slurpfile serving serving.json --arg date "$(date -u +%F)" --arg commit "$GITHUB_SHA" \
+            --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{date: $date, commit: $commit, run: $run, serving: $serving[0]}' > nightly.json
+      - if: inputs.tier == 'nightly' && inputs.passed
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-summary
+          path: nightly.json
+          retention-days: 90

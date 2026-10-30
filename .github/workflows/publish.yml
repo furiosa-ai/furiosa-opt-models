@@ -1,0 +1,60 @@
+name: publish
+
+on:
+  workflow_call:
+    secrets:
+      DATADOG_API_KEY:
+        required: true
+      DATADOG_APP_KEY:
+        required: true
+
+permissions: {contents: read}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+      DATADOG_APP_KEY: ${{ secrets.DATADOG_APP_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      # Main is not measured again: its commit takes the pull-request measurement of its exact
+      # tree, which exists when the pull request was up to date with main at its last run.
+      - id: main
+        if: github.event_name == 'push'
+        # Explicit bash adds pipefail, so a failed query fails the step instead of recording nothing.
+        shell: bash
+        run: |
+          tree="$(git rev-parse HEAD^{tree})"
+          while read -r metric dimensions; do
+            curl --fail-with-body -sS --get https://api.us3.datadoghq.com/api/v1/query \
+              -H "DD-API-KEY: $DATADOG_API_KEY" -H "DD-APPLICATION-KEY: $DATADOG_APP_KEY" \
+              --data-urlencode "from=$(date -d '30 days ago' +%s)" \
+              --data-urlencode "to=$(date +%s)" \
+              --data-urlencode "query=avg:furiosa_opt.$metric{tree:$tree AND event:pull_request AND NOT stage:sample} by {$dimensions,run,attempt}.fill(null)" |
+              jq -c --arg dimensions "$dimensions" '
+                if (.errors // [] | length) > 0 then error("Datadog query failed") else . end |
+                .series[]? |
+                {metric, tags: (.scope | split(",") |
+                   map(select(split(":")[0] | IN($dimensions | split(",")[]))) | sort)} +
+                ([.pointlist[] | select(.[1] != null)] | last | select(. != null) |
+                 {timestamp: .[0], value: .[1]})'
+          done <<'QUERIES' | jq -sc 'group_by([.metric, .tags])[] | max_by(.timestamp) | {metric, tags, value}' > "$RUNNER_TEMP/main.jsonl"
+          forward.step_ms model,test,case
+          kernel.cycles model,test,case,kernel
+          serving.ttft_ms model,batch,scenario
+          serving.tpot_ms model,batch,scenario
+          serving.request_ms model,batch,scenario
+          QUERIES
+          if [ -s "$RUNNER_TEMP/main.jsonl" ]; then
+            echo "path=$RUNNER_TEMP/main.jsonl" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No pull request measured tree $tree; main records nothing for it."
+          fi
+      - if: steps.main.outputs.path
+        uses: ./.github/actions/datadog
+        with:
+          path: ${{ steps.main.outputs.path }}
+          api-key: ${{ secrets.DATADOG_API_KEY }}
+          app-key: ${{ secrets.DATADOG_APP_KEY }}
+      - uses: ./.github/actions/publish

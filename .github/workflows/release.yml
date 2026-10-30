@@ -1,0 +1,30 @@
+name: release
+
+# A version tag gets a GitHub release holding the engine wheel built from it, the wheel that goes to
+# PyPI. The framework plugins install from this repository.
+on:
+  push:
+    tags: ['v*']
+
+permissions: {contents: read}
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    permissions: {actions: read, contents: write}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions: {contents: write}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-wheel
+      - run: |
+          mkdir wheels
+          tar xzf products.tar.gz -C wheels
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
+            --verify-tag wheels/furiosa_opt_engine-*.whl
+        env:
+          GH_TOKEN: ${{ github.token }}

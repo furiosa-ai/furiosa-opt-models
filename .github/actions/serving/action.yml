@@ -1,0 +1,59 @@
+name: serving
+description: Serve each checkpoint with its documented flags and sweep the concurrency widths of its
+  task's workloads of a tier.
+inputs:
+  tier: {description: 'A key of a task''s `serving` in the inventory: the workloads to sweep.', required: true}
+  checkpoints: {description: 'Checkpoint IDs, one per line.', required: true}
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        TIER: ${{ inputs.tier }}
+        CHECKPOINTS: ${{ inputs.checkpoints }}
+        # The engine core runs inside the server process, sparing a second import at startup.
+        VLLM_ENABLE_V1_MULTIPROCESSING: '0'
+      run: |
+        inventory=.github/benchmarks.json
+        while read -r checkpoint; do
+          [ -n "$checkpoint" ] || continue
+          task="$(jq -er --arg id "$checkpoint" '.models[] | select(.id == $id) | .task' "$inventory")"
+          # The task's workloads of the tier; a task the tier does not serve sweeps nothing.
+          workloads="$(jq -c --arg t "$TIER" --arg task "$task" '.tasks[$task].serving[$t] // [] | .[]' "$inventory")"
+          # The flags come from the inventory, so CI serves the command the model page documents.
+          serve="$(jq -er --arg id "$checkpoint" --arg task "$task" '.tasks[$task].serve
+            + (.models[] | select(.id == $id) | .serve // []) | @sh' "$inventory")"
+          # A reranker's chat template lives in its checkpoint, as on its model page.
+          if [[ $serve == *"{checkpoint}"* ]]; then
+            serve="${serve//\{checkpoint\}/$(uvx --from huggingface-hub hf download "$checkpoint" --quiet)}"
+          fi
+          # vLLM serves the checkpoint's context, or the shorter one its `--max-model-len` sets.
+          config="$(uvx --from huggingface-hub hf download "$checkpoint" config.json --quiet)"
+          context="$(jq -er --slurpfile inventory "$inventory" --arg id "$checkpoint" '
+            ($inventory[0].models[] | select(.id == $id) | .serve // []) as $serve
+            | [.max_position_embeddings // .text_config.max_position_embeddings]
+              + [$serve | index("--max-model-len") // empty | $serve[. + 1] | tonumber | select(. > 0)]
+            | min' "$config")"
+          while read -r workload; do
+            [ -n "$workload" ] || continue
+            # A workload's directory and `scenario` tag: its input length, then its output length if any.
+            lengths="$(jq -r '[.input, .output | values] | map(tostring) | join("-")' <<< "$workload")"
+            if (( $(jq '.input + (.output // 0)' <<< "$workload") > context )); then
+              echo "::notice::$checkpoint serves $context tokens, short of the $lengths workload."
+              continue
+            fi
+            # Each width fills its slots `waves` times after its warm-up waves, with a floor on
+            # prompts for a stable median; a text task's `--ignore-eos` holds every output at its length.
+            jq --slurpfile inventory "$inventory" '$inventory[0].sweep as $w | .widths | map({max_concurrency: .,
+              num_prompts: ([$w.minimum_prompts, $w.waves * .] | max), num_warmups: ($w.warmup_waves * .)})' <<< "$workload" > widths.json
+            bench="$(jq -r --argjson s "$workload" --arg task "$task" '.tasks[$task].bench
+              + ["--random-input-len", "\($s.input)"] + if $s.output then ["--random-output-len", "\($s.output)"] else [] end
+              | @sh' "$inventory")"
+            # `sweep/<org>--<checkpoint>/<lengths>/` names what the metrics action tags.
+            directory="sweep/$(tr '[:upper:]' '[:lower:]' <<< "${checkpoint/\//--}")"
+            python3 -m vllm.benchmarks.sweep.serve --output-dir "$directory" --experiment-name "$lengths" --num-runs 1 \
+              --bench-params widths.json \
+              --serve-cmd "vllm serve $checkpoint $serve" \
+              --bench-cmd "vllm bench serve --model $checkpoint $bench"
+          done <<< "$workloads"
+        done <<< "$CHECKPOINTS"

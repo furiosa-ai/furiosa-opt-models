@@ -1,0 +1,72 @@
+[project]
+name = "furiosa-opt-models-dev"
+version = "0.0.0"
+requires-python = ">=3.11"
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.37",
+    "mkdocs-macros-plugin>=1.3",
+    "mkdocs-material>=9.6",
+    "mkdocstrings-python>=1.16",
+    "mypy>=1.18",
+    "numpy>=2",
+    "pytest>=8",
+    "ruff>=0.14",
+]
+
+[tool.basedpyright]
+typeCheckingMode = "all"
+pythonVersion = "3.11"
+pythonPlatform = "All"
+include = ["crates/furiosa-opt-engine/python", "integrations"]
+extraPaths = [
+    "crates/furiosa-opt-engine/python",
+    "integrations/furiosa-opt-vllm",
+    "integrations/furiosa-opt-vllm/tests",
+    "integrations/furiosa-opt-sglang",
+    "integrations/furiosa-opt-sglang/tests",
+]
+exclude = ["**/__pycache__", "**/.venv", "**/build", "**/dist"]
+reportUnusedCallResult = "warning"
+reportUnusedVariable = "error"
+reportMissingParameterType = "error"
+reportPrivateUsage = "error"
+reportMissingTypeStubs = "none"
+reportAny = "warning"
+reportUnknownArgumentType = "warning"
+reportUnknownMemberType = "warning"
+reportUnknownParameterType = "warning"
+reportUnknownVariableType = "warning"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["crates/furiosa-opt-engine/python", "integrations/*"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.pytest.ini_options]
+addopts = ["-ra", "--strict-config", "--strict-markers"]
+testpaths = ["integrations"]
+markers = ["feature(name): covers the named row of the serving feature support table"]
+pythonpath = ["."]
+filterwarnings = [
+    "error",
+    "ignore:max_rollback_tokens is deprecated:DeprecationWarning:xgrammar.*",
+    "ignore:Only CUDA.*support.*currently:UserWarning:sglang.*",
+    "ignore:`torch.jit.script_method` is deprecated:DeprecationWarning:torch.*",
+    # SGLang's quantization layers import FlashInfer kernels that use renamed CUTLASS DSL names.
+    "ignore:cutlass.utils.* is deprecated:DeprecationWarning:flashinfer.*",
+    # sentencepiece's SWIG types declare no module; as an error this crashes the importing process.
+    "ignore:builtin type Swig.* has no __module__ attribute:DeprecationWarning",
+    # vLLM's engine client closes its sockets but never terminates its zmq context.
+    "ignore:Unclosed context <zmq:ResourceWarning",
+]

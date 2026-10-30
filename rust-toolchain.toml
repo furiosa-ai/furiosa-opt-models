@@ -1,0 +1,5 @@
+[toolchain]
+# Pinned to the device toolchain, not chosen here: the kernel compiler is a rustc driver linked
+# against this exact nightly's rustc-dev, so a newer channel cannot load it.
+channel = "nightly-2026-05-01"
+components = ["rustc-dev", "llvm-tools", "rustfmt", "clippy"]

@@ -1,0 +1,43 @@
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[project]
+name = "furiosa-opt-vllm"
+version = "0.1.0"
+description = "vLLM platform plugin for FuriosaAI NPUs"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+    "furiosa-opt-engine",
+    "huggingface-hub>=0.34",
+    "typing-extensions>=4.12",
+    "numpy>=1.26",
+    # vLLM's CPU build: the plugin samples and schedules on the host. PyPI carries only the CUDA
+    # build; its torch comes from https://download.pytorch.org/whl/cpu.
+    "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.31.0/vllm-0.31.0+cpu-cp38-abi3-manylinux_2_39_x86_64.whl ; platform_machine == 'x86_64'",
+    "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.31.0/vllm-0.31.0+cpu-cp38-abi3-manylinux_2_39_aarch64.whl ; platform_machine == 'aarch64'",
+    # A range, since vLLM-Omni (the omni extra) requires transformers below 5.15 over a
+    # model-construction regression it reports in 5.15, while vLLM itself allows newer releases.
+    "transformers>=5.14.1,<5.18",
+]
+
+[project.optional-dependencies]
+diffusion = ["diffusers==0.40.0"]
+omni = ["vllm-omni==0.31.0rc1"]
+suffix = ["arctic-inference==0.3.0"]
+
+# --8<-- [start:entry-points]
+[project.entry-points."vllm.platform_plugins"]
+furiosa = "furiosa_opt_vllm:register"
+
+[project.entry-points."vllm_omni.platform_plugins"]
+furiosa = "furiosa_opt_vllm:register_omni"
+# --8<-- [end:entry-points]
+
+[tool.uv.build-backend]
+module-root = ""
+
+[tool.uv.sources]
+furiosa-opt-engine = { path = "../../crates/furiosa-opt-engine" }

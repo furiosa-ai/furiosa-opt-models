@@ -1,0 +1,43 @@
+{
+  "text-generation": {
+    "title": "Text generation",
+    "tasks": ["text"],
+    "id": "mjt-y46-egz",
+    "share": "https://p.us3.datadoghq.com/sb/50b6828c-954c-11f0-ab6d-e612f3089d3f-50fb7cc2d833995137d3178e5aeb4c13",
+    "widgets": [
+      {
+        "title": "Serving",
+        "panels": [
+          {"title": "Throughput vs interactivity", "metric": "serving.tpot_ms", "chart": "capacity"},
+          {"title": "TTFT", "metric": "serving.ttft_ms", "tags": ["scenario", "batch"]},
+          {"title": "TPOT", "metric": "serving.tpot_ms", "tags": ["scenario", "batch"]}
+        ]
+      },
+      {
+        "title": "Phase",
+        "panels": [
+          {"title": "Total time", "metric": "forward.step_ms", "tags": ["case"], "legend": "Call"},
+          {
+            "title": "Device time", "metric": "kernel.cycles", "tags": ["case"], "unit": "cycles",
+            "aggregate": "sum", "legend": "Call"
+          }
+        ]
+      }
+    ]
+  },
+  "embedding-reranking": {
+    "title": "Embedding & reranking",
+    "tasks": ["embedding", "reranking", "classification"],
+    "id": "k32-4jk-4j3",
+    "share": "https://p.us3.datadoghq.com/sb/50b6828c-954c-11f0-ab6d-e612f3089d3f-e122cf2f9f6bde578b8a74cd9d030cd3",
+    "widgets": [
+      {
+        "title": "Serving",
+        "panels": [
+          {"title": "Throughput vs latency", "metric": "serving.request_ms", "chart": "capacity"},
+          {"title": "Request latency", "metric": "serving.request_ms", "tags": ["scenario", "batch"]}
+        ]
+      }
+    ]
+  }
+}

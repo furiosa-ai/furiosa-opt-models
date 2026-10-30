@@ -1,0 +1,62 @@
+name: compiler
+description: Publish the pinned compiler and SDK when they are missing.
+outputs:
+  revision:
+    description: The compiler revision from the workspace dependencies.
+    value: ${{ steps.pin.outputs.revision }}
+runs:
+  using: composite
+  steps:
+    - id: pin
+      shell: bash
+      run: |
+        python3 -c 'import tomllib; std = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["dependencies"]["furiosa-opt-std"]; print("revision=" + std["rev"])' >> "$GITHUB_OUTPUT"
+    - id: assets
+      shell: bash
+      run: |
+        if ! command -v gh; then
+          sudo apt-get update -qq
+          sudo apt-get install -yqq gh
+        fi
+        # The `compiler` release caches the installed compiler per pin and the Rust SDK; a repository
+        # without it starts empty.
+        gh release view compiler > /dev/null 2>&1 ||
+          gh release create compiler --prerelease --title compiler --notes "CI's cache of the pinned compiler and the Rust SDK."
+        gh api "repos/$GITHUB_REPOSITORY/releases/tags/compiler" > "$RUNNER_TEMP/compiler-assets.json"
+        for name in compiler sdk; do
+          if [ "$name" = compiler ]; then file="$REVISION.tar.gz"; else file="toolchain-ubuntu-24.04-cross-$RUNNER_ARCH-$TOOLCHAIN.tar.gz"; fi
+          echo "$name=$(jq --arg name "$file" 'any(.assets[]; .name == $name and .state == "uploaded")' "$RUNNER_TEMP/compiler-assets.json")" >> "$GITHUB_OUTPUT"
+        done
+      env:
+        REVISION: ${{ steps.pin.outputs.revision }}
+    - if: steps.assets.outputs.sdk != 'true'
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ env.TOOLCHAIN }}
+        components: rustc-dev, llvm-tools
+        targets: aarch64-unknown-none,aarch64-unknown-none-softfloat
+    - if: steps.assets.outputs.compiler != 'true' && steps.assets.outputs.sdk == 'true'
+      uses: ./.github/actions/toolchain
+    # A pin bump moves to the tip of furiosa-opt-preview's default branch, so CI installs the compiler
+    # with the install guide's command. The compiler release caches it per pin, so a later tip does
+    # not reach a pin installed earlier.
+    - if: steps.assets.outputs.compiler != 'true'
+      shell: bash
+      run: |
+        binstall="${CARGO_HOME:-$HOME/.cargo}/bin/cargo-binstall"
+        [ -x "$binstall" ] || curl -L --proto '=https' --tlsv1.2 -sSf \
+          https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+        "$binstall" --no-confirm --root "$RUNNER_TEMP/compiler" \
+          --git https://github.com/furiosa-ai/furiosa-opt-preview cargo-furiosa-opt
+        tar -I 'gzip -1' -cf "$RUNNER_TEMP/$REVISION.tar.gz" -C "$RUNNER_TEMP/compiler" bin
+        gh release upload compiler "$RUNNER_TEMP/$REVISION.tar.gz" --clobber
+      env:
+        REVISION: ${{ steps.pin.outputs.revision }}
+    - if: steps.assets.outputs.sdk != 'true'
+      shell: bash
+      run: |
+        # The Rust toolchain only; the system packages a build needs come from the Ubuntu mirrors, so the
+        # public release redistributes no GPL package.
+        name="toolchain-ubuntu-24.04-cross-$RUNNER_ARCH-$TOOLCHAIN.tar.gz"
+        tar --exclude='./share/doc' -I 'gzip -1' -cf "$RUNNER_TEMP/$name" -C "$(rustc --print sysroot)" .
+        gh release upload compiler "$RUNNER_TEMP/$name" --clobber

@@ -1,0 +1,26 @@
+name: sccache
+description: Cache Rust compilation and optional compiler executables with GitHub Actions.
+inputs:
+  compilers: {description: Additional compiler executable names to wrap., default: ''}
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        echo RUSTC_WRAPPER=sccache >> "$GITHUB_ENV"
+        echo SCCACHE_GHA_ENABLED=true >> "$GITHUB_ENV"
+        echo SCCACHE_IDLE_TIMEOUT=0 >> "$GITHUB_ENV"
+    - uses: mozilla-actions/sccache-action@fd02668681acd5f960e1372061bee5e3e987195c
+      with:
+        disable_annotations: true
+        version: v0.18.0
+    - if: inputs.compilers != ''
+      shell: bash
+      env:
+        COMPILERS: ${{ inputs.compilers }}
+      run: |
+        mkdir -p "$RUNNER_TEMP/bin"
+        for compiler in $COMPILERS; do
+          ln -s "$SCCACHE_PATH" "$RUNNER_TEMP/bin/$compiler"
+        done
+        echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"

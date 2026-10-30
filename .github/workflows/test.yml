@@ -1,0 +1,48 @@
+name: test
+
+on:
+  workflow_call:
+
+permissions: {contents: read}
+
+env:
+  # A fork's code, which a maintainer approved but nobody trusts, gets caches of its own, so it
+  # cannot change what later runs of this repository read.
+  HF_HOME: ${{ github.event.pull_request.head.repo.fork && '/tmp/fork-cache/huggingface' || '/root/.cache/huggingface' }}
+
+jobs:
+  run:
+    if: github.event_name == 'pull_request'
+    runs-on: arc-runner-benchmark-rngd4
+    timeout-minutes: 10
+    steps:
+      # The inventory and actions come from the tree the test binaries were built from.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: '3.11'
+          activate-environment: true
+          enable-cache: false
+          cache-local-path: ${{ github.event.pull_request.head.repo.fork && '/tmp/fork-cache/uv' || '/root/.cache/furiosa-opt-models/uv' }}
+      - uses: ./.github/actions/checkpoints
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: build-*
+          path: products
+      - run: |
+          for archive in products/*/products.tar.gz; do tar xzf "$archive" -C "$(dirname "$archive")"; done
+          # The engine's binding tests embed this interpreter, which links it and imports numpy.
+          uv pip install numpy
+          export LD_LIBRARY_PATH="$(python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+          export PYTHONHOME="$(python -c 'import sys; print(sys.base_prefix)')"
+          export PYTHONPATH="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+          # Forward tests run alone in the bench workflow, which measures them.
+          mapfile -t skip < <(jq -r '.models[].forward // empty | "--skip", .' .github/benchmarks.json)
+          # Device tests open the runner's chips, so the tests run one at a time.
+          for binary in products/*/tests/*; do
+            "$binary" "${skip[@]}" --test-threads 1
+          done
+        env:
+          FURIOSA_OPT_PROFILE: info

@@ -1,0 +1,21 @@
+name: kernels
+description: Restore and save a kernel store, which keeps one compiled artifact per kernel.
+inputs:
+  store:
+    description: The store's name; jobs that compile the same kernels share one.
+    required: true
+  revision:
+    description: The compiler revision, whose artifacts no other revision reads.
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: echo "FURIOSA_OPT_OUT_DIR=$RUNNER_TEMP/kernel" >> "$GITHUB_ENV"
+    # The latest store of the revision holds every kernel an earlier run compiled, so a run
+    # compiles only the kernels it changed; a run saves its store under its own commit.
+    - uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/kernel
+        key: kernels-${{ inputs.store }}-${{ inputs.revision }}-${{ github.sha }}
+        restore-keys: kernels-${{ inputs.store }}-${{ inputs.revision }}-

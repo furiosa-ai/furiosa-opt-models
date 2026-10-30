@@ -1,0 +1,35 @@
+name: lint
+
+on:
+  workflow_call:
+
+permissions: {contents: read}
+
+env:
+  CARGO_TERM_COLOR: always
+  TOOLCHAIN: nightly-2026-05-01
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
+          components: rustfmt
+      - uses: astral-sh/setup-uv@v5
+      - run: cargo fmt --all --check
+      - run: uv run --only-group dev ruff check .
+      - run: uv run --only-group dev ruff format --check .
+      - run: uv run --only-group dev mkdocs build --strict
+      # Flags are in lychee.toml; links to this repository's files resolve against the checkout.
+      - uses: lycheeverse/lychee-action@v2
+        with:
+          fail: true
+          args: >-
+            --root-dir ${{ github.workspace }}/site
+            --remap 'https://github.com/furiosa-ai/furiosa-opt-models/(blob|tree)/[^/]+/(.*) file://${{ github.workspace }}/$2'
+            --remap 'https?://developer.furiosa.ai/furiosa-opt-models/(.*) file://${{ github.workspace }}/site/$1'
+            --remap 'file://${{ github.workspace }}/site/furiosa-opt-models(.*) file://${{ github.workspace }}/site$1'
+            'site/**/*.html' README.md 'crates/*/README.md' 'integrations/*/README.md'

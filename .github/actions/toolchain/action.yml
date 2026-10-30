@@ -1,0 +1,37 @@
+name: toolchain
+description: Install the Rust SDK, native dependencies and optional kernel compiler.
+inputs:
+  revision:
+    description: Kernel compiler revision to install from the compiler release.
+    default: ''
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        sudo apt-get update -qq
+        command -v gh || sudo apt-get install -yqq gh
+        sdk="${XDG_CACHE_HOME:-$HOME/.cache}/furiosa-opt-models/toolchains/ubuntu-24.04-cross-$TOOLCHAIN"
+        mkdir -p "$(dirname "$sdk")"
+        (
+          flock 9
+          if [ ! -x "$sdk/bin/rustc" ]; then
+            temporary="$(mktemp -d "$sdk.XXXXXX")"
+            trap 'rm -rf "$temporary"' EXIT
+            name="toolchain-ubuntu-24.04-cross-$RUNNER_ARCH-$TOOLCHAIN.tar.gz"
+            gh release download compiler --pattern "$name" --dir "$temporary"
+            tar xzf "$temporary/$name" -C "$temporary"
+            rm "$temporary/$name"
+            mv "$temporary" "$sdk"
+          fi
+          sudo apt-get --no-install-recommends install -yqq clang gcc-aarch64-linux-gnu libc6-dev-arm64-cross python3-dev zstd
+        ) 9>"$sdk.lock"
+        echo "$sdk/bin" >> "$GITHUB_PATH"
+        echo "LD_LIBRARY_PATH=$sdk/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+        if [ -n "$REVISION" ]; then
+          gh release download compiler --pattern "$REVISION.tar.gz" --dir "$RUNNER_TEMP"
+          tar xzf "$RUNNER_TEMP/$REVISION.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+        fi
+      env:
+        REVISION: ${{ inputs.revision }}
