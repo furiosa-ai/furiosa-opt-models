@@ -367,12 +367,15 @@ where
             ("v_proj", keys),
         ];
         context.checkpoint(from, |cx| {
-            let mut stored = Vec::with_capacity(parts.len());
-            for (part, rows) in parts {
-                stored.push(cx.field(part, part, |cx| {
-                    Stored::read(from, cx, (In::SIZE, rows), RANK)
-                })?);
-            }
+            let mut children = Children::default();
+            let stored = (parts.iter())
+                .map(|&(part, rows)| {
+                    children.ask(cx.field(part, part, |cx| {
+                        Stored::read(from, cx, (In::SIZE, rows), RANK)
+                    }))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let stored = children.node(stored.into_iter().collect::<Option<Vec<_>>>())?;
             let zero = bf16::from_f32(0.0);
             let (mut a, mut b) = (
                 vec![zero; K::SIZE * In::SIZE],
