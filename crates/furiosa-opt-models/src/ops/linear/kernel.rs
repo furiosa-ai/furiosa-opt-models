@@ -374,30 +374,20 @@ impl<In: AxisName, Out: AxisName, Rows: AxisName, B: AxisName, V: Source> crate:
     type Output = Staged<In, Out, Rows, V::Chips>;
 
     fn forward(&self, device: &mut Device, input: V) -> Self::Output {
+        /// The rows of `input` copied whole into the layout their route reads.
+        fn copied<V: Source, C: M, S: M, E: M>(
+            device: &mut Device,
+            input: V,
+        ) -> DmTensor<bf16, V::Chips, C, S, E> {
+            let mut rows = DmTensor::new();
+            input.copy(device, rows.view_mut());
+            rows
+        }
         match const { Staged::<In, Out, Rows, V::Chips>::route::<B>() } {
-            Routing::Replicated => {
-                let mut rows = DmTensor::new();
-                input.copy(device, rows.view_mut());
-                Staged::Replicated(rows)
-            }
-
-            Routing::Transposed => {
-                let mut rows = DmTensor::new();
-                input.copy(device, rows.view_mut());
-                Staged::Transposed(rows)
-            }
-
-            Routing::Ring => {
-                let mut rows = DmTensor::new();
-                input.copy(device, rows.view_mut());
-                Staged::Ring(rows)
-            }
-
-            Routing::Chunk => {
-                let mut rows = DmTensor::new();
-                input.copy(device, rows.view_mut());
-                Staged::Chunk(rows)
-            }
+            Routing::Replicated => Staged::Replicated(copied(device, input)),
+            Routing::Transposed => Staged::Transposed(copied(device, input)),
+            Routing::Ring => Staged::Ring(copied(device, input)),
+            Routing::Chunk => Staged::Chunk(copied(device, input)),
         }
     }
 }
@@ -529,65 +519,55 @@ where
         if live.count::<axis::Lanes<Rows>>() == <Groups<Rows> as M>::SIZE {
             return Contraction::<In, Out>::resident(device, &self.weight, input, |_, _| ());
         }
-        let rows = {
-            match const { Staged::<In, Out, Rows>::route::<axis::Lanes<Rows>>() } {
-                Routing::Replicated => {
-                    let mut rows: Replicated<In, Out, Rows> = DmTensor::new();
-                    for at in 0..live.count::<axis::Lanes<Rows>>() {
-                        group(at).copy(
-                            &mut *device,
-                            rows.view_mut().tile::<
-                                Layout<Rows>::Groups,
-                                1,
-                                Layout<Rows>::GroupMut<Chunked<In, Out>>,
-                            >(at),
-                        );
-                    }
-                    Staged::<In, Out, Rows>::Replicated(rows)
-                }
-                Routing::Transposed => {
-                    let mut rows: Transposed<In, Out, Rows> = DmTensor::new();
-                    for at in 0..live.count::<axis::Lanes<Rows>>() {
-                        group(at).copy(
-                            &mut *device,
-                            rows.view_mut().tile::<
-                                Layout<Rows>::Groups,
-                                1,
-                                m![1, { Layout<Rows>::SelectedMut }, In % ({ Packet<Rows> })],
-                            >(at),
-                        );
-                    }
-                    Staged::<In, Out, Rows>::Transposed(rows)
-                }
-                Routing::Ring => {
-                    let mut rows: Ring<In, Out, Rows> = DmTensor::new();
-                    for at in 0..live.count::<axis::Lanes<Rows>>() {
-                        group(at).copy(
-                            &mut *device,
-                            rows.view_mut().tile::<
-                                Layout<Rows>::Groups,
-                                1,
-                                m![1, { Layout<Rows>::GroupMut<m![In % 16]> }],
-                            >(at),
-                        );
-                    }
-                    Staged::<In, Out, Rows>::Ring(rows)
-                }
-                Routing::Chunk => {
-                    let mut rows: ChunkRows<In, Out, Rows> = DmTensor::new();
-                    for at in 0..live.count::<axis::Lanes<Rows>>() {
-                        group(at).copy(
-                            &mut *device,
-                            rows.view_mut().tile::<
-                                Layout<Rows>::Groups,
-                                1,
-                                m![1, { Layout<Rows>::GroupMut<Chunked<In, Out>> }],
-                            >(at),
-                        );
-                    }
-                    Staged::<In, Out, Rows>::Chunk(rows)
-                }
+        /// The live lane groups of the rows, each copied from where `group` reads it into its tile
+        /// `T` of the layout their route reads.
+        fn grouped<Rows: AxisName, T: M, U: Source, C: M, S: M, E: M>(
+            device: &mut Device,
+            live: &Live<PhantomData<Rows>, Rows>,
+            (group, _): (&impl Fn(usize) -> U, PhantomData<T>),
+        ) -> DmTensor<bf16, U::Chips, C, S, E> {
+            let mut rows = DmTensor::new();
+            for at in 0..live.count::<axis::Lanes<Rows>>() {
+                group(at).copy(
+                    &mut *device,
+                    rows.view_mut().tile::<Layout<Rows>::Groups, 1, T>(at),
+                );
             }
+            rows
+        }
+        let rows = match const { Staged::<In, Out, Rows>::route::<axis::Lanes<Rows>>() } {
+            Routing::Replicated => Staged::Replicated(grouped(
+                device,
+                &live,
+                (
+                    &group,
+                    PhantomData::<Layout<Rows>::GroupMut<Chunked<In, Out>>>,
+                ),
+            )),
+            Routing::Transposed => Staged::Transposed(grouped(
+                device,
+                &live,
+                (
+                    &group,
+                    PhantomData::<m![1, { Layout<Rows>::SelectedMut }, In % ({ Packet<Rows> })]>,
+                ),
+            )),
+            Routing::Ring => Staged::Ring(grouped(
+                device,
+                &live,
+                (
+                    &group,
+                    PhantomData::<m![1, { Layout<Rows>::GroupMut<m![In % 16]> }]>,
+                ),
+            )),
+            Routing::Chunk => Staged::Chunk(grouped(
+                device,
+                &live,
+                (
+                    &group,
+                    PhantomData::<m![1, { Layout<Rows>::GroupMut<Chunked<In, Out>> }]>,
+                ),
+            )),
         };
         let mut result = DmTensor::new();
         #[unroll]
