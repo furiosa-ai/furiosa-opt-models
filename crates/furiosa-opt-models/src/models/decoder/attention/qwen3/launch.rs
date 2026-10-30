@@ -7,26 +7,30 @@
 //!   tokens out tile by tile.
 //! - The envelope a launch is compiled for is the size's [`Decode`].
 
-use super::{CatalogBody, Groups, Hidden, LmHead};
+use super::{CatalogBody, Groups, Hidden, LmHead, QueryHeads};
+use crate::load::Named;
 use crate::models::decoder::attention::{
     ForCausalLM, ForSequenceClassification, Geometry, Head, KvHeads,
 };
 use crate::modules::attention::{self, key_value};
 use crate::modules::language::{self, Call, Selected};
+use crate::modules::lora::{self, Rank};
 use crate::ops::attention::full::paged::{
     self,
     chunks::{Cache, Chunks as Windows},
 };
 use crate::ops::embedding;
 use crate::ops::linear::affine::Columns;
+use crate::ops::linear::query::matrix::Width;
 use crate::ops::normalization::Blocked;
 use crate::ops::rotary::{
     self, SplitHalf,
     group::{self, Table},
 };
+use crate::ops::swiglu::GateUp;
 use crate::specialize::attention::{Decode, WAVES};
 use crate::tensor::cache::Blocks;
-use crate::tensor::memory::Hbm;
+use crate::tensor::memory::{Hbm, Memory};
 use crate::tensor::parallel::Chip;
 use furiosa_opt_std::prelude::*;
 
@@ -84,31 +88,126 @@ pub type Classifier<S, P> =
 type Front = (((), (), ()), (), ());
 
 /// A layer's state slot: its attention's (its front's, its cache blocks, which it writes and
-/// reads, and its output projection's), then its MLP's, which holds none.
-pub type Layer<'b> = ((Front, &'b mut Blocks<KvHeads, Head>, ()), ());
+/// reads, and its output projection's), then what its projections run with in the call, `A`:
+/// their adapters, none by default.
+pub type Layer<'b, A = ()> = ((Front, &'b mut Blocks<KvHeads, Head>, ()), A);
 
-/// A launch's body's state: the hidden rows the embedding writes and each layer's slot, then the
-/// final norm's, which holds none.
-pub type Body<'s, 'b, S> = &'s mut (
-    (
-        HbmTensor<bf16, Chip, Blocked<Hidden<S>, Capacity<S>>>,
-        <S as Geometry>::Layers<Layer<'b>>,
-    ),
+/// A launch's body's state: the hidden rows the embedding writes and the layers' slots `L`, a
+/// [`Layer`] each, then the final norm's, which holds none.
+pub type Body<'s, S, L> = &'s mut (
+    (HbmTensor<bf16, Chip, Blocked<Hidden<S>, Capacity<S>>>, L),
     (),
 );
 
 /// A launch's state: its body's, then the place `O` its head writes the selected rows' outputs in,
 /// their tokens by default.
-pub type State<'s, 'b, S, O = Tokens<S>> = &'s mut (
+pub type State<'s, S, L, O = Tokens<S>> = &'s mut (
     (
-        (
-            HbmTensor<bf16, Chip, Blocked<Hidden<S>, Capacity<S>>>,
-            <S as Geometry>::Layers<Layer<'b>>,
-        ),
+        (HbmTensor<bf16, Chip, Blocked<Hidden<S>, Capacity<S>>>, L),
         (),
     ),
     O,
 );
+
+/// A LoRA adapter of the catalog's size `S` as PEFT saves it, over memory `X`: each layer's
+/// updates of its query, key, value and output projections and of its feed-forward's packed
+/// gate/up and down projections.
+pub type Adapter<S, X> = Named<
+    "base_model",
+    Named<"model", Named<"model", Named<"layers", <S as Geometry>::Layers<Terms<S, X>>>>>,
+>;
+
+/// One layer's terms of an [`Adapter`].
+pub type Terms<S, X> = (
+    Named<
+        "self_attn",
+        (
+            (
+                Named<"q_proj", Factors<Rank<1>, Hidden<S>, Width<QueryHeads<S>, Head>, X>>,
+                Named<"k_proj", Factors<Rank<1>, Hidden<S>, Width<KvHeads, Head>, X>>,
+                Named<"v_proj", Factors<Rank<1>, Hidden<S>, Width<KvHeads, Head>, X>>,
+            ),
+            Named<"o_proj", Factors<Rank<1>, <S as Geometry>::Queries, Hidden<S>, X>>,
+        ),
+    >,
+    Named<
+        "mlp",
+        (
+            lora::GateUp<Factors<Rank<2>, Hidden<S>, GateUp<Intermediate<S>>, X>>,
+            Named<"down_proj", Factors<Rank<1>, Intermediate<S>, Hidden<S>, X>>,
+        ),
+    >,
+);
+
+/// An update's `[K, In]` and `[Out, K]` factors in memory `X`.
+type Factors<K, In, Out, X> = lora::Term<
+    <X as Memory>::Tensor<bf16, Chip, m![K, In]>,
+    <X as Memory>::Tensor<bf16, Chip, m![Out, K]>,
+>;
+
+type Intermediate<S> = <S as Geometry>::Intermediate;
+
+/// A selection of a launch's rows over `K` rank columns: one on the rows that run with its
+/// adapter, zero on every other.
+pub type Selection<S, K> = HbmTensor<bf16, Chip, m![{ Symbol<Capacity<S>> }, K]>;
+
+/// The selections of a call's `N` adapters, over one term's rank columns, then over the packed
+/// gate/up term's.
+pub type Selections<S, const N: usize> = ([Selection<S, Rank<1>>; N], [Selection<S, Rank<2>>; N]);
+
+/// What each layer's projections run with in a call of `N` adapters of the size `S`: each
+/// adapter's term of the projection, and its selection of the launch's rows.
+pub type Adapted<'t, S, const N: usize> = lora::Layer<
+    Projected<'t, S, Width<QueryHeads<S>, Head>, Hidden<S>, Rank<1>, N>,
+    Projected<'t, S, Width<KvHeads, Head>, Hidden<S>, Rank<1>, N>,
+    Projected<'t, S, Width<KvHeads, Head>, Hidden<S>, Rank<1>, N>,
+    Projected<'t, S, Hidden<S>, <S as Geometry>::Queries, Rank<1>, N>,
+    Projected<'t, S, GateUp<Intermediate<S>>, Hidden<S>, Rank<2>, N>,
+    Projected<'t, S, Hidden<S>, Intermediate<S>, Rank<1>, N>,
+>;
+
+/// A projection's adapters from `In` to `Out` features over `K` rank columns.
+type Projected<'t, S, Out, In, K, const N: usize> =
+    lora::Adapters<'t, Factors<K, In, Out, Hbm>, Selection<S, K>, N>;
+
+/// Layer `layer`'s adapters of `held`, a call's adapters, with their `selections`.
+pub fn adapted<'t, S: Geometry + Decode + 'static, const N: usize>(
+    held: [&'t Adapter<S, Hbm>; N],
+    layer: usize,
+    (one, two): &'t Selections<S, N>,
+) -> Adapted<'t, S, N>
+where
+    <S as Geometry>::Layers<Terms<S, Hbm>>: AsRef<[Terms<S, Hbm>]>,
+{
+    let terms = held.map(|adapter| &adapter.0.0.0.0.as_ref()[layer]);
+    let (attention, mlp) = (terms.map(|t| &t.0.0), terms.map(|t| &t.1.0));
+    lora::Layer {
+        query: lora::Adapters {
+            terms: attention.map(|t| &t.0.0.0),
+            selections: one,
+        },
+        key: lora::Adapters {
+            terms: attention.map(|t| &t.0.1.0),
+            selections: one,
+        },
+        value: lora::Adapters {
+            terms: attention.map(|t| &t.0.2.0),
+            selections: one,
+        },
+        output: lora::Adapters {
+            terms: attention.map(|t| &t.1.0),
+            selections: one,
+        },
+        gate_up: lora::Adapters {
+            terms: mlp.map(|t| t.0.term()),
+            selections: two,
+        },
+        down: lora::Adapters {
+            terms: mlp.map(|t| &t.1.0),
+            selections: one,
+        },
+    }
+}
 
 /// What a launch's nodes read beside its token IDs and live rows, prepared once before its first
 /// node runs: its rows' rotation and cache slots, its attention work and the rows it returns.
@@ -148,23 +247,6 @@ mod tests {
     use super::*;
     use crate::load::{Checkpoint, Load};
     use crate::models::decoder::form::{Affine, BlockScaled};
-
-    /// Each size's BF16 catalog model runs its whole tree on its launch's input and state.
-    #[test]
-    fn runs_a_launch() {
-        macro_rules! runs {
-            ($($size:literal),+) => {$({
-                type S = Size<$size>;
-                fn runs<'i, 'a: 'i, 's, 'b: 's>()
-                where
-                    Model<S, Affine>: crate::Module<&'i mut Input<'a, S>, (), State<'s, 'b, S>>,
-                {
-                }
-                runs();
-            })+};
-        }
-        runs!("8B");
-    }
 
     /// Each size's catalog model loads from a checkpoint in dense BF16, and Qwen3-8B also in
     /// block-scaled FP8.

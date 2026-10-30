@@ -23,15 +23,19 @@ type Capacity = launch::Capacity<Size>;
 type Reach = <Size as crate::specialize::attention::Decode>::Reach;
 type Slots = <Size as crate::specialize::attention::Decode>::Slots;
 
-impl<'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, Size>, Env, launch::State<'s, 'b, Size>>
-    for ForCausalLM
+impl<'i, 'a, 's, 'b, Env>
+    Module<
+        &'i mut launch::Input<'a, Size>,
+        Env,
+        launch::State<'s, Size, [launch::Layer<'b>; DEPTH]>,
+    > for ForCausalLM
 {
     type Output = ();
     fn forward(
         &self,
         device: &mut Device,
         _: Env,
-        state: launch::State<'s, 'b, Size>,
+        state: launch::State<'s, Size, [launch::Layer<'b>; DEPTH]>,
         input: &'i mut launch::Input<'a, Size>,
     ) {
         let causal = &self.model;

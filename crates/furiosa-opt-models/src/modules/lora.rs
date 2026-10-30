@@ -9,7 +9,10 @@
 //!   projection adds each adapter's update of the rows it selects to its own output; a call without
 //!   adapters keeps the state `()`.
 //! - [`Packed`] is the update of a projection that computes the query, key and value projections
-//!   at once, its rows ordered as the base checkpoint's packed weight orders them.
+//!   at once, its rows ordered as the base checkpoint's packed weight orders them; [`GateUp`] that
+//!   of the packed gate and up projections of a feed-forward.
+//! - A projection that writes its rows in HBM adds each adapter's update there
+//!   ([`Adapters::add`]); a layer's [`Layer`] holds each of its projections' adapters.
 //!
 //! Numerics: `lora_A x` rounds to BF16, the selection keeps or zeroes it exactly, `lora_B` of it
 //! rounds to BF16, and its sum with the projection's BF16 output rounds once.
@@ -26,6 +29,7 @@ use crate::load::{Checkpoint, Children, Context, Load, LoadError};
 use crate::ops::linear::Affine;
 use crate::ops::normalization::Spread;
 use crate::ops::pointwise::{add::Add, multiply::Multiply};
+use crate::tensor::parallel::Chip;
 use crate::tensor::{live::Live, memory::Memory};
 
 /// The rank a term holds for each module it adapts: an adapter of a lower rank is zero-padded, and
@@ -58,20 +62,31 @@ pub struct Adapters<'a, T, S, const N: usize> {
     pub selections: &'a [S; N],
 }
 
+/// Written out, as a derive would ask the term and the selection to be `Copy` too.
+impl<T, S, const N: usize> Clone for Adapters<'_, T, S, N> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T, S, const N: usize> Copy for Adapters<'_, T, S, N> {}
+
 /// The projection's output plus each adapter's update of the rows it selects: the update's
 /// `lora_A` and `lora_B` run as the projection does, its selection is a product and its sum an
 /// addition.
-impl<'s, 'a, I, W, A, B, Out, K, R, Env, const N: usize>
-    Module<I, Env, &'s mut Adapters<'a, Term<A, B>, HbmTensor<bf16, m![1], m![R, K]>, N>>
-    for Affine<W, ()>
+impl<'s, 'a, 'x, X, W, A, B, Out, K, R, Env, const N: usize>
+    Module<
+        &'x Live<X, R>,
+        Env,
+        &'s mut Adapters<'a, Term<A, B>, HbmTensor<bf16, m![1], m![R, K]>, N>,
+    > for Affine<W, ()>
 where
-    I: Copy,
     Out: AxisName,
     K: AxisName,
     R: AxisName,
     Env: Copy,
-    Self: for<'u> Module<I, Env, &'u mut (), Output = Live<Spread<Out, R>, R>>,
-    Affine<A, ()>: for<'u> Module<I, Env, &'u mut (), Output = Live<Spread<K, R>, R>>,
+    Self: for<'u> Module<&'x Live<X, R>, Env, &'u mut (), Output = Live<Spread<Out, R>, R>>,
+    Affine<A, ()>: for<'u> Module<&'x Live<X, R>, Env, &'u mut (), Output = Live<Spread<K, R>, R>>,
     Affine<B, ()>: for<'h, 'u> Module<
             &'h Live<Spread<K, R>, R>,
             Env,
@@ -86,7 +101,7 @@ where
         device: &mut Device,
         env: Env,
         adapters: &'s mut Adapters<'a, Term<A, B>, HbmTensor<bf16, m![1], m![R, K]>, N>,
-        input: I,
+        input: &'x Live<X, R>,
     ) -> Self::Output {
         let mut output = self.forward(&mut *device, env, &mut (), input);
         #[unroll]
@@ -118,6 +133,188 @@ impl<KvHeads, Queries, T> Packed<KvHeads, Queries, T> {
     /// The term, in the packed projection's output order.
     pub fn term(&self) -> &T {
         &self.0
+    }
+}
+
+/// The update of a feed-forward's projection computing its gate and up rows at once, packed as
+/// the gate's rows then the up's: its rank holds the gate's, then the up's, and each output row
+/// reads only its own part's.
+#[derive(DeviceSend)]
+pub struct GateUp<T>(T);
+
+impl<T> GateUp<T> {
+    /// The term, in the packed projection's output order.
+    pub fn term(&self) -> &T {
+        &self.0
+    }
+}
+
+/// The adapters each of a layer's projections runs with in a call: its query, key, value and
+/// output projections' and its feed-forward's packed gate/up and down projections'.
+#[derive(Clone, Copy, DeviceSend)]
+pub struct Layer<Q, K, V, O, G, D> {
+    pub query: Q,
+    pub key: K,
+    pub value: V,
+    pub output: O,
+    pub gate_up: G,
+    pub down: D,
+}
+
+/// The states of a layer's projections in a call: `()` for every one when the call runs no
+/// adapter, else a [`Layer`] of their adapters.
+pub trait States: Copy {
+    type Query;
+    type Key;
+    type Value;
+    type Output;
+    type GateUp;
+    type Down;
+
+    fn query(&mut self) -> &mut Self::Query;
+    fn key(&mut self) -> &mut Self::Key;
+    fn value(&mut self) -> &mut Self::Value;
+    fn output(&mut self) -> &mut Self::Output;
+    fn gate_up(&mut self) -> &mut Self::GateUp;
+    fn down(&mut self) -> &mut Self::Down;
+}
+
+/// A call without adapters: every projection's state is `()`.
+impl States for () {
+    type Query = ();
+    type Key = ();
+    type Value = ();
+    type Output = ();
+    type GateUp = ();
+    type Down = ();
+
+    fn query(&mut self) -> &mut () {
+        self
+    }
+
+    fn key(&mut self) -> &mut () {
+        self
+    }
+
+    fn value(&mut self) -> &mut () {
+        self
+    }
+
+    fn output(&mut self) -> &mut () {
+        self
+    }
+
+    fn gate_up(&mut self) -> &mut () {
+        self
+    }
+
+    fn down(&mut self) -> &mut () {
+        self
+    }
+}
+
+impl<Q: Copy, K: Copy, V: Copy, O: Copy, G: Copy, D: Copy> States for Layer<Q, K, V, O, G, D> {
+    type Query = Q;
+    type Key = K;
+    type Value = V;
+    type Output = O;
+    type GateUp = G;
+    type Down = D;
+
+    fn query(&mut self) -> &mut Q {
+        &mut self.query
+    }
+
+    fn key(&mut self) -> &mut K {
+        &mut self.key
+    }
+
+    fn value(&mut self) -> &mut V {
+        &mut self.value
+    }
+
+    fn output(&mut self) -> &mut O {
+        &mut self.output
+    }
+
+    fn gate_up(&mut self) -> &mut G {
+        &mut self.gate_up
+    }
+
+    fn down(&mut self) -> &mut D {
+        &mut self.down
+    }
+}
+
+/// The windows of `Window` rows of `All` rows.
+#[derive(Clone, Debug)]
+struct Windows<All, Window>(PhantomData<(All, Window)>);
+
+impl<All: AxisName, Window: AxisName> AxisName for Windows<All, Window> {
+    const NAME: Ident = Ident::new("Windows");
+    const SIZE: usize = All::SIZE / Window::SIZE;
+}
+
+impl<'a, A, B, K: AxisName, All: AxisName, const N: usize>
+    Adapters<'a, Term<A, B>, HbmTensor<bf16, Chip, m![All, K]>, N>
+{
+    /// `lines`, a window of rows a projection wrote from launch row `start` on, the projection of
+    /// the live rows `live` of `input`, plus each adapter's update of those rows; `start` is a
+    /// multiple of the window's rows.
+    pub(crate) fn add<'i, Rows, Window, Out, I>(
+        &self,
+        device: &mut Device,
+        live: Live<(), Rows>,
+        input: &'i I,
+        start: usize,
+        mut lines: HbmTensor<bf16, Chip, m![Window, Out]>,
+    ) -> HbmTensor<bf16, Chip, m![Window, Out]>
+    where
+        Rows: AxisName,
+        Window: AxisName,
+        Out: AxisName,
+        Affine<A, ()>: for<'o> crate::Op<
+                (
+                    Live<(), Rows>,
+                    &'i I,
+                    &'o mut HbmTensor<bf16, Chip, m![Window, K]>,
+                ),
+                Output = (),
+            >,
+        Affine<B, ()>: for<'s, 'o> crate::Op<
+                (
+                    Live<(), Window>,
+                    &'s HbmTensor<bf16, Chip, m![Window, K]>,
+                    &'o mut HbmTensor<bf16, Chip, m![Window, Out]>,
+                ),
+                Output = (),
+            >,
+    {
+        type Spans<All, Window> = Symbol<Windows<All, Window>>;
+        let rows = Live::<(), Window>::all().subrange(0, live.rows());
+        #[unroll]
+        for slot in 0..N {
+            let term = self.terms[slot];
+            let mut shrunk = HbmTensor::new();
+            crate::Op::forward(&term.lora_a, &mut *device, (live, input, &mut shrunk));
+            // SAFETY: a window's rows of a selection are contiguous, and no launch writes one.
+            let selection: HbmTensor<bf16, Chip, m![Window, K]> = unsafe {
+                self.selections[slot]
+                    .view()
+                    .reshape::<Chip, m![{ Spans<All, Window> }, Window, K]>()
+                    .tile::<m![{ Spans<All, Window> }], 1, m![
+                        { Spans<All, Window> } = 1 # ({ Spans<All, Window> }),
+                        Window,
+                        K
+                    ]>(start / Window::SIZE)
+                    .alias()
+            };
+            let selected = crate::Op::forward(&Multiply, &mut *device, (&shrunk, &selection));
+            let mut update = HbmTensor::new();
+            crate::Op::forward(&term.lora_b, &mut *device, (rows, &selected, &mut update));
+            lines = crate::Op::forward(&Add, &mut *device, (&lines, &update));
+        }
+        lines
     }
 }
 
@@ -405,6 +602,60 @@ where
             }
             Ok(Packed(Term::host(a, b), PhantomData))
         })
+    }
+}
+
+/// The `gate_proj` and `up_proj` modules below the context's name, joined: the gate's `lora_A`
+/// rows then the up's, each padded to [`RANK`], and each output row its part's `lora_B` row in the
+/// part's rank columns, zero in the other's.
+impl<'c, In, Out, K> Load<&'c Checkpoint> for GateUp<Term<Host<m![K, In]>, Host<m![Out, K]>>>
+where
+    In: AxisName,
+    Out: AxisName,
+    K: AxisName,
+{
+    fn load(context: &mut Context<'_>, from: &'c Checkpoint) -> Result<Self, LoadError> {
+        const { assert!(K::SIZE == 2 * RANK && Out::SIZE.is_multiple_of(2)) };
+        let rows = Out::SIZE / 2;
+        context.checkpoint(from, |cx| {
+            let mut stored = Vec::with_capacity(2);
+            for part in ["gate_proj", "up_proj"] {
+                stored.push(cx.field(part, part, |cx| {
+                    Stored::read(from, cx, (In::SIZE, rows), RANK)
+                })?);
+            }
+            let zero = bf16::from_f32(0.0);
+            let (mut a, mut b) = (
+                vec![zero; K::SIZE * In::SIZE],
+                vec![zero; Out::SIZE * K::SIZE],
+            );
+            for (part, stored) in stored.iter().enumerate() {
+                let Some(Stored {
+                    rank,
+                    a: shrink,
+                    b: expand,
+                }) = stored
+                else {
+                    continue;
+                };
+                (a[part * RANK * In::SIZE..].iter_mut().zip(shrink))
+                    .for_each(|(into, value)| *into = bf16::from_f32(*value));
+                for row in 0..rows {
+                    let into = &mut b[(part * rows + row) * K::SIZE + part * RANK..][..*rank];
+                    for (into, value) in into.iter_mut().zip(&expand[row * rank..]) {
+                        *into = bf16::from_f32(*value);
+                    }
+                }
+            }
+            Ok(GateUp(Term::host(a, b)))
+        })
+    }
+}
+
+/// A packed gate/up term built on host, in HBM of the context's device.
+impl<'h, T: Load<&'h U>, U> Load<&'h GateUp<U>> for GateUp<T> {
+    fn load(context: &mut Context<'_>, host: &'h GateUp<U>) -> Result<Self, LoadError> {
+        Ok(GateUp(T::load(context, &host.0)?))
     }
 }
 
