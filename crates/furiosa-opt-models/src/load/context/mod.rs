@@ -1,8 +1,9 @@
 //! The position of a traversal, the scopes it is in, and what it read.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::IntoFuture;
+use std::future::Future;
 use std::mem;
+use std::pin::Pin;
 
 use furiosa_opt_std::prelude::{Device, HbmBuffer, HbmTensor, HostTensor, M, MaterializableScalar};
 use safetensors::Dtype;
@@ -48,12 +49,17 @@ struct Cursor {
 }
 
 /// The outermost checkpoint traversal: it fails with every name below `root` that it neither read
-/// (from `start` of the names read) nor ignored.
+/// (from `start` of the names read) nor ignored, and waits for the copies its leaves submitted.
 struct Strict {
     root: String,
     start: usize,
     ignore: Vec<String>,
+    /// Each copy into a leaf's storage, in the order the leaves submitted them.
+    copies: Vec<Pending>,
 }
+
+/// A copy into a leaf's storage, submitted and not yet seen to end; it fails as its leaf.
+type Pending = Pin<Box<dyn Future<Output = Result<(), LoadError>>>>;
 
 impl<'d> Context<'d> {
     /// A traversal at the root; leaves load into HBM of `device`, which a borrow does not need.
@@ -230,8 +236,9 @@ impl<'d> Context<'d> {
         }
     }
 
-    /// Every traversal of `source`: the outermost one runs `visit`, then fails with each name below
-    /// its root that nothing read or ignored; nested ones only run `visit`.
+    /// Every traversal of `source`: the outermost one runs `visit` and waits for every copy its
+    /// leaves submitted, then fails with the first copy that failed, else as `visit` failed, else
+    /// with each name below its root that nothing read or ignored; nested ones only run `visit`.
     pub fn checkpoint<R>(
         &mut self,
         source: &Checkpoint,
@@ -244,13 +251,16 @@ impl<'d> Context<'d> {
             root: self.name(),
             start: self.read.len(),
             ignore: Vec::new(),
+            copies: Vec::new(),
         });
         let result = visit(self);
         let Strict {
             root,
             start,
             ignore,
+            copies,
         } = self.strict.take().expect("set above");
+        Self::wait(copies)?;
         let value = result?;
         let read: BTreeSet<&String> = self.read[start..].iter().collect();
         let unexpected: Vec<String> = source
@@ -353,8 +363,8 @@ impl<'d> Context<'d> {
         backings.remove(&path).expect("found above")
     }
 
-    /// `host` in HBM as the leaf at the current position: a new allocation, or in a stack the
-    /// current layer of the leaf's backing, which the leaf's first layer allocates.
+    /// `host` copied into HBM as the leaf at the current position: a new allocation, or in a stack
+    /// the current layer of the leaf's backing, which the leaf's first layer allocates.
     pub(crate) fn upload<D: MaterializableScalar, C: M, S: M, E: M>(
         &mut self,
         host: &HostTensor<D, E>,
@@ -366,30 +376,50 @@ impl<'d> Context<'d> {
         };
         let device = self.device.as_deref_mut();
         let device = device.expect("an HBM leaf loads through a context with a device");
-        let Some(stack) = &mut self.stack else {
-            let upload = host.to_hbm::<C, S>(&mut device.pdma).into_future();
-            return futures_executor::block_on(task::unconstrained(upload)).map_err(failed);
-        };
-        // Each chip holds its share of every layer, layer after layer.
-        let bytes = HbmTensor::<D, C, S>::size() / C::SIZE;
-        let backing = match stack.backings.get(&path) {
-            Some(backing) => backing,
-            None => {
-                let backing = HbmBuffer::alloc(device, bytes * stack.count).map_err(failed)?;
-                stack.backings.entry(path.clone()).or_insert(backing)
+        let mut leaf = match &mut self.stack {
+            None => HbmTensor::alloc(device).map_err(failed)?,
+            Some(stack) => {
+                // Each chip holds its share of every layer, layer after layer.
+                let bytes = HbmTensor::<D, C, S>::size() / C::SIZE;
+                let backing = match stack.backings.get(&path) {
+                    Some(backing) => backing,
+                    None => {
+                        let backing =
+                            HbmBuffer::alloc(device, bytes * stack.count).map_err(failed)?;
+                        stack.backings.entry(path.clone()).or_insert(backing)
+                    }
+                };
+                let at = stack.layer * bytes;
+                (backing.alias(at..at + bytes))
+                    .and_then(HbmTensor::try_from)
+                    .map_err(failed)?
             }
         };
-        let at = stack.layer * bytes;
-        let mut layer: HbmTensor<D, C, S> = backing
-            .alias(at..at + bytes)
-            .and_then(HbmTensor::try_from)
-            .map_err(failed)?;
-        let write = host
+        let copy = host
             .to_hbm::<C, S>(&mut device.pdma)
-            .output(&mut layer)
-            .into_future();
-        futures_executor::block_on(task::unconstrained(write)).map_err(failed)?;
-        Ok(layer)
+            .output(&mut leaf)
+            .submit();
+        self.submitted(copy)?;
+        Ok(leaf)
+    }
+
+    /// Takes `copy`, submitted into the storage of the leaf at the current position: the outermost
+    /// checkpoint traversal waits for it, and fails with it as the leaf's failure; a leaf loaded
+    /// outside one waits for it here. The submitted copy holds the host bytes it reads.
+    pub(crate) fn submitted(
+        &mut self,
+        copy: impl Future<Output = Result<(), furiosa_opt_std::Error>> + 'static,
+    ) -> Result<(), LoadError> {
+        let path = self.path();
+        let copy = async move {
+            copy.await
+                .map_err(|source| LoadError::Device { path, source })
+        };
+        let Some(strict) = &mut self.strict else {
+            return Self::wait([copy]);
+        };
+        strict.copies.push(Box::pin(copy));
+        Ok(())
     }
 
     /// The reports of the rules this traversal ran.
@@ -407,6 +437,20 @@ impl<'d> Context<'d> {
             self.cursor.config = self.cursor.scope.pop();
         }
         result
+    }
+
+    /// Waits for each of `copies` in turn: the first that failed, as the failure of its leaf.
+    fn wait(
+        copies: impl IntoIterator<Item: Future<Output = Result<(), LoadError>>>,
+    ) -> Result<(), LoadError> {
+        futures_executor::block_on(task::unconstrained(async move {
+            let mut first = Ok(());
+            for copy in copies {
+                let ended = copy.await;
+                first = first.and(ended);
+            }
+            first
+        }))
     }
 
     /// What `lookup` finds at the current name, and that name; recorded as read, `Missing` under

@@ -467,8 +467,8 @@ pub(super) mod tests {
     axes![V = 8, H = 4];
 
     /// A leaf on host: the value a checkpoint tensor converts to, which an HBM leaf uploads. The
-    /// write of a tensor stored from byte `0xff` fails as a device failing after it took the copy,
-    /// one from `0xfe` as a device refusing it before.
+    /// write of a tensor stored from byte `0xff` submits a copy that fails as a device failing
+    /// after it took the copy, one from `0xfe` a copy that fails as a device refusing it before.
     pub(in crate::load) struct Value<D: MaterializableScalar, C: M + 'static, S: M + 'static>(
         pub(in crate::load) HostTensor<D, m![{ C }, { S }]>,
     );
@@ -509,13 +509,10 @@ pub(super) mod tests {
                 let first = from
                     .get(&cx.name())
                     .and_then(|view| view.data().first().copied());
-                let device = |source| LoadError::Device {
-                    path: cx.path(),
-                    source,
-                };
+                let mut failed = |error| cx.submitted(std::future::ready(Err(error)));
                 match first {
-                    Some(0xff) => Err(device(furiosa_opt_std::Error::Poisoned)),
-                    Some(0xfe) => Err(device(furiosa_opt_std::Error::Invalid("refused"))),
+                    Some(0xff) => failed(furiosa_opt_std::Error::Poisoned),
+                    Some(0xfe) => failed(furiosa_opt_std::Error::Invalid("refused")),
                     _ => Ok(*into = new),
                 }
             };
