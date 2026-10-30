@@ -1874,7 +1874,7 @@ impl<R: AxisName> PairFrequencies<R> {
 pub mod group {
     use super::SplitHalf;
     use crate::Op;
-    use crate::load::{Checkpoint, Children, Context, Load, LoadError};
+    use crate::load::{Context, Load, LoadError};
     use crate::modules::generic::Either;
     use crate::ops::linear::query::group::Group;
     use crate::ops::linear::query::{Cluster, Tile, fp8};
@@ -1911,40 +1911,22 @@ pub mod group {
         }
     }
 
-    /// Each position's rotation from the config's `rope_theta`: pair `j` of position `p` turns by
-    /// `p theta^(-2j / Head)`, an output half the sum over the input halves of `[[cos, -sin], [sin,
-    /// cos]]` times them, for the positions of `max_position_embeddings` the compiled `Position`
-    /// holds; every position past them rotates to zero.
-    impl<'a, Head: AxisName, Position: AxisName> Load<&'a Checkpoint>
+    /// Each position's rotation at `frequencies`: pair `j` of position `p` turns by `p f_j`, an
+    /// output half the sum over the input halves of `[[cos, -sin], [sin, cos]]` times them, scaled
+    /// by the frequencies' amplitude, for every position the compiled `Position` holds.
+    impl<'f, Head: AxisName, Position: AxisName> Load<&'f super::PairFrequencies<Head>>
         for SplitHalf<Head, Table<Position, super::Row<Head>>>
     {
-        fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
-            let mut children = Children::default();
-            let theta = children.ask(context.config_number(from, "rope_theta"))?;
-            let positions = children.ask(context.config_number(from, "max_position_embeddings"))?;
-            let (theta, positions) = children.node(theta.zip(positions))?;
-            let frequencies = super::PairFrequencies::<Head>::unscaled::<Head>(theta.1 as f32)
-                .map_err(|error| LoadError::InvalidData {
-                    name: theta.0,
-                    reason: error.to_string(),
-                })?;
-            let (name, positions) = positions;
-            if positions < 1.0 || positions.fract() != 0.0 {
-                return Err(LoadError::InvalidData {
-                    name,
-                    reason: format!("{positions} is no count of positions"),
-                });
-            }
-            let positions = positions.min(Position::SIZE as f64);
+        fn load(
+            context: &mut Context<'_>,
+            frequencies: &'f super::PairFrequencies<Head>,
+        ) -> Result<Self, LoadError> {
+            let amplitude = f64::from(frequencies.amplitude());
             let pairs = frequencies.pairs();
             let table = (0..Position::SIZE).flat_map(|position| {
                 pairs.iter().flat_map(move |&frequency| {
-                    let angle = f64::from(position as f32 * frequency);
-                    let (sin, cos) = match (position as f64) < positions {
-                        true => angle.sin_cos(),
-                        false => (0.0, 0.0),
-                    };
-                    [cos, -sin, sin, cos].map(|value| bf16::from_f32(value as f32))
+                    let (sin, cos) = f64::from(position as f32 * frequency).sin_cos();
+                    [cos, -sin, sin, cos].map(|value| bf16::from_f32((amplitude * value) as f32))
                 })
             });
             let table = HostTensor::<
@@ -2355,27 +2337,24 @@ pub mod group {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::load::Checkpoint;
 
         axes![Position = 4, Head = 8];
 
-        /// The checkpoint of a config of `rope_theta` and `max_position_embeddings`.
-        fn config(config: serde_json::Value) -> Checkpoint {
-            let directory = tempfile::tempdir().unwrap();
-            Checkpoint::new(directory.path(), Some(config)).unwrap()
-        }
-
-        /// A config's rotation loads each position's `[[cos, -sin], [sin, cos]]` of every pair for
-        /// the positions the model takes and zeros past them; a missing key or a count of no
-        /// positions is refused.
+        /// Every position's rotation loads as `[[cos, -sin], [sin, cos]]` of each pair's angle,
+        /// scaled by the frequencies' amplitude.
         #[tokio::test(flavor = "current_thread")]
-        async fn loads_the_configured_rotation() {
+        async fn loads_every_positions_rotation() {
             type Rotation = SplitHalf<Head, Table<Position, super::super::Row<Head>>>;
             let _lease = crate::tests::DEVICE.lock().await;
             let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
-            let source =
-                config(serde_json::json!({"rope_theta": 1e4, "max_position_embeddings": 3}));
-            let rotation: Rotation = source.load(&mut device).unwrap();
+            let pairs: Vec<f64> = (0..Head::SIZE / 2)
+                .map(|pair| 1e4f64.powf(-2.0 * pair as f64 / Head::SIZE as f64))
+                .collect();
+            let amplitude = 1.25;
+            let frequencies =
+                super::super::PairFrequencies::<Head>::new(&pairs, amplitude).unwrap();
+            let rotation: Rotation =
+                Load::load(&mut Context::new(&mut device), &frequencies).unwrap();
             let table = rotation
                 .frequency
                 .to_host::<m![Position, { Symbol<super::super::Row<Head>> }, OutputHalf, InputHalf]>(
@@ -2384,31 +2363,17 @@ pub mod group {
                 .await
                 .unwrap()
                 .into_vec();
-            let pairs = Head::SIZE / 2;
             for (index, found) in table.iter().enumerate() {
-                let (position, pair, cell) = (index / (pairs * 4), index / 4 % pairs, index % 4);
-                let frequency = 1e4f64.powf(-2.0 * pair as f64 / Head::SIZE as f64);
-                let angle = position as f64 * frequency;
-                let expected = match position < 3 {
-                    true => [angle.cos(), -angle.sin(), angle.sin(), angle.cos()][cell],
-                    false => 0.0,
-                };
+                let (position, pair, cell) = (
+                    index / (pairs.len() * 4),
+                    index / 4 % pairs.len(),
+                    index % 4,
+                );
+                let angle = position as f64 * pairs[pair];
+                let expected =
+                    amplitude * [angle.cos(), -angle.sin(), angle.sin(), angle.cos()][cell];
                 let error = (f64::from(found.to_f32()) - expected).abs();
-                assert!(error <= 2f64.powi(-8), "{index}: {found:?} vs {expected}");
-            }
-            let missing = config(serde_json::json!({"rope_theta": 1e4}));
-            match missing.load::<Rotation>(&mut device).err() {
-                Some(LoadError::Missing(names)) => {
-                    assert_eq!(names, ["config.json:max_position_embeddings"])
-                }
-                other => panic!("{other:?} is not `Missing`"),
-            }
-            let none = config(serde_json::json!({"rope_theta": 1e4, "max_position_embeddings": 0}));
-            match none.load::<Rotation>(&mut device).err() {
-                Some(LoadError::InvalidData { name, .. }) => {
-                    assert_eq!(name, "config.json:max_position_embeddings")
-                }
-                other => panic!("{other:?} is not `InvalidData`"),
+                assert!(error <= 2f64.powi(-7), "{index}: {found:?} vs {expected}");
             }
         }
     }
