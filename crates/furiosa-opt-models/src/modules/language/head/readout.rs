@@ -3,7 +3,6 @@
 use super::{InDm, Tree};
 use crate::Module;
 use crate::modules::generic::schedule::{Fill, Spill};
-use crate::modules::generic::schedule::{IntoStream, Stream};
 use crate::ops::index::scatter::Store;
 use crate::ops::normalization::span::{Selection, Span, Tile};
 use crate::ops::normalization::{Blocked, Spread};
@@ -11,7 +10,6 @@ use crate::ops::reduction;
 use crate::tensor::live::{Live, OnTile};
 use crate::tensor::scalar::Value;
 use crate::tensor::{axis::Rows, parallel::Chip};
-use core::task::Poll;
 use furiosa_opt_std::prelude::*;
 use std::borrow::Borrow;
 
@@ -20,84 +18,6 @@ use std::borrow::Borrow;
 pub struct Selected<Capacity: AxisName> {
     pub live: Value,
     pub rows: HbmTensor<i32, Chip, m![Capacity]>,
-}
-
-/// The selected rows' tokens into the head's slot. The node takes every tile of its upstream into
-/// a place of its own; once the upstream ends, it reads out the selected rows' tokens, a span a trip.
-impl<'a, 's, 'i, U, E, X, Width: AxisName, V: AxisName, W, B, I, Capacity: AxisName>
-    IntoStream<U, E, &'s mut HbmTensor<i32, Chip, m![Capacity]>> for &'a Tree<Width, V, W, B, I>
-where
-    U: Stream<Item = Live<X, Capacity>>,
-    E: Copy + Into<&'i Selected<Capacity>>,
-    W: Borrow<HbmTensor<bf16, Chip, m![V, Width]>>,
-    B: Borrow<HbmTensor<f32, Chip, m![V]>>,
-    I: Borrow<HbmTensor<i32, Chip, m![V]>>,
-    HbmTensor<bf16, Chip, Blocked<Width, Capacity>>:
-        for<'x> Spill<Device, &'x X, Live<(), Capacity>>,
-{
-    type Stream = Node<'a, 's, U, E, Width, V, W, B, I, Capacity>;
-
-    fn into_stream(
-        self,
-        env: E,
-        tokens: &'s mut HbmTensor<i32, Chip, m![Capacity]>,
-        upstream: U,
-    ) -> Self::Stream {
-        Node {
-            head: self,
-            upstream,
-            env,
-            hidden: HbmTensor::new(),
-            tokens,
-            done: false,
-        }
-    }
-}
-
-/// A greedy head's node: the head, its upstream, the env, the place the upstream's rows gather in,
-/// its tokens' place, and whether it read them out.
-pub(crate) struct Node<'a, 's, U, E, Width: AxisName, V: AxisName, W, B, I, Capacity: AxisName> {
-    head: &'a Tree<Width, V, W, B, I>,
-    upstream: U,
-    env: E,
-    hidden: HbmTensor<bf16, Chip, Blocked<Width, Capacity>>,
-    tokens: &'s mut HbmTensor<i32, Chip, m![Capacity]>,
-    done: bool,
-}
-
-/// Once the upstream ends, so after its last effect, a trip a span of the selected rows gathers
-/// the span, writes the head's masks in data memory, then reads and stores each of its tiles.
-impl<'i, U, E, X, Width: AxisName, V: AxisName, W, B, I, Capacity: AxisName> Stream
-    for Node<'_, '_, U, E, Width, V, W, B, I, Capacity>
-where
-    U: Stream<Item = Live<X, Capacity>>,
-    E: Copy + Into<&'i Selected<Capacity>>,
-    W: Borrow<HbmTensor<bf16, Chip, m![V, Width]>>,
-    B: Borrow<HbmTensor<f32, Chip, m![V]>>,
-    I: Borrow<HbmTensor<i32, Chip, m![V]>>,
-    HbmTensor<bf16, Chip, Blocked<Width, Capacity>>:
-        for<'x> Spill<Device, &'x X, Live<(), Capacity>>,
-{
-    type Item = ();
-
-    fn poll_next(&mut self, context: &mut Device) -> Poll<Option<()>> {
-        if self.done {
-            return Poll::Ready(None);
-        }
-        match self.upstream.poll_next(&mut *context) {
-            Poll::Ready(Some(tile)) => {
-                let at = tile.with(());
-                self.hidden.spill(&mut *context, tile.value(), at);
-                return Poll::Pending;
-            }
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(None) => {}
-        }
-        self.done = true;
-        self.head
-            .read(context, &self.hidden, self.env.into(), &mut *self.tokens);
-        Poll::Ready(None)
-    }
 }
 
 impl<Capacity: AxisName> Selected<Capacity> {
@@ -224,20 +144,12 @@ mod tests {
     use super::super::Greedy;
     use super::*;
     use crate::load::{Checkpoint, Context, Load};
-    use crate::modules::generic::schedule::Scheduled;
     use crate::ops::linear::Affine;
-    use crate::ops::normalization::span::{Owned, Tiled};
-    use crate::ops::normalization::{RmsNorm, tests::blocked};
+    use crate::ops::normalization::tests::blocked;
     use crate::ops::reduction::Argmax;
-    use crate::tensor::form::Weight;
-    use crate::{Then, tests::DEVICE};
+    use crate::tests::DEVICE;
 
     axes![Hidden = 4096, Padded = 152064];
-
-    impl Tiled for Hidden {
-        type Capacity = Rows<126>;
-        type Last = Rows<4>;
-    }
 
     type Capacity = Rows<1024>;
     type Place = HbmTensor<bf16, Chip, Blocked<Hidden, Capacity>>;
@@ -249,7 +161,6 @@ mod tests {
         Affine<&'w HbmTensor<bf16, Chip, m![Padded, Hidden]>, &'w HbmTensor<f32, Chip, m![Padded]>>,
         Argmax<Padded, Chip, &'w HbmTensor<i32, Chip, m![Padded]>>,
     >;
-    type Env<'i> = (Live<(), Capacity>, &'i Selected<Capacity>);
 
     /// The checkpoint's tokens; the compiled vocabulary pads them.
     const LIVE: usize = 151_936 - 256;
@@ -259,84 +170,18 @@ mod tests {
     const TIED: usize = 77;
     const LATER: usize = 100;
 
-    impl<'i> From<Env<'i>> for &'i Selected<Capacity> {
-        fn from((_, selected): Env<'i>) -> Self {
-            selected
-        }
+    /// The tokens the head reads of the selected rows among a launch's rows.
+    #[device(chip = 1)]
+    fn read_out(
+        device: &mut Device,
+        head: &Head<'_>,
+        selected: &Selected<Capacity>,
+        input: &Place,
+    ) -> Tokens {
+        let mut tokens = Tokens::new();
+        head.read(device, input, selected, &mut tokens);
+        tokens
     }
-
-    /// A body ending in no norm: it gives each span of the launch's live rows, one a poll; at its
-    /// end, after its last tile, it stores the first span again at the trace span its ends count.
-    #[derive(DeviceSend)]
-    struct Spans;
-
-    struct Node<'s, 'h, 'i> {
-        env: Env<'i>,
-        places: &'s mut (&'h Place, &'h mut Place),
-        given: usize,
-        ends: usize,
-    }
-
-    impl<'m, 's, 'h, 'i, U: Stream> IntoStream<U, Env<'i>, &'s mut (&'h Place, &'h mut Place)>
-        for &'m Spans
-    {
-        type Stream = Node<'s, 'h, 'i>;
-
-        fn into_stream(
-            self,
-            env: Env<'i>,
-            places: &'s mut (&'h Place, &'h mut Place),
-            _: U,
-        ) -> Self::Stream {
-            Node {
-                env,
-                places,
-                given: 0,
-                ends: 0,
-            }
-        }
-    }
-
-    impl Stream for Node<'_, '_, '_> {
-        type Item = Live<Owned<Hidden, Span>, Capacity>;
-
-        fn poll_next(&mut self, device: &mut Device) -> Poll<Option<Self::Item>> {
-            let live = self.env.0;
-            if self.given < live.count::<Span>() {
-                let tile = live.tile::<Span>(self.given);
-                self.given += 1;
-                return Poll::Ready(Some(tile.with(self.places.0.fill(device, tile))));
-            }
-            let rows = self.places.0.fill(device, live.tile::<Span>(0));
-            let at = Live::<(), Capacity>::all().tile::<Span>(self.ends);
-            self.places.1.spill(device, &rows, at);
-            self.ends += 1;
-            Poll::Ready(None)
-        }
-    }
-
-    macro_rules! read_out {
-        ($name:ident, $body:ty, $places:pat => $state:expr) => {
-            #[device(chip = 1)]
-            fn $name(
-                device: &mut Device,
-                model: &Then<$body, Head<'_>>,
-                count: &Value,
-                selected: &Selected<Capacity>,
-                input: &Place,
-                trace: &mut Place,
-            ) -> Tokens {
-                let env = (Live::<(), Capacity>::read(count), selected);
-                let $places = (input, trace);
-                let mut state = ($state, Tokens::new());
-                Scheduled(model).forward(device, env, &mut state, ());
-                state.1
-            }
-        };
-    }
-
-    read_out!(plain, Spans, places => places);
-    read_out!(normalized, Then<Spans, RmsNorm<Hidden>>, places => (places, ()));
 
     /// Row `row`'s feature values: a feature of its own, the first two, the third, or the second.
     fn features(row: usize) -> &'static [usize] {
@@ -344,11 +189,10 @@ mod tests {
         CASES[row % 4]
     }
 
-    /// Row `row`'s token, its first two features weighted by `gain`.
-    fn token(row: usize, gain: (f32, f32)) -> usize {
+    /// Row `row`'s token: its own, the first of two tied, or the second feature's.
+    fn token(row: usize) -> usize {
         match row % 4 {
             0 => 1000 + row,
-            1 if gain.1 > gain.0 => SECOND,
             1 => FIRST,
             2 => TIED,
             _ => SECOND,
@@ -356,9 +200,9 @@ mod tests {
     }
 
     /// Each selected row's first maximum among the checkpoint's tokens, in selection order, read
-    /// from the normalized rows the body gives, after the body's last effect, which runs once.
+    /// from a launch's rows.
     #[tokio::test(flavor = "current_thread")]
-    async fn reads_the_body_once_it_ends() {
+    async fn reads_each_selected_rows_first_maximum() {
         let _lease = DEVICE.lock().await;
         let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
         let rows = 520;
@@ -403,7 +247,6 @@ mod tests {
             .unwrap();
         let count =
             |value: usize| HostTensor::<i32, m![1]>::from_vec([i32::try_from(value).unwrap()]);
-        let launch_rows = count(rows).to_hbm(&mut device.pdma).await.unwrap();
         let weight = HostTensor::<bf16, m![Padded, Hidden]>::from_vec(weight)
             .to_hbm(&mut device.pdma)
             .await
@@ -417,9 +260,7 @@ mod tests {
         let ranks = ranks.unwrap();
         // Out of order across both spans, the last span partial; none, and a tile of eight.
         let chosen: Vec<usize> = (0..140).map(|index| (index * 37 + 11) % rows).collect();
-        let selections = [&chosen[..], &[], &[517, 2, 513, 1, 0]];
-        let gains = [None, Some((2.0, 1.0)), Some((1.0, 2.0))];
-        for (selection, gain) in selections.iter().flat_map(|s| gains.map(|g| (*s, g))) {
+        for selection in [&chosen[..], &[], &[517, 2, 513, 1, 0]] {
             let mut offsets = vec![0; Capacity::SIZE];
             for (slot, &row) in selection.iter().enumerate() {
                 offsets[slot] = i32::try_from(row * 32).unwrap();
@@ -434,87 +275,18 @@ mod tests {
                     .await
                     .unwrap(),
             };
-            let mut trace = place(vec![bf16::from_f32(0.0); Capacity::SIZE * Hidden::SIZE])
-                .to_hbm::<Chip, Blocked<Hidden, Capacity>>(&mut device.pdma)
-                .await
-                .unwrap();
             let argmax = Load::load(&mut Context::new(None), &ranks).unwrap();
             let head: Head<'_> = Greedy::new(Affine::new(&weight, &mask), argmax);
-            let tokens = match gain {
-                None => launch(
-                    plain,
-                    (
-                        &mut device,
-                        &Then(Spans, head),
-                        &launch_rows,
-                        &selected,
-                        &input_rows,
-                        &mut trace,
-                    ),
-                )
+            let tokens = launch(read_out, (&mut device, &head, &selected, &input_rows))
                 .await
-                .unwrap(),
-                Some((first, second)) => {
-                    let mut gains = vec![bf16::from_f32(1.0); Hidden::SIZE];
-                    gains[0] = bf16::from_f32(first);
-                    gains[1] = bf16::from_f32(second);
-                    let norm = RmsNorm::new(Weight::new(
-                        HostTensor::<bf16, m![Hidden]>::from_vec(gains)
-                            .to_hbm(&mut device.pdma)
-                            .await
-                            .unwrap(),
-                    ));
-                    let model = Then(Then(Spans, norm), head);
-                    launch(
-                        normalized,
-                        (
-                            &mut device,
-                            &model,
-                            &launch_rows,
-                            &selected,
-                            &input_rows,
-                            &mut trace,
-                        ),
-                    )
-                    .await
-                    .unwrap()
-                }
-            };
+                .unwrap();
             let tokens = tokens
                 .to_host::<m![Capacity]>(&mut device.pdma)
                 .await
                 .unwrap()
                 .into_vec();
             for (slot, &row) in selection.iter().enumerate() {
-                let want = token(row, gain.unwrap_or((1.0, 1.0)));
-                assert_eq!(
-                    tokens[slot] as usize, want,
-                    "{gain:?} slot {slot} row {row}"
-                );
-            }
-            let trace = trace
-                .to_host::<Blocked<Hidden, Capacity>>(&mut device.pdma)
-                .await
-                .unwrap()
-                .into_vec();
-            let span = Span::SIZE;
-            for chunk in 0..Hidden::SIZE / 16 {
-                for row in 0..Capacity::SIZE {
-                    for lane in 0..16 {
-                        let at = (chunk * Capacity::SIZE + row) * 16 + lane;
-                        let want = if row < span {
-                            input[row * Hidden::SIZE + chunk * 16 + lane]
-                        } else {
-                            bf16::from_f32(0.0)
-                        };
-                        assert_eq!(
-                            trace[at].to_f32(),
-                            want.to_f32(),
-                            "{gain:?} body end: row {row} feature {}",
-                            chunk * 16 + lane
-                        );
-                    }
-                }
+                assert_eq!(tokens[slot] as usize, token(row), "slot {slot} row {row}");
             }
         }
     }

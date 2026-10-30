@@ -27,9 +27,9 @@ type Second<Hidden, QWidth, Rows> = (
 );
 
 /// The quantized projection landed: its weights, staged once, the step of the tile in progress
-/// and what each step leaves the next. A tile takes three steps, one a poll or one a phase: the
-/// tile's rows landed and the first block's first pass, then the other passes and the exchange of
-/// one half of the clusters' partial sums, then the sum, which it gives.
+/// and what each step leaves the next. A tile takes three steps, one a phase: the tile's rows
+/// landed and the first block's first pass, then the other passes and the exchange of one half of
+/// the clusters' partial sums, then the sum, which it gives.
 pub struct Landed<Hidden: AxisName, QWidth: AxisName, Rows: AxisName> {
     staged: Staged<Hidden, QWidth>,
     step: usize,
