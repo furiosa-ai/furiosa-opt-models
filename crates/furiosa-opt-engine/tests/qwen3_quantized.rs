@@ -13,7 +13,7 @@ use furiosa_opt_engine::{Checkpoint, Load, LoadError, LoadOptions, Quantization}
 use furiosa_opt_models::load::Context;
 use furiosa_opt_models::models::Implements;
 use furiosa_opt_models::models::decoder::attention::{Geometry, Head, KvHeads, qwen3};
-use furiosa_opt_models::models::decoder::form;
+use furiosa_opt_models::models::decoder::{form, launch};
 use furiosa_opt_models::ops::linear::query::matrix::Width;
 use furiosa_opt_models::tensor::form::fp8::Granularity;
 use furiosa_opt_std::prelude::*;
@@ -65,7 +65,7 @@ type Queries = <Size as Geometry>::Queries;
 type Pairs = Width<KvHeads, Head>;
 
 /// The Qwen3-0.6B causal line whose projections hold form `F`.
-type Line<F> = qwen3::launch::Model<Size, F>;
+type Line<F> = launch::Model<Size, F>;
 
 /// A channel-scaled projection of `In`-wide rows to `Out` features, in HBM.
 type Projection<In, Out> =

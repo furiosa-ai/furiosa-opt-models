@@ -37,6 +37,7 @@ use std::{io, marker::PhantomData};
 
 pub mod attention;
 pub mod hybrid;
+pub mod launch;
 pub mod recurrent;
 
 /// A decoder's declaration, holding no parameters: its geometry, cache scalar, placement `P`, the

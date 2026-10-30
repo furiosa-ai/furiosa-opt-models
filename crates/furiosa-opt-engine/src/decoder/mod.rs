@@ -27,11 +27,12 @@ pub use cache::{Cache, CacheSpec, Group, Kind, Pool};
 
 use crate::{AsyncModule, Checkpoint, Load, LoadError, forward};
 use furiosa_opt_models::Module;
-use furiosa_opt_models::models::decoder::attention::qwen3::{LmHead, fp8, launch};
+use furiosa_opt_models::models::decoder::attention::qwen3::{LmHead, fp8};
 use furiosa_opt_models::models::decoder::attention::{
     ForCausalLM, ForSequenceClassification, Geometry, Head, KvHeads,
 };
 use furiosa_opt_models::models::decoder::form;
+use furiosa_opt_models::models::decoder::launch;
 use furiosa_opt_models::modules::attention::key_value;
 use furiosa_opt_models::modules::language::{Classifier, Input, Selected};
 use furiosa_opt_models::modules::lora::{self, Rank, States};

@@ -8,8 +8,8 @@
 //! - The envelope a launch is compiled for is the size's [`Decode`]: its rows, and the context its
 //!   rotary table, prompt chunks and work items cover, its windows' [`Positions`].
 
-use super::{CatalogBody, Groups, Hidden, LmHead, QueryHeads, tiles};
 use crate::load::Named;
+use crate::models::decoder::attention::qwen3::{CatalogBody, LmHead, QueryHeads, tiles};
 use crate::models::decoder::attention::{
     ForCausalLM, ForSequenceClassification, Geometry, Head, KvHeads,
 };
@@ -197,6 +197,8 @@ type Factors<K, In, Out, X> = lora::Term<
 >;
 
 type Intermediate<S> = <S as Geometry>::Intermediate;
+type Hidden<S> = <S as Geometry>::Hidden;
+type Groups<S> = <S as Geometry>::Groups;
 
 /// A selection of a launch's rows over `K` rank columns: one on the rows that run with its
 /// adapter, zero on every other.
@@ -298,9 +300,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::super::Size;
     use super::*;
     use crate::load::{Checkpoint, Load};
+    use crate::models::decoder::attention::qwen3::Size;
     use crate::models::decoder::form::{Affine, BlockScaled, ChannelScaled};
 
     /// Each size's catalog model loads from a checkpoint in dense BF16, the sizes up to 4B also

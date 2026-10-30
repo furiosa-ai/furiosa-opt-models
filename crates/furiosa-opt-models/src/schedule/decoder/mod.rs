@@ -25,11 +25,12 @@
 use crate::Module;
 use crate::load::Named;
 use crate::models::decoder::Form;
-use crate::models::decoder::attention::qwen3::{self, LmHead, QueryHeads, fp8, launch};
+use crate::models::decoder::attention::qwen3::{self, LmHead, QueryHeads, fp8};
 use crate::models::decoder::attention::{
     ForCausalLM, ForSequenceClassification, Geometry, Head, KvHeads, Qwen2Layer,
 };
 use crate::models::decoder::form::BlockScaled;
+use crate::models::decoder::launch;
 use crate::modules::attention::{Attention, NormalizedQkv, Positioned, Projection};
 use crate::modules::generic::collection::View;
 use crate::modules::generic::schedule::{Begin, Fill, Spill};
