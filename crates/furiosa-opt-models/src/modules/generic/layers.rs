@@ -40,59 +40,6 @@ where
     }
 }
 
-// TODO: the device translator refuses this chain: it cannot assign a field of an array element
-// through `&mut self`, as each poll does to a layer's slot.
-/// The layers chained over the upstream, ending with the last: a poll polls, in order, each layer
-/// whose last output the next one took, so a tile passes every layer before the next arrives.
-impl<T, U: Stream<Item = T>, C: Stream<Item = T> + AsMut<Slot<T>>, const N: usize> Stream
-    for ([C; N], U)
-{
-    type Item = T;
-
-    fn poll_next(&mut self, device: &mut Device) -> Poll<Option<T>> {
-        let mut polled = if self.0[0].as_mut().is_empty() {
-            self.1.poll_next(device)
-        } else {
-            Poll::Pending
-        };
-        #[unroll]
-        for index in 0..N {
-            self.0[index].as_mut().put(polled);
-            polled = if index + 1 == N || self.0[index + 1].as_mut().is_empty() {
-                self.0[index].poll_next(device)
-            } else {
-                Poll::Pending
-            };
-        }
-        polled
-    }
-}
-
-impl<'m, 's, U: Stream, E: Copy, S, L, C, const N: usize> IntoStream<U, E, &'s mut [S; N]>
-    for &'m [L; N]
-where
-    &'m L: IntoStream<Slot<U::Item>, E, &'s mut S, Stream = C>,
-    C: Stream<Item = U::Item> + AsMut<Slot<U::Item>>,
-{
-    type Stream = ([C; N], U);
-
-    fn into_stream(self, env: E, slots: &'s mut [S; N], upstream: U) -> Self::Stream {
-        (start(self, env, slots), upstream)
-    }
-}
-
-/// Every layer's code in place: the chain of the collection's layers.
-impl<'m, U: Stream, E, S, C> IntoStream<U, E, S> for &'m Layers<C, Unrolled>
-where
-    &'m C: IntoStream<U, E, S>,
-{
-    type Stream = <&'m C as IntoStream<U, E, S>>::Stream;
-
-    fn into_stream(self, env: E, state: S, upstream: U) -> Self::Stream {
-        (&self.layers).into_stream(env, state, upstream)
-    }
-}
-
 /// What a rolled stack starts its next layer from: the layers not yet started, each with its state
 /// slot, and the call's env.
 trait Refill<T> {
@@ -399,22 +346,6 @@ impl<X, Env, S, Body: Module<X, Env, S>, const N: usize> Collection<X, Env, S> f
     fn apply(&self, device: &mut Device, env: Env, state: S, hidden: X, _: usize) -> Body::Output {
         self.body.forward(device, env, state, hidden)
     }
-}
-
-/// Starts each layer of a chain on its own state slot, over its [`Slot`].
-pub(super) fn start<'m, 's, T, E: Copy, S, L, const N: usize>(
-    layers: &'m [L; N],
-    env: E,
-    slots: &'s mut [S; N],
-) -> [<&'m L as IntoStream<Slot<T>, E, &'s mut S>>::Stream; N]
-where
-    &'m L: IntoStream<Slot<T>, E, &'s mut S>,
-{
-    let mut index = 0;
-    slots.each_mut().map(|slot| {
-        index += 1;
-        (&layers[index - 1]).into_stream(env, slot, Slot::new())
-    })
 }
 
 #[cfg(test)]
