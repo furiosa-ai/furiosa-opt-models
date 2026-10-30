@@ -8,6 +8,7 @@ use crate::specialize::collective;
 use crate::{
     Op,
     tensor::{
+        axis::Single,
         live::Live,
         parallel::{Parallel, Part, Shard},
     },
@@ -55,34 +56,21 @@ impl<X, R> Op<Live<X, R>> for AllReduce<Parallel<1>> {
     }
 }
 
+/// A vector is the one row of a sum of rows.
 impl<D: OutputScalar, W: AxisName, const N: usize> Op<HbmTensor<D, ChipMap<N>, m![W]>>
     for AllReduce<Parallel<N>>
 {
     type Output = HbmTensor<D, ChipMap<N>, m![W]>;
 
     fn forward(&self, device: &mut Device, input: Self::Output) -> Self::Output {
-        const {
-            assert!(W::SIZE > 0 && W::SIZE % 1024 == 0 && W::SIZE <= 32768);
-        }
-        let input: Local<D, ChipMap<N>, W> = input.to_dm(&mut device.tdma);
-        let input: Local<f32, ChipMap<N>, W> = device
-            .main
-            .begin(input.view())
-            .fetch::<m![W / 1024], m![W % 4 # 8]>()
-            .fetch_cast::<f32>()
-            .collect::<m![W / 1024], m![W % 4 # 8]>()
-            .commit_trim::<m![W % 4]>()
-            .commit();
-        let mut sum = input;
-        #[unroll]
-        for round in 0..const { collective::rounds(N) } {
-            sum = self.reduce::<W>(device, sum, round);
-        }
-        D::narrow::<ChipMap<N>, W>(device, sum).to_hbm(&mut device.tdma)
+        // SAFETY: a vector is its one row, every cell at its address.
+        let row = unsafe { input.reshape::<ChipMap<N>, m![Single, W]>() };
+        // SAFETY: as above, back to the vector.
+        unsafe { self.forward(device, row).reshape() }
     }
 }
 
-/// Every row summed over the chips as the vector sum is: FP32 pairwise rounds, then one narrowing.
+/// Every row summed over the chips: FP32 pairwise rounds, then one narrowing.
 impl<D: OutputScalar, R: AxisName, W: AxisName, const N: usize>
     Op<HbmTensor<D, ChipMap<N>, m![R, W]>> for AllReduce<Parallel<N>>
 {
@@ -100,14 +88,14 @@ impl<D: OutputScalar, R: AxisName, W: AxisName, const N: usize>
         };
         let mut output: HbmTensor<D, ChipMap<N>, m![R, W]> = HbmTensor::new();
         for pass in 0..<Passes<R, W> as M>::SIZE {
-            let tile: RowsLocal<D, ChipMap<N>, T<R, W>, W> = rows
+            let tile: Local<D, ChipMap<N>, T<R, W>, W> = rows
                 .tile::<Passes<R, W>, 1, m![
                     { Symbol<Tiles<R, W>> } = 1 # ({ Symbol<Tiles<R, W>> }),
                     { Symbol<T<R, W>> },
                     W
                 ]>(pass)
                 .to_dm(&mut device.tdma);
-            let mut sum: RowsLocal<f32, ChipMap<N>, T<R, W>, W> = device
+            let mut sum: Local<f32, ChipMap<N>, T<R, W>, W> = device
                 .main
                 .begin(tile.view())
                 .fetch::<m![{ Symbol<T<R, W>> }, W / 1024], m![W % 4 # 8]>()
@@ -117,7 +105,7 @@ impl<D: OutputScalar, R: AxisName, W: AxisName, const N: usize>
                 .commit();
             #[unroll]
             for round in 0..const { collective::rounds(N) } {
-                sum = self.reduce_rows::<T<R, W>, W>(device, sum, round);
+                sum = self.reduce::<T<R, W>, W>(device, sum, round);
             }
             // SAFETY: as for the input.
             let target = unsafe {
@@ -125,7 +113,7 @@ impl<D: OutputScalar, R: AxisName, W: AxisName, const N: usize>
                     .view_mut()
                     .reshape::<ChipMap<N>, m![{ Symbol<Tiles<R, W>> }, { Symbol<T<R, W>> }, W]>()
             };
-            D::narrow_rows::<ChipMap<N>, T<R, W>, W>(device, sum)
+            D::narrow::<ChipMap<N>, T<R, W>, W>(device, sum)
                 .view()
                 .to_hbm_view(
                     &mut device.tdma,
@@ -141,78 +129,13 @@ impl<D: OutputScalar, R: AxisName, W: AxisName, const N: usize>
 }
 
 impl<const N: usize> AllReduce<Parallel<N>> {
-    /// The pairwise sums of round `round`.
-    fn reduce<W: AxisName>(
-        &self,
-        device: &mut Device,
-        input: Local<f32, ChipMap<N>, W>,
-        round: usize,
-    ) -> Local<f32, ChipMap<N>, W> {
-        let exchanged = input
-            .chip_shuffle(const { collective::partners::<N>() }[round])
-            .to_dm::<m![W / 1024, W % 4]>(&mut device.tdma);
-        let mut pair: DmTensor<
-            f32,
-            ChipMap<N>,
-            m![1 # 2],
-            ReductionSlices<W>,
-            m![Two, W / 1024, W % 4],
-        > = DmTensor::new();
-        input.view().to_dm_view(
-            &mut device.tdma,
-            pair.view_mut()
-                .tile::<m![Two], 1, m![Two = 1 #{!} 2, W / 1024, W % 4]>(0),
-        );
-        exchanged.view().to_dm_view(
-            &mut device.tdma,
-            pair.view_mut()
-                .tile::<m![Two], 1, m![Two = 1 #{!} 2, W / 1024, W % 4]>(1),
-        );
-        let low = pair
-            .chip_slice::<m![Two], m![W / 1024, W % 4]>(
-                const { collective::selections::<N>(false) }[round],
-            )
-            .to_dm::<m![W / 1024, W % 4]>(&mut device.tdma);
-        let high = pair
-            .chip_slice::<m![Two], m![W / 1024, W % 4]>(
-                const { collective::selections::<N>(true) }[round],
-            )
-            .to_dm::<m![W / 1024, W % 4]>(&mut device.tdma);
-        let high: VrfTensor<
-            f32,
-            ChipMap<N>,
-            m![1 # 2],
-            ReductionSlices<W>,
-            m![W / 1024, W % 4 # 8],
-        > = device
-            .sub
-            .begin(high.view())
-            .fetch::<m![W / 1024], m![W % 4 # 8]>()
-            .collect::<m![W / 1024], m![W % 4 # 8]>()
-            .to_vrf();
-        // Both partners use low + high, including when NaN operand order matters.
-        device
-            .main
-            .begin(low.view())
-            .fetch::<m![W / 1024], m![W % 4 # 8]>()
-            .collect::<m![W / 1024], m![W % 4 # 8]>()
-            .vector_init()
-            .vector_intra_slice_tag(TagMode::Zero)
-            .vector_narrow_split::<m![W / 1024, W % 4 / 4 # 2], m![W % 4]>()
-            .vector_fp_binary(FpBinaryOp::AddF, &high)
-            .vector_widen_concat::<m![W / 1024], m![W % 4 # 8]>()
-            .vector_final()
-            .commit_trim::<m![W % 4]>()
-            .commit()
-    }
-
     /// The pairwise sums of round `round`, every row at once.
-    fn reduce_rows<R: AxisName, W: AxisName>(
+    fn reduce<R: AxisName, W: AxisName>(
         &self,
         device: &mut Device,
-        input: RowsLocal<f32, ChipMap<N>, R, W>,
+        input: Local<f32, ChipMap<N>, R, W>,
         round: usize,
-    ) -> RowsLocal<f32, ChipMap<N>, R, W> {
+    ) -> Local<f32, ChipMap<N>, R, W> {
         let exchanged = input
             .chip_shuffle(const { collective::partners::<N>() }[round])
             .to_dm::<m![R, W / 1024, W % 4]>(&mut device.tdma);
@@ -324,9 +247,8 @@ axes![Two = 2];
 type ChipMap<const N: usize> = m![{ Symbol<Shard<N>> }];
 type Rows<D, const N: usize, R, W> = HbmTensor<D, ChipMap<N>, m![R, W]>;
 type ReductionSlices<W> = m![W % 1024 / 128, W % 128 / 4];
-type Local<D, Chips, W> = DmTensor<D, Chips, m![1 # 2], ReductionSlices<W>, m![W / 1024, W % 4]>;
 /// A chip's rows in the sum's layout: each slice one part of every row.
-type RowsLocal<D, Chips, R, W> =
+type Local<D, Chips, R, W> =
     DmTensor<D, Chips, m![1 # 2], ReductionSlices<W>, m![R, W / 1024, W % 4]>;
 
 /// The rows one pass of a sum of rows takes: the partner's rows of a pass take one 32-byte VRF
@@ -356,54 +278,27 @@ impl<R: AxisName, W: AxisName> AxisName for Tiles<R, W> {
 
 /// Floating-point storage supported by the chip sum.
 pub(crate) trait OutputScalar: MaterializableScalar + FetchCast<f32> {
-    /// Convert the completed f32 reduction to its output element type.
-    fn narrow<Chips: M, W: AxisName>(
+    /// Convert the completed f32 reduction of every row to its output element type.
+    fn narrow<Chips: M, R: AxisName, W: AxisName>(
         device: &mut Device,
-        input: Local<f32, Chips, W>,
-    ) -> Local<Self, Chips, W>;
-
-    /// [`OutputScalar::narrow`] for every row of a sum of rows.
-    fn narrow_rows<Chips: M, R: AxisName, W: AxisName>(
-        device: &mut Device,
-        input: RowsLocal<f32, Chips, R, W>,
-    ) -> RowsLocal<Self, Chips, R, W>;
+        input: Local<f32, Chips, R, W>,
+    ) -> Local<Self, Chips, R, W>;
 }
 
 impl OutputScalar for f32 {
-    fn narrow<Chips: M, W: AxisName>(
+    fn narrow<Chips: M, R: AxisName, W: AxisName>(
         _: &mut Device,
-        input: Local<f32, Chips, W>,
-    ) -> Local<Self, Chips, W> {
-        input
-    }
-
-    fn narrow_rows<Chips: M, R: AxisName, W: AxisName>(
-        _: &mut Device,
-        input: RowsLocal<f32, Chips, R, W>,
-    ) -> RowsLocal<Self, Chips, R, W> {
+        input: Local<f32, Chips, R, W>,
+    ) -> Local<Self, Chips, R, W> {
         input
     }
 }
 
 impl OutputScalar for bf16 {
-    fn narrow<Chips: M, W: AxisName>(
+    fn narrow<Chips: M, R: AxisName, W: AxisName>(
         device: &mut Device,
-        input: Local<f32, Chips, W>,
-    ) -> Local<Self, Chips, W> {
-        device
-            .main
-            .begin(input.view())
-            .fetch::<m![W / 1024], m![W % 4 # 8]>()
-            .collect::<m![W / 1024], m![W % 4 # 8]>()
-            .cast::<bf16, m![W % 4 # 16]>()
-            .commit_trim::<m![W % 4]>()
-            .commit()
-    }
-
-    fn narrow_rows<Chips: M, R: AxisName, W: AxisName>(
-        device: &mut Device,
-        input: RowsLocal<f32, Chips, R, W>,
-    ) -> RowsLocal<Self, Chips, R, W> {
+        input: Local<f32, Chips, R, W>,
+    ) -> Local<Self, Chips, R, W> {
         device
             .main
             .begin(input.view())
