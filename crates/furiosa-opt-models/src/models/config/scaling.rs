@@ -49,6 +49,16 @@ pub enum Kind {
 }
 
 impl Spectrum {
+    /// The spectrum of base `theta` that `kind` rescales over the whole head, as a size that
+    /// compiles one states it.
+    pub fn new(theta: Positive, kind: Kind) -> Self {
+        Self {
+            theta,
+            fraction: 1.0,
+            kind,
+        }
+    }
+
     pub fn theta(&self) -> Positive {
         self.theta
     }
@@ -427,7 +437,9 @@ impl Outer {
             "llama3" => Kind::Llama3(
                 Config::deserialize(typed("llama3")).map_err(|error| error.to_string())?,
             ),
-            "yarn" => {
+            // vLLM names DeepSeek's YaRN, whose magnitude over every dimension also scales its
+            // attention's scores, `deepseek_yarn`.
+            "yarn" | "deepseek_yarn" => {
                 let mut yarn = typed("yarn");
                 // Transformers reads a null factor as the declared context over the trained one.
                 let null = yarn.get("factor").is_some_and(Value::is_null);
@@ -527,7 +539,7 @@ impl TryFrom<Raw> for Config {
 /// YaRN's rescaling: pairs turning over `fast` times in the `original` context keep their
 /// frequency, under `slow` divide it by `factor`, a ramp blends; `amplitude` scales each rotation.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
-#[serde(try_from = "YarnRaw")]
+#[serde(try_from = "YarnParameters")]
 pub struct Yarn {
     factor: f64,
     fast: f64,
@@ -535,9 +547,18 @@ pub struct Yarn {
     original: NonZeroUsize,
     truncate: bool,
     amplitude: f64,
+    mscale_all_dim: Option<f64>,
 }
 
 impl Yarn {
+    /// YaRN's magnitude over every dimension, from `mscale_all_dim`, or one where the parameters
+    /// name none; an attention that follows it, as DeepSeek's does, scales its scores by its
+    /// square.
+    pub fn magnitude(&self) -> f64 {
+        self.mscale_all_dim
+            .map_or(1.0, |coefficient| mscale(self.factor, coefficient))
+    }
+
     /// The frequency of each pair of a `head`-wide head, as Transformers' YaRN computes it.
     fn frequencies(&self, theta: f64, head: usize) -> Vec<f64> {
         let width = head as f64;
@@ -562,51 +583,48 @@ impl Yarn {
     }
 }
 
-#[derive(serde::Deserialize)]
-struct YarnRaw {
-    rope_type: super::Literal<"yarn">,
-    factor: Positive,
-    original_max_position_embeddings: NonZeroUsize,
-    beta_fast: Option<f64>,
-    beta_slow: Option<f64>,
-    attention_factor: Option<f64>,
-    mscale: Option<f64>,
-    mscale_all_dim: Option<f64>,
-    truncate: Option<bool>,
+/// YaRN's parameters by their names in a configuration: what a checkpoint declares, and what a
+/// size that compiles one YaRN states; an absent one reads as Transformers' default.
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
+pub struct YarnParameters {
+    pub factor: Positive,
+    pub original_max_position_embeddings: NonZeroUsize,
+    pub beta_fast: Option<f64>,
+    pub beta_slow: Option<f64>,
+    pub attention_factor: Option<f64>,
+    pub mscale: Option<f64>,
+    pub mscale_all_dim: Option<f64>,
+    pub truncate: Option<bool>,
 }
 
-impl TryFrom<YarnRaw> for Yarn {
+impl TryFrom<YarnParameters> for Yarn {
     type Error = String;
 
-    fn try_from(raw: YarnRaw) -> Result<Self, Self::Error> {
-        let super::Literal = raw.rope_type;
-        let factor = f64::from(raw.factor.get());
+    fn try_from(parameters: YarnParameters) -> Result<Self, Self::Error> {
+        let factor = f64::from(parameters.factor.get());
         if factor < 1.0 {
             return Err(format!("factor: found {factor}, expected >= 1"));
         }
-        // Transformers reads an absent or zero ramp bound as its default.
+        // Transformers reads an absent or zero ramp bound, or magnitude, as its default.
         let nonzero = |value: Option<f64>| value.filter(|value| *value != 0.0);
         let (fast, slow) = (
-            nonzero(raw.beta_fast).unwrap_or(32.0),
-            nonzero(raw.beta_slow).unwrap_or(1.0),
+            nonzero(parameters.beta_fast).unwrap_or(32.0),
+            nonzero(parameters.beta_slow).unwrap_or(1.0),
         );
         if !(fast > slow && slow > 0.0) {
             return Err(format!(
                 "beta_fast: found {fast}, expected > beta_slow {slow} > 0"
             ));
         }
-        let scale = |mscale: f64| match factor <= 1.0 {
-            true => 1.0,
-            false => 0.1 * mscale * factor.ln() + 1.0,
-        };
+        let mscale_all_dim = nonzero(parameters.mscale_all_dim);
         let amplitude = match (
-            raw.attention_factor,
-            nonzero(raw.mscale),
-            nonzero(raw.mscale_all_dim),
+            parameters.attention_factor,
+            nonzero(parameters.mscale),
+            mscale_all_dim,
         ) {
             (Some(amplitude), _, _) => amplitude,
-            (None, Some(mscale), Some(all)) => scale(mscale) / scale(all),
-            (None, _, _) => scale(1.0),
+            (None, Some(own), Some(all)) => mscale(factor, own) / mscale(factor, all),
+            (None, _, _) => mscale(factor, 1.0),
         };
         if !(amplitude > 0.0 && amplitude.is_finite()) {
             return Err(format!(
@@ -617,10 +635,20 @@ impl TryFrom<YarnRaw> for Yarn {
             factor,
             fast,
             slow,
-            original: raw.original_max_position_embeddings,
-            truncate: raw.truncate.unwrap_or(true),
+            original: parameters.original_max_position_embeddings,
+            truncate: parameters.truncate.unwrap_or(true),
             amplitude,
+            mscale_all_dim,
         })
+    }
+}
+
+/// YaRN's magnitude at `factor` for a magnitude parameter `coefficient`, Transformers'
+/// `get_mscale`: a YaRN that does not extend the context scales nothing.
+fn mscale(factor: f64, coefficient: f64) -> f64 {
+    match factor <= 1.0 {
+        true => 1.0,
+        false => 0.1 * coefficient * factor.ln() + 1.0,
     }
 }
 
@@ -1325,5 +1353,47 @@ mod tests {
                 "partial_rotary_factor: found 0, expected a fraction in (0, 1]".into()
             )
         );
+    }
+
+    /// A size states its compiled YaRN by the parameters a configuration names, which the rule that
+    /// reads a checkpoint's YaRN converts; `deepseek_yarn` spells YaRN too, and parameters of one
+    /// amplitude that scale an attention's scores differently are two YaRNs.
+    #[test]
+    fn states_a_yarn_by_its_parameters() {
+        let stated = Yarn::try_from(YarnParameters {
+            factor: Positive(16.0),
+            original_max_position_embeddings: NonZeroUsize::new(16384).unwrap(),
+            beta_fast: Some(32.0),
+            beta_slow: Some(1.0),
+            attention_factor: None,
+            mscale: Some(1.0),
+            mscale_all_dim: Some(1.0),
+            truncate: None,
+        })
+        .unwrap();
+        let read = |parameters: Value| match parse::<Spectrum>(nested(parameters, 1e9)) {
+            Ok(Spectrum {
+                kind: Kind::Yarn(yarn),
+                ..
+            }) => yarn,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(read(yarn()), stated);
+        let mut vllm = yarn();
+        vllm["rope_type"] = json!("deepseek_yarn");
+        vllm["type"] = json!("deepseek_yarn");
+        assert_eq!(read(vllm), stated);
+        let mut deepseek = yarn();
+        deepseek["mscale"] = json!(0.707);
+        deepseek["mscale_all_dim"] = json!(0.707);
+        let deepseek = read(deepseek);
+        assert_eq!((deepseek.amplitude, stated.amplitude), (1.0, 1.0));
+        assert_ne!(deepseek, stated);
+        let magnitude = |yarn: Yarn| yarn.magnitude();
+        assert!((magnitude(deepseek) - 1.196_022_023).abs() <= 1e-9);
+        assert!((magnitude(stated) - 1.277_258_872).abs() <= 1e-9);
+        let mut unscaled = yarn();
+        unscaled.as_object_mut().unwrap().remove("mscale_all_dim");
+        assert_eq!(magnitude(read(unscaled)), 1.0);
     }
 }

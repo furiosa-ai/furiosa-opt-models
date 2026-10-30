@@ -8,6 +8,10 @@
 //! - [`Model`] is the catalog's composition, over the [`AXK1ForCausalLM`] template.
 
 use crate::models::Family;
+use crate::models::config::{
+    self, Positive,
+    scaling::{Kind, Spectrum, YarnParameters},
+};
 use crate::models::decoder::attention::Geometry;
 use crate::modules::feedforward::moe::Reduce;
 use crate::modules::feedforward::moe::TopK;
@@ -34,8 +38,8 @@ use crate::tensor::memory::Memory;
 use crate::{Branch, Interleave, Sequential, Then};
 use furiosa_opt_std::prelude::*;
 use serde::Deserialize;
-use std::f32::consts::PI;
 use std::io;
+use std::num::NonZeroUsize;
 
 pub type Model = AXK1ForCausalLM<
     Embedding,
@@ -185,38 +189,41 @@ axes![
 /// The compiled YaRN encoding; every latent attention layer reads its tables.
 pub struct Yarn;
 
+/// The YaRN the size rotates by, as the published config declares it: factor 40 over 4096
+/// trained positions, both magnitudes 0.707.
+const YARN: YarnParameters = YarnParameters {
+    factor: Positive::new(40.0),
+    original_max_position_embeddings: NonZeroUsize::new(4096).unwrap(),
+    beta_fast: Some(32.0),
+    beta_slow: Some(1.0),
+    attention_factor: None,
+    mscale: Some(0.707),
+    mscale_all_dim: Some(0.707),
+    truncate: None,
+};
+
 impl Yarn {
-    const POSITIONS: usize = 4096;
-    const THETA: f32 = 10000.0;
-    const FACTOR: f64 = 40.0;
-    const BETA_FAST: f64 = 32.0;
-    const BETA_SLOW: f64 = 1.0;
-    const MSCALE: f64 = 0.707;
+    /// The spectrum the size rotates by: its YaRN at base 10000 over the whole rotated key.
+    pub fn spectrum() -> Spectrum {
+        Spectrum::new(Positive::new(10000.0), Kind::Yarn(Self::rescaling()))
+    }
 
     /// Inverse rotary frequencies, attention scale and rotation amplitude, in that order.
     pub fn tables() -> [Vec<f32>; 3] {
-        let correction = |rotations: f32| {
-            Rotary::SIZE as f32 * (Self::POSITIONS as f32 / (rotations * 2.0 * PI)).ln()
-                / (2.0 * Self::THETA.ln())
-        };
-        let low = correction(Self::BETA_FAST as f32).floor().max(0.0);
-        let high = correction(Self::BETA_SLOW as f32)
-            .ceil()
-            .min((Rotary::SIZE - 1) as f32);
-        let factor = Self::FACTOR as f32;
-        let inverse: Vec<f32> = (0..Rotary::SIZE / 2)
-            .map(|index| {
-                let frequency = Self::THETA.powf(-2.0 * index as f32 / Rotary::SIZE as f32);
-                let mask = 1.0 - ((index as f32 - low) / (high - low)).clamp(0.0, 1.0);
-                frequency / factor * (1.0 - mask) + frequency * mask
-            })
-            .collect();
-        let magnitude = 0.1 * Self::MSCALE as f32 * factor.ln() + 1.0;
+        let bound = Self::spectrum()
+            .bind::<Rotary, Rotary>()
+            .expect("the compiled YaRN binds");
+        let magnitude = Self::rescaling().magnitude();
+        let width = (Content::SIZE + Rotary::SIZE) as f64;
         [
-            inverse,
-            vec![magnitude * magnitude / (Content::SIZE as f32 + Rotary::SIZE as f32).sqrt()],
-            vec![1.0],
+            bound.pairs().to_vec(),
+            vec![(magnitude * magnitude / width.sqrt()) as f32],
+            vec![bound.amplitude()],
         ]
+    }
+
+    fn rescaling() -> config::scaling::Yarn {
+        YARN.try_into().expect("the compiled YaRN holds")
     }
 }
 
@@ -267,7 +274,8 @@ pub struct Config {
     first_k_dense_replace: usize,
     vocab_size: usize,
     rms_norm_eps: f64,
-    max_position_embeddings: usize,
+    #[serde(flatten, deserialize_with = "config::declared")]
+    max_position_embeddings: NonZeroUsize,
     #[serde(default)]
     tie_word_embeddings: bool,
     #[serde(default)]
@@ -292,13 +300,8 @@ pub struct Config {
     routed_scaling_factor: Option<f64>,
     #[serde(default)]
     moe_layer_freq: Option<usize>,
-    #[serde(default)]
-    rope_theta: Option<f64>,
-    /// Transformers 5 spells `rope_scaling` and `rope_theta` together as this.
-    #[serde(default)]
-    rope_parameters: Option<serde_json::Value>,
-    #[serde(default)]
-    rope_scaling: Option<serde_json::Value>,
+    #[serde(flatten, deserialize_with = "config::flattened")]
+    rope: Spectrum,
 }
 
 /// A config is of a size when it declares the size's values, at most its compiled vocabulary rows
@@ -393,43 +396,16 @@ where
                 Self::TIED_EMBEDDINGS
             )));
         }
-        if config.max_position_embeddings > Tokens::SIZE {
+        if config.max_position_embeddings.get() > Tokens::SIZE {
             return Err(unsupported(&format!(
                 "max_position_embeddings: past the compiled context of {}",
                 Tokens::SIZE
             )));
         }
-        let rope = config
-            .rope_parameters
-            .as_ref()
-            .or(config.rope_scaling.as_ref());
-        let yarn = rope.is_some_and(|rope| {
-            let kind = (rope.get("rope_type").or_else(|| rope.get("type")))
-                .and_then(serde_json::Value::as_str);
-            let holds = |key: &str, value: f64| {
-                rope.get(key).and_then(serde_json::Value::as_f64) == Some(value)
-            };
-            matches!(kind, Some("yarn" | "deepseek_yarn"))
-                && holds("factor", Yarn::FACTOR)
-                && holds("beta_fast", Yarn::BETA_FAST)
-                && holds("beta_slow", Yarn::BETA_SLOW)
-                && holds("mscale", Yarn::MSCALE)
-                && holds("mscale_all_dim", Yarn::MSCALE)
-                && holds("original_max_position_embeddings", Yarn::POSITIONS as f64)
-        });
-        let theta =
-            (config.rope_theta).or_else(|| rope.and_then(|rope| rope.get("rope_theta")?.as_f64()));
+        config::compiled("rope_parameters", config.rope, Yarn::spectrum())?;
         let not = |declared: Option<&str>, served: &str| declared.is_some_and(|it| it != served);
         let other = |declared: Option<usize>| declared.is_some_and(|it| it != 1);
         let features = [
-            (
-                !yarn,
-                "rope_scaling: DeepSeek-V2 rotates with its compiled YaRN",
-            ),
-            (
-                theta != Some(f64::from(Yarn::THETA)),
-                "rope_theta: DeepSeek-V2 rotates its compiled YaRN at 10000",
-            ),
             (
                 config.q_lora_rank.is_some(),
                 "q_lora_rank: DeepSeek-V2 projects its queries at full rank",
