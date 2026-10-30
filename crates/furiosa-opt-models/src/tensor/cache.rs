@@ -59,17 +59,11 @@ impl<Heads: AxisName, Dimension: AxisName> Blocks<Heads, Dimension> {
         blocks: Range<usize>,
         values: impl IntoIterator<Item = bf16>,
     ) -> Result<(), Box<dyn Error>> {
-        let values: Vec<_> = values.into_iter().collect();
-        let width = Self::BLOCK_STRIDE as usize / size_of::<bf16>();
-        assert_eq!(values.len(), blocks.len() * width);
-        for (block, values) in blocks.zip(values.chunks_exact(width)) {
-            HostTensor::<bf16, m![Block, KeyValue, Heads, Dimension]>::from_vec(
-                values.iter().copied(),
-            )
-            .to_hbm(&mut device.pdma)
-            .output(&mut self.tokens[block])
-            .await?;
-        }
+        let image = bf16::to_buf(&values.into_iter().collect::<Vec<_>>());
+        let bytes = Self::BLOCK_STRIDE as usize;
+        assert_eq!(image.len(), blocks.len() * bytes);
+        let blocks = self.tokens[blocks].iter_mut();
+        device.pdma.to_hbm(image.chunks(bytes).zip(blocks)).await?;
         Ok(())
     }
 
