@@ -32,7 +32,13 @@ pub(crate) type Reduced<G, Heads, Spread> = m![
 /// The heads of a slice's run that each slice of [`Queries`] keeps.
 pub(crate) type QueryLocal<G, Heads> = m![Heads % G];
 /// The rest of a slice's run, which [`Queries`] spreads over the slices.
-pub(crate) type QuerySpread<G, Heads> = m![Heads % (Heads / 8) / G];
+type Spread<G, Heads> = m![Heads % (Heads / 8) / G];
+/// `Spread` over the slices of a group's copies; a run of fewer heads leaves the rest empty.
+pub(crate) type QuerySpread<G, Heads> = m![{ Spread<G, Heads> } # ({ <G as Group>::Copies })];
+/// The slices of a group's copies as `Spread` and the copies past it, which a tensor the same
+/// in every head fills, the slices a run of fewer heads leaves empty included.
+pub(crate) type SpreadCopies<G, Heads> =
+    m![{ Spread<G, Heads> }, { <G as Group>::Copies } / ({ Spread<G, Heads> })];
 /// The slices of [`Queries`].
 pub(crate) type QuerySlices<G, Heads> = Rows<G, Heads, QuerySpread<G, Heads>>;
 /// The projected queries of `Heads`, as their head norm and rotation read them.
@@ -52,9 +58,11 @@ mod tests {
     use super::group::{TilePair, Tiles};
     use super::matrix::Dense;
     use super::*;
-    use crate::modules::attention::Projection;
+    use crate::Module;
+    use crate::modules::attention::{KeyValue, Projection};
     use crate::modules::generic::Either;
-    use crate::modules::generic::schedule::{Fill, IntoStream, Stream};
+    use crate::modules::generic::schedule::{Begin, Fill, IntoStream, Stream};
+    use crate::ops::attention::full::head;
     use crate::ops::attention::geometry::Hidden;
     use crate::ops::linear::Affine;
     use crate::ops::normalization::tests::random;
@@ -62,9 +70,13 @@ mod tests {
         Blocked, Scaled,
         span::{Owned, Span},
     };
+    use crate::ops::rotary::group::{InputHalf, OutputHalf, Rotation};
+    use crate::ops::rotary::{Rotary, Row, SplitHalf};
+    use crate::tensor::form::Weight;
     use crate::tensor::live::{self, Live};
-    use crate::tensor::scalar::Value;
+    use crate::tensor::scalar::{F32, Value};
     use crate::tests::DEVICE;
+    use core::marker::PhantomData;
     use core::task::Poll;
     use furiosa_opt_std::runtime::launch;
 
@@ -340,6 +352,29 @@ mod tests {
         }
     }
 
+    axes![Sixteen = 16, Two = 2, Four = 4, Waves = 8];
+
+    /// The hidden width of the Qwen3 size of sixteen query heads.
+    type Narrow = Hidden<1024>;
+    /// Qwen3's head norm epsilon, as FP32 bits.
+    const EPSILON: usize = 1e-6_f32.to_bits() as usize;
+    type Half = Row<Head>;
+    /// Each wave's rotation: `[out, in, pair]` coefficients for each of its rows.
+    type Rotations = SplitHalf<Head, Rotation<Waves, Half>>;
+    type Norm = head::Stored<Head, EPSILON>;
+    /// The dense projections of `Q` query heads over the key and value heads.
+    type Heads<Q> = Projection<
+        Affine<Dense<Narrow, Q, Head>, ()>,
+        Affine<(Dense<Narrow, KvHeads, Head>, ()), ()>,
+        Affine<(Dense<Narrow, KvHeads, Head>, ()), ()>,
+    >;
+    /// A launch's queries, `G` for each key and value head, as attention reads them.
+    type Grouped<G> = HbmTensor<bf16, Chip, m![All, KvHeads, G, Head]>;
+    type Period = Either<
+        super::matrix::Period<Narrow, TilePair, All>,
+        super::matrix::Period<Narrow, Single, All>,
+    >;
+
     /// A period's output rows from row `start` into the launch's rows in HBM, `Local` of a
     /// slice's run of heads in each slice and the rest spread over `Spread`.
     fn store<G: Group, Heads: AxisName, Spread: M, Local: M, All: AxisName>(
@@ -504,5 +539,229 @@ mod tests {
             (0.04, Span::SIZE),
         )
         .await;
+    }
+
+    // # A period's heads through the query path
+
+    /// A launch's queries, keys and values of `Q` query heads, `G` a key and value head, through
+    /// the query path a period at a time, as its attention's stage stores them.
+    #[device(chip = 1)]
+    fn stored<Q: AxisName, G: AxisName>(
+        device: &mut Device,
+        projection: &Heads<Q>,
+        norms: &(Norm, Norm),
+        rotations: &Rotations,
+        rows: &super::launch::Normalized<Narrow, All>,
+        count: &Value,
+        queries: &mut Grouped<G>,
+    ) -> (KeyRows, KeyRows) {
+        let live = Live::<(), All>::read(count);
+        let Projection { query, key, value } = projection;
+        let value = value.forward(&mut *device, live, &mut (), Begin(()));
+        let mut launch = value.forward(&mut *device, live, &mut (), Begin(()));
+        let key = key.forward(&mut *device, live, &mut (), Begin(()));
+        let query = query.forward(&mut *device, live, &mut (), Begin(()));
+        let query_norm = norms.0.forward(&mut *device, live, &mut (), Begin(()));
+        let key_norm = norms.1.forward(&mut *device, live, &mut (), Begin(()));
+        let stage = KeyValue {
+            write: (),
+            read: (),
+        };
+        let mut retained = (KeyRows::new(), KeyRows::new());
+        let mut store = |device: &mut Device, period: Live<Period, All>| {
+            let at = period.with(());
+            let rows = period.value();
+            let projected = (
+                query.forward(&mut *device, live, &mut (), rows),
+                key.forward(&mut *device, live, &mut (), rows),
+                value.forward(&mut *device, live, &mut (), rows),
+            );
+            let normalized = (
+                query_norm.forward(&mut *device, live, &mut (), projected.0),
+                key_norm.forward(&mut *device, live, &mut (), projected.1),
+            );
+            let positioned = (normalized, &(rotations, at));
+            let (query, key) =
+                Rotary::<Head>::new().forward(&mut *device, live, &mut (), positioned);
+            let heads = at.with((query, key, projected.2));
+            let places = (&mut *queries, &mut retained);
+            stage.forward(device, (), &mut &mut (), (places, heads));
+        };
+        type Pair = <TilePair as Group>::Period;
+        let pairs = live.count::<Tile>() / 2;
+        for at in 0..pairs {
+            let next = launch.period::<TilePair>(rows, at);
+            let period = value.forward(&mut *device, live, &mut (), next);
+            store(
+                &mut *device,
+                live.tile::<Pair>(at).with(Either::Left(period)),
+            );
+        }
+        for _ in 0..live.count::<Tile>() % 2 {
+            let next = launch.period::<Single>(rows, pairs);
+            let period = value.forward(&mut *device, live, &mut (), next);
+            let single = live.tile::<Tile>(2 * pairs).with(Either::Right(period));
+            store(&mut *device, single);
+        }
+        retained
+    }
+
+    /// A row's `heads`, each normalized with `gain`, then rotated by the row's `rotation`: an
+    /// output half the sum over the input halves of their coefficients times them.
+    fn positioned(heads: &[f64], gain: &[bf16], rotation: &[bf16]) -> Vec<f64> {
+        let half = Half::SIZE;
+        let epsilon = f64::from(f32::from_bits(EPSILON as u32));
+        let mut rows = Vec::with_capacity(heads.len());
+        for head in heads.chunks_exact(Head::SIZE) {
+            let mean = head.iter().map(|v| v * v).sum::<f64>() / Head::SIZE as f64;
+            let normalized: Vec<f64> = (head.iter().zip(gain))
+                .map(|(v, g)| v / (mean + epsilon).sqrt() * f64::from(g.to_f32()))
+                .collect();
+            for out in 0..2 {
+                for pair in 0..half {
+                    let rotated = (0..2).map(|input| {
+                        let c = rotation[(out * 2 + input) * half + pair];
+                        f64::from(c.to_f32()) * normalized[input * half + pair]
+                    });
+                    rows.push(rotated.sum());
+                }
+            }
+        }
+        rows
+    }
+
+    /// The largest RMS of `got - expected` relative to that of `expected`, over the heads.
+    fn worst(got: &[bf16], expected: &[f64]) -> f64 {
+        let heads = got
+            .chunks_exact(Head::SIZE)
+            .zip(expected.chunks_exact(Head::SIZE));
+        heads.fold(0.0, |worst, (got, expected)| {
+            let (difference, norm) = got.iter().zip(expected).fold((0.0, 0.0), |(d, n), (g, e)| {
+                let g = f64::from(g.to_f32());
+                (d + (g - e) * (g - e), n + e * e)
+            });
+            f64::max(worst, (difference / norm).sqrt())
+        })
+    }
+
+    /// A launch of `rows` rows of `Q` query heads, `G` a key and value head: each row's stored
+    /// heads against the definition, within BF16 rounding.
+    async fn stores<Q: AxisName, G: AxisName>(device: &mut Device, rows: usize) {
+        const { assert!(Q::SIZE == KvHeads::SIZE * G::SIZE) };
+        let (query, pair) = (Q::SIZE * Head::SIZE, KvHeads::SIZE * Head::SIZE);
+        let weights = [
+            random(query * Narrow::SIZE, 0x9e37_79b9),
+            random(pair * Narrow::SIZE, 0x7f4a_7c15),
+            random(pair * Narrow::SIZE, 0x3c6e_f372),
+        ];
+        async fn upload<Heads: AxisName>(
+            device: &mut Device,
+            values: &[bf16],
+        ) -> Dense<Narrow, Heads, Head> {
+            HostTensor::<bf16, m![Heads, Head, Narrow]>::from_vec(values.to_vec())
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap()
+        }
+        let projection: Heads<Q> = Projection {
+            query: Affine::new(upload::<Q>(device, &weights[0]).await, ()),
+            key: Affine::new((upload::<KvHeads>(device, &weights[1]).await, ()), ()),
+            value: Affine::new((upload::<KvHeads>(device, &weights[2]).await, ()), ()),
+        };
+        async fn norm(device: &mut Device, gain: &[bf16]) -> Norm {
+            let replicated = gain.repeat(head::Replica::SIZE);
+            let weight = HostTensor::<bf16, head::Replicated<Head>>::from_vec(replicated)
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+            Norm {
+                weight: Weight::new(weight),
+                epsilon: F32,
+                head: PhantomData,
+            }
+        }
+        let gains = [0xa076_1d64, 0xe703_7ed1].map(|seed| {
+            (random(Head::SIZE, seed).iter())
+                .map(|g| bf16::from_f32(1.0 + g.to_f32() / 2.0))
+                .collect::<Vec<_>>()
+        });
+        let norms = (norm(device, &gains[0]).await, norm(device, &gains[1]).await);
+        type Table = m![Waves, Tile, OutputHalf, InputHalf, Half];
+        let entry = 4 * Half::SIZE;
+        let table = random(Waves::SIZE * Tile::SIZE * entry, 0x8ebc_6af0);
+        let rotations = Rotations {
+            frequency: HostTensor::<bf16, Table>::from_vec(table.clone())
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap(),
+            head: PhantomData,
+        };
+        let x = random(All::SIZE * Narrow::SIZE, 0x2545_f491);
+        let input = HostTensor::<bf16, m![All, Narrow]>::from_vec(x.clone())
+            .to_hbm::<Chip, m![All / 8, Narrow / 16, All % 8, Narrow % 16]>(&mut device.pdma)
+            .await
+            .unwrap();
+        let count = live::tests::count(rows)
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap();
+        let mut queries: Grouped<G> = HostTensor::<bf16, m![All, KvHeads, G, Head]>::zero()
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap();
+        let arguments = (
+            &mut *device,
+            &projection,
+            &norms,
+            &rotations,
+            &input,
+            &count,
+            &mut queries,
+        );
+        let (keys, values) = launch(stored, arguments).await.unwrap();
+        let queries = queries
+            .to_host::<m![All, KvHeads, G, Head]>(&mut device.pdma)
+            .await
+            .unwrap()
+            .into_vec();
+        let mut pairs = Vec::new();
+        for rows in [keys, values] {
+            let host = rows.to_host::<m![All, KvHeads, Head]>(&mut device.pdma);
+            pairs.push(host.await.unwrap().into_vec());
+        }
+        let x: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
+        let logical = weights.map(|w| w.iter().map(|v| v.to_f32()).collect::<Vec<_>>());
+        for row in 0..rows {
+            let x = &x[row * Narrow::SIZE..][..Narrow::SIZE];
+            let rotation = &table[row * entry..][..entry];
+            let expected = [
+                positioned(&reference(x, &logical[0]), &gains[0], rotation),
+                positioned(&reference(x, &logical[1]), &gains[1], rotation),
+                reference(x, &logical[2]),
+            ];
+            let got = [
+                &queries[row * query..][..query],
+                &pairs[0][row * pair..][..pair],
+                &pairs[1][row * pair..][..pair],
+            ];
+            for (which, (got, expected)) in got.iter().zip(&expected).enumerate() {
+                let error = worst(got, expected);
+                assert!(
+                    error <= 0.02,
+                    "{} query heads, row {row}, output {which}: relative error {error}",
+                    Q::SIZE
+                );
+            }
+        }
+    }
+
+    /// At sixteen query heads, half the slices empty, as at 32: a pair of tiles and a single tile
+    /// store their rows' heads projected, query and key heads normalized and rotated by their row.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stores_rotated_heads_at_sixteen_queries() {
+        let _lease = DEVICE.lock().await;
+        let mut device = Device::new(stored.topology()).unwrap();
+        stores::<Sixteen, Two>(&mut device, 3 * Tile::SIZE).await;
+        stores::<QueryHeads, Four>(&mut device, 3 * Tile::SIZE).await;
     }
 }
