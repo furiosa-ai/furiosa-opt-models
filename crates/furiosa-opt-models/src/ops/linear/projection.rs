@@ -1,6 +1,6 @@
 //! Single-row BF16 projections that read the weight four output rows of each block at a time.
 
-use super::kernel::{Contraction, Rounded, Tiling};
+use super::kernel::{Contraction, Rounded, Rounding, Tiling};
 use super::{Affine, Matrix};
 use crate::ops::normalization::Spread;
 use crate::tensor::form::BlockScaled;
@@ -139,12 +139,22 @@ impl<I: AxisName, O: AxisName, Chip: M, W: Matrix<Chip, In = I, Out = O>>
         for block in 0..(O::SIZE / 256) {
             let index = 4 * block;
             let tile = self.weight.tile::<OneRow<I, O>>(device, index);
-            Rounded::finish::<_, _, _, _, _, m![1], Elements<O>, _, _, _>(
-                Contraction::<I, O>::sums(device, &tile, &input)
-                    .vector_init()
-                    .vector_inter_slice_reduce::<Reduced<O>, m![{ Elements<O> }, 1]>(
-                        InterSliceReduceOpF32::Add,
-                    ),
+            bf16::finish::<
+                Reduced<O>,
+                m![{ Elements<O> }, 1],
+                m![1],
+                m![1],
+                Elements<O>,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+            >(
+                &(),
+                Contraction::<I, O>::sums(device, &tile, &input),
                 output
                     .view_mut()
                     .tile::<m![O % ({ Block<O> })], 4, m![{ Elements<O> } #{!} ({ Block<O> })]>(
