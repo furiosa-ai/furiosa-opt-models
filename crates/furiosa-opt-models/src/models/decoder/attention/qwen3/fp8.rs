@@ -31,8 +31,8 @@ impl TryFrom<&decoder::Config<Spectrum>> for Config {
     fn try_from(config: &decoder::Config<Spectrum>) -> io::Result<Self> {
         if !matches!(
             &config.quantization_config,
-            Some(Quantization { scheme: Scheme::Block, excluded: Exclusions(excluded), kv_cache: false })
-                if excluded.is_empty()
+            Some(Quantization { schemes, excluded: Exclusions(excluded), kv_cache: false })
+                if *schemes == [Scheme::Block] && excluded.is_empty()
         ) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,

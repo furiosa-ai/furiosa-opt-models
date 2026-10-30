@@ -301,7 +301,9 @@ impl<Width: AxisName, Rows: AxisName, Env, Chips: M + 'static>
 }
 
 /// Write key and value rows to distinct physical byte offsets, bounded by the supplied count.
+/// The rows are written as they are, so a checkpoint's static E4M3 cache scales go unread.
 #[derive(Default, DeviceSend, Load)]
+#[load(ignore = "k_scale", ignore = "v_scale")]
 pub struct Scatter;
 
 /// The offsets and count are owned or borrowed, so a count every layer shares stays one operand.

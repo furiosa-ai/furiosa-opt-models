@@ -1,152 +1,188 @@
-//! Gemma 4's dense text function: a scaled token embedding, sliding and full attention layers
-//! interleaved in checkpoint order, and a softcapped tied vocabulary head.
+//! Gemma 4's dense text model: a scaled token embedding, sliding and full attention layers
+//! interleaved in checkpoint order, a final norm, and a greedy head tied to the embedding.
 //!
-//! - A size is a [`decoder::Geometry`] of the model axes with the sliding group first, and the
-//!   projection forms are [`decoder::Projections`]; every default is the served 12B checkpoint,
-//!   whose axes this module declares.
+//! - A [`Size`] is a published size; its [`Geometry`] holds the model-wide axes, and its layers
+//!   attend in [`sliding::Group`] or [`full::Group`], each a [`decoder::Attention`] of its own
+//!   [`LayerType`].
+//! - [`ForCausalLM`] and [`Model`] are the shared roots over [`Catalog`], the one binding of the
+//!   [`Gemma4ForCausalLM`] recipe: its body is the base model's, its head the causal model's.
+//! - A checkpoint keeps the text model under `model.language_model`, beside the media embedders,
+//!   and its config in `text_config`; [`Quantized`] holds its projections as it stores them.
 
-use crate::Sequential;
+use super::{Geometry, LayerType};
+use crate::load::{self, Checkpoint, Load, LoadError, Named};
 use crate::models::config::decoder::Language;
 use crate::models::config::{
-    self, Constant, Disabled, Enabled, Literal, Positive, Quantization, Scheme, Size, compiled,
-    scaling::Spectra,
+    self, Constant, Disabled, Enabled, Literal, Positive, compiled, scaling::Spectra,
 };
-use crate::models::decoder::{
-    self, Attention, Declaration, Forms, Requirement, Rotation, Shape, form,
-};
+use crate::models::decoder::{self, Attention, Forms, Rotation, form};
 use crate::models::{Family, vocabulary};
-use crate::modules::attention;
-use crate::modules::{language, multimodal, transformer};
+use crate::modules::attention::{self, key_value};
+use crate::modules::language::{self, Greedy};
+use crate::modules::{multimodal, transformer};
 use crate::ops::attention::gqa::Cache;
-use crate::ops::embedding;
+use crate::ops::embedding::Embedding;
 use crate::ops::index::scatter::Scatter;
-use crate::ops::index::table::History;
 use crate::ops::linear::Affine;
 use crate::ops::normalization::{RmsNorm, UnitRmsNorm};
 use crate::ops::pointwise::activation::NewGelu;
-use crate::ops::pointwise::activation::Tanh;
-use crate::ops::pointwise::add;
-use crate::ops::pointwise::multiply;
-use crate::tensor::cache::Blocks;
-use crate::tensor::scalar::Value;
-use crate::{Branch, Then};
+use crate::ops::pointwise::{add, multiply};
+use crate::ops::reduction::Argmax;
+use crate::tensor::axis;
+use crate::tensor::cache;
+use crate::tensor::form::Weight;
+use crate::tensor::memory::{Hbm, Memory};
+use crate::tensor::parallel::{Chip, Parallel};
+use crate::{Branch, Op, Sequential, Then};
 use furiosa_opt_std::prelude::*;
 use serde::Deserialize;
-use std::{io, marker::PhantomData, num::NonZeroUsize};
+use std::{io, num::NonZeroUsize};
 
-/// Scaled embedding, `S` sliding and `F` full attention layers in order `O`, final norm and
-/// softcapped vocabulary logits, at geometry `G` with projection forms `P`.
-pub type Model<
-    G = Sizes,
-    P = Quantized,
-    const S: usize = SLIDING,
-    const F: usize = FULL,
-    const O: &'static [Branch] = ORDER,
-> = Gemma4ForCausalLM<
-    Embedding<<G as Shape>::Vocabulary, <G as Shape>::Hidden>,
-    Qkv<<G as Shape>::Hidden, <G as Shape>::Queries, <G as Shape>::First, P>,
-    decoder::Position<<G as Shape>::First>,
-    decoder::Attend<<G as Shape>::First, UNSCALED>,
-    decoder::Output<P, <G as Shape>::Hidden, <G as Shape>::First>,
-    Qkv<<G as Shape>::Hidden, <G as Shape>::Queries, <G as Shape>::Second, P>,
-    decoder::Position<<G as Shape>::Second>,
-    decoder::Attend<<G as Shape>::Second, UNSCALED>,
-    decoder::Output<P, <G as Shape>::Hidden, <G as Shape>::Second>,
+/// A published Gemma 4 checkpoint size, by its hub spelling.
+pub struct Size<const N: &'static str>;
+
+/// HF `Gemma4ForCausalLM`: the text model, then the greedy head tied to its embedding, in
+/// projection forms `P`, a cache of `C` and memory `X`, for calls of `R` rows.
+pub type ForCausalLM<P = Quantized, C = cache::Bf16, X = Hbm, R = Rows> =
+    super::ForCausalLM<Size<"12B">, Model<P, C, X, R>, LmHead<X>, P>;
+
+/// HF `Gemma4TextModel`: the embedding, the layers and the final norm, and the constants that
+/// prepare a call's attention context in each group.
+pub type Model<P = Quantized, C = cache::Bf16, X = Hbm, R = Rows> =
+    super::Model<Size<"12B">, Body<P, C, X>, RotaryEmbedding<C, X, R>, P>;
+
+/// The embedding, the layers and the final norm: the body of the catalog binding.
+pub type Body<P = Quantized, C = cache::Bf16, X = Hbm> = Catalog<P, C, X>::Body;
+
+/// The one binding of the [`Gemma4ForCausalLM`] recipe over the published size's axes, its
+/// projections in forms `P`, its cache of `C` and every leaf in memory `X`.
+pub type Catalog<P, C, X> = Gemma4ForCausalLM<
+    Then<Named<"embed_tokens", Table<X>>, Normalizer<X>>,
+    Qkv<sliding::Group, P, X, Named<"v_proj", Values<sliding::Group, P, X>>>,
+    decoder::Position<sliding::Group, C>,
+    decoder::Attend<sliding::Group, UNSCALED>,
+    Output<sliding::Group, P, X>,
+    Qkv<full::Group, P, X, Named<"k_proj", Keys<full::Group, P, X>>>,
+    decoder::Position<full::Group, C>,
+    decoder::Attend<full::Group, UNSCALED>,
+    Output<full::Group, P, X>,
     Scatter,
     (),
-    decoder::FeedForward<P, <G as Shape>::Hidden, <G as Shape>::Intermediate, NewGelu>,
-    RmsNorm<<G as Shape>::Hidden>,
+    decoder::FeedForward<P, Hidden, Intermediate, NewGelu, Parallel<1>, X>,
+    Norm<Hidden, X>,
     add::Add,
-    Scale,
-    Head<<G as Shape>::Vocabulary, <G as Shape>::Hidden>,
-    S,
-    F,
-    O,
+    Named<"layer_scalar", Scale<X>>,
+    LmHead<X>,
+    SLIDING,
+    FULL,
+    ORDER,
 >;
 
-/// Scaled embedding and interleaved decoder layers followed by final RMS normalization.
-pub type Body<
-    G = Sizes,
-    P = Quantized,
-    const S: usize = SLIDING,
-    const F: usize = FULL,
-    const O: &'static [Branch] = ORDER,
-> = Model<G, P, S, F, O>::Body;
+/// The greedy head over the vocabulary rows: the projection by the tied embedding table, whose
+/// bias lowers no row, and the first maximum of each row's scores; a logit softcap, being
+/// monotone, leaves that maximum.
+pub type LmHead<X = Hbm> = Greedy<
+    Hidden,
+    Vocabulary,
+    Affine<
+        <X as Memory>::Tensor<bf16, Chip, m![Vocabulary, Hidden]>,
+        <X as Memory>::Tensor<f32, Chip, m![Vocabulary]>,
+    >,
+    Argmax<Vocabulary, Chip, <X as Memory>::Tensor<i32, Chip, m![Vocabulary]>>,
+>;
 
-/// Token lookup scaled by the factor its configuration fixes.
-pub type Embedding<Vocabulary, Hidden> = Then<embedding::Embedding<Vocabulary, Hidden>, Scale>;
+/// The token table.
+type Table<X> = Embedding<
+    Vocabulary,
+    Hidden,
+    Chip,
+    Weight<m![Vocabulary, Hidden], Chip, <X as Memory>::Tensor<bf16, Chip, m![Vocabulary, Hidden]>>,
+>;
 
-type Scale = multiply::Scale<HbmTensor<f32, Chip, m![1 # 8]>>;
+/// Group `A`'s query, key and value heads: queries and keys normalized by learned gains, and the
+/// heads of value projection `V` by unit gain.
+type Qkv<A, P, X, V> = attention::NormalizedQkv<
+    attention::Projection<
+        Named<"q_proj", Heads<<P as Forms>::Query, <A as Attention>::QueryWidth, QueryView<A>, X>>,
+        Named<"k_proj", Keys<A, P, X>>,
+        Then<V, UnitNorm<<A as Attention>::Head, X>>,
+    >,
+    Named<"q_norm", Norm<<A as Attention>::Head, X>>,
+    Named<"k_norm", Norm<<A as Attention>::Head, X>>,
+>;
 
-type Chip = m![1];
+/// Group `A`'s query heads, each key/value head's together, as the call's rows read them.
+type QueryView<A> = <Rows as decoder::Envelope>::Queries<
+    Queries,
+    <A as Attention>::Heads,
+    <A as Attention>::Groups,
+    <A as Attention>::Head,
+>;
+
+/// Group `A`'s key heads; a full group's values are the same projection's heads, as its
+/// checkpoint stores keys alone.
+type Keys<A, P, X> = Heads<<P as Forms>::Key, <A as Attention>::KvWidth, KvView<A>, X>;
+
+/// Group `A`'s value heads.
+type Values<A, P, X> = Heads<<P as Forms>::Value, <A as Attention>::KvWidth, KvView<A>, X>;
+
+/// Group `A`'s key/value heads.
+type KvView<A> = decoder::HeadView<<A as Attention>::Heads, <A as Attention>::Head>;
+
+/// Heads read as `View`, projected from a row in form `F` to `Width` features.
+type Heads<F, Width, View, X> = decoder::Heads<F, Hidden, Width, View, bf16, Parallel<1>, X>;
+
+/// Group `A`'s attended heads projected back to rows.
+type Output<A, P, X> = Named<"o_proj", decoder::Output<P, Hidden, A, Parallel<1>, X>>;
+
+/// The norm of every Gemma 4 layer and head: `rms_norm_eps` 1e-6.
+type Norm<W, X> = <Size<"12B"> as Geometry>::Norm<W, X>;
+
+/// A norm of unit gain, whose checkpoint stores no weight.
+type UnitNorm<W, X> = UnitRmsNorm<W, EPSILON, m![1], <X as Memory>::Tensor<bf16, m![1], m![W]>>;
+
+/// Multiplies rows by one FP32 value held in memory `X`.
+type Scale<X> = multiply::Scale<<X as Memory>::Tensor<f32, Chip, m![1 # 8]>>;
+
+/// The constants that prepare a call's rotations, write slots and paged history reads, one set
+/// a group, for calls of `R` rows and a cache of `C`.
+type RotaryEmbedding<C, X, R> = (
+    Preparation<sliding::Group, C, X, R>,
+    Preparation<full::Group, C, X, R>,
+);
+
+/// Group `A`'s constants, bound to its layer type's rotary spectrum and window.
+type Preparation<A, C, X, R> = key_value::Preparation<
+    R,
+    key_value::Paging<
+        <A as Attention>::Heads,
+        <A as Attention>::Head,
+        R,
+        <A as Attention>::Windows,
+        C,
+        X,
+        Chip,
+        <A as Attention>::Rotated,
+        A,
+    >,
+    Chip,
+    X,
+>;
+
+/// The rows a call prepares its attention context for.
+pub type Rows = axis::Rows<64>;
 
 /// Normalized queries and keys make scores need no multiplier.
 const UNSCALED: usize = 1.0_f32.to_bits() as usize;
 
-/// Group `A`'s query, key and value projections into heads: queries and keys normalized by learned
-/// gains, values by unit gain.
-pub type Qkv<Hidden, Queries, A, P> = attention::Projection<
-    decoder::NormalizedHeads<
-        <P as Forms>::Query,
-        Hidden,
-        <A as Attention>::QueryWidth,
-        Queries,
-        <A as Attention>::Head,
-        RmsNorm<<A as Attention>::Head>,
-    >,
-    decoder::NormalizedHeads<
-        <P as Forms>::Key,
-        Hidden,
-        <A as Attention>::KvWidth,
-        <A as Attention>::Heads,
-        <A as Attention>::Head,
-        RmsNorm<<A as Attention>::Head>,
-    >,
-    decoder::NormalizedHeads<
-        <P as Forms>::Value,
-        Hidden,
-        <A as Attention>::KvWidth,
-        <A as Attention>::Heads,
-        <A as Attention>::Head,
-        UnitRmsNorm<<A as Attention>::Head>,
-    >,
->;
+/// `rms_norm_eps` of the published size, as the bits of the FP32 nearest to it.
+const EPSILON: usize = 1e-6_f32.to_bits() as usize;
 
-/// Tied vocabulary projection whose logits `z` become `c * tanh(z / c)`.
-pub type Head<Vocabulary, Hidden> =
-    Then<Then<Then<Affine<HbmTensor<bf16, Chip, m![Vocabulary, Hidden]>, ()>, Scale>, Tanh>, Scale>;
-
-/// Token id, semantic attention context and writable sliding/full layer-cache arrays.
-pub type Context<
-    'a,
-    const ALIGNED: bool = true,
-    G = Sizes,
-    const S: usize = SLIDING,
-    const F: usize = FULL,
-> = (
-    Value,
-    attention::Context<&'a Value, &'a Value, History<'a, ALIGNED>>,
-    (
-        &'a mut [Blocks<
-            <<G as Shape>::First as Attention>::Heads,
-            <<G as Shape>::First as Attention>::Head,
-            bf16,
-            Chip,
-        >; S],
-        &'a mut [Blocks<
-            <<G as Shape>::Second as Attention>::Heads,
-            <<G as Shape>::Second as Attention>::Head,
-            bf16,
-            Chip,
-        >; F],
-    ),
-);
-
-/// Sliding and full attention layer counts of the served checkpoint.
+/// Sliding and full attention layer counts of the published size.
 pub const SLIDING: usize = 40;
 pub const FULL: usize = 8;
 
-/// Every sixth layer of the served checkpoint attends over its full history.
+/// Every sixth layer of the published size attends over its full history.
 pub const ORDER: &[Branch] = &Branch::periodic::<{ SLIDING + FULL }>(6);
 
 /// The layer types a checkpoint names its sliding and full attention layers by.
@@ -159,11 +195,7 @@ axes![
     Queries = 16
 ];
 
-/// The served checkpoint's geometry.
-pub type Sizes =
-    decoder::Geometry<Hidden, Intermediate, Vocabulary, Queries, sliding::Group, full::Group>;
-
-/// FP8 per-channel attention projections and an NVFP4 feed-forward, as the served checkpoint
+/// FP8 per-channel attention projections and an NVFP4 feed-forward, as the published checkpoint
 /// stores them.
 pub type Quantized = decoder::Projections<
     form::ChannelScaled,
@@ -208,99 +240,109 @@ pub mod full {
     pub type Group = decoder::Group<Heads, Head, Groups, QueryWidth, KvWidth, Rotated, Windows>;
 }
 
-/// Supported context lengths, rotary frequencies and head constants for the two compiled attention
-/// groups of geometry `G`, projection forms `P` and layer order `O`.
-pub struct Config<
-    G: Shape = Sizes,
-    P = Quantized,
-    const S: usize = SLIDING,
-    const F: usize = FULL,
-    const O: &'static [Branch] = ORDER,
-> {
-    /// Maximum token positions for full attention.
-    pub positions: usize,
-    /// Sliding history width in tokens.
-    pub window: usize,
-    /// The frequencies each group's rotation binds, in sliding, full order.
-    pub rotary: (Bound<Sliding<G>>, Bound<Full<G>>),
-    /// Multiplier of every embedded token row: the BF16-rounded square root of the hidden width.
-    pub embedding: f32,
-    /// The bound `c` of the head's `c * tanh(z / c)` logits.
-    pub softcap: f32,
-    /// The NVFP4 projections the checkpoint declares, which NVFP4 forms require.
-    pub quantization: Option<Quantization>,
-    compiled: PhantomData<fn() -> (G, P)>,
+impl LayerType for sliding::Group {
+    const NAME: Option<&'static str> = Some(LAYER_TYPES[0]);
 }
 
-impl<G: Shape, P, const S: usize, const F: usize, const O: &'static [Branch]> Clone
-    for Config<G, P, S, F, O>
+impl LayerType for full::Group {
+    const NAME: Option<&'static str> = Some(LAYER_TYPES[1]);
+}
+
+// Each group's widths are its heads' products, and both groups hold the model's query heads.
+const _: () = assert!(
+    <sliding::Group as Attention>::CONSISTENT
+        && <full::Group as Attention>::CONSISTENT
+        && sliding::Heads::SIZE * sliding::Groups::SIZE == Queries::SIZE
+        && full::Heads::SIZE * full::Groups::SIZE == Queries::SIZE
+        && ORDER.len() == SLIDING + FULL
+);
+
+impl Geometry for Size<"12B"> {
+    type Hidden = Hidden;
+    type Intermediate = Intermediate;
+    type Vocabulary = Vocabulary;
+    type Layers<L> = [L; Self::LAYERS];
+    type Norm<W: AxisName, X: Memory> =
+        RmsNorm<W, EPSILON, m![1], Weight<m![W], m![1], <X as Memory>::Tensor<bf16, m![1], m![W]>>>;
+
+    const SIZE: &'static str = "12B";
+    const FAMILY: &'static str = "gemma4";
+    const LAYERS: usize = SLIDING + FULL;
+    const EPSILON: usize = EPSILON;
+    const TIED_EMBEDDINGS: bool = true;
+}
+
+/// A checkpoint keeps the text model beside the media embedders, which no text class reads.
+impl Family for Size<"12B"> {
+    type Hf = Hf;
+
+    const MODEL: &'static str = "model.language_model";
+    const CONFIG: &'static str = "text_config";
+    const IGNORE: &'static [&'static str] = &[
+        "model.vision_embedder",
+        "model.embed_vision",
+        "model.embed_audio",
+    ];
+}
+
+/// Every embedded row's multiplier: the BF16 rounding of `sqrt(hidden_size)`, which Transformers'
+/// scaled embedding computes and no checkpoint stores.
+#[derive(DeviceSend, Load)]
+#[load(tree)]
+pub struct Normalizer<X: Memory = Hbm>(Scale<X>);
+
+/// The multiplier a load places from the config's `hidden_size`.
+impl<'a, X: Memory> Load<&'a Checkpoint> for Normalizer<X>
+where
+    <X as Memory>::Tensor<f32, Chip, m![1 # 8]>: Load<HostTensor<f32, m![{ Chip }, { m![1 # 8] }]>>,
 {
-    fn clone(&self) -> Self {
-        Self {
-            rotary: self.rotary.clone(),
-            quantization: self.quantization.clone(),
-            ..*self
-        }
+    fn load(context: &mut load::Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
+        context.checkpoint(from, |cx| {
+            let (_, hidden) = cx.config_number(from, "hidden_size")?;
+            let factor = bf16::from_f32((hidden as f32).sqrt()).to_f32();
+            let host: HostTensor<f32, m![{ Chip }, { m![1 # 8] }]> =
+                HostTensor::from_vec([factor, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+            let scale = cx.field("0", "", |cx| cx.field("0", "", |cx| Load::load(cx, host)));
+            scale.map(|factor| Self(multiply::Scale(factor)))
+        })
     }
 }
 
-impl<G: Shape, P: Forms, const S: usize, const F: usize, const O: &'static [Branch]> Family
-    for Config<G, P, S, F, O>
+/// The multiplier is no update target.
+impl<'t, 's, X: Memory> Load<(&'t mut Normalizer<X>, &'s Checkpoint)> for &'t mut Normalizer<X> {
+    fn load(
+        context: &mut load::Context<'_>,
+        (into, from): (&'t mut Normalizer<X>, &'s Checkpoint),
+    ) -> Result<Self, LoadError> {
+        context.checkpoint(from, |_| Ok(()))?;
+        Ok(into)
+    }
+}
+
+impl<I, X: Memory> Op<I> for Normalizer<X>
+where
+    Scale<X>: Op<I>,
 {
-    type Hf = Hf<G>;
-}
+    type Output = <Scale<X> as Op<I>>::Output;
 
-impl<G: Shape, P: Forms, const S: usize, const F: usize, const O: &'static [Branch]> decoder::Paired
-    for Config<G, P, S, F, O>
-{
-    type Model<CacheScalar: Scalar> =
-        decoder::Interleaved<G, S, F, CacheScalar, Model<G, P, S, F, O>>;
-
-    type First = <Sliding<G> as Attention>::Rotated;
-    type Second = <Full<G> as Attention>::Rotated;
-
-    fn positions(&self) -> usize {
-        self.positions
-    }
-
-    fn groups(&self) -> ((Bound<Sliding<G>>, usize), (Bound<Full<G>>, usize)) {
-        let (sliding, full) = self.rotary.clone();
-        ((sliding, self.window), (full, self.positions))
-    }
-
-    fn constants(&self) -> decoder::Constants {
-        decoder::Constants {
-            embedding: Some(self.embedding),
-            softcap: Some(self.softcap),
-            ..Default::default()
-        }
+    fn forward(&self, device: &mut Device, input: I) -> Self::Output {
+        Op::forward(&self.0, device, input)
     }
 }
 
-/// The sliding attention group of geometry `G`.
-type Sliding<G> = <G as Shape>::First;
-
-/// The full attention group of geometry `G`.
-type Full<G> = <G as Shape>::Second;
-
-/// The frequencies the rotation of group `A` binds.
-type Bound<A> = <<A as Attention>::Rotated as Rotation>::Frequencies;
-
-/// A Gemma 4 checkpoint's language configuration.
+/// A Gemma 4 checkpoint's text configuration.
 #[derive(Deserialize)]
-#[serde(bound = "G: Shape")]
-pub struct Hf<G: Shape> {
+pub struct Hf {
     #[serde(flatten, deserialize_with = "config::text")]
-    text: Language<Text<G>>,
+    text: Language<Text>,
 }
 
-/// The fields only Gemma 4's language configuration has, and the sizes geometry `G` compiles.
+/// The fields only Gemma 4's text configuration has, at the sizes the published size compiles.
 #[derive(Deserialize)]
-#[serde(bound = "G: Shape")]
-struct Text<G: Shape> {
-    hidden_size: Size<G::Hidden>,
-    intermediate_size: Size<G::Intermediate>,
-    num_attention_heads: Size<G::Queries>,
+struct Text {
+    hidden_size: config::Size<Hidden>,
+    intermediate_size: config::Size<Intermediate>,
+    num_attention_heads: config::Size<Queries>,
     vocab_size: usize,
     hidden_activation: Literal<"gelu_pytorch_tanh">,
     attention_bias: Disabled,
@@ -312,25 +354,18 @@ struct Text<G: Shape> {
     // Transformers' Gemma 4 configurations default to a tied head.
     tie_word_embeddings: Option<Enabled>,
     final_logit_softcapping: Positive,
-    #[serde(flatten, deserialize_with = "config::declared")]
-    max_position_embeddings: NonZeroUsize,
     sliding_window: NonZeroUsize,
     #[serde(flatten, deserialize_with = "config::flattened")]
     spectra: Spectra,
-    quantization_config: Option<serde_json::Value>,
 }
 
-impl<G: Shape, P: Forms, const S: usize, const F: usize, const O: &'static [Branch]> TryFrom<Hf<G>>
-    for Config<G, P, S, F, O>
-{
+/// A config is of the 12B size when it declares its geometry, layer order and head constants, a
+/// rotary spectrum each group binds, at most its vocabulary rows and a sliding window within the
+/// compiled cache windows. A longer declared context is served up to the compiled one.
+impl TryFrom<Hf> for Size<"12B"> {
     type Error = io::Error;
 
-    /// Refuses checkpoint geometry, layer order or rotary options outside the compiled composition.
-    fn try_from(Hf { text }: Hf<G>) -> io::Result<Self> {
-        const {
-            assert!(G::CONSISTENT);
-            assert!(O.len() == S + F);
-        }
+    fn try_from(Hf { text }: Hf) -> io::Result<Self> {
         let geometry = &text.geometry;
         let Text {
             hidden_activation: Literal,
@@ -341,54 +376,45 @@ impl<G: Shape, P: Forms, const S: usize, const F: usize, const O: &'static [Bran
             hidden_size_per_layer_input: Constant,
             attention_k_eq_v: Enabled,
             tie_word_embeddings: None | Some(Enabled),
-            hidden_size: Size { .. },
-            intermediate_size: Size { .. },
-            num_attention_heads: Size { .. },
+            hidden_size: config::Size { .. },
+            intermediate_size: config::Size { .. },
+            num_attention_heads: config::Size { .. },
+            final_logit_softcapping: Positive { .. },
             ..
         } = text.extra;
-        vocabulary::<G::Vocabulary>(text.extra.vocab_size)?;
+        vocabulary::<Vocabulary>(text.extra.vocab_size)?;
         let [sliding, full] = LAYER_TYPES;
         let (own, global) = (text.group(sliding), text.group(full));
         for (field, found, expected) in [
             (
                 "num_hidden_layers",
                 geometry.num_hidden_layers.get(),
-                O.len(),
+                ORDER.len(),
             ),
             (
                 "num_key_value_heads",
                 own.num_key_value_heads,
-                <Sliding<G> as Attention>::Heads::SIZE,
+                sliding::Heads::SIZE,
             ),
-            (
-                "head_dim",
-                own.head_dim,
-                <Sliding<G> as Attention>::Head::SIZE,
-            ),
+            ("head_dim", own.head_dim, sliding::Head::SIZE),
             (
                 "num_global_key_value_heads",
                 global.num_key_value_heads,
-                <Full<G> as Attention>::Heads::SIZE,
+                full::Heads::SIZE,
             ),
-            (
-                "global_head_dim",
-                global.head_dim,
-                <Full<G> as Attention>::Head::SIZE,
-            ),
+            ("global_head_dim", global.head_dim, full::Head::SIZE),
         ] {
             compiled(field, found, expected)?;
         }
         compiled("rms_norm_eps", geometry.rms_norm_eps, Some(1e-6))?;
-        let order: Vec<String> = O
+        let order: Vec<String> = ORDER
             .iter()
             .map(|branch| LAYER_TYPES[*branch as usize].to_owned())
             .collect();
         compiled("layer_types", text.layer_types(), order.as_slice())?;
-        let positions = (text.extra.max_position_embeddings.get())
-            .min(<Full<G> as Attention>::Windows::SIZE * Cache::SIZE);
         let window = text.extra.sliding_window.get();
         // An unaligned start reserves one cache window for the partial prefix.
-        let maximum = (<Sliding<G> as Attention>::Windows::SIZE - 1) * Cache::SIZE;
+        let maximum = (sliding::Windows::SIZE - 1) * Cache::SIZE;
         if window > maximum {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -400,48 +426,12 @@ impl<G: Shape, P: Forms, const S: usize, const F: usize, const O: &'static [Bran
                 io::Error::new(error.kind(), format!("rope_parameters.{layer}: {error}"))
             }
         };
-        let rotary = (
-            <Sliding<G> as Attention>::Rotated::spectrum::<<Sliding<G> as Attention>::Head>(
-                text.extra.spectra.of(sliding)?,
-            )
-            .map_err(within(sliding))?,
-            <Full<G> as Attention>::Rotated::spectrum::<<Full<G> as Attention>::Head>(
-                text.extra.spectra.of(full)?,
-            )
-            .map_err(within(full))?,
-        );
-        let unsupported = |message: &str| io::Error::new(io::ErrorKind::Unsupported, message);
-        let quantization = match (P::REQUIREMENT, text.extra.quantization_config) {
-            (Requirement::Unquantized | Requirement::Undeclared, _) => None,
-            (Requirement::Declared(Declaration::Nvfp4), Some(declared)) => {
-                let declared: Quantization = config::parse(&declared)?;
-                if declared.scheme != Scheme::Nvfp4 {
-                    return Err(unsupported(
-                        "quantization_config: found FP8, compiled NVFP4 projections",
-                    ));
-                }
-                Some(declared)
-            }
-            (Requirement::Declared(Declaration::Nvfp4), None) => {
-                return Err(unsupported(
-                    "quantization_config: missing, compiled NVFP4 projections",
-                ));
-            }
-            (Requirement::Declared(Declaration::Fp8(_)), _) => {
-                return Err(unsupported(
-                    "quantization_config: this family reads no FP8 declaration",
-                ));
-            }
-        };
-        Ok(Self {
-            positions,
-            window,
-            rotary,
-            embedding: bf16::from_f32((G::Hidden::SIZE as f32).sqrt()).to_f32(),
-            softcap: text.extra.final_logit_softcapping.get(),
-            quantization,
-            compiled: PhantomData,
-        })
+        let spectra = &text.extra.spectra;
+        <sliding::Group as Attention>::Rotated::spectrum::<sliding::Head>(spectra.of(sliding)?)
+            .map_err(within(sliding))?;
+        <full::Group as Attention>::Rotated::spectrum::<full::Head>(spectra.of(full)?)
+            .map_err(within(full))?;
+        Ok(Self)
     }
 }
 
@@ -627,280 +617,193 @@ pub type Gemma4ForCausalLM<
 >;
 
 #[cfg(test)]
-mod tests {
+pub(in crate::models) mod tests {
     use super::*;
-    use crate::models::Family;
-    use crate::ops::attention::geometry::{QueryGroups, QueryWidth};
-    use crate::ops::rotary::PairFrequencies;
+    use crate::models::Implements;
+    use serde_json::{Value, json};
 
-    axes![
-        Heads2 = 2,
-        Heads4 = 4,
-        Heads8 = 8,
-        Heads16 = 16,
-        Head = 128,
-        Width = 1024,
-        Windows = 16
-    ];
-
-    /// The key or value projection width of `H` heads.
-    #[derive(Clone, Debug)]
-    struct KvWidth<H>(PhantomData<H>);
-
-    impl<H: AxisName> AxisName for KvWidth<H> {
-        const NAME: Ident = Ident::new("KvWidth");
-        const SIZE: usize = H::SIZE * Head::SIZE;
+    /// The published checkpoint's `quantization_config`, as `unsloth/gemma-4-12b-it-NVFP4` writes
+    /// it: FP8 attention projections per channel, an NVFP4 feed-forward and an E4M3 cache.
+    pub(in crate::models) fn quantization() -> Value {
+        let unset = json!({
+            "actorder": null, "block_structure": null, "group_size": null, "observer": null,
+            "observer_kwargs": {}, "scale_dtype": null, "zp_dtype": null,
+        });
+        let with = |fields: Value| {
+            let mut values = unset.clone();
+            (values.as_object_mut().unwrap()).extend(fields.as_object().unwrap().clone());
+            values
+        };
+        let fp8 = |dynamic: bool, strategy: &str| {
+            with(json!({
+                "num_bits": 8, "type": "float", "symmetric": true, "dynamic": dynamic,
+                "strategy": strategy, "observer": "memoryless_minmax",
+            }))
+        };
+        let nvfp4 = |dynamic: Value, actorder: Value| {
+            with(json!({
+                "num_bits": 4, "type": "float", "symmetric": true, "dynamic": dynamic,
+                "strategy": "tensor_group", "group_size": 16, "actorder": actorder,
+                "scale_dtype": "torch.float8_e4m3fn", "observer": "static_minmax",
+            }))
+        };
+        json!({
+            "config_groups": {
+                "group_0": {
+                    "format": "float-quantized", "output_activations": null,
+                    "targets": ["re:.*self_attn\\.(q|k|v|o)_proj$"],
+                    "weights": fp8(false, "channel"), "input_activations": fp8(true, "token"),
+                },
+                "group_1": {
+                    "format": "nvfp4-pack-quantized", "output_activations": null,
+                    "targets": ["re:.*language_model.*\\.mlp\\.(gate|up|down)_proj$"],
+                    "weights": nvfp4(json!(false), json!("static")),
+                    "input_activations": nvfp4(json!("local"), json!(null)),
+                },
+            },
+            "format": "mixed-precision", "global_compression_ratio": null,
+            "ignore": [
+                "model.vision_embedder.patch_dense", "model.embed_vision.embedding_projection",
+                "model.embed_audio.embedding_projection", "lm_head",
+            ],
+            "kv_cache_scheme": with(json!({
+                "num_bits": 8, "type": "float", "symmetric": true, "dynamic": false,
+                "strategy": "tensor", "observer": "static_minmax",
+            })),
+            "quant_method": "compressed-tensors", "quantization_status": "compressed",
+            "sparsity_config": {}, "transform_config": {}, "version": "0.17.2.a20260707",
+        })
     }
 
-    type Group<Heads, Groups> =
-        decoder::Group<Heads, Head, Groups, QueryWidth<2048>, KvWidth<Heads>, Head, Windows>;
-
-    type Sizes<First, Second> = decoder::Geometry<Width, Width, Width, Sixteen, First, Second>;
-
-    axes![Sixteen = 16];
-
-    const ORDER: &[Branch] = &Branch::periodic::<6>(3);
-
-    /// A checkpoint document for geometry `G` with `O`'s layer types.
-    fn document<G: Shape, const O: &'static [Branch]>() -> serde_json::Value {
-        type First<G> = <G as Shape>::First;
-        type Second<G> = <G as Shape>::Second;
-        serde_json::json!({
-            "hidden_size": G::Hidden::SIZE,
-            "intermediate_size": G::Intermediate::SIZE,
-            "num_hidden_layers": O.len(),
-            "num_attention_heads": G::Queries::SIZE,
-            "num_key_value_heads": <First<G> as Attention>::Heads::SIZE,
-            "num_global_key_value_heads": <Second<G> as Attention>::Heads::SIZE,
-            "head_dim": <First<G> as Attention>::Head::SIZE,
-            "global_head_dim": <Second<G> as Attention>::Head::SIZE,
-            "vocab_size": G::Vocabulary::SIZE,
-            "layer_types": O
+    /// The published size's text configuration, as Transformers before 5.15 writes it.
+    fn document() -> Value {
+        json!({
+            "hidden_size": Hidden::SIZE, "intermediate_size": Intermediate::SIZE,
+            "num_hidden_layers": ORDER.len(), "num_attention_heads": Queries::SIZE,
+            "num_key_value_heads": sliding::Heads::SIZE,
+            "num_global_key_value_heads": full::Heads::SIZE,
+            "head_dim": sliding::Head::SIZE, "global_head_dim": full::Head::SIZE,
+            "vocab_size": Vocabulary::SIZE,
+            "layer_types": ORDER
                 .iter()
-                .map(|branch| ["sliding_attention", "full_attention"][*branch as usize])
+                .map(|branch| LAYER_TYPES[*branch as usize])
                 .collect::<Vec<_>>(),
             "hidden_activation": "gelu_pytorch_tanh", "attention_bias": false,
             "enable_moe_block": false, "use_double_wide_mlp": false, "num_kv_shared_layers": 0,
             "hidden_size_per_layer_input": 0, "attention_k_eq_v": true,
             "tie_word_embeddings": true, "rms_norm_eps": 1e-6, "final_logit_softcapping": 30.0,
-            "max_position_embeddings": 4096, "sliding_window": 512,
+            "max_position_embeddings": 262144, "sliding_window": 1024,
             "rope_parameters": {
                 "sliding_attention": {"rope_type": "default", "rope_theta": 1e4},
                 "full_attention": {
-                    "rope_type": "proportional", "rope_theta": 1e6,
-                    "partial_rotary_factor": <Second<G> as Attention>::Rotated::COORDINATES as f32
-                        / <Second<G> as Attention>::Head::SIZE as f32,
+                    "rope_type": "proportional", "rope_theta": 1e6, "partial_rotary_factor": 0.25,
                 },
             },
         })
     }
 
-    /// A geometry parses the checkpoint whose head counts and widths it compiles, and refuses one
-    /// whose key/value heads differ in either group, naming the field, the count found and the
-    /// compiled one.
-    fn parses_own_heads<First: Attention, Second: Attention>() {
-        type Compiled<First, Second> = Config<Sizes<First, Second>, Quantized, 4, 2, ORDER>;
-        let accepted = document::<Sizes<First, Second>, ORDER>();
-        let config = Compiled::<First, Second>::parse(&accepted).unwrap();
-        assert_eq!((config.window, config.positions), (512, 4096));
-        for (field, heads) in [
-            ("num_key_value_heads", First::Heads::SIZE),
-            ("num_global_key_value_heads", Second::Heads::SIZE),
-        ] {
-            let mut refused = accepted.clone();
-            refused[field] = serde_json::json!(2 * heads);
-            let error = Compiled::<First, Second>::parse(&refused).err().unwrap();
-            assert_eq!(
-                (error.kind(), error.to_string()),
-                (
-                    io::ErrorKind::Unsupported,
-                    format!("{field}: found {}, compiled {heads}", 2 * heads)
-                )
-            );
-        }
+    /// The kind and reason of the size's refusal of `document`, none if it parses.
+    fn refusal(document: &Value) -> Option<(io::ErrorKind, String)> {
+        let error = Size::<"12B">::parse(document).err()?;
+        Some((error.kind(), error.to_string()))
     }
 
-    /// The frequencies each group of a checkpoint with `rope` binds, sliding then full, whose
-    /// full group has geometry `Full`.
-    fn rotary<Full: Attention>(
-        rope: serde_json::Value,
-    ) -> io::Result<(
-        PairFrequencies<Head>,
-        <Full::Rotated as Rotation>::Frequencies,
-    )> {
-        type Compiled<Full> =
-            Config<Sizes<Group<Heads8, QueryGroups<2>>, Full>, Quantized, 4, 2, ORDER>;
-        let mut document = document::<Sizes<Group<Heads8, QueryGroups<2>>, Full>, ORDER>();
-        document["rope_parameters"] = rope;
-        Compiled::<Full>::parse(&document).map(|config| config.rotary)
-    }
-
-    /// Each group binds the frequencies its layer type's spectrum gives; a group whose checkpoint
-    /// rotates nothing is refused.
+    /// The published configuration parses; another head count, head width, layer count or layer
+    /// order is refused by its field, with what it found and what the size compiles.
     #[test]
-    fn binds_each_group_spectrum() {
-        use crate::models::config::scaling::Spectrum;
-        use serde_json::json;
-        type Rotating = Group<Heads8, QueryGroups<2>>;
-        let default = |theta: f32| json!({"rope_type": "default", "rope_theta": theta});
-        let llama3 = json!({
-            "rope_type": "llama3", "rope_theta": 1e6, "factor": 16.0, "low_freq_factor": 1.0,
-            "high_freq_factor": 4.0, "original_max_position_embeddings": 8192,
-        });
-        let rescaled = config::parse::<Spectrum>(&json!({"rope_parameters": llama3}))
-            .and_then(|spectrum| spectrum.bind::<Head, Head>())
-            .unwrap();
-        let unscaled = |theta| PairFrequencies::<Head>::unscaled::<Head>(theta).unwrap();
-        assert_eq!(
-            rotary::<Rotating>(json!({
-                "sliding_attention": default(1e4), "full_attention": default(1e6),
-            }))
-            .unwrap(),
-            (unscaled(1e4), unscaled(1e6))
-        );
-        assert_eq!(
-            rotary::<Rotating>(json!({
-                "sliding_attention": llama3, "full_attention": default(1e6),
-            }))
-            .unwrap(),
-            (rescaled, unscaled(1e6))
-        );
-        let error =
-            rotary::<Rotating>(json!({"sliding_attention": llama3, "full_attention": null}))
-                .map(drop)
-                .unwrap_err();
-        let reason = format!(
-            "rope_parameters.full_attention: found layers that rotate nothing, compiled {} rotated",
-            <Rotating as Attention>::Rotated::COORDINATES
-        );
-        assert_eq!(
-            (error.kind(), error.to_string()),
-            (io::ErrorKind::Unsupported, reason)
-        );
-        let error =
-            rotary::<Rotating>(json!({"sliding_attention": null, "full_attention": default(1e6)}))
-                .map(drop)
-                .unwrap_err();
-        let reason = format!(
-            "rope_parameters.sliding_attention: found layers that rotate nothing, compiled {} \
-             rotated",
-            <Rotating as Attention>::Rotated::COORDINATES
-        );
-        assert_eq!(
-            (error.kind(), error.to_string()),
-            (io::ErrorKind::Unsupported, reason)
-        );
-    }
-
-    /// NVFP4 projections read the ModelOpt declaration a nested checkpoint keeps at its root,
-    /// with the E4M3 cache it declares, and refuse a missing or another declaration; forms that
-    /// read no declaration leave it unread.
-    #[test]
-    fn reads_the_declared_nvfp4_projections() {
-        use serde_json::json;
-        type Geometry = Sizes<Group<Heads8, QueryGroups<2>>, Group<Heads4, QueryGroups<4>>>;
-        type Nvfp4 = decoder::Projections<
-            form::Affine,
-            form::Affine,
-            form::Affine,
-            form::Affine,
-            form::Nvfp4BlockScaled,
-        >;
-        type Declared = Config<Geometry, Nvfp4, 4, 2, ORDER>;
-        type Unread = Config<Geometry, Quantized, 4, 2, ORDER>;
-        let values = json!({"dynamic": false, "num_bits": 4, "type": "float", "group_size": 16});
-        let modelopt = json!({
-            "quant_method": "modelopt", "quant_algo": "NVFP4",
-            "config_groups": {
-                "group_0": {"input_activations": values, "weights": values, "targets": ["Linear"]},
-            },
-            "ignore": ["lm_head", "model.language_model.layers.0.self_attn*"],
-            "kv_cache_scheme": {"dynamic": false, "num_bits": 8, "type": "float"},
-        });
-        let compressed = json!({
-            "quant_method": "compressed-tensors", "format": "nvfp4-pack-quantized",
-        });
-        let nested = |quantization: Option<&serde_json::Value>| {
-            let mut root = json!({"text_config": document::<Geometry, ORDER>()});
-            if let Some(quantization) = quantization {
-                root["quantization_config"] = quantization.clone();
-            }
-            config::language(&root).unwrap().into_owned()
+    fn refuses_another_geometry_by_field() {
+        assert_eq!(refusal(&document()), None);
+        let order = ORDER.iter().map(|branch| LAYER_TYPES[*branch as usize]);
+        let mut swapped: Vec<_> = order.collect();
+        swapped.swap(4, 5);
+        let compiled = |field: &str, found: usize, expected: usize| {
+            format!("{field}: found {found}, compiled {expected}")
         };
-        let declared = Declared::parse(&nested(Some(&modelopt)))
-            .unwrap()
-            .quantization
-            .unwrap();
-        assert!(declared.excluded.excludes("lm_head"));
-        assert!(
-            declared
-                .excluded
-                .excludes("model.language_model.layers.0.self_attn.q_proj")
-        );
-        assert!(declared.kv_cache);
-        let unread = Unread::parse(&nested(Some(&compressed))).unwrap();
-        assert!(unread.quantization.is_none());
-        for (refusal, reason) in [
+        let layers = ORDER.len();
+        for (field, value, reason) in [
             (
-                Declared::parse(&nested(None)),
-                "quantization_config: missing, compiled NVFP4 projections",
+                "num_key_value_heads",
+                json!(4),
+                compiled("num_key_value_heads", 4, sliding::Heads::SIZE),
             ),
             (
-                Declared::parse(&nested(Some(&compressed))),
-                r#"found "nvfp4-pack-quantized", compiled "float-quantized""#,
+                "num_global_key_value_heads",
+                json!(2),
+                compiled("num_global_key_value_heads", 2, full::Heads::SIZE),
             ),
             (
-                Declared::parse(&nested(Some(
-                    &json!({"quant_method": "fp8", "activation_scheme": "static"}),
-                ))),
-                "quantization_config: found FP8, compiled NVFP4 projections",
+                "head_dim",
+                json!(128),
+                compiled("head_dim", 128, sliding::Head::SIZE),
+            ),
+            (
+                "global_head_dim",
+                json!(256),
+                compiled("global_head_dim", 256, full::Head::SIZE),
+            ),
+            (
+                "num_hidden_layers",
+                json!(layers - 6),
+                compiled("num_hidden_layers", layers - 6, layers),
             ),
         ] {
-            let error = refusal.err().unwrap();
+            let mut changed = document();
+            changed[field] = value;
             assert_eq!(
-                (error.kind(), error.to_string()),
-                (io::ErrorKind::Unsupported, reason.into())
+                refusal(&changed),
+                Some((io::ErrorKind::Unsupported, reason)),
+                "{field}"
             );
         }
+        let mut reordered = document();
+        reordered["layer_types"] = json!(swapped);
+        let (kind, reason) = refusal(&reordered).unwrap();
+        assert_eq!(kind, io::ErrorKind::Unsupported);
+        assert!(
+            reason.starts_with("layer_types: found [\"sliding_attention\""),
+            "{reason}"
+        );
     }
 
-    /// Each pairing of group geometries parses its own checkpoint and refuses the others' heads.
+    /// Each group binds its own spectrum: a group whose layers the checkpoint rotates nothing is
+    /// refused, naming its layer type and the coordinates it rotates.
     #[test]
-    fn parses_each_group_geometry() {
-        for row in [
-            parses_own_heads::<Group<Heads2, QueryGroups<8>>, Group<Heads16, QueryGroups<1>>>,
-            parses_own_heads::<Group<Heads4, QueryGroups<4>>, Group<Heads8, QueryGroups<2>>>,
-            parses_own_heads::<Group<Heads8, QueryGroups<2>>, Group<Heads4, QueryGroups<4>>>,
-            parses_own_heads::<Group<Heads16, QueryGroups<1>>, Group<Heads2, QueryGroups<8>>>,
+    fn refuses_groups_that_rotate_nothing() {
+        for (layer, rotated) in [
+            ("sliding_attention", sliding::Head::SIZE),
+            ("full_attention", full::Rotated::SIZE),
         ] {
-            row();
+            let mut document = document();
+            document["rope_parameters"][layer] = Value::Null;
+            let reason = format!(
+                "rope_parameters.{layer}: found layers that rotate nothing, compiled {rotated} \
+                 rotated"
+            );
+            assert_eq!(
+                refusal(&document),
+                Some((io::ErrorKind::Unsupported, reason))
+            );
         }
     }
 
     /// `document` with `fields` set apart at every layer of type `kind`, as Transformers'
     /// `per_layer_config` writes them.
-    fn apart(
-        mut document: serde_json::Value,
-        kind: &str,
-        fields: serde_json::Value,
-    ) -> serde_json::Value {
+    fn apart(mut document: Value, kind: &str, fields: Value) -> Value {
         let types = document["layer_types"].as_array().unwrap().clone();
         let layers = types.iter().enumerate().filter(|(_, layer)| *layer == kind);
         let overrides = layers.map(|(layer, _)| (format!("{layer:02}"), fields.clone()));
-        document["per_layer_config"] = serde_json::Value::Object(overrides.collect());
+        document["per_layer_config"] = Value::Object(overrides.collect());
         document
     }
 
-    /// The served checkpoint as Transformers 5.15 and later write it: its full layers' own head
-    /// count and width in place of the `global_*` fields.
-    fn transformers() -> serde_json::Value {
-        let mut document = document::<super::Sizes, { super::ORDER }>();
+    /// The published configuration as Transformers 5.15 and later write it: its full layers' own
+    /// head count and width in place of the `global_*` fields.
+    fn transformers() -> Value {
+        let mut document = document();
         for field in ["num_global_key_value_heads", "global_head_dim"] {
             document.as_object_mut().unwrap().remove(field);
         }
-        let own = serde_json::json!({
-            "num_key_value_heads": full::Heads::SIZE, "head_dim": full::Head::SIZE,
-        });
+        let own = json!({"num_key_value_heads": full::Heads::SIZE, "head_dim": full::Head::SIZE});
         apart(document, "full_attention", own)
     }
 
@@ -911,13 +814,12 @@ mod tests {
     fn reads_full_layers_in_either_spelling() {
         let both = {
             let mut document = transformers();
-            document["num_global_key_value_heads"] = serde_json::json!(full::Heads::SIZE);
-            document["global_head_dim"] = serde_json::json!(full::Head::SIZE);
+            document["num_global_key_value_heads"] = json!(full::Heads::SIZE);
+            document["global_head_dim"] = json!(full::Head::SIZE);
             document
         };
-        let checkpoint = document::<super::Sizes, { super::ORDER }>();
-        for document in [checkpoint, transformers(), both] {
-            <Config>::parse(&document).unwrap();
+        for document in [document(), transformers(), both] {
+            assert_eq!(refusal(&document), None);
         }
     }
 
@@ -925,8 +827,6 @@ mod tests {
     /// and reason.
     #[test]
     fn refuses_per_layer_geometry_outside_the_groups() {
-        use serde_json::json;
-        let checkpoint = document::<super::Sizes, { super::ORDER }>;
         let narrow = json!({"num_key_value_heads": full::Heads::SIZE, "head_dim": 256});
         let unheld = json!({
             "num_key_value_heads": full::Heads::SIZE, "head_dim": full::Head::SIZE,
@@ -939,12 +839,12 @@ mod tests {
                 "global_head_dim: found 256, compiled 512",
             ),
             (
-                apart(checkpoint(), "full_attention", narrow),
+                apart(document(), "full_attention", narrow),
                 io::ErrorKind::InvalidData,
                 "global_head_dim: found 512, but the full_attention layers' head_dim is 256",
             ),
             (
-                apart(checkpoint(), "sliding_attention", json!({"head_dim": 64})),
+                apart(document(), "sliding_attention", json!({"head_dim": 64})),
                 io::ErrorKind::Unsupported,
                 "head_dim: found 64, compiled 256",
             ),
@@ -955,8 +855,7 @@ mod tests {
                  `intermediate_size`, expected `num_key_value_heads` or `head_dim`",
             ),
         ] {
-            let error = <Config>::parse(&document).err().unwrap();
-            assert_eq!((error.kind(), error.to_string()), (kind, reason.into()));
+            assert_eq!(refusal(&document), Some((kind, reason.into())));
         }
     }
 
@@ -964,34 +863,34 @@ mod tests {
     /// unsupported.
     #[test]
     fn reads_an_omitted_tying_as_tied() {
-        let mut document = document::<super::Sizes, { super::ORDER }>();
-        let fields = document.as_object_mut().unwrap();
-        fields.remove("tie_word_embeddings");
-        <Config>::parse(&document).unwrap();
-        document["tie_word_embeddings"] = serde_json::json!(false);
-        let error = <Config>::parse(&document).err().unwrap();
+        let mut document = document();
+        document
+            .as_object_mut()
+            .unwrap()
+            .remove("tie_word_embeddings");
+        assert_eq!(refusal(&document), None);
+        document["tie_word_embeddings"] = json!(false);
         assert_eq!(
-            (error.kind(), error.to_string()),
-            (
+            refusal(&document),
+            Some((
                 io::ErrorKind::Unsupported,
                 "tie_word_embeddings: found false, compiled true".into()
-            )
+            ))
         );
     }
 
     /// A vocabulary of at most the compiled rows is served; a larger one is unsupported.
     #[test]
     fn serves_a_vocabulary_up_to_its_rows() {
-        let rows = <super::Sizes as Shape>::Vocabulary::SIZE;
-        let mut document = document::<super::Sizes, { super::ORDER }>();
-        document["vocab_size"] = serde_json::json!(rows - 1);
-        <Config>::parse(&document).unwrap();
-        document["vocab_size"] = serde_json::json!(rows + 1);
-        let error = <Config>::parse(&document).err().unwrap();
+        let rows = Vocabulary::SIZE;
+        let mut document = document();
+        document["vocab_size"] = json!(rows - 1);
+        assert_eq!(refusal(&document), None);
+        document["vocab_size"] = json!(rows + 1);
         let reason = format!("vocab_size: {}, the size holds 1 to {rows}", rows + 1);
         assert_eq!(
-            (error.kind(), error.to_string()),
-            (io::ErrorKind::Unsupported, reason)
+            refusal(&document),
+            Some((io::ErrorKind::Unsupported, reason))
         );
     }
 
@@ -999,22 +898,49 @@ mod tests {
     /// is refused, keeping one window for an unaligned prefix.
     #[test]
     fn serves_a_context_up_to_the_compiled_windows() {
-        let positions = <Full<super::Sizes> as Attention>::Windows::SIZE * Cache::SIZE;
-        let window = (<Sliding<super::Sizes> as Attention>::Windows::SIZE - 1) * Cache::SIZE;
-        let mut document = document::<super::Sizes, { super::ORDER }>();
-        document["max_position_embeddings"] = serde_json::json!(positions + 1);
-        assert_eq!(<Config>::parse(&document).unwrap().positions, positions);
-        document["sliding_window"] = serde_json::json!(window);
-        <Config>::parse(&document).unwrap();
-        document["sliding_window"] = serde_json::json!(window + 1);
-        let error = <Config>::parse(&document).err().unwrap();
+        let positions = full::Windows::SIZE * Cache::SIZE;
+        let window = (sliding::Windows::SIZE - 1) * Cache::SIZE;
+        let mut document = document();
+        document["max_position_embeddings"] = json!(positions + 1);
+        assert_eq!(refusal(&document), None);
+        document["sliding_window"] = json!(window);
+        assert_eq!(refusal(&document), None);
+        document["sliding_window"] = json!(window + 1);
         let reason = format!(
             "sliding_window: found {}, compiled maximum {window}",
             window + 1
         );
         assert_eq!(
-            (error.kind(), error.to_string()),
-            (io::ErrorKind::Unsupported, reason)
+            refusal(&document),
+            Some((io::ErrorKind::Unsupported, reason))
         );
+    }
+
+    /// The causal model admits the published configuration and its mixed-precision declaration;
+    /// a declaration of another scheme, of one scheme fewer, or none is refused by it.
+    #[test]
+    fn admits_the_published_quantization() {
+        let directory = tempfile::tempdir().unwrap();
+        let scope = |quantization: Option<Value>| {
+            let mut config = json!({"text_config": document(), "tie_word_embeddings": true});
+            if let Some(quantization) = quantization {
+                config["quantization_config"] = quantization;
+            }
+            let source = Checkpoint::new(directory.path(), Some(config)).unwrap();
+            <ForCausalLM>::scope(&source)
+        };
+        assert_eq!(scope(Some(quantization())).unwrap(), "");
+        let mut tensors = quantization();
+        tensors["config_groups"]["group_0"]["weights"]["strategy"] = json!("tensor");
+        let mut channels = quantization();
+        (channels["config_groups"].as_object_mut().unwrap()).remove("group_1");
+        for refused in [scope(Some(tensors)), scope(Some(channels)), scope(None)] {
+            match refused {
+                Err(LoadError::Unsupported { name, .. }) => {
+                    assert_eq!(name, "config.json:quantization_config");
+                }
+                other => panic!("{other:?} is not `Unsupported`"),
+            }
+        }
     }
 }

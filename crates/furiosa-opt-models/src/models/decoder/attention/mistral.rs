@@ -5,9 +5,7 @@ use crate::models::config::{
     self, Absent, Constant, Disabled, Scheme, Size, compiled, flattened, scaling,
 };
 use crate::models::decoder::attention::{Qwen2ForCausalLM, Qwen2Layer};
-use crate::models::decoder::{
-    self, Attention, Declaration, Envelope, Forms, Query, Requirement, Shape, form,
-};
+use crate::models::decoder::{self, Attention, Declaration, Envelope, Forms, Query, Shape, form};
 use crate::models::{Family, vocabulary};
 use crate::modules::{attention, language};
 use crate::ops::attention::gqa::Read;
@@ -438,15 +436,15 @@ where
             io::Error::new(error.kind(), format!("{}: {error}", scaling::TEMPERATURE))
         })?;
         let quantization = decoder.quantization_config;
-        match (F::REQUIREMENT, &quantization) {
-            (Requirement::Declared(Declaration::Fp8(scheme)), Some(declared))
-                if declared.scheme == scheme && !declared.kv_cache => {}
+        let requirement = F::REQUIREMENT;
+        match (requirement.declaration(), &quantization) {
+            (Some(Declaration::Fp8(scheme)), Some(declared))
+                if declared.schemes == [scheme] && !declared.kv_cache => {}
             // The NVFP4 parameters refuse cache scales: a declared E4M3 cache is at unit scale, and
             // a BF16 cache holds its values unrounded.
-            (Requirement::Declared(Declaration::Nvfp4), Some(declared))
-                if declared.scheme == Scheme::Nvfp4 => {}
-            (Requirement::Unquantized | Requirement::Undeclared, None) => {}
-            (Requirement::Declared(_), None) => {
+            (Some(Declaration::Nvfp4), Some(declared)) if declared.schemes == [Scheme::Nvfp4] => {}
+            (_, None) if !requirement.quantized() || requirement.online() => {}
+            (_, None) => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     "this composition expects declared quantized projections",
@@ -594,12 +592,12 @@ mod tests {
     /// A configuration whose projections load FP8 blocks serves only a block-scaled checkpoint,
     /// one whose projections load tensor-scaled FP8 only a tensor-scaled one, and one whose
     /// projections load NVFP4 only an NVFP4 one, whatever modules the checkpoint leaves unquantized;
-    /// none quantizes its cache, and projections that read no declaration take none.
+    /// none quantizes its cache, and projections a load quantizes take no declaration.
     #[test]
     fn requires_the_scheme_its_forms_load() {
         use crate::models::Family;
         use crate::models::decoder::{Projections, attention::mistral};
-        use form::{ChannelScaled, Nvfp4 as Channelled};
+        use form::ChannelScaled;
         type Blocks = mistral::Config<mistral::Sizes, Projections<form::BlockScaled>>;
         type Nvfp4 = mistral::Config<mistral::Sizes, Projections<form::Nvfp4BlockScaled>>;
         let document = |quantization: serde_json::Value| {
@@ -642,7 +640,7 @@ mod tests {
         Blocks::parse(&excluding).unwrap();
         let declared = Nvfp4::parse(&nvfp4()).unwrap().quantization;
         assert!(
-            matches!(declared, Some(nvfp4) if nvfp4.scheme == crate::models::config::Scheme::Nvfp4
+            matches!(declared, Some(nvfp4) if nvfp4.schemes == [crate::models::config::Scheme::Nvfp4]
             && nvfp4.kv_cache && nvfp4.excluded.excludes("lm_head"))
         );
         let mut unquantized = nvfp4();
@@ -656,11 +654,8 @@ mod tests {
         let mut cached = block();
         cached["quantization_config"]["kv_cache_scheme"] =
             json!({"num_bits": 8, "type": "float", "dynamic": false});
-        type Undeclared = mistral::Config<
-            mistral::Sizes,
-            Projections<ChannelScaled, ChannelScaled, ChannelScaled, ChannelScaled, Channelled>,
-        >;
-        Undeclared::parse(&unquantized).unwrap();
+        type Online = mistral::Config<mistral::Sizes, Projections<ChannelScaled>>;
+        Online::parse(&unquantized).unwrap();
         let mismatch = "checkpoint quantization does not match the projection and cache modules";
         for (refusal, reason) in [
             (<mistral::Config>::parse(&block()).map(drop), mismatch),
@@ -669,7 +664,7 @@ mod tests {
             (Blocks::parse(&nvfp4()).map(drop), mismatch),
             (Nvfp4::parse(&block()).map(drop), mismatch),
             (Blocks::parse(&cached).map(drop), mismatch),
-            (Undeclared::parse(&tensor()).map(drop), mismatch),
+            (Online::parse(&tensor()).map(drop), mismatch),
             (
                 Nvfp4::parse(&unquantized).map(drop),
                 "this composition expects declared quantized projections",

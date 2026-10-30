@@ -1,10 +1,12 @@
-//! Checkpoint quantization declarations: E4M3 weights under static per-tensor scales or 128 x 128
-//! block scales, or E2M1 weights and inputs with E4M3 scales per 16 inputs under static FP32 tensor
-//! scales, and the modules a checkpoint leaves unquantized.
+//! Checkpoint quantization declarations: E4M3 weights under static per-tensor scales, 128 x 128
+//! block scales or per-channel scales, or E2M1 weights and inputs with E4M3 scales per 16 inputs
+//! under static FP32 tensor scales, and the modules a checkpoint leaves unquantized.
+//!
+//! - A mixed-precision checkpoint declares one scheme for each module group.
 
 use super::{
     Absent, Constant, Disabled, Enabled, Exclusion, Exclusions, Literal, UNSUPPORTED, flattened,
-    located,
+    located, refuse,
 };
 use crate::tensor::form::fp8::GROUP;
 use serde::Deserialize;
@@ -16,7 +18,8 @@ use std::collections::BTreeMap;
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(try_from = "Value")]
 pub struct Quantization {
-    pub scheme: Scheme,
+    /// The scheme of each module group, once, in `Scheme` order.
+    pub schemes: Vec<Scheme>,
     /// The modules left unquantized: by name, by a name prefix, or by a part of their name.
     pub excluded: Exclusions,
     /// Whether the checkpoint declares an E4M3 KV cache. An NVFP4 cache is at unit scale, since
@@ -25,13 +28,16 @@ pub struct Quantization {
 }
 
 /// How a checkpoint quantizes its projections.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Scheme {
     /// E4M3 weights and input activations, each under one static scale.
     Tensor,
     /// E4M3 weights with one scale per 128 x 128 block; the activations quantize at run time per
     /// group of 128 inputs.
     Block,
+    /// E4M3 weights with one static scale per output channel; the activations quantize at run time
+    /// per token, if at all.
+    Channel,
     /// E2M1 weights and inputs with an E4M3 scale per 16 inputs under a static FP32 tensor scale.
     Nvfp4,
 }
@@ -54,18 +60,43 @@ enum Hf {
     /// Read through a JSON map, so that its algorithm is a string as the document writes it.
     #[serde(deserialize_with = "flattened")]
     Modelopt(Modelopt),
+    /// Its module groups are read once their format is known.
     #[serde(rename = "compressed-tensors")]
     CompressedTensors {
-        format: Literal<"float-quantized">,
+        format: Format,
         quantization_status: Literal<"compressed">,
-        config_groups: BTreeMap<String, BlockGroup>,
+        config_groups: BTreeMap<String, Value>,
         ignore: Option<Vec<String>>,
-        #[serde(default)]
-        kv_cache_scheme: Absent,
-        #[serde(default)]
-        sparsity_config: Absent,
+        kv_cache_scheme: Option<Tensor>,
+        sparsity_config: Option<BTreeMap<String, Value>>,
         transform_config: Option<BTreeMap<String, Value>>,
     },
+}
+
+/// How a compressed-tensors checkpoint stores its quantized weights: E4M3 values, packed E2M1
+/// values, or each module group in the format it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+enum Format {
+    Float,
+    Packed,
+    Mixed,
+}
+
+impl TryFrom<String> for Format {
+    type Error = String;
+
+    fn try_from(found: String) -> Result<Self, Self::Error> {
+        match found.as_str() {
+            "float-quantized" => Ok(Self::Float),
+            "nvfp4-pack-quantized" => Ok(Self::Packed),
+            "mixed-precision" => Ok(Self::Mixed),
+            _ => Err(refuse(
+                format_args!("{found:?}"),
+                r#""float-quantized", "nvfp4-pack-quantized" or "mixed-precision""#,
+            )),
+        }
+    }
 }
 
 /// A ModelOpt `quantization_config`, by its quantization algorithm.
@@ -271,22 +302,276 @@ impl BlockGroup {
     }
 }
 
+/// One quantized module group of a compressed-tensors checkpoint: symmetric 8-bit float weights
+/// with one static scale per output channel, and activations quantized at run time per token, or
+/// left as they are.
+#[derive(Clone, Debug, Deserialize)]
+struct ChannelGroup {
+    weights: ChannelWeights,
+    input_activations: Option<TokenActivations>,
+    #[serde(default)]
+    output_activations: Absent,
+    targets: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ChannelWeights {
+    num_bits: Constant<8>,
+    #[serde(rename = "type")]
+    kind: Literal<"float">,
+    symmetric: Enabled,
+    dynamic: Disabled,
+    strategy: Literal<"channel">,
+    #[serde(default)]
+    group_size: Absent,
+    #[serde(default)]
+    block_structure: Absent,
+    #[serde(default)]
+    actorder: Absent,
+    #[serde(default)]
+    scale_dtype: Absent,
+    #[serde(default)]
+    zp_dtype: Absent,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TokenActivations {
+    num_bits: Constant<8>,
+    #[serde(rename = "type")]
+    kind: Literal<"float">,
+    symmetric: Enabled,
+    dynamic: Enabled,
+    strategy: Literal<"token">,
+    #[serde(default)]
+    group_size: Absent,
+    #[serde(default)]
+    block_structure: Absent,
+    #[serde(default)]
+    actorder: Absent,
+    #[serde(default)]
+    scale_dtype: Absent,
+    #[serde(default)]
+    zp_dtype: Absent,
+}
+
+impl ChannelGroup {
+    /// Whether the group quantizes some modules; deserialization already refined its values.
+    fn quantizes(&self) -> bool {
+        let token = |activations: &TokenActivations| {
+            let TokenActivations {
+                num_bits: Constant,
+                kind: Literal,
+                symmetric: Enabled,
+                dynamic: Enabled,
+                strategy: Literal,
+                group_size: Absent,
+                block_structure: Absent,
+                actorder: Absent,
+                scale_dtype: Absent,
+                zp_dtype: Absent,
+            } = activations;
+        };
+        let Self {
+            weights:
+                ChannelWeights {
+                    num_bits: Constant,
+                    kind: Literal,
+                    symmetric: Enabled,
+                    dynamic: Disabled,
+                    strategy: Literal,
+                    group_size: Absent,
+                    block_structure: Absent,
+                    actorder: Absent,
+                    scale_dtype: Absent,
+                    zp_dtype: Absent,
+                },
+            input_activations,
+            output_activations: Absent,
+            targets,
+        } = self;
+        input_activations.iter().for_each(token);
+        !targets.is_empty()
+    }
+}
+
+/// One NVFP4 module group of a compressed-tensors checkpoint: symmetric four-bit float weights in
+/// blocks of 16 under E4M3 block scales and a static tensor scale, and inputs that quantize so at
+/// run time under their static tensor scale, or left as they are.
+#[derive(Clone, Debug, Deserialize)]
+struct PackedGroup {
+    weights: PackedWeights,
+    input_activations: Option<PackedInputs>,
+    #[serde(default)]
+    output_activations: Absent,
+    targets: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct PackedWeights {
+    num_bits: Constant<4>,
+    #[serde(rename = "type")]
+    kind: Literal<"float">,
+    symmetric: Enabled,
+    dynamic: Disabled,
+    strategy: Literal<"tensor_group">,
+    group_size: Constant<16>,
+    #[serde(default)]
+    block_structure: Absent,
+    /// The order calibration visited the columns in, which leaves them stored in place.
+    actorder: Option<Literal<"static">>,
+    scale_dtype: Option<Literal<"torch.float8_e4m3fn">>,
+    #[serde(default)]
+    zp_dtype: Absent,
+}
+
+/// Inputs whose E4M3 block scales come at run time under a static tensor scale.
+#[derive(Clone, Debug, Deserialize)]
+struct PackedInputs {
+    num_bits: Constant<4>,
+    #[serde(rename = "type")]
+    kind: Literal<"float">,
+    symmetric: Enabled,
+    dynamic: Literal<"local">,
+    strategy: Literal<"tensor_group">,
+    group_size: Constant<16>,
+    #[serde(default)]
+    block_structure: Absent,
+    #[serde(default)]
+    actorder: Absent,
+    scale_dtype: Option<Literal<"torch.float8_e4m3fn">>,
+    #[serde(default)]
+    zp_dtype: Absent,
+}
+
+impl PackedGroup {
+    /// Whether the group quantizes some modules; deserialization already refined its values.
+    fn quantizes(&self) -> bool {
+        let inputs = |inputs: &PackedInputs| {
+            let PackedInputs {
+                num_bits: Constant,
+                kind: Literal,
+                symmetric: Enabled,
+                dynamic: Literal,
+                strategy: Literal,
+                group_size: Constant,
+                block_structure: Absent,
+                actorder: Absent,
+                scale_dtype: None | Some(Literal),
+                zp_dtype: Absent,
+            } = inputs;
+        };
+        let Self {
+            weights:
+                PackedWeights {
+                    num_bits: Constant,
+                    kind: Literal,
+                    symmetric: Enabled,
+                    dynamic: Disabled,
+                    strategy: Literal,
+                    group_size: Constant,
+                    block_structure: Absent,
+                    actorder: None | Some(Literal),
+                    scale_dtype: None | Some(Literal),
+                    zp_dtype: Absent,
+                },
+            input_activations,
+            output_activations: Absent,
+            targets,
+        } = self;
+        input_activations.iter().for_each(inputs);
+        !targets.is_empty()
+    }
+}
+
+impl Format {
+    /// The scheme of a module group of a checkpoint stored in this format; only a mixed-precision
+    /// checkpoint's groups name formats of their own.
+    fn scheme(self, group: &Value) -> Result<Scheme, String> {
+        let read = |error: serde_json::Error| error.to_string();
+        let unsupported = |message: &str| format!("{UNSUPPORTED}{message}");
+        let own = (group.get("format").filter(|format| !format.is_null()))
+            .map(|format| Self::deserialize(format).map_err(read))
+            .transpose()?;
+        let packed = match (self, own) {
+            (Self::Float | Self::Mixed, Some(Self::Float)) | (Self::Float, None) => false,
+            (Self::Packed | Self::Mixed, Some(Self::Packed)) | (Self::Packed, None) => true,
+            _ => {
+                return Err(unsupported(
+                    "a module group's format: expected the checkpoint's, or its own in a \
+                     mixed-precision checkpoint",
+                ));
+            }
+        };
+        let strategy = &group["weights"]["strategy"];
+        let (quantizes, scheme, refusal) = match (packed, strategy.as_str()) {
+            (true, _) => {
+                let group = PackedGroup::deserialize(group).map_err(read)?;
+                (group.quantizes(), Scheme::Nvfp4, NVFP4)
+            }
+            (false, Some("channel")) => {
+                let group = ChannelGroup::deserialize(group).map_err(read)?;
+                (group.quantizes(), Scheme::Channel, FP8)
+            }
+            (false, Some("block")) => {
+                let group = BlockGroup::deserialize(group).map_err(read)?;
+                (group.linear(), Scheme::Block, FP8)
+            }
+            (false, _) => return Err(refuse(strategy, r#""block" or "channel""#)),
+        };
+        quantizes
+            .then_some(scheme)
+            .ok_or_else(|| unsupported(refusal))
+    }
+}
+
+/// The FP8 scales a declaration's FP8 groups may hold, which a refusal of others names.
+const FP8: &str = "expected static per-tensor E4M3 scales, or 128 x 128 block weight scales with \
+                   activations scaled at run time per 128 inputs";
+
+/// The NVFP4 groups a declaration may hold, which a refusal of others names.
+const NVFP4: &str = "expected NVFP4 linear weights and inputs";
+
 impl TryFrom<Value> for Quantization {
     type Error = String;
 
     fn try_from(declared: Value) -> Result<Self, Self::Error> {
         let unsupported = |message: &str| format!("{UNSUPPORTED}{message}");
-        let fp8 = || {
-            unsupported(
-                "expected static per-tensor E4M3 scales, or 128 x 128 block weight scales with \
-                 activations scaled at run time per 128 inputs",
-            )
-        };
+        let fp8 = || unsupported(FP8);
         // A declared cache, or none when its values are asymmetric.
         let symmetric = |cache: Option<Tensor>| {
             cache.map_or(Some(false), |cache| cache.symmetric().then_some(true))
         };
-        let (scheme, excluded, kv_cache) = match located::<_, Hf>(declared)? {
+        // ModelOpt's NVFP4 declarations name prefixes; the others `re:.*part.*` patterns.
+        let prefixes = |entries: Vec<String>| {
+            let prefix = |entry: String| match entry.strip_suffix('*') {
+                Some(prefix) => Exclusion::Prefix(prefix.to_owned()),
+                None => Exclusion::Module(entry),
+            };
+            (entries.into_iter())
+                .map(|entry| {
+                    prefix(entry).named().ok_or_else(|| {
+                        unsupported("exclusions must be module names or prefixes ending in `*`")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let patterns = |entries: Vec<String>| {
+            let pattern = |entry: String| {
+                let part = (entry.strip_prefix("re:.*")).and_then(|part| part.strip_suffix(".*"));
+                match part {
+                    Some(part) => Exclusion::Part(part.to_owned()),
+                    None => Exclusion::Module(entry),
+                }
+            };
+            (entries.into_iter())
+                .map(|entry| {
+                    pattern(entry).named().ok_or_else(|| {
+                        unsupported("exclusions must be module names or `re:.*part.*` patterns")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let (mut schemes, excluded, kv_cache) = match located::<_, Hf>(declared)? {
             Hf::Fp8 {
                 activation_scheme,
                 weight_block_size,
@@ -303,8 +588,8 @@ impl TryFrom<Value> for Quantization {
                 };
                 let ignored = ignored_layers.into_iter().chain(modules_to_not_convert);
                 (
-                    scheme,
-                    ignored.flatten().collect(),
+                    vec![scheme],
+                    patterns(ignored.flatten().collect())?,
                     symmetric(kv_cache_scheme),
                 )
             }
@@ -318,8 +603,8 @@ impl TryFrom<Value> for Quantization {
                     return Err(fp8());
                 }
                 (
-                    Scheme::Tensor,
-                    ignore.unwrap_or_default(),
+                    vec![Scheme::Tensor],
+                    patterns(ignore.unwrap_or_default())?,
                     symmetric(kv_cache_scheme),
                 )
             }
@@ -330,7 +615,7 @@ impl TryFrom<Value> for Quantization {
             }) => {
                 if config_groups.is_empty() || !config_groups.values().all(Group::<Values>::linear)
                 {
-                    return Err(unsupported("expected NVFP4 linear weights and inputs"));
+                    return Err(unsupported(NVFP4));
                 }
                 let cache = kv_cache_scheme.map(
                     |Cache {
@@ -340,8 +625,8 @@ impl TryFrom<Value> for Quantization {
                      }| (),
                 );
                 (
-                    Scheme::Nvfp4,
-                    ignore.unwrap_or_default(),
+                    vec![Scheme::Nvfp4],
+                    prefixes(ignore.unwrap_or_default())?,
                     Some(cache.is_some()),
                 )
             }
@@ -349,50 +634,36 @@ impl TryFrom<Value> for Quantization {
                 return Err(unsupported("quant_algo: expected \"FP8\" or \"NVFP4\""));
             }
             Hf::CompressedTensors {
-                format: Literal,
+                format,
                 quantization_status: Literal,
                 config_groups,
                 ignore,
-                kv_cache_scheme: Absent,
-                sparsity_config: Absent,
+                kv_cache_scheme,
+                sparsity_config,
                 transform_config,
             } => {
-                if config_groups.is_empty()
-                    || !config_groups.values().all(BlockGroup::linear)
-                    || transform_config.is_some_and(|transforms| !transforms.is_empty())
-                {
+                let empty =
+                    |part: Option<BTreeMap<String, Value>>| part.is_none_or(|part| part.is_empty());
+                if config_groups.is_empty() || !empty(transform_config) {
                     return Err(fp8());
                 }
-                (Scheme::Block, ignore.unwrap_or_default(), Some(false))
+                if !empty(sparsity_config) {
+                    return Err(refuse("a value", "none"));
+                }
+                let schemes = (config_groups.values())
+                    .map(|group| format.scheme(group))
+                    .collect::<Result<Vec<_>, _>>()?;
+                (
+                    schemes,
+                    patterns(ignore.unwrap_or_default())?,
+                    symmetric(kv_cache_scheme),
+                )
             }
         };
-        let excluded = excluded
-            .into_iter()
-            .map(|entry| {
-                let (exclusion, refusal) = match scheme {
-                    Scheme::Nvfp4 => (
-                        match entry.strip_suffix('*') {
-                            Some(prefix) => Exclusion::Prefix(prefix.to_owned()),
-                            None => Exclusion::Module(entry),
-                        },
-                        "NVFP4 exclusions must be module names or prefixes ending in `*`",
-                    ),
-                    Scheme::Tensor | Scheme::Block => (
-                        match entry
-                            .strip_prefix("re:.*")
-                            .and_then(|part| part.strip_suffix(".*"))
-                        {
-                            Some(part) => Exclusion::Part(part.to_owned()),
-                            None => Exclusion::Module(entry),
-                        },
-                        "FP8 exclusions must be module names or `re:.*part.*` patterns",
-                    ),
-                };
-                exclusion.named().ok_or_else(|| unsupported(refusal))
-            })
-            .collect::<Result<_, _>>()?;
+        schemes.sort_unstable();
+        schemes.dedup();
         Ok(Self {
-            scheme,
+            schemes,
             excluded: Exclusions(excluded),
             kv_cache: kv_cache.ok_or_else(fp8)?,
         })
@@ -478,7 +749,7 @@ mod tests {
             .map(|(document, scheme)| (quantization(&document).unwrap(), scheme))
             .collect();
         for (config, scheme) in &parsed {
-            assert_eq!(config.scheme, *scheme);
+            assert_eq!(config.schemes, [*scheme]);
         }
         assert!(parsed[1].0.kv_cache && !parsed[0].0.kv_cache);
         let excludes = |at: usize, module| parsed[at].0.excluded.excludes(module);
@@ -514,7 +785,7 @@ mod tests {
             "expected static per-tensor E4M3 scales, or 128 x 128 block weight scales with ",
             "activations scaled at run time per 128 inputs",
         );
-        let patterns = "FP8 exclusions must be module names or `re:.*part.*` patterns";
+        let patterns = "exclusions must be module names or `re:.*part.*` patterns";
         let asymmetric =
             json!({"num_bits": 8, "type": "float", "dynamic": false, "symmetric": false});
         let cases = [
@@ -560,7 +831,12 @@ mod tests {
                 json!(["Embedding"]),
                 scales,
             ),
-            (&modelopt, &["kv_cache_scheme"][..], asymmetric, scales),
+            (
+                &modelopt,
+                &["kv_cache_scheme"][..],
+                asymmetric.clone(),
+                scales,
+            ),
             (&compressed, &["config_groups"][..], json!({}), scales),
             (
                 &compressed,
@@ -614,8 +890,8 @@ mod tests {
             (
                 &compressed,
                 &[group[0], group[1], "weights", "strategy"][..],
-                json!("channel"),
-                "found \"channel\", compiled \"block\"",
+                json!("tensor"),
+                r#"found "tensor", compiled "block" or "channel""#,
             ),
             (
                 &compressed,
@@ -674,7 +950,13 @@ mod tests {
             (
                 &compressed,
                 &["kv_cache_scheme"][..],
-                json!({"num_bits": 8}),
+                asymmetric.clone(),
+                scales,
+            ),
+            (
+                &compressed,
+                &["sparsity_config"][..],
+                json!({"format": "dense"}),
                 "found a value, compiled none",
             ),
             (
@@ -687,7 +969,10 @@ mod tests {
                 &compressed,
                 &["format"][..],
                 json!("pack-quantized"),
-                "found \"pack-quantized\", compiled \"float-quantized\"",
+                concat!(
+                    r#"found "pack-quantized", compiled "float-quantized", "#,
+                    r#""nvfp4-pack-quantized" or "mixed-precision""#,
+                ),
             ),
         ];
         let found: Vec<_> = cases
@@ -764,7 +1049,7 @@ mod tests {
     #[test]
     fn parses_nvfp4_declarations() {
         let config = quantization(&nvfp4()).unwrap();
-        assert_eq!(config.scheme, Scheme::Nvfp4);
+        assert_eq!(config.schemes, [Scheme::Nvfp4]);
         assert_eq!(
             config.excluded.0,
             [
@@ -773,15 +1058,10 @@ mod tests {
             ]
         );
         assert!(config.kv_cache);
-        let exclusions = "NVFP4 exclusions must be module names or prefixes ending in `*`";
+        let exclusions = "exclusions must be module names or prefixes ending in `*`";
         let linear = "expected NVFP4 linear weights and inputs";
         for (path, value, reason) in [
             ("/quant_algo", json!("FP8"), "found a value, compiled none"),
-            (
-                "/quant_method",
-                json!("compressed-tensors"),
-                "found 16, compiled 128",
-            ),
             (
                 "/config_groups/group_0/weights/num_bits",
                 json!(8),
@@ -826,5 +1106,89 @@ mod tests {
         let mut document = nvfp4();
         document.as_object_mut().unwrap().remove("kv_cache_scheme");
         assert!(!quantization(&document).unwrap().kv_cache);
+        document["quant_method"] = json!("compressed-tensors");
+        let error = quantization(&document).unwrap_err();
+        assert_eq!(
+            (error.kind(), error.to_string()),
+            (io::ErrorKind::InvalidData, "missing field `format`".into())
+        );
+    }
+
+    /// A mixed-precision declaration parses to the scheme of each module group, its exclusions and
+    /// its E4M3 cache; a group's other values or format, or a sparse checkpoint, are refused.
+    #[test]
+    fn parses_mixed_precision_declarations() {
+        use crate::models::decoder::attention::gemma4;
+        let config = quantization(&gemma4::tests::quantization()).unwrap();
+        assert_eq!(config.schemes, [Scheme::Channel, Scheme::Nvfp4]);
+        assert!(config.kv_cache);
+        for module in ["lm_head", "model.embed_audio.embedding_projection"] {
+            assert!(config.excluded.excludes(module), "{module}");
+        }
+        assert!(!(config.excluded).excludes("model.language_model.layers.0.self_attn.q_proj"));
+        let fp8 = concat!(
+            "expected static per-tensor E4M3 scales, or 128 x 128 block weight scales with ",
+            "activations scaled at run time per 128 inputs",
+        );
+        let format = "a module group's format: expected the checkpoint's, or its own in a \
+                      mixed-precision checkpoint";
+        let (channel, packed) = ("/config_groups/group_0", "/config_groups/group_1");
+        for (path, value, reason) in [
+            (
+                format!("{channel}/weights/strategy"),
+                json!("group"),
+                r#"found "group", compiled "block" or "channel""#,
+            ),
+            (
+                format!("{channel}/weights/dynamic"),
+                json!(true),
+                "found true, compiled false",
+            ),
+            (
+                format!("{channel}/input_activations/strategy"),
+                json!("group"),
+                r#"found "group", compiled "token""#,
+            ),
+            (format!("{channel}/targets"), json!([]), fp8),
+            (
+                format!("{packed}/weights/num_bits"),
+                json!(8),
+                "found 8, compiled 4",
+            ),
+            (
+                format!("{packed}/weights/actorder"),
+                json!("group"),
+                r#"found "group", compiled "static""#,
+            ),
+            (
+                format!("{packed}/input_activations/dynamic"),
+                json!("dynamic"),
+                r#"found "dynamic", compiled "local""#,
+            ),
+            (format!("{packed}/format"), json!(null), format),
+            (format!("{packed}/format"), json!("mixed-precision"), format),
+            (
+                "/sparsity_config".to_owned(),
+                json!({"format": "dense"}),
+                "found a value, compiled none",
+            ),
+            ("/kv_cache_scheme/symmetric".to_owned(), json!(false), fp8),
+        ] {
+            let mut document = gemma4::tests::quantization();
+            *document.pointer_mut(&path).unwrap() = value;
+            let error = quantization(&document).unwrap_err();
+            let refusal = (error.kind(), error.to_string());
+            assert_eq!(
+                refusal,
+                (io::ErrorKind::Unsupported, reason.into()),
+                "{path}"
+            );
+        }
+        let mut nvfp4 = gemma4::tests::quantization();
+        nvfp4["format"] = json!("nvfp4-pack-quantized");
+        let error = quantization(&nvfp4).unwrap_err();
+        assert_eq!(error.to_string(), format);
+        (nvfp4["config_groups"].as_object_mut().unwrap()).remove("group_0");
+        assert_eq!(quantization(&nvfp4).unwrap().schemes, [Scheme::Nvfp4]);
     }
 }

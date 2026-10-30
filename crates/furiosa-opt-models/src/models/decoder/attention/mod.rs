@@ -22,7 +22,7 @@ use crate::models::config::{
     self,
     scaling::{Spectra, Spectrum},
 };
-use crate::models::decoder::{Form, form};
+use crate::models::decoder::{Forms, form};
 use crate::models::{Class, Family, Implements};
 use crate::modules::attention::key_value;
 use crate::modules::language::{self, Greedy};
@@ -80,38 +80,38 @@ pub trait Geometry {
     const TIED_EMBEDDINGS: bool;
 }
 
-/// A causal language model of size `G` whose projections hold form `P`: the base model, then the
+/// A causal language model of size `G` whose projections hold forms `P`: the base model, then the
 /// head that reads its rows.
 #[derive(DeviceSend, Load)]
 #[load(tree)]
 pub struct ForCausalLM<G: Geometry, Model, Head, P = form::Affine> {
     pub size: PhantomData<G>,
-    /// The form of the body's projections, by which a line's scope admits a checkpoint.
+    /// The forms of the body's projections, by which a line's scope admits a checkpoint.
     pub form: PhantomData<P>,
     pub model: Model,
     pub lm_head: Head,
 }
 
-/// The base model of size `G` whose projections hold form `P`: the body, and the constants that
+/// The base model of size `G` whose projections hold forms `P`: the body, and the constants that
 /// prepare each call's attention context.
 #[derive(DeviceSend, Load)]
 #[load(tree)]
 pub struct Model<G: Geometry, Body, Rotary, P = form::Affine> {
     pub size: PhantomData<G>,
-    /// The form of the body's projections, by which a line's scope admits a checkpoint.
+    /// The forms of the body's projections, by which a line's scope admits a checkpoint.
     pub form: PhantomData<P>,
     #[load(rename = "")]
     pub body: Body,
     pub rotary_emb: Rotary,
 }
 
-/// A sequence classifier of size `G` whose projections hold form `P`: the base model, then the
+/// A sequence classifier of size `G` whose projections hold forms `P`: the base model, then the
 /// scores of its last row.
 #[derive(DeviceSend, Load)]
 #[load(tree)]
 pub struct ForSequenceClassification<G: Geometry, Model, Score, P = form::Affine> {
     pub size: PhantomData<G>,
-    /// The form of the body's projections, by which a line's scope admits a checkpoint.
+    /// The forms of the body's projections, by which a line's scope admits a checkpoint.
     pub form: PhantomData<P>,
     pub model: Model,
     pub score: Score,
@@ -383,8 +383,8 @@ impl<G: Geometry, Model, Projection, Select, P>
     }
 }
 
-/// A causal model reads a checkpoint at its root, if its form admits it.
-impl<G: Geometry + Family, Model, Head, P: Form> Implements for ForCausalLM<G, Model, Head, P> {
+/// A causal model reads a checkpoint at its root, if its forms admit it.
+impl<G: Geometry + Family, Model, Head, P: Forms> Implements for ForCausalLM<G, Model, Head, P> {
     const SIZE: &'static str = G::SIZE;
     const CLASS: Class = Class {
         family: G::FAMILY,
@@ -398,8 +398,8 @@ impl<G: Geometry + Family, Model, Head, P: Form> Implements for ForCausalLM<G, M
 }
 
 /// A base model reads its own layout at a checkpoint's root, and a causal or classifier
-/// checkpoint's where its family keeps it, not both, if its form admits the checkpoint.
-impl<G: Geometry + Family, Body, Rotary, P: Form> Implements for Model<G, Body, Rotary, P> {
+/// checkpoint's where its family keeps it, not both, if its forms admit the checkpoint.
+impl<G: Geometry + Family, Body, Rotary, P: Forms> Implements for Model<G, Body, Rotary, P> {
     const SIZE: &'static str = G::SIZE;
     const CLASS: Class = Class {
         family: G::FAMILY,
@@ -426,8 +426,8 @@ impl<G: Geometry + Family, Body, Rotary, P: Form> Implements for Model<G, Body, 
     }
 }
 
-/// A sequence classifier reads a checkpoint at its root, if its form admits it.
-impl<G: Geometry + Family, Model, Score, P: Form> Implements
+/// A sequence classifier reads a checkpoint at its root, if its forms admit it.
+impl<G: Geometry + Family, Model, Score, P: Forms> Implements
     for ForSequenceClassification<G, Model, Score, P>
 {
     const SIZE: &'static str = G::SIZE;
