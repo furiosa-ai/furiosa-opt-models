@@ -101,9 +101,6 @@ impl Geometry for Size {
 impl Decode for Size {
     type Rows = <Original as Decode>::Rows;
     type Windows = <Original as Decode>::Windows;
-    type Width = <Original as Decode>::Width;
-    type Packed = <Original as Decode>::Packed;
-    type Work = <Original as Decode>::Work;
     type Capacity = <Original as Decode>::Capacity;
     type Reach = <Original as Decode>::Reach;
     type Sequences = <Original as Decode>::Sequences;

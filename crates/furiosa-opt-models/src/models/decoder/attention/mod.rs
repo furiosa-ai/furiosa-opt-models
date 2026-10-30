@@ -16,6 +16,7 @@ use serde::Deserialize;
 use super::hybrid::{
     Glm5NextForCausalLM, GraniteMoeHybridForCausalLM, K3DSparkModel, OlmoHybridForCausalLM,
 };
+use crate::Sequential;
 use crate::load::{self, Checkpoint, Load, LoadError};
 use crate::models::config::{
     self,
@@ -24,17 +25,15 @@ use crate::models::config::{
 use crate::models::decoder::{Form, form};
 use crate::models::{Class, Family, Implements};
 use crate::modules::attention::key_value;
-use crate::modules::generic::schedule::{Empty, IntoStream, Scheduled};
-use crate::modules::language::{self, Call, Greedy, Input};
+use crate::modules::language::{self, Greedy};
 use crate::modules::{
     attention, diffusion, feedforward,
     generic::collection::{Array, Collected},
     mixing, recurrent, residual, speculative, transformer,
 };
 use crate::ops::rotary::{self, PairFrequencies, SplitHalf};
-use crate::tensor::{live::Live, memory::Memory};
+use crate::tensor::memory::Memory;
 use crate::{Either, First, Fork, Identity, Interleave, Layers, Repeat, Then, Unrolled};
-use crate::{Module, Sequential};
 use furiosa_opt_std::prelude::*;
 use qwen3::Qwen3ForCausalLM;
 
@@ -275,59 +274,6 @@ impl<G: Geometry + Family, Model, Score, P: Form> Implements
     fn scope(source: &Checkpoint) -> Result<&'static str, LoadError> {
         check::<G>(source.config())?;
         P::REQUIREMENT.admits(source).map(|()| "")
-    }
-}
-
-/// A call's rows through the body, whose state's places take its hidden rows, the call's context
-/// prepared by the constants of a key and value paging.
-impl<'x, R: AxisName, T, C, Chips: M, Env: Copy, S, P, G: Geometry, Body, Rows, Paging, Q, X, F>
-    Module<&'x mut Input<R, T, C, Chips>, Env, S>
-    for Model<G, Body, key_value::Preparation<Rows, Paging, Q, X>, F>
-where
-    Rows: AxisName,
-    Q: M + 'static,
-    X: Memory,
-    key_value::Preparation<Rows, Paging, Q, X>:
-        for<'d, 'c> Module<(Live<(), R>, &'c mut C), Env, &'d mut (), Output = P>,
-    for<'m, 'c> &'m Body: IntoStream<Empty<()>, Call<'c, P, T, R>, S>,
-{
-    type Output = ();
-
-    fn forward(
-        &self,
-        device: &mut Device,
-        env: Env,
-        state: S,
-        input: &'x mut Input<R, T, C, Chips>,
-    ) {
-        self.call(device, env, state, input, &self.body);
-    }
-}
-
-impl<G: Geometry, Body, Rotary, F> Model<G, Body, Rotary, F> {
-    /// A call's rows through `tree`: the call's history is read once into the context, then `tree`
-    /// streams over the call, its env, on the call's state; the context cannot escape the call.
-    fn call<'x, R: AxisName, T, C, Chips: M, Env: Copy, S, P, Tree>(
-        &self,
-        device: &mut Device,
-        env: Env,
-        state: S,
-        input: &'x mut Input<R, T, C, Chips>,
-        tree: Tree,
-    ) where
-        Rotary: for<'d, 'c> Module<(Live<(), R>, &'c mut C), Env, &'d mut (), Output = P>,
-        Tree: Copy + for<'c> IntoStream<Empty<()>, Call<'c, P, T, R>, S>,
-    {
-        let live = Live::<(), R>::read(&input.count);
-        let context = self
-            .rotary_emb
-            .forward(&mut *device, env, &mut (), (live, &mut input.cache));
-        let call = Call {
-            context: &context,
-            tokens: &input.tokens,
-            live,
-        };
-        Scheduled(tree).forward(device, call, state, ());
     }
 }
 
