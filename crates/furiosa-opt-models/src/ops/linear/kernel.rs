@@ -276,7 +276,7 @@ type Word<D> = Symbol<mapping::Packet<D>>;
 
 /// The elements of `D` one contraction step takes: two DMA packets.
 #[derive(Clone, Debug)]
-struct Step<D>(PhantomData<D>);
+pub(crate) struct Step<D>(PhantomData<D>);
 
 impl<D: Scalar> AxisName for Step<D> {
     const NAME: Ident = Ident::new("Step");
@@ -928,7 +928,93 @@ type Sums<'l, In, Out, Rows, B, X> = ContractTensor<
     m![{ Layout<Rows>::Lanes } # 8],
 >;
 
+/// How a contraction packs a slice's weight against the lanes: the packets it fetches and
+/// collects, the steps it contracts with their outputs, and the order the lanes fold the sums in.
+pub(crate) trait Packing<In: AxisName, D: Scalar, Rows: M, Inputs: M, Time: M, Lane: M> {
+    type Fetched: M;
+    type Fetch: M;
+    type Collected: M;
+    type Collect: M;
+    type Steps: M;
+    type Step: M;
+    type Outputs: M;
+    type Folded: M;
+    type Lanes: M;
+}
+
+/// A packet of one output's `D` inputs, two packets a step: `Rows` outputs by `Inputs` inputs.
+pub(crate) struct Segment;
+
+impl<In: AxisName, D: Scalar, Rows: M, Inputs: M, Time: M, Lane: M>
+    Packing<In, D, Rows, Inputs, Time, Lane> for Segment
+{
+    type Fetched = m![{ Rows }, { Inputs } / ({ Word<D> })];
+    type Fetch = m![In % ({ Word<D> })];
+    type Collected = m![{ Rows }, { Inputs } / ({ Word<D> })];
+    type Collect = m![In % ({ Word<D> })];
+    type Steps = m![{ Rows }, { Inputs } / ({ Symbol<Step<D>> }), { Time }];
+    type Step = m![In % ({ Symbol<Step<D>> })];
+    type Outputs = m![1];
+    type Folded = m![{ Rows }, { Time }];
+    type Lanes = m![{ Lane } # 8];
+}
+
+/// A packet of `Packet` outputs by `Q` inputs, one packet a step and collected in halves: `Rows`
+/// and `Inputs` count such packets, and the lanes fold the sums in `Folded` order.
+pub(crate) struct Grid<Packet, Folded, const Q: usize>(PhantomData<(Packet, Folded)>);
+
+impl<
+    In: AxisName,
+    D: Scalar,
+    Rows: M,
+    Inputs: M,
+    Time: M,
+    Lane: M,
+    Packet: M,
+    Folded: M,
+    const Q: usize,
+> Packing<In, D, Rows, Inputs, Time, Lane> for Grid<Packet, Folded, Q>
+{
+    type Fetched = m![{ Rows }, { Inputs }];
+    type Fetch = m![{ Packet }, In % { Q }];
+    type Collected = m![({ Rows }, { Inputs }), { Packet } / ({ Packet } / 2)];
+    type Collect = m![{ Packet } % ({ Packet } / 2), In % { Q }];
+    type Steps = m![{ Rows }, { Inputs }, { Time }];
+    type Step = m![{ Packet }, In % { Q }];
+    type Outputs = Packet;
+    type Folded = Folded;
+    type Lanes = Lane;
+}
+
 impl<In: AxisName, Out: AxisName> Contraction<In, Out> {
+    /// A weight tile against one batch's lanes, packed as `P` packs it: each slice's `Rows` outputs
+    /// over `Inputs` for each `Time` group of `Lane` lanes, before the parts meet.
+    pub(crate) fn contract<'l, P, D, Rows: M, Inputs: M, Time: M, Lane: M, C, S, E, L, T, X>(
+        device: &'l mut Device,
+        weight: &'l DmTensor<D, X, C, S, E>,
+        lanes: &'l TrfTensor<D, X, C, S, L, T>,
+    ) -> ContractTensor<'l, { Tu::Main }, f32, X, C, S, P::Folded, P::Lanes>
+    where
+        P: Packing<In, D, Rows, Inputs, Time, Lane>,
+        D: MaterializableScalar + ContractionCast<Output = f32>,
+        C: M,
+        S: M,
+        E: M,
+        L: M,
+        T: M,
+        X: M,
+    {
+        device
+            .main
+            .begin(weight.view())
+            .fetch::<P::Fetched, P::Fetch>()
+            .collect::<P::Collected, P::Collect>()
+            .contract_outer::<P::Steps, P::Step, _, _, _>(lanes)
+            .contract_packet::<P::Outputs>()
+            .contract_time::<m![{ Rows }, { Time }]>()
+            .contract_lane::<P::Folded, P::Lanes>(LaneMode::Interleaved)
+    }
+
     /// A weight slab against one batch's lanes: each slice's `Rows` outputs for each `Time` group
     /// of `Lane` lanes before the parts meet, streamed a `D` packet and contracted two at a time.
     pub(crate) fn sums<
@@ -947,21 +1033,9 @@ impl<In: AxisName, Out: AxisName> Contraction<In, Out> {
         lanes: &'l TrfTensor<D, X, C, S, Lane, m![{ Time }, { Inputs }]>,
     ) -> ContractTensor<'l, { Tu::Main }, f32, X, C, S, m![{ Rows }, { Time }], m![{ Lane } # 8]>
     {
-        device
-            .main
-            .begin(weight.view())
-            .fetch::<m![{ Rows }, { Inputs } / ({ Word<D> })], m![In % ({ Word<D> })]>()
-            .collect::<m![{ Rows }, { Inputs } / ({ Word<D> })], m![In % ({ Word<D> })]>()
-            .contract_outer::<
-                m![{ Rows }, { Inputs } / ({ Symbol<Step<D>> }), { Time }],
-                m![In % ({ Symbol<Step<D>> })],
-                _,
-                _,
-                _,
-            >(lanes)
-            .contract_packet::<m![1]>()
-            .contract_time::<m![{ Rows }, { Time }]>()
-            .contract_lane::<m![{ Rows }, { Time }], m![{ Lane } # 8]>(LaneMode::Interleaved)
+        Self::contract::<Segment, D, Rows, Inputs, Time, Lane, _, _, _, _, _, _>(
+            device, weight, lanes,
+        )
     }
 
     /// Every batch of `B` of the staged rows against weight slab `slab`, each batch's sums plus
@@ -1296,53 +1370,6 @@ impl<In: AxisName, Out: AxisName> Linear<In, Out> {
         ],
     > {
         projected.view().tile::<Layout<Rows>::Groups, 1, _>(at)
-    }
-}
-
-/// The step shape beside `sums`: several outputs a packet.
-impl<In: AxisName, Out: AxisName> Contraction<In, Out> {
-    /// A weight slab against one batch's lanes, `Packet` by `Q` a packet: each slice's `Rows`
-    /// outputs over `Inputs` inputs for each `Time` group, `Folded` ordering the sums to reduce.
-    pub(crate) fn packets<
-        'l,
-        Rows: M,
-        Inputs: M,
-        Packet: M,
-        Time: M,
-        Folded: M,
-        Lane: M,
-        const Q: usize,
-        C: M,
-        S: M,
-        E: M,
-        L: M,
-        T: M,
-        X: M,
-    >(
-        device: &'l mut Device,
-        weight: &'l DmTensor<bf16, X, C, S, E>,
-        lanes: &'l TrfTensor<bf16, X, C, S, L, T>,
-    ) -> ContractTensor<'l, { Tu::Main }, f32, X, C, S, Folded, Lane> {
-        device
-            .main
-            .begin(weight.view())
-            .fetch::<m![{ Rows }, { Inputs }], m![{ Packet }, In % { Q }]>()
-            .collect::<
-                m![({ Rows }, { Inputs }), { Packet } / ({ Packet } / 2)],
-                m![{ Packet } % ({ Packet } / 2), In % { Q }],
-            >()
-            .contract_outer::<
-                m![{ Rows }, { Inputs }, { Time }],
-                m![{ Packet }, In % { Q }],
-                _,
-                _,
-                _,
-            >(
-                lanes,
-            )
-            .contract_packet::<Packet>()
-            .contract_time::<m![{ Rows }, { Time }]>()
-            .contract_lane::<Folded, Lane>(LaneMode::Interleaved)
     }
 }
 

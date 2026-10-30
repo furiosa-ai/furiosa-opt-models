@@ -13,7 +13,7 @@
 use core::marker::PhantomData;
 
 use super::Matrix;
-use super::kernel::{Contraction, Offset, Rounding, Tiling};
+use super::kernel::{Contraction, Grid, Offset, Rounding, Tiling};
 use crate::Op;
 use crate::specialize::contraction;
 use furiosa_opt_std::prelude::*;
@@ -550,14 +550,13 @@ impl<I: AxisName, O: AxisName, R: AxisName> Chunked<I, O, R> {
         Folded<I, O, R>,
         m![{ B<R> } % 8],
     > {
-        Contraction::<I, O>::packets::<
+        Contraction::<I, O>::contract::<
+            Grid<m![O % 8], Folded<I, O, R>, 4>,
+            bf16,
             m![O % ({ Ns<I, O, R> }) / 8],
             m![I % ({ Ks<I, O, R> }) / 4],
-            m![O % 8],
             m![{ B<R> } % ({ Hr<R> }) / 8],
-            Folded<I, O, R>,
             m![{ B<R> } % 8],
-            4,
             _,
             _,
             _,
