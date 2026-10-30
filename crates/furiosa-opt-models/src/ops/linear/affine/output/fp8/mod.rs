@@ -2,7 +2,6 @@
 
 use super::*;
 use crate::tensor::form::fp8::Rows;
-pub(crate) use project::Landed;
 pub(crate) use to_dm::ToDm;
 
 mod contract;
