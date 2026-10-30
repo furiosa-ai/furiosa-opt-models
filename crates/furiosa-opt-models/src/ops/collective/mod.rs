@@ -28,19 +28,9 @@ impl<P> Default for AllReduce<P> {
     }
 }
 
-impl<D: Scalar, W: AxisName> Op<HbmTensor<D, m![1], m![W]>> for AllReduce<Parallel<1>> {
-    type Output = HbmTensor<D, m![1], m![W]>;
-
-    fn forward(&self, _: &mut Device, input: Self::Output) -> Self::Output {
-        input
-    }
-}
-
-/// One chip's rows are already the sum.
-impl<D: Scalar, R: AxisName, W: AxisName> Op<HbmTensor<D, m![1], m![R, W]>>
-    for AllReduce<Parallel<1>>
-{
-    type Output = HbmTensor<D, m![1], m![R, W]>;
+/// One chip's tensor is already the sum.
+impl<D: Scalar, E: M> Op<HbmTensor<D, m![1], E>> for AllReduce<Parallel<1>> {
+    type Output = HbmTensor<D, m![1], E>;
 
     fn forward(&self, _: &mut Device, input: Self::Output) -> Self::Output {
         input
