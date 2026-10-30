@@ -36,7 +36,7 @@ const SCALED: usize = 16 * 8;
 pub(crate) const BAND: usize = 64;
 
 /// Data memory a slice gives a row tile's weight slab, in bytes.
-pub(crate) const SLAB: usize = 301_056;
+const SLAB: usize = 301_056;
 
 /// Bytes of a BF16 weight or row element, which a projection over rows stages.
 const BF16: usize = 2;
@@ -910,17 +910,42 @@ pub(crate) const fn half(rows: usize) -> usize {
 }
 
 /// The row tile `(parts, kept, passes)` of `(input, output)` at `half` rows a cluster: a listed
-/// shape's entry, else [`derived`]'s.
+/// shape's entry, else [`derived`]'s; a tile that does not [`hold`] fails to compile.
 pub(crate) const fn row_tile(input: usize, output: usize, half: usize) -> (usize, usize, usize) {
-    let mut at = 0;
-    while at < ROW_TILES.len() {
-        let entry = &ROW_TILES[at];
-        if entry.input == input && entry.output == output && entry.half == half {
-            return (entry.parts, entry.kept, entry.passes);
+    let tile = 'listed: {
+        let mut at = 0;
+        while at < ROW_TILES.len() {
+            let entry = &ROW_TILES[at];
+            if entry.input == input && entry.output == output && entry.half == half {
+                break 'listed (entry.parts, entry.kept, entry.passes);
+            }
+            at += 1;
         }
-        at += 1;
-    }
-    derived(input, output, half)
+        derived(input, output, half)
+    };
+    assert!(
+        hold(input, output, half, tile),
+        "the row tile does not fit the projection"
+    );
+    tile
+}
+
+/// Whether the row tile `(parts, kept, passes)` splits `input` by `output` over the slices at
+/// `half` rows a cluster, a K group's rows of a block in a TRF bank, a slice's outputs in its slab.
+const fn hold(
+    input: usize,
+    output: usize,
+    half: usize,
+    (parts, kept, passes): (usize, usize, usize),
+) -> bool {
+    let chunk = input / parts;
+    let outputs = parts / (half / 8) * kept;
+    input.is_multiple_of(parts)
+        && chunk.is_multiple_of(4)
+        && half * chunk * BF16 <= super::TRF / 2
+        && kept.is_multiple_of(8)
+        && outputs * chunk * BF16 <= SLAB
+        && super::SLICES / parts * outputs * passes == output
 }
 
 /// The row tile of the fewest weight passes, then the fewest K groups, whose slab fits
