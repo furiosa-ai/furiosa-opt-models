@@ -14,6 +14,7 @@
 use crate::decoder::{Decoder, Instance, Served};
 use crate::vision_language::Encoder;
 use furiosa_opt_models::load::{Checkpoint, Context, Load, LoadError, Part};
+use furiosa_opt_models::models::decoder::attention::qwen3::launch;
 use furiosa_opt_models::models::decoder::attention::{llama, qwen3};
 use furiosa_opt_models::models::decoder::form;
 use furiosa_opt_models::models::vision_language::gemma4_unified;
@@ -184,9 +185,7 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
         "LlamaForCausalLM",
         &[
             Implementation::of::<llama::nvfp4::ForCausalLM>(),
-            Implementation::of::<
-                llama::ForCausalLM<llama::Size<"8B">, form::Affine, Parallel<1>, cache::Bf16, Hbm>,
-            >(),
+            Implementation::of::<launch::Model<llama::Size<"8B">, form::Affine>>(),
         ],
     ),
     ("LlamaForCausalLMEagle", &[]),
@@ -227,13 +226,7 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
     (
         "MistralForCausalLM",
         &[Implementation::of::<
-            llama::ForCausalLM<
-                llama::Size<"Mistral-7B">,
-                form::Affine,
-                Parallel<1>,
-                cache::Bf16,
-                Hbm,
-            >,
+            launch::Model<llama::Size<"Mistral-7B">, form::Affine>,
         >()],
     ),
     ("MistralForCausalLMEagle", &[]),
@@ -316,9 +309,7 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
             Implementation::of::<
                 qwen3::ForCausalLM<qwen3::Size<"4B">, form::Affine, Parallel<1>, cache::Bf16, Hbm>,
             >(),
-            Implementation::of::<
-                qwen3::ForCausalLM<qwen3::Size<"8B">, form::Affine, Parallel<1>, cache::Bf16, Hbm>,
-            >(),
+            Implementation::of::<launch::Model<qwen3::Size<"8B">, form::Affine>>(),
             Implementation::of::<qwen3::fp8::ForCausalLM>(),
             Implementation::of::<
                 qwen3::ForCausalLM<
@@ -371,24 +362,8 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
                     Hbm,
                 >,
             >(),
-            Implementation::of::<
-                qwen3::ForSequenceClassification<
-                    qwen3::Size<"4B">,
-                    form::Affine,
-                    Parallel<1>,
-                    cache::Bf16,
-                    Hbm,
-                >,
-            >(),
-            Implementation::of::<
-                qwen3::ForSequenceClassification<
-                    qwen3::Size<"8B">,
-                    form::Affine,
-                    Parallel<1>,
-                    cache::Bf16,
-                    Hbm,
-                >,
-            >(),
+            Implementation::of::<launch::Classifier<qwen3::Size<"4B">, form::Affine>>(),
+            Implementation::of::<launch::Classifier<qwen3::Size<"8B">, form::Affine>>(),
         ],
     ),
     (
@@ -403,9 +378,7 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
             Implementation::of::<
                 qwen3::Model<qwen3::Size<"4B">, form::Affine, Parallel<1>, cache::Bf16, Hbm>,
             >(),
-            Implementation::of::<
-                qwen3::Model<qwen3::Size<"8B">, form::Affine, Parallel<1>, cache::Bf16, Hbm>,
-            >(),
+            Implementation::of::<launch::Base<qwen3::Size<"8B">, form::Affine>>(),
         ],
     ),
     ("Qwen3MoeForCausalLM", &[]),
