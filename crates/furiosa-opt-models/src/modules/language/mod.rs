@@ -38,8 +38,7 @@ impl<R, Tokens, Cache, Chips: M> Input<R, Tokens, Cache, Chips> {
     }
 }
 
-/// What every node of a call reads: the context its preparation computed, its tokens and its live
-/// rows.
+/// What a call's leaves read: the context its preparation computed, its tokens and its live rows.
 pub struct Call<'c, C, T, R> {
     pub(crate) context: &'c C,
     pub(crate) tokens: &'c T,
@@ -57,13 +56,6 @@ impl<C, T, R> Copy for Call<'_, C, T, R> {}
 impl<C, T, R> From<Call<'_, C, T, R>> for Live<(), R> {
     fn from(call: Call<'_, C, T, R>) -> Self {
         call.live
-    }
-}
-
-/// The embedding's input: the call's tokens with its live rows.
-impl<'c, C, T, R> From<Call<'c, C, T, R>> for (&'c T, Live<(), R>) {
-    fn from(call: Call<'c, C, T, R>) -> Self {
-        (call.tokens, call.live)
     }
 }
 
