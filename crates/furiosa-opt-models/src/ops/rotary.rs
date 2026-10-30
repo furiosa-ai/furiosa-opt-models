@@ -16,6 +16,7 @@ use furiosa_opt_std::prelude::*;
 use std::io;
 
 use crate::ops::attention::full::heads::tiles;
+use crate::ops::index::scatter::Store;
 use crate::ops::linear::Groups;
 
 use crate::ops::attention::{RowGroups, TileGroups};
@@ -588,51 +589,11 @@ where
             Live<(), Rows>,
         ),
     ) -> Self::Output {
-        // Stores only the live rows; a later row is left unwritten.
         let store = |device: &mut Device,
                      table: &CoefficientSlices<Rows, Rotated, Chip>|
          -> CoefficientRows<Rows, Rotated, Chip> {
-            let mut output: CoefficientRows<Rows, Rotated, Chip> = HbmTensor::new();
-            live.cover::<Lanes<Rows>, _>(
-                &mut (device, &mut output),
-                (
-                    |(device, output)| {
-                        table
-                            .view()
-                            .to_hbm_view(&mut device.tdma, output.view_mut());
-                    },
-                    |(device, output), packet| {
-                        table
-                        .view()
-                        .tile::<Layout<Rows>::Groups, 1, Layout<Rows>::Elements<m![Rotated % 8]>>(
-                            packet,
-                        )
-                        .to_hbm_view(
-                            &mut device.tdma,
-                            output
-                                .view_mut()
-                                .tile::<
-                                    Layout<Rows>::Groups,
-                                    1,
-                                    Layout<Rows>::GroupMut<m![Rotated]>,
-                                >(
-                                    packet,
-                                ),
-                        );
-                    },
-                    |(device, output), row| {
-                        table
-                            .view()
-                            .tile::<m![Rows], 1, m![Rows = 1 # Rows, Rotated % 8]>(row)
-                            .to_hbm_view(
-                                &mut device.tdma,
-                                output
-                                    .view_mut()
-                                    .tile::<m![Rows], 1, m![Rows = 1 #{!} Rows, Rotated]>(row),
-                            );
-                    },
-                ),
-            );
+            let mut output = HbmTensor::new();
+            Store::live(device, table, live, &mut output);
             output
         };
         let angle = self.angle(device, (frequency, position));
