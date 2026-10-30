@@ -1,6 +1,6 @@
-//! Qwen3's and Llama's listed roots of the packed tree as decoders: a call stages its requests,
-//! streams the base model's body over every layer's own blocks into the call's rows, then keeps the
-//! rows its requests keep.
+//! Qwen3's listed roots of the packed tree as decoders: a call stages its requests, streams the
+//! base model's body over every layer's own blocks into the call's rows, then keeps the rows its
+//! requests keep.
 //!
 //! - The base model returns the kept rows' hidden values; the causal model runs its greedy head
 //!   on them and returns their tokens; the sequence classifier runs its score head on them and
@@ -16,7 +16,7 @@ use super::adapters::{self, SLOTS};
 use super::{Batch, CacheSpec, Decoder, Group, Kind, Limits, Output, Pool, Rows, Table, Tables};
 use crate::{AsyncModule, Checkpoint, Function, LoadError, forward};
 use furiosa_opt_models::load::{Context, Load};
-use furiosa_opt_models::models::decoder::attention::{Geometry, llama, qwen3};
+use furiosa_opt_models::models::decoder::attention::{Geometry, qwen3};
 use furiosa_opt_models::models::decoder::attention::{Head, KvHeads};
 use furiosa_opt_models::models::decoder::form;
 use furiosa_opt_models::modules::language::Input;
@@ -90,8 +90,8 @@ fn keep<W: AxisName>(
 }
 
 /// The decoders of the listed sizes `$size` whose projections hold form `$form`: the base model
-/// and the causal model, which run `SLOTS` adapters a call when `adapted`, and none when their
-/// front is `normalized`, Qwen3's, or `projected`, Llama's.
+/// and the causal model, which run `SLOTS` adapters a call when `adapted`, and none when
+/// `normalized`.
 macro_rules! decoders {
     ($(($size:ty, $form:ty) => $kind:ident),+ $(,)?) => {$(
         /// The kept rows' hidden values.
@@ -217,9 +217,8 @@ macro_rules! decoders {
         }
     };
     (@load $kind:ident $size:ty) => {};
-    // A layer's front slots around its query, key and value projection's `$qkv`: Qwen3's normalize
-    // each query and key head after it, Llama's take the heads as projected.
-    (@front projected $qkv:expr) => { $qkv };
+    // A layer's front slots around its query, key and value projection's `$qkv`, then its query
+    // and key head norms'.
     (@front $kind:ident $qkv:expr) => { ($qkv, (), ()) };
     // Each layer's slots: its front's, its cache blocks and its output projection's, then its
     // feed-forward's gate, up and down projections'.
@@ -277,9 +276,6 @@ decoders!(
     (qwen3::Size<"0.6B">, form::Affine) => adapted,
     (qwen3::Size<"1.7B">, form::Affine) => adapted,
     (qwen3::Size<"4B">, form::Affine) => adapted,
-    (qwen3::Size<"8B">, form::Affine) => normalized,
-    (llama::Size<"8B">, form::Affine) => projected,
-    (llama::Size<"Mistral-7B">, form::Affine) => projected,
     (qwen3::Size<"0.6B">, form::ChannelScaled) => normalized,
     (qwen3::Size<"1.7B">, form::ChannelScaled) => normalized,
     (qwen3::Size<"4B">, form::ChannelScaled) => normalized,
@@ -350,9 +346,4 @@ macro_rules! classifiers {
     )+};
 }
 
-classifiers!(
-    qwen3::Size<"0.6B">,
-    qwen3::Size<"1.7B">,
-    qwen3::Size<"4B">,
-    qwen3::Size<"8B">,
-);
+classifiers!(qwen3::Size<"0.6B">, qwen3::Size<"1.7B">);
