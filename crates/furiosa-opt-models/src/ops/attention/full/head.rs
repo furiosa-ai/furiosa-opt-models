@@ -82,6 +82,15 @@ impl<A, B> Op<Either<A, B>> for () {
     }
 }
 
+/// ...or those of a group's tiles.
+impl<C: M, P: M, R: M> Op<DmTensor<bf16, Chip, C, P, R>> for () {
+    type Output = DmTensor<bf16, Chip, C, P, R>;
+
+    fn forward(&self, _: &mut Device, rows: DmTensor<bf16, Chip, C, P, R>) -> Self::Output {
+        rows
+    }
+}
+
 impl<Head: AxisName, const EPSILON: usize> Staged<Head, EPSILON> {
     /// Rows `u` of `T` rows of heads whose true values are `c s u`, `inverse` holding each row's
     /// `1 / (c s)²` (`c s = 1` without it), normalized as the true rows are and left in their layout.

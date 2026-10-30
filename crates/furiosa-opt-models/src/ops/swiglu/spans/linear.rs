@@ -95,6 +95,52 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
     }
 }
 
+/// The dense down projection lands no weight panel ahead of its product: the contraction reads its
+/// slabs from HBM.
+impl<Hidden: AxisName, Intermediate: AxisName, Env> Module<Begin<usize>, Env, &mut ()>
+    for Linear<Intermediate, Hidden, Chip>
+{
+    type Output = ();
+
+    fn forward(&self, _: &mut Device, _: Env, _: &mut (), _: Begin<usize>) {}
+}
+
+/// The product, already in HBM, waits there for the down projection, no panel landed for it.
+impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName, Env>
+    Module<Begin<(Live<Lines<Rows, Intermediate>, Capacity>, ())>, Env, &mut ()>
+    for Linear<Intermediate, Hidden, Chip>
+{
+    type Output = Lines<Rows, Intermediate>;
+
+    fn forward(
+        &self,
+        _: &mut Device,
+        _: Env,
+        _: &mut (),
+        Begin((product, ())): Begin<(Live<Lines<Rows, Intermediate>, Capacity>, ())>,
+    ) -> Lines<Rows, Intermediate> {
+        product.into_value()
+    }
+}
+
+/// Nor does any of its input land before it projects: the product is the down projection's input.
+impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName, Env>
+    Module<Live<(Lines<Rows, Intermediate>, ((), ())), Capacity>, Env, &mut ()>
+    for Linear<Intermediate, Hidden, Chip>
+{
+    type Output = Lines<Rows, Intermediate>;
+
+    fn forward(
+        &self,
+        _: &mut Device,
+        _: Env,
+        _: &mut (),
+        staged: Live<(Lines<Rows, Intermediate>, ((), ())), Capacity>,
+    ) -> Lines<Rows, Intermediate> {
+        staged.into_value().0
+    }
+}
+
 /// The down projection of a span's live product rows, landed back on chip as the span's rows.
 impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName, Env: Copy>
     Module<Live<Lines<Rows, Intermediate>, Capacity>, Env, &mut ()>
