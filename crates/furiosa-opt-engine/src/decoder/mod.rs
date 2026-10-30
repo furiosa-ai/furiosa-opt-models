@@ -173,7 +173,8 @@ pub trait Decoder: Send + Sync {
     /// adapter tree, or `Infallible` for a decoder that runs none.
     type Adapter: Send + Sync + 'static;
 
-    fn limits(&self) -> Limits;
+    /// What one call holds when its rows' attention is tiled as `tiling` says.
+    fn limits(&self, tiling: Tiling) -> Limits;
 
     /// Views of `storage`, the layers of a cache allocated for this decoder.
     fn layers(storage: &[HbmBuffer]) -> io::Result<Self::Layers>;
@@ -247,7 +248,8 @@ impl<'r, 'c, 'l, 'a, D: Decoder>
         (cache, adapters): (&'c Cache, &'l [Option<&'a D::Adapter>]),
         requests: &'r [Request],
     ) -> io::Result<D::Output> {
-        let batch = Batch::new(requests, &Decoder::limits(&self.decoder), cache, adapters)?;
+        let limits = Decoder::limits(&self.decoder, self.tiling);
+        let batch = Batch::new(requests, &limits, cache, adapters)?;
         let mut layers = cache.lend(D::layers)?;
         self.decoder
             .call(device, &mut layers, batch, self.tiling)
@@ -283,7 +285,7 @@ pub trait Served: Send + Sync {
 /// `Adapter`s.
 impl<D: Decoder> Served for Instance<D> {
     fn limits(&self) -> Limits {
-        Decoder::limits(&self.decoder)
+        Decoder::limits(&self.decoder, self.tiling)
     }
 
     fn output(&self) -> Output {
@@ -483,8 +485,8 @@ impl<R: AxisName, W: AxisName> AxisName for Tables<R, W> {
 /// A catalog root as a decoder: a call plans its rows' positions, cache slots, attention work and
 /// selected rows on the host, then launches the root once over every layer's own blocks, which
 /// writes the selected rows' outputs in kept order; a call that runs adapters passes each layer's
-/// projections their terms and selections of the rows. Its prompt chunks attend apart from their
-/// history, so it refuses a fixed tiling.
+/// projections their terms and selections of the rows. Under a fixed tiling every row is a work
+/// item, so a launch holds the size's call rows.
 impl<R> Decoder for R
 where
     R: Root + DeviceSend + Send + Sync,
@@ -516,8 +518,8 @@ where
     type Layers = Vec<Blocks<KvHeads, Head>>;
     type Adapter = <R::Adapting as Adapting<R::Size>>::Adapter;
 
-    fn limits(&self) -> Limits {
-        limits::<R::Size>(Self::ADAPTERS)
+    fn limits(&self, tiling: Tiling) -> Limits {
+        limits::<R::Size>(Self::ADAPTERS, tiling)
     }
 
     fn layers(storage: &[HbmBuffer]) -> io::Result<Self::Layers> {
@@ -541,12 +543,6 @@ where
     ) -> impl Future<Output = io::Result<Self::Output>> + Send {
         let root = self;
         async move {
-            if tiling == Tiling::Fixed {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "the launch model attends prompt chunks apart from their history",
-                ));
-            }
             let mut reads = batch.operands::<
                 launch::Capacity<R::Size>,
                 <R::Size as Decode>::Reach,
@@ -556,7 +552,7 @@ where
                 Head,
                 launch::Waves<R::Size>,
                 <R::Size as Decode>::Windows,
-            >(0)?;
+            >(0, tiling)?;
             if let Some(binding) = batch.adapters() {
                 reads.extend(binding.selections::<launch::Capacity<R::Size>, Rank<1>>());
                 reads.extend(binding.selections::<launch::Capacity<R::Size>, Rank<2>>());
@@ -621,12 +617,18 @@ where
 /// What each layer's projections of the root `R` run with in a call of adapters.
 type Held<'t, R> = <<R as Root>::Adapting as Adapting<<R as Root>::Size>>::States<'t>;
 
-/// What a launch of the size `S` holds: the context its size is compiled for, the launch's rows,
-/// one paged group of every layer's blocks, and `adapters` adapters.
-fn limits<S: Geometry + Decode + 'static>(adapters: usize) -> Limits {
+/// What a launch of the size `S` holds, its rows tiled as `tiling` says: the context its size is
+/// compiled for, one paged group of every layer's blocks, `adapters` adapters, and the launch's
+/// rows; a fixed tiling attends every row as a work item, so it holds the size's call rows, which
+/// its items hold over the whole context.
+fn limits<S: Geometry + Decode + 'static>(adapters: usize, tiling: Tiling) -> Limits {
+    let rows = match tiling {
+        Tiling::Fixed => S::Rows::SIZE,
+        Tiling::Adaptive => launch::Capacity::<S>::SIZE,
+    };
     Limits {
         window: launch::Positions::<S>::SIZE,
-        rows: launch::Capacity::<S>::SIZE,
+        rows,
         cache: CacheSpec {
             pools: vec![Pool {
                 block: Block::SIZE,
@@ -684,7 +686,7 @@ mod tests {
 
     /// A launch of Qwen3-4B admits and plans a call past the 40960 positions a Qwen3 checkpoint
     /// declares, up to the context its size is compiled for: decode rows and a prompt that end at
-    /// its last position.
+    /// its last position, under a fixed tiling as many as the launch admits.
     #[test]
     fn launches_plan_the_compiled_context() -> io::Result<()> {
         type S = qwen3::Size<"4B">;
@@ -710,27 +712,29 @@ mod tests {
                 overrides: Vec::new(),
             })
         };
-        let limits = limits::<S>(0);
-        let context = limits.window;
-        assert!(context > 40960, "{context} positions");
-        // The rows every row of which the items hold over the whole context.
-        let rows = <S as Decode>::Rows::SIZE;
-        let cache = Cache::new(&device, &limits.cache, 2 + rows)?;
-        let mut requests = vec![request(rows / 2, context, 0)?];
-        for row in 0..rows / 2 {
-            requests.push(request(1, context, 2 + row)?);
+        for tiling in [Tiling::Adaptive, Tiling::Fixed] {
+            let limits = limits::<S>(0, tiling);
+            let context = limits.window;
+            assert!(context > 40960, "{tiling:?}: {context} positions");
+            // The rows every row of which the items hold over the whole context.
+            let rows = limits.rows.min(<S as Decode>::Rows::SIZE);
+            let cache = Cache::new(&device, &limits.cache, 2 + rows)?;
+            let mut requests = vec![request(rows / 2, context, 0)?];
+            for row in 0..rows / 2 {
+                requests.push(request(1, context, 2 + row)?);
+            }
+            let batch = Batch::<Infallible>::new(&requests, &limits, &cache, &[])?;
+            batch.operands::<
+                launch::Capacity<S>,
+                <S as Decode>::Reach,
+                <S as Decode>::Sequences,
+                KvHeads,
+                <S as Geometry>::Groups,
+                Head,
+                launch::Waves<S>,
+                <S as Decode>::Windows,
+            >(0, tiling)?;
         }
-        let batch = Batch::<Infallible>::new(&requests, &limits, &cache, &[])?;
-        batch.operands::<
-            launch::Capacity<S>,
-            <S as Decode>::Reach,
-            <S as Decode>::Sequences,
-            KvHeads,
-            <S as Geometry>::Groups,
-            Head,
-            launch::Waves<S>,
-            <S as Decode>::Windows,
-        >(0)?;
         Ok(())
     }
 }
