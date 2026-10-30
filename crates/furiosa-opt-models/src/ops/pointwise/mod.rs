@@ -72,6 +72,19 @@ type Slices<S> = m![{ Width<S> } % ({ Extent<S> }) / ({ Segment<S> }) # 256];
 type Elements<S> = m![{ Width<S> } % ({ Segment<S> })];
 type Rows<D, S, Chips = m![1]> = DmTensor<D, Chips, m![1 # 2], Slices<S>, Elements<S>>;
 type Registers<S, Chips = m![1]> = VrfTensor<f32, Chips, m![1 # 2], Slices<S>, Elements<S>>;
+/// A window's FP32 values narrowed to four lanes, the stream a formula computes in.
+type Narrowed<'l, S, Chips> = VectorNarrowTensor<
+    'l,
+    { Tu::Main },
+    f32,
+    Chips,
+    m![1 # 2],
+    Slices<S>,
+    m![{ Width<S> } % ({ Segment<S> }) / 4],
+    m![{ Width<S> } % 4],
+    Fresh,
+    { stage::VeOrder::IntraFirst },
+>;
 
 /// Scalars widened to FP32 for arithmetic and converted back at the window boundary.
 pub(crate) trait Float: MaterializableScalar + FetchCast<f32> {
@@ -107,25 +120,28 @@ impl Float for bf16 {
 }
 
 impl<S: M + 'static> Window<S> {
-    /// `input` through `formula` window by window, computed in FP32 in DM and rounded once to `D`
+    /// `formula` of the inputs window by window, computed in FP32 in DM and rounded once to `D`
     /// on its way back; a single element pads to a vector of eight.
-    pub(in crate::ops) fn map<D: Float, Chips: M>(
+    pub(in crate::ops) fn map<D: Float, Chips: M, const N: usize>(
         device: &mut Device,
-        input: &HbmTensor<D, Chips, S>,
-        formula: impl Fn(&mut Device, Rows<D, S, Chips>) -> Rows<f32, S, Chips>,
+        inputs: [&HbmTensor<D, Chips, S>; N],
+        formula: impl Fn(&mut Device, [Rows<D, S, Chips>; N]) -> Rows<f32, S, Chips>,
     ) -> HbmTensor<D, Chips, S> {
         if const { S::SIZE == 1 } {
             // Padded to a part (eight cells here) rather than to 8: this branch is instantiated for
             // every `S`, and the reshape below asserts equal sizes for each.
             type Padded<S> = m![{ Symbol<Flat<S>> } = 1 # ({ Segment<S> })];
-            // SAFETY: flattening preserves the contiguous element order.
-            let input = unsafe { input.view().reshape::<Chips, m![{ Symbol<Flat<S>> }]>() };
-            let input: DmTensor<D, Chips, m![1 # 2], m![1 # 256], Padded<S>> =
-                input.pad::<Padded<S>>().to_dm(&mut device.tdma);
-            // SAFETY: both mappings cover the same eight contiguous cells; only lane 0 reaches HBM.
-            let input: Rows<D, S, Chips> = unsafe { input.reshape() };
+            let inputs = inputs.map(|input| {
+                // SAFETY: flattening preserves the contiguous element order.
+                let input = unsafe { input.view().reshape::<Chips, m![{ Symbol<Flat<S>> }]>() };
+                let input: DmTensor<D, Chips, m![1 # 2], m![1 # 256], Padded<S>> =
+                    input.pad::<Padded<S>>().to_dm(&mut device.tdma);
+                // SAFETY: both mappings cover the same eight contiguous cells; only lane 0 reaches
+                // HBM.
+                unsafe { input.reshape() }
+            });
             let mut result = HbmTensor::<D, Chips, m![{ Symbol<Flat<S>> }]>::new();
-            let output = formula(&mut *device, input);
+            let output = formula(&mut *device, inputs);
             D::narrow(device, output)
                 .view()
                 .tile::<m![{ Width<S> }], 1, m![{ Width<S> } = 1 # 8]>(0)
@@ -141,11 +157,13 @@ impl<S: M + 'static> Window<S> {
 
         let mut result = HbmTensor::<D, Chips, m![{ Symbol<Flat<S>> }]>::new();
         for index in 0..S::SIZE / Window::<Width<S>>::SIZE {
-            let input: Rows<D, S, Chips> =
+            let inputs = inputs.map(|input| {
+                // SAFETY: flattening preserves the contiguous element order.
                 unsafe { input.view().reshape::<Chips, m![{ Symbol<Flat<S>> }]>() }
                     .tile::<m![{ Width<S> } / ({ Extent<S> })], 1, Batch<S>>(index)
-                    .to_dm(&mut device.tdma);
-            let output = formula(&mut *device, input);
+                    .to_dm(&mut device.tdma)
+            });
+            let output = formula(&mut *device, inputs);
             D::narrow(device, output).view().to_hbm_view(
                 &mut device.tdma,
                 result
@@ -155,6 +173,33 @@ impl<S: M + 'static> Window<S> {
         }
         // SAFETY: flattening preserves the contiguous element order.
         unsafe { result.reshape() }
+    }
+
+    /// `op` of two tensors' FP32 values in the same layout, the right one read from the vector
+    /// registers.
+    pub(in crate::ops) fn binary<D: Float, Chips: M>(
+        device: &mut Device,
+        inputs: [&HbmTensor<D, Chips, S>; 2],
+        op: FpBinaryOp,
+    ) -> HbmTensor<D, Chips, S> {
+        Self::map(device, inputs, |device, [left, right]| {
+            let right: Registers<S, Chips> = device
+                .sub
+                .begin(right.view())
+                .fetch::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
+                .fetch_cast::<f32>()
+                .collect::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
+                .to_vrf();
+            Self::stream(&mut device.main, &left)
+                .vector_fp_binary(op, &right)
+                .vector_widen_concat::<
+                    m![{ Width<S> } % ({ Segment<S> }) / 8],
+                    m![{ Width<S> } % 8],
+                >()
+                .vector_final()
+                .commit_trim::<m![{ Width<S> } % 8]>()
+                .commit()
+        })
     }
 
     /// Each window's values in FP32, and the same values narrowed to four lanes, as the stream a
@@ -162,18 +207,7 @@ impl<S: M + 'static> Window<S> {
     fn stream<'l, D: Float, Chips: M>(
         main: &'l mut TuContext<{ Tu::Main }>,
         input: &'l Rows<D, S, Chips>,
-    ) -> VectorNarrowTensor<
-        'l,
-        { Tu::Main },
-        f32,
-        Chips,
-        m![1 # 2],
-        Slices<S>,
-        m![{ Width<S> } % ({ Segment<S> }) / 4],
-        m![{ Width<S> } % 4],
-        Fresh,
-        { stage::VeOrder::IntraFirst },
-    > {
+    ) -> Narrowed<'l, S, Chips> {
         main.begin(input.view())
             .fetch::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
             .fetch_cast::<f32>()
@@ -181,60 +215,6 @@ impl<S: M + 'static> Window<S> {
             .vector_init()
             .vector_intra_slice_tag(TagMode::Zero)
             .vector_narrow_split::<m![{ Width<S> } % ({ Segment<S> }) / 4], m![{ Width<S> } % 4]>()
-    }
-}
-
-impl<S: M + 'static> Window<S> {
-    pub(in crate::ops) fn combine<D: Float, const MULTIPLY: bool, Chips: M>(
-        device: &mut Device,
-        lhs: &HbmTensor<D, Chips, S>,
-        rhs: &HbmTensor<D, Chips, S>,
-    ) -> HbmTensor<D, Chips, S> {
-        let mut result = HbmTensor::<D, Chips, m![{ Width<S> }]>::new();
-        for index in 0..S::SIZE / Window::<S>::SIZE {
-            let lhs: Rows<D, S, Chips> = unsafe { lhs.view().reshape::<Chips, m![{ Width<S> }]>() }
-                .tile::<m![{ Width<S> } / ({ Extent<S> })], 1, Batch<S>>(index)
-                .to_dm(&mut device.tdma);
-            let rhs: Rows<D, S, Chips> = unsafe { rhs.view().reshape::<Chips, m![{ Width<S> }]>() }
-                .tile::<m![{ Width<S> } / ({ Extent<S> })], 1, Batch<S>>(index)
-                .to_dm(&mut device.tdma);
-            let rhs: Registers<S, Chips> = device
-                .sub
-                .begin(rhs.view())
-                .fetch::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
-                .fetch_cast::<f32>()
-                .collect::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
-                .to_vrf();
-            let output: Rows<f32, S, Chips> = device
-            .main
-            .begin(lhs.view())
-            .fetch::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
-            .fetch_cast::<f32>()
-            .collect::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
-            .vector_init()
-            .vector_intra_slice_tag(TagMode::Zero)
-            .vector_narrow_split::<m![{ Width<S> } % ({ Segment<S> }) / 4], m![{ Width<S> } % 4]>()
-            .vector_fp_binary(
-                if MULTIPLY {
-                    FpBinaryOp::MulF(FpMulAlu::Mul0)
-                } else {
-                    FpBinaryOp::AddF
-                },
-                &rhs,
-            )
-            .vector_widen_concat::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
-            .vector_final()
-            .commit_trim::<m![{ Width<S> } % 8]>()
-            .commit();
-            D::narrow(device, output).view().to_hbm_view(
-                &mut device.tdma,
-                result
-                    .view_mut()
-                    .tile::<m![{ Width<S> } / ({ Extent<S> })], 1, BatchMut<S>>(index),
-            );
-        }
-        // SAFETY: flattening preserves the contiguous element order.
-        unsafe { result.reshape() }
     }
 }
 

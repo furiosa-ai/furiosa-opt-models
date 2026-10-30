@@ -124,6 +124,35 @@ impl<R: AxisName> Block<R> {
     }
 }
 
+impl<T: AxisName, A: AxisName, V: AxisName> Block<Packed<T, A, V>> {
+    /// Each span of a packed sequence, in packing order, as regions `(first, count, table row)`
+    /// into `output`: its whole blocks through `blocks`, its edge strips through `strips`.
+    pub(crate) fn spans<O>(
+        device: &mut Device,
+        output: &mut O,
+        mut blocks: impl FnMut(&mut Device, &mut O, (usize, usize, usize)),
+        mut strips: impl FnMut(&mut Device, &mut O, (usize, usize, usize)),
+    ) {
+        // Each span's strips before its first whole block, its whole blocks, then its strips after;
+        // strips are 64 rows when every span comes in them, else 16.
+        let plan = const { Self::plan(Join::spans::<T, A, V>(), Packed::<T, A, V>::STRIP) };
+        #[unroll]
+        for span in 0..3 {
+            #[unroll]
+            for region in 0..3 {
+                let (first, count, index) = plan[span][region];
+                if count > 0 {
+                    if region == 1 {
+                        blocks(&mut *device, &mut *output, (first, count, index));
+                    } else {
+                        strips(&mut *device, &mut *output, (first, count, index));
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl<R: AxisName, W: AxisName, X: M> Op<(&Rows<R, W, X>, usize, &mut Part<bf16, R, W, X>)>
     for Block<R>
 {
@@ -302,95 +331,78 @@ where
         ),
     ) {
         let weight = self.weight.tensor();
-        // Each span's strips before its first whole block, its whole blocks, then its strips after;
-        // strips are 64 rows when every span comes in them, else 16.
-        let plan = const {
-            Block::<Packed<T, A, V>>::plan(Join::spans::<T, A, V>(), Packed::<T, A, V>::STRIP)
-        };
-        #[unroll]
-        for span in 0..3 {
-            #[unroll]
-            for region in 0..3 {
-                let (first, count, index) = plan[span][region];
-                if count > 0 {
-                    if region == 1 {
-                        type R<T, A, V> = Packed<T, A, V>;
-                        type B<T, A, V> = Block<R<T, A, V>>;
-                        let (shift, scale) = tables;
-                        let gain = {
-                            let (weight, scale) = (weight.view(), B::<T, A, V>::row(scale, index));
-                            let weight = B::<T, A, V>::new().forward(&mut *device, weight);
-                            let scale: Feature<R<T, A, V>, Width, Chips> =
-                                scale.to_dm(&mut device.tdma);
-                            device.main.begin(scale.view())
-                                .fetch::<m![Width % ({ E<Width> }) / 8], m![Width % 8]>()
-                                .fetch_cast::<f32>()
-                                .collect::<m![Width % ({ E<Width> }) / 8], m![Width % 8]>()
-                                .vector_init()
-                                .vector_intra_slice_tag(TagMode::Zero)
-                                .vector_narrow_split::<
-                                    m![Width % ({ E<Width> }) / 8, Width % 8 / 4 % 2],
-                                    m![Width % 4],
-                                >()
-                                .vector_fp_binary(FpBinaryOp::AddF, 1.0f32)
-                                .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &weight)
-                                .vector_widen_concat::<
-                                    m![Width % ({ E<Width> }) / 8],
-                                    m![Width % 8],
-                                >()
-                                .vector_final()
-                                .to_vrf(&mut device.sub)
-                        };
-                        let shift = B::<T, A, V>::new()
-                            .forward(&mut *device, B::<T, A, V>::row(shift, index));
-                        let last = first + count - 1;
-                        let (mut current, mut next): (
-                            Part<bf16, R<T, A, V>, Width, Chips>,
-                            Part<bf16, R<T, A, V>, Width, Chips>,
-                        ) = (DmTensor::new(), DmTensor::new());
-                        let (mut kept, mut held): (
-                            Part<bf16, R<T, A, V>, Width, Chips>,
-                            Part<bf16, R<T, A, V>, Width, Chips>,
-                        ) = (DmTensor::new(), DmTensor::new());
-                        B::<T, A, V>::new().forward(&mut *device, (input, first, &mut current));
-                        B::<T, A, V>::new()
-                            .forward(&mut *device, (input, (first + 1).min(last), &mut next));
-                        for pair in 0..(count + 1) / 2 {
-                            let at = first + 2 * pair;
-                            let inverse =
-                                B::<T, A, V>::new().forward(&mut *device, (&current, self));
-                            let following =
-                                B::<T, A, V>::new().forward(&mut *device, (&next, self));
-                            B::<T, A, V>::new().forward(
-                                &mut *device,
-                                (&current, (&inverse, &gain, &shift), &mut kept),
-                            );
-                            B::<T, A, V>::new()
-                                .forward(&mut *device, (input, (at + 2).min(last), &mut current));
-                            B::<T, A, V>::new().forward(&mut *device, (&kept, &mut *output, at));
-                            B::<T, A, V>::new().forward(
-                                &mut *device,
-                                (&next, (&following, &gain, &shift), &mut held),
-                            );
-                            B::<T, A, V>::new()
-                                .forward(&mut *device, (input, (at + 3).min(last), &mut next));
-                            B::<T, A, V>::new()
-                                .forward(&mut *device, (&held, &mut *output, (at + 1).min(last)));
-                        }
-                    } else if const { Packed::<T, A, V>::STRIP == 64 } {
-                        Wide::<Width>::new().forward(
-                            &mut *device,
-                            (input, &mut *output, self, tables, (first, count, index)),
-                        );
-                    } else {
-                        Narrow::<Width>::new().forward(
-                            &mut *device,
-                            (input, &mut *output, self, tables, (first, count, index)),
-                        );
-                    }
+        type R<T, A, V> = Packed<T, A, V>;
+        type B<T, A, V> = Block<R<T, A, V>>;
+        B::<T, A, V>::spans(
+            device,
+            output,
+            |device, output, (first, count, index)| {
+                let (shift, scale) = tables;
+                let gain = {
+                    let (weight, scale) = (weight.view(), B::<T, A, V>::row(scale, index));
+                    let weight = B::<T, A, V>::new().forward(&mut *device, weight);
+                    let scale: Feature<R<T, A, V>, Width, Chips> = scale.to_dm(&mut device.tdma);
+                    device
+                        .main
+                        .begin(scale.view())
+                        .fetch::<m![Width % ({ E<Width> }) / 8], m![Width % 8]>()
+                        .fetch_cast::<f32>()
+                        .collect::<m![Width % ({ E<Width> }) / 8], m![Width % 8]>()
+                        .vector_init()
+                        .vector_intra_slice_tag(TagMode::Zero)
+                        .vector_narrow_split::<
+                            m![Width % ({ E<Width> }) / 8, Width % 8 / 4 % 2],
+                            m![Width % 4],
+                        >()
+                        .vector_fp_binary(FpBinaryOp::AddF, 1.0f32)
+                        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &weight)
+                        .vector_widen_concat::<m![Width % ({ E<Width> }) / 8], m![Width % 8]>()
+                        .vector_final()
+                        .to_vrf(&mut device.sub)
+                };
+                let shift =
+                    B::<T, A, V>::new().forward(&mut *device, B::<T, A, V>::row(shift, index));
+                let last = first + count - 1;
+                let (mut current, mut next): (
+                    Part<bf16, R<T, A, V>, Width, Chips>,
+                    Part<bf16, R<T, A, V>, Width, Chips>,
+                ) = (DmTensor::new(), DmTensor::new());
+                let (mut kept, mut held): (
+                    Part<bf16, R<T, A, V>, Width, Chips>,
+                    Part<bf16, R<T, A, V>, Width, Chips>,
+                ) = (DmTensor::new(), DmTensor::new());
+                B::<T, A, V>::new().forward(&mut *device, (input, first, &mut current));
+                B::<T, A, V>::new()
+                    .forward(&mut *device, (input, (first + 1).min(last), &mut next));
+                for pair in 0..(count + 1) / 2 {
+                    let at = first + 2 * pair;
+                    let inverse = B::<T, A, V>::new().forward(&mut *device, (&current, self));
+                    let following = B::<T, A, V>::new().forward(&mut *device, (&next, self));
+                    B::<T, A, V>::new().forward(
+                        &mut *device,
+                        (&current, (&inverse, &gain, &shift), &mut kept),
+                    );
+                    B::<T, A, V>::new()
+                        .forward(&mut *device, (input, (at + 2).min(last), &mut current));
+                    B::<T, A, V>::new().forward(&mut *device, (&kept, &mut *output, at));
+                    B::<T, A, V>::new().forward(
+                        &mut *device,
+                        (&next, (&following, &gain, &shift), &mut held),
+                    );
+                    B::<T, A, V>::new()
+                        .forward(&mut *device, (input, (at + 3).min(last), &mut next));
+                    B::<T, A, V>::new()
+                        .forward(&mut *device, (&held, &mut *output, (at + 1).min(last)));
                 }
-            }
-        }
+            },
+            |device, output, strips| {
+                if const { Packed::<T, A, V>::STRIP == 64 } {
+                    Wide::<Width>::new().forward(device, (input, output, self, tables, strips));
+                } else {
+                    Narrow::<Width>::new().forward(device, (input, output, self, tables, strips));
+                }
+            },
+        );
     }
 }
 

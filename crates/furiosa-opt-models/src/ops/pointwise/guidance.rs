@@ -1,7 +1,7 @@
 //! Classifier-free guidance over complete predictions or the channels preceding learned
 //! variance.
 
-use super::{Flat, Part, Window};
+use super::{Batch, BatchMut, Extent, Registers, Rows, Segment, Slices, Width, Window};
 use crate::Op;
 use crate::tensor::scalar;
 use furiosa_opt_std::prelude::*;
@@ -34,22 +34,7 @@ impl<P: M + 'static, S: M + 'static> AxisName for Planes<P, S> {
     };
 }
 
-type Width<S> = Symbol<Flat<S>>;
 type Plane<P, S> = Symbol<Planes<P, S>>;
-type Extent<S> = Symbol<Window<S>>;
-type Segment<S> = Symbol<Part<S>>;
-
-type Batch<S> =
-    m![{Width<S>} / ({Extent<S>}) = 1 # ({Width<S>} / ({Extent<S>})), {Width<S>} % ({Extent<S>})];
-
-type BatchMut<S> = m![
-    {Width<S>} / ({Extent<S>}) = 1 #{!} ({Width<S>} / ({Extent<S>})),
-    {Width<S>} % ({Extent<S>})
-];
-type Slices<S> = m![{Width<S>} % ({Extent<S>}) / ({Segment<S>}) # 256];
-type Elements<S> = m![{Width<S>} % ({Segment<S>})];
-type Rows<S> = DmTensor<f32, m![1], m![1 # 2], Slices<S>, Elements<S>>;
-type Registers<S> = VrfTensor<f32, m![1], m![1 # 2], Slices<S>, Elements<S>>;
 
 impl<Prediction: M + 'static, Sample: M + 'static, G: Borrow<Factor>>
     Op<(&[Values<Prediction>; 2], G)> for Combine<Prediction, Sample>
@@ -64,7 +49,7 @@ impl<Prediction: M + 'static, Sample: M + 'static, G: Borrow<Factor>>
         let mut result = Values::<m![{Width<Sample>}]>::new();
         for index in 0..Sample::SIZE / Window::<Sample>::SIZE {
             // Indexed borrows, since `each_ref` builds raw pointers that device code cannot lower.
-            let [conditional, unconditional]: [Rows<Sample>; 2] =
+            let [conditional, unconditional]: [Rows<f32, Sample>; 2] =
                 [&predictions[0], &predictions[1]].map(|prediction| {
                     // SAFETY: Planes splits the same contiguous cells into whole sample planes.
                     unsafe {
@@ -91,7 +76,7 @@ impl<Prediction: M + 'static, Sample: M + 'static, G: Borrow<Factor>>
             let scale: DmTensor<f32, m![1], m![1 # 2], Slices<Sample>, m![1 # 8]> =
                 scale.borrow().to_dm(&mut device.tdma);
             let scale = scalar::register(device, &scale);
-            let output: Rows<Sample> = device
+            let output: Rows<f32, Sample> = device
                 .main
                 .begin(conditional.view())
                 .fetch::<m![{Width<Sample>} % ({Segment<Sample>}) / 8], m![{Width<Sample>} % 8]>()
@@ -111,7 +96,7 @@ impl<Prediction: M + 'static, Sample: M + 'static, G: Borrow<Factor>>
                 .vector_final()
                 .commit_trim::<m![{Width<Sample>} % 8]>()
                 .commit();
-            let output: Rows<Sample> = device
+            let output: Rows<f32, Sample> = device
                 .main
                 .begin(output.view())
                 .fetch::<m![{Width<Sample>} % ({Segment<Sample>}) / 8], m![{Width<Sample>} % 8]>()

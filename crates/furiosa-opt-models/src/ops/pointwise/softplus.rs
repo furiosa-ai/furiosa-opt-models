@@ -18,7 +18,7 @@ impl<D: Float, S: M + 'static, Chips: M> Op<&HbmTensor<D, Chips, S>> for Softplu
     /// Each window's `max(log(1 + exp(min(x, 20))), x)` in FP32, in three DM round trips; the log
     /// exceeds `x` exactly where `x` is at most the threshold.
     fn forward(&self, device: &mut Device, input: &HbmTensor<D, Chips, S>) -> Self::Output {
-        Window::<S>::map(device, input, |device, input| {
+        Window::<S>::map(device, [input], |device, [input]| {
             let source: Registers<S, Chips> = device
                 .sub
                 .begin(input.view())

@@ -1,6 +1,6 @@
 //! torch's `clamp`: every element held between two bounds fixed when the kernel compiles.
 
-use super::{Float, Segment, Width, Window};
+use super::{Float, Rows, Segment, Width, Window};
 use crate::Op;
 use crate::load::Load;
 use crate::tensor::scalar::F32;
@@ -22,23 +22,32 @@ impl<D: Float, S: M + 'static, Chips: M, const LOWER: usize, const UPPER: usize>
 {
     type Output = HbmTensor<D, Chips, S>;
 
-    /// Each window raised to the lower bound, then lowered to the upper one, in one DM round trip.
     fn forward(&self, device: &mut Device, input: &HbmTensor<D, Chips, S>) -> Self::Output {
-        Window::<S>::map(device, input, |device, input| {
-            device
-                .main
-                .begin(input.view())
-                .fetch::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
-                .fetch_cast::<f32>()
-                .collect::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
-                .vector_init()
-                .vector_intra_slice_tag(TagMode::Zero)
-                .vector_clip(ClipBinaryOpF32::Max, f32::from(F32::<LOWER>))
-                .vector_clip(ClipBinaryOpF32::Min, f32::from(F32::<UPPER>))
-                .vector_final()
-                .commit_trim::<m![{ Width<S> } % 8]>()
-                .commit()
+        Window::<S>::map(device, [input], |device, [input]| {
+            Self::window(device, &input)
         })
+    }
+}
+
+impl<const LOWER: usize, const UPPER: usize> Clamp<F32<LOWER>, F32<UPPER>> {
+    /// A window raised to the lower bound, then lowered to the upper one, in one DM round trip.
+    pub(super) fn window<D: Float, S: M + 'static, Chips: M>(
+        device: &mut Device,
+        input: &Rows<D, S, Chips>,
+    ) -> Rows<f32, S, Chips> {
+        device
+            .main
+            .begin(input.view())
+            .fetch::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
+            .fetch_cast::<f32>()
+            .collect::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_clip(ClipBinaryOpF32::Max, f32::from(F32::<LOWER>))
+            .vector_clip(ClipBinaryOpF32::Min, f32::from(F32::<UPPER>))
+            .vector_final()
+            .commit_trim::<m![{ Width<S> } % 8]>()
+            .commit()
     }
 }
 
