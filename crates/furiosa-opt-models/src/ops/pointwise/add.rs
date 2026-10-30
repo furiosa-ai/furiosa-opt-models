@@ -29,7 +29,7 @@ impl<D: Float, S: M + 'static, Chips: M> Op<(&HbmTensor<D, Chips, S>, &HbmTensor
         device: &mut Device,
         (left, right): (&HbmTensor<D, Chips, S>, &HbmTensor<D, Chips, S>),
     ) -> Self::Output {
-        Window::<S>::combine::<_, false, Chips>(device, left, right)
+        Window::<S>::binary(device, [left, right], FpBinaryOp::AddF)
     }
 }
 

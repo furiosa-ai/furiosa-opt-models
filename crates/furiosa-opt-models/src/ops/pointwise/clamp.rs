@@ -24,7 +24,7 @@ impl<D: Float, S: M + 'static, Chips: M, const LOWER: usize, const UPPER: usize>
 
     /// Each window raised to the lower bound, then lowered to the upper one, in one DM round trip.
     fn forward(&self, device: &mut Device, input: &HbmTensor<D, Chips, S>) -> Self::Output {
-        Window::<S>::map(device, input, |device, input| {
+        Window::<S>::map(device, [input], |device, [input]| {
             device
                 .main
                 .begin(input.view())

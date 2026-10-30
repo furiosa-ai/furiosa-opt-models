@@ -1,8 +1,6 @@
 //! Elementwise products: of two tensors, of a tensor and a scalar, and of rows and per-row scalars.
 
-use super::{
-    Batch, BatchMut, Extent, Float, Rows, Segment, Slices, SpreadPacket, SpreadTime, Width, Window,
-};
+use super::{Float, Segment, Slices, SpreadPacket, SpreadTime, Width, Window};
 use crate::Op;
 use crate::load::Load;
 use crate::ops::normalization::{Chunk, Spread};
@@ -37,7 +35,7 @@ impl<D: Float, S: M + 'static, Chips: M> Op<(&HbmTensor<D, Chips, S>, &HbmTensor
         device: &mut Device,
         (left, right): (&HbmTensor<D, Chips, S>, &HbmTensor<D, Chips, S>),
     ) -> Self::Output {
-        Window::<S>::combine::<_, true, Chips>(device, left, right)
+        Window::<S>::binary(device, [left, right], FpBinaryOp::MulF(FpMulAlu::Mul0))
     }
 }
 
@@ -62,7 +60,7 @@ impl<'s, D: Float, S: M + 'static, K, Chips: M + 'static>
             &'s HbmTensor<f32, Chips, m![Single, 1 # 8]>,
         ),
     ) -> Self::Output {
-        (Scale::rows(device, &query, factor), key)
+        (Scale(factor).forward(device, &query), key)
     }
 }
 
@@ -115,49 +113,31 @@ impl<D: Float, S: M + 'static, Chips: M + 'static> Op<&HbmTensor<D, Chips, S>>
     type Output = HbmTensor<D, Chips, S>;
 
     fn forward(&self, device: &mut Device, input: &HbmTensor<D, Chips, S>) -> Self::Output {
-        Self::rows(device, input, &self.0)
+        Scale(&self.0).forward(device, input)
     }
 }
 
-/// `input` times the FP32 scalar in the first cell of `factor`, rounded to `D` once.
-impl<F: M, Chips: M + 'static> Scale<HbmTensor<f32, Chips, F>> {
-    pub(in crate::ops) fn rows<D: Float, S: M + 'static>(
-        device: &mut Device,
-        input: &HbmTensor<D, Chips, S>,
-        factor: &HbmTensor<f32, Chips, F>,
-    ) -> HbmTensor<D, Chips, S> {
-        let mut result = HbmTensor::<D, Chips, m![{ Width<S> }]>::new();
-        for index in 0..S::SIZE / Window::<S>::SIZE {
-            let input: Rows<D, S, Chips> =
-                unsafe { input.view().reshape::<Chips, m![{ Width<S> }]>() }
-                    .tile::<m![{ Width<S> } / ({ Extent<S> })], 1, Batch<S>>(index)
-                    .to_dm(&mut device.tdma);
+/// `input` times the FP32 scalar in the first cell of the factor, rounded to `D` once.
+impl<D: Float, S: M + 'static, F: M, Chips: M + 'static> Op<&HbmTensor<D, Chips, S>>
+    for Scale<&HbmTensor<f32, Chips, F>>
+{
+    type Output = HbmTensor<D, Chips, S>;
+
+    fn forward(&self, device: &mut Device, input: &HbmTensor<D, Chips, S>) -> Self::Output {
+        Window::<S>::map(device, [input], |device, [input]| {
             let scale: DmTensor<f32, Chips, m![1 # 2], Slices<S>, m![1 # 8]> =
-                factor.to_dm(&mut device.tdma);
+                self.0.to_dm(&mut device.tdma);
             let scale = scalar::register(device, &scale);
-            let output: Rows<f32, S, Chips> = device
-            .main
-            .begin(input.view())
-            .fetch::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
-            .fetch_cast::<f32>()
-            .collect::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
-            .vector_init()
-            .vector_intra_slice_tag(TagMode::Zero)
-            .vector_narrow_split::<m![{ Width<S> } % ({ Segment<S> }) / 4], m![{ Width<S> } % 4]>()
-            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &scale)
-            .vector_widen_concat::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
-            .vector_final()
-            .commit_trim::<m![{ Width<S> } % 8]>()
-            .commit();
-            D::narrow(device, output).view().to_hbm_view(
-                &mut device.tdma,
-                result
-                    .view_mut()
-                    .tile::<m![{ Width<S> } / ({ Extent<S> })], 1, BatchMut<S>>(index),
-            );
-        }
-        // SAFETY: flattening preserves the contiguous element order.
-        unsafe { result.reshape() }
+            Window::<S>::stream(&mut device.main, &input)
+                .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &scale)
+                .vector_widen_concat::<
+                    m![{ Width<S> } % ({ Segment<S> }) / 8],
+                    m![{ Width<S> } % 8],
+                >()
+                .vector_final()
+                .commit_trim::<m![{ Width<S> } % 8]>()
+                .commit()
+        })
     }
 }
 

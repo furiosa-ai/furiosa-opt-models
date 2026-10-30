@@ -15,7 +15,7 @@ impl<S: M + 'static> Op<&HbmTensor<f32, m![1], S>> for Denormalize {
     /// Each window in three DM round trips: `x / 2 + 1 / 2`, then the clip at 0, then the clip
     /// at 1.
     fn forward(&self, device: &mut Device, input: &HbmTensor<f32, m![1], S>) -> Self::Output {
-        Window::<S>::map(device, input, |device, input| {
+        Window::<S>::map(device, [input], |device, [input]| {
             let output: Rows<f32, S> = Window::<S>::stream(&mut device.main, &input)
                 .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), 0.5_f32)
                 .vector_fp_binary(FpBinaryOp::AddF, 0.5_f32)

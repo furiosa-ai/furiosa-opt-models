@@ -45,7 +45,7 @@ impl<D: Float, S: M + 'static, Chips: M + 'static> Op<&HbmTensor<D, Chips, S>> f
 
     /// Each window's `x * sigmoid(1.702 x)` in FP32, `x` held in the stash.
     fn forward(&self, device: &mut Device, input: &HbmTensor<D, Chips, S>) -> Self::Output {
-        Window::<S>::map(device, input, |device, input| {
+        Window::<S>::map(device, [input], |device, [input]| {
             Window::<S>::stream(&mut device.main, &input)
                 .vector_stash()
                 .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), 1.702_f32)
@@ -76,7 +76,7 @@ impl<D: Float, S: M + 'static, Chips: M + 'static> Op<&HbmTensor<D, Chips, S>> f
     /// Each window's `x / 2 * (1 + erf(x / sqrt(2)))` in FP32, in two DM round trips: the error
     /// function, then its product with `x`.
     fn forward(&self, device: &mut Device, input: &HbmTensor<D, Chips, S>) -> Self::Output {
-        Window::<S>::map(device, input, |device, input| {
+        Window::<S>::map(device, [input], |device, [input]| {
             let source: Registers<S, Chips> = device
                 .sub
                 .begin(input.view())
@@ -132,7 +132,7 @@ impl<D: Float, S: M + 'static, Chips: M + 'static> Op<&HbmTensor<D, Chips, S>> f
     /// Each window's `x / 2 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 x³)))` in FP32 over three DM
     /// round trips: `1 + 0.044715 x²`, the tanh of it times `sqrt(2/pi) x`, the product.
     fn forward(&self, device: &mut Device, input: &HbmTensor<D, Chips, S>) -> Self::Output {
-        Window::<S>::map(device, input, |device, input| {
+        Window::<S>::map(device, [input], |device, [input]| {
             let source: Registers<S, Chips> = device
                 .sub
                 .begin(input.view())
@@ -206,7 +206,7 @@ impl<D: Float, S: M + 'static, Chips: M> Op<&HbmTensor<D, Chips, S>> for Silu {
 
     /// Each window's `x * sigmoid(x)` in FP32, `x` held in the stash.
     fn forward(&self, device: &mut Device, input: &HbmTensor<D, Chips, S>) -> Self::Output {
-        Window::<S>::map(device, input, |device, input| {
+        Window::<S>::map(device, [input], |device, [input]| {
             Window::<S>::stream(&mut device.main, &input)
                 .vector_silu()
                 .vector_widen_concat::<
@@ -228,7 +228,7 @@ impl<D: Float, S: M + 'static, Chips: M> Op<&HbmTensor<D, Chips, S>> for Sigmoid
     type Output = HbmTensor<D, Chips, S>;
 
     fn forward(&self, device: &mut Device, input: &HbmTensor<D, Chips, S>) -> Self::Output {
-        Window::<S>::map(device, input, |device, input| {
+        Window::<S>::map(device, [input], |device, [input]| {
             Window::<S>::stream(&mut device.main, &input)
                 .vector_fp_unary(FpUnaryOp::Sigmoid)
                 .vector_widen_concat::<
@@ -250,7 +250,7 @@ impl<D: Float, S: M + 'static, Chips: M + 'static> Op<&HbmTensor<D, Chips, S>> f
     type Output = HbmTensor<D, Chips, S>;
 
     fn forward(&self, device: &mut Device, input: &HbmTensor<D, Chips, S>) -> Self::Output {
-        Window::<S>::map(device, input, |device, input| {
+        Window::<S>::map(device, [input], |device, [input]| {
             Window::<S>::stream(&mut device.main, &input)
                 .vector_fp_unary(FpUnaryOp::Tanh)
                 .vector_widen_concat::<
