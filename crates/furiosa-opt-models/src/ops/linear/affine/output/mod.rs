@@ -1,17 +1,15 @@
-//! The attention's output projection over a launch's attended rows: one node stages its weights,
-//! takes the attended rows once and gives their projection a span at a time; the weights' form
-//! projects each span, in as many polls as it takes.
+//! The attention's output projection over a launch's attended rows: its weights staged once, then
+//! their projection a span at a time in three steps, of which the dense forms work in the last.
 
 use furiosa_opt_std::prelude::*;
 
 use crate::Module;
-use crate::modules::generic::schedule::{Begin, IntoStream, Slot, Stream};
+use crate::modules::generic::schedule::Begin;
 use crate::ops::linear::Affine;
 use crate::ops::normalization::span::{Owned, Span};
 use crate::ops::pointwise::add::{Add, Term};
 use crate::tensor::live::Live;
 use crate::tensor::parallel::Chip;
-use core::borrow::Borrow;
 use core::marker::PhantomData;
 use core::task::Poll;
 
@@ -28,134 +26,6 @@ pub(crate) struct ToDm<'a, QWidth: AxisName, Capacity: AxisName, Reach: AxisName
     pub capacity: PhantomData<Capacity>,
 }
 
-/// The projection of a launch's attended rows, which its upstream gives once, a span at a time.
-impl<U, E, S, W, L, A, O, Capacity> IntoStream<U, E, S> for Affine<W, ()>
-where
-    Capacity: AxisName,
-    E: Into<Live<(), Capacity>>,
-    U: Stream<Item = Live<A, Capacity>>,
-    Self: for<'s> Module<Begin<()>, (), &'s mut (), Output = L>
-        + for<'s, 'l> Module<&'l mut L, (), &'s mut (), Output = ()>
-        + for<'s, 'l, 'a> Module<
-            (&'l mut L, &'a A, Live<(), Capacity>),
-            (),
-            &'s mut (),
-            Output = Poll<O>,
-        >,
-{
-    type Stream = Node<Self, Self, L, A, Capacity, U>;
-
-    fn into_stream(self, env: E, _: S, upstream: U) -> Self::Stream {
-        Node::new(self, env.into(), upstream)
-    }
-}
-
-/// A borrowed projection streams as its reference.
-impl<'m, U, E, S, W, L, A, O, Capacity> IntoStream<U, E, S> for &'m Affine<W, ()>
-where
-    Capacity: AxisName,
-    E: Into<Live<(), Capacity>>,
-    U: Stream<Item = Live<A, Capacity>>,
-    Affine<W, ()>: for<'s> Module<Begin<()>, (), &'s mut (), Output = L>
-        + for<'s, 'l> Module<&'l mut L, (), &'s mut (), Output = ()>
-        + for<'s, 'l, 'a> Module<
-            (&'l mut L, &'a A, Live<(), Capacity>),
-            (),
-            &'s mut (),
-            Output = Poll<O>,
-        >,
-{
-    type Stream = Node<Self, Affine<W, ()>, L, A, Capacity, U>;
-
-    fn into_stream(self, env: E, _: S, upstream: U) -> Self::Stream {
-        Node::new(self, env.into(), upstream)
-    }
-}
-
-/// An output projection's node: its projection `T`, held as `M`, what its weights landed at its
-/// first poll, the launch's live rows, its attended rows, the spans it gave and its upstream. It
-/// polls its upstream for the attended rows, then for its end once it gave every span.
-pub(crate) struct Node<M, T, L, A, Capacity, U> {
-    module: M,
-    landed: Option<L>,
-    live: Live<(), Capacity>,
-    attended: Option<A>,
-    given: usize,
-    upstream: U,
-    projection: PhantomData<T>,
-}
-
-impl<M, T, L, A, Capacity, U> Node<M, T, L, A, Capacity, U> {
-    const fn new(module: M, live: Live<(), Capacity>, upstream: U) -> Self {
-        Self {
-            module,
-            landed: None,
-            live,
-            attended: None,
-            given: 0,
-            upstream,
-            projection: PhantomData,
-        }
-    }
-}
-
-impl<X, M, T, L, A, Capacity, U: AsMut<Slot<X>>> AsMut<Slot<X>> for Node<M, T, L, A, Capacity, U> {
-    fn as_mut(&mut self) -> &mut Slot<X> {
-        self.upstream.as_mut()
-    }
-}
-
-impl<M, W, L, A, O, Capacity, U> Stream for Node<M, Affine<W, ()>, L, A, Capacity, U>
-where
-    Capacity: AxisName,
-    M: Borrow<Affine<W, ()>>,
-    U: Stream<Item = Live<A, Capacity>>,
-    Affine<W, ()>: for<'s> Module<Begin<()>, (), &'s mut (), Output = L>
-        + for<'s, 'l> Module<&'l mut L, (), &'s mut (), Output = ()>
-        + for<'s, 'l, 'a> Module<
-            (&'l mut L, &'a A, Live<(), Capacity>),
-            (),
-            &'s mut (),
-            Output = Poll<O>,
-        >,
-{
-    type Item = Live<O, Capacity>;
-
-    fn poll_next(&mut self, context: &mut Device) -> Poll<Option<Self::Item>> {
-        let projection = self.module.borrow();
-        if matches!(self.attended, None) {
-            let polled = self.upstream.poll_next(&mut *context);
-            if matches!(self.landed, None) {
-                let mut landed = projection.forward(&mut *context, (), &mut (), Begin(()));
-                projection.forward(&mut *context, (), &mut (), &mut landed);
-                self.landed = Some(landed);
-            }
-            match polled {
-                Poll::Ready(Some(attended)) => self.attended = Some(attended.into_value()),
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-        if self.given >= self.live.count::<Span>() {
-            return match self.upstream.poll_next(context) {
-                Poll::Ready(None) => Poll::Ready(None),
-                _ => Poll::Pending,
-            };
-        }
-        let (Some(landed), Some(attended)) = (&mut self.landed, &self.attended) else {
-            return Poll::Pending;
-        };
-        let tile = self.live.tile::<Span>(self.given);
-        match projection.forward(&mut *context, (), &mut (), (landed, attended, tile)) {
-            Poll::Ready(rows) => {
-                self.given += 1;
-                Poll::Ready(Some(tile.with(rows)))
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::fp8::{Blocked, Stored};
@@ -165,6 +35,8 @@ mod tests {
     use crate::ops::normalization::Blocked as Rows;
     use crate::ops::normalization::tests::random;
     use crate::tensor::axis;
+    use crate::tensor::live::tests::count;
+    use crate::tensor::scalar::Value;
     use crate::tests::DEVICE;
     use furiosa_opt_std::runtime::launch;
 
@@ -178,111 +50,61 @@ mod tests {
     type Projected<H = Hidden<4096>> = HbmTensor<bf16, Chip, Rows<H, All>>;
     type Dense<H = Hidden<4096>> = Affine<HbmTensor<bf16, Chip, m![H, QWidth]>, ()>;
 
-    /// The launch's attended rows, given once, then its end.
-    struct Given(Option<Live<Attended, All>>);
-
-    impl Stream for Given {
-        type Item = Live<Attended, All>;
-
-        fn poll_next(&mut self, _: &mut Device) -> Poll<Option<Self::Item>> {
-            Poll::Ready(self.0.take())
-        }
-    }
-
-    /// Each span its upstream gives, stored at its rows.
-    struct Store<'o, H: AxisName, U> {
-        upstream: U,
-        stored: &'o mut Projected<H>,
-    }
-
-    impl<H: AxisName, U: Stream<Item = Live<Owned<H, Span>, All>>> Stream for Store<'_, H, U> {
-        type Item = ();
-
-        fn poll_next(&mut self, device: &mut Device) -> Poll<Option<()>> {
-            match self.upstream.poll_next(&mut *device) {
-                Poll::Ready(Some(rows)) => {
-                    self.stored.spill(device, rows.value(), rows.with(()));
-                    Poll::Ready(Some(()))
-                }
-                Poll::Ready(None) => Poll::Ready(None),
-                Poll::Pending => Poll::Pending,
-            }
-        }
-    }
-
-    /// The projection streamed over a launch's attended rows, given once, each span stored at its
-    /// rows.
+    /// The projection of the live rows `count` names of a launch's attended rows as a schedule
+    /// takes it: begun, its weights landed, then each span in its three steps, stored at its rows.
     macro_rules! project {
-        ($name:ident, $projection:ty, $live:literal) => {
+        ($name:ident, $projection:ty) => {
             #[device(chip = 1)]
             fn $name(
                 device: &mut Device,
                 projection: &$projection,
                 attended: &Attended,
+                count: &Value,
             ) -> Projected {
-                let live = Live::<(), All>::all().subrange(0, $live);
+                let live = Live::<(), All>::read(count);
                 let mut stored = Projected::new();
-                {
-                    // SAFETY: the stream reads the attended rows only while they exist.
-                    let given = Given(Some(live.with(unsafe { attended.view().alias() })));
-                    let mut root = Store {
-                        upstream: projection.into_stream(live, (), given),
-                        stored: &mut stored,
-                    };
-                    let mut done = false;
-                    while !done {
-                        done = matches!(root.poll_next(&mut *device), Poll::Ready(None));
-                    }
+                let mut landed = projection.forward(&mut *device, (), &mut (), Begin(()));
+                projection.forward(&mut *device, (), &mut (), &mut landed);
+                for span in 0..live.count::<Span>() {
+                    let tile = live.tile::<Span>(span);
+                    let begun = Begin(Begin((&mut landed, tile.with(attended))));
+                    let begun = projection.forward(&mut *device, (), &mut (), begun);
+                    let begun = projection.forward(&mut *device, (), &mut (), begun);
+                    let rows = projection.forward(&mut *device, (), &mut (), begun);
+                    stored.spill(&mut *device, &rows, tile);
                 }
                 stored
             }
         };
     }
 
-    project!(dense_one, Dense, 1);
-    project!(dense_many, Dense, 600);
-    project!(quantized_one, Stored<H, QWidth>, 1);
-    project!(quantized_many, Stored<H, QWidth>, 600);
+    project!(dense, Dense);
+    project!(quantized, Stored<H, QWidth>);
 
-    /// The dense projection into `W` hidden features streamed over a launch's attended rows,
-    /// given once, each span stored at its rows.
-    macro_rules! project_into {
-        ($name:ident, $live:literal) => {
-            #[device(chip = 1)]
-            fn $name<W: AxisName>(
-                device: &mut Device,
-                projection: &Dense<W>,
-                attended: &Attended,
-            ) -> Projected<W>
-            where
-                for<'p> &'p Dense<W>: IntoStream<
-                        Given,
-                        Live<(), All>,
-                        (),
-                        Stream: Stream<Item = Live<Owned<W, Span>, All>>,
-                    >,
-            {
-                let live = Live::<(), All>::all().subrange(0, $live);
-                let mut stored = Projected::<W>::new();
-                {
-                    // SAFETY: the stream reads the attended rows only while they exist.
-                    let given = Given(Some(live.with(unsafe { attended.view().alias() })));
-                    let mut root = Store {
-                        upstream: projection.into_stream(live, (), given),
-                        stored: &mut stored,
-                    };
-                    let mut done = false;
-                    while !done {
-                        done = matches!(root.poll_next(&mut *device), Poll::Ready(None));
-                    }
-                }
-                stored
-            }
-        };
+    /// The dense projection into `W` hidden features of the live rows `count` names of a launch's
+    /// attended rows, each span in its three steps, stored at its rows.
+    #[device(chip = 1)]
+    fn dense_into<W: AxisName>(
+        device: &mut Device,
+        projection: &Dense<W>,
+        attended: &Attended,
+        count: &Value,
+    ) -> Projected<W> {
+        let live = Live::<(), All>::read(count);
+        let mut stored = Projected::<W>::new();
+        // The dense weights land nothing: each span's last step reads them from HBM.
+        projection.forward(&mut *device, (), &mut (), Begin(()));
+        projection.forward(&mut *device, (), &mut (), &mut ());
+        for span in 0..live.count::<Span>() {
+            let tile = live.tile::<Span>(span);
+            let begun = Begin(Begin((&mut (), tile.with(attended))));
+            let begun = projection.forward(&mut *device, (), &mut (), begun);
+            let begun = projection.forward(&mut *device, (), &mut (), begun);
+            let rows = projection.forward(&mut *device, (), &mut (), begun);
+            stored.spill(&mut *device, &rows, tile);
+        }
+        stored
     }
-
-    project_into!(dense_into_one, 1);
-    project_into!(dense_into_many, 600);
 
     /// The RMS of `got - expected` relative to that of `expected`.
     fn error(got: &[f64], expected: &[f64]) -> f64 {
@@ -299,7 +121,7 @@ mod tests {
     async fn check<H: AxisName, P: DeviceSend>(
         device: &mut Device,
         projection: &P,
-        run: impl AsyncFn(&mut Device, &P, usize, &Attended) -> Projected<H>,
+        run: impl AsyncFn(&mut Device, &P, &Value, &Attended) -> Projected<H>,
         weights: &[f32],
         tolerance: f64,
     ) {
@@ -313,7 +135,8 @@ mod tests {
                 .to_hbm(&mut device.pdma)
                 .await
                 .unwrap();
-            run(&mut *device, projection, live, &attended)
+            let count = count(live).to_hbm(&mut device.pdma).await.unwrap();
+            run(&mut *device, projection, &count, &attended)
                 .await
                 .to_host::<m![All, H]>(&mut device.pdma)
                 .await
@@ -383,11 +206,9 @@ mod tests {
             .unwrap(),
             (),
         );
-        let run =
-            async |device: &mut Device, p: &Dense, live: usize, attended: &Attended| match live {
-                1 => launch(dense_one, (device, p, attended)).await.unwrap(),
-                _ => launch(dense_many, (device, p, attended)).await.unwrap(),
-            };
+        let run = async |device: &mut Device, p: &Dense, live: &Value, attended: &Attended| {
+            launch(dense, (device, p, attended, live)).await.unwrap()
+        };
         check(&mut device, &matrix, run, &weights, 0.004).await;
         let quantized_weights = Affine::new(
             crate::tensor::form::fp8::Rows::new(
@@ -402,11 +223,8 @@ mod tests {
             ),
             (),
         );
-        let run = async |device: &mut Device, p: &Stored<H, QWidth>, live: usize, a: &Attended| {
-            match live {
-                1 => launch(quantized_one, (device, p, a)).await.unwrap(),
-                _ => launch(quantized_many, (device, p, a)).await.unwrap(),
-            }
+        let run = async |device: &mut Device, p: &Stored<H, QWidth>, live: &Value, a: &Attended| {
+            launch(quantized, (device, p, a, live)).await.unwrap()
         };
         check(&mut device, &quantized_weights, run, &weights, 0.04).await;
     }
@@ -415,15 +233,7 @@ mod tests {
     /// matches the reference on the live rows of two spans.
     #[tokio::test(flavor = "current_thread")]
     async fn projects_into_every_width() {
-        async fn projects<W: AxisName>(device: &mut Device)
-        where
-            for<'p> &'p Dense<W>: IntoStream<
-                    Given,
-                    Live<(), All>,
-                    (),
-                    Stream: Stream<Item = Live<Owned<W, Span>, All>>,
-                >,
-        {
+        async fn projects<W: AxisName>(device: &mut Device) {
             let weights: Vec<f32> = random(W::SIZE * QWidth::SIZE, 0x9e37)
                 .iter()
                 .map(|v| v.to_f32() / 16.0)
@@ -440,11 +250,9 @@ mod tests {
                 .unwrap(),
                 (),
             );
-            let run =
-                async |device: &mut Device, p: &Dense<W>, live: usize, a: &Attended| match live {
-                    1 => launch(dense_into_one, (device, p, a)).await.unwrap(),
-                    _ => launch(dense_into_many, (device, p, a)).await.unwrap(),
-                };
+            let run = async |device: &mut Device, p: &Dense<W>, live: &Value, a: &Attended| {
+                launch(dense_into, (device, p, a, live)).await.unwrap()
+            };
             check(&mut *device, &matrix, run, &weights, 0.004).await;
         }
         let _lease = DEVICE.lock().await;
