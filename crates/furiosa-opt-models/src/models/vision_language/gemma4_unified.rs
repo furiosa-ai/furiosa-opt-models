@@ -23,7 +23,7 @@ use crate::ops::embedding::Factorized;
 use crate::ops::linear::{Affine, Linear};
 use crate::ops::normalization::{LayerNorm, UnitRmsNorm};
 use crate::ops::pointwise::add::Add;
-use crate::tensor::memory::Memory;
+use crate::tensor::memory::{Hbm, Memory};
 use crate::tensor::parallel::Chip;
 use crate::{Identity, Module, Sequential, Then};
 
@@ -33,7 +33,9 @@ axes![
     Text = 3840,
     Samples = 640,
     Positions = 1120,
-    Coordinates = 2
+    Coordinates = 2,
+    Short = 512,
+    Long = 2304
 ];
 
 /// A merged patch's features: 48 x 48 pixels of three channels.
@@ -46,7 +48,7 @@ pub type Frames<R> = HbmTensor<bf16, Chip, m![R, Samples]>;
 pub type Rows<R> = HbmTensor<bf16, Chip, m![R, Text]>;
 
 /// The byte offset of each patch's row in the factorized position table for one coordinate:
-/// [`offset`] of its x, or of its y.
+/// [`offset`](super::Encoder::offset) of its x, or of its y.
 pub type Offsets<R> = HbmTensor<i32, Chip, m![R]>;
 
 /// The factorized position table as stored, `[positions, coordinates, features]`: a table of rows
@@ -263,11 +265,29 @@ where
     }
 }
 
-/// The byte offset of the [`Table`] row a patch's `coordinate` (0 for x, 1 for y) at `position`
-/// reads.
-pub const fn offset(position: usize, coordinate: usize) -> i32 {
-    ((Coordinates::SIZE * position + coordinate) * Embed::SIZE * size_of::<bf16>()) as i32
+/// Launches of 512 or 2304 rows; a patch's operand is the byte offset of the [`Table`] row its
+/// coordinate reads.
+impl super::Encoder for Encoder<Hbm> {
+    type Short = Short;
+    type Long = Long;
+    type Patch = Patch;
+    type Positions = Positions;
+    type Samples = Samples;
+    type Text = Text;
+    type Vision = (VisionState, ProjectionState);
+    type Audio = ProjectionState;
+    type View<'a> = Encoder<&'a Hbm>;
+
+    fn offset(position: usize, coordinate: usize) -> i32 {
+        ((Coordinates::SIZE * position + coordinate) * Embed::SIZE * size_of::<bf16>()) as i32
+    }
 }
+
+/// A [`VisionEmbedder`]'s state: its patch path's and its position table's, then its last norm's.
+type VisionState = (((((), ()), ()), ()), ());
+
+/// A [`MultimodalEmbedder`]'s state: its norm's and the identity's, then its projection's.
+type ProjectionState = (((), ()), ());
 
 #[cfg(test)]
 mod tests {
