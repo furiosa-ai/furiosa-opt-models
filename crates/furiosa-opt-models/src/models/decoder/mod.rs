@@ -573,26 +573,16 @@ impl Requirement {
 pub enum Declaration {
     /// FP8 weights and activations scaled as the scheme says.
     Fp8(config::Scheme),
-    /// NVFP4 weights and inputs under static tensor scales, whose inputs the projections read in
-    /// the given form.
-    Nvfp4(Inputs),
-}
-
-/// The form a [`Late`](crate::tensor::form::nvfp4::Late) projection's inputs enter its contraction
-/// in, which decides the factors its tensor scales become.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Inputs {
-    /// Quantized at run time as the weights are, under the checkpoint's input scale.
-    Quantized,
-    /// BF16 as they are, so the checkpoint's input scale goes unread.
-    Bf16,
+    /// NVFP4 weights and inputs under static tensor scales; a projection's form type says whether
+    /// it reads its inputs quantized or as BF16.
+    Nvfp4,
 }
 
 impl Declaration {
     const fn same(self, other: Self) -> bool {
         match (self, other) {
             (Self::Fp8(first), Self::Fp8(second)) => first as u8 == second as u8,
-            (Self::Nvfp4(first), Self::Nvfp4(second)) => first as u8 == second as u8,
+            (Self::Nvfp4, Self::Nvfp4) => true,
             _ => false,
         }
     }
@@ -601,14 +591,14 @@ impl Declaration {
     fn reads(self, scheme: config::Scheme) -> bool {
         match self {
             Self::Fp8(own) => own == scheme,
-            Self::Nvfp4(_) => scheme == config::Scheme::Nvfp4,
+            Self::Nvfp4 => scheme == config::Scheme::Nvfp4,
         }
     }
 }
 
 /// The projection parameter forms a checkpoint can store.
 pub mod form {
-    use super::{Declaration, Form, Inputs, Memory, PhantomData, Requirement, fp8, linear};
+    use super::{Declaration, Form, Memory, PhantomData, Requirement, fp8, linear};
     use crate::models::config::Scheme;
     use crate::ops::linear::{output, query};
     use crate::ops::swiglu;
@@ -770,8 +760,7 @@ pub mod form {
                 X::Tensor<f8e4m3, Chip, nvfp4::Scales<In, Out>>,
             >;
 
-        const REQUIREMENT: Requirement =
-            Requirement::Declared(Declaration::Nvfp4(Inputs::Quantized));
+        const REQUIREMENT: Requirement = Requirement::Declared(Declaration::Nvfp4);
 
         type Caches = (bf16,);
     }
@@ -792,7 +781,7 @@ pub mod form {
                 X::Tensor<f8e4m3, Chip, nvfp4::Scales<In, Out>>,
             >;
 
-        const REQUIREMENT: Requirement = Requirement::Declared(Declaration::Nvfp4(Inputs::Bf16));
+        const REQUIREMENT: Requirement = Requirement::Declared(Declaration::Nvfp4);
 
         type Caches = (bf16,);
     }
@@ -943,7 +932,7 @@ mod tests {
     }
 
     /// A layer requires the declaration its quantized projections read, which covers those that
-    /// read none, and no declaration where none reads one.
+    /// read none, and no declaration where none reads one; NVFP4 inputs read either way share one.
     const _: () = {
         use crate::tensor::form::nvfp4::W4A16;
         use form::{Affine, BlockScaled, ChannelScaled, Nvfp4, Nvfp4BlockScaled};
@@ -957,11 +946,15 @@ mod tests {
         ));
         assert!(matches!(
             <Projections<Affine, Affine, Affine, Affine, Nvfp4BlockScaled> as Forms>::REQUIREMENT,
-            Requirement::Declared(Declaration::Nvfp4(Inputs::Quantized))
+            Requirement::Declared(Declaration::Nvfp4)
         ));
         assert!(matches!(
             <Projections<Affine, Affine, Affine, Affine, Nvfp4BlockScaled<W4A16>> as Forms>::REQUIREMENT,
-            Requirement::Declared(Declaration::Nvfp4(Inputs::Bf16))
+            Requirement::Declared(Declaration::Nvfp4)
+        ));
+        assert!(matches!(
+            <Projections<Nvfp4BlockScaled, Nvfp4BlockScaled<W4A16>> as Forms>::REQUIREMENT,
+            Requirement::Declared(Declaration::Nvfp4)
         ));
         assert!(matches!(
             <Projections<ChannelScaled, BlockScaled, BlockScaled, Affine, Affine> as Forms>::REQUIREMENT,
@@ -1017,6 +1010,23 @@ mod tests {
         match Requirement::Unquantized.admits(&source(Some(json!(5)))) {
             Err(LoadError::InvalidData { name, .. }) => assert_eq!(name, declared),
             other => panic!("{other:?} is not `InvalidData`"),
+        }
+    }
+
+    /// An NVFP4 line refuses a checkpoint that declares no quantization, naming its scheme alone.
+    #[test]
+    fn refuses_an_undeclared_checkpoint_by_its_scheme() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = Checkpoint::new(directory.path(), Some(serde_json::json!({}))).unwrap();
+        match Requirement::Declared(Declaration::Nvfp4).admits(&source) {
+            Err(LoadError::Unsupported { name, reason }) => assert_eq!(
+                (name.as_str(), reason.as_str()),
+                (
+                    "config.json:quantization_config",
+                    "missing, the line holds Nvfp4 projections"
+                )
+            ),
+            other => panic!("{other:?} is not `Unsupported`"),
         }
     }
 }

@@ -361,11 +361,6 @@ impl Config {
     pub fn pooled(&self) -> bool {
         self.pool || self.projection.is_some()
     }
-
-    /// Image tower family.
-    pub fn family(&self) -> Family {
-        self.family
-    }
 }
 
 #[cfg(test)]

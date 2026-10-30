@@ -336,13 +336,6 @@ impl TryFrom<Hf> for Config {
     }
 }
 
-impl Config {
-    /// Requested prediction contract.
-    pub fn head(&self) -> &Head {
-        &self.head
-    }
-}
-
 pub(super) type BertBody<Embedding, Attention, Mlp, Norm, Add, const DEPTH: usize> =
     Encoder<Embedding, [transformer::PostNorm<Attention, Mlp, Norm, Norm, Add>; DEPTH]>;
 

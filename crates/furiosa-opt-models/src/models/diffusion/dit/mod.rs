@@ -2,7 +2,7 @@
 //! over a [`Size`], as `Transformer2DModel<Size<"XL-2-256">, f32, Parallel<1>, X>`.
 //!
 //! - The size fixes every value its compiled transformer holds.
-use crate::models::Family;
+use crate::models::{Family, Scalar};
 use crate::modules::diffusion::{AdaptiveNorm, SplitGates, SplitModulation};
 use crate::modules::vision::{Patch, SinCos};
 use crate::modules::{attention, diffusion, feedforward, language};
@@ -47,7 +47,7 @@ pub struct Model {
     >,
 }
 
-impl<T: Borrow<Time>, Env: Copy> Module<(&Sample, (&Label, T)), Env, &mut ()> for Model {
+impl<T: Borrow<Scalar>, Env: Copy> Module<(&Sample, (&Label, T)), Env, &mut ()> for Model {
     type Output = Prediction;
 
     fn forward(
@@ -131,8 +131,6 @@ type Attention = attention::Full<
     Linear<Hidden, Hidden>,
 >;
 
-type Scalar = Time;
-
 type Head = diffusion::Head<
     Modulation<Width<2304>, SplitModulation<Hidden>>,
     AdaptiveNorm,
@@ -149,16 +147,13 @@ pub type Prediction = Image<Channels<OUT_CHANNELS>, Height<SAMPLE_SIZE>, Columns
 pub type Patches =
     Grid<Height<SAMPLE_SIZE>, Columns<SAMPLE_SIZE>, Height<PATCH_SIZE>, Columns<PATCH_SIZE>>;
 
-/// Training timestep supplied to the sinusoidal time embedding.
-pub type Time = HbmTensor<f32, m![1], m![1]>;
-
 /// Class index, including the unconditional embedding-table entry.
 pub type Label = HbmTensor<i32, m![1], m![Single]>;
 
-type Condition = (Time, Label);
+type Condition = (Scalar, Label);
 
 struct ConditioningInput<'a> {
-    time: &'a Time,
+    time: &'a Scalar,
     label: &'a Label,
 }
 
@@ -187,8 +182,8 @@ impl<Env: Copy> Module<&mut Context, Env, &mut ()> for Model {
     }
 }
 
-impl From<(Sample, Time, Label)> for Context {
-    fn from((sample, time, label): (Sample, Time, Label)) -> Self {
+impl From<(Sample, Scalar, Label)> for Context {
+    fn from((sample, time, label): (Sample, Scalar, Label)) -> Self {
         Self {
             sample,
             condition: (time, label),

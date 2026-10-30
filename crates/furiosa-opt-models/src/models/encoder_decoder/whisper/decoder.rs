@@ -1,11 +1,7 @@
 //! Decoder history is writable; encoded source projections become read-only after creation.
 
-use super::{Ids, Mask};
-use crate::{
-    Module,
-    modules::attention,
-    ops::index::{gather::RowStorage, table::KeyValue},
-};
+use super::Mask;
+use crate::Module;
 use furiosa_opt_std::prelude::*;
 
 /// The decoder over its step's masks: the self attention reads the history mask, the cross
@@ -36,21 +32,3 @@ where
             .forward(device, ((&(), mask), (cross_mask, access)), state, input)
     }
 }
-
-/// Opaque F32 key/value row storage.
-pub type Cache<Width> = KeyValue<RowStorage<Width>>;
-
-/// Per-row key/value byte offsets.
-pub type Offsets<Count> = KeyValue<Ids<Count>>;
-
-/// Key/value write destinations and number of rows to write.
-pub type Write<Count> = (Offsets<Count>, HbmTensor<i32, m![1], m![1]>);
-
-/// Self-history writes and reads without rotary operands.
-pub type History<Queries, Keys> = attention::Context<(), Write<Queries>, Offsets<Keys>>;
-
-/// Writable self-attention storage paired with its history operands.
-pub type State<Width, Queries, Keys> = (Cache<Width>, History<Queries, Keys>);
-
-/// Projected source cache and the offsets used for source-memory access.
-pub type Cross<Width, Source> = (Cache<Width>, Write<Source>);
