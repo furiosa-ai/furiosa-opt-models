@@ -152,7 +152,7 @@ impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, Env> Module<Begin<()>, E
     type Output = Affine<Flat<Hidden, Heads, Head>, ()>;
 
     fn forward(&self, _: &mut Device, _: Env, _: &mut (), _: Begin<()>) -> Self::Output {
-        // SAFETY: the node that holds the alias keeps the weight it reads, heads in HBM order.
+        // SAFETY: the landed form that holds the alias keeps the weight it reads, heads in HBM order.
         Affine::new(unsafe { self.weight.view().alias() }, ())
     }
 }
