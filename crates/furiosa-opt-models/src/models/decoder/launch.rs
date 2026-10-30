@@ -223,6 +223,42 @@ pub type Adapted<'t, S, const N: usize> = lora::Layer<
 type Projected<'t, S, Out, In, K, const N: usize> =
     lora::Adapters<'t, Factors<K, In, Out, Hbm>, Selection<S, K>, N>;
 
+/// What a launch's nodes read beside its token IDs and live rows, prepared once before its first
+/// node runs: its rows' rotation and cache slots, its attention work and the rows it returns.
+pub type Context<'a, Capacity, Reach, Sequences, Slots, Groups, Waves, W> = (
+    attention::Context<
+        SplitHalf<Head, group::Rotation<Slots, rotary::Row<Head>>>,
+        &'a HbmTensor<i32, Chip, m![Reach]>,
+        paged::Context<'a, Sequences, KvHeads, Groups, Head, Waves, W, Capacity>,
+    >,
+    &'a Selected<Capacity>,
+);
+
+/// The rows the readout reads tokens of.
+impl<'c, T, Capacity, Reach, Sequences, Slots, Groups, Waves, W>
+    From<Call<'c, Context<'_, Capacity, Reach, Sequences, Slots, Groups, Waves, W>, T, Capacity>>
+    for &'c Selected<Capacity>
+where
+    Capacity: AxisName,
+    Reach: AxisName,
+    Sequences: AxisName,
+    Slots: AxisName,
+    Groups: AxisName,
+    Waves: AxisName,
+    W: AxisName,
+{
+    fn from(
+        call: Call<
+            'c,
+            Context<'_, Capacity, Reach, Sequences, Slots, Groups, Waves, W>,
+            T,
+            Capacity,
+        >,
+    ) -> Self {
+        call.context.1
+    }
+}
+
 /// Layer `layer`'s adapters of `held`, a call's adapters, with their `selections`.
 pub fn adapted<'t, S: Geometry + Decode + 'static, const N: usize>(
     held: [&'t Adapter<S, Hbm>; N],
@@ -259,42 +295,6 @@ where
             terms: mlp.map(|t| &t.1.0),
             selections: one,
         },
-    }
-}
-
-/// What a launch's nodes read beside its token IDs and live rows, prepared once before its first
-/// node runs: its rows' rotation and cache slots, its attention work and the rows it returns.
-pub type Context<'a, Capacity, Reach, Sequences, Slots, Groups, Waves, W> = (
-    attention::Context<
-        SplitHalf<Head, group::Rotation<Slots, rotary::Row<Head>>>,
-        &'a HbmTensor<i32, Chip, m![Reach]>,
-        paged::Context<'a, Sequences, KvHeads, Groups, Head, Waves, W, Capacity>,
-    >,
-    &'a Selected<Capacity>,
-);
-
-/// The rows the readout reads tokens of.
-impl<'c, T, Capacity, Reach, Sequences, Slots, Groups, Waves, W>
-    From<Call<'c, Context<'_, Capacity, Reach, Sequences, Slots, Groups, Waves, W>, T, Capacity>>
-    for &'c Selected<Capacity>
-where
-    Capacity: AxisName,
-    Reach: AxisName,
-    Sequences: AxisName,
-    Slots: AxisName,
-    Groups: AxisName,
-    Waves: AxisName,
-    W: AxisName,
-{
-    fn from(
-        call: Call<
-            'c,
-            Context<'_, Capacity, Reach, Sequences, Slots, Groups, Waves, W>,
-            T,
-            Capacity,
-        >,
-    ) -> Self {
-        call.context.1
     }
 }
 
