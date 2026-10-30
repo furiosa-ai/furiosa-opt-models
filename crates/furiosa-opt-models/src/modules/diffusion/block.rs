@@ -1,8 +1,8 @@
 //! Transformer blocks whose attention and feed-forward residuals the condition modulates.
 
 use super::Modulated;
+use crate::Module;
 use crate::load::Load;
-use crate::{Module, Then};
 use furiosa_opt_std::prelude::{Device, DeviceSend};
 
 /// Modulates pre-norm attention and feed-forward residuals from a shared condition; `norm` is the
@@ -146,98 +146,6 @@ where
             .forward(&mut *device, env, feedforward, &normalized);
         self.add
             .forward(device, env, &mut (), (&hidden, &feedforward))
-    }
-}
-
-/// Adds post-branch normalization to condition-modulated attention and feed-forward residuals.
-#[derive(DeviceSend)]
-pub struct Sandwich<Modulation, Attention, FeedForward, Norm, PostNorm, Gate> {
-    pub modulation: Modulation,
-    pub attention: Attention,
-    pub feedforward: FeedForward,
-    pub norms: [Norm; 2],
-    pub post_norms: [PostNorm; 2],
-    pub gate: Gate,
-}
-
-/// The state holds the modulation's slot, then each branch's: its child then the post norm, so a
-/// branch's slot pairs the child's with the norm's.
-impl<
-    's,
-    'e,
-    X,
-    E,
-    M,
-    G,
-    A,
-    F,
-    ModulationState,
-    AttentionState,
-    FeedForwardState,
-    Modulation,
-    Attention,
-    FeedForward,
-    Norm,
-    PostNorm,
-    Gate,
-    Env: Copy,
->
-    Module<
-        X,
-        (&'e E, Env),
-        &'s mut (
-            ModulationState,
-            (AttentionState, ()),
-            (FeedForwardState, ()),
-        ),
-    > for Sandwich<Modulation, Attention, FeedForward, Norm, PostNorm, Gate>
-where
-    Modulation: Module<&'e E, Env, &'s mut ModulationState, Output = ((M, G), (M, G))>,
-    Norm: for<'a, 'b, 'd> Module<(&'a X, &'b M), Env, &'d mut (), Output = X>,
-    Attention: for<'a> Module<&'a X, Env, &'s mut AttentionState, Output = A>,
-    FeedForward: for<'x> Module<&'x X, Env, &'s mut FeedForwardState, Output = F>,
-    PostNorm: for<'x, 'd> Module<&'x A, Env, &'d mut (), Output = X>
-        + for<'x, 'd> Module<&'x F, Env, &'d mut (), Output = X>,
-    Gate: for<'a, 'b, 'c, 'd> Module<(&'a X, &'b X, &'c G), Env, &'d mut (), Output = X>,
-{
-    type Output = X;
-
-    fn forward(
-        &self,
-        device: &mut Device,
-        (condition, env): (&'e E, Env),
-        (modulation, attention, feedforward): &'s mut (
-            ModulationState,
-            (AttentionState, ()),
-            (FeedForwardState, ()),
-        ),
-        hidden: X,
-    ) -> X {
-        let ((attention_norm, attention_gate), (feedforward_norm, feedforward_gate)) = self
-            .modulation
-            .forward(&mut *device, env, modulation, condition);
-        let hidden = Modulated(
-            &self.norms[0],
-            Then(&self.attention, &self.post_norms[0]),
-            &self.gate,
-        )
-        .forward(
-            &mut *device,
-            env,
-            attention,
-            (&hidden, (&attention_norm, &attention_gate)),
-        );
-        Modulated(
-            &self.norms[1],
-            Then(&self.feedforward, &self.post_norms[1]),
-            &self.gate,
-        )
-        .forward(
-            device,
-            env,
-            feedforward,
-            (&hidden, (&feedforward_norm, &feedforward_gate)),
-        )
     }
 }
 

@@ -640,8 +640,13 @@ pub type ZImageTransformer2DModel<
     Conditioning,
     diffusion::Refined<
         Layers<
-            [diffusion::Sandwich<Modulation, Attention, Mlp, Norm, PostNorm, TanhGate>;
-                IMAGE_DEPTH],
+            [diffusion::Adaptive<
+                Modulation,
+                Then<Attention, PostNorm>,
+                Then<Mlp, PostNorm>,
+                Norm,
+                TanhGate,
+            >; IMAGE_DEPTH],
             Unrolled,
         >,
         Layers<
@@ -650,8 +655,13 @@ pub type ZImageTransformer2DModel<
         >,
         Join,
         Layers<
-            [diffusion::Sandwich<Modulation, Attention, Mlp, Norm, PostNorm, TanhGate>;
-                JOINT_DEPTH],
+            [diffusion::Adaptive<
+                Modulation,
+                Then<Attention, PostNorm>,
+                Then<Mlp, PostNorm>,
+                Norm,
+                TanhGate,
+            >; JOINT_DEPTH],
             Unrolled,
         >,
     >,

@@ -1,6 +1,6 @@
 //! Diffusion pipelines, numerical trajectories and condition-modulated transformer blocks.
 
-pub use block::{Adaptive, Conditioned, Cross, Sandwich, Single, Spatial};
+pub use block::{Adaptive, Conditioned, Cross, Single, Spatial};
 pub use coupled::Coupled;
 pub use denoiser::{
     Control, Controlled, Denoiser, DualStream, Embedding, Head, PackedEmbedding, PackedHead,
