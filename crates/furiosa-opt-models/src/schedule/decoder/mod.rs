@@ -36,7 +36,7 @@ use crate::ops::linear::query::{Tile, launch::Normalized};
 use crate::ops::normalization::Blocked;
 use crate::ops::normalization::span::{Owned, Span, Stage};
 use crate::ops::pointwise::SwiGlu;
-use crate::ops::swiglu::spans::fp8::Staging;
+use crate::ops::swiglu::spans::fp8::Ready;
 use crate::specialize::attention::Decode;
 use crate::tensor::live::Live;
 use crate::tensor::memory::Hbm;
@@ -156,10 +156,10 @@ struct Front {
     key_norm: Begun<HeadNorm>,
 }
 
-/// A tile between its MLP's two steps: its product staged for the down projection, and the rows
-/// of the attention residual, which the MLP residual adds to.
+/// A tile between its MLP's two steps: the down projection's inputs landed, and the rows of the
+/// attention residual, which the MLP residual adds to.
 struct Staged {
-    product: Staging<Width, Intermediate, Span>,
+    ready: Ready<Width, Intermediate, Span>,
     attended: Live<Owned<Width, Span>, Capacity>,
 }
 
@@ -298,6 +298,7 @@ fn end(
     let _ = step(&mut *device);
     let ahead = gate_up.forward(&mut *device, (), &mut (), Begin(()));
     let _ = step(&mut *device);
+    let first = down.forward(&mut *device, (), &mut (), Begin(0usize));
     let projected = match step(&mut *device) {
         Poll::Ready(rows) => tile.with(rows),
         Poll::Pending => tile.with(Owned::new()),
@@ -306,12 +307,17 @@ fn end(
     let normalized = gain.forward(&mut *device, (), &mut (), &attended);
     let rows = tile.with(normalized.value());
     let projected = gate_up.forward(&mut *device, (), &mut (), (ahead, rows));
+    // The later down panels land under the last gate/up pair and the gating, the next part's
+    // weights under the down projection once its inputs landed.
+    let later = (
+        down.forward(&mut *device, (), &mut (), Begin(1usize)),
+        down.forward(&mut *device, (), &mut (), Begin(2usize)),
+    );
     let product = SwiGlu.forward(&mut *device, (), &mut (), tile.with(projected));
-    let staged = down.forward(&mut *device, (), &mut (), Begin(tile.with(product)));
-    Staged {
-        product: staged,
-        attended,
-    }
+    let product = tile.with(product);
+    let staged = down.forward(&mut *device, (), &mut (), Begin((product, first)));
+    let ready = down.forward(&mut *device, (), &mut (), tile.with((staged, later)));
+    Staged { ready, attended }
 }
 
 /// A `staged` tile through the second step of `layer`'s MLP, the down projection, and the MLP
@@ -323,9 +329,9 @@ fn update(
 ) -> Live<Owned<Width, Span>, Capacity> {
     let Sequential(_, Residual(_, mlp, sum)) = layer;
     let (_, down) = mlp.0.parts();
-    let Staged { product, attended } = staged;
+    let Staged { ready, attended } = staged;
     let tile = attended.with(());
-    let fed = tile.with(down.forward(&mut *device, (), &mut (), tile.with(product)));
+    let fed = tile.with(down.forward(&mut *device, (), &mut (), tile.with(ready)));
     sum.forward(device, (), &mut (), (&attended, &fed))
 }
 
