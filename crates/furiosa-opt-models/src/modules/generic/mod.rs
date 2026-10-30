@@ -99,8 +99,6 @@ mod interleave;
 
 mod order;
 
-pub mod schedule;
-
 #[cfg(test)]
 mod tests {
     use super::*;

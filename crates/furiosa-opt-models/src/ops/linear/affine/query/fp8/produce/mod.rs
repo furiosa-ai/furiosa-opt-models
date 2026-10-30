@@ -2,7 +2,7 @@
 //! then a last single tile, and each period's queries, keys and values, each by its projection.
 
 use super::*;
-use crate::modules::generic::schedule::Begin;
+use crate::Begin;
 use crate::ops::linear::query::group::{TilePair, Tiles};
 use crate::ops::linear::query::launch::{Launch, Next};
 use crate::tensor::live::Live;

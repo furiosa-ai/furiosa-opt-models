@@ -1,6 +1,6 @@
 use super::*;
+use crate::Begin;
 use crate::Op;
-use crate::modules::generic::schedule::Begin;
 use crate::ops::normalization::span;
 use crate::tensor::axis;
 use crate::tensor::live::Live;

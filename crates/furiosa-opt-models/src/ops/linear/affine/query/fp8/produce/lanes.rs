@@ -1,6 +1,6 @@
 use super::*;
+use crate::Begin;
 use crate::Op;
-use crate::modules::generic::schedule::Begin;
 
 /// The launch's rows spread over the slices, before their quantization for the pairs: `rows`
 /// live rows from tile `base`.

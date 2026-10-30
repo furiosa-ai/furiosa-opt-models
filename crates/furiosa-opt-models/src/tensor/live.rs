@@ -8,6 +8,7 @@
 //!   with [`Live::groups`].
 //! - A module that reads its live rows in tiles of its own sizes runs its work on each
 //!   ([`Live::tiles`]).
+//! - A tile's rows move between a place in HBM and the chip through [`Fill`] and [`Spill`].
 
 use super::scalar::Value;
 use core::marker::PhantomData;
@@ -203,6 +204,19 @@ impl<X, R: AxisName> Live<X, R> {
             OnTile::<D, Small>::run(work, context, const { Large::SIZE / Small::SIZE } * count);
         }
     }
+}
+
+/// A place in HBM whose rows a leaf reads on chip: [`Fill::fill`] moves the rows of one tile `T`
+/// on chip.
+pub(crate) trait Fill<D, T> {
+    /// The tile's rows, on chip.
+    type Rows;
+    fn fill(&self, context: &mut D, tile: T) -> Self::Rows;
+}
+
+/// A place in HBM a leaf writes from chip: [`Spill::spill`] stores the rows `R` of one tile `T`.
+pub(crate) trait Spill<D, R, T> {
+    fn spill(&mut self, context: &mut D, rows: R, tile: T);
 }
 
 /// What a module that reads its live rows tile by tile runs on tile `index` of `W` rows, counted

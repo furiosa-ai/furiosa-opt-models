@@ -59,10 +59,10 @@ mod tests {
     use super::launch::Normalized;
     use super::matrix::Dense;
     use super::*;
+    use crate::Begin;
     use crate::Module;
     use crate::modules::attention::{KeyValue, Projection};
     use crate::modules::generic::Either;
-    use crate::modules::generic::schedule::{Begin, Fill, Spill};
     use crate::ops::attention::full::head;
     use crate::ops::attention::geometry::Hidden;
     use crate::ops::linear::Affine;
@@ -71,7 +71,7 @@ mod tests {
     use crate::ops::rotary::group::{InputHalf, OutputHalf, Rotation};
     use crate::ops::rotary::{Rotary, Row, SplitHalf};
     use crate::tensor::form::Weight;
-    use crate::tensor::live::{self, Live};
+    use crate::tensor::live::{self, Fill, Live, Spill};
     use crate::tensor::scalar::{F32, Value};
     use crate::tests::DEVICE;
     use core::marker::PhantomData;
