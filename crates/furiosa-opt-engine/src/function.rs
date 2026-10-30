@@ -4,8 +4,8 @@
 //! - The entry: `forward`, which runs any module on one chip.
 //! - A call returns once the runtime accepted its launch. A refusal at submission is the call's
 //!   error; a failure after that surfaces where a result is read, which waits for the launch.
-//! - Nothing loads an entry before a call, and loading a tree binds none, so a binary that only
-//!   loads reaches no kernel.
+//! - Nothing loads an entry before a call, and loading a tree binds none; a binary that loads
+//!   through the registry still compiles every listed decoder's kernels, which a load may return.
 
 use std::io;
 
