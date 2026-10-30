@@ -1,10 +1,11 @@
 //! The decoder schema that the transformer decoder families share: geometry, rotary part and the
 //! flags their compositions hold fixed.
 
-use super::scaling::{Kind, Spectrum};
+use super::scaling::{Kind, Multimodal, Sections, Spectrum};
 use super::{Disabled, Literal, PerLayer, Positive, flattened, refuse};
+use furiosa_opt_std::prelude::AxisName;
 use serde::{Deserialize, de};
-use std::{collections::BTreeMap, io, num::NonZeroUsize};
+use std::{collections::BTreeMap, io, marker::PhantomData, num::NonZeroUsize};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Geometry {
@@ -176,6 +177,67 @@ impl TryFrom<Spectrum> for Rotary {
                 ),
                 "the unscaled spectrum over the whole head",
             )),
+        }
+    }
+}
+
+/// A checkpoint's unscaled rotary base, for a family whose kernels rotate the leading `Rotated`
+/// coordinates of each `Head`-wide head as one rotation at that width's frequencies, pair `i` with
+/// pair `i + Rotated / 2`: any other spectrum is refused as unsupported.
+#[derive(Clone, Copy, Debug)]
+pub struct Prefix<Head, Rotated>(pub Positive, PhantomData<fn() -> (Head, Rotated)>);
+
+impl<Head: AxisName, Rotated: AxisName> TryFrom<Spectrum> for Prefix<Head, Rotated> {
+    type Error = String;
+
+    fn try_from(spectrum: Spectrum) -> Result<Self, Self::Error> {
+        match spectrum.kind() == Kind::Default && spectrum.rotated(Head::SIZE) == Rotated::SIZE {
+            true => Ok(Self(spectrum.theta(), PhantomData)),
+            false => Err(refuse(
+                format_args!(
+                    "{:?} rotating {} of each head",
+                    spectrum.kind(),
+                    spectrum.fraction()
+                ),
+                format_args!(
+                    "the unscaled spectrum over the first {} of {} coordinates",
+                    Rotated::SIZE,
+                    Head::SIZE
+                ),
+            )),
+        }
+    }
+}
+
+/// A checkpoint's unscaled rotary base over the whole head, for a family whose kernels hold a
+/// multimodal rotation's sections interleaved across each `Head`-wide head: sections in one block
+/// each are refused as unsupported, and sections that do not cover a head's pairs as malformed.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(try_from = "Multimodal", bound = "Head: AxisName")]
+pub struct Interleaved<Head>(pub Positive, PhantomData<fn() -> Head>);
+
+impl<Head: AxisName> TryFrom<Multimodal> for Interleaved<Head> {
+    type Error = String;
+
+    fn try_from(Multimodal { spectrum, sections }: Multimodal) -> Result<Self, Self::Error> {
+        let Rotary(theta) = Rotary::try_from(spectrum)?;
+        match sections {
+            Some(Sections {
+                pairs,
+                interleaved: false,
+            }) => Err(refuse(
+                format_args!("sections {pairs:?} in one block each"),
+                "interleaved sections",
+            )),
+            Some(Sections { pairs, .. }) if pairs.iter().sum::<usize>() != Head::SIZE / 2 => {
+                Err(format!(
+                    "mrope_section: found {pairs:?}, expected sections of the {} pairs of a \
+                     {}-wide head",
+                    Head::SIZE / 2,
+                    Head::SIZE
+                ))
+            }
+            _ => Ok(Self(theta, PhantomData)),
         }
     }
 }
@@ -361,6 +423,103 @@ mod tests {
             assert_eq!(
                 (error.kind(), error.to_string()),
                 (io::ErrorKind::Unsupported, reason),
+                "{document}"
+            );
+        }
+    }
+
+    /// A family that rotates a head's prefix holds the unscaled spectrum whose rotated width is
+    /// the prefix; a spectrum over another width, or a rescaled one, is refused as unsupported,
+    /// naming the spectrum it found.
+    #[test]
+    fn refuses_spectra_off_the_rotated_prefix() {
+        use furiosa_opt_std::prelude::*;
+        axes![Whole = 128, Half = 64];
+        let prefix = |document: serde_json::Value| {
+            let spectrum: Spectrum = parse(&document).unwrap();
+            Prefix::<Whole, Half>::try_from(spectrum).map_err(super::super::refusal)
+        };
+        let theta = prefix(json!({"rope_theta": 1e4, "partial_rotary_factor": 0.5})).unwrap();
+        assert_eq!(theta.0.get(), 1e4);
+        for (document, found) in [
+            (json!({"rope_theta": 1e4}), "Default rotating 1"),
+            (
+                json!({"rope_theta": 1e4, "partial_rotary_factor": 0.25}),
+                "Default rotating 0.25",
+            ),
+            (
+                json!({"rope_parameters": {
+                    "rope_type": "linear", "factor": 2.0, "rope_theta": 1e4,
+                    "partial_rotary_factor": 0.5,
+                }}),
+                "Linear { factor: 2.0 } rotating 0.5",
+            ),
+            (
+                json!({"rope_parameters": {
+                    "rope_type": "proportional", "rope_theta": 1e4, "partial_rotary_factor": 0.5,
+                }}),
+                "Proportional { factor: Positive(1.0) } rotating 0.5",
+            ),
+        ] {
+            let error = prefix(document.clone()).unwrap_err();
+            let reason = format!(
+                "found {found} of each head, compiled the unscaled spectrum over the first 64 of \
+                 128 coordinates"
+            );
+            assert_eq!(
+                (error.kind(), error.to_string()),
+                (io::ErrorKind::Unsupported, reason),
+                "{document}"
+            );
+        }
+    }
+
+    /// A family that interleaves a multimodal rotation's sections holds the unscaled spectrum
+    /// with sections, or none, interleaved over a head's pairs; sections in one block each and a
+    /// rescaled spectrum are unsupported, sections over another count of pairs malformed.
+    #[test]
+    fn holds_interleaved_sections_of_the_head() {
+        use furiosa_opt_std::prelude::*;
+        axes![Whole = 128];
+        let sections = |section: serde_json::Value, interleaved: bool| {
+            json!({"rope_theta": 5e6, "rope_scaling": {
+                "rope_type": "default", "mrope_section": section, "mrope_interleaved": interleaved,
+            }})
+        };
+        for document in [
+            sections(json!([24, 20, 20]), true),
+            json!({"rope_theta": 5e6}),
+        ] {
+            let Interleaved(theta, _) = parse::<Interleaved<Whole>>(&document).unwrap();
+            assert_eq!(theta.get(), 5e6, "{document}");
+        }
+        let linear = json!({"rope_theta": 5e6, "rope_scaling": {
+            "rope_type": "linear", "factor": 2.0, "mrope_section": [24, 20, 20],
+            "mrope_interleaved": true,
+        }});
+        for (document, kind, reason) in [
+            (
+                sections(json!([24, 20, 20]), false),
+                io::ErrorKind::Unsupported,
+                "found sections [24, 20, 20] in one block each, compiled interleaved sections",
+            ),
+            (
+                sections(json!([24, 20, 16]), true),
+                io::ErrorKind::InvalidData,
+                "mrope_section: found [24, 20, 16], expected sections of the 64 pairs of a \
+                 128-wide head",
+            ),
+            (
+                linear,
+                io::ErrorKind::Unsupported,
+                "found Linear { factor: 2.0 } rotating 1 of each head, compiled the unscaled \
+                 spectrum over the whole head",
+            ),
+        ] {
+            let error = parse::<Interleaved<Whole>>(&document).unwrap_err();
+            assert_eq!(
+                (error.kind(), error.to_string()),
+                (kind, reason.into()),
                 "{document}"
             );
         }

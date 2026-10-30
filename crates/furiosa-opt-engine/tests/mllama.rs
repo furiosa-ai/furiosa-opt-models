@@ -36,10 +36,34 @@ fn mllama_is_refused_until_its_root_exists() {
 
 // # The size by its published config
 
-/// The size parses its published checkpoint's config.
+/// The size parses its published checkpoint's config, and any other spectrum its text model
+/// binds: another base, another Llama 3 rescaling, none, or no base, which reads as
+/// `MllamaTextConfig`'s.
 #[test]
 fn size_reads_its_published_config() {
-    mllama::Size::<"11B">::parse(&MLLAMA_11B.config()).unwrap();
+    let published = MLLAMA_11B.config();
+    mllama::Size::<"11B">::parse(&published).unwrap();
+    for (key, value) in [
+        ("rope_theta", json!(10000.0)),
+        ("rope_scaling", json!(null)),
+        (
+            "rope_scaling",
+            json!({
+                "rope_type": "llama3", "factor": 16.0, "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0, "original_max_position_embeddings": 8192,
+            }),
+        ),
+    ] {
+        let mut document = published.clone();
+        document["text_config"][key] = value;
+        mllama::Size::<"11B">::parse(&document).unwrap();
+    }
+    let mut baseless = published;
+    baseless["text_config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("rope_theta");
+    mllama::Size::<"11B">::parse(&baseless).unwrap();
 }
 
 /// A config the size does not serve is refused, each case by its kind and reason, which names a
@@ -48,7 +72,7 @@ fn size_reads_its_published_config() {
 fn refuses_what_the_size_does_not_hold() {
     use io::ErrorKind::{InvalidData, Unsupported};
     let published = MLLAMA_11B.config();
-    let cases: [(&[&str], Value, io::ErrorKind, &str); 37] = [
+    let cases: [(&[&str], Value, io::ErrorKind, &str); 34] = [
         (
             &["model_type"],
             json!("llava"),
@@ -116,24 +140,6 @@ fn refuses_what_the_size_does_not_hold() {
             "text_config.rms_norm_eps: 0.000001, the size holds 0.00001",
         ),
         (
-            &["text_config", "rope_theta"],
-            json!(10000.0),
-            InvalidData,
-            "text_config.rope_theta: 10000, the size holds 500000",
-        ),
-        (
-            &["text_config", "rope_scaling", "factor"],
-            json!(16.0),
-            InvalidData,
-            "text_config.rope_scaling.factor: 16, the size holds 8",
-        ),
-        (
-            &["text_config", "rope_scaling", "rope_type"],
-            json!("linear"),
-            Unsupported,
-            "text_config.rope_scaling.rope_type: the text model rotates with Llama 3's frequencies",
-        ),
-        (
             &["text_config", "tie_word_embeddings"],
             json!(true),
             InvalidData,
@@ -152,38 +158,39 @@ fn refuses_what_the_size_does_not_hold() {
             "text_config.hidden_act: the text model's feed-forward is SiLU",
         ),
         (
-            &["text_config", "rope_scaling", "high_freq_factor"],
-            json!(2.0),
+            &["text_config", "rope_parameters"],
+            json!({"rope_type": "linear"}),
             InvalidData,
-            "text_config.rope_scaling.high_freq_factor: 2, the size holds 4",
+            "text_config: missing field `factor`",
         ),
         (
-            &["text_config", "rope_scaling", "low_freq_factor"],
-            json!(2.0),
+            &["text_config", "rope_theta"],
+            json!(0),
             InvalidData,
-            "text_config.rope_scaling.low_freq_factor: 2, the size holds 1",
-        ),
-        (
-            &[
-                "text_config",
-                "rope_scaling",
-                "original_max_position_embeddings",
-            ],
-            json!(4096),
-            InvalidData,
-            "text_config.rope_scaling.original_max_position_embeddings: 4096, the size holds 8192",
+            "text_config: rope_theta: found 0, expected a positive finite value",
         ),
         (
             &["text_config", "rope_scaling"],
-            json!(null),
-            InvalidData,
-            "text_config.rope_scaling: absent, the size rotates with Llama 3's frequencies",
+            json!({"rope_type": "dynamic", "factor": 2.0}),
+            Unsupported,
+            "text_config: found rope_type \"dynamic\", compiled default, proportional, linear, \
+             llama3 or yarn",
         ),
         (
-            &["text_config", "rope_parameters"],
-            json!({"rope_type": "linear"}),
+            &["text_config", "rope_scaling"],
+            json!({
+                "rope_type": "yarn", "factor": 4.0, "attention_factor": 2.0,
+                "original_max_position_embeddings": 8192,
+            }),
             Unsupported,
-            "text_config.rope_parameters.rope_type: the text model rotates with Llama 3's frequencies",
+            "text_config.attention_factor: found 2.0, compiled 1.0",
+        ),
+        (
+            &["text_config", "partial_rotary_factor"],
+            json!(0.5),
+            Unsupported,
+            "text_config.partial_rotary_factor: found 0.5 of a 128-wide head, compiled 128 rotated \
+             coordinates",
         ),
         (
             &["vision_config", "model_type"],

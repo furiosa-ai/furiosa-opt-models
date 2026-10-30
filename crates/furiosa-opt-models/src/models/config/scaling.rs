@@ -7,12 +7,16 @@
 //! - A checkpoint spells one spectrum as `rope_parameters`, or as `rope_theta` beside
 //!   `rope_scaling`; a description nested by layer type is [`Spectra`]. Two spellings of one value
 //!   must agree.
+//! - A field that a configuration leaves out reads as its class's [`Defaults`]; read without a
+//!   class, a spectrum refuses a missing base.
+//! - What a spectrum's parameters declare beside it, a query temperature ([`Rope`]) or a
+//!   multimodal rotation's sections ([`Multimodal`]), a spectrum alone refuses.
 
 use super::{Positive, refuse};
 use crate::ops::pointwise::multiply::Temperature;
 use crate::ops::rotary::PairFrequencies;
 use furiosa_opt_std::prelude::AxisName;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 use serde_json::{Map, Value};
 use std::fmt::Debug;
 use std::mem;
@@ -47,6 +51,16 @@ pub enum Kind {
 }
 
 impl Spectrum {
+    /// The spectrum of base `theta` that `kind` rescales over the whole head, as a size that
+    /// compiles one states it.
+    pub fn new(theta: Positive, kind: Kind) -> Self {
+        Self {
+            theta,
+            fraction: 1.0,
+            kind,
+        }
+    }
+
     pub fn theta(&self) -> Positive {
         self.theta
     }
@@ -59,15 +73,28 @@ impl Spectrum {
         self.fraction
     }
 
+    /// The coordinates of a `head`-wide head that the spectrum rotates, truncated as Transformers
+    /// truncates them, `int(head * fraction)`.
+    pub(super) fn rotated(&self, head: usize) -> usize {
+        (self.fraction * head as f64) as usize
+    }
+
+    /// The amplitude every rotation scales by: a YaRN spectrum's attention factor, else one.
+    pub fn amplitude(&self) -> f64 {
+        match self.kind {
+            Kind::Yarn(yarn) => yarn.amplitude,
+            _ => 1.0,
+        }
+    }
+
     /// The frequency of each of the `rotated / 2` pairs of a `head`-wide head, as Transformers
     /// computes it; refused when it rotates part of a head, since `i` pairs with `i + head / 2`.
     pub fn frequencies(&self, head: usize, rotated: usize) -> io::Result<Vec<f64>> {
         let theta = f64::from(self.theta.get());
         let unscaled = |pair: usize| theta.powf(-2.0 * pair as f64 / head as f64);
-        // Transformers truncates the rotated width, `int(head * fraction)`.
         let width = match self.kind {
             Kind::Proportional { .. } => 2 * (self.fraction * head as f64 / 2.0) as usize,
-            _ => (self.fraction * head as f64) as usize,
+            _ => self.rotated(head),
         };
         let holds = match self.kind {
             Kind::Proportional { .. } => width == rotated,
@@ -107,11 +134,29 @@ impl Spectrum {
     /// The frequencies of a `Head`-wide head's `Rotated` coordinates, at the spectrum's
     /// amplitude.
     pub fn bind<Head: AxisName, Rotated: AxisName>(&self) -> io::Result<PairFrequencies<Rotated>> {
-        let amplitude = match self.kind {
-            Kind::Yarn(yarn) => yarn.amplitude,
-            _ => 1.0,
-        };
-        PairFrequencies::new(&self.frequencies(Head::SIZE, Rotated::SIZE)?, amplitude)
+        PairFrequencies::new(
+            &self.frequencies(Head::SIZE, Rotated::SIZE)?,
+            self.amplitude(),
+        )
+    }
+}
+
+/// The values a configuration class gives the rotary fields that a configuration leaves out, as
+/// Transformers' class attributes give them: its `default_theta`, and the part of each head it
+/// rotates.
+pub trait Defaults {
+    /// The base of a configuration that names none.
+    const THETA: Positive;
+
+    /// The fraction of each head that a configuration naming none rotates.
+    const FRACTION: f64 = 1.0;
+
+    /// Deserializes a flattened spectrum as the class reads it.
+    fn spectrum<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Spectrum, D::Error> {
+        let document: Document = super::flattened(deserializer)?;
+        Spectra::read(document, Some(Self::THETA), Self::FRACTION)
+            .and_then(Spectrum::try_from)
+            .map_err(de::Error::custom)
     }
 }
 
@@ -160,23 +205,33 @@ impl TryFrom<Document> for Spectra {
     type Error = Refusal;
 
     fn try_from(document: Document) -> Result<Self, Self::Error> {
-        let defaults = Defaults {
+        Self::read(document, None, 1.0)
+    }
+}
+
+impl Spectra {
+    /// The spectra `document` spells, a description that names no base taking `theta` and one
+    /// that names no fraction rotating `fraction` of each head.
+    fn read(document: Document, theta: Option<Positive>, fraction: f64) -> Result<Self, Refusal> {
+        let outer = Outer {
             theta: document.rope_theta,
             fraction: document.partial_rotary_factor,
             original: document.original_max_position_embeddings,
             declared: document.max_position_embeddings,
+            default_theta: theta,
+            default_fraction: fraction,
         };
         // Transformers 5 nests the base among the rescaling's parameters; earlier releases keep
         // the base at the top and the rescaling under its own name.
         let layers = match (document.rope_parameters, document.rope_scaling) {
             (Some(parameters), Some(scaling)) => {
-                let layers = defaults.layers(parameters)?;
-                if defaults.layers(scaling)? != layers {
+                let layers = outer.layers(parameters)?;
+                if outer.layers(scaling)? != layers {
                     return Err("rope_scaling: differs from rope_parameters beside it".to_owned());
                 }
                 layers
             }
-            (parameters, scaling) => defaults.layers(parameters.or(scaling).unwrap_or_default())?,
+            (parameters, scaling) => outer.layers(parameters.or(scaling).unwrap_or_default())?,
         };
         Ok(Self(layers))
     }
@@ -262,19 +317,77 @@ impl TryFrom<Map<String, Value>> for Rope {
     }
 }
 
-/// What one spectrum's description defaults from the document around it.
-struct Defaults {
+/// Transformers' names for the fields of a spectrum's parameters that give a multimodal
+/// rotation's sections; a [`Spectrum`] alone refuses them.
+const SECTIONS: [&str; 2] = ["mrope_section", "mrope_interleaved"];
+
+/// A multimodal rotation's sections: how many rotated pairs turn by each of a position's
+/// temporal, height and width components (`mrope_section`), the pairs of each interleaved across
+/// the head where `mrope_interleaved` holds and in one block each otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+pub struct Sections {
+    #[serde(rename = "mrope_section")]
+    pub pairs: [usize; 3],
+    #[serde(rename = "mrope_interleaved", default)]
+    pub interleaved: bool,
+}
+
+/// A spectrum, and the sections of a multimodal rotation where the spectrum's parameters declare
+/// them; a rotation by one position for every pair, as a text-only prompt gives, turns alike under
+/// any sections.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(try_from = "Map<String, Value>")]
+pub struct Multimodal {
+    pub spectrum: Spectrum,
+    pub sections: Option<Sections>,
+}
+
+impl TryFrom<Map<String, Value>> for Multimodal {
+    type Error = Refusal;
+
+    fn try_from(mut document: Map<String, Value>) -> Result<Self, Self::Error> {
+        // Both spellings of the parameters must agree, so each loses its sections, which must
+        // agree with the other's.
+        let malformed = |error: serde_json::Error| error.to_string();
+        let sections = ["rope_parameters", "rope_scaling"]
+            .into_iter()
+            .filter_map(|spelling| match document.get_mut(spelling) {
+                Some(Value::Object(parameters)) => {
+                    let fields = SECTIONS.map(|field| parameters.remove_entry(field));
+                    let fields = fields.into_iter().flatten().collect::<Map<_, _>>();
+                    (!fields.is_empty()).then(|| Sections::deserialize(Value::Object(fields)))
+                }
+                _ => None,
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(malformed)?
+            .into_iter()
+            .try_fold(None, |held, sections| {
+                agree(SECTIONS[0], held, Some(sections))
+            })?;
+        let spectrum = Spectrum::deserialize(Value::Object(document)).map_err(malformed)?;
+        Ok(Self { spectrum, sections })
+    }
+}
+
+/// What one spectrum's description defaults from the document around it, then from the
+/// configuration's class.
+struct Outer {
     theta: Option<Positive>,
     fraction: Option<f64>,
     original: Option<NonZeroUsize>,
     /// `max_position_embeddings`: the context the checkpoint declares.
     declared: Option<NonZeroUsize>,
+    /// The class's base, which a description naming none takes; without one it is refused.
+    default_theta: Option<Positive>,
+    /// The class's fraction of each head, which a description naming none rotates.
+    default_fraction: f64,
 }
 
 /// A refusal raised outside serde, which keeps the unsupported prefix of [`refuse`].
 type Refusal = String;
 
-impl Defaults {
+impl Outer {
     /// The spectra a description gives: one of its rotary fields, or one per layer type that
     /// keys an object, or null for no rotation, by the type's name.
     fn layers(&self, parameters: Map<String, Value>) -> Result<Layers, Refusal> {
@@ -310,6 +423,12 @@ impl Defaults {
                 "a rotation alone",
             ));
         }
+        if SECTIONS.iter().any(|field| parameters.contains_key(*field)) {
+            return Err(refuse(
+                format_args!("a multimodal rotation's sections ({})", SECTIONS[0]),
+                "a rotation by one position",
+            ));
+        }
         #[derive(Deserialize)]
         struct Common {
             rope_type: Option<String>,
@@ -339,13 +458,14 @@ impl Defaults {
             }
         };
         let theta = agree("rope_theta", common.rope_theta, self.theta)?
+            .or(self.default_theta)
             .ok_or("missing field `rope_theta`")?;
         let fraction = agree(
             "partial_rotary_factor",
             common.partial_rotary_factor,
             self.fraction,
         )?
-        .unwrap_or(1.0);
+        .unwrap_or(self.default_fraction);
         if !(fraction > 0.0 && fraction <= 1.0) {
             return Err(format!(
                 "partial_rotary_factor: found {fraction}, expected a fraction in (0, 1]"
@@ -385,7 +505,9 @@ impl Defaults {
             "llama3" => Kind::Llama3(
                 Config::deserialize(typed("llama3")).map_err(|error| error.to_string())?,
             ),
-            "yarn" => {
+            // vLLM names DeepSeek's YaRN, whose magnitude over every dimension also scales its
+            // attention's scores, `deepseek_yarn`.
+            "yarn" | "deepseek_yarn" => {
                 let mut yarn = typed("yarn");
                 // Transformers reads a null factor as the declared context over the trained one.
                 let null = yarn.get("factor").is_some_and(Value::is_null);
@@ -421,14 +543,6 @@ pub struct Config {
 }
 
 impl Config {
-    /// Llama 3 rescaled rotary frequency of each dimension pair of a `head`-wide attention head.
-    pub fn frequencies(&self, theta: Positive, head: usize) -> Vec<f32> {
-        let theta = f64::from(theta.get());
-        (0..head / 2)
-            .map(|pair| self.rescale(theta.powf(-2.0 * pair as f64 / head as f64)) as f32)
-            .collect()
-    }
-
     /// The rescaled value of an unscaled frequency.
     fn rescale(&self, frequency: f64) -> f64 {
         let (factor, low, high, original) = (
@@ -485,7 +599,7 @@ impl TryFrom<Raw> for Config {
 /// YaRN's rescaling: pairs turning over `fast` times in the `original` context keep their
 /// frequency, under `slow` divide it by `factor`, a ramp blends; `amplitude` scales each rotation.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
-#[serde(try_from = "YarnRaw")]
+#[serde(try_from = "YarnParameters")]
 pub struct Yarn {
     factor: f64,
     fast: f64,
@@ -493,9 +607,18 @@ pub struct Yarn {
     original: NonZeroUsize,
     truncate: bool,
     amplitude: f64,
+    mscale_all_dim: Option<f64>,
 }
 
 impl Yarn {
+    /// YaRN's magnitude over every dimension, from `mscale_all_dim`, or one where the parameters
+    /// name none; an attention that follows it, as DeepSeek's does, scales its scores by its
+    /// square.
+    pub fn magnitude(&self) -> f64 {
+        self.mscale_all_dim
+            .map_or(1.0, |coefficient| mscale(self.factor, coefficient))
+    }
+
     /// The frequency of each pair of a `head`-wide head, as Transformers' YaRN computes it.
     fn frequencies(&self, theta: f64, head: usize) -> Vec<f64> {
         let width = head as f64;
@@ -520,51 +643,48 @@ impl Yarn {
     }
 }
 
-#[derive(serde::Deserialize)]
-struct YarnRaw {
-    rope_type: super::Literal<"yarn">,
-    factor: Positive,
-    original_max_position_embeddings: NonZeroUsize,
-    beta_fast: Option<f64>,
-    beta_slow: Option<f64>,
-    attention_factor: Option<f64>,
-    mscale: Option<f64>,
-    mscale_all_dim: Option<f64>,
-    truncate: Option<bool>,
+/// YaRN's parameters by their names in a configuration: what a checkpoint declares, and what a
+/// size that compiles one YaRN states; an absent one reads as Transformers' default.
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
+pub struct YarnParameters {
+    pub factor: Positive,
+    pub original_max_position_embeddings: NonZeroUsize,
+    pub beta_fast: Option<f64>,
+    pub beta_slow: Option<f64>,
+    pub attention_factor: Option<f64>,
+    pub mscale: Option<f64>,
+    pub mscale_all_dim: Option<f64>,
+    pub truncate: Option<bool>,
 }
 
-impl TryFrom<YarnRaw> for Yarn {
+impl TryFrom<YarnParameters> for Yarn {
     type Error = String;
 
-    fn try_from(raw: YarnRaw) -> Result<Self, Self::Error> {
-        let super::Literal = raw.rope_type;
-        let factor = f64::from(raw.factor.get());
+    fn try_from(parameters: YarnParameters) -> Result<Self, Self::Error> {
+        let factor = f64::from(parameters.factor.get());
         if factor < 1.0 {
             return Err(format!("factor: found {factor}, expected >= 1"));
         }
-        // Transformers reads an absent or zero ramp bound as its default.
+        // Transformers reads an absent or zero ramp bound, or magnitude, as its default.
         let nonzero = |value: Option<f64>| value.filter(|value| *value != 0.0);
         let (fast, slow) = (
-            nonzero(raw.beta_fast).unwrap_or(32.0),
-            nonzero(raw.beta_slow).unwrap_or(1.0),
+            nonzero(parameters.beta_fast).unwrap_or(32.0),
+            nonzero(parameters.beta_slow).unwrap_or(1.0),
         );
         if !(fast > slow && slow > 0.0) {
             return Err(format!(
                 "beta_fast: found {fast}, expected > beta_slow {slow} > 0"
             ));
         }
-        let scale = |mscale: f64| match factor <= 1.0 {
-            true => 1.0,
-            false => 0.1 * mscale * factor.ln() + 1.0,
-        };
+        let mscale_all_dim = nonzero(parameters.mscale_all_dim);
         let amplitude = match (
-            raw.attention_factor,
-            nonzero(raw.mscale),
-            nonzero(raw.mscale_all_dim),
+            parameters.attention_factor,
+            nonzero(parameters.mscale),
+            mscale_all_dim,
         ) {
             (Some(amplitude), _, _) => amplitude,
-            (None, Some(mscale), Some(all)) => scale(mscale) / scale(all),
-            (None, _, _) => scale(1.0),
+            (None, Some(own), Some(all)) => mscale(factor, own) / mscale(factor, all),
+            (None, _, _) => mscale(factor, 1.0),
         };
         if !(amplitude > 0.0 && amplitude.is_finite()) {
             return Err(format!(
@@ -575,10 +695,20 @@ impl TryFrom<YarnRaw> for Yarn {
             factor,
             fast,
             slow,
-            original: raw.original_max_position_embeddings,
-            truncate: raw.truncate.unwrap_or(true),
+            original: parameters.original_max_position_embeddings,
+            truncate: parameters.truncate.unwrap_or(true),
             amplitude,
+            mscale_all_dim,
         })
+    }
+}
+
+/// YaRN's magnitude at `factor` for a magnitude parameter `coefficient`, Transformers'
+/// `get_mscale`: a YaRN that does not extend the context scales nothing.
+fn mscale(factor: f64, coefficient: f64) -> f64 {
+    match factor <= 1.0 {
+        true => 1.0,
+        false => 0.1 * coefficient * factor.ln() + 1.0,
     }
 }
 
@@ -1230,5 +1360,170 @@ mod tests {
                 .map(|(halved, unscaled)| halved / unscaled)
                 .all(|ratio| ratio == 0.5)
         );
+    }
+
+    /// A configuration class reads a spectrum's absent base and fraction as its own, under every
+    /// spelling the document gives none in; a base or fraction the document names wins over the
+    /// class's, at the top or nested.
+    #[test]
+    fn reads_absent_fields_as_the_class_defaults_them() {
+        struct Class;
+        impl Defaults for Class {
+            const THETA: Positive = Positive(5e5);
+            const FRACTION: f64 = 0.5;
+        }
+        #[derive(Debug, Deserialize)]
+        struct Part {
+            #[serde(flatten, deserialize_with = "Class::spectrum")]
+            rope: Spectrum,
+        }
+        let read = |document: Value| parse::<Part>(document).unwrap().rope;
+        let spectrum = |theta, fraction, kind| Spectrum {
+            theta: Positive(theta),
+            fraction,
+            kind,
+        };
+        let linear = Kind::Linear { factor: 2.0 };
+        for (document, expected) in [
+            (json!({}), spectrum(5e5, 0.5, Kind::Default)),
+            (
+                json!({"rope_scaling": {"rope_type": "linear", "factor": 2.0}}),
+                spectrum(5e5, 0.5, linear),
+            ),
+            (
+                json!({"rope_theta": 1e4}),
+                spectrum(1e4, 0.5, Kind::Default),
+            ),
+            (
+                nested(json!({"rope_type": "linear", "factor": 2.0}), 1e6),
+                spectrum(1e6, 0.5, linear),
+            ),
+            (
+                json!({"partial_rotary_factor": 1.0}),
+                spectrum(5e5, 1.0, Kind::Default),
+            ),
+        ] {
+            assert_eq!(read(document.clone()), expected, "{document}");
+        }
+        let refusal = parse::<Part>(json!({"partial_rotary_factor": 0.0})).unwrap_err();
+        assert_eq!(
+            (refusal.kind(), refusal.to_string()),
+            (
+                io::ErrorKind::InvalidData,
+                "partial_rotary_factor: found 0, expected a fraction in (0, 1]".into()
+            )
+        );
+    }
+
+    /// Qwen3-VL's text rotation.
+    fn sectioned() -> Value {
+        json!({
+            "rope_theta": 5e6,
+            "rope_scaling": {
+                "rope_type": "default", "mrope_section": [24, 20, 20], "mrope_interleaved": true,
+            },
+        })
+    }
+
+    /// A multimodal rotation's sections read beside its spectrum in either spelling, none where
+    /// the parameters name none; a spectrum alone refuses them, and two spellings must declare
+    /// the same.
+    #[test]
+    fn reads_multimodal_sections_beside_spectra() {
+        let multimodal: Multimodal = parse(sectioned()).unwrap();
+        assert_eq!(
+            multimodal.spectrum,
+            parse::<Spectrum>(json!({"rope_theta": 5e6})).unwrap()
+        );
+        let interleaved = Sections {
+            pairs: [24, 20, 20],
+            interleaved: true,
+        };
+        assert_eq!(multimodal.sections, Some(interleaved));
+        let mut transformers = sectioned()["rope_scaling"].clone();
+        transformers["rope_theta"] = json!(5e6);
+        let respelled: Multimodal = parse(json!({"rope_parameters": transformers})).unwrap();
+        assert_eq!(
+            (respelled.spectrum, respelled.sections),
+            (multimodal.spectrum, multimodal.sections)
+        );
+        let mut chunked = sectioned();
+        chunked["rope_scaling"]
+            .as_object_mut()
+            .unwrap()
+            .remove("mrope_interleaved");
+        let chunked: Multimodal = parse(chunked).unwrap();
+        let sections = Sections {
+            interleaved: false,
+            ..interleaved
+        };
+        assert_eq!(chunked.sections, Some(sections));
+        let plain: Multimodal = parse(json!({"rope_theta": 5e6})).unwrap();
+        assert_eq!(plain.sections, None);
+        let refusal = parse::<Spectrum>(sectioned()).unwrap_err();
+        assert_eq!(
+            (refusal.kind(), refusal.to_string()),
+            (
+                io::ErrorKind::Unsupported,
+                "found a multimodal rotation's sections (mrope_section), compiled a rotation by \
+                 one position"
+                    .into()
+            )
+        );
+        let mut differing = sectioned();
+        differing["rope_parameters"] = differing["rope_scaling"].clone();
+        differing["rope_parameters"]["mrope_section"] = json!([16, 24, 24]);
+        let refusal = parse::<Multimodal>(differing).unwrap_err();
+        assert_eq!(
+            (refusal.kind(), refusal.to_string()),
+            (
+                io::ErrorKind::InvalidData,
+                "mrope_section: found Sections { pairs: [16, 24, 24], interleaved: true } and \
+                 Sections { pairs: [24, 20, 20], interleaved: true }"
+                    .into()
+            )
+        );
+    }
+
+    /// A size states its compiled YaRN by the parameters a configuration names, which the rule that
+    /// reads a checkpoint's YaRN converts; `deepseek_yarn` spells YaRN too, and parameters of one
+    /// amplitude that scale an attention's scores differently are two YaRNs.
+    #[test]
+    fn states_a_yarn_by_its_parameters() {
+        let stated = Yarn::try_from(YarnParameters {
+            factor: Positive(16.0),
+            original_max_position_embeddings: NonZeroUsize::new(16384).unwrap(),
+            beta_fast: Some(32.0),
+            beta_slow: Some(1.0),
+            attention_factor: None,
+            mscale: Some(1.0),
+            mscale_all_dim: Some(1.0),
+            truncate: None,
+        })
+        .unwrap();
+        let read = |parameters: Value| match parse::<Spectrum>(nested(parameters, 1e9)) {
+            Ok(Spectrum {
+                kind: Kind::Yarn(yarn),
+                ..
+            }) => yarn,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(read(yarn()), stated);
+        let mut vllm = yarn();
+        vllm["rope_type"] = json!("deepseek_yarn");
+        vllm["type"] = json!("deepseek_yarn");
+        assert_eq!(read(vllm), stated);
+        let mut deepseek = yarn();
+        deepseek["mscale"] = json!(0.707);
+        deepseek["mscale_all_dim"] = json!(0.707);
+        let deepseek = read(deepseek);
+        assert_eq!((deepseek.amplitude, stated.amplitude), (1.0, 1.0));
+        assert_ne!(deepseek, stated);
+        let magnitude = |yarn: Yarn| yarn.magnitude();
+        assert!((magnitude(deepseek) - 1.196_022_023).abs() <= 1e-9);
+        assert!((magnitude(stated) - 1.277_258_872).abs() <= 1e-9);
+        let mut unscaled = yarn();
+        unscaled.as_object_mut().unwrap().remove("mscale_all_dim");
+        assert_eq!(magnitude(read(unscaled)), 1.0);
     }
 }

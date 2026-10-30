@@ -36,10 +36,23 @@ fn llava_is_refused_until_its_root_exists() {
 
 // # The size by its published config
 
-/// The size parses its published checkpoint's config.
+/// The size parses its published checkpoint's config, whose text half names no rotary field, and
+/// any other spectrum its decoder binds: another base, or a rescaled one.
 #[test]
 fn size_reads_its_published_config() {
-    llava::Size::<"1.5-7b">::parse(&LLAVA_1_5_7B.config()).unwrap();
+    let published = LLAVA_1_5_7B.config();
+    llava::Size::<"1.5-7b">::parse(&published).unwrap();
+    for (key, value) in [
+        ("rope_theta", json!(1000000.0)),
+        (
+            "rope_scaling",
+            json!({"rope_type": "linear", "factor": 2.0}),
+        ),
+    ] {
+        let mut document = published.clone();
+        document["text_config"][key] = value;
+        llava::Size::<"1.5-7b">::parse(&document).unwrap();
+    }
 }
 
 /// A config the size does not serve is refused, each case by its kind and reason, which names a
@@ -48,7 +61,7 @@ fn size_reads_its_published_config() {
 fn refuses_what_the_size_does_not_hold() {
     use io::ErrorKind::{InvalidData, Unsupported};
     let published = LLAVA_1_5_7B.config();
-    let cases: [(&[&str], Value, io::ErrorKind, &str); 35] = [
+    let cases: [(&[&str], Value, io::ErrorKind, &str); 36] = [
         (
             &["model_type"],
             json!("llava_next"),
@@ -148,8 +161,8 @@ fn refuses_what_the_size_does_not_hold() {
         (
             &["text_config", "rope_parameters"],
             json!({"rope_type": "linear"}),
-            Unsupported,
-            "text_config.rope_parameters.rope_type: the decoder rotates without scaling",
+            InvalidData,
+            "text_config: missing field `factor`",
         ),
         (
             &["text_config", "rms_norm_eps"],
@@ -159,9 +172,9 @@ fn refuses_what_the_size_does_not_hold() {
         ),
         (
             &["text_config", "rope_theta"],
-            json!(1000000.0),
+            json!(0),
             InvalidData,
-            "text_config.rope_theta: 1000000, the decoder holds 10000",
+            "text_config: rope_theta: found 0, expected a positive finite value",
         ),
         (
             &["text_config", "tie_word_embeddings"],
@@ -177,9 +190,17 @@ fn refuses_what_the_size_does_not_hold() {
         ),
         (
             &["text_config", "rope_scaling"],
-            json!({"rope_type": "linear", "factor": 2.0}),
+            json!({"rope_type": "dynamic", "factor": 2.0}),
             Unsupported,
-            "text_config.rope_scaling: the decoder rotates without scaling",
+            "text_config: found rope_type \"dynamic\", compiled default, proportional, linear, \
+             llama3 or yarn",
+        ),
+        (
+            &["text_config", "partial_rotary_factor"],
+            json!(0.5),
+            Unsupported,
+            "text_config.partial_rotary_factor: found 0.5 of a 128-wide head, compiled 128 rotated \
+             coordinates",
         ),
         (
             &["text_config", "hidden_act"],

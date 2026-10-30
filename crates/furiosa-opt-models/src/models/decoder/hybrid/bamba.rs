@@ -5,6 +5,11 @@
 //!   checkpoint order ([`ORDER`]); its attention rotates the first half of each head's features.
 //! - [`Model`] is the catalog's composition, a call's attention and recurrent state as its input.
 
+use crate::models::config::{
+    self, Positive,
+    decoder::Prefix,
+    scaling::{Defaults, Spectrum},
+};
 use crate::models::decoder::attention::{Chunks, Geometry};
 use crate::models::decoder::recurrent::mamba::{self, Ids, Rows};
 use crate::models::decoder::recurrent::mamba2;
@@ -257,8 +262,14 @@ pub struct Config {
     mamba_proj_bias: bool,
     #[serde(default)]
     mamba_conv_bias: Option<bool>,
-    #[serde(default)]
-    rope_scaling: Option<Value>,
+    #[serde(flatten, deserialize_with = "Config::spectrum")]
+    rope: Spectrum,
+}
+
+/// `BambaConfig`'s: Transformers' default base, and half of each head, which the class fixes.
+impl Defaults for Config {
+    const THETA: Positive = Positive::new(10000.0);
+    const FRACTION: f64 = 0.5;
 }
 
 /// A config is of a size when it declares the size's values and layer order, at most its compiled
@@ -368,6 +379,7 @@ where
                 Self::TIED_EMBEDDINGS
             )));
         }
+        Prefix::<AttentionHead, Rotated>::try_from(config.rope).map_err(config::refusal)?;
         let context = Chunks::SIZE * gqa::Cache::SIZE;
         if config.max_position_embeddings.unwrap_or(262144) > context {
             return Err(unsupported(&format!(
@@ -389,10 +401,6 @@ where
             (
                 config.mamba_conv_bias == Some(false),
                 "mamba_conv_bias: Bamba's convolution adds its bias",
-            ),
-            (
-                config.rope_scaling.is_some(),
-                "rope_scaling: Bamba rotates without scaling",
             ),
         ];
         match features.into_iter().find(|(declared, _)| *declared) {

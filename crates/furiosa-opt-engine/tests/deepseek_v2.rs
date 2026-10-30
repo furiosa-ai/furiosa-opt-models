@@ -41,7 +41,7 @@ fn deepseek_v2_lite_loads_strictly() {
 // # Configs
 
 /// The size parses its published checkpoint's config, and the same rotation in Transformers 5's
-/// spelling.
+/// spelling and under vLLM's name for DeepSeek's YaRN.
 #[test]
 fn size_reads_its_published_config() {
     let published = DEEPSEEK_V2_LITE.config();
@@ -52,6 +52,9 @@ fn size_reads_its_published_config() {
     rope["rope_theta"] = respelled["rope_theta"].take();
     respelled["rope_parameters"] = rope;
     Size::<"Lite">::parse(&respelled).unwrap();
+    let mut vllm = published;
+    vllm["rope_scaling"]["type"] = json!("deepseek_yarn");
+    Size::<"Lite">::parse(&vllm).unwrap();
 }
 
 /// A config the size does not serve is refused, each case by its kind and reason.
@@ -175,18 +178,6 @@ fn size_refuses_what_it_does_not_serve() {
             "max_position_embeddings: past the compiled context of 163840",
         ),
         (
-            "rope_scaling",
-            json!({"type": "linear", "factor": 2.0}),
-            Unsupported,
-            "rope_scaling: DeepSeek-V2 rotates with its compiled YaRN",
-        ),
-        (
-            "rope_theta",
-            json!(50000),
-            Unsupported,
-            "rope_theta: DeepSeek-V2 rotates its compiled YaRN at 10000",
-        ),
-        (
             "q_lora_rank",
             json!(1536),
             Unsupported,
@@ -264,25 +255,69 @@ fn size_refuses_what_it_does_not_serve() {
         let error = Size::<"Lite">::parse(document).map(drop).unwrap_err();
         (error.kind(), error.to_string())
     };
-    let yarn = "rope_scaling: DeepSeek-V2 rotates with its compiled YaRN".to_owned();
-    for (key, value) in [
-        ("type", json!("linear")),
-        ("factor", json!(20.0)),
-        ("beta_fast", json!(16)),
-        ("beta_slow", json!(2)),
-        ("mscale", json!(1.0)),
-        ("mscale_all_dim", json!(1.0)),
-        ("original_max_position_embeddings", json!(2048)),
+    // The compiled YaRN's fields, which each rescaled case below changes one of.
+    let yarn = "factor: 40.0, fast: 32.0, slow: 1.0, original: 4096, truncate: true, \
+                amplitude: 1.0, mscale_all_dim: Some(0.707)";
+    let rescaled = |from: &str, to: &str| format!("Yarn(Yarn {{ {} }})", yarn.replace(from, to));
+    let spectrum = |theta: &str, kind: &str| {
+        format!("Spectrum {{ theta: Positive({theta}), fraction: 1.0, kind: {kind} }}")
+    };
+    let compiled = |theta: &str| spectrum(theta, &format!("Yarn(Yarn {{ {yarn} }})"));
+    let rotation = |found: String| {
+        let reason = format!(
+            "rope_parameters: found {found}, compiled {}",
+            compiled("10000.0")
+        );
+        (Unsupported, reason)
+    };
+    for (fields, found) in [
+        (
+            json!({"rope_scaling": {"type": "linear", "factor": 2.0}}),
+            spectrum("10000.0", "Linear { factor: 2.0 }"),
+        ),
+        (json!({"rope_theta": 50000}), compiled("50000.0")),
     ] {
         let mut document = published.clone();
-        document["rope_scaling"][key] = value;
-        assert_eq!(refused(&document), (Unsupported, yarn.clone()), "{key}");
+        document
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        assert_eq!(refused(&document), rotation(found), "{fields}");
+    }
+    for (fields, kind) in [
+        (json!({"type": "linear"}), "Linear { factor: 40.0 }".into()),
+        (
+            json!({"factor": 20.0}),
+            rescaled("factor: 40.0", "factor: 20.0"),
+        ),
+        (
+            json!({"beta_fast": 16}),
+            rescaled("fast: 32.0", "fast: 16.0"),
+        ),
+        (json!({"beta_slow": 2}), rescaled("slow: 1.0", "slow: 2.0")),
+        (
+            json!({"mscale": 1.0, "mscale_all_dim": 1.0}),
+            rescaled("Some(0.707)", "Some(1.0)"),
+        ),
+        (
+            json!({"original_max_position_embeddings": 2048}),
+            rescaled("original: 4096", "original: 2048"),
+        ),
+    ] {
+        let mut document = published.clone();
+        document["rope_scaling"]
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        let found = spectrum("10000.0", &kind);
+        assert_eq!(refused(&document), rotation(found), "{fields}");
     }
     let mut unrotated = published.clone();
     unrotated.as_object_mut().unwrap().remove("rope_scaling");
-    assert_eq!(refused(&unrotated), (Unsupported, yarn));
+    let found = spectrum("10000.0", "Default");
+    assert_eq!(refused(&unrotated), rotation(found));
     let mut baseless = published.clone();
     baseless.as_object_mut().unwrap().remove("rope_theta");
-    let theta = "rope_theta: DeepSeek-V2 rotates its compiled YaRN at 10000".to_owned();
-    assert_eq!(refused(&baseless), (Unsupported, theta));
+    let missing = (InvalidData, "missing field `rope_theta`".to_owned());
+    assert_eq!(refused(&baseless), missing);
 }

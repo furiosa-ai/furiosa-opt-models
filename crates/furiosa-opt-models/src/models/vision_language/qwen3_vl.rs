@@ -9,6 +9,7 @@ use std::io;
 use serde::Deserialize;
 
 use crate::models::Family;
+use crate::models::config::{self, decoder::Interleaved};
 use crate::models::decoder::attention::{Geometry, Head, KvHeads, PaddedVocabulary};
 use crate::modules::{attention, language, multimodal, transformer};
 use crate::ops::attention::geometry::{self, QueryGroups, QueryWidth};
@@ -65,19 +66,10 @@ struct Text {
     head_dim: usize,
     vocab_size: usize,
     rms_norm_eps: f64,
-    #[serde(default)]
-    rope_scaling: Option<RopeScaling>,
+    #[serde(flatten, deserialize_with = "config::flattened")]
+    _rotary: Interleaved<Head>,
     #[serde(default)]
     attention_bias: bool,
-}
-
-/// The rotation's sections, interleaved across the head.
-#[derive(Deserialize)]
-struct RopeScaling {
-    #[serde(default)]
-    mrope_interleaved: bool,
-    #[serde(default)]
-    rope_type: Option<String>,
 }
 
 /// A config is of a size when its text model declares the size's values and at most its compiled
@@ -141,18 +133,11 @@ where
                 Self::TIED_EMBEDDINGS
             )));
         }
-        let interleaved = |rotation: &RopeScaling| {
-            rotation.mrope_interleaved
-                && rotation.rope_type.as_deref().is_none_or(|t| t == "default")
-        };
-        match (text.rope_scaling, text.attention_bias) {
-            (Some(rotation), _) if !interleaved(&rotation) => Err(unsupported(
-                "text_config.rope_scaling: the text model rotates its interleaved sections alone",
-            )),
-            (_, true) => Err(unsupported(
+        match text.attention_bias {
+            true => Err(unsupported(
                 "text_config.attention_bias: the text model projects without biases",
             )),
-            _ => Ok(Size),
+            false => Ok(Size),
         }
     }
 }

@@ -8,6 +8,10 @@
 //! - The text model's token table has eight rows past its vocabulary, one an image token.
 
 use crate::models::Family;
+use crate::models::config::{
+    self, Positive,
+    scaling::{Defaults, Spectrum},
+};
 use furiosa_opt_std::prelude::*;
 use serde::Deserialize;
 use std::io;
@@ -117,18 +121,6 @@ const GLOBAL_LAYERS: usize = 8;
 /// `rms_norm_eps` of the text model and `norm_eps` of the image tower.
 const EPSILON: f32 = 1e-5;
 
-/// `rope_theta`: the base of the text model's rotation.
-const THETA: f64 = 500000.0;
-
-/// Llama 3's frequency stretch: low frequencies slow by `FACTOR`, high ones keep their speed, and
-/// the band between `LOW_FACTOR` and `HIGH_FACTOR` wavelengths of the original context blends.
-const FACTOR: f64 = 8.0;
-const HIGH_FACTOR: f64 = 4.0;
-const LOW_FACTOR: f64 = 1.0;
-
-/// `original_max_position_embeddings`: the context the frequencies were trained at.
-const ORIGINAL_POSITIONS: usize = 8192;
-
 /// `max_position_embeddings`: the positions the text model serves.
 const POSITIONS: usize = 131072;
 
@@ -167,24 +159,16 @@ pub struct Text {
     vocab_size: usize,
     cross_attention_layers: Vec<usize>,
     rms_norm_eps: f64,
-    rope_theta: Option<f64>,
-    rope_scaling: Option<Rope>,
-    rope_parameters: Option<Rope>,
+    #[serde(flatten, deserialize_with = "Text::spectrum")]
+    rope: Spectrum,
     max_position_embeddings: usize,
     hidden_act: String,
     tie_word_embeddings: bool,
 }
 
-/// A rotation's frequencies: Llama 3's, which stretch the low frequencies by `factor`.
-#[derive(Deserialize)]
-pub struct Rope {
-    #[serde(alias = "type")]
-    rope_type: String,
-    rope_theta: Option<f64>,
-    factor: Option<f64>,
-    high_freq_factor: Option<f64>,
-    low_freq_factor: Option<f64>,
-    original_max_position_embeddings: Option<usize>,
+/// `MllamaTextConfig`'s: its `default_theta`.
+impl Defaults for Text {
+    const THETA: Positive = Positive::new(500000.0);
 }
 
 /// The image tower's `vision_config`; an absent key holds `MllamaVisionConfig`'s default.
@@ -222,9 +206,8 @@ impl Default for Text {
             vocab_size: 128256,
             cross_attention_layers: text::CROSS.to_vec(),
             rms_norm_eps: 1e-5,
-            rope_theta: None,
-            rope_scaling: None,
-            rope_parameters: None,
+            rope: Self::spectrum(serde_json::Value::Object(Default::default()))
+                .expect("a configuration naming no rotary field rotates by its class's base"),
             max_position_embeddings: 131072,
             hidden_act: "silu".into(),
             tie_word_embeddings: false,
@@ -318,52 +301,9 @@ impl Text {
                 "hidden_act: the text model's feed-forward is SiLU",
             ));
         }
-        let (key, rope) = match (&self.rope_parameters, &self.rope_scaling) {
-            (Some(rope), _) => ("rope_parameters", rope),
-            (None, Some(rope)) => ("rope_scaling", rope),
-            (None, None) => {
-                return Err(invalid(
-                    "rope_scaling: absent, the size rotates with Llama 3's frequencies".into(),
-                ));
-            }
-        };
-        if rope.rope_type != "llama3" {
-            return Err(unsupported(&format!(
-                "{key}.rope_type: the text model rotates with Llama 3's frequencies"
-            )));
-        }
-        let shown = |value: Option<f64>| value.map_or("absent".into(), |value| value.to_string());
-        let factors = [
-            ("factor", rope.factor, FACTOR),
-            ("high_freq_factor", rope.high_freq_factor, HIGH_FACTOR),
-            ("low_freq_factor", rope.low_freq_factor, LOW_FACTOR),
-        ];
-        if let Some((name, declared, held)) = factors
-            .into_iter()
-            .find(|(_, declared, held)| *declared != Some(*held))
-        {
-            return Err(invalid(format!(
-                "{key}.{name}: {}, the size holds {held}",
-                shown(declared)
-            )));
-        }
-        match rope.original_max_position_embeddings {
-            Some(ORIGINAL_POSITIONS) => {}
-            original => {
-                return Err(invalid(format!(
-                    "{key}.original_max_position_embeddings: {}, the size holds \
-                     {ORIGINAL_POSITIONS}",
-                    original.map_or("absent".into(), |original| original.to_string())
-                )));
-            }
-        }
-        match rope.rope_theta.or(self.rope_theta) {
-            Some(THETA) => Ok(()),
-            theta => Err(invalid(format!(
-                "rope_theta: {}, the size holds {THETA}",
-                shown(theta)
-            ))),
-        }
+        // The text model's rotation holds each pair's frequency and no amplitude.
+        self.rope.bind::<Head, Head>()?;
+        config::compiled("attention_factor", self.rope.amplitude(), 1.0).map(drop)
     }
 }
 

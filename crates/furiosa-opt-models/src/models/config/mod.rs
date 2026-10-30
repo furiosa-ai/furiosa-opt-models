@@ -164,6 +164,13 @@ impl TryFrom<Option<de::IgnoredAny>> for Absent {
 pub struct Positive(f32);
 
 impl Positive {
+    /// A value the code fixes, such as a compiled base; a constant that is not positive and
+    /// finite fails the build.
+    pub const fn new(value: f32) -> Self {
+        assert!(value.is_finite() && value > 0.0, "a positive finite value");
+        Self(value)
+    }
+
     pub const fn get(self) -> f32 {
         self.0
     }
