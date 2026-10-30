@@ -212,7 +212,7 @@ pub struct Hf {
     model_type: Option<String>,
     projection_dim: Option<usize>,
     #[serde(flatten, deserialize_with = "config::text")]
-    text: Geometry,
+    text: Tower,
 }
 
 impl TryFrom<Hf> for Config {
@@ -311,9 +311,9 @@ impl TryFrom<Hf> for Config {
     }
 }
 
-/// The text encoder's geometry, each field defaulting by the model type.
+/// The text tower's geometry, each field defaulting by the model type.
 #[derive(Deserialize)]
-struct Geometry {
+struct Tower {
     hidden_size: Option<usize>,
     intermediate_size: Option<usize>,
     num_attention_heads: Option<usize>,
