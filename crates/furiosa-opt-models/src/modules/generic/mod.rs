@@ -12,7 +12,6 @@ pub use interleave::{Branch, Interleave};
 pub(crate) use layers::Collection;
 pub use layers::{Layers, Repeat, Rolled, Unrolled};
 pub(crate) use order::Order;
-pub use schedule::Scheduled;
 pub use sequential::{Sequential, Then};
 
 /// Returns the input unchanged.

@@ -1,6 +1,5 @@
 //! Modules applied one after another: each takes its predecessor's output, moved or lent.
 
-use super::schedule::{IntoStream, Stream};
 use crate::Module;
 use crate::load::Load;
 use furiosa_opt_std::prelude::{Device, DeviceSend};
@@ -30,39 +29,6 @@ where
     }
 }
 // --8<-- [end:sequential]
-
-/// B's stream over A's: B polls A for each input tile it needs.
-impl<'s, U: Stream, E: Copy, AState, BState, A, B> IntoStream<U, E, &'s mut (AState, BState)>
-    for Sequential<A, B>
-where
-    A: IntoStream<U, E, &'s mut AState>,
-    B: IntoStream<A::Stream, E, &'s mut BState>,
-{
-    type Stream = B::Stream;
-
-    fn into_stream(
-        self,
-        env: E,
-        (first, second): &'s mut (AState, BState),
-        upstream: U,
-    ) -> Self::Stream {
-        let first = self.0.into_stream(env, first, upstream);
-        self.1.into_stream(env, second, first)
-    }
-}
-
-/// A borrowed sequence streams as the sequence of its borrowed parts.
-impl<'m, 's, U: Stream, E, AState, BState, A, B> IntoStream<U, E, &'s mut (AState, BState)>
-    for &'m Sequential<A, B>
-where
-    Sequential<&'m A, &'m B>: IntoStream<U, E, &'s mut (AState, BState)>,
-{
-    type Stream = <Sequential<&'m A, &'m B> as IntoStream<U, E, &'s mut (AState, BState)>>::Stream;
-
-    fn into_stream(self, env: E, state: &'s mut (AState, BState), upstream: U) -> Self::Stream {
-        Sequential(&self.0, &self.1).into_stream(env, state, upstream)
-    }
-}
 
 /// Applies A, then lends its output to B without transferring ownership.
 #[derive(Clone, DeviceSend, Load)]
@@ -95,32 +61,6 @@ where
     ) -> Z {
         let hidden = self.0.forward(&mut *device, env, first, input);
         self.1.forward(device, env, second, &hidden)
-    }
-}
-
-/// A tile belongs to the node that polled it, so a lent output streams as a moved one: `Then`
-/// streams as `Sequential`.
-impl<'s, U: Stream, E, AState, BState, A, B> IntoStream<U, E, &'s mut (AState, BState)>
-    for Then<A, B>
-where
-    Sequential<A, B>: IntoStream<U, E, &'s mut (AState, BState)>,
-{
-    type Stream = <Sequential<A, B> as IntoStream<U, E, &'s mut (AState, BState)>>::Stream;
-
-    fn into_stream(self, env: E, state: &'s mut (AState, BState), upstream: U) -> Self::Stream {
-        Sequential(self.0, self.1).into_stream(env, state, upstream)
-    }
-}
-
-impl<'m, 's, U: Stream, E, AState, BState, A, B> IntoStream<U, E, &'s mut (AState, BState)>
-    for &'m Then<A, B>
-where
-    Sequential<&'m A, &'m B>: IntoStream<U, E, &'s mut (AState, BState)>,
-{
-    type Stream = <Sequential<&'m A, &'m B> as IntoStream<U, E, &'s mut (AState, BState)>>::Stream;
-
-    fn into_stream(self, env: E, state: &'s mut (AState, BState), upstream: U) -> Self::Stream {
-        Sequential(&self.0, &self.1).into_stream(env, state, upstream)
     }
 }
 
