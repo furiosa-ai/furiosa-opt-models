@@ -345,6 +345,9 @@ class Draft:
     cache_dtype: str | None
     # The target's context length, to which drafting extends a request.
     max_model_len: int
+    # Under parallel drafting, the token the draft model reads at each draft position after the
+    # first; `None` drafts each position from the draft before it.
+    mask: int | None
 
     @classmethod
     def parse(cls, config: VllmConfig, settings: SpeculativeConfig, section: Section) -> Draft:
@@ -382,6 +385,30 @@ class Draft:
             )
         if quantization(settings.draft_model_config, "speculative_config.") is not None:
             raise Refused("speculative_config.quantization", "quantizes no draft model at load")
+        mask = None
+        if settings.parallel_drafting:
+            # The first token of these the draft config names, as vLLM's proposer reads it.
+            draft = settings.draft_model_config.hf_config
+            dflash = getattr(draft, "dflash_config", None) or {}
+            names = ("dspark_noise_token_id", "pard_token", "ptd_token_id")
+            mask = (
+                dflash["mask_token_id"]
+                if "mask_token_id" in dflash
+                else draft.mask_token_id
+                if getattr(draft, "mask_token_id", None) is not None
+                else next((getattr(draft, name) for name in names if hasattr(draft, name)), None)
+            )
+            vocabulary = settings.draft_model_config.get_vocab_size()
+            # The engine reads no token ID, so one past the vocabulary would read other memory.
+            if not isinstance(mask, int) or isinstance(mask, bool) or not 0 <= mask < vocabulary:
+                raise Refused(
+                    "speculative_config.parallel_drafting",
+                    (
+                        "requires a draft config whose mask token (dflash_config.mask_token_id, "
+                        "mask_token_id, dspark_noise_token_id, pard_token or ptd_token_id) lies "
+                        f"in the draft vocabulary of {vocabulary} tokens, not {mask!r}"
+                    ),
+                )
         # The engine loads once vLLM checks a configuration, not when vLLM imports the platform.
         import furiosa_opt_engine as engine
 
@@ -400,6 +427,7 @@ class Draft:
             load.download_dir,
             cache_dtype,
             config.model_config.max_model_len,
+            mask,
         )
 
 
