@@ -20,7 +20,7 @@ impl<
                 &mut HeadRows<Rows, KvHeads, Groups, Head>,
             ),
             (
-                &Wide<KvHeads, Head, Waves>,
+                (&Wide<KvHeads, Head, Waves>, &Floor),
                 Shape,
                 (&Gather, &Blocks<KvHeads, Head>),
             ),
@@ -39,13 +39,13 @@ where
         context: &mut Device,
         env: Env,
         _: &mut (),
-        ((query, attended), (items, shape, pool), ((boundary, state), guests)): (
+        ((query, attended), ((items, floor), shape, pool), ((boundary, state), guests)): (
             (
                 &HeadRows<Rows, KvHeads, Groups, Head>,
                 &mut HeadRows<Rows, KvHeads, Groups, Head>,
             ),
             (
-                &Wide<KvHeads, Head, Waves>,
+                (&Wide<KvHeads, Head, Waves>, &Floor),
                 Shape,
                 (&Gather, &Blocks<KvHeads, Head>),
             ),
@@ -176,7 +176,10 @@ where
         // rounded into their half of `rounded`; what a merge keeps of it returned.
         let attend =
             |context: &mut Device,
-             (shape, (keys, limits)): (Shape, (&Self::WideKeys, &Self::WideLimits<Waves>)),
+             (shape, (keys, (limits, floor))): (
+                Shape,
+                (&Self::WideKeys, &Self::WideBounds<Waves>),
+            ),
              ((queries, in_dm), wave): ((&Self::WideQueries<Waves>, &Self::WideInDm), usize),
              rounded: &mut Self::WideRounded<Waves>|
              -> Self::WideKept {
@@ -214,9 +217,15 @@ where
                     .fetch::<m![1], m![1 # 8]>()
                     .collect::<m![1], m![1 # 8]>()
                     .to_vrf();
+                let floor: Self::WideVrf<i32, m![1 # 8]> = context
+                    .sub
+                    .begin(floor.view())
+                    .fetch::<m![1], m![1 # 8]>()
+                    .collect::<m![1], m![1 # 8]>()
+                    .to_vrf();
                 self.attend::<m![Groups], Self::WideUnits, _, _, _, _, _, _>(
                     context,
-                    ((&heads, &limit), (keys, in_dm)),
+                    ((&heads, (&limit, &floor)), (keys, in_dm)),
                     (shape.units, shape.depth),
                     (wave, rounded),
                 )
@@ -234,7 +243,10 @@ where
             // through every other module.
             let keys: Self::WideKeys = items.keys.to_dm(&mut context.tdma);
             // Every wave's at once: a transfer queued between two histories delays the second.
-            let limits: Self::WideLimits<Waves> = items.limits.to_dm(&mut context.tdma);
+            let bounds: Self::WideBounds<Waves> = (
+                items.limits.to_dm(&mut context.tdma),
+                floor.to_dm(&mut context.tdma),
+            );
             to_dm(context, (&mut queries, 0));
             let mut in_dm = history(context, 0);
             let chain =
@@ -244,7 +256,7 @@ where
                  (wave, rounded): (usize, &mut Self::WideRounded<Waves>)| {
                     attend(
                         context,
-                        (shape, (&keys, &limits)),
+                        (shape, (&keys, &bounds)),
                         ((queries, in_dm), wave),
                         rounded,
                     )

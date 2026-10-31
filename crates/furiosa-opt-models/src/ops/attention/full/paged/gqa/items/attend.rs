@@ -42,7 +42,8 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> Attention<KvHeads, Gro
     }
 
     /// Wave `wave`'s chain on slices `S`: query lanes scored over `in_dm`'s first `units` units
-    /// below their `limit`, normalized over `2^depth` slices into `rounded`; returns what merges.
+    /// below their `limit` and past its `floor`, normalized over `2^depth` slices into `rounded`;
+    /// returns what merges.
     pub(super) fn attend<
         L: M,
         U: M,
@@ -55,10 +56,13 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> Attention<KvHeads, Gro
     >(
         &self,
         context: &mut Device,
-        ((heads, limit), (keys, in_dm)): (
+        ((heads, (limit, floor)), (keys, in_dm)): (
             (
                 &Self::ItemDm<S, bf16, m![{ R }, Head]>,
-                &Self::ItemVrf<S, i32, Limit>,
+                (
+                    &Self::ItemVrf<S, i32, Limit>,
+                    &Self::ItemVrf<S, i32, m![1 # 8]>,
+                ),
             ),
             (
                 &Self::ItemDm<S, i32, Keys>,
@@ -97,7 +101,8 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> Attention<KvHeads, Gro
                 .collect::<R, m![1 # 8]>()
                 .to_vrf()
         };
-        // The slots each row sees, as tags: those whose key position is below its limit.
+        // The slots each row sees, as tags: those whose key position `k` is below its limit `l` by
+        // at most its window, where max(k - l, floor - (k - l)) is negative.
         let distance: Self::ItemDm<S, i32, Keys> = context
             .main
             .begin(keys.view())
@@ -106,6 +111,10 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> Attention<KvHeads, Gro
             .vector_init()
             .vector_intra_slice_tag(TagMode::Zero)
             .vector_fxp(FxpBinaryOp::SubFxp, limit)
+            .vector_stash()
+            .vector_fxp(FxpBinaryOp::MulInt, -1)
+            .vector_clip(ClipBinaryOpI32::AddFxp, floor)
+            .vector_clip(ClipBinaryOpI32::Max, Stash)
             .vector_final()
             .commit_trim::<m![T % 8]>()
             .commit();

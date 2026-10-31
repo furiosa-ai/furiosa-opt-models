@@ -206,6 +206,10 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> Attention<KvHeads, Gro
     type WideKeys = Self::WideDm<i32, Self::WideTime>;
     /// A column's limit on each of its token slices.
     type WideLimit = Self::WideDm<i32, m![1 # 8]>;
+    /// The launch's window floor on each token slice.
+    type WideFloor = Self::WideDm<i32, m![1 # 8]>;
+    /// Every wave's column limits, and the launch's window floor.
+    type WideBounds<Waves: AxisName> = (Self::WideLimits<Waves>, Self::WideFloor);
     /// Every wave's column limits on each column's first slice.
     type WideLimits<Waves: AxisName> =
         DmTensor<i32, Chip, Self::ItemCluster, ColumnSlices<m![1 # 16]>, m![Waves, 1 # 8]>;

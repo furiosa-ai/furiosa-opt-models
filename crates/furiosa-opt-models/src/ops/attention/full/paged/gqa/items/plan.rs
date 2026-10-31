@@ -5,11 +5,15 @@
 //! - An item row of at most one packed column's keys may be packed: an adaptive launch packs them
 //!   all when that takes fewer waves in all than the wide domain alone would, and none otherwise; a
 //!   fixed one packs them all. Each domain keeps its rows in row order and plans them alone.
-//! - The arrays are the launch's row count, then the packed domain's, then the wide domain's.
+//! - A row that attends its last `window` keys reads its blocks from the one holding the window's
+//!   first key, as if its history began there; a slot is seen when its key lies below its column's
+//!   limit by at most `window`, so the keys of that block below the window are not.
+//! - The arrays are the launch's row count and window floor, then the packed domain's, then the
+//!   wide domain's.
 
 use super::*;
 use crate::ops::index::table::FIELDS;
-use crate::ops::index::table::{CACHED, LEN, START};
+use crate::ops::index::table::{CACHED, LEN, START, TABLE};
 use crate::specialize::attention::DECODES;
 use std::iter;
 use std::slice;
@@ -26,27 +30,62 @@ pub enum Tiling {
     Fixed,
 }
 
+/// How a call's host plans each row's items: their tiling, and the keys a row attends, its last
+/// `window` with itself among them, or with no window its whole history.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Options {
+    pub tiling: Tiling,
+    pub window: Option<usize>,
+}
+
+/// A tiling alone attends each row's whole history.
+impl From<Tiling> for Options {
+    fn from(tiling: Tiling) -> Self {
+        Self {
+            tiling,
+            window: None,
+        }
+    }
+}
+
+/// The window of a row that attends its whole history: past every position a row holds.
+const WHOLE: usize = 1 << 24;
+
 /// A launch's items as the arrays the two domains' bodies read, at the compiled capacities.
 pub struct Plan {
     rows: i32,
+    floor: [i32; FLOOR],
     packed: packed::plan::Plan,
     wide: wide::plan::Plan,
 }
 
 impl Plan {
-    /// The items of decode rows `segments`, block IDs `ids` padded to whole runs, tiled as `tiling`
-    /// says in `Waves` wide waves; `Reach` holds the rows as group tiles, the last [`SINKS`] sinks.
+    /// The items of decode rows `segments`, block IDs `ids` padded to whole runs, planned as
+    /// `options` says in `Waves` wide waves; `Reach` holds the rows as group tiles, the last
+    /// [`SINKS`] sinks.
     pub fn new<KvHeads: AxisName, G: AxisName, Head: AxisName, Waves: AxisName, Reach: AxisName>(
         segments: &[[i32; FIELDS]],
         ids: &[i32],
-        tiling: Tiling,
+        options: impl Into<Options>,
     ) -> Self {
+        let Options { tiling, window } = options.into();
+        let window = window.unwrap_or(WHOLE);
+        assert!(
+            (1..=WHOLE).contains(&window),
+            "a row's window holds the row and at most 2^24 positions"
+        );
+        let window = window as i32;
+        let block = Block::SIZE.ilog2();
         let tiles = GroupTile::<G>::TILES;
         let tiled: Vec<[i32; FIELDS]> = segments
             .iter()
             .flat_map(|row| {
+                let skipped = (row[LEN] + row[CACHED] - window).max(0) >> block;
+                let mut row = *row;
+                row[CACHED] -= skipped << block;
+                row[TABLE] += skipped;
                 (0..tiles).map(move |tile| {
-                    let mut row = *row;
+                    let mut row = row;
                     row[START] = row[START] * tiles as i32 + tile as i32;
                     row
                 })
@@ -68,8 +107,11 @@ impl Plan {
             true => (packed, wide),
             false => (Vec::new(), tiled.iter().collect()),
         };
+        let mut floor = [0; FLOOR];
+        floor[0] = -window - 1;
         Self {
             rows: i32::try_from(segments.len()).expect("the decode rows fit i32"),
+            floor,
             packed: packed::plan::Plan::new::<KvHeads, GroupTile<G>, Head, Tiled<Reach, G>>(
                 &packed, ids, tiling,
             ),
@@ -101,6 +143,7 @@ impl Plan {
     /// Each array in [`Items::bind`] order: the leading words the launch uses, and all its words.
     pub fn reads(&self) -> impl Iterator<Item = (&[i32], usize)> {
         iter::once((slice::from_ref(&self.rows), 1))
+            .chain(iter::once((&self.floor[..], FLOOR)))
             .chain(self.packed.reads())
             .chain(self.wide.reads())
     }
@@ -125,7 +168,7 @@ mod tests {
         let ids = vec![1; 1 << 18];
         let plan = Plan::new::<Heads, G, Head, Waves<WAVES>, Rows<1280>>(&segments, &ids, tiling);
         let leading = |at: usize| plan.reads().nth(at).map_or(0, |(read, _)| read[0]);
-        [leading(1), leading(1 + packed::plan::ARRAYS)]
+        [leading(2), leading(2 + packed::plan::ARRAYS)]
     }
 
     /// A short row is packed only when that takes fewer waves in all than every row wide would;

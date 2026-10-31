@@ -25,7 +25,7 @@ use crate::tensor::cache::Blocks;
 use gqa::items::SINKS;
 use gqa::items::Shape;
 use gqa::items::{GroupTile, Tiled};
-pub use gqa::items::{Items, Plan, Tiling, Waves};
+pub use gqa::items::{Items, Options, Plan, Tiling, Waves};
 
 mod append;
 pub mod chunks;
@@ -97,13 +97,14 @@ impl<
     }
 
     /// The arrays, in [`Work::bind`] order, of a launch whose `R` rows (`segments`) attend as items
-    /// tiled as `tiling` says: its used leading words, then all; `ids` holds row IDs, padded to 16.
+    /// planned as `options` says: its used leading words, then all; `ids` holds row IDs, padded
+    /// to 16.
     pub fn sequential<R: AxisName>(
         segments: &[[i32; FIELDS]],
         ids: &[i32],
-        tiling: Tiling,
+        options: impl Into<Options>,
     ) -> io::Result<Vec<(Vec<i32>, usize)>> {
-        let items = Plan::new::<KvHeads, G, Head, Waves, Sinked<R>>(segments, ids, tiling);
+        let items = Plan::new::<KvHeads, G, Head, Waves, Sinked<R>>(segments, ids, options);
         let items = items.reads().map(|(read, words)| (read.to_vec(), words));
         let chunks = chunks::Plan::<W>::new::<Sequences>().reads()?;
         Ok(items.chain(chunks).collect())
@@ -377,10 +378,12 @@ impl<
 mod tests {
     use super::*;
     use crate::Op;
+    use crate::load::Checkpoint;
+    use crate::modules::attention::key_value::{History, Paging, Preparation};
     use crate::ops::attention::Attention;
     use crate::ops::attention::Heads;
     use crate::ops::attention::gqa::{Cache, Pages};
-    use crate::ops::index::table::{BlockIndex, PADDING_BIAS};
+    use crate::ops::index::table::{BlockIndex, Fields, PADDING_BIAS};
     use crate::specialize::attention::{HISTORY_WAVES, Strategy, WAVES};
     use crate::tensor::axis::Rows;
     use crate::tensor::cache::{Block, Blocks};
@@ -390,11 +393,17 @@ mod tests {
     use furiosa_opt_std::runtime::launch;
     use gqa::items::tests::{
         self as items, Heads as KvHeads, KEYS, LONG, QueryEights as Eights, QueryGroups as Groups,
-        QueryPairs as Pairs, QuerySingle as Single, QuerySixteens as Sixteens, SCALE, UNIT, Wide,
-        Width as Head, stride,
+        QueryPairs as Pairs, QuerySingle as Single, QuerySixteens as Sixteens, SCALE, UNIT, WINDOW,
+        Wide, Width as Head, stride,
     };
+    use std::ops::Range;
 
     axes![Sequences = 1, Windows = 80];
+    // A call's flat table of block IDs: 32 rows, each of a whole history's blocks.
+    axes![Table = 81920];
+
+    /// How the catalog's layers of `R` rows page a history of `H` KV heads of `D` channels.
+    type Paged<R, H, D> = Preparation<R, Paging<H, D, R, Windows>>;
 
     type Layout<R, H, G, D> = m![R, H, G, D];
     type Queries<R, H, G, D> = HbmTensor<bf16, Chip, Layout<R, H, G, D>>;
@@ -454,6 +463,42 @@ mod tests {
         let heads: Heads<R, H, G, D> = query.to_dm(&mut device.tdma);
         let query = Live::<(), R>::read(live).with(heads);
         let output = Op::forward(&attention, &mut *device, (&query, &*pool, pages));
+        output
+            .value()
+            .view()
+            .to_hbm_view(&mut device.tdma, attended.view_mut());
+    }
+
+    /// The windowed leaf over the pages `preparation` derives from the compact `history` of a
+    /// call's `live` rows, as the catalog's layers page their history.
+    #[device(chip = 1)]
+    fn attend_paged<R: AxisName, H: AxisName, G: AxisName, D: AxisName, const SCALE: usize>(
+        device: &mut Device,
+        scale: &F32<SCALE>,
+        query: &Queries<R, H, G, D>,
+        paged: (&Paged<R, H, D>, &History<R, Table, R>),
+        live: &Value,
+        pool: &mut Blocks<H, D>,
+        attended: &mut Queries<R, H, G, D>,
+    ) {
+        let (preparation, history) = paged;
+        let tiles = Live::<(), R>::read(live);
+        let blocks = (&history.segments, &history.blocks);
+        let logical = Op::forward(&preparation.derive, &mut *device, blocks);
+        let context = Module::forward(
+            &preparation.geometry,
+            &mut *device,
+            (),
+            &mut (),
+            (tiles, (&logical, history)),
+        );
+        let attention = Attention::<PhantomData<(H, G, D)>, F32<SCALE>, { Strategy::Windows }> {
+            heads: PhantomData,
+            scale: *scale,
+        };
+        let heads: Heads<R, H, G, D> = query.to_dm(&mut device.tdma);
+        let query = tiles.with(heads);
+        let output = Op::forward(&attention, &mut *device, (&query, &*pool, &context.read));
         output
             .value()
             .view()
@@ -669,17 +714,18 @@ mod tests {
     ) {
         let output =
             as_items::<R, KvHeads, G, Head, SCALE, WAVES>(device, histories, masks, lengths);
-        check_rows::<KvHeads, G, Head, SCALE>(lengths, &output.await);
+        check_rows::<KvHeads, G, Head, SCALE>((lengths, items::prefix), &output.await);
     }
 
-    /// Each row `r` of `output` attends its `lengths[r]` keys as a host softmax does.
+    /// Each row `r` of `output` attends what `seen(r, lengths[r])` names of the pool's histories,
+    /// as a host softmax does.
     fn check_rows<H: AxisName, G: AxisName, D: AxisName, const SCALE: usize>(
-        lengths: &[usize],
+        (lengths, seen): (&[usize], impl Fn(usize, usize) -> (usize, Range<usize>)),
         output: &[bf16],
     ) {
         let rows = output.chunks_exact(stride::<H, G, D>());
         for ((row, &length), got) in lengths.iter().enumerate().zip(rows) {
-            items::check::<H, G, D, SCALE>(row, length, got, lengths.len());
+            items::check::<H, G, D, SCALE>(row, seen(row, length), got, lengths.len());
         }
     }
 
@@ -724,10 +770,96 @@ mod tests {
         for lengths in [vec![KEYS; 32], tail, vec![LONG, 17, 1]] {
             let output = as_items::<Rows<32>, KvHeads, Pairs, Wide, UNIT, WAVES>;
             let output = output(device, &mut pool, &masks, &lengths).await;
-            check_rows::<KvHeads, Pairs, Wide, UNIT>(&lengths, &output);
+            check_rows::<KvHeads, Pairs, Wide, UNIT>((&lengths, items::prefix), &output);
             let output = by_windows::<Rows<32>, KvHeads, Pairs, Wide, UNIT>;
             let output = output(device, &mut pool, &lengths).await;
-            check_rows::<KvHeads, Pairs, Wide, UNIT>(&lengths, &output);
+            check_rows::<KvHeads, Pairs, Wide, UNIT>((&lengths, items::prefix), &output);
+        }
+    }
+
+    /// The rows of `lengths` keys of a call of `R` rows, attended by the windowed leaf over the
+    /// pages a device paging of a window of [`WINDOW`] keys derives from the call's compact history:
+    /// a segment a row, each row's block IDs from position 0 as a framework names them.
+    async fn by_paging<R: AxisName, H: AxisName, G: AxisName, D: AxisName, const SCALE: usize>(
+        device: &mut Device,
+        lengths: &[usize],
+    ) -> Vec<bf16> {
+        let (mut pool, tables) = items::windowed::<H, D>(device, lengths, WINDOW).await;
+        let empty = tempfile::tempdir().unwrap();
+        let config = serde_json::json!({"rope_theta": 1e4, "max_position_embeddings": WINDOW});
+        let checkpoint = Checkpoint::new(empty.path(), Some(config)).unwrap();
+        let preparation: Paged<R, H, D> = checkpoint.load(device).unwrap();
+        // Each row's table from a whole table row, the last ID repeated to its end.
+        let (mut segments, mut blocks) = (vec![0; R::SIZE * FIELDS], Vec::new());
+        for (row, (&length, table)) in lengths.iter().zip(&tables).enumerate() {
+            let segment = [row, 1, length - 1, blocks.len(), table.len()];
+            segments[row * FIELDS..][..FIELDS].copy_from_slice(&segment.map(|word| word as i32));
+            let padded = table.len().next_multiple_of(BlockIndex::SIZE);
+            blocks.extend((0..padded).map(|at| table[at.min(table.len() - 1)]));
+        }
+        blocks.resize(Table::SIZE, 0);
+        let history = History {
+            segments: HostTensor::<i32, m![R, Fields]>::from_vec(segments)
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap(),
+            blocks: HostTensor::<i32, m![Table]>::from_vec(blocks)
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap(),
+            selected: HostTensor::<i32, m![R]>::zero()
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap(),
+            extents: HostTensor::<i32, m![3]>::zero()
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap(),
+        };
+        let queries = items::queries::<H, G, D>(R::SIZE);
+        let queries = HostTensor::<bf16, Layout<R, H, G, D>>::from_vec(queries);
+        let queries: Queries<R, H, G, D> = queries.to_hbm(&mut device.pdma).await.unwrap();
+        let live = count(lengths.len()).to_hbm(&mut device.pdma).await.unwrap();
+        let mut attended: Queries<R, H, G, D> = HostTensor::<bf16, Layout<R, H, G, D>>::zero()
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap();
+        let arguments = (
+            &mut *device,
+            &F32::<SCALE>,
+            &queries,
+            (&preparation, &history),
+            &live,
+            &mut pool,
+            &mut attended,
+        );
+        launch(attend_paged, arguments).await.unwrap();
+        attended
+            .to_host::<Layout<R, H, G, D>>(&mut device.pdma)
+            .await
+            .unwrap()
+            .into_vec()
+    }
+
+    /// Through a device paging of a window of [`WINDOW`] keys, as the catalog's layers page their
+    /// history, the windowed leaf's rows of 128-wide heads in four query groups and of 256-wide
+    /// heads in two attend only their window as a host softmax does, though poison fills their
+    /// keys below it and the null block takes the place of every block wholly below it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn attends_only_each_row_window_through_its_pages() {
+        let _lease = DEVICE.lock().await;
+        let mut device = Device::new(attend_paged.topology()).unwrap();
+        let device = &mut device;
+        let windowed = items::WINDOWED;
+        let seen = |row: usize, length: usize| (row, items::lowest(length, WINDOW)..length);
+        let mixed: Vec<usize> = (0..16).map(|row| windowed[row % windowed.len()]).collect();
+        for lengths in [vec![2 * WINDOW + 17], windowed.to_vec(), mixed] {
+            let output = by_paging::<Rows<16>, KvHeads, Groups, Head, SCALE>;
+            let output = output(device, &lengths).await;
+            check_rows::<KvHeads, Groups, Head, SCALE>((&lengths, seen), &output);
+            let output = by_paging::<Rows<32>, KvHeads, Pairs, Wide, UNIT>;
+            let output = output(device, &lengths).await;
+            check_rows::<KvHeads, Pairs, Wide, UNIT>((&lengths, seen), &output);
         }
     }
 }

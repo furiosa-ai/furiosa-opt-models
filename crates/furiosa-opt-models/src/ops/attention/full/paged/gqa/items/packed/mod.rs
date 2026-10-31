@@ -167,6 +167,8 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> Attention<KvHeads, Gro
         m![{ Self::PackedSlot }, KeyValue, KvHeads % ({ Local<KvHeads> }), Head],
     >;
     type PackedKeys = Self::PackedDm<i32, m![Pack, { Self::PackedSlot }]>;
+    /// The launch's window floor on each token slice.
+    type PackedFloor = Self::PackedDm<i32, m![1 # 8]>;
     /// Four consecutive waves' lane limits of each column, wave `w`'s at `w % 4`, on each of its
     /// token slices: a pair of waves arrives while the pair before it is still being read.
     type PackedLimits<Waves: AxisName> = Self::PackedDm<i32, m![Waves % 4, Pack, 1 # 8]>;

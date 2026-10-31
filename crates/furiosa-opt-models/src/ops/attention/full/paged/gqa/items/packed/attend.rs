@@ -11,7 +11,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, Rows: AxisName, H, S, 
                 &mut HeadRows<Rows, KvHeads, Groups, Head>,
             ),
             (
-                &Packed<KvHeads, Head>,
+                (&Packed<KvHeads, Head>, &Floor),
                 Shape,
                 (&Gather, &Blocks<KvHeads, Head>),
             ),
@@ -30,13 +30,13 @@ where
         context: &mut Device,
         env: Env,
         _: &mut (),
-        ((query, attended), (items, shape, pool), ((boundary, state), guests)): (
+        ((query, attended), ((items, floor), shape, pool), ((boundary, state), guests)): (
             (
                 &HeadRows<Rows, KvHeads, Groups, Head>,
                 &mut HeadRows<Rows, KvHeads, Groups, Head>,
             ),
             (
-                &Packed<KvHeads, Head>,
+                (&Packed<KvHeads, Head>, &Floor),
                 Shape,
                 (&Gather, &Blocks<KvHeads, Head>),
             ),
@@ -159,7 +159,7 @@ where
         // Wave `wave`'s chain: both lanes of every group scored and normalized over the group,
         // their rows rounded into their half of `rounded`.
         let attend = |context: &mut Device,
-                      (shape, keys): (Shape, &Self::PackedKeys),
+                      (shape, (keys, floor)): (Shape, (&Self::PackedKeys, &Self::PackedFloor)),
                       (((queries, limits), in_dm), wave): (
             (&Self::PackedLanes<Waves>, &Self::PackedInDm),
             usize,
@@ -188,9 +188,15 @@ where
                 .fetch::<m![Pack], m![1 # 8]>()
                 .collect::<m![Pack], m![1 # 8]>()
                 .to_vrf();
+            let floor: Self::PackedVrf<i32, m![1 # 8]> = context
+                .sub
+                .begin(floor.view())
+                .fetch::<m![1], m![1 # 8]>()
+                .collect::<m![1], m![1 # 8]>()
+                .to_vrf();
             self.attend::<m![Pack, Groups], Self::PackedUnits, _, _, _, _, _, _>(
                 context,
-                ((&heads, &limit), (keys, in_dm)),
+                ((&heads, (&limit, &floor)), (keys, in_dm)),
                 (shape.units, shape.depth),
                 (wave, rounded),
             );
@@ -206,6 +212,7 @@ where
             // Only while the layer attends: a launch-long table on chip would hold its memory
             // through every other module.
             let keys: Self::PackedKeys = items.keys.to_dm(&mut context.tdma);
+            let floor: Self::PackedFloor = floor.to_dm(&mut context.tdma);
             to_dm(context, (&mut lanes, 0));
             let mut in_dm = history(context, 0);
             let chain =
@@ -213,7 +220,12 @@ where
                  lanes: &Self::PackedLanes<Waves>,
                  in_dm: &Self::PackedInDm,
                  (wave, rounded): (usize, &mut Self::PackedRounded<Waves>)| {
-                    attend(context, (shape, &keys), ((lanes, in_dm), wave), rounded)
+                    attend(
+                        context,
+                        (shape, (&keys, &floor)),
+                        ((lanes, in_dm), wave),
+                        rounded,
+                    )
                 };
             // Two waves a trip into alternating buffers, each under the other's chain; a history
             // issues once the last arrives, behind the next pair's queries or this pair's rows.
