@@ -208,13 +208,10 @@ trait Cut<Z: Geometry + Decode + 'static, A: States> {
     fn update(&self, device: &mut Device, staged: Self::Staged, adapters: &mut A) -> RowTile<Z>;
 }
 
-/// The forms a layer's input norm, projections and head norms take for a tile's rows, landed: the
-/// norm's gain, the value form, the launch of the tile's rows it stages, the key and query forms
-/// and the two head norms' forms.
-struct Front<G, V, L, K, Q, QN, KN> {
+/// The forms a layer's input norm, key and query projections and head norms take for a tile's
+/// rows, landed: the norm's gain, the key and query forms and the two head norms' forms.
+struct Front<G, K, Q, QN, KN> {
     gain: G,
-    value: V,
-    launch: L,
     key: K,
     query: Q,
     query_norm: QN,
@@ -352,15 +349,7 @@ where
         + for<'x> Module<Live<(DS, (DP, DP)), Capacity<Z>>, (), &'x mut (), Output = DR>
         + for<'x> Module<Live<DR, Capacity<Z>>, (), &'x mut T::Down, Output = Owned<Width<Z>, Span>>,
 {
-    type Front = Front<
-        <Stage as crate::Op<&'static Norm<Z>>>::Output,
-        VB,
-        Launch<Width<Z>, F, Capacity<Z>>,
-        KB,
-        QB,
-        QNB,
-        KNB,
-    >;
+    type Front = Front<<Stage as crate::Op<&'static Norm<Z>>>::Output, KB, QB, QNB, KNB>;
     type Landed = OL;
     type Staged = Staged<DR, Z>;
 
@@ -371,7 +360,7 @@ where
                 Positioned {
                     projection:
                         NormalizedQkv {
-                            projection: Projection { query, key, value },
+                            projection: Projection { query, key, .. },
                             query_norm,
                             key_norm,
                         },
@@ -379,8 +368,6 @@ where
                 },
             ..
         } = &attention.0;
-        let value = value.forward(&mut *device, tile, &mut (), Begin(()));
-        let launch = value.forward(&mut *device, tile, &mut (), Begin(()));
         let key = key.forward(&mut *device, tile, &mut (), Begin(()));
         let query = query.forward(&mut *device, tile, &mut (), Begin(()));
         let query_norm = query_norm.forward(&mut *device, tile, &mut (), Begin(()));
@@ -388,8 +375,6 @@ where
         let gain = crate::Op::forward(&Stage, &mut *device, &norm.0);
         Front {
             gain,
-            value,
-            launch,
             key,
             query,
             query_norm,
@@ -401,16 +386,28 @@ where
         &self,
         device: &mut Device,
         call: Launched<'_, '_, Z>,
-        mut front: Self::Front,
+        front: Self::Front,
         rows: RowTile<Z>,
         (stored, adapters): (&mut Stored<Z>, &mut T),
     ) -> RowTile<Z> {
         let Sequential(Residual(_, attention, _), _) = self;
         let Attention {
-            qkv: Positioned { positions, .. },
+            qkv:
+                Positioned {
+                    projection:
+                        NormalizedQkv {
+                            projection: Projection { value, .. },
+                            ..
+                        },
+                    positions,
+                },
             ..
         } = &attention.0;
         let tile = rows.with(());
+        // The periods read the value projection last, so it lands here, under the input norm,
+        // behind the down projection's last transfer.
+        let value = value.forward(&mut *device, tile, &mut (), Begin(()));
+        let mut launch = value.forward(&mut *device, tile, &mut (), Begin(()));
         let normalized = front.gain.forward(&mut *device, (), &mut (), &rows);
         // The rows the periods read lie apart from the launch, which the period loops carry.
         let mut home = Normalized::new();
@@ -420,21 +417,21 @@ where
         let pairs = tile.count::<Tile>() / 2;
         let most = <Capacity<Z>>::SIZE / Pair::SIZE;
         for _ in 0..(pairs + most - 1) / most {
-            let begin = Begin(front.launch.period::<TilePair>(&home, 0));
-            front.value.forward(&mut *device, tile, &mut (), begin);
+            let begin = Begin(launch.period::<TilePair>(&home, 0));
+            value.forward(&mut *device, tile, &mut (), begin);
         }
         for at in 0..pairs {
             let start = tile.tile::<Pair>(at).start();
             let landing = ToDm::<TilePair, QueryHeads<Z>>(PhantomData);
-            let next = front.launch.period::<TilePair>(&home, at);
+            let next = launch.period::<TilePair>(&home, at);
             let landed = (
                 (landing, (rotation, start / Pair::SIZE)),
-                front.value.forward(&mut *device, tile, &mut (), next),
+                value.forward(&mut *device, tile, &mut (), next),
             );
             period(
                 device,
                 positions,
-                &front,
+                (&front, &value),
                 tile,
                 landed,
                 start,
@@ -444,15 +441,15 @@ where
         for _ in 0..tile.count::<Tile>() % 2 {
             let start = tile.tile::<Tile>(2 * pairs).start();
             let landing = ToDm::<Tiles<1>, QueryHeads<Z>>(PhantomData);
-            let next = front.launch.period::<Tiles<1>>(&home, pairs);
+            let next = launch.period::<Tiles<1>>(&home, pairs);
             let landed = (
                 (landing, (rotation, start / Tile::SIZE)),
-                front.value.forward(&mut *device, tile, &mut (), next),
+                value.forward(&mut *device, tile, &mut (), next),
             );
             period(
                 device,
                 positions,
-                &front,
+                (&front, &value),
                 tile,
                 landed,
                 start,
@@ -514,14 +511,14 @@ where
 }
 
 /// A period of `G` tiles of a tile's rows through a layer's projections, their forms begun in
-/// `front` and running with `adapters`, stored at row `start` of `stored`, its rows landed and its
-/// rotation's coefficients landed by `landing` from `index`: the queries projected, normalized,
-/// rotated and stored while the keys and values project, then the keys normalized, rotated and
-/// stored with the values.
-fn period<Z, G, P, GN, V, LA, K, Q, QN, KN, QH, KH, T: States>(
+/// `front` and `value` and running with `adapters`, stored at row `start` of `stored`, its rows
+/// landed and its rotation's coefficients landed by `landing` from `index`: the queries projected,
+/// normalized, rotated and stored while the keys and values project, then the keys normalized,
+/// rotated and stored with the values.
+fn period<Z, G, P, GN, V, K, Q, QN, KN, QH, KH, T: States>(
     device: &mut Device,
     positions: &Rotary<Head>,
-    front: &Front<GN, V, LA, K, Q, QN, KN>,
+    (front, value): (&Front<GN, K, Q, QN, KN>, &V),
     tile: Live<(), Capacity<Z>>,
     ((landing, index), rows): (Landing<'_, G, Z>, P),
     start: usize,
@@ -538,7 +535,6 @@ fn period<Z, G, P, GN, V, LA, K, Q, QN, KN, QH, KH, T: States>(
     let Front {
         query,
         key,
-        value,
         query_norm,
         key_norm,
         ..
