@@ -128,7 +128,8 @@ where
     }
 }
 
-/// `bf16(bf16(silu(gate)) * up)` of a span's gate/up rows in HBM.
+/// `bf16(bf16(silu(gate)) * up)` of a span's live gate/up rows in HBM, a tile of them at a time;
+/// the rows of the tiles past them are unspecified.
 impl<Intermediate: AxisName, Rows: AxisName, Capacity: AxisName, Env: Copy>
     Module<Live<Lines<Rows, GateUp<Intermediate>>, Capacity>, Env, &mut ()> for SwiGlu
 {
@@ -137,11 +138,14 @@ impl<Intermediate: AxisName, Rows: AxisName, Capacity: AxisName, Env: Copy>
     fn forward(
         &self,
         context: &mut Device,
-        env: Env,
+        _: Env,
         _: &mut (),
         projected: Live<Lines<Rows, GateUp<Intermediate>>, Capacity>,
     ) -> Self::Output {
-        self.forward(context, env, &mut (), projected.value())
+        let mut product = Lines::new();
+        let live = projected.with(());
+        crate::Op::forward(self, context, (projected.value(), &mut product, live));
+        product
     }
 }
 
