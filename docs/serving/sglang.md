@@ -15,7 +15,7 @@ The platform accepts these values:
 | `--device` | Unset or `cpu` (framework tensors stay on the host; the model runs on RNGD) |
 | `--attention-backend`, `--prefill-attention-backend`, `--decode-attention-backend` | Unset or `torch_native` (the engine runs attention) |
 | `startup_weight_load_mode` | `serial` |
-| `disaggregation_mode` | `null` |
+| `disaggregation_mode` | `null`, or `prefill` and `decode` with `--disaggregation-transfer-backend mooncake_tcp` ([Disaggregate prefill and decode](index.md#disaggregate-prefill-and-decode)) |
 | Attention data, expert, context parallelism (`attn_dp_size`, `ep_size`, `dcp_size`, `attn_cp_size`) and `nnodes` | 1 |
 | `--tp-size` | A chip count the model is compiled for; one scheduler drives every chip, so `/server_info` reports `tp_size` 1 |
 | `--dp-size` | Any, or 1 with speculative decoding; replica `i` runs on the `--tp-size` chips from position `i` × `--tp-size` of `FURIOSA_VISIBLE_CHIPS`, or of every installed chip when it is unset |
@@ -40,6 +40,7 @@ These features are not supported yet, and the plugin refuses them at startup rat
 - Returning hidden states, routed experts or indexer top-k.
 - Diffusion LM algorithms (`dllm_algorithm`) and `prefill_only_disable_kv_cache`.
 - Encoder disaggregation (`--encoder-only`, `--language-only`).
+- With prefill-decode disaggregation: a transfer backend other than `mooncake_tcp` (`nixl` and `mori` register the token pool as device memory, and `fake` moves no KV), a model split over chips (an image page holds each chip's part in turn, which a server split otherwise reads differently), host receive (`--disaggregation-decode-host-receive-threshold` below 1: SGLang receives into a host pool only beside a token pool of separate key and value buffers), decode-side cache offload, which needs a storage backend, KV checksums, which SGLang computes with a CUDA kernel, a `host_pool` retraction backup, which SGLang backs up only from an MHA token pool, and NGRAM speculative decoding, whose decode server cannot read the first token SGLang hands a received request.
 
 The platform disables CUDA graphs and piecewise CUDA graphs, and sets the scheduling options by model kind:
 

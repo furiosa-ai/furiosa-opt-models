@@ -2,6 +2,21 @@
 inference takes, its response encoder, its host-pool strategy, and each SGLang function it replaces
 or precedes, beside the reason."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sglang.srt.disaggregation.decode import (
+        DecodePreallocQueue,
+        DecodeRequest,
+        DecodeTransferQueue,
+    )
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+
 
 def register() -> None:
     """Register extensions before SGLang starts its workers."""
@@ -34,6 +49,7 @@ def register() -> None:
     from transformers import AutoConfig
 
     from furiosa_opt_sglang import speculative
+    from furiosa_opt_sglang.cache import Cache
     from furiosa_opt_sglang.generation import Sampled
     from furiosa_opt_sglang.offload import Strategy
     from furiosa_opt_sglang.paging import assign
@@ -88,6 +104,48 @@ def register() -> None:
         request: ResumeMemoryOccupationReqInput,
     ) -> None:
         resume(module(updater), request.tags)
+
+    def send(
+        scheduler: Scheduler, req: Req, last_chunk: bool = False, end_idx: int | None = None
+    ) -> None:
+        _ = last_chunk
+        # SGLang leaves the scheduler's pools untyped.
+        allocator = cast("BaseTokenToKVPoolAllocator", scheduler.token_to_kv_pool_allocator)
+        requests = cast("ReqToTokenPool", scheduler.req_to_token_pool)
+        cache = allocator.get_kvcache()
+        assert isinstance(cache, Cache), "the platform disaggregates the engine's token pool only"
+        # SGLang sends these tokens' pages, a non-last send all but a partial last page.
+        end = end_idx
+        if end is None:
+            extended = req.extend_end
+            assert extended is not None, "SGLang sends a request's pages once a step extended it"
+            end = min(extended, len(req.origin_input_ids))
+        cache.image.store(requests.req_to_token[req.kv.req_pool_idx, req.start_send_idx : end])
+
+    def receive(
+        queue: DecodePreallocQueue,
+        decode_req: DecodeRequest,
+        kv_indices: torch.Tensor,
+        *_metadata: object,
+        **options: object,
+    ) -> None:
+        cache = queue.token_to_kv_pool
+        assert isinstance(cache, Cache), "the platform disaggregates the engine's token pool only"
+        # SGLang's transfer destinations are string enums; the platform refuses host receive.
+        assert options.get("destination") != "host", "a transfer writes into the host image only"
+        row = decode_req.req.kv.req_pool_idx
+        assert row is not None, "SGLang allocates a request's row before it receives the row's KV"
+        cache.image.receive(row, kv_indices)
+
+    def transferred(
+        result: list[Req], queue: DecodeTransferQueue, *_args: object, **_options: object
+    ) -> None:
+        # SGLang leaves the scheduler's pools untyped.
+        allocator = cast("BaseTokenToKVPoolAllocator", queue.scheduler.token_to_kv_pool_allocator)
+        cache = allocator.get_kvcache()
+        assert isinstance(cache, Cache), "the platform disaggregates the engine's token pool only"
+        # Every transferred request holds the row it received into.
+        cache.image.load(row for req in result if (row := req.kv.req_pool_idx) is not None)
 
     # SGLang stacks pooled tensors before HTTP serialization and exposes no response encoder hook.
     ENCODERS_BY_TYPE[torch.Tensor] = cast(
@@ -160,6 +218,26 @@ def register() -> None:
             "sglang.srt.utils.torch_memory_saver_adapter.TorchMemorySaverAdapter.create",
             HookType.AROUND,
             saver,
+        ),
+        # A transfer backend sends a prefill's pages from the token pool's host image, which holds
+        # what the device's pages hold once the send's store returns.
+        (
+            "sglang.srt.disaggregation.prefill.SchedulerDisaggregationPrefillMixin.send_kv_chunk",
+            HookType.BEFORE,
+            send,
+        ),
+        # A decode server's transfer backend writes the token slots it names here into the host
+        # image; they load as SGLang reports the transfer done, before it publishes, backs up or
+        # runs the request.
+        (
+            "sglang.srt.disaggregation.decode.DecodePreallocQueue._send_kv_metadata",
+            HookType.BEFORE,
+            receive,
+        ),
+        (
+            "sglang.srt.disaggregation.decode.DecodeTransferQueue.pop_transferred",
+            HookType.AFTER,
+            transferred,
         ),
         # Releasing and resuming memory by tag move the engine's weights and cache storage.
         (f"{manager}.release_memory_occupation", HookType.AFTER, released),

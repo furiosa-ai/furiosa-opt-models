@@ -34,7 +34,7 @@ Install a plugin first ([Installation](../getting-started/installation.md)); [Qu
 | Data parallelism | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Run data-parallel replicas](#run-data-parallel-replicas) |
 | Pipeline, expert and context parallelism | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | LoRA | <span class="support support-yes">Supported</span> | <span class="support support-no">Not yet</span> | [Serve LoRA adapters](#serve-lora-adapters) |
-| Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache) | <span class="support support-yes">Supported</span> (NIXL) | <span class="support support-no">Not yet</span> | [Disaggregate prefill and decode](#disaggregate-prefill-and-decode) |
+| Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache) | <span class="support support-yes">Supported</span> (NIXL) | <span class="support support-yes">Supported</span> (Mooncake over TCP) | [Disaggregate prefill and decode](#disaggregate-prefill-and-decode) |
 | Disaggregated encoder and encoder caches | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Per-request metrics | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Report per-request metrics](#report-per-request-metrics) |
 | Batch invariance | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Keep outputs independent of the batch](#keep-outputs-independent-of-the-batch) |
@@ -171,38 +171,63 @@ vLLM observes the failure as soon as the copy ends; SGLang may observe it only l
 
 ## Disaggregate prefill and decode
 
-With vLLM, a prefill server computes a prompt's cache and a decode server continues the request from it, through vLLM's NIXL connectors (`NixlConnector`, which names `NixlPullConnector`, or `NixlPushConnector`) in their host-buffer mode:
+A disaggregated deployment prefills a prompt on one server and decodes it on another, which moves the prompt's KV cache between them.
+Run the two servers on chips of their own ([Choose the chips](#choose-the-chips)):
 
-```bash
-vllm serve Qwen/Qwen3-0.6B --port 8100 \
-  --kv-transfer-config '{"kv_connector": "NixlConnector", "kv_role": "kv_producer", "kv_buffer_device": "cpu"}'
-VLLM_NIXL_SIDE_CHANNEL_PORT=5601 vllm serve Qwen/Qwen3-0.6B --port 8200 \
-  --kv-transfer-config '{"kv_connector": "NixlConnector", "kv_role": "kv_consumer", "kv_buffer_device": "cpu"}'
-```
+=== "vLLM"
 
-A request goes to the prefill server with `"kv_transfer_params": {"do_remote_decode": true}` and `max_tokens` 1, then to the decode server with the `kv_transfer_params` that response returns, both under one request ID (`X-Request-Id` or `request_id`), as vLLM's disaggregation proxies route it; `NixlPushConnector` pairs the decode with its prefill by that ID.
-NIXL cannot register the device's memory, so it stages blocks in host buffers of its own and the runner copies each request's blocks between them and the engine cache; `kv_buffer_device` must be `cpu`.
-Each copy ends before NIXL sends the blocks or reports them received, and a failed copy stops the server.
-The decode server's `vllm:external_prefix_cache_hits` counts the prompt tokens it took from its connector, and `vllm:nixl_bytes_transferred` the bytes NIXL moved.
+    With vLLM, a prefill server computes a prompt's cache and a decode server continues the request from it, through vLLM's NIXL connectors (`NixlConnector`, which names `NixlPullConnector`, or `NixlPushConnector`) in their host-buffer mode:
 
-Both servers take the same model, quantization and speculative method, which NIXL's handshake compares; a request's LoRA adapter is named on both.
-Data-parallel replicas and sleep mode are served with a connector.
-One worker drives every chip while vLLM awaits each tensor-parallel rank, so a connector serves one chip a replica.
-Only the attention cache moves, so startup refuses a connector for a model with recurrent state or encoder memory and on an encoder-only instance.
-Mooncake and MoRIIO register the cache's device memory, which the engine does not map for them, and LMCache copies the cache's torch tensors itself, so startup refuses them.
+    ```bash
+    vllm serve Qwen/Qwen3-0.6B --port 8100 \
+      --kv-transfer-config '{"kv_connector": "NixlConnector", "kv_role": "kv_producer", "kv_buffer_device": "cpu"}'
+    VLLM_NIXL_SIDE_CHANNEL_PORT=5601 vllm serve Qwen/Qwen3-0.6B --port 8200 \
+      --kv-transfer-config '{"kv_connector": "NixlConnector", "kv_role": "kv_consumer", "kv_buffer_device": "cpu"}'
+    ```
 
-vLLM's `MultiConnector` runs a NIXL connector and offloading together; the offloading entry names the plugin's connector and its module, since `--kv-offloading-size` replaces any other connector:
+    A request goes to the prefill server with `"kv_transfer_params": {"do_remote_decode": true}` and `max_tokens` 1, then to the decode server with the `kv_transfer_params` that response returns, both under one request ID (`X-Request-Id` or `request_id`), as vLLM's disaggregation proxies route it; `NixlPushConnector` pairs the decode with its prefill by that ID.
+    NIXL cannot register the device's memory, so it stages blocks in host buffers of its own and the runner copies each request's blocks between them and the engine cache; `kv_buffer_device` must be `cpu`.
+    Each copy ends before NIXL sends the blocks or reports them received, and a failed copy stops the server.
+    The decode server's `vllm:external_prefix_cache_hits` counts the prompt tokens it took from its connector, and `vllm:nixl_bytes_transferred` the bytes NIXL moved.
 
-```bash
-VLLM_NIXL_SIDE_CHANNEL_PORT=5601 vllm serve Qwen/Qwen3-0.6B --port 8200 --kv-transfer-config '{
-  "kv_connector": "MultiConnector", "kv_role": "kv_both", "kv_connector_extra_config": {"connectors": [
-    {"kv_connector": "NixlConnector", "kv_role": "kv_consumer", "kv_buffer_device": "cpu"},
-    {"kv_connector": "RNGDOffloadingConnector", "kv_connector_module_path": "furiosa_opt_vllm.offload",
-     "kv_role": "kv_both", "kv_connector_extra_config": {"cpu_bytes_to_use": 17179869184}}]}}'
-```
+    Both servers take the same model, quantization and speculative method, which NIXL's handshake compares; a request's LoRA adapter is named on both.
+    Data-parallel replicas and sleep mode are served with a connector.
+    One worker drives every chip while vLLM awaits each tensor-parallel rank, so a connector serves one chip a replica.
+    Only the attention cache moves, so startup refuses a connector for a model with recurrent state or encoder memory and on an encoder-only instance.
+    Mooncake and MoRIIO register the cache's device memory, which the engine does not map for them, and LMCache copies the cache's torch tensors itself, so startup refuses them.
 
-vLLM loads a request's blocks from the first of its connectors that has them and stores them through each; each connector takes the settings it takes alone.
-The NIXL entry may be `NixlPushConnector`, the entries may come in either order, and the decode server may run data-parallel replicas or sleep mode; each replica keeps its own host tier, so route a request's reloads to the replica that decoded it (`X-data-parallel-rank`).
+    vLLM's `MultiConnector` runs a NIXL connector and offloading together; the offloading entry names the plugin's connector and its module, since `--kv-offloading-size` replaces any other connector:
+
+    ```bash
+    VLLM_NIXL_SIDE_CHANNEL_PORT=5601 vllm serve Qwen/Qwen3-0.6B --port 8200 --kv-transfer-config '{
+      "kv_connector": "MultiConnector", "kv_role": "kv_both", "kv_connector_extra_config": {"connectors": [
+        {"kv_connector": "NixlConnector", "kv_role": "kv_consumer", "kv_buffer_device": "cpu"},
+        {"kv_connector": "RNGDOffloadingConnector", "kv_connector_module_path": "furiosa_opt_vllm.offload",
+         "kv_role": "kv_both", "kv_connector_extra_config": {"cpu_bytes_to_use": 17179869184}}]}}'
+    ```
+
+    vLLM loads a request's blocks from the first of its connectors that has them and stores them through each; each connector takes the settings it takes alone.
+    The NIXL entry may be `NixlPushConnector`, the entries may come in either order, and the decode server may run data-parallel replicas or sleep mode; each replica keeps its own host tier, so route a request's reloads to the replica that decoded it (`X-data-parallel-rank`).
+
+=== "SGLang"
+
+    No transport reaches the device memory that holds the engine's cache, so each server keeps a pinned host image of its cache, which the transport registers, and copies a request's pages between the device and the image.
+
+    ```bash
+    FURIOSA_VISIBLE_CHIPS=0 python -m sglang.launch_server --model-path Qwen/Qwen3-0.6B --port 30000 \
+      --disaggregation-mode prefill --disaggregation-transfer-backend mooncake_tcp \
+      --disaggregation-bootstrap-port 8998
+    FURIOSA_VISIBLE_CHIPS=1 python -m sglang.launch_server --model-path Qwen/Qwen3-0.6B --port 30001 \
+      --disaggregation-mode decode --disaggregation-transfer-backend mooncake_tcp
+    ```
+
+    Mooncake's backend needs its transfer engine installed, `mooncake-transfer-engine-non-cuda` on a host without CUDA.
+    Send each `/generate` request to both servers at once, as SGLang's router does, with the same `"bootstrap_host"`, `"bootstrap_port": 8998` and a `"bootstrap_room"` number of its own; the decode server's response holds the generated tokens.
+    The prefill server copies the pages of each send to its image before Mooncake reads them, whichever step or hierarchical-cache reload wrote them on the device, so prefix-cache hits and chunked prefills send current pages.
+    The decode server copies the pages a request received to the device as soon as SGLang reports the transfer done, before it caches, backs up or runs the request; a request that `/pause_generation` with `"mode": "retract"` retracted receives them again, and one the server retracts for memory restores from its own host backup.
+    A prefill server, and any server started with `--enable-pd-role-switch`, schedules without overlap: SGLang's overlapped early send of a cached prefix records a CUDA event, and a scheduler keeps the overlap it started with.
+    `mooncake_tcp` selects Mooncake's TCP transport: its RDMA transport registers memory with `ibv_reg_mr`, which refuses the engine's pinned memory.
+    The memory saver, the hierarchical cache, a decode server's radix cache, [data-parallel replicas](#run-data-parallel-replicas), STANDALONE speculative decoding and role switching work beside disaggregation; [SGLang's options](sglang.md#options) list the settings startup refuses with it.
 
 ## Put the server to sleep
 
@@ -449,4 +474,5 @@ Why each feature is not served yet:
 - **Online quantization** with methods other than vLLM's `fp8_per_tensor` and SGLang's `fp8`: the other methods quantize the activations too or use other formats.
 - **Tensor, pipeline, expert and context parallelism**, and serving across nodes: each served checkpoint runs on one chip.
 - **LoRA with SGLang**: `--enable-lora` and `--lora-paths` are refused; the SGLang plugin runs no adapter yet.
-- **Disaggregated prefill with SGLang, KV connectors other than vLLM's NIXL ones, and a disaggregated encoder**: the SGLang plugin moves no cache row to another instance, Mooncake, MoRIIO and LMCache reach the cache without host buffers, and of a disaggregated encoder only the [encoder-only instance](#embed-media-on-an-encoder-only-instance) runs.
+- **KV connectors other than vLLM's NIXL ones, and transports other than Mooncake over TCP with SGLang**: Mooncake, MoRIIO and LMCache reach vLLM's cache without host buffers ([Disaggregate prefill and decode](#disaggregate-prefill-and-decode)).
+- **A disaggregated encoder**: only the [encoder-only instance](#embed-media-on-an-encoder-only-instance) runs.

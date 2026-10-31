@@ -10,6 +10,9 @@ from sglang.srt.platforms.interface import SRTPlatform
 from typing_extensions import override
 
 from furiosa_opt_sglang.admission import (
+    BACKEND,
+    FAKE,
+    Disaggregation,
     Hierarchical,
     Recurrent,
     Refused,
@@ -54,6 +57,16 @@ class Platform(SRTPlatform):
         _ = Requested.parse(raw)
         resolved = Resolved.parse(server_args)
         speculative = Speculations.parse(server_args) is not None
+        disaggregation = None
+        if resolved.disaggregation_mode != "null":
+            disaggregation = Disaggregation.parse(server_args)
+            # SGLang refuses the fake backend on a prefill server itself.
+            if disaggregation.disaggregation_transfer_backend == "fake":
+                raise Refused("disaggregation_transfer_backend", FAKE)
+            # SGLang's mooncake_tcp backend sets it; ibv_reg_mr refuses the engine's pinned
+            # memory, a dma-heap mapping, which Mooncake's RDMA transport would register.
+            if os.environ.get("MC_FORCE_TCP") != "1":
+                raise Refused("disaggregation_transfer_backend", BACKEND)
         # One scheduler drives every chip of a split model, as SGLang's would drive one rank;
         # the engine reads the operator's degree, which SGLang's ranks would each load whole.
         # Each data-parallel replica's first chip then lies that many chips past the last one's.
@@ -98,6 +111,11 @@ class Platform(SRTPlatform):
             or speculative
             or state
             or not model_config.is_generation
+            # SGLang's overlapped early send of a cached prefix records a CUDA event, which this
+            # platform of host tensors cannot create; a scheduler fixes overlap when it starts, so
+            # a server that may switch to prefilling never overlaps either.
+            or resolved.disaggregation_mode == "prefill"
+            or (disaggregation is not None and disaggregation.enable_pd_role_switch)
         )
         # Prompt chunks share a step with decode rows, so long prompts neither stall them nor wait
         # for a prefill wave; a speculative step verifies decode rows only.

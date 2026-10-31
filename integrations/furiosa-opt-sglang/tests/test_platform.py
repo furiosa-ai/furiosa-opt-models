@@ -7,6 +7,7 @@ import pytest
 from sglang.srt.server_args import ServerArgs, prepare_server_args
 
 from furiosa_opt_sglang.admission import (
+    Disaggregation,
     Hierarchical,
     Recurrent,
     Refused,
@@ -42,13 +43,6 @@ from furiosa_opt_sglang.platform import Platform
         (["--prefill-attention-backend", "flashinfer"], "prefill_attention_backend"),
         (["--decode-attention-backend", "flashinfer"], "decode_attention_backend"),
         (["--startup-weight-load-mode", "overlap"], "startup_weight_load_mode"),
-        pytest.param(
-            ["--disaggregation-mode", "prefill"],
-            "disaggregation_mode",
-            marks=pytest.mark.feature(
-                "Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache)"
-            ),
-        ),
         (["--load-format", "dummy"], "load_format"),
         (["--enable-unified-cache-external-linker"], "enable_unified_cache_external_linker"),
         (["--ple-offload-embedding"], "ple_offload_embedding"),
@@ -95,7 +89,7 @@ def test_refuses_unserved_cache(dtype: str) -> None:
 def test_reads_only_options_sglang_declares() -> None:
     """Every option the platform reads is an SGLang server option, so none reads as missing."""
     declared = set(ServerArgs.__annotations__)
-    for served in (Requested, Resolved, Recurrent, Hierarchical):
+    for served in (Requested, Resolved, Recurrent, Hierarchical, Disaggregation):
         assert set(served.model_fields) <= declared, served.__name__
 
 

@@ -107,15 +107,18 @@ def assign(
         offset += end - start
 
 
-def requests(runner: Runner) -> None:
+def requests(runner: Runner, cache: Cache) -> None:
     from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 
     # SGLang reserves table entries past the context for a speculative step's draft slots.
-    runner.req_to_token_pool = Requests(
+    pool = Requests(
         runner.max_running_requests,
         runner.model_config.context_len + get_req_to_token_extra_context_len(),
         runner.selected,
     )
+    # A transfer backend's KV belongs to the row allocation SGLang received it for.
+    pool.register_on_alloc_rows(cache.image.received.allocate)
+    runner.req_to_token_pool = pool
 
 
 def initialize(runner: Runner, loaded: Model) -> Model:
@@ -167,8 +170,9 @@ def model(runner: Runner, limits: Limits, loaded: Model) -> tuple[Model, int]:
                 raise ValueError("the framework must resolve the attention head width")
             heads = runner.model_config.get_num_kv_heads(1)
             pages = Pages.parse(core, heads, limits.head)
-            loaded = replace(loaded, cache=tokens(runner, limits, core, pages))
-            requests(runner)
+            cache = tokens(runner, limits, core, pages)
+            loaded = replace(loaded, cache=cache)
+            requests(runner, cache)
             return loaded, pool.block
         case _:
             assert_never(core)
