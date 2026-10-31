@@ -1,6 +1,7 @@
-//! The Gemma 4 catalog's layers interleaved in two collections, one layer of each a period, over
-//! a call of rows that attend a history in their layers' caches: sliding layers in both
-//! collections, or sliding layers and full layers; and the full layers' attention leaf alone.
+//! The Gemma 4 catalog's layers interleaved in two collections over a call of rows that attend a
+//! history in their layers' caches: sliding layers in both collections or sliding and full layers,
+//! one of each a period, and the catalog's own period of five sliding layers and a full one; and
+//! the full layers' attention leaf alone.
 
 #![feature(register_tool)]
 #![register_tool(furiosa_opt)]
@@ -71,6 +72,12 @@ type Layers = Interleaved<Group>;
 /// and full to the final norm.
 type Mixed = Interleaved<full::Group>;
 
+/// The catalog's period: five sliding layers, then a full one.
+const PERIOD: &[Branch] = &Branch::periodic::<6>(6);
+
+/// One period of the catalog's order.
+type Period = Interleave<([Sliding; 5], [Full; 1]), PERIOD>;
+
 /// A call's context of group `A`: its rows' rotation, write slots and paged reads.
 type Context<A> = attention::Context<
     Rotation<<A as Attention>::Rotated, Chip, Rows>,
@@ -80,6 +87,7 @@ type Context<A> = attention::Context<
 
 type Pool<A> = Blocks<<A as Attention>::Heads, <A as Attention>::Head>;
 type Pools<B> = ([Pool<Group>; 2], [Pool<B>; 2]);
+type PeriodPools = ([Pool<Group>; 5], [Pool<full::Group>; 1]);
 
 /// The call's hidden rows.
 type HiddenRows = HbmTensor<bf16, Chip, m![Rows, Hidden]>;
@@ -253,6 +261,65 @@ fn scheduled_mixed(
     let mut state = (
         (Places::<Group, Rows>::new(), [(a, slots), (b, slots)]),
         (Places::<full::Group, Rows>::new(), [(c, slots), (d, slots)]),
+    );
+    let schedule = Decoder((layers, norm));
+    Module::forward(
+        &schedule,
+        &mut *device,
+        contexts,
+        &mut state,
+        (&mut home, live),
+    );
+    home
+}
+
+/// The period's sequential forward over the call's live rows, then the final norm.
+#[device(chip = 1)]
+fn sequential_period(
+    device: &mut Device,
+    (layers, norm): (&Period, &FinalNorm),
+    contexts: (&Context<Group>, &Context<full::Group>),
+    pools: &mut PeriodPools,
+    (hidden, live): (&HiddenRows, &Value),
+) -> HiddenRows {
+    let live = Live::<(), Rows>::read(live);
+    let rows: Live<Spread<Hidden, Rows, Chip>, Rows> = live.with(hidden.to_dm(&mut device.tdma));
+    let ([a, b, c, d, e], [f]) = pools;
+    let mut states = (
+        [
+            state::<Group>(a),
+            state::<Group>(b),
+            state::<Group>(c),
+            state::<Group>(d),
+            state::<Group>(e),
+        ],
+        [state::<full::Group>(f)],
+    );
+    let rows: Live<Spread<Hidden, Rows, Chip>, Rows> =
+        Module::forward(layers, &mut *device, contexts, &mut states, rows);
+    let rows: Live<Spread<Hidden, Rows, Chip>, Rows> =
+        Module::forward(norm, &mut *device, (), &mut (), &rows);
+    rows.value().to_hbm(&mut device.tdma)
+}
+
+/// The same period and norm run by the decoder schedule.
+#[device(chip = 1)]
+fn scheduled_period(
+    device: &mut Device,
+    (layers, norm): (&Period, &FinalNorm),
+    contexts: (&Context<Group>, &Context<full::Group>),
+    pools: &mut PeriodPools,
+    (hidden, live): (&HiddenRows, &Value),
+) -> HiddenRows {
+    let live = Live::<(), Rows>::read(live);
+    let mut home: HiddenRows = HbmTensor::new();
+    hidden.view().to_hbm_view(&mut device.tdma, home.view_mut());
+    let ([a, b, c, d, e], [f]) = pools;
+    let slots: Leaves = Default::default();
+    let sliding = [(a, slots), (b, slots), (c, slots), (d, slots), (e, slots)];
+    let mut state = (
+        (Places::<Group, Rows>::new(), sliding),
+        (Places::<full::Group, Rows>::new(), [(f, slots)]),
     );
     let schedule = Decoder((layers, norm));
     Module::forward(
@@ -573,14 +640,8 @@ async fn read<A: Attention>(device: &mut Device, pool: &Pool<A>) -> Vec<bf16> {
     values
 }
 
-/// The four layers of the layers of a second collection of group `B`, each its own weights, in
-/// checkpoint order of their collections, and the final norm.
-fn model<B: Kind>(device: &mut Device) -> (Interleaved<B>, FinalNorm) {
-    let first = [0, 2].map(|at| checkpoint::<Group>(at).load(&mut *device).unwrap());
-    let second = [1, 3].map(|at| checkpoint::<B>(at).load(&mut *device).unwrap());
-    let layers = Interleave {
-        layers: (first, second),
-    };
+/// The final norm.
+fn norm(device: &mut Device) -> FinalNorm {
     let mut checkpoint = Checkpoint::default();
     let gains = (0..Hidden::SIZE).flat_map(|channel| {
         bf16::from_f32(0.75 + (channel % 5) as f32 / 8.0)
@@ -589,7 +650,18 @@ fn model<B: Kind>(device: &mut Device) -> (Interleaved<B>, FinalNorm) {
     });
     let gains = gains.collect();
     (checkpoint.insert("norm.weight", Dtype::BF16, &[Hidden::SIZE], gains)).unwrap();
-    (layers, checkpoint.load(device).unwrap())
+    checkpoint.load(device).unwrap()
+}
+
+/// Two sliding layers and two of group `B`, each its own weights, in checkpoint order of their
+/// collections, and the final norm.
+fn model<B: Kind>(device: &mut Device) -> (Interleaved<B>, FinalNorm) {
+    let first = [0, 2].map(|at| checkpoint::<Group>(at).load(&mut *device).unwrap());
+    let second = [1, 3].map(|at| checkpoint::<B>(at).load(&mut *device).unwrap());
+    let layers = Interleave {
+        layers: (first, second),
+    };
+    (layers, norm(device))
 }
 
 /// Every layer's cache before a call, in checkpoint order: the first collection's at even
@@ -603,8 +675,25 @@ fn caches<B: Kind>() -> [Vec<bf16>; 4] {
     ]
 }
 
-/// The call's `live` rows through the layers, by the schedule or `in_order`, from the caches
-/// `caches` hold in checkpoint order: the live rows' outputs and every layer's cache after it.
+/// The call's rows, `live` of them live, and their count.
+async fn input(device: &mut Device, live: usize) -> (HiddenRows, Value) {
+    let input = HostTensor::<bf16, m![Rows, Hidden]>::from_vec(hidden(live));
+    let count = HostTensor::<i32, m![1]>::from_vec([live as i32]);
+    let input = input.to_hbm(&mut device.pdma).await.unwrap();
+    (input, count.to_hbm(&mut device.pdma).await.unwrap())
+}
+
+/// The `live` rows of `output`.
+async fn rows(device: &mut Device, output: &HiddenRows, live: usize) -> Vec<bf16> {
+    let output = output.to_host::<m![Rows, Hidden]>(&mut device.pdma).await;
+    let mut output = output.unwrap().into_vec();
+    output.truncate(live * Hidden::SIZE);
+    output
+}
+
+/// The call's `live` rows through two sliding layers and two of group `B`, by the schedule or
+/// `in_order`, from the caches `caches` hold in checkpoint order: the live rows' outputs and every
+/// layer's cache after it.
 async fn run<B: Kind>(
     device: &mut Device,
     in_order: bool,
@@ -626,18 +715,11 @@ async fn run<B: Kind>(
             pool::<B>(device, &caches[3]).await,
         ],
     );
-    let input = HostTensor::<bf16, m![Rows, Hidden]>::from_vec(hidden(live));
-    let input: HiddenRows = input.to_hbm(&mut device.pdma).await.unwrap();
-    let count: Value = HostTensor::<i32, m![1]>::from_vec([live as i32])
-        .to_hbm(&mut device.pdma)
-        .await
-        .unwrap();
+    let (input, count) = input(device, live).await;
     let (first, second) = (&contexts.0, &contexts.1);
     let input = (&input, &count);
     let output = B::forward(device, in_order, model, (first, second), &mut pools, input).await;
-    let output = output.to_host::<m![Rows, Hidden]>(&mut device.pdma).await;
-    let mut output = output.unwrap().into_vec();
-    output.truncate(live * Hidden::SIZE);
+    let output = rows(device, &output, live).await;
     let ([a, b], [c, d]) = &pools;
     let caches = [
         read::<Group>(device, a).await,
@@ -648,20 +730,76 @@ async fn run<B: Kind>(
     (output, caches)
 }
 
-/// The sequential forward's outputs are finite and each layer's cache holds every live row's
-/// keys and values, the history and the slots past the live rows as they were.
-fn written<B: Kind>(live: usize, output: &[bf16], found: &[Vec<bf16>; 4], before: &[Vec<bf16>; 4]) {
+/// Every layer's cache before a call of the period, in checkpoint order.
+fn period_caches() -> [Vec<bf16>; 6] {
+    [0, 1, 2, 3, 4, 5].map(|layer| match layer < 5 {
+        true => cache::<Group>(layer),
+        false => cache::<full::Group>(layer),
+    })
+}
+
+/// The call's `live` rows through the period, by the schedule or `in_order`, from the caches
+/// `caches` hold in checkpoint order: the live rows' outputs and every layer's cache after it.
+async fn run_period(
+    device: &mut Device,
+    in_order: bool,
+    model: (&Period, &FinalNorm),
+    caches: &[Vec<bf16>; 6],
+    live: usize,
+) -> (Vec<bf16>, [Vec<bf16>; 6]) {
+    let contexts = (
+        context::<Group>(device, live).await,
+        context::<full::Group>(device, live).await,
+    );
+    let mut pools = (
+        [
+            pool::<Group>(device, &caches[0]).await,
+            pool::<Group>(device, &caches[1]).await,
+            pool::<Group>(device, &caches[2]).await,
+            pool::<Group>(device, &caches[3]).await,
+            pool::<Group>(device, &caches[4]).await,
+        ],
+        [pool::<full::Group>(device, &caches[5]).await],
+    );
+    let (input, count) = input(device, live).await;
+    let arguments = (
+        &mut *device,
+        model,
+        (&contexts.0, &contexts.1),
+        &mut pools,
+        (&input, &count),
+    );
+    let output = match in_order {
+        true => launch(sequential_period, arguments).await,
+        false => launch(scheduled_period, arguments).await,
+    };
+    let output = rows(device, &output.unwrap(), live).await;
+    let ([a, b, c, d, e], [f]) = &pools;
+    let caches = [
+        read::<Group>(device, a).await,
+        read::<Group>(device, b).await,
+        read::<Group>(device, c).await,
+        read::<Group>(device, d).await,
+        read::<Group>(device, e).await,
+        read::<full::Group>(device, f).await,
+    ];
+    (output, caches)
+}
+
+/// The sequential forward's outputs are finite and each layer's cache, its tokens `widths` of
+/// that layer's values, holds every live row's keys and values, the history and the slots past
+/// the live rows as they were.
+fn written(
+    live: usize,
+    output: &[bf16],
+    (found, before): (&[Vec<bf16>], &[Vec<bf16>]),
+    widths: &[usize],
+) {
     for (at, value) in output.iter().enumerate() {
         let value = value.to_f32();
         assert!(value.is_finite(), "{live} rows: element {at} is {value}");
     }
-    let widths = [
-        width::<Group>(),
-        width::<B>(),
-        width::<Group>(),
-        width::<B>(),
-    ];
-    for (layer, ((found, before), width)) in found.iter().zip(before).zip(widths).enumerate() {
+    for (layer, ((found, before), &width)) in found.iter().zip(before).zip(widths).enumerate() {
         for (at, (found, before)) in found.iter().zip(before).enumerate() {
             let token = at / width;
             let place = format!("layer {layer}, {live} rows: token {token}");
@@ -673,34 +811,40 @@ fn written<B: Kind>(live: usize, output: &[bf16], found: &[Vec<bf16>; 4], before
     }
 }
 
-/// The scheduled run of the layers of a second collection of group `B` gives every live row's
-/// output and every slot of every layer's cache bit for bit as the sequential forward does, which
-/// itself writes every live row and nothing else.
+/// The schedule's live rows and caches `found` are the sequential forward's `want` bit for bit.
+fn agree(live: usize, found: (&[bf16], &[Vec<bf16>]), want: (&[bf16], &[Vec<bf16>])) {
+    for (at, (found, want)) in found.0.iter().zip(want.0).enumerate() {
+        let (row, feature) = (at / Hidden::SIZE, at % Hidden::SIZE);
+        let place = format!("{live} rows: row {row}, feature {feature}");
+        assert_eq!(found.to_bits(), want.to_bits(), "{place}");
+    }
+    for (layer, (held, wanted)) in found.1.iter().zip(want.1).enumerate() {
+        let same = held
+            .iter()
+            .zip(wanted)
+            .position(|(h, w)| h.to_bits() != w.to_bits());
+        assert_eq!(
+            same, None,
+            "layer {layer}, {live} rows: first differing cache element"
+        );
+    }
+}
+
+/// The scheduled run of two sliding layers and two of group `B` gives every live row's output and
+/// every slot of every layer's cache bit for bit as the sequential forward does, which itself
+/// writes every live row and nothing else.
 async fn schedules_as_in_order<B: Kind>() {
     let _lease = DEVICE.lock().await;
     let mut device = Device::new(scheduled.topology()).unwrap();
     let (layers, norm) = model::<B>(&mut device);
     let caches = caches::<B>();
+    let widths = [width::<Group>(), width::<B>()].repeat(2);
     for live in [Rows::SIZE, 9] {
         let model = (&layers, &norm);
         let (want, wanted) = run::<B>(&mut device, true, model, &caches, live).await;
-        written::<B>(live, &want, &wanted, &caches);
+        written(live, &want, (&wanted, &caches), &widths);
         let (found, held) = run::<B>(&mut device, false, model, &caches, live).await;
-        for (at, (found, want)) in found.iter().zip(&want).enumerate() {
-            let (row, feature) = (at / Hidden::SIZE, at % Hidden::SIZE);
-            let place = format!("{live} rows: row {row}, feature {feature}");
-            assert_eq!(found.to_bits(), want.to_bits(), "{place}");
-        }
-        for (layer, (held, wanted)) in held.iter().zip(&wanted).enumerate() {
-            let same = held
-                .iter()
-                .zip(wanted)
-                .position(|(h, w)| h.to_bits() != w.to_bits());
-            assert_eq!(
-                same, None,
-                "layer {layer}, {live} rows: first differing cache element"
-            );
-        }
+        agree(live, (&found, &held), (&want, &wanted));
     }
 }
 
@@ -715,7 +859,7 @@ async fn runs_the_layers_sequentially() {
     for live in [Rows::SIZE, 9] {
         let (output, found) =
             run::<Group>(&mut device, true, (&layers, &norm), &caches, live).await;
-        written::<Group>(live, &output, &found, &caches);
+        written(live, &output, (&found, &caches), &[width::<Group>(); 4]);
     }
 }
 
@@ -732,6 +876,31 @@ async fn schedules_the_layers_as_they_run_in_order() {
 #[tokio::test(flavor = "current_thread")]
 async fn schedules_sliding_and_full_layers_as_they_run_in_order() {
     schedules_as_in_order::<full::Group>().await;
+}
+
+/// The catalog's period, five sliding layers then a full one into the final norm, runs by the
+/// schedule as it runs in order, bit for bit, the sequential forward writing every live row and
+/// nothing else.
+#[tokio::test(flavor = "current_thread")]
+async fn schedules_the_catalog_period_as_it_runs_in_order() {
+    let _lease = DEVICE.lock().await;
+    let mut device = Device::new(scheduled_period.topology()).unwrap();
+    let sliding = [0, 1, 2, 3, 4].map(|at| checkpoint::<Group>(at).load(&mut device).unwrap());
+    let full = [checkpoint::<full::Group>(5).load(&mut device).unwrap()];
+    let layers: Period = Interleave {
+        layers: (sliding, full),
+    };
+    let norm = norm(&mut device);
+    let caches = period_caches();
+    let mut widths = vec![width::<Group>(); 5];
+    widths.push(width::<full::Group>());
+    for live in [Rows::SIZE, 9] {
+        let model = (&layers, &norm);
+        let (want, wanted) = run_period(&mut device, true, model, &caches, live).await;
+        written(live, &want, (&wanted, &caches), &widths);
+        let (found, held) = run_period(&mut device, false, model, &caches, live).await;
+        agree(live, (&found, &held), (&want, &wanted));
+    }
 }
 
 type FullHeads = <full::Group as Attention>::Heads;
