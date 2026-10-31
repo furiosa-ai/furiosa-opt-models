@@ -3,6 +3,7 @@
 
 use super::{Owned, Span};
 use crate::ops::normalization::{Blocked, Offset, Part, Spread};
+use crate::specialize::contraction::BAND;
 use crate::tensor::live::{Fill, Live, Spill};
 use crate::tensor::{axis::Rows, parallel::Chip};
 use furiosa_opt_std::prelude::*;
@@ -81,6 +82,43 @@ impl<'r, Hidden: AxisName, Capacity: AxisName, Chips: M + 'static>
         } else {
             rows.view().to_hbm_view(&mut context.tdma, span);
         }
+    }
+}
+
+/// A span's row-major rows split into the two cluster halves.
+type Halves<Hidden> = m![Span / (Span / 2), Span % (Span / 2), Hidden];
+
+/// The first `ROWS` rows of each cluster half of a span's row-major rows.
+type First<Hidden, const ROWS: usize> =
+    m![Span / (Span / 2), Span % (Span / 2) = { ROWS } # (Span / 2), Hidden];
+
+/// A span's rows in HBM as the dense projections write them, row by row, land on chip a tile of
+/// the rows holding the live ones at a time: the first eight or 64 rows of each cluster half when
+/// those hold them all, otherwise every row.
+impl<Hidden: AxisName, Chips: M + 'static> Fill<Device, Live<(), Span>>
+    for HbmTensor<bf16, Chips, m![Span, Hidden]>
+{
+    type Rows = Owned<Hidden, Span, Chips>;
+
+    fn fill(&self, context: &mut Device, live: Live<(), Span>) -> Self::Rows {
+        const { assert!(Span::SIZE.is_multiple_of(2 * BAND)) };
+        // SAFETY: the same row digits split the rows into consecutive cluster halves.
+        let halves = unsafe { self.view().reshape::<Chips, Halves<Hidden>>() };
+        let mut rows = Self::Rows::new();
+        if live.rows() <= 8 {
+            halves
+                .tile::<m![Span % (Span / 2)], 8, First<Hidden, 8>>(0)
+                .to_dm_view(&mut context.tdma, rows.view_mut().tile::<m![Span % (Span / 2)], 8,
+                    m![Span % (Span / 2) = 8 #{!} (Span / 2), { Offset<Hidden> }]>(0));
+        } else if live.rows() <= BAND {
+            halves
+                .tile::<m![Span % (Span / 2)], BAND, First<Hidden, BAND>>(0)
+                .to_dm_view(&mut context.tdma, rows.view_mut().tile::<m![Span % (Span / 2)], BAND,
+                    m![Span % (Span / 2) = { BAND } #{!} (Span / 2), { Offset<Hidden> }]>(0));
+        } else {
+            self.view().to_dm_view(&mut context.tdma, rows.view_mut());
+        }
+        rows
     }
 }
 
