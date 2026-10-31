@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Self, cast, final
+from typing import TYPE_CHECKING, cast, final
 
 import torch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -13,39 +12,11 @@ from sglang.srt.mem_cache.memory_pool import KVCache
 from typing_extensions import override
 
 import furiosa_opt_engine as engine
+from furiosa_opt_sglang.cache.pages import Pages
 from furiosa_opt_sglang.decoder import RELEASED
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
-
-    from furiosa_opt_sglang.decoder import Decoder
-
-
-@dataclass(frozen=True, slots=True)
-class Pages:
-    """A decoder's paged keys and values as the token pool keeps them: blocks of `pool`'s format for
-    each of `layers`, a part of each block on every one of `chips` chips, where a token's row holds
-    `heads` keys, then as many values, of `width` elements of `dtype` each, which the engine does
-    not report."""
-
-    pool: engine.decoder.Pool
-    layers: range
-    chips: int
-    dtype: torch.dtype
-    heads: int
-    width: int
-
-    @classmethod
-    def parse(cls, decoder: Decoder, heads: int, width: int) -> Self:
-        """Refuse a row format whose blocks the engine sizes otherwise."""
-        if decoder.model is None:
-            raise RuntimeError(RELEASED)
-        # PyTorch exposes its named dtypes through an untyped module lookup.
-        dtype = cast("torch.dtype", getattr(torch, decoder.model.kv_cache))
-        size = decoder.pool.block * 2 * heads * width * dtype.itemsize
-        if size != decoder.pool.bytes:
-            raise ValueError(f"the engine pages {decoder.pool.bytes} bytes a block, SGLang {size}")
-        return cls(decoder.pool, decoder.layers, decoder.model.parallel, dtype, heads, width)
 
 
 @final

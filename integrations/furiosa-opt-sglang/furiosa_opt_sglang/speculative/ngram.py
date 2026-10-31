@@ -10,7 +10,7 @@ from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 if TYPE_CHECKING:
     from collections.abc import Set
 
-    from furiosa_opt_sglang.platform import Ngram
+    from furiosa_opt_sglang.admission import Ngram
     from furiosa_opt_sglang.speculative import Decoding
 
 

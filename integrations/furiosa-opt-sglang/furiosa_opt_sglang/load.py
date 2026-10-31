@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, cast
 
 from pydantic import JsonValue, TypeAdapter
 
-from furiosa_opt_sglang.platform import CACHE_DTYPES, CacheDtype, Refused
+from furiosa_opt_sglang.admission import CACHE_DTYPES, CacheDtype, Refused
 
 if TYPE_CHECKING:
     from collections.abc import Mapping

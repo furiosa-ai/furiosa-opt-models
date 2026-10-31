@@ -15,7 +15,8 @@ import furiosa_opt_engine as engine
 if TYPE_CHECKING:
     import torch
 
-    from furiosa_opt_sglang.cache import Cache, Pages
+    from furiosa_opt_sglang.cache import Cache
+    from furiosa_opt_sglang.cache.pages import Pages
     from furiosa_opt_sglang.decoder import Decoder
     from furiosa_opt_sglang.paging import Limits
     from furiosa_opt_sglang.runner import Runner

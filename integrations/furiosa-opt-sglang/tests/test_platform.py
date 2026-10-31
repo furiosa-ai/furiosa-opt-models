@@ -6,9 +6,8 @@ from typing import cast
 import pytest
 from sglang.srt.server_args import ServerArgs, prepare_server_args
 
-from furiosa_opt_sglang.platform import (
+from furiosa_opt_sglang.admission import (
     Hierarchical,
-    Platform,
     Recurrent,
     Refused,
     Requested,
@@ -16,6 +15,7 @@ from furiosa_opt_sglang.platform import (
     Speculations,
     Standalone,
 )
+from furiosa_opt_sglang.platform import Platform
 
 
 @pytest.mark.parametrize(
