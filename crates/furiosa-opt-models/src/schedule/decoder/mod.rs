@@ -10,14 +10,15 @@
 //!   embedding; the next part a layer up to its attention's store, or the head.
 //! - The cut of a layer at its attention is private to the impls here, written once for each layer
 //!   shape: the pre-norm layer of Qwen3, Llama and Mistral at every size and in every projection
-//!   form. It is generic in the layer's leaves, each of which takes the cut's steps its own way:
-//!   the block-scaled output projection projects a tile over three steps, the dense one in the
-//!   last of them; Llama's and Mistral's head norms, `()`, leave the heads as projected. One
-//!   routine runs every cut's attention: the rows it reads from the pool stored before it, the
-//!   rows it defers after it.
+//!   form, and the sandwich-norm layer of Gemma 4 (`sandwich`). It is generic in the layer's
+//!   leaves, each of which takes the cut's steps its own way: the block-scaled output projection
+//!   projects a tile over three steps, the dense one in the last of them; Llama's and Mistral's
+//!   head norms, `()`, leave the heads as projected. One routine runs every cut's attention: the
+//!   rows it reads from the pool stored before it, the rows it defers after it.
 //! - [`Decoder`] runs the loops: the first layer's stores over the embedded tiles, then for each
-//!   layer its attention and, tile by tile, the work up to the next store or the head. Two layers
-//!   of an edge may attend in different groups.
+//!   layer its attention and, tile by tile, the work up to the next store or the head; over
+//!   interleaved collections in the order's periods (`interleave`). Two layers of an edge may
+//!   attend in different groups.
 //! - The DMA engine serves transfers in issue order, so weights issue one part ahead of their use
 //!   and behind the small transfers of the work they overlap: the first down panel behind the
 //!   output projection's rows, the first gate/up pair behind the exchange of its partial sums,
@@ -64,6 +65,9 @@ use crate::tensor::parallel::Chip;
 use crate::{Sequential, Then};
 use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
+
+mod interleave;
+mod sandwich;
 
 /// The work between two attentions on one row tile: the end of `A`, then the start of `B`.
 pub struct Tokenwise<A, B>(pub A, pub B);
@@ -234,6 +238,14 @@ trait Cut<A: decoder::Attention, C, T> {
         tile: Live<(), Self::Envelope>,
     ) -> Self::Rows;
 
+    /// A tile's `rows` into `home`.
+    fn spill(
+        &self,
+        device: &mut Device,
+        home: &mut Self::Home,
+        rows: Live<&Self::Rows, Self::Envelope>,
+    );
+
     /// Its front landed for the rows of `tile`.
     fn front(&self, device: &mut Device, tile: Live<(), Self::Envelope>) -> Self::Front;
 
@@ -379,7 +391,8 @@ impl<
 > Cut<Z, Launched<'c, 'a, Z>, T> for Layer<Z, Q, K, V, QN, KN, A, O, G, D>
 where
     T: States,
-    Rows<Z>: Fill<Device, Live<(), Capacity<Z>>, Rows = Owned<Width<Z>, Span>>,
+    Rows<Z>: Fill<Device, Live<(), Capacity<Z>>, Rows = Owned<Width<Z>, Span>>
+        + for<'r> Spill<Device, &'r Owned<Width<Z>, Span>, Live<(), Capacity<Z>>>,
     Z: Geometry<Hidden = H, Norm<H, Hbm> = RmsNorm<H, E, Chip>>
         + decoder::Attention<Heads = KvHeads, Head = Head>
         + Decode
@@ -489,6 +502,15 @@ where
         tile: Live<(), Capacity<Z>>,
     ) -> Owned<Width<Z>, Span> {
         home.fill(device, tile)
+    }
+
+    fn spill(
+        &self,
+        device: &mut Device,
+        home: &mut Rows<Z>,
+        rows: Live<&Owned<Width<Z>, Span>, Capacity<Z>>,
+    ) {
+        home.spill(device, rows.value(), rows.with(()));
     }
 
     fn attend(

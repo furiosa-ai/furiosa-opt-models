@@ -5,6 +5,7 @@
 #![register_tool(furiosa_opt)]
 
 use furiosa_opt_models::load::Checkpoint;
+use furiosa_opt_models::load::Named;
 use furiosa_opt_models::models::decoder::Attention;
 use furiosa_opt_models::models::decoder::attention::gemma4::{self, sliding};
 use furiosa_opt_models::modules::{attention, language};
@@ -12,6 +13,8 @@ use furiosa_opt_models::ops::attention::gqa::{Cache, Pages};
 use furiosa_opt_models::ops::index::table::{BlockIndex, PADDING_BIAS};
 use furiosa_opt_models::ops::normalization::Spread;
 use furiosa_opt_models::ops::rotary::{PairFrequencies, Rotation};
+use furiosa_opt_models::schedule::Decoder;
+use furiosa_opt_models::schedule::decoder::Places;
 use furiosa_opt_models::tensor::cache::{Block, Blocks, KeyValue};
 use furiosa_opt_models::tensor::live::Live;
 use furiosa_opt_models::tensor::memory::Hbm;
@@ -21,6 +24,10 @@ use furiosa_opt_models::{Branch, Interleave, Module};
 use furiosa_opt_std::prelude::*;
 use furiosa_opt_std::runtime::{HbmBuffer, launch};
 use safetensors::Dtype;
+use tokio::sync::Mutex;
+
+/// The device tests share one chip, so they run one at a time.
+static DEVICE: Mutex<()> = Mutex::const_new(());
 
 type Rows = gemma4::Rows;
 type Hidden = gemma4::Hidden;
@@ -29,16 +36,22 @@ type Intermediate = gemma4::Intermediate;
 /// The layer types of the catalog's two collections.
 trait Collections {
     type Sliding;
+    type Full;
+    type Norm;
 }
 
 impl<E, S, F, N, H> Collections
     for language::Hybrid<E, [S; gemma4::SLIDING], [F; gemma4::FULL], N, H, { gemma4::ORDER }>
 {
     type Sliding = S;
+    type Full = F;
+    type Norm = N;
 }
 
 type Catalog = gemma4::Catalog<gemma4::Quantized, bf16, Hbm>;
 type Sliding = <Catalog as Collections>::Sliding;
+/// The final norm after the layers.
+type FinalNorm = Named<"norm", <Catalog as Collections>::Norm>;
 
 type Group = sliding::Group;
 type Head = <Group as Attention>::Head;
@@ -69,6 +82,9 @@ type HiddenRows = HbmTensor<bf16, Chip, m![Rows, Hidden]>;
 type Qkv = ((((), ()), ((), ()), (((), ()), ())), (), ());
 type Units = ((((), ()), ()), ((), ()));
 type State<'b> = ((((Qkv, &'b mut Pool, ()), ()), (Units, ())), ());
+/// What a layer's leaves run with in the schedule: its query/key/value stage's, its output
+/// projection's and its MLP's slots.
+type Leaves = (Qkv, (), Units);
 
 fn state(pool: &mut Pool) -> State<'_> {
     let qkv = ((((), ()), ((), ()), (((), ()), ())), (), ());
@@ -76,11 +92,12 @@ fn state(pool: &mut Pool) -> State<'_> {
     ((((qkv, pool, ()), ()), (units, ())), ())
 }
 
-/// The layers' sequential forward over the call's live rows, each layer on its own cache.
+/// The layers' sequential forward over the call's live rows, each layer on its own cache, then
+/// the final norm.
 #[device(chip = 1)]
 fn sequential(
     device: &mut Device,
-    layers: &Layers,
+    (layers, norm): (&Layers, &FinalNorm),
     context: &Context,
     pools: &mut Pools,
     (hidden, live): (&HiddenRows, &Value),
@@ -91,7 +108,38 @@ fn sequential(
     let mut states = ([state(a), state(b)], [state(c), state(d)]);
     let rows: Live<Spread<Hidden, Rows, Chip>, Rows> =
         Module::forward(layers, &mut *device, (context, context), &mut states, rows);
+    let rows: Live<Spread<Hidden, Rows, Chip>, Rows> =
+        Module::forward(norm, &mut *device, (), &mut (), &rows);
     rows.value().to_hbm(&mut device.tdma)
+}
+
+/// The same layers and norm run by the decoder schedule, the call's rows in place in their home.
+#[device(chip = 1)]
+fn scheduled(
+    device: &mut Device,
+    (layers, norm): (&Layers, &FinalNorm),
+    context: &Context,
+    pools: &mut Pools,
+    (hidden, live): (&HiddenRows, &Value),
+) -> HiddenRows {
+    let live = Live::<(), Rows>::read(live);
+    let mut home: HiddenRows = HbmTensor::new();
+    hidden.view().to_hbm_view(&mut device.tdma, home.view_mut());
+    let ([a, b], [c, d]) = pools;
+    let slots: Leaves = Default::default();
+    let mut state = (
+        (Places::<Group, Rows>::new(), [(a, slots), (b, slots)]),
+        (Places::<Group, Rows>::new(), [(c, slots), (d, slots)]),
+    );
+    let schedule = Decoder((layers, norm));
+    Module::forward(
+        &schedule,
+        &mut *device,
+        (context, context),
+        &mut state,
+        (&mut home, live),
+    );
+    home
 }
 
 /// Tokens of history before the call's first row, past a block boundary.
@@ -366,75 +414,187 @@ async fn read(device: &mut Device, pool: &Pool) -> Vec<bf16> {
     values
 }
 
-/// The four layers, each its own weights, in checkpoint order of their collections.
-fn layers(device: &mut Device) -> Layers {
-    let mut layer = |at: usize| -> Sliding { checkpoint(at).load(device).unwrap() };
+/// The four layers, each its own weights, in checkpoint order of their collections, and the
+/// final norm.
+fn model(device: &mut Device) -> (Layers, FinalNorm) {
+    let mut layer = |at: usize| -> Sliding { checkpoint(at).load(&mut *device).unwrap() };
     let first = [layer(0), layer(2)];
     let second = [layer(1), layer(3)];
-    Interleave {
+    let layers = Interleave {
         layers: (first, second),
-    }
+    };
+    let mut checkpoint = Checkpoint::default();
+    let gains = (0..Hidden::SIZE).flat_map(|channel| {
+        bf16::from_f32(0.75 + (channel % 5) as f32 / 8.0)
+            .to_bits()
+            .to_le_bytes()
+    });
+    let gains = gains.collect();
+    (checkpoint.insert("norm.weight", Dtype::BF16, &[Hidden::SIZE], gains)).unwrap();
+    (layers, checkpoint.load(device).unwrap())
+}
+
+/// The call's `live` rows through the model, by the schedule or `in_order`, from the caches
+/// `caches` hold in checkpoint order: the live rows' outputs and every layer's cache after it.
+async fn run(
+    device: &mut Device,
+    in_order: bool,
+    model: (&Layers, &FinalNorm),
+    caches: &[Vec<bf16>],
+    live: usize,
+) -> (Vec<bf16>, [Vec<bf16>; 4]) {
+    let context = context(device, live).await;
+    let mut pools = (
+        [
+            pool(device, &caches[0]).await,
+            pool(device, &caches[2]).await,
+        ],
+        [
+            pool(device, &caches[1]).await,
+            pool(device, &caches[3]).await,
+        ],
+    );
+    let input = HostTensor::<bf16, m![Rows, Hidden]>::from_vec(hidden(live));
+    let input: HiddenRows = input.to_hbm(&mut device.pdma).await.unwrap();
+    let count: Value = HostTensor::<i32, m![1]>::from_vec([live as i32])
+        .to_hbm(&mut device.pdma)
+        .await
+        .unwrap();
+    let arguments = (&mut *device, model, &context, &mut pools, (&input, &count));
+    let output = match in_order {
+        true => launch(sequential, arguments).await,
+        false => launch(scheduled, arguments).await,
+    };
+    let output = output.unwrap();
+    let output = output.to_host::<m![Rows, Hidden]>(&mut device.pdma).await;
+    let mut output = output.unwrap().into_vec();
+    output.truncate(live * Hidden::SIZE);
+    let ([a, b], [c, d]) = &pools;
+    let caches = [
+        read(device, a).await,
+        read(device, c).await,
+        read(device, b).await,
+        read(device, d).await,
+    ];
+    (output, caches)
 }
 
 /// The sequential forward of the four layers writes every live row's keys and values into each
 /// layer's cache and leaves finite rows; rows past the live ones and the history stay as they were.
 #[tokio::test(flavor = "current_thread")]
 async fn runs_the_layers_sequentially() {
+    let _lease = DEVICE.lock().await;
     let mut device = Device::new(sequential.topology()).unwrap();
-    let layers = layers(&mut device);
+    let (layers, norm) = model(&mut device);
     let caches: Vec<Vec<bf16>> = (0..4).map(cache).collect();
+    let width = KeyValue::SIZE * Heads::SIZE * Head::SIZE;
     for live in [Rows::SIZE, 9] {
-        let context = context(&mut device, live).await;
-        let mut pools = (
-            [
-                pool(&mut device, &caches[0]).await,
-                pool(&mut device, &caches[2]).await,
-            ],
-            [
-                pool(&mut device, &caches[1]).await,
-                pool(&mut device, &caches[3]).await,
-            ],
-        );
-        let input = HostTensor::<bf16, m![Rows, Hidden]>::from_vec(hidden(live));
-        let input: HiddenRows = input.to_hbm(&mut device.pdma).await.unwrap();
-        let count: Value = HostTensor::<i32, m![1]>::from_vec([live as i32])
-            .to_hbm(&mut device.pdma)
-            .await
-            .unwrap();
-        let arguments = (&mut device, &layers, &context, &mut pools, (&input, &count));
-        let output = launch(sequential, arguments).await.unwrap();
-        let output = output
-            .to_host::<m![Rows, Hidden]>(&mut device.pdma)
-            .await
-            .unwrap();
-        let output = output.into_vec();
-        for (at, value) in output[..live * Hidden::SIZE].iter().enumerate() {
-            assert!(
-                value.to_f32().is_finite(),
-                "{live} rows: element {at} is {}",
-                value.to_f32()
-            );
+        let (output, found) = run(&mut device, true, (&layers, &norm), &caches, live).await;
+        for (at, value) in output.iter().enumerate() {
+            let value = value.to_f32();
+            assert!(value.is_finite(), "{live} rows: element {at} is {value}");
         }
-        let width = KeyValue::SIZE * Heads::SIZE * Head::SIZE;
-        let ([a, b], [c, d]) = &pools;
-        for (layer, pool) in [(0, a), (2, b), (1, c), (3, d)] {
-            let found = read(&mut device, pool).await;
-            let before = &caches[layer];
+        for (layer, (found, before)) in found.iter().zip(&caches).enumerate() {
             for (at, (found, before)) in found.iter().zip(before).enumerate() {
                 let token = at / width;
-                let written = (HISTORY..HISTORY + live).contains(&token);
-                match written {
-                    true => assert!(
-                        found.to_f32().is_finite(),
-                        "layer {layer}, {live} rows: token {token}"
-                    ),
-                    false => assert_eq!(
-                        found.to_bits(),
-                        before.to_bits(),
-                        "layer {layer}, {live} rows: token {token}"
-                    ),
+                let place = format!("layer {layer}, {live} rows: token {token}");
+                match (HISTORY..HISTORY + live).contains(&token) {
+                    true => assert!(found.to_f32().is_finite(), "{place}"),
+                    false => assert_eq!(found.to_bits(), before.to_bits(), "{place}"),
                 }
             }
         }
     }
+}
+
+/// The schedule's run of the layers and the final norm, a period seam between every other pair,
+/// gives every live row's output and every slot of every layer's cache bit for bit as the
+/// sequential forward does.
+#[tokio::test(flavor = "current_thread")]
+async fn schedules_the_layers_as_they_run_in_order() {
+    let _lease = DEVICE.lock().await;
+    let mut device = Device::new(scheduled.topology()).unwrap();
+    let (layers, norm) = model(&mut device);
+    let caches: Vec<Vec<bf16>> = (0..4).map(cache).collect();
+    for live in [Rows::SIZE, 9] {
+        let model = (&layers, &norm);
+        let (want, wanted) = run(&mut device, true, model, &caches, live).await;
+        let (found, held) = run(&mut device, false, model, &caches, live).await;
+        for (at, (found, want)) in found.iter().zip(&want).enumerate() {
+            let (row, feature) = (at / Hidden::SIZE, at % Hidden::SIZE);
+            let place = format!("{live} rows: row {row}, feature {feature}");
+            assert_eq!(found.to_bits(), want.to_bits(), "{place}");
+        }
+        for (layer, (held, wanted)) in held.iter().zip(&wanted).enumerate() {
+            let same = held
+                .iter()
+                .zip(wanted)
+                .position(|(h, w)| h.to_bits() != w.to_bits());
+            assert_eq!(
+                same, None,
+                "layer {layer}, {live} rows: first differing cache element"
+            );
+        }
+    }
+}
+
+/// Every catalog root a registry row serves still runs by the decoder family's one loop: the
+/// causal models of each Qwen3 size and form, Llama and Mistral.
+#[test]
+fn every_root_runs_by_the_loop() {
+    use furiosa_opt_models::models::decoder::attention::{Geometry, llama, qwen3};
+    use furiosa_opt_models::models::decoder::form::{Affine, BlockScaled, ChannelScaled};
+    use furiosa_opt_models::models::decoder::launch;
+    use furiosa_opt_models::specialize::attention::Decode;
+    fn runs<R, Z: Geometry + Attention + Decode>()
+    where
+        for<'i, 'a, 's, 'b> R: Module<
+                &'i mut launch::Input<'a, Z>,
+                (),
+                launch::State<'s, Z, <Z as Geometry>::Layers<launch::Layer<'b>>>,
+            >,
+    {
+    }
+    runs::<launch::Model<qwen3::Size<"0.6B">, Affine>, qwen3::Size<"0.6B">>();
+    runs::<launch::Model<qwen3::Size<"8B">, Affine>, qwen3::Size<"8B">>();
+    runs::<launch::Model<qwen3::Size<"4B">, ChannelScaled>, qwen3::Size<"4B">>();
+    runs::<launch::Model<qwen3::Size<"8B">, BlockScaled>, qwen3::Size<"8B">>();
+    runs::<launch::Model<llama::Size<"8B">, Affine>, llama::Size<"8B">>();
+    runs::<launch::Model<llama::Size<"Mistral-7B">, Affine>, llama::Size<"Mistral-7B">>();
+}
+
+/// The catalog's own collections, sliding and full layers in its order, run by the schedule over
+/// each group's context: every edge of the order, sliding to sliding, sliding to full, full to
+/// sliding across a period and full to the final norm, is the one tokenwise work.
+#[test]
+fn schedules_the_catalog_order() {
+    use furiosa_opt_models::models::decoder::attention::gemma4::full;
+    type Full = <Catalog as Collections>::Full;
+    type Of<A> = attention::Context<
+        Rotation<<A as Attention>::Rotated, Chip, Rows>,
+        HbmTensor<i32, Chip, m![Rows]>,
+        Pages<Rows, <A as Attention>::Windows, Chip>,
+    >;
+    type Slot<'b, A> = (
+        &'b mut Blocks<<A as Attention>::Heads, <A as Attention>::Head>,
+        Leaves,
+    );
+    type Order = Interleave<([Sliding; gemma4::SLIDING], [Full; gemma4::FULL]), { gemma4::ORDER }>;
+    fn runs<'m, 'c>()
+    where
+        for<'i, 's, 'b> Decoder<(&'m Order, &'m FinalNorm)>: Module<
+                (&'i mut HiddenRows, Live<(), Rows>),
+                (&'c Of<Group>, &'c Of<full::Group>),
+                &'s mut (
+                    (Places<Group, Rows>, [Slot<'b, Group>; gemma4::SLIDING]),
+                    (
+                        Places<full::Group, Rows>,
+                        [Slot<'b, full::Group>; gemma4::FULL],
+                    ),
+                ),
+                Output = (),
+            >,
+    {
+    }
+    runs();
 }

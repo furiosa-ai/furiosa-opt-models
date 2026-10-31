@@ -10,8 +10,11 @@ use super::{Attention, Context, History, Paged, Positioned};
 
 use crate::Module;
 use crate::load::Load;
+use crate::ops::attention::Heads;
 use crate::ops::attention::full::paged;
+use crate::ops::attention::gqa::Pages;
 use crate::ops::index::scatter;
+use crate::tensor::axis::Single;
 use crate::tensor::cache::Blocks;
 use crate::tensor::live::{Live, Spill};
 use crate::tensor::parallel::Chip;
@@ -215,6 +218,84 @@ where
             },
         );
         Deferred(live.subrange(items.rows(), live.rows()))
+    }
+}
+
+/// Attention over pages reads every row's keys and values from the pool, so every live row is
+/// stored before it, from its retained heads as attention's own write takes them, and none is
+/// deferred: `()` names no rows.
+impl<
+    'p,
+    'w,
+    's,
+    'b,
+    R: AxisName,
+    KvHeads: AxisName,
+    Head: AxisName,
+    Windows: AxisName,
+    WI: Deref<Target = HbmTensor<i32, Chip, m![R]>>,
+    W,
+    Read,
+    Env,
+>
+    Module<
+        (
+            &'p Retention<R, KvHeads, Head>,
+            (&'w WI, &'w Pages<R, Windows, Chip>),
+            Live<(), R>,
+        ),
+        Env,
+        &'s mut &'b mut Blocks<KvHeads, Head>,
+    > for KeyValue<W, Read>
+where
+    W: for<'d, 'r, 'k> Module<
+            (
+                &'r mut Blocks<KvHeads, Head>,
+                &'r HbmTensor<i32, Chip, m![R]>,
+                (
+                    &'k Live<Heads<R, KvHeads, Single, Head>, R>,
+                    &'k Live<Heads<R, KvHeads, Single, Head>, R>,
+                ),
+            ),
+            (),
+            &'d mut (),
+            Output = (),
+        >,
+{
+    type Output = ();
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        _: Env,
+        pool: &'s mut &'b mut Blocks<KvHeads, Head>,
+        ((key, value), (slot, _), live): (
+            &'p Retention<R, KvHeads, Head>,
+            (&'w WI, &'w Pages<R, Windows, Chip>),
+            Live<(), R>,
+        ),
+    ) {
+        let keys = live.with(key.to_dm(&mut device.tdma));
+        let values = live.with(value.to_dm(&mut device.tdma));
+        let rows = (&mut **pool, &**slot, (&keys, &values));
+        self.write.forward(device, (), &mut (), rows);
+    }
+}
+
+/// No rows deferred: nothing is stored once attention ran.
+impl<'p, 'w, 's, 'b, Reach: AxisName, KvHeads: AxisName, Head: AxisName, WI, W, R, Env, C>
+    Module<((), &'p Retention<Reach, KvHeads, Head>, &'w WI), Env, &'s mut &'b mut C>
+    for KeyValue<W, R>
+{
+    type Output = ();
+
+    fn forward(
+        &self,
+        _: &mut Device,
+        _: Env,
+        _: &'s mut &'b mut C,
+        _: ((), &'p Retention<Reach, KvHeads, Head>, &'w WI),
+    ) {
     }
 }
 

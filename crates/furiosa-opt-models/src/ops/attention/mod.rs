@@ -255,7 +255,7 @@ impl<Rows: AxisName, const N: usize> AxisName for TileGroups<Rows, N> {
     const SIZE: usize = <linear::Groups<Tile<Rows, N>> as M>::SIZE;
 }
 
-pub(super) type Heads<Rows, KvHeads, Group, Head> =
+pub(crate) type Heads<Rows, KvHeads, Group, Head> =
     DmTensor<bf16, Chip, m![1 # 2], HeadSlice<Rows, KvHeads>, m![{ RowGroups<Rows, Group> }, Head]>;
 
 #[cfg(test)]
