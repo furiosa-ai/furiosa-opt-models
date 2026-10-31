@@ -211,13 +211,12 @@ pub(crate) fn reach<Rows: AxisName>(rows: usize) -> usize {
 mod tests {
     use super::*;
     use crate::Module;
-    use crate::modules::generic::schedule::{Fill, Spill};
     use crate::ops::attention::geometry::Hidden;
     use crate::ops::normalization::tests::random;
     use crate::ops::normalization::{Blocked, EPSILON, RmsNorm};
     use crate::ops::pointwise::add::Add;
     use crate::tensor::form::Weight;
-    use crate::tensor::live::tests::count;
+    use crate::tensor::live::{Fill, Spill, tests::count};
     use crate::tensor::scalar::Value;
     use crate::tests::DEVICE;
     use furiosa_opt_std::runtime::launch;

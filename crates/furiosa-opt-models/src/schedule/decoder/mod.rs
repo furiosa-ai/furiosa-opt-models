@@ -22,6 +22,7 @@
 //!   so only the output projection lands during one, once its last history is in flight. A form
 //!   whose leaves land nothing ahead takes the same steps, doing nothing in them.
 
+use crate::Begin;
 use crate::Module;
 use crate::load::Named;
 use crate::models::decoder::Form;
@@ -33,7 +34,6 @@ use crate::models::decoder::form::BlockScaled;
 use crate::models::decoder::launch;
 use crate::modules::attention::{Attention, NormalizedQkv, Positioned, Projection};
 use crate::modules::generic::collection::View;
-use crate::modules::generic::schedule::{Begin, Fill, Spill};
 use crate::modules::language::{Backbone, Call, Classifier, Selected};
 use crate::modules::lora::States;
 use crate::modules::residual::Residual;
@@ -51,7 +51,7 @@ use crate::ops::rotary::{Rotary, Row, SplitHalf};
 use crate::ops::swiglu::{self, Mlp};
 use crate::specialize::attention::Decode;
 use crate::tensor::axis;
-use crate::tensor::live::Live;
+use crate::tensor::live::{Fill, Live, Spill};
 use crate::tensor::memory::Hbm;
 use crate::tensor::parallel::Chip;
 use crate::{Sequential, Then};
@@ -98,8 +98,7 @@ type KeyRows<Z> = HbmTensor<bf16, Chip, m![{ Symbol<Reach<Z>> }, KvHeads, Head]>
 type Norm<Z> = <Z as Geometry>::Norm<Width<Z>, Hbm>;
 /// The final norm, where the head starts.
 type FinalNorm<Z> = Named<"norm", Norm<Z>>;
-/// A launch's call as its layers read it: the context its rotary table prepares, its token IDs
-/// and its live rows.
+/// A launch's call as its layers read it: the context its rotary table prepares and its token IDs.
 type Launched<'c, 'a, Z> = Call<
     'c,
     launch::Context<
@@ -113,7 +112,6 @@ type Launched<'c, 'a, Z> = Call<
         <Z as Decode>::Windows,
     >,
     launch::Ids<Z>,
-    Capacity<Z>,
 >;
 /// A row tile of a launch, as the work between two attentions passes it on.
 type RowTile<Z> = Live<Owned<Width<Z>, Span>, Capacity<Z>>;
@@ -697,7 +695,6 @@ where
         let call = Call {
             context: &context,
             tokens: &input.tokens,
-            live,
         };
         let ((embedded, slots), ()) = body;
         let Then(Backbone { embedding, body }, norm) = &model.body;

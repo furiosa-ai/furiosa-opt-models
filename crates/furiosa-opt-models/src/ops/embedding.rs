@@ -1,11 +1,10 @@
 //! Token features gathered from an embedding table: the table row of each token id.
 
 use crate::load::{Checkpoint, Context, Load, LoadError};
-use crate::modules::generic::schedule::{Fill, IntoStream, Stream};
 use crate::ops::index::gather::Gather;
 use crate::ops::index::table::{ByteOffset, Offset};
 use crate::ops::linear::Groups;
-use crate::ops::normalization::span::{self, Owned};
+use crate::ops::normalization::span::Owned;
 use crate::ops::normalization::{Blocked, Chunk, Spread};
 use crate::ops::pointwise::{Float, add::Add};
 use crate::specialize::index::{
@@ -20,7 +19,6 @@ use crate::tensor::{
     live::Live,
 };
 use crate::{Module, Op};
-use core::task::Poll;
 use furiosa_opt_std::prelude::*;
 use furiosa_opt_std::runtime::HostBuffer;
 use std::borrow::Borrow;
@@ -447,84 +445,6 @@ where
                 ]>(block),
             );
         }
-    }
-}
-
-/// A launch's embedded rows, its tokens and live rows read from the env: the node's first poll
-/// embeds every live row into its slot, the launch's hidden rows, and each poll gives a span.
-impl<
-    'm,
-    's,
-    'i,
-    U,
-    E,
-    Vocabulary: AxisName,
-    Hidden: AxisName,
-    Capacity: AxisName,
-    Chips: M + 'static,
-> IntoStream<U, E, &'s mut HbmTensor<bf16, Chips, Blocked<Hidden, Capacity>>>
-    for &'m Embedding<Vocabulary, Hidden, Chips>
-where
-    U: Stream,
-    E: Copy + Into<(&'i Ids<Capacity, Chips>, Live<(), Capacity>)>,
-{
-    type Stream = Node<'m, 's, Vocabulary, Hidden, Capacity, E, Chips>;
-
-    fn into_stream(
-        self,
-        env: E,
-        rows: &'s mut HbmTensor<bf16, Chips, Blocked<Hidden, Capacity>>,
-        _: U,
-    ) -> Self::Stream {
-        Node {
-            embedding: self,
-            env,
-            rows,
-            given: 0,
-        }
-    }
-}
-
-/// An embedding's node: the env it reads the launch from, the rows it embeds into and the spans
-/// of them it gave so far.
-pub struct Node<
-    'm,
-    's,
-    Vocabulary: AxisName,
-    Hidden: AxisName,
-    Capacity: AxisName,
-    E,
-    Chips: M + 'static = Chip,
-> {
-    embedding: &'m Embedding<Vocabulary, Hidden, Chips>,
-    env: E,
-    rows: &'s mut HbmTensor<bf16, Chips, Blocked<Hidden, Capacity>>,
-    given: usize,
-}
-
-impl<'i, Vocabulary: AxisName, Hidden: AxisName, Capacity: AxisName, E, Chips: M + 'static> Stream
-    for Node<'_, '_, Vocabulary, Hidden, Capacity, E, Chips>
-where
-    E: Copy + Into<(&'i Ids<Capacity, Chips>, Live<(), Capacity>)>,
-{
-    type Item = Live<Owned<Hidden, span::Span, Chips>, Capacity>;
-
-    fn poll_next(&mut self, device: &mut Device) -> Poll<Option<Self::Item>> {
-        let (ids, live) = self.env.into();
-        if self.given == 0 {
-            let launch = Launch {
-                ids,
-                count: live,
-                output: &mut *self.rows,
-            };
-            Op::forward(self.embedding, &mut *device, launch);
-        }
-        if self.given < live.count::<span::Span>() {
-            let tile = live.tile::<span::Span>(self.given);
-            self.given += 1;
-            return Poll::Ready(Some(tile.with(self.rows.fill(device, tile))));
-        }
-        Poll::Ready(None)
     }
 }
 

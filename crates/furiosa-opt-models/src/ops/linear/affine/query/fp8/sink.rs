@@ -1,7 +1,7 @@
 use super::*;
 use crate::modules::generic::Either;
-use crate::modules::generic::schedule::Spill;
 use crate::ops::rotary::group::{OutputHalf, Rotated};
+use crate::tensor::live::Spill;
 
 /// A launch's query rows in HBM: `Groups` query heads of `Head` features for each of `KvHeads`.
 type QueryRows<All, KvHeads, Groups, Head> = HbmTensor<bf16, Chip, m![All, KvHeads, Groups, Head]>;

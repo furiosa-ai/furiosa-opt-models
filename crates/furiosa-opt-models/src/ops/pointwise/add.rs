@@ -3,14 +3,12 @@
 use super::{Float, Window};
 use crate::Op;
 use crate::load::Load;
-use crate::modules::generic::schedule::{Fill, IntoStream, Slot, Spill, Stream};
-use crate::ops::normalization::span::{self, Owned, Span};
+use crate::ops::normalization::span::{self, Owned};
 use crate::ops::normalization::{
-    Blocked, Chunk, Cluster, Element, FeatureSlices, Offset, Spread, Tile, TilePart, TileRows,
+    Chunk, Cluster, Element, FeatureSlices, Offset, Spread, Tile, TilePart, TileRows,
 };
 use crate::ops::pointwise::gated;
 use crate::tensor::{axis::Single, live::Live};
-use core::task::Poll;
 use furiosa_opt_std::prelude::*;
 
 /// Elementwise sum of two tensors in the same layout.
@@ -131,118 +129,6 @@ impl<Width: AxisName, Rows: AxisName, R: AxisName, Chips: M + 'static>
 }
 
 // --8<-- [end:add]
-
-/// Rows an add keeps from its input until the branch tile of the same rows comes, and the place
-/// that holds a launch's tiles of them.
-pub(crate) trait Kept<R>: Sized {
-    type Place: for<'r> Spill<Device, &'r Self, Live<(), R>>
-        + Fill<Device, Live<(), R>, Rows = Self>;
-
-    fn place() -> Self::Place;
-}
-
-/// Spans wait in the launch's rows in HBM.
-impl<Width: AxisName, R: AxisName, Chips: M + 'static> Kept<R> for Owned<Width, Span, Chips> {
-    type Place = HbmTensor<bf16, Chips, Blocked<Width, R>>;
-
-    fn place() -> Self::Place {
-        HbmTensor::new()
-    }
-}
-
-/// A launch's rows streamed as one tile wait as a copy in data memory.
-impl<Width: AxisName, R: AxisName, Chips: M + 'static> Kept<R> for Spread<Width, R, Chips> {
-    type Place = Self;
-
-    fn place() -> Self {
-        DmTensor::new()
-    }
-}
-
-impl<Width: AxisName, R: AxisName, Chips: M + 'static>
-    Spill<Device, &Spread<Width, R, Chips>, Live<(), R>> for Spread<Width, R, Chips>
-{
-    fn spill(&mut self, device: &mut Device, rows: &Spread<Width, R, Chips>, _: Live<(), R>) {
-        *self = rows.to_dm(&mut device.tdma);
-    }
-}
-
-impl<Width: AxisName, R: AxisName, Chips: M + 'static> Fill<Device, Live<(), R>>
-    for Spread<Width, R, Chips>
-{
-    type Rows = Self;
-
-    fn fill(&self, device: &mut Device, _: Live<(), R>) -> Self {
-        self.to_dm(&mut device.tdma)
-    }
-}
-
-/// A residual's sum as a stream: its node keeps each input tile in a place of its own until the
-/// branch tile of the same rows comes, so a branch may take every input first.
-impl<'s, U, E, X: Kept<R>, R: AxisName> IntoStream<U, E, &'s mut ()> for Add
-where
-    U: Stream<Item = (Option<Live<X, R>>, Option<Live<X, R>>)>,
-    Node<X::Place, U>: Stream,
-{
-    type Stream = Node<X::Place, U>;
-
-    fn into_stream(self, _: E, _: &'s mut (), upstream: U) -> Self::Stream {
-        Node {
-            kept: X::place(),
-            upstream,
-        }
-    }
-}
-
-impl<'m, 's, U: Stream, E> IntoStream<U, E, &'s mut ()> for &'m Add
-where
-    Add: IntoStream<U, E, &'s mut ()>,
-{
-    type Stream = <Add as IntoStream<U, E, &'s mut ()>>::Stream;
-
-    fn into_stream(self, env: E, unit: &'s mut (), upstream: U) -> Self::Stream {
-        Add.into_stream(env, unit, upstream)
-    }
-}
-
-/// An add's node: the place its input tiles wait in, and its upstream, the residual's node.
-pub struct Node<K, U> {
-    kept: K,
-    upstream: U,
-}
-
-impl<T, K, U: AsMut<Slot<T>>> AsMut<Slot<T>> for Node<K, U> {
-    fn as_mut(&mut self) -> &mut Slot<T> {
-        self.upstream.as_mut()
-    }
-}
-
-/// A branch tile lands before its kept tile, so a branch from far memory overlaps the fill.
-impl<X, R: AxisName, K, U> Stream for Node<K, U>
-where
-    U: Stream<Item = (Option<Live<X, R>>, Option<Live<X, R>>)>,
-    K: for<'r> Spill<Device, &'r X, Live<(), R>> + Fill<Device, Live<(), R>, Rows = X>,
-    Add: for<'x, 'y> Op<(&'x Live<X, R>, &'y Live<X, R>), Output = Live<X, R>>,
-{
-    type Item = Live<X, R>;
-
-    fn poll_next(&mut self, device: &mut Device) -> Poll<Option<Self::Item>> {
-        match self.upstream.poll_next(device) {
-            Poll::Ready(Some((input, branch))) => {
-                if let Some(input) = input {
-                    self.kept.spill(device, input.value(), input.with(()));
-                }
-                let Some(branch) = branch else {
-                    return Poll::Pending;
-                };
-                let kept = branch.with(self.kept.fill(device, branch.with(())));
-                Poll::Ready(Some(Add.forward(device, (&kept, &branch))))
-            }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
 
 /// The FP32 vectors of the features the add keeps in its registers: the gate and the residual.
 const VECTORS: usize = 2;

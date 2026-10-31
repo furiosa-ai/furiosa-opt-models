@@ -1,6 +1,6 @@
 use super::{HeadScales, HeadSquares, Squared, Stored, ValueScale, Weight, Weights};
+use crate::Begin;
 use crate::Op;
-use crate::modules::generic::schedule::Begin;
 use crate::ops::linear::Affine;
 use crate::tensor::parallel::Chip;
 use furiosa_opt_std::prelude::*;

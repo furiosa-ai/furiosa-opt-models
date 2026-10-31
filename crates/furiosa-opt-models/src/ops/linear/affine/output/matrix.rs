@@ -244,43 +244,6 @@ where
     }
 }
 
-/// Span tile `tile` of the attended rows projected in one poll.
-impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head, Env: Copy>
-    Module<
-        (
-            &'l mut (),
-            &'a Attended<Reach, KvHeads, Groups, Head>,
-            Live<(), Capacity>,
-        ),
-        Env,
-        &mut (),
-    > for Affine<HbmTensor<bf16, Chip, m![Hidden, QWidth]>, ()>
-where
-    Hidden: AxisName,
-    QWidth: AxisName,
-    Capacity: AxisName,
-    Reach: AxisName,
-    KvHeads: AxisName,
-    Groups: AxisName,
-    Head: AxisName,
-{
-    type Output = Poll<Owned<Hidden, Span>>;
-
-    fn forward(
-        &self,
-        device: &mut Device,
-        env: Env,
-        _: &mut (),
-        (landed, attended, tile): (
-            &'l mut (),
-            &'a Attended<Reach, KvHeads, Groups, Head>,
-            Live<(), Capacity>,
-        ),
-    ) -> Self::Output {
-        Poll::Ready(self.forward(device, env, &mut (), (landed, tile.with(attended))))
-    }
-}
-
 /// The channel-scaled projection takes the dense projection's steps over its codes: it lands
 /// nothing before the attended rows arrive...
 impl<Hidden: AxisName, QWidth: AxisName, Env> Module<Begin<()>, Env, &mut ()>
@@ -376,43 +339,5 @@ where
     ) -> Self::Output {
         let tile = attended.with(());
         Affine::new(self.held(), ()).span(device, env, attended.into_value(), tile)
-    }
-}
-
-/// A span tile of the attended rows projected in one poll, restoring each weight slab from its
-/// codes.
-impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head, Env: Copy>
-    Module<
-        (
-            &'l mut (),
-            &'a Attended<Reach, KvHeads, Groups, Head>,
-            Live<(), Capacity>,
-        ),
-        Env,
-        &mut (),
-    > for ChannelScaled<QWidth, Hidden>
-where
-    Hidden: AxisName,
-    QWidth: AxisName,
-    Capacity: AxisName,
-    Reach: AxisName,
-    KvHeads: AxisName,
-    Groups: AxisName,
-    Head: AxisName,
-{
-    type Output = Poll<Owned<Hidden, Span>>;
-
-    fn forward(
-        &self,
-        device: &mut Device,
-        env: Env,
-        _: &mut (),
-        ((), attended, tile): (
-            &'l mut (),
-            &'a Attended<Reach, KvHeads, Groups, Head>,
-            Live<(), Capacity>,
-        ),
-    ) -> Self::Output {
-        Poll::Ready(Affine::new(self.held(), ()).span(device, env, attended, tile))
     }
 }
