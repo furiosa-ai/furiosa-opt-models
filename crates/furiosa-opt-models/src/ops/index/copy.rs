@@ -3,7 +3,7 @@
 
 use crate::Module;
 use crate::specialize::index::copy::LENGTHS;
-use crate::tensor::{memory::alias, parallel::Chip};
+use crate::tensor::memory::alias;
 use furiosa_opt_std::prelude::*;
 use furiosa_opt_std::runtime::launch;
 use std::io;
@@ -26,38 +26,41 @@ const _: () = assert!(
         && LENGTHS[4] == 1
 );
 
-/// Consecutive words, as many as `L` maps.
-type Piece<L> = HbmTensor<i32, Chip, L>;
+/// Consecutive words on each chip of `C`, as many as `L` maps.
+type Piece<C, L> = HbmTensor<i32, C, L>;
 
 /// One length's pieces.
-type Pieces<L> = Slice<Piece<L>>;
+type Pieces<C, L> = Slice<Piece<C, L>>;
 
 /// The pieces one launch copies from, by length, longest first: piece `i` of a length in the
 /// source is copied into piece `i` of that length in the destination.
-type Sources = (
-    Pieces<m![Words1024]>,
-    Pieces<m![Words64]>,
-    Pieces<m![Words16]>,
-    Pieces<m![Words4]>,
-    Pieces<m![1]>,
+type Sources<C> = (
+    Pieces<C, m![Words1024]>,
+    Pieces<C, m![Words64]>,
+    Pieces<C, m![Words16]>,
+    Pieces<C, m![Words4]>,
+    Pieces<C, m![1]>,
 );
 
-/// The destinations of one launch's [`Sources`]: the single words' are [`PIECES`] views, those
-/// past the launch's single words naming spare words that no copy writes.
-type Targets = (
-    Pieces<m![Words1024]>,
-    Pieces<m![Words64]>,
-    Pieces<m![Words16]>,
-    Pieces<m![Words4]>,
-    [Piece<m![1]>; PIECES],
+/// The destinations of one launch's [`Sources`]: the single words' are [`Words`].
+type Targets<C> = (
+    Pieces<C, m![Words1024]>,
+    Pieces<C, m![Words64]>,
+    Pieces<C, m![Words16]>,
+    Pieces<C, m![Words4]>,
+    Words<C>,
 );
+
+/// The single-word destinations of one launch: [`PIECES`] views, those past the launch's single
+/// words naming spare words that no copy writes.
+type Words<C> = [Piece<C, m![1]>; PIECES];
 
 /// Copies `from[i]` into `to[i]` for each of `from`, at most `N` of them.
 #[derive(DeviceSend)]
 struct Copies<const N: usize>;
 
-impl<'a, L: M, const N: usize, Env> Module<(&'a Pieces<L>, &'a mut Pieces<L>), Env, &mut ()>
-    for Copies<N>
+impl<'a, C: M, L: M, const N: usize, Env>
+    Module<(&'a Pieces<C, L>, &'a mut Pieces<C, L>), Env, &mut ()> for Copies<N>
 {
     type Output = ();
 
@@ -66,7 +69,7 @@ impl<'a, L: M, const N: usize, Env> Module<(&'a Pieces<L>, &'a mut Pieces<L>), E
         context: &mut Device,
         _: Env,
         _: &mut (),
-        (from, to): (&'a Pieces<L>, &'a mut Pieces<L>),
+        (from, to): (&'a Pieces<C, L>, &'a mut Pieces<C, L>),
     ) {
         // A read of the length waits until every copy issued before it ends, so it is read once.
         let len = from.len();
@@ -82,7 +85,7 @@ impl<'a, L: M, const N: usize, Env> Module<(&'a Pieces<L>, &'a mut Pieces<L>), E
 }
 
 /// The single words, each into a destination of its own.
-impl<'a, Env> Module<(&'a Pieces<m![1]>, &'a mut [Piece<m![1]>; PIECES]), Env, &mut ()>
+impl<'a, C: M, Env> Module<(&'a Pieces<C, m![1]>, &'a mut Words<C>), Env, &mut ()>
     for Copies<PIECES>
 {
     type Output = ();
@@ -92,7 +95,7 @@ impl<'a, Env> Module<(&'a Pieces<m![1]>, &'a mut [Piece<m![1]>; PIECES]), Env, &
         context: &mut Device,
         _: Env,
         _: &mut (),
-        (from, to): (&'a Pieces<m![1]>, &'a mut [Piece<m![1]>; PIECES]),
+        (from, to): (&'a Pieces<C, m![1]>, &'a mut Words<C>),
     ) {
         let len = from.len();
         #[unroll]
@@ -106,19 +109,19 @@ impl<'a, Env> Module<(&'a Pieces<m![1]>, &'a mut [Piece<m![1]>; PIECES]), Env, &
     }
 }
 
-/// Copies HBM slices into HBM slices in pair order, submitting without waiting; a later read of a
-/// destination waits for it. A length mismatch in any pair, or a length that is not whole words,
-/// refuses the batch before anything moves.
+/// Copies HBM slices into HBM slices in pair order on every chip of `C`, each chip its own bytes,
+/// submitting without waiting; a later read of a destination waits for it. A length mismatch in any
+/// pair, or a length that is not whole words, refuses the batch before anything moves.
 // TODO: once std offers a host-submitted HBM-to-HBM copy, this body is that submit; drop `place`.
-pub fn copy<'a>(
+pub fn copy<'a, C: M>(
     device: &mut Device,
     pairs: impl IntoIterator<Item = (&'a HbmBuffer, &'a mut HbmBuffer)>,
 ) -> io::Result<()> {
     /// Launch `launch`'s share of one length's `(source, destination)` pieces.
-    fn views<L: M>(
+    fn views<C: M, L: M>(
         pieces: &[(HbmBuffer, HbmBuffer)],
         launch: usize,
-    ) -> io::Result<(Pieces<L>, Pieces<L>)> {
+    ) -> io::Result<(Pieces<C, L>, Pieces<C, L>)> {
         let share = || pieces.iter().skip(launch * PIECES).take(PIECES);
         Ok((
             share()
@@ -162,10 +165,10 @@ pub fn copy<'a>(
     // Single words copy into arguments of their own to issue back to back; `spare` pads the rest.
     let words = |pieces: &[(HbmBuffer, HbmBuffer)],
                  launch: usize|
-     -> io::Result<(Pieces<m![1]>, [Piece<m![1]>; PIECES])> {
+     -> io::Result<(Pieces<C, m![1]>, Words<C>)> {
         let share = || pieces.iter().skip(launch * PIECES).take(PIECES);
         let free = (share().len()..PIECES).map(|at| alias(&spare, at * word..(at + 1) * word));
-        let to: Vec<Piece<m![1]>> = share()
+        let to: Vec<Piece<C, m![1]>> = share()
             .map(|(_, to)| alias(to, ..))
             .chain(free)
             .collect::<io::Result<_>>()?;
@@ -188,7 +191,7 @@ pub fn copy<'a>(
             );
             Ok(((a, b, c, d, e), (f, g, h, i, j)))
         })
-        .collect::<io::Result<Vec<(Sources, Targets)>>>()?;
+        .collect::<io::Result<Vec<(Sources<C>, Targets<C>)>>>()?;
     for (from, mut to) in launches {
         let few = [from.0.len(), from.1.len(), from.2.len(), from.3.len()]
             .into_iter()
@@ -204,14 +207,14 @@ pub fn copy<'a>(
     Ok(())
 }
 
-/// Copies every piece of `from` into its piece of `to`, at most `N` of each length but the single
-/// word.
-#[device(chip = 1)]
-fn place<const N: usize>(
+/// Copies every piece of `from` into its piece of `to`, each chip of `C` its own, at most `N` of
+/// each length but the single word.
+#[device(chip = C::SIZE)]
+fn place<C: M, const N: usize>(
     context: &mut Device,
     copies: &Copies<N>,
-    from: &Sources,
-    to: &mut Targets,
+    from: &Sources<C>,
+    to: &mut Targets<C>,
 ) {
     copies.forward(&mut *context, (), &mut (), (&from.0, &mut to.0));
     copies.forward(&mut *context, (), &mut (), (&from.1, &mut to.1));
@@ -223,6 +226,7 @@ fn place<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tensor::parallel::Chip;
     use crate::tests::DEVICE;
 
     /// `len` words of `buffer` from word `at`, another owner of them.
@@ -255,7 +259,7 @@ mod tests {
         // row 3500.
         let sources = [words(&source, 3, 2687), words(&source, 3000, 5)];
         let mut targets = [words(&target, 10, 2687), words(&target, 3500, 5)];
-        copy(&mut device, sources.iter().zip(&mut targets)).unwrap();
+        copy::<Chip>(&mut device, sources.iter().zip(&mut targets)).unwrap();
         let target: HbmTensor<i32, Chip, m![Target]> = alias(&target, ..).unwrap();
         let rows = target
             .to_host::<m![Target]>(&mut device.pdma)
@@ -296,7 +300,7 @@ mod tests {
                 .unwrap();
         let target = target.into_buffer();
         let mut targets: Vec<HbmBuffer> = (0..count).map(|row| words(&target, row, 1)).collect();
-        copy(&mut device, sources.iter().zip(&mut targets)).unwrap();
+        copy::<Chip>(&mut device, sources.iter().zip(&mut targets)).unwrap();
         let target: HbmTensor<i32, Chip, m![Target]> = alias(&target, ..).unwrap();
         let rows = target
             .to_host::<m![Target]>(&mut device.pdma)

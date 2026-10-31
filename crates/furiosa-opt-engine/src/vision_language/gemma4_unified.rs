@@ -13,6 +13,7 @@ use furiosa_opt_models::models::vision_language::gemma4_unified::{
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
 use furiosa_opt_models::ops::index::copy;
 use furiosa_opt_models::tensor::memory::{Hbm, alias};
+use furiosa_opt_models::tensor::parallel::Chip;
 use furiosa_opt_std::prelude::*;
 use std::io;
 use std::pin::Pin;
@@ -119,7 +120,7 @@ async fn launch<R: AxisName, Input: M>(
         .collect::<Result<Vec<_>, _>>()
         .map_err(io::Error::other)?;
     let sources = items.iter().map(|rows| rows.buffer());
-    copy(&mut *device, sources.zip(&mut targets))?;
+    copy::<Chip>(&mut *device, sources.zip(&mut targets))?;
     let output = HbmBuffer::alloc(device, R::SIZE * Rows::<bf16, m![Text]>::bytes())
         .map_err(io::Error::other)?;
     run(device, inputs, &output).await?;
