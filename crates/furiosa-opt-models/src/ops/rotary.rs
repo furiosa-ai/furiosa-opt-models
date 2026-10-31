@@ -79,8 +79,8 @@ impl<'a, Slice: M, Query: AxisName, Key: AxisName, Rows: AxisName, Head: AxisNam
         DmTensor<bf16, Chip, Cluster, Slice, m![{ RowGroups<Rows, Key> }, Head]>,
     );
 
-    /// Every row group in shared passes when every group holds a live row; otherwise each live
-    /// group alone, and a group past the live rows is not rotated.
+    /// Every row group in shared passes when every group holds a live row; otherwise each group
+    /// the live rows touch alone, and a group outside them is not rotated.
     fn forward(
         &self,
         device: &mut Device,
@@ -133,7 +133,8 @@ impl<'a, Slice: M, Query: AxisName, Key: AxisName, Rows: AxisName, Head: AxisNam
                     m![{ Groups<Rows> }, Key, Half, { Symbol<Row<Head>> }],
                 >()
         };
-        if live.count::<Lanes<Rows>>() == <Groups<Rows> as M>::SIZE {
+        let (first, count) = live.groups::<Lanes<Rows>>();
+        if count == <Groups<Rows> as M>::SIZE {
             #[unroll]
             for tile in 0..<Tiles<Rows> as M>::SIZE {
                 let low = Fetch::<TileRows<Rows>, Row<Head>>(PhantomData).forward(
@@ -184,7 +185,8 @@ impl<'a, Slice: M, Query: AxisName, Key: AxisName, Rows: AxisName, Head: AxisNam
                 );
             }
         } else {
-            for group in 0..live.count::<Lanes<Rows>>() {
+            for at in 0..count {
+                let group = first + at;
                 let low = Fetch::<m![1], Row<Head>>(PhantomData).forward(
                     device,
                     low.view().tile::<Groups<Rows>, 1, m![
