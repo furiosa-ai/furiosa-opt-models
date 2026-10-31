@@ -16,12 +16,13 @@
 //! - [`Decoder`] runs the loops: the first layer's stores over the embedded tiles, then for each
 //!   layer its attention and, tile by tile, the work up to the next store or the head.
 //! - The DMA engine serves transfers in issue order, so weights issue one part ahead of their use
-//!   and behind the small transfers of the work they overlap: the MLP's first weights behind the
-//!   output projection's rows, its down weights behind the gate/up pairs and the down's inputs,
-//!   the next layer's key and query projections behind them and its value projection under its
-//!   input norm. An attention's working set fills most of data memory, so only the output
-//!   projection lands during one, once its last history is in flight. A form whose leaves land
-//!   nothing ahead takes the same steps, doing nothing in them.
+//!   and behind the small transfers of the work they overlap: the first down panel behind the
+//!   output projection's rows, the first gate/up pair behind the exchange of its partial sums,
+//!   the other down panels behind the gate/up pairs and the down's inputs, the next layer's key
+//!   and query projections behind them and its value projection under its input norm. An
+//!   attention's working set fills most of data memory, so only the output projection lands
+//!   during one, once its last history is in flight. A form whose leaves land nothing ahead takes
+//!   the same steps, doing nothing in them.
 
 use crate::Begin;
 use crate::Module;
@@ -475,16 +476,17 @@ where
         let tile = input.with(());
         let gain = crate::Op::forward(&Stage, &mut *device, &norm.0);
         let rows = attended.with(&attended.value().0);
-        // The first gate/up pair lands behind the output projection's rows, under its passes.
+        // The first down panel lands behind the output projection's rows, under its passes, the
+        // first gate/up pair behind the exchange of its partial sums, which the sum reads.
         let begun = output.forward(
             &mut *device,
             (),
             &mut (),
             Begin(Begin((&mut *landed, rows))),
         );
-        let ahead = gate_up.forward(&mut *device, (), &mut (), Begin(()));
-        let begun = output.forward(&mut *device, (), &mut (), begun);
         let first = down.forward(&mut *device, (), &mut (), Begin(0usize));
+        let begun = output.forward(&mut *device, (), &mut (), begun);
+        let ahead = gate_up.forward(&mut *device, (), &mut (), Begin(()));
         let projected = tile.with(output.forward(&mut *device, (), adapters.output(), begun));
         let attended = sum.forward(&mut *device, (), &mut (), (&input, &projected));
         let normalized = gain.forward(&mut *device, (), &mut (), &attended);

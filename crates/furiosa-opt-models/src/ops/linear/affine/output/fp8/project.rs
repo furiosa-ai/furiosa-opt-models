@@ -6,18 +6,6 @@ use crate::ops::linear::affine::output;
 type Attended<Reach, KvHeads, Groups, Head> =
     HbmTensor<bf16, Chip, m![Reach, KvHeads, Groups, Head]>;
 
-/// What the first step leaves the second: the rows in DM, the resident weight, the quantized rows,
-/// their scales, the partial sums, and the waves with their whole blocks, tail, first passes and
-/// single pass.
-type First<Hidden, QWidth, Rows> = (
-    InDm<Hidden, QWidth, Rows>,
-    Resident<Hidden, QWidth>,
-    Source<Hidden, QWidth, Rows>,
-    ReplicatedScales<Hidden, QWidth, Rows>,
-    tiles::Partial<Hidden, QWidth, Rows>,
-    [usize; 5],
-);
-
 /// What the second step leaves the third: the half of the sums a cluster keeps, the half it
 /// received, and the waves.
 type Second<Hidden, QWidth, Rows> = (
@@ -28,12 +16,12 @@ type Second<Hidden, QWidth, Rows> = (
 
 /// The quantized projection landed: its weights, staged once, the step of the tile in progress
 /// and what each step leaves the next. A tile takes three steps, one a phase: the tile's rows
-/// landed and the first block's first pass, then the other passes and the exchange of one half of
-/// the clusters' partial sums, then the sum, which it gives.
+/// landed in DM, then the passes and the exchange of one half of the clusters' partial sums, then
+/// the sum, which it gives.
 pub struct Landed<Hidden: AxisName, QWidth: AxisName, Rows: AxisName> {
     staged: Staged<Hidden, QWidth>,
     step: usize,
-    first: Option<First<Hidden, QWidth, Rows>>,
+    first: Option<InDm<Hidden, QWidth, Rows>>,
     second: Option<Second<Hidden, QWidth, Rows>>,
 }
 
@@ -78,8 +66,7 @@ type Tile<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head> = (
     Live<&'a Attended<Reach, KvHeads, Groups, Head>, Capacity>,
 );
 
-/// A tile begun: its rows landed and the first block's first pass; given back, it takes its second
-/// step.
+/// A tile begun: its rows landed; given back, it takes its second step.
 impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head>
     Op<Begin<Begin<Tile<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head>>>>
     for Stored<Hidden, QWidth>
@@ -110,8 +97,8 @@ where
     }
 }
 
-/// A tile's second step: the other passes and the exchange of one half of the clusters' partial
-/// sums; given back, it takes its last.
+/// A tile's second step: the passes and the exchange of one half of the clusters' partial sums;
+/// given back, it takes its last.
 impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head>
     Op<Begin<Tile<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head>>>
     for Stored<Hidden, QWidth>
@@ -208,7 +195,7 @@ where
             // SAFETY: QWidth is the same contiguous KV-head, query-group and head product.
             let attended: HbmTensor<bf16, Chip, m![Reach, QWidth]> =
                 unsafe { attended.view().alias() };
-            let in_dm = Op::forward(
+            landed.first = Some(Op::forward(
                 &ToDm::<Hidden>(PhantomData),
                 &mut *context,
                 output::ToDm::<QWidth, Rows, Reach> {
@@ -217,53 +204,41 @@ where
                     live: (tile.count::<crate::tensor::axis::Rows<128>>(), tile.rows()),
                     capacity: PhantomData,
                 },
-            );
-            landed.step = 1;
-            let (weight, _) = &staged.weight;
-            let mut source = Source::new();
-            let mut scales = ReplicatedScales::new();
-            let resident = Op::forward(&contract::Stage, &mut *context, weight);
-            let waves = (rows + 31) / 32;
-            Op::forward(
-                &quantize::First,
-                &mut *context,
-                (&in_dm, (&mut source, &mut scales)),
-            );
-            let (whole, tail) = (waves / 4, waves % 4);
-            let first = (whole + 3) / 4;
-            // One pass of eight rows when no whole block exists.
-            let single = if whole < 1 { 1 } else { 0 };
-            let mut partial = tiles::Partial::new();
-            if first > 0 {
-                Op::forward(
-                    &contract::Pass::<32>,
-                    &mut *context,
-                    ((&resident, &source), (&mut partial, 0)),
-                );
-            } else {
-                Op::forward(
-                    &contract::Pass::<8>,
-                    &mut *context,
-                    ((&resident, &source), (&mut partial, 0)),
-                );
-            }
-            landed.first = Some((
-                in_dm,
-                resident,
-                source,
-                scales,
-                partial,
-                [waves, whole, tail, first, single],
             ));
+            landed.step = 1;
             return Poll::Pending;
         }
         if landed.step < 2 {
             landed.step = 2;
-            if let Some((in_dm, resident, mut source, mut scales, mut partial, counts)) =
-                landed.first.take()
-            {
-                let [waves, whole, tail, first, single] = counts;
-                let channels = &staged.weight.1;
+            if let Some(in_dm) = landed.first.take() {
+                let (weight, channels) = &staged.weight;
+                let mut source = Source::new();
+                let mut scales = ReplicatedScales::new();
+                let resident = Op::forward(&contract::Stage, &mut *context, weight);
+                let waves = (rows + 31) / 32;
+                Op::forward(
+                    &quantize::First,
+                    &mut *context,
+                    (&in_dm, (&mut source, &mut scales)),
+                );
+                let (whole, tail) = (waves / 4, waves % 4);
+                let first = (whole + 3) / 4;
+                // One pass of eight rows when no whole block exists.
+                let single = if whole < 1 { 1 } else { 0 };
+                let mut partial = tiles::Partial::new();
+                if first > 0 {
+                    Op::forward(
+                        &contract::Pass::<32>,
+                        &mut *context,
+                        ((&resident, &source), (&mut partial, 0)),
+                    );
+                } else {
+                    Op::forward(
+                        &contract::Pass::<8>,
+                        &mut *context,
+                        ((&resident, &source), (&mut partial, 0)),
+                    );
+                }
                 if waves > 4 {
                     Op::forward(
                         &quantize::All,
