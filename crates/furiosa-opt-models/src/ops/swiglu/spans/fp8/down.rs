@@ -345,14 +345,16 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
 type Channels<Hidden, Intermediate> =
     DmTensor<f32, Chip, Cluster<Intermediate>, m![Hidden / 16], m![Hidden % 16]>;
 
-/// A staged product's down projection with its three weight panels, their inputs in panel order and
-/// its channel scales landed: what is left is compute and the exchange of the row halves.
-pub struct Ready<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName> {
-    weights: (
-        Down<Hidden, Intermediate>,
-        Down<Hidden, Intermediate>,
-        Down<Hidden, Intermediate>,
-    ),
+/// A staged product's down projection with its weight panels, the third as `W`, their inputs in
+/// panel order and its channel scales landed: once the third has, what is left is compute and the
+/// exchange of the row halves.
+pub struct Ready<
+    Hidden: AxisName,
+    Intermediate: AxisName,
+    Rows: AxisName,
+    W = Down<Hidden, Intermediate>,
+> {
+    weights: (Down<Hidden, Intermediate>, Down<Hidden, Intermediate>, W),
     inputs: (
         Landed<Hidden, Intermediate, Rows>,
         Landed<Hidden, Intermediate, Rows>,
@@ -403,20 +405,20 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
     }
 }
 
-/// A staged product's down panels' inputs and channel scales landed, its later two weight panels
-/// landed beforehand.
+/// A staged product's down panels' inputs and channel scales landed, its second weight panel
+/// landed beforehand and its third still to land.
 impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>
     Op<
         Live<
             (
                 Staging<Hidden, Intermediate, Rows>,
-                (Down<Hidden, Intermediate>, Down<Hidden, Intermediate>),
+                Down<Hidden, Intermediate>,
             ),
             Capacity,
         >,
     > for DownWeights<Hidden, Intermediate>
 {
-    type Output = Ready<Hidden, Intermediate, Rows>;
+    type Output = Ready<Hidden, Intermediate, Rows, ()>;
 
     fn forward(
         &self,
@@ -424,14 +426,14 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
         staged: Live<
             (
                 Staging<Hidden, Intermediate, Rows>,
-                (Down<Hidden, Intermediate>, Down<Hidden, Intermediate>),
+                Down<Hidden, Intermediate>,
             ),
             Capacity,
         >,
     ) -> Self::Output {
         const { assert!(<m![{ Out<Intermediate> } / 64]>::SIZE == Panels::SIZE) };
         let (live, rows) = (staged.count::<axis::Rows<128>>(), staged.rows());
-        let (staging, (second, third)) = staged.into_value();
+        let (staging, second) = staged.into_value();
         let Staging {
             products,
             panels: (h0, h1, h2),
@@ -448,6 +450,36 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
             landed(&mut *context, stored, (1, &h1), (live, rows)),
             landed(&mut *context, stored, (2, &h2), (live, rows)),
         );
+        Ready {
+            weights: (first, second, ()),
+            inputs,
+            channels,
+        }
+    }
+}
+
+/// A down projection whose inputs landed, with its third weight panel, landed behind them.
+impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>
+    Op<(
+        Ready<Hidden, Intermediate, Rows, ()>,
+        Down<Hidden, Intermediate>,
+    )> for DownWeights<Hidden, Intermediate>
+{
+    type Output = Ready<Hidden, Intermediate, Rows>;
+
+    fn forward(
+        &self,
+        _: &mut Device,
+        (ready, third): (
+            Ready<Hidden, Intermediate, Rows, ()>,
+            Down<Hidden, Intermediate>,
+        ),
+    ) -> Self::Output {
+        let Ready {
+            weights: (first, second, ()),
+            inputs,
+            channels,
+        } = ready;
         Ready {
             weights: (first, second, third),
             inputs,

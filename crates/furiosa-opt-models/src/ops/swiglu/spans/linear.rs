@@ -211,7 +211,7 @@ where
 
 /// Nor does any of its input land before it projects: the product is the down projection's input.
 impl<Hidden, Intermediate, Rows, Capacity, T, Env>
-    Module<Live<(Lines<Rows, Intermediate>, ((), ())), Capacity>, Env, &mut ()>
+    Module<Live<(Lines<Rows, Intermediate>, ()), Capacity>, Env, &mut ()>
     for Linear<Intermediate, Hidden, Chip, T>
 where
     Hidden: AxisName,
@@ -227,9 +227,31 @@ where
         _: &mut Device,
         _: Env,
         _: &mut (),
-        staged: Live<(Lines<Rows, Intermediate>, ((), ())), Capacity>,
+        staged: Live<(Lines<Rows, Intermediate>, ()), Capacity>,
     ) -> Lines<Rows, Intermediate> {
         staged.into_value().0
+    }
+}
+
+/// Nor a weight panel after it.
+impl<Hidden, Intermediate, Rows, T, Env> Module<(Lines<Rows, Intermediate>, ()), Env, &mut ()>
+    for Linear<Intermediate, Hidden, Chip, T>
+where
+    Hidden: AxisName,
+    Intermediate: AxisName,
+    Rows: AxisName,
+    T: Matrix<In = Intermediate, Out = Hidden>,
+{
+    type Output = Lines<Rows, Intermediate>;
+
+    fn forward(
+        &self,
+        _: &mut Device,
+        _: Env,
+        _: &mut (),
+        (product, ()): (Lines<Rows, Intermediate>, ()),
+    ) -> Lines<Rows, Intermediate> {
+        product
     }
 }
 
