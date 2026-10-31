@@ -309,7 +309,8 @@ struct Text<G: Shape> {
     num_kv_shared_layers: Constant<0>,
     hidden_size_per_layer_input: Constant<0>,
     attention_k_eq_v: Enabled,
-    tie_word_embeddings: Enabled,
+    // Transformers' Gemma 4 configurations default to a tied head.
+    tie_word_embeddings: Option<Enabled>,
     final_logit_softcapping: Positive,
     #[serde(flatten, deserialize_with = "config::declared")]
     max_position_embeddings: NonZeroUsize,
@@ -339,7 +340,7 @@ impl<G: Shape, P: Forms, const S: usize, const F: usize, const O: &'static [Bran
             num_kv_shared_layers: Constant,
             hidden_size_per_layer_input: Constant,
             attention_k_eq_v: Enabled,
-            tie_word_embeddings: Enabled,
+            tie_word_embeddings: None | Some(Enabled),
             hidden_size: Size { .. },
             intermediate_size: Size { .. },
             num_attention_heads: Size { .. },
@@ -957,6 +958,25 @@ mod tests {
             let error = <Config>::parse(&document).err().unwrap();
             assert_eq!((error.kind(), error.to_string()), (kind, reason.into()));
         }
+    }
+
+    /// A config that omits the head's tying declares Gemma 4's tied head; an untied head is
+    /// unsupported.
+    #[test]
+    fn reads_an_omitted_tying_as_tied() {
+        let mut document = document::<super::Sizes, { super::ORDER }>();
+        let fields = document.as_object_mut().unwrap();
+        fields.remove("tie_word_embeddings");
+        <Config>::parse(&document).unwrap();
+        document["tie_word_embeddings"] = serde_json::json!(false);
+        let error = <Config>::parse(&document).err().unwrap();
+        assert_eq!(
+            (error.kind(), error.to_string()),
+            (
+                io::ErrorKind::Unsupported,
+                "tie_word_embeddings: found false, compiled true".into()
+            )
+        );
     }
 
     /// A vocabulary of at most the compiled rows is served; a larger one is unsupported.
