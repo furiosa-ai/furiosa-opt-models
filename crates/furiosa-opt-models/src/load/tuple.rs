@@ -74,4 +74,5 @@ macro_rules! tuples {
 tuples! {
     (A0 B0 a0 0, A1 B1 a1 1);
     (A0 B0 a0 0, A1 B1 a1 1, A2 B2 a2 2);
+    (A0 B0 a0 0, A1 B1 a1 1, A2 B2 a2 2, A3 B3 a3 3);
 }

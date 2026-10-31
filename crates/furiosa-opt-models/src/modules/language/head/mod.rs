@@ -453,9 +453,12 @@ where
 /// A sequence classifier's score head: one FP32 row of `H` coefficients a label, at most
 /// [`COLUMNS`] labels, whose scores of a row are its dot products with them.
 #[derive(DeviceSend)]
-pub struct Classifier<H: AxisName>(Affine<Weights<H>, Bias>);
+pub struct Classifier<H: AxisName, W = Weights<H>, B = Bias>(
+    Affine<W, B>,
+    std::marker::PhantomData<H>,
+);
 
-impl<H: AxisName> Classifier<H> {
+impl<H: AxisName, W: Borrow<Weights<H>>, B: Borrow<Bias>> Classifier<H, W, B> {
     /// The scores of the rows `selected` names among a launch's normalized rows `hidden`, label
     /// columns first, into the first rows of `scores`; called once the rows' last effect is issued.
     pub(crate) fn read<Capacity: AxisName>(
@@ -478,6 +481,15 @@ impl<H: AxisName> Classifier<H> {
                 ]>(tile.start()),
             );
         }
+    }
+}
+
+impl<'a, H: AxisName> Load<&'a Classifier<H>> for Classifier<H, &'a Weights<H>, &'a Bias> {
+    fn load(_: &mut Context<'_>, from: &'a Classifier<H>) -> Result<Self, LoadError> {
+        Ok(Self(
+            Affine::new(&from.0.weight, &from.0.bias),
+            std::marker::PhantomData,
+        ))
     }
 }
 
@@ -574,10 +586,10 @@ impl<'a, H: AxisName> Load<&'a Checkpoint> for Classifier<H> {
                 })
             });
             let weights = weights.collect::<Result<Vec<_>, _>>()?;
-            Ok(Self(Affine::new(
-                Slice::from(weights),
-                Slice::from(Vec::new()),
-            )))
+            Ok(Self(
+                Affine::new(Slice::from(weights), Slice::from(Vec::new())),
+                std::marker::PhantomData,
+            ))
         })
     }
 }

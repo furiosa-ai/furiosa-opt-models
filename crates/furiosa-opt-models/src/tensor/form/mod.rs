@@ -113,6 +113,28 @@ where
     }
 }
 
+/// A borrowed form copies its borrows of the tree's codes and scales.
+impl<'a, In, Out, E, S, B, C, Chips, W, T> Clone
+    for BlockScaled<In, Out, E, S, B, C, Chips, &'a W, &'a T>
+where
+    In: AxisName,
+    Out: AxisName,
+    E: Scalar,
+    S: Scalar,
+    B: M,
+    C: Copy,
+    Chips: M,
+{
+    fn clone(&self) -> Self {
+        Self {
+            weight: self.weight,
+            weight_scale: self.weight_scale,
+            contract: self.contract,
+            shape: PhantomData,
+        }
+    }
+}
+
 impl<In: AxisName, Out: AxisName, E: Scalar, S: Scalar, B: M, C, Chips: M, W, T>
     BlockScaled<In, Out, E, S, B, C, Chips, W, T>
 {

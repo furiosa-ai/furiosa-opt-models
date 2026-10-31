@@ -44,7 +44,7 @@ use crate::tensor::form::Weight;
 use crate::tensor::memory::Memory;
 use crate::tensor::parallel::Chip;
 use crate::tensor::scalar::F32;
-use catalog::Depth;
+pub use catalog::Depth;
 use furiosa_opt_std::prelude::*;
 
 pub mod fp8;
@@ -436,7 +436,7 @@ pub type Qwen3Model<
 mod catalog {
     /// The catalog binding of a size `S` in projection form `P`, at the count of layers the
     /// size's layer array holds, and its body.
-    pub trait Depth<S, P, C, X> {
+    pub trait Depth<S, P, C, X, K> {
         type Catalog;
         type Body;
     }
@@ -531,7 +531,7 @@ pub type Layer<S, P, C, X> = super::Qwen2Layer<
 
 /// The family's causal model of `N` layers over a size's axes and a form's projections:
 /// `Qwen3ForCausalLM`, or `LlamaForCausalLM` as Qwen2's.
-type Bound<S, P, C, X, const N: usize> = Qwen2ForCausalLM<
+type Bound<S, P, C, X, const N: usize, K = Stack> = Qwen2ForCausalLM<
     Embed<S, X>,
     Heads<S, P, X>,
     Rotary<HeadOf<S>, HeadOf<S>, C>,
@@ -544,24 +544,27 @@ type Bound<S, P, C, X, const N: usize> = Qwen2ForCausalLM<
     Add,
     LmHead<S, X>,
     N,
-    Stack,
+    K,
 >;
 
-impl<S: Geometry + Front + 'static, P: Form, C: Scalar, X: Memory, const N: usize> Depth<S, P, C, X>
-    for [(); N]
+impl<S: Geometry + Front + 'static, P: Form, C: Scalar, X: Memory, const N: usize, K>
+    Depth<S, P, C, X, K> for [(); N]
 where
     swiglu::Down<Intermediate<S>>: AxisName,
     Layer<S, P, C, X>: View<N>,
+    K: crate::modules::generic::collection::Kind<Layer<S, P, C, X>, N>,
 {
-    type Catalog = Bound<S, P, C, X, N>;
-    type Body = Bound<S, P, C, X, N>::Body;
+    type Catalog = Bound<S, P, C, X, N, K>;
+    type Body = Bound<S, P, C, X, N, K>::Body;
 }
 
 /// The one catalog binding of a size `S` in projection form `P` over memory `X`.
-pub type Catalog<S, P, C, X> = <<S as Geometry>::Layers<()> as Depth<S, P, C, X>>::Catalog;
+pub type Catalog<S, P, C, X, K = Stack> =
+    <<S as Geometry>::Layers<()> as Depth<S, P, C, X, K>>::Catalog;
 
 /// The catalog's body: the embedding, the layers and the final norm.
-pub type CatalogBody<S, P, C, X> = <<S as Geometry>::Layers<()> as Depth<S, P, C, X>>::Body;
+pub type CatalogBody<S, P, C, X, K = Stack> =
+    <<S as Geometry>::Layers<()> as Depth<S, P, C, X, K>>::Body;
 
 /// The wide tiles of the size `S`'s work: as many as a call of its rows takes when every row
 /// attends the whole context `S` is compiled for, so its call's work holds whatever it admits.

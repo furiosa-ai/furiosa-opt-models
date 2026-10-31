@@ -6,6 +6,8 @@ use crate::tensor::axis;
 use crate::tensor::live::Live;
 use core::marker::PhantomData;
 
+mod phase;
+
 /// A down panel's row scales, fetched into the VRF of every feature block.
 pub(super) struct FetchScales;
 
@@ -290,57 +292,6 @@ type Spilled<Intermediate, Rows> = (
     StagedScales<Intermediate, Rows>,
 );
 
-/// A tile's product staged for the down projection, then the first down panel landed.
-impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>
-    Op<Begin<Live<Halves<Intermediate, Rows>, Capacity>>> for DownWeights<Hidden, Intermediate>
-{
-    type Output = Staging<Hidden, Intermediate, Rows>;
-
-    fn forward(
-        &self,
-        context: &mut Device,
-        Begin(product): Begin<Live<Halves<Intermediate, Rows>, Capacity>>,
-    ) -> Self::Output {
-        let (products, panels, scales) = spill(&mut *context, product);
-        let first = self.forward(&mut *context, Begin(0));
-        Staging {
-            products,
-            panels,
-            scales,
-            first,
-        }
-    }
-}
-
-/// A tile's product staged for the down projection whose first down panel landed beforehand.
-impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>
-    Op<
-        Begin<(
-            Live<Halves<Intermediate, Rows>, Capacity>,
-            Down<Hidden, Intermediate>,
-        )>,
-    > for DownWeights<Hidden, Intermediate>
-{
-    type Output = Staging<Hidden, Intermediate, Rows>;
-
-    fn forward(
-        &self,
-        context: &mut Device,
-        Begin((product, first)): Begin<(
-            Live<Halves<Intermediate, Rows>, Capacity>,
-            Down<Hidden, Intermediate>,
-        )>,
-    ) -> Self::Output {
-        let (products, panels, scales) = spill(context, product);
-        Staging {
-            products,
-            panels,
-            scales,
-            first,
-        }
-    }
-}
-
 /// The down channel scales in data memory.
 type Channels<Hidden, Intermediate> =
     DmTensor<f32, Chip, Cluster<Intermediate>, m![Hidden / 16], m![Hidden % 16]>;
@@ -359,128 +310,6 @@ pub struct Ready<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName> {
         Landed<Hidden, Intermediate, Rows>,
     ),
     channels: Channels<Hidden, Intermediate>,
-}
-
-/// The down projection of a staged product, its second and third down panels landing between its
-/// first panels' work.
-impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>
-    Op<Live<Staging<Hidden, Intermediate, Rows>, Capacity>> for DownWeights<Hidden, Intermediate>
-{
-    type Output = Owned<Hidden, Rows>;
-
-    fn forward(
-        &self,
-        context: &mut Device,
-        staging: Live<Staging<Hidden, Intermediate, Rows>, Capacity>,
-    ) -> Self::Output {
-        const { assert!(<m![{ Out<Intermediate> } / 64]>::SIZE == Panels::SIZE) };
-        let (live, rows) = (staging.count::<axis::Rows<128>>(), staging.rows());
-        let Staging {
-            products,
-            panels: (h0, h1, h2),
-            scales,
-            first,
-        } = staging.into_value();
-        // SAFETY: the store's row digits are the span's rows in order.
-        let products: HbmTensor<bf16, Chip, Chunks<Intermediate, Rows>> =
-            unsafe { products.reshape() };
-        let channels = self.1.to_dm(&mut context.tdma);
-        // Every panel's input lands ahead of the projections, in the order they read it with their
-        // weight panels.
-        let stored = (&products, &scales);
-        let input0 = landed(&mut *context, stored, (0, &h0), (live, rows));
-        let input1 = landed(&mut *context, stored, (1, &h1), (live, rows));
-        let second = self.forward(&mut *context, Begin(1));
-        let input2 = landed(&mut *context, stored, (2, &h2), (live, rows));
-        let third = |context: &mut Device| self.forward(context, Begin(2));
-        let inputs = (input0, input1, input2);
-        projected(
-            context,
-            ((first, second), third),
-            (inputs, channels),
-            (live, rows),
-        )
-    }
-}
-
-/// A staged product's down panels' inputs and channel scales landed, its later two weight panels
-/// landed beforehand.
-impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>
-    Op<
-        Live<
-            (
-                Staging<Hidden, Intermediate, Rows>,
-                (Down<Hidden, Intermediate>, Down<Hidden, Intermediate>),
-            ),
-            Capacity,
-        >,
-    > for DownWeights<Hidden, Intermediate>
-{
-    type Output = Ready<Hidden, Intermediate, Rows>;
-
-    fn forward(
-        &self,
-        context: &mut Device,
-        staged: Live<
-            (
-                Staging<Hidden, Intermediate, Rows>,
-                (Down<Hidden, Intermediate>, Down<Hidden, Intermediate>),
-            ),
-            Capacity,
-        >,
-    ) -> Self::Output {
-        const { assert!(<m![{ Out<Intermediate> } / 64]>::SIZE == Panels::SIZE) };
-        let (live, rows) = (staged.count::<axis::Rows<128>>(), staged.rows());
-        let (staging, (second, third)) = staged.into_value();
-        let Staging {
-            products,
-            panels: (h0, h1, h2),
-            scales,
-            first,
-        } = staging;
-        // SAFETY: the store's row digits are the span's rows in order.
-        let products: HbmTensor<bf16, Chip, Chunks<Intermediate, Rows>> =
-            unsafe { products.reshape() };
-        let channels = self.1.to_dm(&mut context.tdma);
-        let stored = (&products, &scales);
-        let inputs = (
-            landed(&mut *context, stored, (0, &h0), (live, rows)),
-            landed(&mut *context, stored, (1, &h1), (live, rows)),
-            landed(&mut *context, stored, (2, &h2), (live, rows)),
-        );
-        Ready {
-            weights: (first, second, third),
-            inputs,
-            channels,
-        }
-    }
-}
-
-/// The down projection of a staged product whose weights and inputs landed.
-impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>
-    Op<Live<Ready<Hidden, Intermediate, Rows>, Capacity>> for DownWeights<Hidden, Intermediate>
-{
-    type Output = Owned<Hidden, Rows>;
-
-    fn forward(
-        &self,
-        context: &mut Device,
-        ready: Live<Ready<Hidden, Intermediate, Rows>, Capacity>,
-    ) -> Self::Output {
-        let (live, rows) = (ready.count::<axis::Rows<128>>(), ready.rows());
-        let Ready {
-            weights: (first, second, third),
-            inputs,
-            channels,
-        } = ready.into_value();
-        let third = |_: &mut Device| third;
-        projected(
-            context,
-            ((first, second), third),
-            (inputs, channels),
-            (live, rows),
-        )
-    }
 }
 
 /// A tile's product staged for the down projection: a span of more than two waves quantized by

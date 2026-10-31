@@ -65,9 +65,19 @@ impl<Hidden: AxisName, QWidth: AxisName, Env> Module<Begin<()>, Env, &mut ()>
     fn forward(&self, _: &mut Device, _: Env, _: &mut (), _: Begin<()>) {}
 }
 
+/// Nor does a borrowed one.
+impl<Hidden: AxisName, QWidth: AxisName, Env> Module<Begin<()>, Env, &mut ()>
+    for Affine<&HbmTensor<bf16, Chip, m![Hidden, QWidth]>, ()>
+{
+    type Output = ();
+
+    fn forward(&self, _: &mut Device, _: Env, _: &mut (), _: Begin<()>) {}
+}
+
 /// Nor does it stage anything while an attention's last history is in flight.
-impl<Hidden: AxisName, QWidth: AxisName, Env> Module<&mut (), Env, &mut ()>
-    for Affine<HbmTensor<bf16, Chip, m![Hidden, QWidth]>, ()>
+impl<Hidden: AxisName, QWidth: AxisName, W, Env> Module<&mut (), Env, &mut ()> for Affine<W, ()>
+where
+    W: Matrix<In = QWidth, Out = Hidden>,
 {
     type Output = ();
 
@@ -82,10 +92,11 @@ type Tile<'l, 'a, Capacity, Reach, KvHeads, Groups, Head> = (
 
 /// The dense projection takes the block-scaled form's steps, its first two doing nothing: begun,
 /// a tile is given back for its second step...
-impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head, Env>
+impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head, W, Env>
     Module<Begin<Begin<Tile<'l, 'a, Capacity, Reach, KvHeads, Groups, Head>>>, Env, &mut ()>
-    for Affine<HbmTensor<bf16, Chip, m![Hidden, QWidth]>, ()>
+    for Affine<W, ()>
 where
+    W: Matrix<In = QWidth, Out = Hidden>,
     Hidden: AxisName,
     QWidth: AxisName,
     Capacity: AxisName,
@@ -108,10 +119,11 @@ where
 }
 
 /// ...and after it for its last.
-impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head, Env>
+impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head, W, Env>
     Module<Begin<Tile<'l, 'a, Capacity, Reach, KvHeads, Groups, Head>>, Env, &mut ()>
-    for Affine<HbmTensor<bf16, Chip, m![Hidden, QWidth]>, ()>
+    for Affine<W, ()>
 where
+    W: Matrix<In = QWidth, Out = Hidden>,
     Hidden: AxisName,
     QWidth: AxisName,
     Capacity: AxisName,
@@ -134,10 +146,10 @@ where
 }
 
 /// A tile's last step: the tile's live rows projected, through HBM into the span's rows.
-impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head, Env: Copy>
-    Module<Tile<'l, 'a, Capacity, Reach, KvHeads, Groups, Head>, Env, &mut ()>
-    for Affine<HbmTensor<bf16, Chip, m![Hidden, QWidth]>, ()>
+impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head, W, Env: Copy>
+    Module<Tile<'l, 'a, Capacity, Reach, KvHeads, Groups, Head>, Env, &mut ()> for Affine<W, ()>
 where
+    W: Matrix<In = QWidth, Out = Hidden>,
     Hidden: AxisName,
     QWidth: AxisName,
     Capacity: AxisName,
@@ -156,7 +168,7 @@ where
         ((), attended): Tile<'l, 'a, Capacity, Reach, KvHeads, Groups, Head>,
     ) -> Self::Output {
         let tile = attended.with(());
-        Affine::new(&self.weight, ()).span(device, env, attended.into_value(), tile)
+        self.span(device, env, attended.into_value(), tile)
     }
 }
 
@@ -174,6 +186,7 @@ impl<
     KvHeads,
     Groups,
     Head,
+    W,
     Env,
     A,
     B,
@@ -184,8 +197,9 @@ impl<
         Tile<'l, 'a, Capacity, Reach, KvHeads, Groups, Head>,
         Env,
         &'s mut lora::Adapters<'t, lora::Term<A, B>, HbmTensor<bf16, Chip, m![Capacity, K]>, N>,
-    > for Affine<HbmTensor<bf16, Chip, m![Hidden, QWidth]>, ()>
+    > for Affine<W, ()>
 where
+    W: Matrix<In = QWidth, Out = Hidden>,
     Hidden: AxisName,
     QWidth: AxisName,
     Capacity: AxisName,
@@ -233,12 +247,7 @@ where
             unsafe { attended.into_value().view().alias() };
         let live = Live::<(), Reach>::all().subrange(tile.start(), tile.rows());
         let mut lines = HbmTensor::<bf16, Chip, m![Span, Hidden]>::new();
-        Affine::new(&self.weight, ()).forward(
-            &mut *device,
-            env,
-            &mut (),
-            (live, &attended, &mut lines),
-        );
+        self.forward(&mut *device, env, &mut (), (live, &attended, &mut lines));
         let lines = adapters.add(device, live, &attended, tile.start(), lines);
         lines.to_dm(&mut device.tdma)
     }
@@ -246,8 +255,8 @@ where
 
 /// The channel-scaled projection takes the dense projection's steps over its codes: it lands
 /// nothing before the attended rows arrive...
-impl<Hidden: AxisName, QWidth: AxisName, Env> Module<Begin<()>, Env, &mut ()>
-    for ChannelScaled<QWidth, Hidden>
+impl<Hidden: AxisName, QWidth: AxisName, C, S, Env> Module<Begin<()>, Env, &mut ()>
+    for Weight<m![Hidden, QWidth], Chip, fp8::ChannelScaled<QWidth, Hidden, C, S>>
 {
     type Output = ();
 
@@ -255,8 +264,8 @@ impl<Hidden: AxisName, QWidth: AxisName, Env> Module<Begin<()>, Env, &mut ()>
 }
 
 /// ...nor while an attention's last history is in flight...
-impl<Hidden: AxisName, QWidth: AxisName, Env> Module<&mut (), Env, &mut ()>
-    for ChannelScaled<QWidth, Hidden>
+impl<Hidden: AxisName, QWidth: AxisName, C, S, Env> Module<&mut (), Env, &mut ()>
+    for Weight<m![Hidden, QWidth], Chip, fp8::ChannelScaled<QWidth, Hidden, C, S>>
 {
     type Output = ();
 
@@ -264,9 +273,9 @@ impl<Hidden: AxisName, QWidth: AxisName, Env> Module<&mut (), Env, &mut ()>
 }
 
 /// ...gives a begun tile back for its second step and after it for its last...
-impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head, Env>
+impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head, C, S, Env>
     Module<Begin<Begin<Tile<'l, 'a, Capacity, Reach, KvHeads, Groups, Head>>>, Env, &mut ()>
-    for ChannelScaled<QWidth, Hidden>
+    for Weight<m![Hidden, QWidth], Chip, fp8::ChannelScaled<QWidth, Hidden, C, S>>
 where
     Hidden: AxisName,
     QWidth: AxisName,
@@ -289,9 +298,9 @@ where
     }
 }
 
-impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head, Env>
+impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head, C, S, Env>
     Module<Begin<Tile<'l, 'a, Capacity, Reach, KvHeads, Groups, Head>>, Env, &mut ()>
-    for ChannelScaled<QWidth, Hidden>
+    for Weight<m![Hidden, QWidth], Chip, fp8::ChannelScaled<QWidth, Hidden, C, S>>
 where
     Hidden: AxisName,
     QWidth: AxisName,
@@ -316,10 +325,11 @@ where
 
 /// ...and projects the tile's live attended rows in the last, restoring each weight slab from its
 /// codes.
-impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head, Env: Copy>
+impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head, C, S, Env: Copy>
     Module<Tile<'l, 'a, Capacity, Reach, KvHeads, Groups, Head>, Env, &mut ()>
-    for ChannelScaled<QWidth, Hidden>
+    for Weight<m![Hidden, QWidth], Chip, fp8::ChannelScaled<QWidth, Hidden, C, S>>
 where
+    fp8::ChannelScaled<QWidth, Hidden, C, S>: Matrix<In = QWidth, Out = Hidden>,
     Hidden: AxisName,
     QWidth: AxisName,
     Capacity: AxisName,

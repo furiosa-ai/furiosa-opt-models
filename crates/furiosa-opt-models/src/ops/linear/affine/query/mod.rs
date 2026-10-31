@@ -61,6 +61,7 @@ mod tests {
     use super::*;
     use crate::Begin;
     use crate::Module;
+    use crate::load::{Context, Load};
     use crate::modules::attention::{KeyValue, Projection};
     use crate::modules::generic::Either;
     use crate::ops::attention::full::head;
@@ -92,6 +93,11 @@ mod tests {
         Affine<Dense<H, QueryHeads, Head>, ()>,
         Affine<(Dense<H, KvHeads, Head>, ()), ()>,
         Affine<(Dense<H, KvHeads, Head>, ()), ()>,
+    >;
+    type Borrowed<'w> = Projection<
+        Affine<&'w Dense<H, QueryHeads, Head>, ()>,
+        Affine<(&'w Dense<H, KvHeads, Head>, ()), ()>,
+        Affine<(&'w Dense<H, KvHeads, Head>, ()), ()>,
     >;
     type Quantized = Projection<
         Affine<super::fp8::Weights<H, QueryHeads, Head, HeadSquares<QueryHeads>>, ()>,
@@ -188,9 +194,9 @@ mod tests {
         };
     }
 
-    project!(dense, Matrices, |live| Live::read(live));
+    project!(dense, Borrowed<'_>, |live| Live::read(live));
     project!(quantized, Quantized, |live| Live::read(live));
-    project!(dense_span, Matrices, |live| {
+    project!(dense_span, Borrowed<'_>, |live| {
         Live::read(live).tile::<Span>(1)
     });
     project!(quantized_span, Quantized, |live| {
@@ -324,6 +330,11 @@ mod tests {
         Affine<Dense<Narrow, Q, Head>, ()>,
         Affine<(Dense<Narrow, KvHeads, Head>, ()), ()>,
         Affine<(Dense<Narrow, KvHeads, Head>, ()), ()>,
+    >;
+    type BorrowedHeads<'w, Q> = Projection<
+        Affine<&'w Dense<Narrow, Q, Head>, ()>,
+        Affine<(&'w Dense<Narrow, KvHeads, Head>, ()), ()>,
+        Affine<(&'w Dense<Narrow, KvHeads, Head>, ()), ()>,
     >;
     /// A launch's queries, `G` for each key and value head, as attention reads them.
     type Grouped<G> = HbmTensor<bf16, Chip, m![All, KvHeads, G, Head]>;
@@ -500,11 +511,17 @@ mod tests {
         let weights = Weights::new(0x3c6e_f372_fe94_f82b);
         let matrices = weights.dense(&mut device).await;
         let run = async |device: &mut Device, p: &Matrices, input: &Input, live: &Value| {
-            launch(dense, (device, p, input, live)).await.unwrap()
+            let projection = Borrowed::load(&mut Context::new(None), p).unwrap();
+            launch(dense, (device, &projection, input, live))
+                .await
+                .unwrap()
         };
         check(&mut device, &matrices, run, &weights, (0.004, 0)).await;
         let run = async |device: &mut Device, p: &Matrices, input: &Input, live: &Value| {
-            launch(dense_span, (device, p, input, live)).await.unwrap()
+            let projection = Borrowed::load(&mut Context::new(None), p).unwrap();
+            launch(dense_span, (device, &projection, input, live))
+                .await
+                .unwrap()
         };
         check(&mut device, &matrices, run, &weights, (0.004, Span::SIZE)).await;
         let quantized_weights = weights.quantized(&mut device).await;
@@ -534,7 +551,7 @@ mod tests {
     #[device(chip = 1)]
     fn stored<Q: AxisName, G: AxisName>(
         device: &mut Device,
-        projection: &Heads<Q>,
+        projection: &BorrowedHeads<'_, Q>,
         norms: &(Norm, Norm),
         rotations: &Rotations,
         rows: &super::launch::Normalized<Narrow, All>,
@@ -695,9 +712,10 @@ mod tests {
             .to_hbm(&mut device.pdma)
             .await
             .unwrap();
+        let borrowed = BorrowedHeads::<Q>::load(&mut Context::new(None), &projection).unwrap();
         let arguments = (
             &mut *device,
-            &projection,
+            &borrowed,
             &norms,
             &rotations,
             &input,

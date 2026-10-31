@@ -656,10 +656,18 @@ pub mod form {
             Self::Key<Hidden, Heads, Head, X>;
         type Output<Queries: AxisName, Hidden: AxisName, X: Memory> =
             linear::Affine<X::Tensor<bf16, Chip, m![Hidden, Queries]>, ()>;
-        type GateUp<Hidden: AxisName, Intermediate: AxisName, X: Memory> =
-            linear::Linear<Hidden, swiglu::GateUp<Intermediate>, Chip>;
-        type Down<Hidden: AxisName, Intermediate: AxisName, X: Memory> =
-            linear::Linear<Intermediate, Hidden, Chip>;
+        type GateUp<Hidden: AxisName, Intermediate: AxisName, X: Memory> = linear::Linear<
+            Hidden,
+            swiglu::GateUp<Intermediate>,
+            Chip,
+            X::Tensor<bf16, Chip, m![{ Symbol<swiglu::GateUp<Intermediate>> }, Hidden]>,
+        >;
+        type Down<Hidden: AxisName, Intermediate: AxisName, X: Memory> = linear::Linear<
+            Intermediate,
+            Hidden,
+            Chip,
+            X::Tensor<bf16, Chip, m![Hidden, Intermediate]>,
+        >;
 
         const REQUIREMENT: Requirement = Requirement::Unquantized;
 
@@ -709,50 +717,7 @@ pub mod form {
         type Caches = (bf16, f8e4m3);
     }
 
-    impl Form for BlockScaled {
-        type Stored = f8e4m3;
-
-        type Of<In: AxisName, Out: AxisName, D: Scalar, Chips: M + 'static, X: Memory, V> =
-            tensor::form::BlockScaled<
-                In,
-                Out,
-                f8e4m3,
-                f32,
-                Scales<In, Out>,
-                Block,
-                Chips,
-                V,
-                X::Tensor<f32, Chips, Scales<In, Out>>,
-            >;
-
-        /// Each run of heads spread over the slices, the queries' and keys' with their heads'
-        /// squared scales, the values' with their heads' scales; every leaf in HBM, whatever `X`.
-        type Query<Hidden: AxisName, Heads: AxisName, Head: AxisName, X: Memory> = linear::Affine<
-            query::fp8::Weights<Hidden, Heads, Head, query::fp8::HeadSquares<Heads>>,
-            (),
-        >;
-        type Key<Hidden: AxisName, Heads: AxisName, Head: AxisName, X: Memory> = linear::Affine<
-            (
-                query::fp8::Weights<Hidden, Heads, Head, query::fp8::HeadSquares<Heads>>,
-                (),
-            ),
-            (),
-        >;
-        type Value<Hidden: AxisName, Heads: AxisName, Head: AxisName, X: Memory> = linear::Affine<
-            query::fp8::Weights<Hidden, Heads, Head, query::fp8::HeadScales<Heads, Head>>,
-            (),
-        >;
-        type Output<Queries: AxisName, Hidden: AxisName, X: Memory> =
-            output::fp8::Stored<Hidden, Queries>;
-        type GateUp<Hidden: AxisName, Intermediate: AxisName, X: Memory> =
-            swiglu::spans::fp8::GateUpWeights<Hidden, Intermediate>;
-        type Down<Hidden: AxisName, Intermediate: AxisName, X: Memory> =
-            swiglu::spans::fp8::DownWeights<Hidden, Intermediate>;
-
-        const REQUIREMENT: Requirement = Requirement::Declared(Declaration::Fp8(Scheme::Block));
-
-        type Caches = (bf16,);
-    }
+    mod block;
 
     impl Form for Nvfp4 {
         type Stored = f4e2m1;

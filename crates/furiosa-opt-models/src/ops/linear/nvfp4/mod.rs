@@ -101,8 +101,8 @@ where
         // rows a pass so a pass's block scales fit the vector registers.
         let read = |device: &mut Device, index: usize| -> Tile<I, O> {
             let coded = (
-                OneRow::<I, O>::to_dm(device, self.codes(), index),
-                OneRow::<I, O>::to_dm(device, self.scales(), index),
+                OneRow::<I, O>::to_dm(device, self.codes().view(), index),
+                OneRow::<I, O>::to_dm(device, self.scales().view(), index),
             );
             Self::restore::<_, _, _, _, m![{ Elements<O> } / 2], m![{ Elements<O> } % 2], _, _>(
                 device,
