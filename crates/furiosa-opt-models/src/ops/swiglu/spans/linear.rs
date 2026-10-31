@@ -9,7 +9,7 @@ use crate::ops::linear::{Affine, Linear, Matrix};
 use crate::ops::normalization::span::Owned;
 use crate::ops::pointwise::SwiGlu;
 use crate::ops::swiglu::GateUp;
-use crate::tensor::live::Live;
+use crate::tensor::live::{Fill, Live};
 use crate::tensor::parallel::Chip;
 use furiosa_opt_std::prelude::*;
 
@@ -302,6 +302,7 @@ where
     Rows: AxisName,
     Capacity: AxisName,
     T: Matrix<In = Intermediate, Out = Hidden>,
+    Lines<Rows, Hidden>: Fill<Device, Live<(), Rows>, Rows = Owned<Hidden, Rows>>,
 {
     type Output = Owned<Hidden, Rows>;
 
@@ -323,6 +324,6 @@ where
                 &mut projected,
             ),
         );
-        projected.to_dm(&mut context.tdma)
+        projected.fill(context, Live::all().subrange(0, product.rows()))
     }
 }
