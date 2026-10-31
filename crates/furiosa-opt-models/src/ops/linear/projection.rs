@@ -1,6 +1,6 @@
 //! Single-row BF16 projections that read the weight four output rows of each block at a time.
 
-use super::kernel::{Contraction, Rounded, Tiling};
+use super::kernel::{Contraction, Rounded, Rounding, Tiling};
 use super::{Affine, Matrix};
 use crate::ops::normalization::Spread;
 use crate::tensor::form::BlockScaled;
@@ -49,30 +49,26 @@ pub(super) type Summed<'l, Stage, X, O, Rows> = VectorTensor<
 pub(super) struct Partials<O, Rows>(PhantomData<(O, Rows)>);
 
 impl<O: AxisName, Rows: M> Partials<O, Rows> {
-    /// Each slice's `partial` sums added over the row's parts, in four lanes for the scales.
-    pub(super) fn reduced<'l, X: M, S: M, E: M>(
+    /// Each slice's `partial` sums added over the row's parts, times the scales `scale` applies in
+    /// four lanes, rounded once to `T`, a slice's outputs a packet, as the stream a caller commits.
+    pub(super) fn restored<'l, T: MaterializableScalar, X: M, S: M, E: M>(
         main: &'l mut TuContext<{ Tu::Main }>,
         partial: DmTensorView<'l, f32, X, Cluster, S, E>,
-    ) -> Summed<'l, stage::Narrow, X, O, Rows> {
-        main.begin(partial)
+        scale: impl FnOnce(Summed<'l, stage::Narrow, X, O, Rows>) -> Summed<'l, stage::Fp, X, O, Rows>,
+    ) -> CommitTrimTensor<'l, { Tu::Main }, T, X, Cluster, Reduced<O>, m![1], Rows>
+    where
+        f32: CastEngineCast<T>,
+    {
+        let summed = main
+            .begin(partial)
             .fetch::<Rows, m![1 # 8]>()
             .collect::<Rows, m![1 # 8]>()
             .vector_init()
             .vector_inter_slice_reduce::<Reduced<O>, Rows>(InterSliceReduceOpF32::Add)
             .vector_intra_slice_tag(TagMode::Zero)
-            .vector_narrow_trim::<m![1 # 4]>()
-    }
-
-    /// The `scaled` sums rounded once to `T`, a slice's outputs in one packet, as the stream a
-    /// caller commits.
-    pub(super) fn rounded<'l, T: MaterializableScalar, X: M>(
-        scaled: Summed<'l, stage::Fp, X, O, Rows>,
-    ) -> CommitTrimTensor<'l, { Tu::Main }, T, X, Cluster, Reduced<O>, m![1], Rows>
-    where
-        f32: CastEngineCast<T>,
-    {
+            .vector_narrow_trim::<m![1 # 4]>();
         Rounded::rounded::<T, _, _, _, _, m![1], m![1], Rows, _>(
-            scaled.vector_widen_pad::<m![1 # 8]>().vector_final(),
+            scale(summed).vector_widen_pad::<m![1 # 8]>().vector_final(),
         )
     }
 }
@@ -139,12 +135,22 @@ impl<I: AxisName, O: AxisName, Chip: M, W: Matrix<Chip, In = I, Out = O>>
         for block in 0..(O::SIZE / 256) {
             let index = 4 * block;
             let tile = self.weight.tile::<OneRow<I, O>>(device, index);
-            Rounded::finish::<_, _, _, _, _, m![1], Elements<O>, _, _, _>(
-                Contraction::<I, O>::sums(device, &tile, &input)
-                    .vector_init()
-                    .vector_inter_slice_reduce::<Reduced<O>, m![{ Elements<O> }, 1]>(
-                        InterSliceReduceOpF32::Add,
-                    ),
+            bf16::finish::<
+                Reduced<O>,
+                m![{ Elements<O> }, 1],
+                m![1],
+                m![1],
+                Elements<O>,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+            >(
+                &(),
+                Contraction::<I, O>::sums(device, &tile, &input),
                 output
                     .view_mut()
                     .tile::<m![O % ({ Block<O> })], 4, m![{ Elements<O> } #{!} ({ Block<O> })]>(

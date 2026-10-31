@@ -13,23 +13,22 @@
 use core::marker::PhantomData;
 
 use super::Matrix;
-use super::kernel::{Contraction, Rounded, Tiling, Unrounded};
+use super::kernel::{Contraction, Grid, Offset, Rounding, Tiling};
 use crate::Op;
 use crate::specialize::contraction;
 use furiosa_opt_std::prelude::*;
 
-/// Rows projected by `weight` plus `bias`, block by block, into `Out` rows.
-pub(crate) struct Projection<'a, I: AxisName, O: AxisName, R: AxisName, Chips: M, Bias, Out = bf16>
-{
+/// Rows projected by `weight` plus `bias`, block by block, into `D` rows.
+pub(crate) struct Projection<'a, I: AxisName, O: AxisName, R: AxisName, Chips: M, F, D = bf16> {
     weight: &'a HbmTensor<bf16, Chips, m![O, I]>,
-    bias: &'a Bias,
-    rows: PhantomData<(R, Out)>,
+    bias: &'a F,
+    rows: PhantomData<(R, D)>,
 }
 
-impl<'a, I: AxisName, O: AxisName, R: AxisName, Chips: M, Bias, Out>
-    Projection<'a, I, O, R, Chips, Bias, Out>
+impl<'a, I: AxisName, O: AxisName, R: AxisName, Chips: M, F, D>
+    Projection<'a, I, O, R, Chips, F, D>
 {
-    pub(crate) const fn new(weight: &'a HbmTensor<bf16, Chips, m![O, I]>, bias: &'a Bias) -> Self {
+    pub(crate) const fn new(weight: &'a HbmTensor<bf16, Chips, m![O, I]>, bias: &'a F) -> Self {
         Self {
             weight,
             bias,
@@ -37,9 +36,6 @@ impl<'a, I: AxisName, O: AxisName, R: AxisName, Chips: M, Bias, Out>
         }
     }
 }
-
-/// BF16 elements one register fill holds a slice: one bank, so the next fill takes the other.
-const REGISTER: usize = 16_384;
 
 #[derive(Clone, Copy)]
 struct Config {
@@ -50,23 +46,15 @@ struct Config {
     passes: usize,
 }
 
-/// The row tile of `(input, output)` at a cluster's rows of `rows`, checked against the register,
-/// slab and slice geometry so a tile that cannot hold fails to compile.
+/// The row tile of `(input, output)` at a cluster's rows of `rows`.
 impl Config {
     const fn new(input: usize, output: usize, rows: usize) -> Self {
         let (parts, kept, passes) = contraction::row_tile(input, output, contraction::half(rows));
-        let tiling = Config {
+        Config {
             parts,
             kept,
             passes,
-        };
-        let chunk = input / parts;
-        let outputs = tiling.outputs(rows);
-        assert!(input.is_multiple_of(parts) && chunk.is_multiple_of(4));
-        assert!(contraction::half(rows) * chunk <= REGISTER);
-        assert!(kept.is_multiple_of(8) && outputs * chunk * 2 <= contraction::SLAB);
-        assert!(256 / parts * outputs * passes == output);
-        tiling
+        }
     }
 
     /// Outputs a slice computes in a pass: the reduction spreads them over its K groups, kept a
@@ -230,30 +218,30 @@ type Heads<I, O, R, H> = m![
     O % ({ Symbol<H> })
 ];
 
-impl<'s, 't, I, O, R, Chips, Bias, Out, SourceOrder, SinkOrder, S, T> Op<(&'s S, &'t mut T)>
-    for Projection<'_, I, O, R, Chips, Bias, Out>
+impl<'s, 't, I, O, R, Chips, F, D, SourceOrder, SinkOrder, S, T> Op<(&'s S, &'t mut T)>
+    for Projection<'_, I, O, R, Chips, F, D>
 where
     I: AxisName,
     O: AxisName,
     R: AxisName,
     Chips: M,
-    Bias: Offset<I, O, R, Chips>,
-    Out: Rounding,
+    F: Bias<I, O, R, Chips>,
+    D: Rounding,
     SourceOrder: M,
     SinkOrder: M,
     S: Source<I, O, R, Chips, Order = SourceOrder>,
-    T: Sink<Out, I, O, R, Chips, Order = SinkOrder>,
+    T: Sink<D, I, O, R, Chips, Order = SinkOrder>,
 {
     type Output = ();
 
     fn forward(&self, device: &mut Device, (rows, output): (&'s S, &'t mut T)) {
         for pass in 0..<Passes<I, O, R> as AxisName>::SIZE {
-            Pass::<_, Out, SinkOrder>(self, PhantomData).forward(
+            Pass::<_, D, SinkOrder>(self, PhantomData).forward(
                 device,
                 (
                     pass,
                     rows,
-                    |device: &mut Device, kept: &Result<Out, I, O, R, Chips, SinkOrder>, block| {
+                    |device: &mut Device, kept: &Result<D, I, O, R, Chips, SinkOrder>, block| {
                         output.store(device, kept, (block, pass))
                     },
                 ),
@@ -366,14 +354,14 @@ impl<
     O: AxisName,
     R: AxisName,
     Chips: M,
-    Bias: Offset<I, O, R, Chips>,
+    F: Bias<I, O, R, Chips>,
     Scalar,
     D,
     SourceOrder,
     SinkOrder,
     S,
     Store,
-> Op<(usize, &'s S, Store)> for Pass<'_, Projection<'_, I, O, R, Chips, Bias, Scalar>, D, SinkOrder>
+> Op<(usize, &'s S, Store)> for Pass<'_, Projection<'_, I, O, R, Chips, F, Scalar>, D, SinkOrder>
 where
     D: Rounding,
     SourceOrder: M,
@@ -410,21 +398,44 @@ where
         }
         let slab: Weight<I, O, R, Chips> = self.0.weight.tile::<Chunked<I, O, R>>(device, pass);
         let offsets = self.0.bias.pass(device, pass);
+        // One block's rows by the pass's weight: every output of the pass for the cluster's rows.
+        let contract = |device: &mut Device,
+                        register: &Register<I, O, R, Chips>,
+                        kept: &mut Result<D, I, O, R, Chips, SinkOrder>| {
+            D::finish::<
+                Kept<I, O, R>,
+                m![O % ({ Nr<I, O, R> }) / 8, O % 8],
+                m![{ B<R> } % 8],
+                m![{ D::Packets<m![O % ({ Nr<I, O, R> })]> }, { B<R> } % 8],
+                D::Packet<O>,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+            >(
+                &offsets,
+                Chunked::<I, O, R>::packets(device, &slab, register),
+                kept.view_mut(),
+            );
+        };
         // Block b contracts while block b + 1 fills and block b + 2 arrives.
         for pair in 0..blocks / 2 {
             let block = 2 * pair;
             let register = fill(device, &first);
-            Bias::contract::<D, SinkOrder>(device, (&slab, &offsets), &register, &mut kept);
+            contract(device, &register, &mut kept);
             let next = fill(device, &second);
             rows.to_dm(device, (block + 2).min(blocks - 1), &mut first);
             store(device, &kept, block);
-            Bias::contract::<D, SinkOrder>(device, (&slab, &offsets), &next, &mut held);
+            contract(device, &next, &mut held);
             rows.to_dm(device, (block + 3).min(blocks - 1), &mut second);
             store(device, &held, block + 1);
         }
         if const { <Bs<R> as M>::SIZE % 2 == 1 } {
             let register = fill(device, &first);
-            Bias::contract::<D, SinkOrder>(device, (&slab, &offsets), &register, &mut kept);
+            contract(device, &register, &mut kept);
             store(device, &kept, blocks - 1);
         }
     }
@@ -493,72 +504,13 @@ impl<I: AxisName, O: AxisName, R: AxisName, Chips: M, H: AxisName> Source<I, O, 
     }
 }
 
-/// What a pass adds to its FP32 sums before they round: nothing, or every output's bias.
-pub(crate) trait Offset<I: AxisName, O: AxisName, R: AxisName, Chips: M> {
-    /// The operand a pass reads.
-    type Pass;
+/// A projection's bias: none, or an FP32 value of each output, as each weight pass adds it.
+pub(crate) trait Bias<I: AxisName, O: AxisName, R: AxisName, Chips: M> {
+    /// What a pass adds to its K groups' FP32 sums before they meet.
+    type Pass: Offset<Chips, Cluster<R>, Slices<I, O, R>>;
 
-    /// The operand of pass `pass`.
+    /// The offset of pass `pass`.
     fn pass(&self, device: &mut Device, pass: usize) -> Self::Pass;
-
-    /// One block's rows by the pass's weight: every output of the pass for the cluster's rows.
-    fn contract<D: Rounding, E: M>(
-        device: &mut Device,
-        pass: (&Weight<I, O, R, Chips>, &Self::Pass),
-        register: &Register<I, O, R, Chips>,
-        kept: &mut Result<D, I, O, R, Chips, E>,
-    );
-}
-
-/// The reduced FP32 sums of a block, one stream a slice of eight rows by its kept outputs.
-type Reduced<'l, I, O, R, C> = VectorFinalTensor<
-    'l,
-    { Tu::Main },
-    f32,
-    C,
-    Cluster<R>,
-    Kept<I, O, R>,
-    m![O % ({ Nr<I, O, R> }) / 8, O % 8],
-    m![{ B<R> } % 8],
->;
-
-/// How a block's FP32 sums are stored: rounded once to BF16, or as they are.
-pub(crate) trait Rounding: MaterializableScalar {
-    fn to_dm<I: AxisName, O: AxisName, R: AxisName, Chips: M, E: M>(
-        sums: Reduced<'_, I, O, R, Chips>,
-        kept: &mut Result<Self, I, O, R, Chips, E>,
-    );
-}
-
-impl Rounding for bf16 {
-    fn to_dm<I: AxisName, O: AxisName, R: AxisName, Chips: M, E: M>(
-        sums: Reduced<'_, I, O, R, Chips>,
-        kept: &mut Result<bf16, I, O, R, Chips, E>,
-    ) {
-        Rounded::tail::<
-            _,
-            _,
-            _,
-            _,
-            m![{ B<R> } % 8],
-            m![O % ({ Nr<I, O, R> }) / 4, { B<R> } % 8],
-            m![O % 4],
-            _,
-            _,
-        >(sums, kept.view_mut());
-    }
-}
-
-impl Rounding for f32 {
-    fn to_dm<I: AxisName, O: AxisName, R: AxisName, Chips: M, E: M>(
-        sums: Reduced<'_, I, O, R, Chips>,
-        kept: &mut Result<f32, I, O, R, Chips, E>,
-    ) {
-        Unrounded::tail::<_, _, _, _, m![O % ({ Nr<I, O, R> }) / 2, { B<R> } % 8], m![O % 2], _>(
-            sums,
-        )
-        .commit_view(kept.view_mut());
-    }
 }
 
 // The outputs stay one stream digit until the lane fold: the accumulator check reads a split
@@ -587,14 +539,13 @@ impl<I: AxisName, O: AxisName, R: AxisName> Chunked<I, O, R> {
         Folded<I, O, R>,
         m![{ B<R> } % 8],
     > {
-        Contraction::<I, O>::packets::<
+        Contraction::<I, O>::contract::<
+            Grid<m![O % 8], Folded<I, O, R>, 4>,
+            bf16,
             m![O % ({ Ns<I, O, R> }) / 8],
             m![I % ({ Ks<I, O, R> }) / 4],
-            m![O % 8],
             m![{ B<R> } % ({ Hr<R> }) / 8],
-            Folded<I, O, R>,
             m![{ B<R> } % 8],
-            4,
             _,
             _,
             _,
@@ -605,25 +556,10 @@ impl<I: AxisName, O: AxisName, R: AxisName> Chunked<I, O, R> {
     }
 }
 
-impl<I: AxisName, O: AxisName, R: AxisName, Chips: M> Offset<I, O, R, Chips> for () {
+impl<I: AxisName, O: AxisName, R: AxisName, Chips: M> Bias<I, O, R, Chips> for () {
     type Pass = ();
 
     fn pass(&self, _: &mut Device, _: usize) {}
-
-    fn contract<D: Rounding, E: M>(
-        device: &mut Device,
-        (weight, ()): (&Weight<I, O, R, Chips>, &()),
-        register: &Register<I, O, R, Chips>,
-        kept: &mut Result<D, I, O, R, Chips, E>,
-    ) {
-        let sums = Chunked::<I, O, R>::packets(device, weight, register)
-            .vector_init()
-            .vector_inter_slice_reduce::<Kept<I, O, R>, m![O % ({ Nr<I, O, R> }) / 8, O % 8]>(
-                InterSliceReduceOpF32::Add,
-            )
-            .vector_final();
-        D::to_dm(sums, kept);
-    }
 }
 
 /// A pass's outputs' bias divided by the K groups, which is exact, in every K group's slices: the
@@ -636,7 +572,7 @@ type Offsets<I, O, R, Chips> = VrfTensor<
     m![O % ({ Ns<I, O, R> }) / ({ Nr<I, O, R> }), O % ({ Nr<I, O, R> }) / 8, O % 8],
 >;
 
-impl<I: AxisName, O: AxisName, R: AxisName, Chips: M> Offset<I, O, R, Chips>
+impl<I: AxisName, O: AxisName, R: AxisName, Chips: M> Bias<I, O, R, Chips>
     for HbmTensor<f32, Chips, m![O]>
 {
     type Pass = Offsets<I, O, R, Chips>;
@@ -663,23 +599,6 @@ impl<I: AxisName, O: AxisName, R: AxisName, Chips: M> Offset<I, O, R, Chips>
             .vector_widen_concat::<Group<I, O, R>, m![O % 8]>()
             .vector_final()
             .to_vrf(&mut device.sub)
-    }
-
-    fn contract<D: Rounding, E: M>(
-        device: &mut Device,
-        (weight, offsets): (&Weight<I, O, R, Chips>, &Offsets<I, O, R, Chips>),
-        register: &Register<I, O, R, Chips>,
-        kept: &mut Result<D, I, O, R, Chips, E>,
-    ) {
-        let sums = Chunked::<I, O, R>::packets(device, weight, register)
-            .vector_init()
-            .vector_intra_slice_tag(TagMode::Zero)
-            .vector_clip(ClipBinaryOpF32::Add, offsets)
-            .vector_inter_slice_reduce::<Kept<I, O, R>, m![O % ({ Nr<I, O, R> }) / 8, O % 8]>(
-                InterSliceReduceOpF32::Add,
-            )
-            .vector_final();
-        D::to_dm(sums, kept);
     }
 }
 

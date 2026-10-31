@@ -180,6 +180,36 @@ pub(crate) type Element<In, Out, Rows> =
 pub(crate) type Result<In, Out, Rows, X = m![1]> =
     DmTensor<bf16, X, Cluster<In, Out>, Reduced<In, Out>, Element<In, Out, Rows>>;
 
+/// The cells of a [`Table`] one slab writes for one batch of `B` of the `Rows`, to write.
+type CellsMut<'a, D, In, Out, Rows, B, X> = DmTensorViewMut<
+    'a,
+    D,
+    X,
+    Cluster<In, Out>,
+    Reduced<In, Out>,
+    m![
+        { SlabSelected<In, Out> },
+        Rows / B = 1 #{!} (Rows / B),
+        Rows % B,
+        { <D as Rounding>::Packets<m![Out % ({ Block<In, Out> })]> },
+        { <D as Rounding>::Packet<Out> }
+    ],
+>;
+
+/// The outputs as `D`: each slab's outputs of each row, in eight-byte packets.
+type Table<D, In, Out, Rows, X> = DmTensor<
+    D,
+    X,
+    Cluster<In, Out>,
+    Reduced<In, Out>,
+    m![
+        { SlabIndex<In, Out> },
+        Rows,
+        { <D as Rounding>::Packets<m![Out % ({ Block<In, Out> })]> },
+        { <D as Rounding>::Packet<Out> }
+    ],
+>;
+
 type Resident<In, Out, X = m![1]> = DmTensor<
     bf16,
     X,
@@ -246,7 +276,7 @@ type Word<D> = Symbol<mapping::Packet<D>>;
 
 /// The elements of `D` one contraction step takes: two DMA packets.
 #[derive(Clone, Debug)]
-struct Step<D>(PhantomData<D>);
+pub(crate) struct Step<D>(PhantomData<D>);
 
 impl<D: Scalar> AxisName for Step<D> {
     const NAME: Ident = Ident::new("Step");
@@ -344,30 +374,20 @@ impl<In: AxisName, Out: AxisName, Rows: AxisName, B: AxisName, V: Source> crate:
     type Output = Staged<In, Out, Rows, V::Chips>;
 
     fn forward(&self, device: &mut Device, input: V) -> Self::Output {
+        /// The rows of `input` copied whole into the layout their route reads.
+        fn copied<V: Source, C: M, S: M, E: M>(
+            device: &mut Device,
+            input: V,
+        ) -> DmTensor<bf16, V::Chips, C, S, E> {
+            let mut rows = DmTensor::new();
+            input.copy(device, rows.view_mut());
+            rows
+        }
         match const { Staged::<In, Out, Rows, V::Chips>::route::<B>() } {
-            Routing::Replicated => {
-                let mut rows = DmTensor::new();
-                input.copy(device, rows.view_mut());
-                Staged::Replicated(rows)
-            }
-
-            Routing::Transposed => {
-                let mut rows = DmTensor::new();
-                input.copy(device, rows.view_mut());
-                Staged::Transposed(rows)
-            }
-
-            Routing::Ring => {
-                let mut rows = DmTensor::new();
-                input.copy(device, rows.view_mut());
-                Staged::Ring(rows)
-            }
-
-            Routing::Chunk => {
-                let mut rows = DmTensor::new();
-                input.copy(device, rows.view_mut());
-                Staged::Chunk(rows)
-            }
+            Routing::Replicated => Staged::Replicated(copied(device, input)),
+            Routing::Transposed => Staged::Transposed(copied(device, input)),
+            Routing::Ring => Staged::Ring(copied(device, input)),
+            Routing::Chunk => Staged::Chunk(copied(device, input)),
         }
     }
 }
@@ -497,67 +517,57 @@ where
         (live, input, group): (Live<PhantomData<Rows>, Rows>, V, Group),
     ) -> Self::Output {
         if live.count::<axis::Lanes<Rows>>() == <Groups<Rows> as M>::SIZE {
-            return Contraction::<In, Out>::resident(device, &self.weight, input, |_, _| Rounded);
+            return Contraction::<In, Out>::resident(device, &self.weight, input, |_, _| ());
         }
-        let rows = {
-            match const { Staged::<In, Out, Rows>::route::<axis::Lanes<Rows>>() } {
-                Routing::Replicated => {
-                    let mut rows: Replicated<In, Out, Rows> = DmTensor::new();
-                    for at in 0..live.count::<axis::Lanes<Rows>>() {
-                        group(at).copy(
-                            &mut *device,
-                            rows.view_mut().tile::<
-                                Layout<Rows>::Groups,
-                                1,
-                                Layout<Rows>::GroupMut<Chunked<In, Out>>,
-                            >(at),
-                        );
-                    }
-                    Staged::<In, Out, Rows>::Replicated(rows)
-                }
-                Routing::Transposed => {
-                    let mut rows: Transposed<In, Out, Rows> = DmTensor::new();
-                    for at in 0..live.count::<axis::Lanes<Rows>>() {
-                        group(at).copy(
-                            &mut *device,
-                            rows.view_mut().tile::<
-                                Layout<Rows>::Groups,
-                                1,
-                                m![1, { Layout<Rows>::SelectedMut }, In % ({ Packet<Rows> })],
-                            >(at),
-                        );
-                    }
-                    Staged::<In, Out, Rows>::Transposed(rows)
-                }
-                Routing::Ring => {
-                    let mut rows: Ring<In, Out, Rows> = DmTensor::new();
-                    for at in 0..live.count::<axis::Lanes<Rows>>() {
-                        group(at).copy(
-                            &mut *device,
-                            rows.view_mut().tile::<
-                                Layout<Rows>::Groups,
-                                1,
-                                m![1, { Layout<Rows>::GroupMut<m![In % 16]> }],
-                            >(at),
-                        );
-                    }
-                    Staged::<In, Out, Rows>::Ring(rows)
-                }
-                Routing::Chunk => {
-                    let mut rows: ChunkRows<In, Out, Rows> = DmTensor::new();
-                    for at in 0..live.count::<axis::Lanes<Rows>>() {
-                        group(at).copy(
-                            &mut *device,
-                            rows.view_mut().tile::<
-                                Layout<Rows>::Groups,
-                                1,
-                                m![1, { Layout<Rows>::GroupMut<Chunked<In, Out>> }],
-                            >(at),
-                        );
-                    }
-                    Staged::<In, Out, Rows>::Chunk(rows)
-                }
+        /// The live lane groups of the rows, each copied from where `group` reads it into its tile
+        /// `T` of the layout their route reads.
+        fn grouped<Rows: AxisName, T: M, U: Source, C: M, S: M, E: M>(
+            device: &mut Device,
+            live: &Live<PhantomData<Rows>, Rows>,
+            (group, _): (&impl Fn(usize) -> U, PhantomData<T>),
+        ) -> DmTensor<bf16, U::Chips, C, S, E> {
+            let mut rows = DmTensor::new();
+            for at in 0..live.count::<axis::Lanes<Rows>>() {
+                group(at).copy(
+                    &mut *device,
+                    rows.view_mut().tile::<Layout<Rows>::Groups, 1, T>(at),
+                );
             }
+            rows
+        }
+        let rows = match const { Staged::<In, Out, Rows>::route::<axis::Lanes<Rows>>() } {
+            Routing::Replicated => Staged::Replicated(grouped(
+                device,
+                &live,
+                (
+                    &group,
+                    PhantomData::<Layout<Rows>::GroupMut<Chunked<In, Out>>>,
+                ),
+            )),
+            Routing::Transposed => Staged::Transposed(grouped(
+                device,
+                &live,
+                (
+                    &group,
+                    PhantomData::<m![1, { Layout<Rows>::SelectedMut }, In % ({ Packet<Rows> })]>,
+                ),
+            )),
+            Routing::Ring => Staged::Ring(grouped(
+                device,
+                &live,
+                (
+                    &group,
+                    PhantomData::<m![1, { Layout<Rows>::GroupMut<m![In % 16]> }]>,
+                ),
+            )),
+            Routing::Chunk => Staged::Chunk(grouped(
+                device,
+                &live,
+                (
+                    &group,
+                    PhantomData::<m![1, { Layout<Rows>::GroupMut<Chunked<In, Out>> }]>,
+                ),
+            )),
         };
         let mut result = DmTensor::new();
         #[unroll]
@@ -565,11 +575,11 @@ where
             let weight = self.weight.tile::<Contraction<In, Out>>(device, slab);
             for group in 0..live.count::<axis::Lanes<Rows>>() {
                 let lanes = rows.forward(&mut *device, (group, PhantomData::<axis::Lanes<Rows>>));
-                Rounded.store(
+                Contraction::<In, Out>::store::<_, axis::Lanes<Rows>, _, bf16, _>(
+                    &(),
                     Contraction::<In, Out>::sums(device, &weight, &lanes),
                     &mut result,
-                    slab,
-                    group,
+                    (slab, group),
                 );
             }
         }
@@ -802,12 +812,12 @@ where
                         In
                     ]>(band),
                 );
-                let mut result: Wide<In, Out, B<Rows>, Chips> = DmTensor::new();
-                Contraction::<In, Out>::batches::<_, Batch<In, Out, B<Rows>>, _, _>(
+                let mut result: Table<f32, In, Out, B<Rows>, Chips> = DmTensor::new();
+                Contraction::<In, Out>::batches::<_, Batch<In, Out, B<Rows>>, _, f32, _>(
                     device,
                     &rows,
                     &weight,
-                    &Unrounded,
+                    &(),
                     &mut result,
                     at,
                 );
@@ -898,7 +908,93 @@ type Sums<'l, In, Out, Rows, B, X> = ContractTensor<
     m![{ Layout<Rows>::Lanes } # 8],
 >;
 
+/// How a contraction packs a slice's weight against the lanes: the packets it fetches and
+/// collects, the steps it contracts with their outputs, and the order the lanes fold the sums in.
+pub(crate) trait Packing<In: AxisName, D: Scalar, Rows: M, Inputs: M, Time: M, Lane: M> {
+    type Fetched: M;
+    type Fetch: M;
+    type Collected: M;
+    type Collect: M;
+    type Steps: M;
+    type Step: M;
+    type Outputs: M;
+    type Folded: M;
+    type Lanes: M;
+}
+
+/// A packet of one output's `D` inputs, two packets a step: `Rows` outputs by `Inputs` inputs.
+pub(crate) struct Segment;
+
+impl<In: AxisName, D: Scalar, Rows: M, Inputs: M, Time: M, Lane: M>
+    Packing<In, D, Rows, Inputs, Time, Lane> for Segment
+{
+    type Fetched = m![{ Rows }, { Inputs } / ({ Word<D> })];
+    type Fetch = m![In % ({ Word<D> })];
+    type Collected = m![{ Rows }, { Inputs } / ({ Word<D> })];
+    type Collect = m![In % ({ Word<D> })];
+    type Steps = m![{ Rows }, { Inputs } / ({ Symbol<Step<D>> }), { Time }];
+    type Step = m![In % ({ Symbol<Step<D>> })];
+    type Outputs = m![1];
+    type Folded = m![{ Rows }, { Time }];
+    type Lanes = m![{ Lane } # 8];
+}
+
+/// A packet of `Packet` outputs by `Q` inputs, one packet a step and collected in halves: `Rows`
+/// and `Inputs` count such packets, and the lanes fold the sums in `Folded` order.
+pub(crate) struct Grid<Packet, Folded, const Q: usize>(PhantomData<(Packet, Folded)>);
+
+impl<
+    In: AxisName,
+    D: Scalar,
+    Rows: M,
+    Inputs: M,
+    Time: M,
+    Lane: M,
+    Packet: M,
+    Folded: M,
+    const Q: usize,
+> Packing<In, D, Rows, Inputs, Time, Lane> for Grid<Packet, Folded, Q>
+{
+    type Fetched = m![{ Rows }, { Inputs }];
+    type Fetch = m![{ Packet }, In % { Q }];
+    type Collected = m![({ Rows }, { Inputs }), { Packet } / ({ Packet } / 2)];
+    type Collect = m![{ Packet } % ({ Packet } / 2), In % { Q }];
+    type Steps = m![{ Rows }, { Inputs }, { Time }];
+    type Step = m![{ Packet }, In % { Q }];
+    type Outputs = Packet;
+    type Folded = Folded;
+    type Lanes = Lane;
+}
+
 impl<In: AxisName, Out: AxisName> Contraction<In, Out> {
+    /// A weight tile against one batch's lanes, packed as `P` packs it: each slice's `Rows` outputs
+    /// over `Inputs` for each `Time` group of `Lane` lanes, before the parts meet.
+    pub(crate) fn contract<'l, P, D, Rows: M, Inputs: M, Time: M, Lane: M, C, S, E, L, T, X>(
+        device: &'l mut Device,
+        weight: &'l DmTensor<D, X, C, S, E>,
+        lanes: &'l TrfTensor<D, X, C, S, L, T>,
+    ) -> ContractTensor<'l, { Tu::Main }, f32, X, C, S, P::Folded, P::Lanes>
+    where
+        P: Packing<In, D, Rows, Inputs, Time, Lane>,
+        D: MaterializableScalar + ContractionCast<Output = f32>,
+        C: M,
+        S: M,
+        E: M,
+        L: M,
+        T: M,
+        X: M,
+    {
+        device
+            .main
+            .begin(weight.view())
+            .fetch::<P::Fetched, P::Fetch>()
+            .collect::<P::Collected, P::Collect>()
+            .contract_outer::<P::Steps, P::Step, _, _, _>(lanes)
+            .contract_packet::<P::Outputs>()
+            .contract_time::<m![{ Rows }, { Time }]>()
+            .contract_lane::<P::Folded, P::Lanes>(LaneMode::Interleaved)
+    }
+
     /// A weight slab against one batch's lanes: each slice's `Rows` outputs for each `Time` group
     /// of `Lane` lanes before the parts meet, streamed a `D` packet and contracted two at a time.
     pub(crate) fn sums<
@@ -917,135 +1013,214 @@ impl<In: AxisName, Out: AxisName> Contraction<In, Out> {
         lanes: &'l TrfTensor<D, X, C, S, Lane, m![{ Time }, { Inputs }]>,
     ) -> ContractTensor<'l, { Tu::Main }, f32, X, C, S, m![{ Rows }, { Time }], m![{ Lane } # 8]>
     {
-        device
-            .main
-            .begin(weight.view())
-            .fetch::<m![{ Rows }, { Inputs } / ({ Word<D> })], m![In % ({ Word<D> })]>()
-            .collect::<m![{ Rows }, { Inputs } / ({ Word<D> })], m![In % ({ Word<D> })]>()
-            .contract_outer::<
-                m![{ Rows }, { Inputs } / ({ Symbol<Step<D>> }), { Time }],
-                m![In % ({ Symbol<Step<D>> })],
-                _,
-                _,
-                _,
-            >(lanes)
-            .contract_packet::<m![1]>()
-            .contract_time::<m![{ Rows }, { Time }]>()
-            .contract_lane::<m![{ Rows }, { Time }], m![{ Lane } # 8]>(LaneMode::Interleaved)
+        Self::contract::<Segment, D, Rows, Inputs, Time, Lane, _, _, _, _, _, _>(
+            device, weight, lanes,
+        )
     }
 
-    /// Every batch of `B` of the staged rows against weight slab `slab`, each pass's sums written
-    /// by `epilogue`.
-    fn batches<Rows: AxisName, B: AxisName, X: M, E: Epilogue<In, Out, Rows, B, X>>(
+    /// Every batch of `B` of the staged rows against weight slab `slab`, each batch's sums plus
+    /// `offset` stored as `D` in its cells of `result`.
+    fn batches<Rows: AxisName, B: AxisName, X: M, D: Rounding, F>(
         device: &mut Device,
         rows: &Staged<In, Out, Rows, X>,
         weight: &Resident<In, Out, X>,
-        epilogue: &E,
-        result: &mut E::Result,
+        offset: &F,
+        result: &mut Table<D, In, Out, Rows, X>,
         slab: usize,
-    ) {
+    ) where
+        F: Offset<X, Cluster<In, Out>, ProjectionSlices<In, Out>>,
+    {
         #[unroll]
         for at in 0..<m![Rows / ({ Symbol<B> })] as M>::SIZE {
             let lanes = rows.forward(&mut *device, (at, PhantomData::<B>));
-            epilogue.store(Self::sums(device, weight, &lanes), result, slab, at);
+            Self::store::<Rows, B, X, D, F>(
+                offset,
+                Self::sums(device, weight, &lanes),
+                result,
+                (slab, at),
+            );
         }
     }
 
-    /// Every row of `input`, staged once, against every slab of `weight`; `epilogue(slab)` writes
-    /// that slab's sums.
-    fn resident<Rows: AxisName, V: Source, W, E>(
+    /// Every row of `input`, staged once, against every slab of `weight` plus that slab's
+    /// `offsets(device, slab)`, each output rounded once to BF16.
+    fn resident<Rows: AxisName, V: Source, W, F>(
         device: &mut Device,
         weight: &W,
         input: V,
-        mut epilogue: impl FnMut(&mut Device, usize) -> E,
+        mut offsets: impl FnMut(&mut Device, usize) -> F,
     ) -> Result<In, Out, Rows, V::Chips>
     where
         W: Matrix<V::Chips, In = In, Out = Out>,
-        E: Epilogue<
-                In,
-                Out,
-                Rows,
-                Batch<In, Out, Rows>,
-                V::Chips,
-                Result = Result<In, Out, Rows, V::Chips>,
-            >,
+        F: Offset<V::Chips, Cluster<In, Out>, ProjectionSlices<In, Out>>,
     {
         let rows =
             Stage::<In, Out, Rows, Batch<In, Out, Rows>>(PhantomData).forward(&mut *device, input);
-        let mut pass = |device: &mut Device,
-                        weight: &Resident<In, Out, V::Chips>,
-                        result: &mut Result<In, Out, Rows, V::Chips>,
-                        slab: usize| {
-            let epilogue = epilogue(device, slab);
-            Self::batches(device, &rows, weight, &epilogue, result, slab);
-        };
         let mut result = DmTensor::new();
         #[unroll]
         for slab in 0..<Passes<In, Out> as M>::SIZE {
             let weight = weight.tile::<Self>(device, slab);
-            pass(device, &weight, &mut result, slab);
+            let offset = offsets(device, slab);
+            Self::batches::<_, Batch<In, Out, Rows>, _, bf16, _>(
+                device,
+                &rows,
+                &weight,
+                &offset,
+                &mut result,
+                slab,
+            );
         }
         result
     }
-}
 
-/// What a pass does with its sums: sum them over the contraction parts and write them in its
-/// result.
-trait Epilogue<In: AxisName, Out: AxisName, Rows: AxisName, B: AxisName, X: M> {
-    type Result;
-
-    /// Writes the sums of slab `slab` and batch `at`.
-    fn store(
-        &self,
+    /// Slab `slab`'s FP32 `sums` of batch `at` of `B` rows plus `offset`, added over the parts, as
+    /// `D` in their cells of `result`.
+    fn store<Rows: AxisName, B: AxisName, X: M, D: Rounding, F>(
+        offset: &F,
         sums: Sums<'_, In, Out, Rows, B, X>,
-        result: &mut Self::Result,
+        result: &mut Table<D, In, Out, Rows, X>,
+        (slab, at): (usize, usize),
+    ) where
+        F: Offset<X, Cluster<In, Out>, ProjectionSlices<In, Out>>,
+    {
+        D::finish::<
+            Reduced<In, Out>,
+            m![Out % ({ Block<In, Out> }), { Count<Rows, B> }],
+            Layout<Rows>::Lanes,
+            m![
+                { D::Packets<m![Out % ({ Block<In, Out> })]> },
+                { Count<Rows, B> },
+                { Layout<Rows>::Lanes }
+            ],
+            D::Packet<Out>,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        >(offset, sums, Self::cells::<Rows, B, X, D>(result, slab, at));
+    }
+
+    /// The cells of `result` weight slab `slab` writes for batch `at` of `B` rows.
+    fn cells<Rows: AxisName, B: AxisName, X: M, D: Rounding>(
+        result: &mut Table<D, In, Out, Rows, X>,
         slab: usize,
         at: usize,
-    );
+    ) -> CellsMut<'_, D, In, Out, Rows, B, X> {
+        result
+            .view_mut()
+            .tile::<SlabIndex<In, Out>, 1, m![
+                { SlabSelected<In, Out> },
+                Rows,
+                { D::Packets<m![Out % ({ Block<In, Out> })]> },
+                { D::Packet<Out> }
+            ]>(slab)
+            .tile::<m![Rows / B], 1, _>(at)
+    }
 }
 
-/// The sums rounded once to BF16.
+/// What a pass adds to each contraction part's FP32 sums before the parts meet: nothing, or the
+/// part's share of an offset of each output.
+pub(crate) trait Offset<X: M, C: M, S: M> {
+    /// `sums` plus the offset, added over the parts into slices `Target` of time `Reduced`.
+    fn reduce<'l, Target: M, Reduced: M, Time: M, P: M>(
+        &self,
+        sums: VectorInitTensor<'l, { Tu::Main }, f32, X, C, S, Time, P>,
+    ) -> VectorFinalTensor<'l, { Tu::Main }, f32, X, C, Target, Reduced, P>;
+}
+
+impl<X: M, C: M, S: M> Offset<X, C, S> for () {
+    fn reduce<'l, Target: M, Reduced: M, Time: M, P: M>(
+        &self,
+        sums: VectorInitTensor<'l, { Tu::Main }, f32, X, C, S, Time, P>,
+    ) -> VectorFinalTensor<'l, { Tu::Main }, f32, X, C, Target, Reduced, P> {
+        sums.vector_inter_slice_reduce::<Target, Reduced>(InterSliceReduceOpF32::Add)
+            .vector_final()
+    }
+}
+
+/// Each part's share of the offsets, in every slice of that part: the parts' sums carry the whole
+/// offset once they are added.
+impl<X: M, C: M, S: M, E: M> Offset<X, C, S> for VrfTensor<f32, X, C, S, E> {
+    fn reduce<'l, Target: M, Reduced: M, Time: M, P: M>(
+        &self,
+        sums: VectorInitTensor<'l, { Tu::Main }, f32, X, C, S, Time, P>,
+    ) -> VectorFinalTensor<'l, { Tu::Main }, f32, X, C, Target, Reduced, P> {
+        sums.vector_intra_slice_tag(TagMode::Zero)
+            .vector_clip(ClipBinaryOpF32::Add, self)
+            .vector_inter_slice_reduce::<Target, Reduced>(InterSliceReduceOpF32::Add)
+            .vector_final()
+    }
+}
+
+/// How a pass stores its FP32 sums once the parts meet: rounded once to BF16, or as they are.
+pub(crate) trait Rounding: MaterializableScalar {
+    /// The eight-byte packets of `Outputs`.
+    type Packets<Outputs: M>: M;
+    /// The outputs of `A` one eight-byte packet holds.
+    type Packet<A: AxisName>: M;
+
+    /// Final FP32 sums as `Self`, `Packet` outputs a packet in `Grouped` order, as the stream a
+    /// caller commits; `L` is the row lanes a packet held before rounding.
+    fn round<'l, C: M, S: M, Time: M, P: M, L: M, Grouped: M, Packet: M, X: M>(
+        sums: VectorFinalTensor<'l, { Tu::Main }, f32, X, C, S, Time, P>,
+    ) -> CommitTrimTensor<'l, { Tu::Main }, Self, X, C, S, Grouped, Packet>;
+
+    /// `sums` plus `offset`, added over the parts into slices `Target` of time `Reduced`, as
+    /// `Self` in `into`: `Packet` outputs a packet in `Grouped` order, of `L` row lanes.
+    fn finish<
+        Target: M,
+        Reduced: M,
+        L: M,
+        Grouped: M,
+        Packet: M,
+        F: Offset<X, C, S>,
+        C: M,
+        S: M,
+        Time: M,
+        P: M,
+        E: M,
+        X: M,
+    >(
+        offset: &F,
+        sums: ContractTensor<'_, { Tu::Main }, f32, X, C, S, Time, P>,
+        into: DmTensorViewMut<'_, Self, X, C, Target, E>,
+    ) {
+        Self::round::<_, _, _, _, L, Grouped, Packet, _>(
+            offset.reduce::<Target, Reduced, _, _>(sums.vector_init()),
+        )
+        .commit_view(into);
+    }
+}
+
+impl Rounding for bf16 {
+    type Packets<Outputs: M> = m![{ Outputs } / 4];
+    type Packet<A: AxisName> = m![A % 4];
+
+    fn round<'l, C: M, S: M, Time: M, P: M, L: M, Grouped: M, Packet: M, X: M>(
+        sums: VectorFinalTensor<'l, { Tu::Main }, f32, X, C, S, Time, P>,
+    ) -> CommitTrimTensor<'l, { Tu::Main }, bf16, X, C, S, Grouped, Packet> {
+        Rounded::rounded::<bf16, _, _, _, _, L, Grouped, Packet, _>(sums)
+    }
+}
+
+impl Rounding for f32 {
+    type Packets<Outputs: M> = m![{ Outputs } / 2];
+    type Packet<A: AxisName> = m![A % 2];
+
+    fn round<'l, C: M, S: M, Time: M, P: M, L: M, Grouped: M, Packet: M, X: M>(
+        sums: VectorFinalTensor<'l, { Tu::Main }, f32, X, C, S, Time, P>,
+    ) -> CommitTrimTensor<'l, { Tu::Main }, f32, X, C, S, Grouped, Packet> {
+        Unrounded::tail::<_, _, _, _, Grouped, Packet, _>(sums)
+    }
+}
+
+/// FP32 sums rounded once.
 pub(crate) struct Rounded;
 
 impl Rounded {
-    /// Reduced sums rounded once to BF16 into `into`, `Packet` outputs a packet in `Grouped` order.
-    pub(super) fn finish<
-        C: M,
-        Reduced: M,
-        Rows: M,
-        Time: M,
-        Lane: M,
-        Grouped: M,
-        Packet: M,
-        E: M,
-        X: M,
-        const O: stage::VeOrder,
-    >(
-        reduced: VectorInterSliceReduceTensor<
-            '_,
-            { Tu::Main },
-            f32,
-            X,
-            C,
-            Reduced,
-            m![{ Rows }, { Time }],
-            m![{ Lane } # 8],
-            O,
-        >,
-        into: DmTensorViewMut<'_, bf16, X, C, Reduced, E>,
-    ) {
-        Self::tail::<_, _, _, _, Lane, Grouped, Packet, _, _>(reduced.vector_final(), into);
-    }
-
-    /// Final FP32 sums rounded once to BF16 into `into`, `Packet` outputs a packet in `Grouped`
-    /// order; `L` is the row lanes a packet held before rounding.
-    pub(crate) fn tail<C: M, S: M, Time: M, P: M, L: M, Grouped: M, Packet: M, E: M, X: M>(
-        sums: VectorFinalTensor<'_, { Tu::Main }, f32, X, C, S, Time, P>,
-        into: DmTensorViewMut<'_, bf16, X, C, S, E>,
-    ) {
-        Self::rounded::<bf16, _, _, _, _, L, Grouped, Packet, _>(sums).commit_view(into);
-    }
-
     /// Final FP32 sums rounded once to `T`, `Packet` outputs a packet in `Grouped` order, as the
     /// stream a caller commits; `L` is the row lanes a packet held before rounding.
     pub(crate) fn rounded<
@@ -1069,142 +1244,12 @@ impl Rounded {
             .transpose::<Grouped, m![{ Packet } # ({ Word<T> })]>()
             .commit_trim::<Packet>()
     }
-
-    /// The table's reduced sums rounded into the cells of slab `slab` and batch `at`, four outputs
-    /// a packet.
-    fn round<
-        In: AxisName,
-        Out: AxisName,
-        Rows: AxisName,
-        B: AxisName,
-        X: M,
-        const O: stage::VeOrder,
-    >(
-        reduced: VectorInterSliceReduceTensor<
-            '_,
-            { Tu::Main },
-            f32,
-            X,
-            Cluster<In, Out>,
-            Reduced<In, Out>,
-            m![Out % ({ Block<In, Out> }), { Count<Rows, B> }],
-            m![{ Layout<Rows>::Lanes } # 8],
-            O,
-        >,
-        result: &mut Result<In, Out, Rows, X>,
-        slab: usize,
-        at: usize,
-    ) {
-        Self::finish::<
-            _,
-            _,
-            _,
-            _,
-            _,
-            m![Out % ({ Block<In, Out> }) / 4, { Count<Rows, B> }, { Layout<Rows>::Lanes }],
-            m![Out % 4],
-            _,
-            _,
-            O,
-        >(
-            reduced,
-            Contraction::<In, Out>::cells::<Rows, B, bf16, X, 4>(result.view_mut(), slab, at),
-        );
-    }
 }
 
-impl<In: AxisName, Out: AxisName, Rows: AxisName, B: AxisName, X: M> Epilogue<In, Out, Rows, B, X>
-    for Rounded
-{
-    type Result = Result<In, Out, Rows, X>;
-
-    fn store(
-        &self,
-        sums: Sums<'_, In, Out, Rows, B, X>,
-        result: &mut Self::Result,
-        slab: usize,
-        at: usize,
-    ) {
-        Self::round(
-            sums.vector_init()
-                .vector_inter_slice_reduce::<
-                    Reduced<In, Out>,
-                    m![Out % ({ Block<In, Out> }), { Count<Rows, B> }],
-                >(InterSliceReduceOpF32::Add),
-            result,
-            slab,
-            at,
-        );
-    }
-}
-
-/// Each contraction part's share of an FP32 offset added to its sums, then rounded once to BF16.
-struct Offset<In: AxisName, Out: AxisName, X: M>(Offsets<In, Out, X>);
-
-impl<In: AxisName, Out: AxisName, Rows: AxisName, B: AxisName, X: M> Epilogue<In, Out, Rows, B, X>
-    for Offset<In, Out, X>
-{
-    type Result = Result<In, Out, Rows, X>;
-
-    fn store(
-        &self,
-        sums: Sums<'_, In, Out, Rows, B, X>,
-        result: &mut Self::Result,
-        slab: usize,
-        at: usize,
-    ) {
-        Rounded::round(
-            sums.vector_init()
-                .vector_intra_slice_tag(TagMode::Zero)
-                .vector_clip(ClipBinaryOpF32::Add, &self.0)
-                .vector_inter_slice_reduce::<
-                    Reduced<In, Out>,
-                    m![Out % ({ Block<In, Out> }), { Count<Rows, B> }],
-                >(InterSliceReduceOpF32::Add),
-            result,
-            slab,
-            at,
-        );
-    }
-}
-
-/// The FP32 sums, two outputs a packet.
+/// FP32 sums kept as they are.
 pub(crate) struct Unrounded;
 
 impl Unrounded {
-    /// Sums reduced over the parts, `Packet` outputs a packet in `Grouped` order, ready to commit.
-    pub(crate) fn finish<
-        'l,
-        C: M,
-        S: M,
-        Reduced: M,
-        Rows: M,
-        Time: M,
-        Lane: M,
-        Grouped: M,
-        Packet: M,
-        X: M,
-    >(
-        sums: ContractTensor<
-            'l,
-            { Tu::Main },
-            f32,
-            X,
-            C,
-            S,
-            m![{ Rows }, { Time }],
-            m![{ Lane } # 8],
-        >,
-    ) -> CommitTrimTensor<'l, { Tu::Main }, f32, X, C, Reduced, Grouped, Packet> {
-        Self::tail(
-            sums.vector_init()
-                .vector_inter_slice_reduce::<Reduced, m![{ Rows }, { Time }]>(
-                    InterSliceReduceOpF32::Add,
-                )
-                .vector_final(),
-        )
-    }
-
     /// Final FP32 sums, `Packet` outputs a packet in `Grouped` order, ready to commit.
     pub(crate) fn tail<'l, C: M, S: M, Time: M, P: M, Grouped: M, Packet: M, X: M>(
         sums: VectorFinalTensor<'l, { Tu::Main }, f32, X, C, S, Time, P>,
@@ -1214,39 +1259,7 @@ impl Unrounded {
     }
 }
 
-impl<In: AxisName, Out: AxisName, Rows: AxisName, B: AxisName, X: M> Epilogue<In, Out, Rows, B, X>
-    for Unrounded
-{
-    type Result = Wide<In, Out, Rows, X>;
-
-    fn store(
-        &self,
-        sums: Sums<'_, In, Out, Rows, B, X>,
-        result: &mut Self::Result,
-        slab: usize,
-        at: usize,
-    ) {
-        Self::finish::<
-            _,
-            _,
-            Reduced<In, Out>,
-            _,
-            _,
-            _,
-            m![Out % ({ Block<In, Out> }) / 2, { Count<Rows, B> }, { Layout<Rows>::Lanes }],
-            m![Out % 2],
-            _,
-        >(sums)
-        .commit_view(Contraction::<In, Out>::cells::<Rows, B, f32, X, 2>(
-            result.view_mut(),
-            slab,
-            at,
-        ));
-    }
-}
-
-/// A weight slab's per-output offsets, each part's share in every slice of that part: the parts'
-/// sums carry the whole offset once they are reduced.
+/// A weight slab's per-output offsets, each part's share in every slice of that part.
 type Offsets<In, Out, X = m![1]> = VrfTensor<
     f32,
     X,
@@ -1281,15 +1294,17 @@ impl<'i, In: AxisName, Out: AxisName, Rows: AxisName, Chips: M, S: M, E: M, X: M
             DmTensorView<'i, bf16, X, Chips, S, E>,
         ),
     ) -> Self::Output {
-        Contraction::<In, Out>::resident(device, weight, input, |device, slab| {
-            let in_dm: DmTensor<
-                f32,
-                X,
-                Cluster<In, Out>,
-                ProjectionSlices<In, Out>,
-                m![Out % ({ Block<In, Out> }), 1 # 8],
-            > = Contraction::<In, Out>::to_dm(device, bias, slab);
-            Offset(
+        Contraction::<In, Out>::resident(
+            device,
+            weight,
+            input,
+            |device: &mut Device, slab| -> Offsets<In, Out, X> {
+                let in_dm = Contraction::<In, Out>::to_dm::<
+                    f32,
+                    X,
+                    m![1 # 8],
+                    m![Out % ({ Block<In, Out> }), 1 # 8],
+                >(device, bias, slab);
                 device
                     .main
                     .begin(in_dm.view())
@@ -1304,58 +1319,11 @@ impl<'i, In: AxisName, Out: AxisName, Rows: AxisName, Chips: M, S: M, E: M, X: M
                     )
                     .vector_widen_pad::<m![1 # 8]>()
                     .vector_final()
-                    .to_vrf(&mut device.sub),
-            )
-        })
+                    .to_vrf(&mut device.sub)
+            },
+        )
     }
 }
-
-/// The result cells weight slab `slab` writes for batch `at` of `B` rows, `P` outputs a packet.
-impl<In: AxisName, Out: AxisName> Contraction<In, Out> {
-    fn cells<Rows: AxisName, B: AxisName, D: Scalar, X: M, const P: usize>(
-        output: DmTensorViewMut<
-            '_,
-            D,
-            X,
-            Cluster<In, Out>,
-            Reduced<In, Out>,
-            m![{ SlabIndex<In, Out> }, Rows, Out % ({ Block<In, Out> }) / { P }, Out % { P }],
-        >,
-        slab: usize,
-        at: usize,
-    ) -> DmTensorViewMut<
-        '_,
-        D,
-        X,
-        Cluster<In, Out>,
-        Reduced<In, Out>,
-        m![
-            { SlabSelected<In, Out> },
-            Rows / B = 1 #{!} (Rows / B),
-            Rows % B,
-            Out % ({ Block<In, Out> }) / { P },
-            Out % { P }
-        ],
-    > {
-        output
-            .tile::<SlabIndex<In, Out>, 1, m![
-                { SlabSelected<In, Out> },
-                Rows,
-                Out % ({ Block<In, Out> }) / { P },
-                Out % { P }
-            ]>(slab)
-            .tile::<m![Rows / B], 1, _>(at)
-    }
-}
-
-/// FP32 sums of a weight slab's outputs, two to a packet.
-type Wide<In, Out, Rows, X = m![1]> = DmTensor<
-    f32,
-    X,
-    Cluster<In, Out>,
-    Reduced<In, Out>,
-    m![{ SlabIndex<In, Out> }, Rows, Out % ({ Block<In, Out> }) / 2, Out % 2],
->;
 
 impl<In: AxisName, Out: AxisName> Linear<In, Out> {
     pub type Input<Rows: AxisName> = Input<In, Out, Rows>;
@@ -1382,53 +1350,6 @@ impl<In: AxisName, Out: AxisName> Linear<In, Out> {
         ],
     > {
         projected.view().tile::<Layout<Rows>::Groups, 1, _>(at)
-    }
-}
-
-/// The step shape beside `sums`: several outputs a packet.
-impl<In: AxisName, Out: AxisName> Contraction<In, Out> {
-    /// A weight slab against one batch's lanes, `Packet` by `Q` a packet: each slice's `Rows`
-    /// outputs over `Inputs` inputs for each `Time` group, `Folded` ordering the sums to reduce.
-    pub(crate) fn packets<
-        'l,
-        Rows: M,
-        Inputs: M,
-        Packet: M,
-        Time: M,
-        Folded: M,
-        Lane: M,
-        const Q: usize,
-        C: M,
-        S: M,
-        E: M,
-        L: M,
-        T: M,
-        X: M,
-    >(
-        device: &'l mut Device,
-        weight: &'l DmTensor<bf16, X, C, S, E>,
-        lanes: &'l TrfTensor<bf16, X, C, S, L, T>,
-    ) -> ContractTensor<'l, { Tu::Main }, f32, X, C, S, Folded, Lane> {
-        device
-            .main
-            .begin(weight.view())
-            .fetch::<m![{ Rows }, { Inputs }], m![{ Packet }, In % { Q }]>()
-            .collect::<
-                m![({ Rows }, { Inputs }), { Packet } / ({ Packet } / 2)],
-                m![{ Packet } % ({ Packet } / 2), In % { Q }],
-            >()
-            .contract_outer::<
-                m![{ Rows }, { Inputs }, { Time }],
-                m![{ Packet }, In % { Q }],
-                _,
-                _,
-                _,
-            >(
-                lanes,
-            )
-            .contract_packet::<Packet>()
-            .contract_time::<m![{ Rows }, { Time }]>()
-            .contract_lane::<Folded, Lane>(LaneMode::Interleaved)
     }
 }
 
