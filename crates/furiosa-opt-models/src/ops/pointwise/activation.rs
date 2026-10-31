@@ -1,10 +1,12 @@
 //! Activation functions: each one function of one element.
 
-use super::{Float, Registers, Rows, Segment, SpreadPacket, SpreadTime, Width, Window};
+use super::{
+    Factors, Float, Registers, Rows, Segment, SpreadPacket, SpreadPairs, SpreadTime, Width, Window,
+};
 use crate::Op;
 use crate::load::Load;
 use crate::ops::index::packed::Timestep;
-use crate::ops::normalization::{Chunk, Spread};
+use crate::ops::normalization::{Chunk, Cluster, Element, FeatureSlices, Spread};
 use crate::ops::vector::Silu as _;
 use crate::tensor::live::Live;
 use furiosa_opt_std::prelude::*;
@@ -126,6 +128,10 @@ impl<D: Float, S: M + 'static, Chips: M + 'static> Op<&HbmTensor<D, Chips, S>> f
 #[derive(Default, Clone, Copy, DeviceSend, Load)]
 pub struct NewGelu;
 
+/// The tanh GELU's FP32 coefficients: of the cube, and `sqrt(2 / pi)`.
+const CUBIC: f32 = 0.044715;
+const ROOT: f32 = 0.797_884_6;
+
 impl<D: Float, S: M + 'static, Chips: M + 'static> Op<&HbmTensor<D, Chips, S>> for NewGelu {
     type Output = HbmTensor<D, Chips, S>;
 
@@ -142,7 +148,7 @@ impl<D: Float, S: M + 'static, Chips: M + 'static> Op<&HbmTensor<D, Chips, S>> f
                 .to_vrf();
             let output: Rows<f32, S, Chips> = Window::<S>::stream(&mut device.main, &input)
                 .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &source)
-                .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), 0.044715_f32)
+                .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), CUBIC)
                 .vector_fp_binary(FpBinaryOp::AddF, 1_f32)
                 .vector_widen_concat::<
                     m![{ Width<S> } % ({ Segment<S> }) / 8],
@@ -163,7 +169,7 @@ impl<D: Float, S: M + 'static, Chips: M + 'static> Op<&HbmTensor<D, Chips, S>> f
                     m![{ Width<S> } % 4],
                 >()
                 .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &source)
-                .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), 0.79788456_f32)
+                .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), ROOT)
                 .vector_fp_unary(FpUnaryOp::Tanh)
                 .vector_widen_concat::<
                     m![{ Width<S> } % ({ Segment<S> }) / 8],
@@ -194,6 +200,83 @@ impl<D: Float, S: M + 'static, Chips: M + 'static> Op<&HbmTensor<D, Chips, S>> f
                 .commit_trim::<m![{ Width<S> } % 8]>()
                 .commit()
         })
+    }
+}
+
+/// The tanh GELU of a launch's rows in feature slices in a single-chip tensor's FP32 steps, their
+/// live rows kept; later passes read `x` beside the pass before, so rows never fill the registers.
+impl<'x, W: AxisName, R: AxisName, Chips: M + 'static> Op<&'x Live<Spread<W, R, Chips>, R>>
+    for NewGelu
+{
+    type Output = Live<Spread<W, R, Chips>, R>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        input: &'x Live<Spread<W, R, Chips>, R>,
+    ) -> Self::Output {
+        type Wide<W, R, Chips> = DmTensor<f32, Chips, Cluster, FeatureSlices<W>, Element<W, R>>;
+        type Narrow<W, R> = m![R, W % ({ Symbol<Chunk<W>> }) / 4];
+        let x: Wide<W, R, Chips> = device
+            .main
+            .begin(input.value().view())
+            .fetch::<SpreadTime<W, R>, SpreadPacket<W>>()
+            .fetch_cast::<f32>()
+            .collect::<SpreadTime<W, R>, SpreadPacket<W>>()
+            .commit_trim::<SpreadPacket<W>>()
+            .commit();
+        let inner: Wide<W, R, Chips> = device
+            .main
+            .begin(input.value().view())
+            .fetch::<SpreadTime<W, R>, SpreadPacket<W>>()
+            .fetch_cast::<f32>()
+            .collect::<SpreadTime<W, R>, SpreadPacket<W>>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_split::<Narrow<W, R>, m![W % 4]>()
+            .vector_fp_binary_with_mode(
+                FpBinaryOp::MulF(FpMulAlu::Mul0),
+                BinaryArgMode::Mode00,
+                0.0f32,
+            )
+            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), CUBIC)
+            .vector_fp_binary(FpBinaryOp::AddF, 1_f32)
+            .vector_widen_concat::<SpreadTime<W, R>, SpreadPacket<W>>()
+            .vector_final()
+            .commit_trim::<SpreadPacket<W>>()
+            .commit();
+        let tanh: Wide<W, R, Chips> = device
+            .main
+            .begin_interleaved::<Factors, _, _, _, _, _>(inner.view(), x.view())
+            .fetch::<SpreadPairs<W, R>, SpreadPacket<W>>()
+            .collect::<SpreadPairs<W, R>, SpreadPacket<W>>()
+            .vector_init()
+            .vector_intra_slice_unzip::<Factors, SpreadTime<W, R>>()
+            .vector_narrow_split::<Narrow<W, R>, m![W % 4]>()
+            .vector_fp_zip(FpBinaryOp::MulF(FpMulAlu::Mul0))
+            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), ROOT)
+            .vector_fp_unary(FpUnaryOp::Tanh)
+            .vector_widen_concat::<SpreadTime<W, R>, SpreadPacket<W>>()
+            .vector_final()
+            .commit_trim::<SpreadPacket<W>>()
+            .commit();
+        let value = device
+            .main
+            .begin_interleaved::<Factors, _, _, _, _, _>(tanh.view(), x.view())
+            .fetch::<SpreadPairs<W, R>, SpreadPacket<W>>()
+            .collect::<SpreadPairs<W, R>, SpreadPacket<W>>()
+            .vector_init()
+            .vector_intra_slice_unzip::<Factors, SpreadTime<W, R>>()
+            .vector_narrow_split::<Narrow<W, R>, m![W % 4]>()
+            .vector_fp_binary(FpBinaryOp::AddF, 1_f32, ())
+            .vector_fp_zip(FpBinaryOp::MulF(FpMulAlu::Mul0))
+            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), 0.5_f32)
+            .vector_widen_concat::<SpreadTime<W, R>, SpreadPacket<W>>()
+            .vector_final()
+            .cast::<bf16, m![W % 8 # 16]>()
+            .commit_trim::<m![W % 8]>()
+            .commit();
+        input.with(value)
     }
 }
 
@@ -327,6 +410,10 @@ impl<In: AxisName, Chips: M> Op<HbmTensorView<'_, f32, Chips, m![Timestep, In]>>
 mod tests {
     use super::{Gelu, NewGelu, QuickGelu, Sigmoid, Tanh};
     use crate::Op;
+    use crate::ops::index::scatter::Store;
+    use crate::ops::normalization::Spread;
+    use crate::tensor::live::{Live, tests::count};
+    use crate::tensor::scalar::Value;
     use crate::tests::DEVICE;
     use furiosa_opt_std::{prelude::*, runtime::launch};
 
@@ -435,15 +522,26 @@ mod tests {
             .await
             .unwrap()
             .into_vec();
-        for (x, got) in inputs.iter().zip(output) {
-            let (x, got) = (f64::from(x.to_f32()), f64::from(got.to_f32()));
-            let want = definition(x);
-            let step = (want.abs().log2().floor() - 7.0).exp2();
-            assert!(
-                (got - want).abs() <= step.max(2f64.powi(-16)),
-                "{x}: {got} vs {want}"
-            );
+        for (&x, got) in inputs.iter().zip(output) {
+            assert_close(x, got, definition);
         }
+    }
+
+    /// `got` for input `x` is within one BF16 step of `definition` in FP64, and within 2^-16 of it
+    /// near zero.
+    fn assert_close(x: bf16, got: bf16, definition: fn(f64) -> f64) {
+        let (x, got) = (f64::from(x.to_f32()), f64::from(got.to_f32()));
+        let want = definition(x);
+        let step = (want.abs().log2().floor() - 7.0).exp2();
+        assert!(
+            (got - want).abs() <= step.max(2f64.powi(-16)),
+            "{x}: {got} vs {want}"
+        );
+    }
+
+    /// `x / 2 * (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))`.
+    fn tanh_approximation(x: f64) -> f64 {
+        x / 2.0 * (1.0 + ((2.0 / core::f64::consts::PI).sqrt() * (x + 0.044715 * x.powi(3))).tanh())
     }
 
     /// GELU is `x Phi(x)` through the error function, not its tanh approximation.
@@ -462,11 +560,93 @@ mod tests {
     /// over rows of a width no power of two divides.
     #[tokio::test(flavor = "current_thread")]
     async fn new_gelu_is_the_tanh_approximation() {
-        let definition = |x: f64| {
-            x / 2.0
-                * (1.0 + ((2.0 / core::f64::consts::PI).sqrt() * (x + 0.044715 * x.powi(3))).tanh())
+        matches::<_, m![Gates]>(NewGelu, tanh_approximation).await;
+        matches::<_, m![Rows, Expanded]>(NewGelu, tanh_approximation).await;
+    }
+
+    #[device(chip = 1)]
+    fn activated_rows<A>(
+        device: &mut Device,
+        activation: &A,
+        input: &HbmTensor<bf16, m![1], m![Rows, Expanded]>,
+        (start, rows): (&Value, &Value),
+        output: &mut HbmTensor<bf16, m![1], m![Rows, Expanded]>,
+    ) where
+        A: DeviceSend
+            + for<'x> Op<
+                &'x Live<Spread<Expanded, Rows>, Rows>,
+                Output = Live<Spread<Expanded, Rows>, Rows>,
+            >,
+    {
+        let live =
+            Live::<(), Rows>::all().subrange(start.extent::<m![Rows]>(), rows.extent::<m![Rows]>());
+        let input: Live<Spread<Expanded, Rows>, Rows> = live.with(input.to_dm(&mut device.tdma));
+        let result = activation.forward(&mut *device, &input);
+        Store.forward(device, ((result.value(), result.with(())), output));
+    }
+
+    /// New GELU of a launch's live rows in feature slices is each row's tanh approximation, bit for
+    /// bit as the rows alone give it, wherever the live rows start; the other rows keep the output's.
+    #[tokio::test(flavor = "current_thread")]
+    async fn new_gelu_of_live_rows_is_the_tanh_approximation() {
+        const KEPT: f32 = -3.0;
+        let _lease = DEVICE.lock().await;
+        let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+        let values: Vec<bf16> = (0..Rows::SIZE * Expanded::SIZE)
+            .map(|at| bf16::from_f32((at % 4096) as f32 / 256.0 - 8.0))
+            .collect();
+        let upload = async |device: &mut Device, values: Vec<bf16>| {
+            HostTensor::<bf16, m![Rows, Expanded]>::from_vec(values)
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap()
         };
-        matches::<_, m![Gates]>(NewGelu, definition).await;
-        matches::<_, m![Rows, Expanded]>(NewGelu, definition).await;
+        let whole = upload(&mut device, values.clone()).await;
+        let alone = launch(activated, (&mut device, &NewGelu, &whole))
+            .await
+            .unwrap()
+            .to_host::<m![Rows, Expanded]>(&mut device.pdma)
+            .await
+            .unwrap()
+            .into_vec();
+        for (first, rows) in [(3, 4), (0, 8), (7, 1)] {
+            let live = |at: usize| (first..first + rows).contains(&(at / Expanded::SIZE));
+            let input = values.iter().enumerate().map(|(at, &x)| match live(at) {
+                true => x,
+                false => bf16::from_f32(f32::NAN),
+            });
+            let input = upload(&mut device, input.collect()).await;
+            let mut output = upload(
+                &mut device,
+                vec![bf16::from_f32(KEPT); Rows::SIZE * Expanded::SIZE],
+            )
+            .await;
+            let (start, count) = (
+                count(first).to_hbm(&mut device.pdma).await.unwrap(),
+                count(rows).to_hbm(&mut device.pdma).await.unwrap(),
+            );
+            launch(
+                activated_rows,
+                (&mut device, &NewGelu, &input, (&start, &count), &mut output),
+            )
+            .await
+            .unwrap();
+            let output = output
+                .to_host::<m![Rows, Expanded]>(&mut device.pdma)
+                .await
+                .unwrap()
+                .into_vec();
+            for (at, &got) in output.iter().enumerate() {
+                let want = if live(at) {
+                    alone[at]
+                } else {
+                    bf16::from_f32(KEPT)
+                };
+                assert_eq!(got.to_bits(), want.to_bits(), "rows {first}+{rows}: {at}");
+                if live(at) {
+                    assert_close(values[at], got, tanh_approximation);
+                }
+            }
+        }
     }
 }

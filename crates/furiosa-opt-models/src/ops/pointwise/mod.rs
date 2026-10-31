@@ -242,6 +242,12 @@ impl<S: M + 'static> Window<S> {
 pub(super) type SpreadTime<W, R> = m![R, W % ({ Symbol<Chunk<W>> }) / 8];
 pub(super) type SpreadPacket<W> = m![W % 8];
 
+// The two factors of a product, read interleaved.
+axes![Factors = 2];
+
+/// Two factors' tiles of every row, interleaved row by row.
+pub(super) type SpreadPairs<W, R> = m![R, Factors, W % ({ Symbol<Chunk<W>> }) / 8];
+
 #[cfg(test)]
 mod tests {
     use super::{activation::Silu, add::Add, multiply::Multiply};

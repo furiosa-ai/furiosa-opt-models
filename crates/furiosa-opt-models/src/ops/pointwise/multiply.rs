@@ -1,14 +1,16 @@
 //! Elementwise products: of two tensors, of a tensor and a scalar, and of rows and per-row scalars.
 
 use super::{
-    Batch, BatchMut, Extent, Float, Rows, Segment, Slices, SpreadPacket, SpreadTime, Width, Window,
+    Batch, BatchMut, Extent, Factors, Float, Rows, Segment, Slices, SpreadPacket, SpreadPairs,
+    SpreadTime, Width, Window,
 };
 use crate::Op;
 use crate::load::Load;
-use crate::ops::normalization::{Chunk, Spread};
+use crate::ops::normalization::{Chunk, Cluster, FeatureSlices, Spread};
 use crate::ops::vector::Zip;
 use crate::tensor::{axis::Single, live::Live, scalar};
 use furiosa_opt_std::prelude::*;
+use std::borrow::Borrow;
 use std::num::NonZeroUsize;
 
 /// Multiply a single-chip tensor by an FP32 scalar; the kernel requires eight padded cells.
@@ -161,8 +163,41 @@ impl<F: M, Chips: M + 'static> Scale<HbmTensor<f32, Chips, F>> {
     }
 }
 
-// The two factors of a product, read interleaved.
-axes![Factors = 2];
+/// Every row of one launch in feature slices times the FP32 scalar in the first cell of the factor,
+/// rounded once to BF16; the result keeps their live rows.
+impl<'x, W: AxisName, R: AxisName, Chips: M + 'static, F> Op<&'x Live<Spread<W, R, Chips>, R>>
+    for Scale<F>
+where
+    F: Borrow<HbmTensor<f32, Chips, m![1 # 8]>>,
+{
+    type Output = Live<Spread<W, R, Chips>, R>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        input: &'x Live<Spread<W, R, Chips>, R>,
+    ) -> Self::Output {
+        let factor: DmTensor<f32, Chips, Cluster, FeatureSlices<W>, m![1 # 8]> =
+            self.0.borrow().to_dm(&mut device.tdma);
+        let factor = scalar::register(device, &factor);
+        let value = device
+            .main
+            .begin(input.value().view())
+            .fetch::<SpreadTime<W, R>, SpreadPacket<W>>()
+            .fetch_cast::<f32>()
+            .collect::<SpreadTime<W, R>, SpreadPacket<W>>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_split::<m![R, W % ({ Symbol<Chunk<W>> }) / 4], m![W % 4]>()
+            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &factor)
+            .vector_widen_concat::<SpreadTime<W, R>, SpreadPacket<W>>()
+            .vector_final()
+            .cast::<bf16, m![W % 8 # 16]>()
+            .commit_trim::<m![W % 8]>()
+            .commit();
+        input.with(value)
+    }
+}
 
 /// The FP32 elementwise product of one launch's rows in feature slices, rounded once to BF16, both
 /// factors streamed interleaved so no row count fills the registers; it keeps their live rows.
@@ -182,13 +217,12 @@ impl<'x, 'y, W: AxisName, R: AxisName, Chips: M + 'static>
             &'y Live<Spread<W, R, Chips>, R>,
         ),
     ) -> Self::Output {
-        type Time<W, R> = m![R, Factors, W % ({ Symbol<Chunk<W>> }) / 8];
         let value = device
             .main
             .begin_interleaved::<Factors, _, _, _, _, _>(left.value().view(), right.value().view())
-            .fetch::<Time<W, R>, SpreadPacket<W>>()
+            .fetch::<SpreadPairs<W, R>, SpreadPacket<W>>()
             .fetch_cast::<f32>()
-            .collect::<Time<W, R>, SpreadPacket<W>>()
+            .collect::<SpreadPairs<W, R>, SpreadPacket<W>>()
             .vector_init()
             .vector_zip::<
                 Factors,
