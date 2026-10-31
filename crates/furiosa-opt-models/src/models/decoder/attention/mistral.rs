@@ -444,7 +444,7 @@ where
                 if declared.scheme == scheme && !declared.kv_cache => {}
             // The NVFP4 parameters refuse cache scales: a declared E4M3 cache is at unit scale, and
             // a BF16 cache holds its values unrounded.
-            (Requirement::Declared(Declaration::Nvfp4(_)), Some(declared))
+            (Requirement::Declared(Declaration::Nvfp4), Some(declared))
                 if declared.scheme == Scheme::Nvfp4 => {}
             (Requirement::Unquantized | Requirement::Undeclared, None) => {}
             (Requirement::Declared(_), None) => {

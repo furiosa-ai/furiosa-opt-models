@@ -165,29 +165,69 @@ type MambaNorm<W, X> =
 
 const EPSILON: usize = 1e-5_f32.to_bits() as usize;
 
-macro_rules! sizes {
-    ($($size:literal: $hidden:literal x $layers:literal;)+) => {$(
-        impl Geometry for Size<$size> {
-            const SIZE: &'static str = $size;
-            const FAMILY: &'static str = "mamba";
-            type Hidden = geometry::Hidden<$hidden>;
-            type Vocabulary = axis::Vocabulary;
-            type Layers<L> = [L; $layers];
-            type Norm<W: AxisName, X: Memory> = MambaNorm<W, X>;
+impl Geometry for Size<"130m"> {
+    const SIZE: &'static str = "130m";
+    const FAMILY: &'static str = "mamba";
+    type Hidden = geometry::Hidden<768>;
+    type Vocabulary = axis::Vocabulary;
+    type Layers<L> = [L; Self::LAYERS];
+    type Norm<W: AxisName, X: Memory> = MambaNorm<W, X>;
 
-            const LAYERS: usize = $layers;
-            const EPSILON: usize = EPSILON;
-            const TIED_EMBEDDINGS: bool = true;
-        }
-    )+};
+    const LAYERS: usize = 24;
+    const EPSILON: usize = EPSILON;
+    const TIED_EMBEDDINGS: bool = true;
 }
 
-sizes! {
-    "130m": 768 x 24;
-    "370m": 1024 x 48;
-    "790m": 1536 x 48;
-    "1.4b": 2048 x 48;
-    "2.8b": 2560 x 64;
+impl Geometry for Size<"370m"> {
+    const SIZE: &'static str = "370m";
+    const FAMILY: &'static str = "mamba";
+    type Hidden = geometry::Hidden<1024>;
+    type Vocabulary = axis::Vocabulary;
+    type Layers<L> = [L; Self::LAYERS];
+    type Norm<W: AxisName, X: Memory> = MambaNorm<W, X>;
+
+    const LAYERS: usize = 48;
+    const EPSILON: usize = EPSILON;
+    const TIED_EMBEDDINGS: bool = true;
+}
+
+impl Geometry for Size<"790m"> {
+    const SIZE: &'static str = "790m";
+    const FAMILY: &'static str = "mamba";
+    type Hidden = geometry::Hidden<1536>;
+    type Vocabulary = axis::Vocabulary;
+    type Layers<L> = [L; Self::LAYERS];
+    type Norm<W: AxisName, X: Memory> = MambaNorm<W, X>;
+
+    const LAYERS: usize = 48;
+    const EPSILON: usize = EPSILON;
+    const TIED_EMBEDDINGS: bool = true;
+}
+
+impl Geometry for Size<"1.4b"> {
+    const SIZE: &'static str = "1.4b";
+    const FAMILY: &'static str = "mamba";
+    type Hidden = geometry::Hidden<2048>;
+    type Vocabulary = axis::Vocabulary;
+    type Layers<L> = [L; Self::LAYERS];
+    type Norm<W: AxisName, X: Memory> = MambaNorm<W, X>;
+
+    const LAYERS: usize = 48;
+    const EPSILON: usize = EPSILON;
+    const TIED_EMBEDDINGS: bool = true;
+}
+
+impl Geometry for Size<"2.8b"> {
+    const SIZE: &'static str = "2.8b";
+    const FAMILY: &'static str = "mamba";
+    type Hidden = geometry::Hidden<2560>;
+    type Vocabulary = axis::Vocabulary;
+    type Layers<L> = [L; Self::LAYERS];
+    type Norm<W: AxisName, X: Memory> = MambaNorm<W, X>;
+
+    const LAYERS: usize = 64;
+    const EPSILON: usize = EPSILON;
+    const TIED_EMBEDDINGS: bool = true;
 }
 
 /// What a Mamba checkpoint's config declares that its size fixes, and the features Mamba does not

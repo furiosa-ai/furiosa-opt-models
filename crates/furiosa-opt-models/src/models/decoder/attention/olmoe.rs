@@ -58,10 +58,8 @@ type Qkv = attention::Projection<
     Projection<KvWidth, Heads>,
 >;
 
-type NormalizedProjection<Width, Count> = Sequential<
-    Then<Linear<Hidden, Width>, RmsNorm<Width, { 1e-5_f32.to_bits() as usize }>>,
-    Reshape<m![Count, Head]>,
->;
+type NormalizedProjection<Width, Count> =
+    Sequential<Then<Linear<Hidden, Width>, RmsNorm<Width, EPSILON>>, Reshape<m![Count, Head]>>;
 
 type Linear<I, O> = Affine<HbmTensor<bf16, m![1], m![O, I]>, ()>;
 
@@ -88,7 +86,7 @@ type ExpertMlp = feedforward::ExpertMlp<
     Experts<Intermediate, Hidden, EXPERTS>,
 >;
 
-type Norm = RmsNorm<Hidden, { 1e-5_f32.to_bits() as usize }>;
+type Norm = RmsNorm<Hidden, EPSILON>;
 
 type HeadProjection =
     Sequential<Then<Reshape<m![Single, Hidden]>, HeadMatrix>, Reshape<m![Vocabulary]>>;

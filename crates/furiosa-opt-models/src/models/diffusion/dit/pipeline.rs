@@ -1,5 +1,6 @@
 //! Class-conditioned DDIM generation; noise and the complete timestep schedule are caller inputs.
-use super::{Channels, Columns, Height, IN_CHANNELS, OUT_CHANNELS, SAMPLE_SIZE, Time};
+use super::{Channels, Columns, Height, IN_CHANNELS, OUT_CHANNELS, SAMPLE_SIZE};
+use crate::models::Scalar;
 use crate::{First, Identity, Then};
 use crate::{
     models::diffusion::autoencoder,
@@ -66,6 +67,6 @@ pub type PixelShape = m![
 pub type Pixels = HbmTensor<f32, m![1], PixelShape>;
 
 /// Paired prediction times, classifier-free scale, and DDIM update timestep.
-pub type Step = (([Time; 2], guidance::Factor), ddim::Timestep);
+pub type Step = (([Scalar; 2], guidance::Factor), ddim::Timestep);
 
 axes![Training = 1000];

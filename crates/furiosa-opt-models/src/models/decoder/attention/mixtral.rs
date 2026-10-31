@@ -87,7 +87,7 @@ type ExpertMlp = feedforward::ExpertMlp<
     Experts<Intermediate, Hidden, EXPERTS>,
 >;
 
-type Norm = RmsNorm<Hidden, { 1e-5_f32.to_bits() as usize }>;
+type Norm = RmsNorm<Hidden, EPSILON>;
 
 pub const LAYERS: usize = 32;
 pub const EXPERTS: usize = 8;

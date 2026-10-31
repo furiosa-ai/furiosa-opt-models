@@ -47,8 +47,8 @@ pub type Model<
 > = Qwen3Moe<
     embedding::Embedding<V, H>,
     Qkv<H, Q, K>,
-    RmsNorm<Head>,
-    RmsNorm<Head>,
+    RmsNorm<Head, EPSILON>,
+    RmsNorm<Head, EPSILON>,
     Rotary<Head>,
     Scatter,
     (),
@@ -103,7 +103,7 @@ type Gate<H, const E: usize> = Affine<
 type ExpertMlp<H, I, const E: usize> =
     feedforward::ExpertMlp<Experts<H, I, E>, Silu, Experts<H, I, E>, Multiply, Experts<I, H, E>>;
 
-type Norm<H> = RmsNorm<H>;
+type Norm<H> = RmsNorm<H, EPSILON>;
 
 type HeadProjection<H, V> =
     Sequential<Then<Reshape<m![Single, H]>, HeadMatrix<H, V>>, Reshape<m![V]>>;
@@ -194,8 +194,8 @@ impl Geometry for Size<"30B-A3B"> {
     const SIZE: &'static str = "30B-A3B";
     const FAMILY: &'static str = "qwen3_moe";
     type Queries = QueryWidth<Queries<32>>;
-    type Hidden = geometry::Hidden<2048>;
-    type Intermediate = swiglu::Intermediate<768>;
+    type Hidden = Hidden;
+    type Intermediate = Intermediate;
     type Vocabulary = Vocabulary;
     type KvHeads = Heads;
     type Groups = Groups<Queries<32>, Heads>;

@@ -3,7 +3,7 @@
 //!
 //! - A size's [`Geometry`] is what its checkpoints declare beyond the transformer all sizes share:
 //!   `"dev"` embeds learned guidance, `"schnell"` does not.
-use crate::models::Family;
+use crate::models::{Family, Scalar};
 use crate::modules::diffusion::{AdaptiveNorm, ScaleFirst, SplitGate, SplitGates, SplitModulation};
 use crate::modules::{attention, diffusion, feedforward};
 use crate::ops::attention::Attention;
@@ -123,7 +123,7 @@ pub struct Conditioning<G> {
     pub text: Mlp<Pooled, Width<3072>, Silu>,
 }
 
-impl<T: AxisName, G: Guidance, Env: Copy> Module<((&Time, &G::Input), &Encoded<T>), Env, &mut ()>
+impl<T: AxisName, G: Guidance, Env: Copy> Module<((&Scalar, &G::Input), &Encoded<T>), Env, &mut ()>
     for Conditioning<G>
 {
     type Output = Vector;
@@ -133,7 +133,7 @@ impl<T: AxisName, G: Guidance, Env: Copy> Module<((&Time, &G::Input), &Encoded<T
         device: &mut Device,
         env: Env,
         _: &mut (),
-        ((time, guidance), text): ((&Time, &G::Input), &Encoded<T>),
+        ((time, guidance), text): ((&Scalar, &G::Input), &Encoded<T>),
     ) -> Vector {
         let time = self
             .time
@@ -162,7 +162,7 @@ pub trait Guidance: DeviceSend {
     fn add(&self, device: &mut Device, input: (Vector, &Self::Input)) -> Vector;
 
     /// Applies `op` to a guidance value; an absent value stays absent.
-    fn map<O: for<'x, 's> crate::Module<&'x Time, (), &'s mut (), Output = Time>>(
+    fn map<O: for<'x, 's> crate::Module<&'x Scalar, (), &'s mut (), Output = Scalar>>(
         op: &O,
         device: &mut Device,
         input: &Self::Input,
@@ -178,7 +178,7 @@ impl Guidance for () {
         time
     }
 
-    fn map<O: for<'x, 's> crate::Module<&'x Time, (), &'s mut (), Output = Time>>(
+    fn map<O: for<'x, 's> crate::Module<&'x Scalar, (), &'s mut (), Output = Scalar>>(
         _: &O,
         _: &mut Device,
         (): &(),
@@ -187,20 +187,20 @@ impl Guidance for () {
 }
 
 impl Guidance for TimeEmbedding {
-    type Input = Time;
+    type Input = Scalar;
 
     const PRESENT: bool = true;
 
-    fn add(&self, device: &mut Device, (time, input): (Vector, &Time)) -> Vector {
+    fn add(&self, device: &mut Device, (time, input): (Vector, &Scalar)) -> Vector {
         let guidance = self.forward(&mut *device, (), &mut Default::default(), input);
         Add.forward(device, (), &mut (), (&time, &guidance))
     }
 
-    fn map<O: for<'x, 's> crate::Module<&'x Time, (), &'s mut (), Output = Time>>(
+    fn map<O: for<'x, 's> crate::Module<&'x Scalar, (), &'s mut (), Output = Scalar>>(
         op: &O,
         device: &mut Device,
-        input: &Time,
-    ) -> Time {
+        input: &Scalar,
+    ) -> Scalar {
         op.forward(device, (), &mut (), input)
     }
 }
@@ -270,7 +270,7 @@ impl<A: AxisName, B: AxisName, Env: Copy> Module<(&Qkv<A>, &Qkv<B>), Env, &mut (
     }
 }
 
-type Attend = Attention<PhantomData<Heads>, Time>;
+type Attend = Attention<PhantomData<Heads>, Scalar>;
 
 type Single = diffusion::Single<
     Modulation<Width<9216>, SplitGate<Width<3072>>>,
@@ -303,9 +303,6 @@ impl<A: AxisName, B: AxisName, Env: Copy> Module<&(Hidden<A>, Hidden<B>), Env, &
     }
 }
 
-/// Training timestep or learned-guidance value supplied to an embedding.
-pub type Time = HbmTensor<f32, m![1], m![1]>;
-
 /// Packed 2×2 latent patches with 64 features per row.
 pub type Sample<R> = Rows<Latent, R>;
 
@@ -335,7 +332,7 @@ pub struct Context<I: AxisName, T: AxisName, G: Guidance> {
     /// Token-level and pooled text features.
     pub encoded: Encoded<T>,
     /// Training timestep rather than an unscaled scheduler sigma.
-    pub time: Time,
+    pub time: Scalar,
     /// The learned-guidance input, independent of classifier-free guidance.
     pub guidance: G::Input,
     /// Position phases in text-then-image row order.

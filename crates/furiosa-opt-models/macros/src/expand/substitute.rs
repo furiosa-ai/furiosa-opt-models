@@ -15,33 +15,11 @@ pub(super) struct Counterparts {
 
 impl Counterparts {
     pub(super) fn of(generics: &Generics) -> Self {
-        let memory = |bound: &syn::TypeParamBound| match bound {
-            syn::TypeParamBound::Trait(t) => {
-                t.path.segments.last().is_some_and(|s| s.ident == "Memory")
-            }
-            _ => false,
-        };
-        let declared = |param: &syn::TypeParam| -> Vec<syn::TypeParamBound> {
-            let predicates = generics.where_clause.iter().flat_map(|w| &w.predicates);
-            predicates
-                .filter_map(|predicate| match predicate {
-                    WherePredicate::Type(t) => Some(t),
-                    _ => None,
-                })
-                .filter(|t| matches!(&t.bounded_ty, Type::Path(p) if p.path.is_ident(&param.ident)))
-                .flat_map(|t| t.bounds.iter().cloned())
-                .collect()
-        };
         let converted: Vec<&syn::TypeParam> = generics
             .type_params()
             .filter(|param| {
-                let bounds: Vec<_> = param
-                    .bounds
-                    .iter()
-                    .cloned()
-                    .chain(declared(param))
-                    .collect();
-                bounds.is_empty() || bounds.iter().any(memory)
+                let mut bounds = super::bounds(generics, param).peekable();
+                bounds.peek().is_none() || bounds.any(|bound| super::names(bound, "Memory"))
             })
             .collect();
         let map: Vec<(Ident, Ident)> = converted

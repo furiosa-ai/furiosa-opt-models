@@ -1,5 +1,6 @@
 //! Text-conditioned flow matching with caller-owned noise and sigma schedules.
-use super::{AXES, Head, Time, Width};
+use super::{AXES, Head, Width};
+use crate::models::Scalar;
 use crate::models::diffusion::flux::FluxPipeline;
 use crate::ops::index::sequence::Sum;
 use crate::ops::index::table::Offset;
@@ -226,7 +227,7 @@ pub mod predict {
     #[derive(DeviceSend)]
     pub struct Context<G: Guidance> {
         /// Training timestep (1000 * sigma); the schedule chooses sigma.
-        pub time: Time,
+        pub time: Scalar,
         /// Learned guidance, distinct from classifier-free guidance.
         pub guidance: G::Input,
     }
