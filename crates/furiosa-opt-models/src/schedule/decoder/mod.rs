@@ -17,10 +17,11 @@
 //!   layer its attention and, tile by tile, the work up to the next store or the head.
 //! - The DMA engine serves transfers in issue order, so weights issue one part ahead of their use
 //!   and behind the small transfers of the work they overlap: the MLP's first weights behind the
-//!   output projection's rows, its down weights behind the gate/up pairs, the next layer's
-//!   projections behind the down's inputs. An attention's working set fills most of data memory,
-//!   so only the output projection lands during one, once its last history is in flight. A form
-//!   whose leaves land nothing ahead takes the same steps, doing nothing in them.
+//!   output projection's rows, its down weights behind the gate/up pairs and the down's inputs,
+//!   the next layer's key and query projections behind them and its value projection under its
+//!   input norm. An attention's working set fills most of data memory, so only the output
+//!   projection lands during one, once its last history is in flight. A form whose leaves land
+//!   nothing ahead takes the same steps, doing nothing in them.
 
 use crate::Begin;
 use crate::Module;
@@ -230,8 +231,8 @@ struct Staged<R, Z: Geometry + Decode> {
 /// and `PS` (single tiles); the key and query forms `KB`, `QB` give a period's heads `KHP`, `QHP`
 /// (`KHS`, `QHS`), which the head norms' forms `KNB`, `QNB` leave as the rotation reads them. The
 /// output projection lands as `OL`; the MLP's gate/up form `GB` gives `GO` and its gating `SO`,
-/// whose down projection lands a weight panel as `DP`, stages the product as `DS` and lands its
-/// inputs as `DR`.
+/// whose down projection lands a weight panel as `DP`, stages the product as `DS`, lands its
+/// inputs as `DL` and, with its last panel, as `DR`.
 impl<
     Z,
     H,
@@ -265,6 +266,7 @@ impl<
     SO,
     DP,
     DS,
+    DL,
     DR,
     T,
 > Cut<Z, T> for Layer<Z, Q, K, V, QN, KN, A, O, G, D>
@@ -346,7 +348,8 @@ where
     SwiGlu: for<'x> Module<Live<GO, Capacity<Z>>, (), &'x mut (), Output = SO>,
     D: for<'x> Module<Begin<usize>, (), &'x mut (), Output = DP>
         + for<'x> Module<Begin<(Live<SO, Capacity<Z>>, DP)>, (), &'x mut (), Output = DS>
-        + for<'x> Module<Live<(DS, (DP, DP)), Capacity<Z>>, (), &'x mut (), Output = DR>
+        + for<'x> Module<Live<(DS, DP), Capacity<Z>>, (), &'x mut (), Output = DL>
+        + for<'x> Module<(DL, DP), (), &'x mut (), Output = DR>
         + for<'x> Module<Live<DR, Capacity<Z>>, (), &'x mut T::Down, Output = Owned<Width<Z>, Span>>,
 {
     type Front = Front<<Stage as crate::Op<&'static Norm<Z>>>::Output, KB, QB, QNB, KNB>;
@@ -487,16 +490,16 @@ where
         let normalized = gain.forward(&mut *device, (), &mut (), &attended);
         let rows = tile.with(normalized.value());
         let projected = gate_up.forward(&mut *device, (), adapters.gate_up(), (ahead, rows));
-        // The later down panels land under the last gate/up pair and the gating, the next part's
-        // weights under the down projection once its inputs landed.
-        let later = (
-            down.forward(&mut *device, (), &mut (), Begin(1usize)),
-            down.forward(&mut *device, (), &mut (), Begin(2usize)),
-        );
+        // The second down panel lands under the last gate/up pair and the gating, the third behind
+        // the down projection's inputs, so the projection starts on its first two panels; the next
+        // part's weights land behind the third.
+        let second = down.forward(&mut *device, (), &mut (), Begin(1usize));
         let product = SwiGlu.forward(&mut *device, (), &mut (), tile.with(projected));
         let product = tile.with(product);
         let staged = down.forward(&mut *device, (), &mut (), Begin((product, first)));
-        let ready = down.forward(&mut *device, (), &mut (), tile.with((staged, later)));
+        let landing = down.forward(&mut *device, (), &mut (), tile.with((staged, second)));
+        let third = down.forward(&mut *device, (), &mut (), Begin(2usize));
+        let ready = down.forward(&mut *device, (), &mut (), (landing, third));
         Staged { ready, attended }
     }
 
