@@ -1170,6 +1170,47 @@ impl<KvHeads: AxisName, Groups: AxisName> Op<(&Scores<KvHeads, Groups>, &TailMas
     }
 }
 
+/// A band's mask of a tile over a panel: tagged where a row's window holds the key.
+pub(crate) type BandMask<KvHeads, Groups> =
+    VrfTensor<i4, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, m![Rows % 8, Cache]>;
+
+/// A tile's scores of a panel, a key a row's window does not hold masked as `MaskScores` masks
+/// a key past the history.
+pub(crate) struct MaskBand;
+
+impl<KvHeads: AxisName, Groups: AxisName> Op<(&Scores<KvHeads, Groups>, &BandMask<KvHeads, Groups>)>
+    for MaskBand
+{
+    type Output = Scores<KvHeads, Groups>;
+
+    fn forward(
+        &self,
+        context: &mut Device,
+        (scores, seen): (&Scores<KvHeads, Groups>, &BandMask<KvHeads, Groups>),
+    ) -> Self::Output {
+        context
+            .main
+            .begin(scores.view())
+            .fetch::<m![Rows % 8, Cache / 16], m![Cache % 16]>()
+            .fetch_cast::<f32>()
+            .collect::<m![Rows % 8, Cache / 8], m![Cache % 8]>()
+            .vector_init()
+            .vector_tagged(seen)
+            .vector_logic(
+                LogicBinaryOpF32::BitAnd,
+                Branched::imm(state::PRESENT, 0.0f32),
+            )
+            .vector_clip(
+                ClipBinaryOpF32::Add,
+                Branched::imm(state::PRESENT, f32::NEG_INFINITY),
+            )
+            .vector_final()
+            .cast::<bf16, m![Cache % 8 # 16]>()
+            .commit_trim::<m![Cache % 8]>()
+            .commit()
+    }
+}
+
 /// A partial last panel's keys and values in HBM, each token at or past the committed history
 /// zeroed: both read one mask.
 pub(crate) struct Clean;

@@ -775,6 +775,24 @@ type Partial<KvHeads, Groups, Head> =
 pub(crate) type Table<W> = HbmTensor<i32, Chip, m![{ Symbol<Chunks<W>> }, Cache / Block]>;
 
 pub(crate) type Causal = HbmTensor<i8, Chip, m![Cache, Cache]>;
+/// Each key's column less each row's within a tile, `kk - ii`: where a band's edge crosses a tile.
+pub(crate) type Offsets = HbmTensor<i32, Chip, m![Cache, Cache]>;
+/// Each panel's first key, `128 p`, in the first of a flit's eight words.
+pub(crate) type Starts<W> = HbmTensor<i32, Chip, m![{ Symbol<Chunks<W>> }, 1 # 8]>;
+/// A chunk's tiles' first-row window keys, a tile's in the first of a flit's eight words.
+pub(crate) type TileBases = HbmTensor<i32, Chip, m![TilePair, 1 # 8]>;
+/// A group's tiles' first-row window keys, a tile's in the first of a flit's eight words.
+type Bases<KvHeads, Groups, T> =
+    DmTensor<i32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, m![{ Symbol<T> }, 1 # 8]>;
+/// An I32 of every row and key of a tile.
+type Grid<KvHeads, Groups> =
+    DmTensor<i32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, m![Rows % 8, Cache]>;
+/// One I32 on every row's slice, in the first of a flit's eight words.
+type Word<KvHeads, Groups> =
+    DmTensor<i32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, m![1 # 8]>;
+/// A [`Word`] as a vector-engine operand.
+type WordOperand<KvHeads, Groups> =
+    VrfTensor<i32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, m![1 # 8]>;
 type GroupMask<KvHeads, Groups, Head, T> = DmTensor<
     i8,
     Chip,
@@ -804,6 +822,11 @@ pub(crate) struct Input<
     /// keys the history gather defines, since the fresh rows are attended from `key` and `value`.
     pub lanes: &'a HbmTensor<i32, Chip, m![Cache]>,
     pub slots: &'a SlotTable<W>,
+    /// Where the chunk's window binds, each tile's first row's first window key in the history
+    /// it reads, the first of a flit's eight words.
+    pub bases: &'a TileBases,
+    pub offsets: &'a Offsets,
+    pub starts: &'a Starts<W>,
 }
 
 /// The attended rows of a batch `All`.
@@ -1170,6 +1193,87 @@ where
                 (&queries, &mut carry, &mut running),
             ),
         );
+        // A chunk whose window binds reads its history as panels, each attended per tile with the
+        // keys before each row's window masked.
+        let window = runs.window();
+        for _ in 0..window.count().min(1) {
+            // SAFETY: the two row axes have the same contiguous 128-element order.
+            let offsets = unsafe { input.offsets.view().reshape::<Chip, m![Rows, Cache]>() };
+            let offsets = offsets.to_dm(&mut context.tdma);
+            let mut bases = Bases::<KvHeads, Groups, T>::new();
+            #[unroll]
+            for t in 0..T::SIZE {
+                // SAFETY: one tile's flit of a table nothing writes.
+                let base: HbmTensor<i32, Chip, m![1 # 8]> = unsafe {
+                    input
+                        .bases
+                        .view()
+                        .tile::<m![TilePair], 1, m![TilePair = 1 # TilePair, 1 # 8]>(first + t)
+                        .alias()
+                };
+                base.view().to_dm_view(
+                    &mut context.tdma,
+                    bases
+                        .view_mut()
+                        .tile::<m![{ Symbol<T> }], 1, m![{ TileSlot<T> }, 1 # 8]>(t),
+                );
+            }
+            for p in 0..window.count() {
+                // SAFETY: one immutable run of the table's entries, read in place.
+                let entries: HbmTensor<i32, Chip, m![Cache / Block]> = unsafe {
+                    input
+                        .table
+                        .view()
+                        .tile::<m![{ Symbol<Chunks<W>> }], 1, m![
+                            { Symbol<Chunks<W>> } = 1 # ({ Symbol<Chunks<W>> }), Cache / Block
+                        ]>(p)
+                        .alias()
+                };
+                let (key, value) = Module::forward(
+                    &history::LastPanel,
+                    &mut *context,
+                    env,
+                    &mut (),
+                    ((pool, &entries, input.history), p),
+                );
+                let panel = Module::forward(
+                    &history::Clean,
+                    &mut *context,
+                    env,
+                    &mut (),
+                    ((&key, &value), (input.slots, input.lanes, p)),
+                );
+                // SAFETY: one panel's flit of a table nothing writes.
+                let start: HbmTensor<i32, Chip, m![1 # 8]> = unsafe {
+                    input
+                        .starts
+                        .view()
+                        .tile::<m![{ Symbol<Chunks<W>> }], 1,
+                            m![{ Symbol<Chunks<W>> } = 1 # ({ Symbol<Chunks<W>> }), 1 # 8]>(p)
+                        .alias()
+                };
+                let start: Word<KvHeads, Groups> = start.to_dm(&mut context.tdma);
+                let band = Banded {
+                    offsets: &offsets,
+                    bases: &bases,
+                    start: context
+                        .sub
+                        .begin(start.view())
+                        .fetch::<m![1], m![1 # 8]>()
+                        .collect::<m![1], m![1 # 8]>()
+                        .to_vrf(),
+                };
+                Op::forward(
+                    &Masked,
+                    &mut *context,
+                    (
+                        (input, (&band, p)),
+                        (&panel.0, &panel.1),
+                        (&queries, &mut carry, &mut running),
+                    ),
+                );
+            }
+        }
         #[unroll]
         for i in 0..T::SIZE {
             let attended: DmTensor<
@@ -1730,101 +1834,234 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, T: AxisName, All: Axis
                 ),
             );
         }
-        // Only the partial last panel, masked to the committed keys, is attended per tile; its key
-        // and value fills and its mask serve every tile. A head wider than one fill keeps the
-        // panel staged and fills a tile's parts one after another.
+        // Only the partial last panel, masked to the committed keys, is attended per tile.
         let partial = runs.partial();
         for _ in 0..partial.count() {
-            if const { Part::<Head>::WHOLE } {
-                let key = Op::forward(
-                    &fresh::LoadKeys::<KvHeads, Groups, Head>(PhantomData),
-                    &mut *context,
-                    last.0.view(),
-                );
-                let mask = Op::forward(
-                    &history::LastKeys::<KvHeads, Groups>(PhantomData),
-                    &mut *context,
-                    (input.lanes, input.slots, partial.begin()),
-                );
-                let value = Op::forward(
-                    &fresh::LoadValues::<KvHeads, Groups, Head>(PhantomData),
-                    &mut *context,
-                    last.1.view(),
-                );
-                #[unroll]
-                for i in 0..T::SIZE {
-                    let query = queries
-                        .view()
-                        .tile::<m![{ Symbol<T> }], 1, TileRows<Head, T>>(i);
-                    let mut scores = Scores::<KvHeads, Groups>::new();
-                    Op::forward(
-                        &fresh::FreshScores,
-                        &mut *context,
-                        (input.attention, query, &key, scores.view_mut()),
-                    );
-                    let scores = Op::forward(&history::MaskScores, &mut *context, (&scores, &mask));
-                    let (probabilities, lse) =
-                        Op::forward(&panel::Normalize, &mut *context, scores.view());
-                    let mut partial = Partial::<KvHeads, Groups, Head>::new();
-                    Op::forward(
-                        &panel::Weight,
-                        &mut *context,
-                        (probabilities.view(), &value, partial.view_mut()),
-                    );
-                    Op::forward(
-                        &state::Merge,
-                        &mut *context,
-                        (
-                            (&mut *carry, &mut *running, i),
-                            (partial.view(), lse.view()),
-                        ),
-                    );
-                }
-            } else {
-                let mut keys: fresh::KeyPanel<KvHeads, Head> =
-                    last.0.view().to_dm(&mut context.tdma);
-                let mask = Op::forward(
-                    &history::LastKeys::<KvHeads, Groups>(PhantomData),
-                    &mut *context,
-                    (input.lanes, input.slots, partial.begin()),
-                );
-                let mut values = fresh::Staged::<KvHeads, Head>::new();
+            Op::forward(
+                &Masked,
+                &mut *context,
+                (
+                    (input, (&(), partial.begin())),
+                    last,
+                    (queries, &mut *carry, &mut *running),
+                ),
+            );
+        }
+    }
+}
+
+/// What masks each tile's scores of a history panel past what the panel's end mask does.
+trait Band<KvHeads: AxisName, Groups: AxisName> {
+    /// Tile `tile`'s scores of the panel, masked.
+    fn mask(
+        &self,
+        context: &mut Device,
+        scores: Scores<KvHeads, Groups>,
+        tile: usize,
+    ) -> Scores<KvHeads, Groups>;
+}
+
+/// Each row sees every key of the panel before the history's end.
+impl<KvHeads: AxisName, Groups: AxisName> Band<KvHeads, Groups> for () {
+    fn mask(
+        &self,
+        _: &mut Device,
+        scores: Scores<KvHeads, Groups>,
+        _: usize,
+    ) -> Scores<KvHeads, Groups> {
+        scores
+    }
+}
+
+/// A window's band over a panel: row `ii` of a group's tile `t` sees the panel's keys from
+/// `bases[t] + ii` on, the first key its window holds in the history the chunk reads.
+struct Banded<'a, KvHeads: AxisName, Groups: AxisName, T: AxisName> {
+    offsets: &'a Grid<KvHeads, Groups>,
+    bases: &'a Bases<KvHeads, Groups, T>,
+    /// The panel's first key.
+    start: WordOperand<KvHeads, Groups>,
+}
+
+impl<KvHeads: AxisName, Groups: AxisName, T: AxisName> Band<KvHeads, Groups>
+    for Banded<'_, KvHeads, Groups, T>
+{
+    fn mask(
+        &self,
+        context: &mut Device,
+        scores: Scores<KvHeads, Groups>,
+        tile: usize,
+    ) -> Scores<KvHeads, Groups> {
+        let base: WordOperand<KvHeads, Groups> = context
+            .sub
+            .begin(
+                self.bases
+                    .view()
+                    .tile::<m![{ Symbol<T> }], 1, m![{ TileOf<T> }, 1 # 8]>(tile),
+            )
+            .fetch::<m![1], m![1 # 8]>()
+            .collect::<m![1], m![1 # 8]>()
+            .to_vrf();
+        // Key `kk` of the panel lies in row `ii`'s window where `start + kk - ii - base` is not
+        // negative.
+        let distance: Grid<KvHeads, Groups> = context
+            .main
+            .begin(self.offsets.view())
+            .fetch::<m![Rows % 8, Cache / 8], m![Cache % 8]>()
+            .collect::<m![Rows % 8, Cache / 8], m![Cache % 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_fxp(FxpBinaryOp::SubFxp, &base)
+            .vector_clip(ClipBinaryOpI32::AddFxp, &self.start)
+            .vector_final()
+            .commit_trim::<m![Cache % 8]>()
+            .commit();
+        let seen: history::BandMask<KvHeads, Groups> = context
+            .main
+            .begin(distance.view())
+            .fetch::<m![Rows % 8, Cache / 8], m![Cache % 8]>()
+            .collect::<m![Rows % 8, Cache / 8], m![Cache % 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Comparison([
+                Cmp::Greater(-1i32),
+                Cmp::False,
+                Cmp::False,
+                Cmp::False,
+            ]))
+            .vector_log(&mut context.sub);
+        Op::forward(&history::MaskBand, context, (&scores, &seen))
+    }
+}
+
+/// A history panel attended by each tile of a group: its cleaned keys and values, the scores
+/// masked to the history's keys and as `band` says of each tile. The panel's key and value fills
+/// and its end mask serve every tile; a head wider than one fill keeps the panel staged and fills
+/// a tile's parts one after another.
+struct Masked;
+
+impl<
+    KvHeads: AxisName,
+    Groups: AxisName,
+    Head: AxisName,
+    T: AxisName,
+    All: AxisName,
+    W: AxisName,
+    B: Band<KvHeads, Groups>,
+>
+    Op<(
+        (&Input<'_, KvHeads, Groups, Head, All, W>, (&B, usize)),
+        (&CachePanel<KvHeads, Head>, &CachePanel<KvHeads, Head>),
+        (
+            &history::Group<KvHeads, Groups, Head, T>,
+            &mut state::Carry<KvHeads, Groups, Head, T>,
+            &mut state::Running<KvHeads, Groups, T>,
+        ),
+    )> for Masked
+{
+    type Output = ();
+
+    fn forward(
+        &self,
+        context: &mut Device,
+        ((input, (band, at)), last, (queries, carry, running)): (
+            (&Input<'_, KvHeads, Groups, Head, All, W>, (&B, usize)),
+            (&CachePanel<KvHeads, Head>, &CachePanel<KvHeads, Head>),
+            (
+                &history::Group<KvHeads, Groups, Head, T>,
+                &mut state::Carry<KvHeads, Groups, Head, T>,
+                &mut state::Running<KvHeads, Groups, T>,
+            ),
+        ),
+    ) {
+        if const { Part::<Head>::WHOLE } {
+            let key = Op::forward(
+                &fresh::LoadKeys::<KvHeads, Groups, Head>(PhantomData),
+                &mut *context,
+                last.0.view(),
+            );
+            let mask = Op::forward(
+                &history::LastKeys::<KvHeads, Groups>(PhantomData),
+                &mut *context,
+                (input.lanes, input.slots, at),
+            );
+            let value = Op::forward(
+                &fresh::LoadValues::<KvHeads, Groups, Head>(PhantomData),
+                &mut *context,
+                last.1.view(),
+            );
+            #[unroll]
+            for i in 0..T::SIZE {
+                let query = queries
+                    .view()
+                    .tile::<m![{ Symbol<T> }], 1, TileRows<Head, T>>(i);
+                let mut scores = Scores::<KvHeads, Groups>::new();
                 Op::forward(
-                    &fresh::StageValues,
+                    &fresh::FreshScores,
                     &mut *context,
-                    (last.1.view(), &mut values),
+                    (input.attention, query, &key, scores.view_mut()),
                 );
-                #[unroll]
-                for i in 0..T::SIZE {
-                    let key = keys.key(context, 0);
-                    let mut scores = Scores::<KvHeads, Groups>::new();
-                    Op::forward(
-                        &fresh::TileScores,
-                        &mut *context,
-                        (
-                            input.attention,
-                            (queries, i),
-                            (key, &mut keys),
-                            scores.view_mut(),
-                        ),
-                    );
-                    let scores = Op::forward(&history::MaskScores, &mut *context, (&scores, &mask));
-                    let (probabilities, lse) =
-                        Op::forward(&panel::Normalize, &mut *context, scores.view());
-                    let partial = Op::forward(
-                        &panel::WeighParts::<Head>(PhantomData),
-                        &mut *context,
-                        (probabilities.view(), &mut values),
-                    );
-                    Op::forward(
-                        &state::Merge,
-                        &mut *context,
-                        (
-                            (&mut *carry, &mut *running, i),
-                            (partial.view(), lse.view()),
-                        ),
-                    );
-                }
+                let scores = Op::forward(&history::MaskScores, &mut *context, (&scores, &mask));
+                let scores = band.mask(context, scores, i);
+                let (probabilities, lse) =
+                    Op::forward(&panel::Normalize, &mut *context, scores.view());
+                let mut partial = Partial::<KvHeads, Groups, Head>::new();
+                Op::forward(
+                    &panel::Weight,
+                    &mut *context,
+                    (probabilities.view(), &value, partial.view_mut()),
+                );
+                Op::forward(
+                    &state::Merge,
+                    &mut *context,
+                    (
+                        (&mut *carry, &mut *running, i),
+                        (partial.view(), lse.view()),
+                    ),
+                );
+            }
+        } else {
+            let mut keys: fresh::KeyPanel<KvHeads, Head> = last.0.view().to_dm(&mut context.tdma);
+            let mask = Op::forward(
+                &history::LastKeys::<KvHeads, Groups>(PhantomData),
+                &mut *context,
+                (input.lanes, input.slots, at),
+            );
+            let mut values = fresh::Staged::<KvHeads, Head>::new();
+            Op::forward(
+                &fresh::StageValues,
+                &mut *context,
+                (last.1.view(), &mut values),
+            );
+            #[unroll]
+            for i in 0..T::SIZE {
+                let key = keys.key(context, 0);
+                let mut scores = Scores::<KvHeads, Groups>::new();
+                Op::forward(
+                    &fresh::TileScores,
+                    &mut *context,
+                    (
+                        input.attention,
+                        (queries, i),
+                        (key, &mut keys),
+                        scores.view_mut(),
+                    ),
+                );
+                let scores = Op::forward(&history::MaskScores, &mut *context, (&scores, &mask));
+                let scores = band.mask(context, scores, i);
+                let (probabilities, lse) =
+                    Op::forward(&panel::Normalize, &mut *context, scores.view());
+                let partial = Op::forward(
+                    &panel::WeighParts::<Head>(PhantomData),
+                    &mut *context,
+                    (probabilities.view(), &mut values),
+                );
+                Op::forward(
+                    &state::Merge,
+                    &mut *context,
+                    (
+                        (&mut *carry, &mut *running, i),
+                        (partial.view(), lse.view()),
+                    ),
+                );
             }
         }
     }
@@ -2349,12 +2586,11 @@ impl<
 
 #[cfg(test)]
 mod tests {
-    use super::super::chunks::{self, Words};
-    use super::super::gqa::items::tests::{QueryPairs, UNIT, Wide};
+    use super::super::chunks;
+    use super::super::gqa::items::tests::{QueryPairs, UNIT, WINDOW, Wide, place};
     use super::*;
     use crate::tensor::axis::Rows;
     use crate::tensor::cache::Blocks;
-    use crate::tensor::live::tests::count;
     use crate::tensor::scalar::F32;
     use crate::tests::DEVICE;
     use furiosa_opt_std::runtime::launch;
@@ -2369,30 +2605,26 @@ mod tests {
     /// FP32 bits.
     const SCALE: usize = 0x3db5_0000;
 
+    /// One chunk's rows and the launch arrays its plan binds.
     #[derive(DeviceSend)]
-    struct Chunk<H: AxisName, G: AxisName, D: AxisName> {
+    struct Fixture<H: AxisName, G: AxisName, D: AxisName> {
         query: Queries<H, G, D>,
         key: Fresh<H, D>,
         value: Fresh<H, D>,
-        causal: Causal,
-        table: Table<Windows>,
-        h: Value,
-        work: HbmTensor<i32, Chip, m![{ Symbol<Words<Sequences, Windows>> }]>,
-        lanes: HbmTensor<i32, Chip, m![Cache]>,
-        slots: SlotTable<Windows>,
+        chunks: chunks::Invocation<Sequences, Windows>,
     }
 
     #[device(chip = 1)]
     fn attend_chunk<H: AxisName, G: AxisName, D: AxisName, const SCALE: usize>(
         device: &mut Device,
         scale: &F32<SCALE>,
-        chunk: &Chunk<H, G, D>,
+        fixture: &Fixture<H, G, D>,
         blocks: &mut Blocks<H, D>,
         output: &mut Output<H, G, D>,
     ) {
         // SAFETY: fixture query rows are contiguous and share the same length.
         let query = unsafe {
-            chunk
+            fixture
                 .query
                 .view()
                 .reshape::<Chip, m![FixtureRows, H, G, D]>()
@@ -2402,6 +2634,7 @@ mod tests {
             heads: PhantomData,
             scale: f32::from(*scale),
         };
+        let (invocation, chunk) = (&fixture.chunks, fixture.chunks.chunk(0));
         Attend.forward(
             device,
             (),
@@ -2411,16 +2644,19 @@ mod tests {
                     Input::<H, G, D, FixtureRows, Windows> {
                         attention: &attention,
                         query: &query,
-                        key: &chunk.key,
-                        value: &chunk.value,
+                        key: &fixture.key,
+                        value: &fixture.value,
                         start: 0,
-                        causal: &chunk.causal,
+                        causal: &invocation.causal,
                         table: &chunk.table,
                         history: &chunk.h,
                         lanes: &chunk.lanes,
-                        slots: &chunk.slots,
+                        slots: &invocation.slots,
+                        bases: &chunk.bases,
+                        offsets: &invocation.offsets,
+                        starts: &invocation.starts,
                     },
-                    &Epoch::new(&chunk.work, 0),
+                    &Epoch::new(&invocation.work, 0),
                 ),
                 (&Gather, &*blocks),
                 output,
@@ -2467,13 +2703,21 @@ mod tests {
         (shrink, gain / f64::from(shrink))
     }
 
+    /// The first key row `j` of a chunk over `h` keys attends in `window`.
+    fn lowest(h: usize, j: usize, window: Option<usize>) -> usize {
+        window.map_or(0, |window| (h + j + 1).saturating_sub(window))
+    }
+
     /// The attended rows of a chunk of `q` rows over `h` keys of a poisoned, shuffled pool of `H`
-    /// KV heads of `D` channels, `G` query groups each, under the score multiplier of bits
-    /// `SCALE`; scratch rows past the chunk's hold `past`, or else a NaN query and the next key's
-    /// key and value, and live row `nan` holds a NaN value. Attending leaves the pool's bytes.
+    /// KV heads of `D` channels, `G` query groups each, each row attending its last `window` keys,
+    /// under the score multiplier of bits `SCALE`; scratch rows past the chunk's hold `past`, or
+    /// else a NaN query and the next key's key and value, and live row `nan` holds a NaN value.
+    /// Poison fills the keys below the chunk's first row's window, and one poisoned block takes
+    /// the place of every block wholly below it, as a framework names its null block there.
+    /// Attending leaves the pool's bytes.
     async fn attend<H: AxisName, G: AxisName, D: AxisName, const SCALE: usize>(
         context: &mut Device,
-        (q, h): (usize, usize),
+        (q, h, window): (usize, usize, Option<usize>),
         (past, nan): (Option<f32>, Option<usize>),
     ) -> Vec<bf16> {
         let scratch = |row: usize, own: f32, next: f32| {
@@ -2494,7 +2738,8 @@ mod tests {
         let mut data: Vec<bf16> = (0..blocks * Block::SIZE * row)
             .map(|at| bf16::from_f32([f32::NAN, f32::INFINITY, f32::NEG_INFINITY][at % 3]))
             .collect();
-        for k in 0..q + h {
+        let first = lowest(h, 0, window);
+        for k in first..q + h {
             let token = physical(k / Block::SIZE) * Block::SIZE + k % Block::SIZE;
             for head in 0..heads {
                 for channel in 0..width {
@@ -2508,19 +2753,24 @@ mod tests {
             .write(&mut *context, 0..blocks, data.iter().copied())
             .await
             .unwrap();
-        let table: Table<Windows> =
-            HostTensor::<i32, m![{ Symbol<Chunks<Windows>> }, Cache / Block]>::from_vec(
-                (0..Chunks::<Windows>::SIZE * Cache::SIZE / Block::SIZE).map(|i| {
-                    i32::try_from(physical(i % blocks)).unwrap() * Blocks::<H, D>::BLOCK_STRIDE
-                }),
-            )
-            .to_hbm(&mut context.pdma)
-            .await
-            .expect("host transfer");
-        let slots = HostTensor::<i32, m![{ Symbol<Chunks<Windows>> }, Cache]>::from_vec(0..40960)
-            .to_hbm(&mut context.pdma)
-            .await
-            .expect("host transfer");
+        let null = |i: usize| match (i + 1) * Block::SIZE <= first {
+            true => 0,
+            false => i,
+        };
+        let mut plan = chunks::Plan::<Windows>::new::<Sequences>();
+        (plan.count, plan.q[0], plan.h[0]) = (1, q as i32, h as i32);
+        plan.window = window;
+        plan.lanes.fill(h as i32);
+        for (i, entry) in plan.tables.iter_mut().enumerate() {
+            *entry =
+                i32::try_from(physical(null(i) % blocks)).unwrap() * Blocks::<H, D>::BLOCK_STRIDE;
+        }
+        let reads = plan.reads().unwrap();
+        let reads = reads.iter().map(|(read, words)| (&read[..], *words));
+        let mut buffers = place(&mut *context, reads).await;
+        let masks = chunks::Masks::<Windows>::new(&mut *context).await.unwrap();
+        let next = || Ok(buffers.next().expect("an array a buffer"));
+        let invocation = chunks::Invocation::bind(next, &masks).unwrap();
         let query: Queries<H, G, D> = HostTensor::<bf16, m![Query, H, G, D]>::from_vec(
             (0..Query::SIZE * heads * groups * width).map(|at| {
                 let j = at / (heads * groups * width);
@@ -2532,11 +2782,6 @@ mod tests {
         .to_hbm(&mut context.pdma)
         .await
         .expect("host transfer");
-        let lanes: HbmTensor<i32, Chip, m![Cache]> =
-            HostTensor::<i32, m![Cache]>::from_vec(vec![i32::try_from(h).unwrap(); Cache::SIZE])
-                .to_hbm(&mut context.pdma)
-                .await
-                .expect("host transfer");
         let mut output: Output<H, G, D> =
             HostTensor::<bf16, m![FixtureRows, H, G, D]>::from_vec(vec![
                 bf16::from_f32(
@@ -2573,36 +2818,16 @@ mod tests {
         .to_hbm(&mut context.pdma)
         .await
         .expect("host transfer");
-        let causal: Causal = HostTensor::<i8, m![Cache, Cache]>::from_vec(
-            (0..Cache::SIZE * Cache::SIZE).map(|at| i8::from(at % Cache::SIZE > at / Cache::SIZE)),
-        )
-        .to_hbm(&mut context.pdma)
-        .await
-        .expect("host transfer");
-        let mut plan = chunks::Plan::<Windows>::new::<Sequences>();
-        (plan.count, plan.q[0], plan.h[0]) = (1, q as i32, h as i32);
-        let [.., (work, _)] = plan.reads().unwrap();
-        let chunk = Chunk {
+        let fixture = Fixture {
             query,
             key: fresh,
             value: values,
-            causal,
-            table,
-            h: count(h)
-                .to_hbm(&mut context.pdma)
-                .await
-                .expect("host transfer"),
-            work: HostTensor::<i32, m![{ Symbol<Words<Sequences, Windows>> }]>::from_vec(work)
-                .to_hbm(&mut context.pdma)
-                .await
-                .expect("host transfer"),
-            lanes,
-            slots,
+            chunks: invocation,
         };
         let arguments = (
             &mut *context,
             &F32::<SCALE>,
-            &chunk,
+            &fixture,
             &mut allocation,
             &mut output,
         );
@@ -2622,21 +2847,23 @@ mod tests {
             .into_vec()
     }
 
-    /// Each of the `q` live rows of `attend`'s chunk over `h` keys attends every key up to its own
-    /// as an f64 softmax does, to 0.004 of each channel's magnitude, at least 1.
+    /// Each of the `q` live rows of `attend`'s chunk over `h` keys attends every key of its last
+    /// `window` up to its own as an f64 softmax does, to 0.004 of each channel's magnitude, at
+    /// least 1.
     fn check<H: AxisName, G: AxisName, D: AxisName, const SCALE: usize>(
-        (q, h): (usize, usize),
+        (q, h, window): (usize, usize, Option<usize>),
         got: &[bf16],
     ) {
         let (_, gain) = gain::<D, SCALE>();
         let mut max_error = 0.0f64;
         for j in 0..q {
+            let keys = lowest(h, j, window)..=h + j;
             for head in 0..H::SIZE {
                 for group in 0..G::SIZE {
                     let query = f64::from(query_value(j, head, group)) * gain;
                     let score = |k: usize| query * f64::from(kv(k, head));
-                    let top = (0..=h + j).map(score).fold(f64::NEG_INFINITY, f64::max);
-                    let (weighted, mass) = (0..=h + j).fold((0.0, 0.0), |(weighted, mass), k| {
+                    let top = keys.clone().map(score).fold(f64::NEG_INFINITY, f64::max);
+                    let (weighted, mass) = keys.clone().fold((0.0, 0.0), |(weighted, mass), k| {
                         let weight = (score(k) - top).exp();
                         (weighted + weight * f64::from(value(k, head)), mass + weight)
                     });
@@ -2648,14 +2875,14 @@ mod tests {
                         max_error = max_error.max(error);
                         assert!(
                             error <= 0.004 * want.abs().max(1.0),
-                            "q={q} h={h} row={j} head={head} group={group} channel={channel}: \
-                             {found} != {want}"
+                            "q={q} h={h} window={window:?} row={j} head={head} group={group} \
+                             channel={channel}: {found} != {want}"
                         );
                     }
                 }
             }
         }
-        println!("q={q} h={h} max_error={max_error}");
+        println!("q={q} h={h} window={window:?} max_error={max_error}");
     }
 
     /// Scratch rows of NaN or infinities past live rows that end inside a 128-key panel give the
@@ -2682,14 +2909,14 @@ mod tests {
         let row = <m![KvHeads, G, Head]>::SIZE;
         let attend = attend::<KvHeads, G, Head, SCALE>;
         for (q, h) in cases {
-            let zeroed = attend(&mut *context, (q, h), (Some(0.0), None)).await;
+            let zeroed = attend(&mut *context, (q, h, None), (Some(0.0), None)).await;
             let runs = [
                 (f32::NAN, None),
                 (f32::INFINITY, None),
                 (f32::NAN, Some(q - 1)),
             ];
             for (past, nan) in runs {
-                let got = attend(&mut *context, (q, h), (Some(past), nan)).await;
+                let got = attend(&mut *context, (q, h, None), (Some(past), nan)).await;
                 let clean = nan.unwrap_or(q) * row;
                 for (at, (got, zeroed)) in got[..clean].iter().zip(&zeroed[..clean]).enumerate() {
                     let (got, zeroed) = (got.to_f32(), zeroed.to_f32());
@@ -2742,8 +2969,9 @@ mod tests {
             (1023, 2049),
         ];
         for (q, h) in cases {
-            let got = attend::<KvHeads, G, Head, SCALE>(&mut *context, (q, h), (None, None));
-            check::<KvHeads, G, Head, SCALE>((q, h), &got.await);
+            let chunk = (q, h, None);
+            let got = attend::<KvHeads, G, Head, SCALE>(&mut *context, chunk, (None, None));
+            check::<KvHeads, G, Head, SCALE>(chunk, &got.await);
         }
     }
 
@@ -2763,8 +2991,38 @@ mod tests {
             (1023, 0),
         ];
         for (q, h) in cases {
-            let got = attend::<KvHeads, QueryPairs, Wide, UNIT>(&mut context, (q, h), (None, None));
-            check::<KvHeads, QueryPairs, Wide, UNIT>((q, h), &got.await);
+            let chunk = (q, h, None);
+            let got = attend::<KvHeads, QueryPairs, Wide, UNIT>(&mut context, chunk, (None, None));
+            check::<KvHeads, QueryPairs, Wide, UNIT>(chunk, &got.await);
+        }
+    }
+
+    /// Chunks of 128-wide heads in four query groups and of 256-wide heads in two attend only
+    /// each row's last [`WINDOW`] keys, causally, as an f64 softmax does: a row whose window opens
+    /// inside a block, rows whose windows reach exactly the history's first key and one past it,
+    /// whole tiles whose first row sees all of a short history and whose last row sees none, and
+    /// chunks of every tile domain, though poison fills the keys below the first row's window and
+    /// one poisoned block every block wholly below it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn attends_only_each_row_window() {
+        let _lease = DEVICE.lock().await;
+        let mut context = Device::new(attend_chunk.topology()).unwrap();
+        let cases = [
+            (1, 2 * WINDOW + 16),
+            (2, WINDOW),
+            (17, WINDOW - 17),
+            (128, WINDOW),
+            (300, 2866),
+            (1024, 1100),
+            (129, 2049),
+            (513, 3000),
+        ];
+        for (q, h) in cases {
+            let chunk = (q, h, Some(WINDOW));
+            let got = attend::<KvHeads, Groups, Head, SCALE>(&mut context, chunk, (None, None));
+            check::<KvHeads, Groups, Head, SCALE>(chunk, &got.await);
+            let got = attend::<KvHeads, QueryPairs, Wide, UNIT>(&mut context, chunk, (None, None));
+            check::<KvHeads, QueryPairs, Wide, UNIT>(chunk, &got.await);
         }
     }
 }
