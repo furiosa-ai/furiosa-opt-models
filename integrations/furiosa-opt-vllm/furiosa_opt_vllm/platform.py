@@ -16,11 +16,11 @@ from furiosa_opt_vllm.admission import (
     CONTRACTS,
     Refused,
     adapters,
-    offload,
     options,
     speculative,
     verify_checkpoint,
 )
+from furiosa_opt_vllm.transfer import offload
 
 if TYPE_CHECKING:
     from vllm.config import CacheConfig, ModelConfig, VllmConfig
