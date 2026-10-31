@@ -20,8 +20,8 @@ Install a plugin first ([Installation](../getting-started/installation.md)); [Qu
 | Prompt embeddings | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Custom logits processors | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Watermarking | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
-| Speculative decoding (ngram, suffix, draft model) | <span class="support support-yes">Supported</span> (ngram and suffix; no draft model yet) | <span class="support support-yes">Supported</span> (ngram and draft model; no suffix decoding in SGLang) | [ngram or suffix](#speculate-with-ngram-or-suffix-decoding), [draft model](#speculate-with-a-draft-model) |
-| Speculative decoding (EAGLE, MTP, Medusa, MLP, parallel draft models) | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
+| Speculative decoding (ngram, suffix, draft model) | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> (ngram and draft model; no suffix decoding in SGLang) | [ngram or suffix](#speculate-with-ngram-or-suffix-decoding), [draft model](#speculate-with-a-draft-model) |
+| Speculative decoding (EAGLE, MTP, Medusa, MLP, parallel draft models) | <span class="support support-yes">Supported</span> (parallel draft models; no EAGLE, MTP, Medusa or MLP yet) | <span class="support support-no">Not yet</span> | [parallel draft model](#speculate-with-a-draft-model) |
 | Automatic prefix caching | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Reuse cached prefixes](#reuse-cached-prefixes) |
 | FP8 KV cache | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Quantized checkpoints (FP8, NVFP4) | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
@@ -108,6 +108,13 @@ Without it, vLLM refuses `{"method": "suffix"}` at startup and names the package
 Its message pins an older Arctic Inference release; the extra pins the one the plugin is tested with.
 
 ## Speculate with a draft model
+
+With vLLM, a smaller causal language model that shares the target's vocabulary and cache block size drafts the tokens on the target's chips; `"parallel_drafting": true` drafts all of a step's positions at once from a mask token the draft config names, such as `pard_token`:
+
+```bash
+vllm serve Qwen/Qwen3-1.7B \
+  --speculative-config '{"method": "draft_model", "model": "amd/PARD-Qwen3-0.6B", "num_speculative_tokens": 4, "parallel_drafting": true}'
+```
 
 With SGLang, a smaller causal language model that shares the target's tokenizer drafts the tokens on the target's chips:
 
@@ -429,7 +436,7 @@ Asking for a feature that is not supported yet has one of three outcomes:
 
 - **Refused** before it runs, with the reason: an option the [vLLM](vllm.md#options) or [SGLang](sglang.md#options) page names stops startup, and so does a checkpoint config no served decoder holds, such as a rope type the engine does not compute; a request field [SGLang requests](sglang.md#requests) names fails its request with HTTP 400, and vLLM refuses a request that is not greedy or holds prompt embeddings.
 - **Not verified**: tool calling and reasoning outputs with vLLM and `tool_choice` `auto` may work, as its parsers read the greedy answer, but no test runs them on RNGD yet.
-- **Not refused**: any other way to ask may fail with an internal error or not take effect. A vLLM draft model (`"method": "draft_model"`) passes the option check, then fails at load.
+- **Not refused**: any other way to ask may fail with an internal error or not take effect.
 
 Why each feature is not served yet:
 
@@ -437,7 +444,7 @@ Why each feature is not served yet:
 - **Reranking and score heads**: SGLang's reranking reads the logprobs of two tokens; vLLM's reranking and either plugin's classification run a score head, which the engine loads but neither plugin calls yet.
 - **Prompt embeddings**: a decoder call takes token IDs.
 - **Multimodal inputs**: no served checkpoint answers about images, video or audio; Gemma 4 unified's media encoder runs [on an encoder-only instance](#embed-media-on-an-encoder-only-instance), but the engine serves no language model of it.
-- **Speculative methods other than ngram and suffix** (vLLM, which also has no draft model yet) or NGRAM and STANDALONE (SGLang).
+- **Speculative methods other than ngram, suffix and a draft model** (vLLM) or NGRAM and STANDALONE (SGLang).
 - **FP8 KV cache and quantized checkpoints**: the served checkpoints load BF16 weights and cache keys and values in BF16.
 - **Online quantization** with methods other than vLLM's `fp8_per_tensor` and SGLang's `fp8`: the other methods quantize the activations too or use other formats.
 - **Tensor, pipeline, expert and context parallelism**, and serving across nodes: each served checkpoint runs on one chip.

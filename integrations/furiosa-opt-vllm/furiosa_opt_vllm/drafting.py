@@ -5,6 +5,9 @@
   vocabulary or block size, or a shorter window.
 - `Drafting` is a drafter with its cache, which the target's block tables address, and the
   leading positions of each request that cache holds.
+- A draft model drafts each position after the first from the draft before it; under parallel
+  drafting it reads its mask token there instead, in the calls that append the known tokens, so
+  that one step's drafts are the outputs of one forward of the known tokens and the masks.
 """
 
 from __future__ import annotations
@@ -134,8 +137,12 @@ class Drafting:
             start = min(self.cached.get(req_id, 0), end - 1)
             plans[index] = Plan(req_id, blocks, start, end, min(count, room - end + 1))
         drafts = self.append(batch, plans)
-        # Draft each later position from the previous draft, in calls of at most `rows` requests.
-        for step in range(1, max((plan.drafts for plan in plans.values()), default=0)):
+        # Without a mask token, draft each later position from the previous draft, in calls of at
+        # most `rows` requests; a parallel draft model's appended calls drafted them all.
+        widest = max((plan.drafts for plan in plans.values()), default=0)
+        if self.drafter.draft.mask is not None:
+            widest = 0
+        for step in range(1, widest):
             live = [index for index, plan in plans.items() if plan.drafts > step]
             for first in range(0, len(live), model.rows):
                 part = live[first : first + model.rows]
@@ -157,7 +164,9 @@ class Drafting:
         # Read the drafts once every call is submitted, then record what the cache now holds.
         proposed = read(drafts)
         for plan in plans.values():
-            self.cached[plan.req_id] = plan.end + plan.drafts - 1
+            # A mask position holds no draft, so the next step writes it again.
+            held = plan.drafts - 1 if self.drafter.draft.mask is None else 0
+            self.cached[plan.req_id] = plan.end + held
         return [proposed.get(index, []) for index in range(len(sampled))]
 
     def retire(self, req_id: str) -> None:
@@ -172,14 +181,16 @@ class Drafting:
     def append(
         self, batch: InputBatch, plans: Mapping[int, Plan]
     ) -> dict[int, list[tuple[engine.HbmTensor, int]]]:
-        """Append the known positions each planned request's cache lacks, in calls of at most
-        `rows` rows; each request's first draft is on the device, in the output of the call that
-        appends its last known position, at its row there."""
+        """Append the known positions each planned request's cache lacks, and under parallel
+        drafting a mask at each draft position after the first, in calls of at most `rows` rows;
+        each request's drafts are on the device, in the outputs of the calls that append its last
+        known position and its masks, at their rows there."""
         model = self.drafter.model
+        mask = self.drafter.draft.mask
         rows = [
-            Row(index, position, position + 1 == plan.end)
+            Row(index, position, position + 1 >= plan.end)
             for index, plan in plans.items()
-            for position in range(plan.start, plan.end)
+            for position in range(plan.start, plan.end + (0 if mask is None else plan.drafts - 1))
         ]
         drafts: dict[int, list[tuple[engine.HbmTensor, int]]] = {index: [] for index in plans}
         for first in range(0, len(rows), model.rows):
@@ -187,22 +198,29 @@ class Drafting:
             call = Call[int].plan(chunk, every=False)
             ids = engine.HostTensor.from_dlpack(
                 operand(
-                    [int(batch.token_ids_cpu[row.sequence, row.position]) for row in chunk],
+                    [
+                        int(batch.token_ids_cpu[row.sequence, row.position])
+                        if mask is None or row.position < plans[row.sequence].end
+                        else mask
+                        for row in chunk
+                    ],
                     self.drafter.draft.model.get_vocab_size(),
                 )
             ).to_hbm(self.drafter.device)
+            # A run's complete rows end it: its last known position and its masks.
+            kept = [sum(chunk[row].complete for row in run.rows) for run in call.requests]
             output = model.forward(
                 [
                     engine.decoder.Request(
                         self.tables(plans[run.sequence]),
                         run.cached,
                         ids[run.rows[0] : run.rows[-1] + 1],
-                        engine.decoder.Keep.LAST if run.complete else engine.decoder.Keep.NONE,
+                        range(len(run.rows) - count, len(run.rows)),
                     )
-                    for run in call.requests
+                    for run, count in zip(call.requests, kept, strict=True)
                 ],
                 self.cache,
             )
-            for row, run in enumerate(run for run in call.requests if run.complete):
-                drafts[run.sequence].append((output, row))
+            for row, index in enumerate(call.kept):
+                drafts[chunk[index].sequence].append((output, row))
         return drafts

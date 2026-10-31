@@ -1,12 +1,14 @@
 """A draft model's proposals, checked on the host against a causal model held in memory.
 
 - A draft model drafts each position after the first from the draft before it.
+- A parallel draft model reads its mask token at every draft position after the first, in the
+  calls that append the known tokens, as one forward of the known tokens and the masks would.
 - No drafter call runs an adapter: the target alone runs a request's adapter.
-- Startup refuses a recurrent draft model, whose state a rejected draft cannot roll back.
 """
 
 from __future__ import annotations
 
+import json
 import zlib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -17,25 +19,28 @@ from typing import Final, cast
 import numpy as np
 import pytest
 import torch
+from huggingface_hub import hf_hub_download
 from numpy.typing import NDArray
 from test_vllm_platform import refused
 from transformers import BambaConfig, MambaConfig, PretrainedConfig
 from vllm import SamplingParams
 from vllm.config import LoadConfig, ModelConfig, VllmConfig
 from vllm.engine.arg_utils import EngineArgs
+from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 import furiosa_opt_engine as engine
 from furiosa_opt_vllm import admission, drafting
 from furiosa_opt_vllm.additional import Section
-from furiosa_opt_vllm.admission import Draft, speculative
+from furiosa_opt_vllm.admission import Draft, Refused, speculative
 from furiosa_opt_vllm.drafting import Drafter, Drafting
 from furiosa_opt_vllm.runner import Runner
 
 TARGET: Final = "Qwen/Qwen3-0.6B"
+PARALLEL: Final = "amd/PARD-Qwen3-0.6B"
 VOCABULARY: Final = 151936
 BLOCK: Final = 16
-# Rows one call of the model in memory holds: fewer than a long prompt's rows.
+# Rows one call of the model in memory holds: fewer than a long prompt's or many masks' rows.
 ROWS: Final = 8
 PROMPTS: Final = {"short": list(range(100, 105)), "long": list(range(200, 200 + ROWS + 3))}
 TABLES: Final = {"short": list(range(128)), "long": list(range(128, 256))}
@@ -207,19 +212,24 @@ def session(monkeypatch: pytest.MonkeyPatch) -> Callable[[VllmConfig], Session]:
     return start
 
 
-def configuration(draft: str) -> VllmConfig:
+def configuration(draft: str, *, parallel: bool) -> VllmConfig:
     return EngineArgs(
         model=TARGET,
         dtype="bfloat16",
         max_model_len=2048,
         skip_tokenizer_init=True,
-        speculative_config={"method": "draft_model", "model": draft, "num_speculative_tokens": 3},
+        speculative_config={
+            "method": "draft_model",
+            "model": draft,
+            "num_speculative_tokens": 3,
+            "parallel_drafting": parallel,
+        },
     ).create_engine_config()
 
 
 # A step's tokens accept every draft, or reject the first draft of one request.
 STEPS: Final = [(), ("short",), ("long",)]
-# Three drafts, and ten: more than the rows one call of the model holds.
+# Three drafts fit one call; ten put their nine masks over two of the model's calls.
 COUNTS: Final = [3, 10]
 
 
@@ -228,7 +238,7 @@ COUNTS: Final = [3, 10]
 def test_drafts_from_previous_draft(session: Callable[[VllmConfig], Session], count: int) -> None:
     """Each request's drafts continue its known tokens greedily, one draft after another, also
     after rejected and accepted drafts and for known tokens that take more than one call."""
-    run = session(configuration(TARGET))
+    run = session(configuration(TARGET, parallel=False))
     proposed: dict[str, list[int]] = {req_id: [] for req_id in PROMPTS}
     for rejected in STEPS:
         run.step(proposed, rejected, count)
@@ -240,14 +250,78 @@ def test_drafts_from_previous_draft(session: Callable[[VllmConfig], Session], co
 
 
 @pytest.mark.usefixtures("platform_env")
-def test_drafts_without_adapters(session: Callable[[VllmConfig], Session]) -> None:
+@pytest.mark.parametrize("count", COUNTS)
+def test_drafts_in_parallel(session: Callable[[VllmConfig], Session], count: int) -> None:
+    """A parallel draft model's drafts are its greedy tokens at the last known position and at
+    `count - 1` mask tokens after it, which its calls write there: proposed together, after
+    rejected and accepted drafts, and for known tokens and masks that take more than one call."""
+    mask = json.loads(Path(hf_hub_download(PARALLEL, "config.json")).read_text())["pard_token"]
+    run = session(configuration(PARALLEL, parallel=True))
+    proposed: dict[str, list[int]] = {req_id: [] for req_id in PROMPTS}
+    for rejected in STEPS:
+        run.step(proposed, rejected, count)
+        for req_id in PROMPTS:
+            known = run.known(req_id)
+            expected = [greedy(known + [mask] * offset) for offset in range(count)]
+            assert proposed[req_id] == expected, (rejected, req_id)
+            table = TABLES[req_id]
+            written = [
+                run.cache.slots[table[p // BLOCK] * BLOCK + p % BLOCK]
+                for p in range(len(known), len(known) + count - 1)
+            ]
+            assert written == [mask] * (count - 1), (rejected, req_id)
+
+
+@pytest.mark.usefixtures("platform_env")
+@pytest.mark.parametrize(("draft", "parallel"), [(TARGET, False), (PARALLEL, True)])
+def test_drafts_without_adapters(
+    session: Callable[[VllmConfig], Session], draft: str, *, parallel: bool
+) -> None:
     """A drafter's calls run the base model: no request names an adapter slot."""
-    run = session(configuration(TARGET))
+    run = session(configuration(draft, parallel=parallel))
     proposed: dict[str, list[int]] = {req_id: [] for req_id in PROMPTS}
     for rejected in STEPS:
         run.step(proposed, rejected, 3)
     assert run.model.calls
     assert all(request.adapter is None for call in run.model.calls for request in call)
+
+
+def parallel_draft(directory: Path, settings: dict[str, object]) -> EngineArgs:
+    """The target drafted in parallel by the parallel draft model's config with `settings` over
+    its mask token, saved in `directory`."""
+    config = json.loads(Path(hf_hub_download(PARALLEL, "config.json")).read_text())
+    del config["pard_token"]
+    (directory / "config.json").write_text(json.dumps(config | settings))
+    return EngineArgs(
+        model=TARGET,
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        speculative_config={
+            "method": "draft_model",
+            "model": str(directory),
+            "num_speculative_tokens": 3,
+            "parallel_drafting": True,
+        },
+    )
+
+
+@pytest.mark.usefixtures("platform_env")
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"pard_token": VOCABULARY},
+        {"pard_token": -1},
+        {"ptd_token_id": VOCABULARY + 7},
+        {"pard_token": True},
+        {},
+    ],
+    ids=["past-vocabulary", "negative", "ptd-past-vocabulary", "bool", "none"],
+)
+def test_refuses_mask_outside_vocabulary(tmp_path: Path, settings: dict[str, object]) -> None:
+    """The engine reads no token ID, so startup refuses parallel drafting unless the draft config
+    names a mask token in the draft vocabulary, before any weight loads."""
+    error: Refused = refused(parallel_draft(tmp_path, settings))
+    assert error.option == "speculative_config.parallel_drafting"
 
 
 @pytest.mark.usefixtures("platform_env")
@@ -292,3 +366,44 @@ def test_refuses_recurrent_draft(
         "cannot roll back recurrent state for speculative decoding",
     )
     assert "speculative_config.model" not in read
+
+
+@pytest.mark.usefixtures("platform_env")
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"pard_token": 151670},
+        {"ptd_token_id": 151671},
+        {"mask_token_id": 151672},
+        {"mask_token_id": None, "pard_token": 151670},
+        {"mask_token_id": 151672, "pard_token": 151670},
+        {"pard_token": 151670, "ptd_token_id": 151671},
+        {"dflash_config": {"mask_token_id": 151673}, "mask_token_id": 151672},
+        {"dflash_config": {"block_size": 16}, "pard_token": 151670},
+        {"dspark_noise_token_id": 151674, "pard_token": 151670},
+        {"mask_token_id": 151672, "dspark_noise_token_id": 151674},
+    ],
+    ids=[
+        "pard",
+        "ptd",
+        "mask",
+        "mask-none",
+        "mask-first",
+        "pard-first",
+        "dflash-first",
+        "dflash-without-mask",
+        "dspark-first",
+        "mask-before-dspark",
+    ],
+)
+def test_reads_upstream_mask_token(tmp_path: Path, settings: dict[str, object]) -> None:
+    """Parallel drafting reads the mask token vLLM's own proposer reads of the draft config."""
+    config = parallel_draft(tmp_path, settings).create_engine_config()
+    draft = speculative(config, Section.parse(config))
+    assert isinstance(draft, Draft)
+    assert config.speculative_config is not None
+    upstream = SpecDecodeBaseProposer.__new__(SpecDecodeBaseProposer)
+    upstream.draft_model_config = config.speculative_config.draft_model_config
+    upstream.pass_hidden_states_to_model = False
+    _ = getattr(upstream, "_init_parallel_drafting_params")()  # noqa: B009
+    assert draft.mask == upstream.parallel_drafting_token_id

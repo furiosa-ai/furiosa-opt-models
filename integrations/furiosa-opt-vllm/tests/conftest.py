@@ -392,3 +392,37 @@ class Greedy:
 def greedy() -> Greedy:
     """One Transformers model of each target a session's checks read."""
     return Greedy()
+
+
+@pytest.fixture(scope="module")
+def adapters(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
+    """PEFT checkpoints of Qwen3-0.6B saved by PEFT: of rank 32, the adapter terms' rank, on every
+    attention and MLP projection, of rank 8 under rsLoRA on the attention projections, and of rank
+    4 on the query and output projections, whose larger scale keeps its update as large as the
+    others' on fewer modules.
+
+    Each factor is `0.02 * N(0, 1)`: its update changes the greedy tokens, while a much larger one
+    flattens the scores until BF16 rounding picks the token.
+    """
+    import torch
+    from peft import LoraConfig, get_peft_model
+    from transformers import AutoModelForCausalLM
+
+    attention = ["q_proj", "k_proj", "v_proj", "o_proj"]
+    mlp = ["gate_proj", "up_proj", "down_proj"]
+    directory = tmp_path_factory.mktemp("adapters")
+    forms = {
+        # An update grows as alpha / r times sqrt(r): alpha 45 at rank 32 keeps rank 16's size.
+        "full": LoraConfig(r=32, lora_alpha=45, target_modules=attention + mlp),
+        "rslora": LoraConfig(r=8, lora_alpha=16, use_rslora=True, target_modules=attention),
+        "partial": LoraConfig(r=4, lora_alpha=32, target_modules=["q_proj", "o_proj"]),
+    }
+    for seed, (name, config) in enumerate(forms.items()):
+        model = get_peft_model(AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B"), config)
+        generator = torch.Generator().manual_seed(seed)
+        with torch.no_grad():
+            for parameter, value in model.named_parameters():
+                if ".lora_" in parameter:
+                    _ = value.copy_(0.02 * torch.randn(value.shape, generator=generator))
+        model.save_pretrained(str(directory / name))
+    return {name: directory / name for name in forms}
