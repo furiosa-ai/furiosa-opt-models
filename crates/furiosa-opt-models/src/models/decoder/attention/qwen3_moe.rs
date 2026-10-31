@@ -7,7 +7,7 @@
 //! - [`Model`] and [`Body`] are the catalog's composition, over the [`Qwen3Moe`] template.
 
 use crate::models::decoder::attention::{Chunks, Geometry, mixtral::DbrxForCausalLM};
-use crate::models::{Family, config};
+use crate::models::{Family, config, vocabulary};
 use crate::modules::feedforward::moe::Normalize;
 use crate::modules::feedforward::moe::Reduce;
 use crate::modules::feedforward::moe::TopK;
@@ -310,13 +310,7 @@ where
                 "{key}: {declared}, the size {N} holds {held}"
             )));
         }
-        let rows = <Self as Geometry>::Vocabulary::SIZE;
-        if !(1..=rows).contains(&config.vocab_size) {
-            return Err(invalid(format!(
-                "vocab_size: {}, the size compiles {rows} rows",
-                config.vocab_size
-            )));
-        }
+        vocabulary::<<Self as Geometry>::Vocabulary>(config.vocab_size)?;
         if (config.rms_norm_eps as f32).to_bits() as usize != Self::EPSILON {
             return Err(invalid(format!(
                 "rms_norm_eps: {}, another than the size's",

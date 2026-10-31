@@ -51,19 +51,21 @@ const SIZES: [(Published, fn(&Value) -> io::Result<()>); 2] = [
     (WHISPER_TINY_EN, parse::<whisper::Size<"tiny.en">>),
 ];
 
-/// Each size parses its published checkpoint's config, and the other size refuses it by a field
-/// they differ in, with both values: one size serves each published checkpoint.
+/// Each size parses its published checkpoint's config; the other size refuses it by a field they
+/// differ in, with both values, or serves it if its rows hold the checkpoint's smaller vocabulary.
 #[test]
-fn each_size_reads_its_published_config_alone() {
+fn each_size_reads_its_published_config() {
     let configs: Vec<Value> = SIZES
         .iter()
         .map(|(published, _)| published.config())
         .collect();
+    let tokens = |config: &Value| config["vocab_size"].as_u64();
     for (served, document) in configs.iter().enumerate() {
         for (size, (published, parse)) in SIZES.iter().enumerate() {
             match (size == served, parse(document)) {
                 (true, Ok(())) => {}
-                (false, Err(error)) if error.kind() == io::ErrorKind::InvalidData => {
+                (false, Ok(())) => assert!(tokens(document) < tokens(&configs[size])),
+                (false, Err(error)) if error.kind() == io::ErrorKind::Unsupported => {
                     refuses_by_difference(&error, document, &configs[size]);
                 }
                 (_, parsed) => panic!("{published:?}'s size on config {served}: {parsed:?}"),
@@ -161,8 +163,14 @@ fn refuses_what_the_size_does_not_hold() {
         (
             "vocab_size",
             json!(51866),
+            Unsupported,
+            "vocab_size: 51866, the size holds 1 to 51865",
+        ),
+        (
+            "vocab_size",
+            json!(0),
             InvalidData,
-            "vocab_size: 51866, the size tiny holds 51865",
+            "vocab_size: 0, the size holds 1 to 51865",
         ),
         (
             "tie_word_embeddings",

@@ -8,7 +8,7 @@
 //!   unscaled.
 
 use super::CrossDecoder;
-use crate::models::Family;
+use crate::models::{Family, vocabulary};
 pub use crate::models::{Ids, Scalar};
 use crate::modules::{attention, feedforward, language, multimodal, transformer};
 use crate::ops::attention::Attention;
@@ -296,11 +296,6 @@ where
                 config.max_target_positions,
                 <Self as Geometry>::Positions::SIZE,
             ),
-            (
-                "vocab_size",
-                config.vocab_size,
-                <Self as Geometry>::Vocabulary::SIZE,
-            ),
         ];
         if let Some((key, declared, held)) = fixed
             .into_iter()
@@ -310,6 +305,7 @@ where
                 "{key}: {declared}, the size {N} holds {held}"
             )));
         }
+        vocabulary::<<Self as Geometry>::Vocabulary>(config.vocab_size)?;
         if !config.tie_word_embeddings {
             return Err(invalid(
                 "tie_word_embeddings: false, the size ties: true".into(),

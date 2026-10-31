@@ -113,14 +113,14 @@ fn size_refuses_what_it_does_not_serve() {
         (
             "vocab_size",
             json!(50304),
-            InvalidData,
-            "vocab_size: 50304, the size compiles 50288 rows",
+            Unsupported,
+            "vocab_size: 50304, the size holds 1 to 50288",
         ),
         (
             "vocab_size",
             json!(0),
             InvalidData,
-            "vocab_size: 0, the size compiles 50288 rows",
+            "vocab_size: 0, the size holds 1 to 50288",
         ),
         (
             "layer_norm_epsilon",

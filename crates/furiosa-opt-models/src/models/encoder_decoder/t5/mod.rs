@@ -8,8 +8,8 @@
 //! - Every size has heads of 64 features, 32 relative-position buckets reaching 128 positions
 //!   and a 1e-6 norm epsilon.
 
-use crate::models::Family;
 use crate::models::encoder::NormalizedEncoder;
+use crate::models::{Family, vocabulary};
 pub use crate::models::{Ids, Scalar};
 use crate::modules::attention::relative;
 use crate::modules::multimodal;
@@ -257,13 +257,9 @@ impl Hf {
                 G::MODEL_TYPE
             )));
         }
+        vocabulary::<G::Vocabulary>(self.vocab_size.unwrap_or(defaults.vocab_size))?;
         let layers = self.num_layers.unwrap_or(defaults.num_layers);
         let fixed = [
-            (
-                "vocab_size",
-                self.vocab_size.unwrap_or(defaults.vocab_size),
-                G::Vocabulary::SIZE,
-            ),
             (
                 "d_model",
                 self.d_model.unwrap_or(defaults.d_model),

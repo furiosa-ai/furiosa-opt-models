@@ -6,7 +6,7 @@
 //! - [`Model`] is the catalog's composition, over the [`DbrxForCausalLM`] template.
 
 use crate::models::decoder::attention::{Chunks, Geometry, mixtral::DbrxForCausalLM};
-use crate::models::{Family, config};
+use crate::models::{Family, config, vocabulary};
 use crate::modules::feedforward::moe::Reduce;
 use crate::modules::feedforward::moe::TopK;
 use crate::modules::{attention, feedforward};
@@ -233,13 +233,7 @@ where
                 "{key}: {declared}, the size {N} holds {held}"
             )));
         }
-        let rows = <Self as Geometry>::Vocabulary::SIZE;
-        if !(1..=rows).contains(&config.vocab_size) {
-            return Err(invalid(format!(
-                "vocab_size: {}, the size compiles {rows} rows",
-                config.vocab_size
-            )));
-        }
+        vocabulary::<<Self as Geometry>::Vocabulary>(config.vocab_size)?;
         let epsilon = config.rms_norm_eps.unwrap_or(1e-5);
         if (epsilon as f32).to_bits() as usize != Self::EPSILON {
             return Err(invalid(format!(

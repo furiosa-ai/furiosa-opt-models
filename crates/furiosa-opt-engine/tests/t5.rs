@@ -207,8 +207,14 @@ fn refuses_what_the_size_does_not_hold() {
         (
             "vocab_size",
             json!(250112),
+            Unsupported,
+            "vocab_size: 250112, the size holds 1 to 32128",
+        ),
+        (
+            "vocab_size",
+            json!(0),
             InvalidData,
-            "vocab_size: 250112, the size small holds 32128",
+            "vocab_size: 0, the size holds 1 to 32128",
         ),
         (
             "relative_attention_num_buckets",

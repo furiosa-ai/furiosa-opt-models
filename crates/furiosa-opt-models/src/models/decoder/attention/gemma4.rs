@@ -6,7 +6,6 @@
 //!   whose axes this module declares.
 
 use crate::Sequential;
-use crate::models::Family;
 use crate::models::config::decoder::Language;
 use crate::models::config::{
     self, Constant, Disabled, Enabled, Literal, Positive, Quantization, Scheme, Size, compiled,
@@ -15,6 +14,7 @@ use crate::models::config::{
 use crate::models::decoder::{
     self, Attention, Declaration, Forms, Requirement, Rotation, Shape, form,
 };
+use crate::models::{Family, vocabulary};
 use crate::modules::attention;
 use crate::modules::{language, multimodal, transformer};
 use crate::ops::attention::gqa::Cache;
@@ -301,7 +301,7 @@ struct Text<G: Shape> {
     hidden_size: Size<G::Hidden>,
     intermediate_size: Size<G::Intermediate>,
     num_attention_heads: Size<G::Queries>,
-    vocab_size: Size<G::Vocabulary>,
+    vocab_size: usize,
     hidden_activation: Literal<"gelu_pytorch_tanh">,
     attention_bias: Disabled,
     enable_moe_block: Disabled,
@@ -343,9 +343,9 @@ impl<G: Shape, P: Forms, const S: usize, const F: usize, const O: &'static [Bran
             hidden_size: Size { .. },
             intermediate_size: Size { .. },
             num_attention_heads: Size { .. },
-            vocab_size: Size { .. },
             ..
         } = text.extra;
+        vocabulary::<G::Vocabulary>(text.extra.vocab_size)?;
         let [sliding, full] = LAYER_TYPES;
         let (own, global) = (text.group(sliding), text.group(full));
         for (field, found, expected) in [
@@ -968,6 +968,22 @@ mod tests {
             let error = <Config>::parse(&document).err().unwrap();
             assert_eq!((error.kind(), error.to_string()), (kind, reason.into()));
         }
+    }
+
+    /// A vocabulary of at most the compiled rows is served; a larger one is unsupported.
+    #[test]
+    fn serves_a_vocabulary_up_to_its_rows() {
+        let rows = <super::Sizes as Shape>::Vocabulary::SIZE;
+        let mut document = document::<super::Sizes, { super::ORDER }>();
+        document["vocab_size"] = serde_json::json!(rows - 1);
+        <Config>::parse(&document).unwrap();
+        document["vocab_size"] = serde_json::json!(rows + 1);
+        let error = <Config>::parse(&document).err().unwrap();
+        let reason = format!("vocab_size: {}, the size holds 1 to {rows}", rows + 1);
+        assert_eq!(
+            (error.kind(), error.to_string()),
+            (io::ErrorKind::Unsupported, reason)
+        );
     }
 
     /// A context or a sliding window past the compiled cache windows is refused by its field;

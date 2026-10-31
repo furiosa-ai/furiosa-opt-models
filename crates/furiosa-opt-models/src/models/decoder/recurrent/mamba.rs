@@ -8,7 +8,7 @@
 
 pub use crate::models::Ids;
 use crate::models::decoder::recurrent::Geometry;
-use crate::models::{Family, Scalar};
+use crate::models::{Family, Scalar, vocabulary};
 use crate::modules::recurrent::Gate;
 use crate::modules::recurrent::{Convolution, Projection};
 use crate::modules::{language, recurrent, residual};
@@ -273,13 +273,7 @@ where
                 "{key}: {declared}, the size {N} holds {held}"
             )));
         }
-        let rows = <Self as Geometry>::Vocabulary::SIZE;
-        if !(1..=rows).contains(&config.vocab_size) {
-            return Err(invalid(format!(
-                "vocab_size: {}, the size compiles {rows} rows",
-                config.vocab_size
-            )));
-        }
+        vocabulary::<<Self as Geometry>::Vocabulary>(config.vocab_size)?;
         let epsilon = config.layer_norm_epsilon.unwrap_or(1e-5);
         if (epsilon as f32).to_bits() as usize != Self::EPSILON {
             return Err(invalid(format!(

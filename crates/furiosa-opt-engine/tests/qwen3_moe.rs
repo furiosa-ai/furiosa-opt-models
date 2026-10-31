@@ -118,14 +118,14 @@ fn size_refuses_what_it_does_not_serve() {
         (
             "vocab_size",
             json!(152064),
-            InvalidData,
-            "vocab_size: 152064, the size compiles 151936 rows",
+            Unsupported,
+            "vocab_size: 152064, the size holds 1 to 151936",
         ),
         (
             "vocab_size",
             json!(0),
             InvalidData,
-            "vocab_size: 0, the size compiles 151936 rows",
+            "vocab_size: 0, the size holds 1 to 151936",
         ),
         (
             "rms_norm_eps",
