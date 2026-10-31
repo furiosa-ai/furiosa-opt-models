@@ -880,18 +880,21 @@ fn refusals_read_no_weight() {
         let checkpoint = Checkpoint::new(directory.path(), Some(edited)).unwrap();
         LoadOptions::new().parse(&checkpoint).map(drop)
     };
-    // Every implementation of the name refuses the edited width before its form, the BF16 sizes
-    // and then those a load quantizes; the registry reports each refusal in its order.
-    let widths = [
-        ("0.6B", 1024),
-        ("1.7B", 2048),
-        ("4B", 2560),
-        ("8B", 4096),
-        ("0.6B", 1024),
-        ("1.7B", 2048),
-        ("4B", 2560),
-    ]
-    .map(|(size, width)| format!("config.json: hidden_size: 1000, the size {size} holds {width}"));
+    // Every implementation of the name refuses the edited width before its form, the BF16 sizes,
+    // then the block-scaled FP8 line, which refuses the checkpoint's form first, and then the
+    // sizes a load quantizes; the registry reports each refusal in its order.
+    let width =
+        |(size, width)| format!("config.json: hidden_size: 1000, the size {size} holds {width}");
+    let widths: Vec<String> = [("0.6B", 1024), ("1.7B", 2048), ("4B", 2560), ("8B", 4096)]
+        .map(width)
+        .into_iter()
+        .chain([
+            "config.json: unsupported, quantization_config: dense serving supports only \
+                 block-scaled E4M3 FP8 Qwen3-8B"
+                .to_string(),
+        ])
+        .chain([("0.6B", 1024), ("1.7B", 2048), ("4B", 2560)].map(width))
+        .collect();
     let cases = [
         (
             named("NoSuchModel"),
