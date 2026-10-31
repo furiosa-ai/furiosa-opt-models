@@ -218,11 +218,13 @@ async fn rotates_the_leading_coordinates_of_wide_heads() {
     }
 }
 
-/// Heads that rotate every coordinate turn as before.
+/// Heads that rotate every coordinate turn as before: 128-wide heads of eight key/value heads of
+/// four query heads, and the sliding group's 256-wide heads of eight of two.
 #[tokio::test(flavor = "current_thread")]
 async fn rotates_whole_heads() {
     let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
     for live in [9, 64] {
         check::<qwen3::Size<"8B">>(&mut device, 1e6, live).await;
+        check::<gemma4::sliding::Group>(&mut device, 1e4, live).await;
     }
 }

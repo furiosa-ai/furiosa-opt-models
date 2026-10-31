@@ -24,6 +24,7 @@ use crate::tensor::{axis::Lanes, parallel::Chip};
 use crate::tensor::{live::Live, mapping::Rows as Layout};
 
 use crate::ops::pointwise::multiply::QueryScale;
+use crate::specialize::VRF;
 use crate::tensor::axis;
 use crate::tensor::mapping::BroadcastClusters as Cluster;
 
@@ -45,12 +46,25 @@ type Table<Slice, Count, Row, Chips = Chip> =
 type Coefficient<Slice, Count, Row> =
     VrfTensor<f32, Chip, Cluster, Slice, m![{ Count }, OutputHalf, Row]>;
 
-/// Row groups one pass rotates; each group's two coefficient tables take 1 KiB of the shared
-/// 8 KiB VRF.
-type TileRows<Rows> = m![{ Groups<Rows> } % ({ Symbol<TileGroups<Rows, 32>> })];
+/// Row groups one pass of `Head`-wide heads rotates: those of up to 32 rows whose two coefficient
+/// tables, `Head` FP32 a row group each, take at most half of a slice's VRF.
+#[derive(Clone, Debug)]
+struct Pass<Rows, Head>(PhantomData<(Rows, Head)>);
+
+impl<Rows: AxisName, Head: AxisName> AxisName for Pass<Rows, Head> {
+    const NAME: Ident = Ident::new("TileGroups");
+    const SIZE: usize = {
+        let held = VRF / 2 / (2 * Head::SIZE * size_of::<f32>());
+        let tile = <TileGroups<Rows, 32> as AxisName>::SIZE;
+        if held < tile { held } else { tile }
+    };
+}
+
+/// A pass's row groups.
+type TileRows<Rows, Head> = m![{ Groups<Rows> } % ({ Symbol<Pass<Rows, Head>> })];
 
 /// The pass a row group belongs to.
-type Tiles<Rows> = m![{ Groups<Rows> } / ({ Symbol<TileGroups<Rows, 32>> })];
+type Tiles<Rows, Head> = m![{ Groups<Rows> } / ({ Symbol<Pass<Rows, Head>> })];
 
 /// Rotates every live row's query and key by its position's coefficients.
 #[derive(DeviceSend)]
@@ -136,48 +150,46 @@ impl<'a, Slice: M, Query: AxisName, Key: AxisName, Rows: AxisName, Head: AxisNam
         let (first, count) = live.groups::<Lanes<Rows>>();
         if count == <Groups<Rows> as M>::SIZE {
             #[unroll]
-            for tile in 0..<Tiles<Rows> as M>::SIZE {
-                let low = Fetch::<TileRows<Rows>, Row<Head>>(PhantomData).forward(
+            for tile in 0..<Tiles<Rows, Head> as M>::SIZE {
+                let low = Fetch::<TileRows<Rows, Head>, Row<Head>>(PhantomData).forward(
                     device,
-                    low.view().tile::<Tiles<Rows>, 1, m![
-                        { Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, OutputHalf,
-                        { Symbol<Row<Head>> }
+                    low.view().tile::<Tiles<Rows, Head>, 1, m![
+                        { Tiles<Rows, Head> } = 1 # ({ Tiles<Rows, Head> }),
+                        { TileRows<Rows, Head> }, OutputHalf, { Symbol<Row<Head>> }
                     ]>(tile),
                 );
-                let high = Fetch::<TileRows<Rows>, Row<Head>>(PhantomData).forward(
+                let high = Fetch::<TileRows<Rows, Head>, Row<Head>>(PhantomData).forward(
                     device,
-                    high.view().tile::<Tiles<Rows>, 1, m![
-                        { Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, OutputHalf,
-                        { Symbol<Row<Head>> }
+                    high.view().tile::<Tiles<Rows, Head>, 1, m![
+                        { Tiles<Rows, Head> } = 1 # ({ Tiles<Rows, Head> }),
+                        { TileRows<Rows, Head> }, OutputHalf, { Symbol<Row<Head>> }
                     ]>(tile),
                 );
-                RotateRows::<
-                    TileRows<Rows>,
-                    m![Query],
-                    Row<Head>,
-                >(PhantomData).forward(
-                    device, (
-                    query.clone().tile::<Tiles<Rows>, 1, m![
-                        { Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, Query, Half,
-                        { Symbol<Row<Head>> }
-                    ]>(tile),
-                    rotated_query.view_mut().tile::<Tiles<Rows>, 1, m![
-                        { Tiles<Rows> } = 1 #{!} ({ Tiles<Rows> }), { TileRows<Rows> }, Query,
-                        OutputHalf, { Symbol<Row<Head>> }
-                    ]>(tile),
-                    &low,
-                    &high,
-                ));
-                RotateRows::<TileRows<Rows>, m![Key], Row<Head>>(PhantomData).forward(
+                RotateRows::<TileRows<Rows, Head>, m![Query], Row<Head>>(PhantomData).forward(
                     device,
                     (
-                        key.clone().tile::<Tiles<Rows>, 1, m![
-                            { Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, Key, Half,
-                            { Symbol<Row<Head>> }
+                        query.clone().tile::<Tiles<Rows, Head>, 1, m![
+                            { Tiles<Rows, Head> } = 1 # ({ Tiles<Rows, Head> }),
+                            { TileRows<Rows, Head> }, Query, Half, { Symbol<Row<Head>> }
                         ]>(tile),
-                        rotated_key.view_mut().tile::<Tiles<Rows>, 1, m![
-                            { Tiles<Rows> } = 1 #{!} ({ Tiles<Rows> }), { TileRows<Rows> }, Key,
-                            OutputHalf, { Symbol<Row<Head>> }
+                        rotated_query.view_mut().tile::<Tiles<Rows, Head>, 1, m![
+                            { Tiles<Rows, Head> } = 1 #{!} ({ Tiles<Rows, Head> }),
+                            { TileRows<Rows, Head> }, Query, OutputHalf, { Symbol<Row<Head>> }
+                        ]>(tile),
+                        &low,
+                        &high,
+                    ),
+                );
+                RotateRows::<TileRows<Rows, Head>, m![Key], Row<Head>>(PhantomData).forward(
+                    device,
+                    (
+                        key.clone().tile::<Tiles<Rows, Head>, 1, m![
+                            { Tiles<Rows, Head> } = 1 # ({ Tiles<Rows, Head> }),
+                            { TileRows<Rows, Head> }, Key, Half, { Symbol<Row<Head>> }
+                        ]>(tile),
+                        rotated_key.view_mut().tile::<Tiles<Rows, Head>, 1, m![
+                            { Tiles<Rows, Head> } = 1 #{!} ({ Tiles<Rows, Head> }),
+                            { TileRows<Rows, Head> }, Key, OutputHalf, { Symbol<Row<Head>> }
                         ]>(tile),
                         &low,
                         &high,
