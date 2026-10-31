@@ -144,8 +144,8 @@ Both servers copy the cache blocks of computed prompts to a tier of host memory,
     The platform serves it through the plugin's `RNGDOffloadingConnector` instead of vLLM's `OffloadingConnector`, which copies with CUDA streams; vLLM's scheduler still decides what to store, load and evict.
     Options of vLLM's CPU offloading, such as `blocks_per_chunk` and `eviction_policy`, go in `--kv-transfer-config '{"kv_connector_extra_config": {...}}'` beside the size.
     vLLM completes a transfer once the worker of each rank reports it, and one worker drives every chip, so offloading serves one chip a replica.
-    It also serves one replica: with data parallelism vLLM ranks each replica's worker among all of them.
-    Sleep mode frees the cache storage the host tier copies, so startup refuses `--enable-sleep-mode` beside offloading.
+    Each data-parallel replica keeps its own host tier.
+    Sleep mode empties the host tier along with the prefix cache, and after waking the host tier copies the blocks of the cache that waking allocates.
     The `vllm:kv_offload_store_bytes` and `vllm:kv_offload_load_bytes` metrics count the bytes moved each way.
 
 === "SGLang"
