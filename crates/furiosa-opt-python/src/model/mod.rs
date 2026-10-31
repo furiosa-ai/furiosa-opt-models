@@ -25,13 +25,15 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use std::path::PathBuf;
 use std::sync::PoisonError;
 
+mod gemma4;
 mod llama;
 mod mistral;
 mod qwen3;
 
 /// The submodule of each model type that loads, by family: its name, the function that adds its
 /// classes to it, and its decoder classes by name.
-pub(super) const FAMILIES: [Family; 3] = [
+pub(super) const FAMILIES: [Family; 4] = [
+    ("gemma4", gemma4::register, gemma4::CLASSES),
     ("llama", llama::register, llama::CLASSES),
     ("mistral", mistral::register, mistral::CLASSES),
     ("qwen3", qwen3::register, qwen3::CLASSES),
