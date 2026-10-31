@@ -42,6 +42,13 @@ def decoder(runner: Runner) -> Decoder:
             raise NotImplementedError("sleep mode moves the memory of a decoder only")
 
 
+def cache(runner: Runner) -> engine.decoder.Cache:
+    """The KV cache the runner holds now, which sleep mode releases and waking allocates anew."""
+    if runner.cache is None:
+        raise RuntimeError("wake_up must restore the KV cache before its blocks move")
+    return runner.cache
+
+
 def sleep(runner: Runner, level: int) -> None:
     """Release the weights and the KV cache; level 1 keeps the weights' copy."""
     release(runner, TAGS, decoder(runner).copy if level == 1 else None)

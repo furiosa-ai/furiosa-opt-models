@@ -402,15 +402,18 @@ def connector(name: str, module: str | None = None) -> KVTransferConfig:
             {"blocks_per_chunk": 2},
         ),
         (Ignored(kv_transfer_config=connector("RNGDOffloadingConnector", offload.__name__)), {}),
+        (Ignored(kv_offloading_size=1, data_parallel_size=2), {}),
+        (Ignored(kv_offloading_size=1, enable_sleep_mode=True), {}),
     ],
-    ids=["size", "size-and-options", "connector"],
+    ids=["size", "size-and-options", "connector", "data-parallel", "sleep-mode"],
 )
 @pytest.mark.feature("KV cache offloading")
 def test_offloads_through_the_rngd_connector(
     ignored: Ignored, options: dict[str, object], served: Path
 ) -> None:
     """`--kv-offloading-size` alone, or with offloading options, makes vLLM's factory build the
-    plugin's connector over a host tier of that many GiB, as naming the connector does."""
+    plugin's connector over a host tier of that many GiB, as naming the connector does, in each
+    data-parallel replica and under sleep mode too."""
     arguments = EngineArgs(model=str(served), dtype="bfloat16", skip_tokenizer_init=True, **ignored)
     transfer = arguments.create_engine_config().kv_transfer_config
     assert transfer is not None
@@ -475,16 +478,6 @@ RANKS = "{}: vLLM awaits each rank; one worker drives all chips"
             RANKS.format("offloads at pipeline_parallel_size=1"),
             marks=pytest.mark.skip(reason="pending: pipeline parallelism, refused for every model"),
         ),
-        (
-            Ignored(kv_offloading_size=1, data_parallel_size=2),
-            "data_parallel_size",
-            "offloads at data_parallel_size=1: vLLM ranks each replica's worker among all replicas",
-        ),
-        (
-            Ignored(kv_offloading_size=1, enable_sleep_mode=True),
-            "enable_sleep_mode",
-            "offloads the KV cache without sleep mode, which frees the cache its host tier copies",
-        ),
     ],
     ids=[
         "lmcache",
@@ -495,8 +488,6 @@ RANKS = "{}: vLLM awaits each rank; one worker drives all chips"
         "recompute",
         "tp",
         "pp",
-        "dp",
-        "sleep",
     ],
 )
 @pytest.mark.feature("KV cache offloading")
