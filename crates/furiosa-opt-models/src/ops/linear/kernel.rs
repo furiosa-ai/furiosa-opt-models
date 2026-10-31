@@ -516,18 +516,21 @@ where
         device: &mut Device,
         (live, input, group): (Live<PhantomData<Rows>, Rows>, V, Group),
     ) -> Self::Output {
-        if live.count::<axis::Lanes<Rows>>() == <Groups<Rows> as M>::SIZE {
+        let (first, count) = live.groups::<axis::Lanes<Rows>>();
+        if count == <Groups<Rows> as M>::SIZE {
             return Contraction::<In, Out>::resident(device, &self.weight, input, |_, _| ());
         }
-        /// The live lane groups of the rows, each copied from where `group` reads it into its tile
-        /// `T` of the layout their route reads.
+        /// The lane groups the live rows touch, each copied from where `group` reads it into its
+        /// tile `T` of the layout their route reads.
         fn grouped<Rows: AxisName, T: M, U: Source, C: M, S: M, E: M>(
             device: &mut Device,
             live: &Live<PhantomData<Rows>, Rows>,
             (group, _): (&impl Fn(usize) -> U, PhantomData<T>),
         ) -> DmTensor<bf16, U::Chips, C, S, E> {
             let mut rows = DmTensor::new();
-            for at in 0..live.count::<axis::Lanes<Rows>>() {
+            let (first, count) = live.groups::<axis::Lanes<Rows>>();
+            for at in 0..count {
+                let at = first + at;
                 group(at).copy(
                     &mut *device,
                     rows.view_mut().tile::<Layout<Rows>::Groups, 1, T>(at),
@@ -573,7 +576,8 @@ where
         #[unroll]
         for slab in 0..<Passes<In, Out> as M>::SIZE {
             let weight = self.weight.tile::<Contraction<In, Out>>(device, slab);
-            for group in 0..live.count::<axis::Lanes<Rows>>() {
+            for at in 0..count {
+                let group = first + at;
                 let lanes = rows.forward(&mut *device, (group, PhantomData::<axis::Lanes<Rows>>));
                 Contraction::<In, Out>::store::<_, axis::Lanes<Rows>, _, bf16, _>(
                     &(),

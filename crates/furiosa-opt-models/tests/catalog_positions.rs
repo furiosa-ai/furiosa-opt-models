@@ -107,8 +107,9 @@ fn position(
     (normalized, positioned)
 }
 
-/// The first `rows` rows positioned, the keys projected by the stage from `hidden`; the queries
-/// enter in the form their projection leaves them, whose weight exceeds the SRAM it stages.
+/// The live rows `start..start + rows` positioned, the keys projected by the stage from `hidden`;
+/// the queries enter in the form their projection leaves them, whose weight exceeds the SRAM it
+/// stages.
 #[device(chip = 1)]
 fn from_hidden(
     device: &mut Device,
@@ -117,45 +118,16 @@ fn from_hidden(
         &HbmTensor<bf16, Chip, m![Rows, Hidden]>,
         &HbmTensor<bf16, Chip, m![Rows, QueryWidth]>,
     ),
-    (rotation, rows): (&Rotation<Rotated, Chip, Rows>, &Value),
+    (rotation, start, rows): (&Rotation<Rotated, Chip, Rows>, &Value, &Value),
 ) -> Positioned {
-    let live = Live::<(), Rows>::read(rows);
+    let live =
+        Live::<(), Rows>::all().subrange(start.extent::<m![Rows]>(), rows.extent::<m![Rows]>());
     let hidden: Live<Spread<Hidden, Rows, Chip>, Rows> = live.with(hidden.to_dm(&mut device.tdma));
     let queries: Live<Spread<QueryWidth, Rows>, Rows> = live.with(queries.to_dm(&mut device.tdma));
     let projection = &stage.0.projection;
     let query = Op::forward(&projection.query.0.1, &mut *device, queries);
     let key = Module::forward(&projection.key, &mut *device, (), &mut ((), ()), &hidden);
     position(device, stage, (query, key), rotation)
-}
-
-/// The live rows `start..start + rows` positioned, the queries and keys entering in the form the
-/// stage's projections leave them in.
-#[device(chip = 1)]
-fn from_projections(
-    device: &mut Device,
-    stage: (&Qkv, &Position),
-    (queries, keys): (
-        &HbmTensor<bf16, Chip, m![Rows, QueryWidth]>,
-        &HbmTensor<bf16, Chip, m![Rows, KvWidth]>,
-    ),
-    (rotation, start, rows): (&Rotation<Rotated, Chip, Rows>, &Value, &Value),
-) -> Positioned {
-    let live =
-        Live::<(), Rows>::all().subrange(start.extent::<m![Rows]>(), rows.extent::<m![Rows]>());
-    let queries: Live<Spread<QueryWidth, Rows>, Rows> = live.with(queries.to_dm(&mut device.tdma));
-    let keys: Live<Spread<KvWidth, Rows>, Rows> = live.with(keys.to_dm(&mut device.tdma));
-    let projection = &stage.0.projection;
-    let query = Op::forward(&projection.query.0.1, &mut *device, queries);
-    let key = Op::forward(&projection.key.0.1, &mut *device, keys);
-    position(device, stage, (query, key), rotation)
-}
-
-/// Where a check's keys come from: the stage's projection of the hidden rows, or the form that
-/// projection leaves them in.
-#[derive(Clone, Copy, Debug)]
-enum Keys {
-    Hidden,
-    Projected,
 }
 
 /// A value no live row reads: a NaN with a payload of its own.
@@ -244,12 +216,7 @@ fn normalize(projected: &[bf16]) -> Vec<f32> {
 
 /// Positions the live rows `start..start + rows`, every other row poison, and checks them as the
 /// module documentation states, the normalized heads within four BF16 steps of the host's.
-async fn check(
-    device: &mut Device,
-    stage: (&Qkv, &Position),
-    keys: Keys,
-    (start, rows): (usize, usize),
-) {
+async fn check(device: &mut Device, stage: (&Qkv, &Position), (start, rows): (usize, usize)) {
     let live = start..start + rows;
     let (head, rotated) = (Head::SIZE, Rotated::SIZE);
     let (half, pairs) = (head / 2, rotated / 2);
@@ -302,38 +269,21 @@ async fn check(
     let count = |value: usize| HostTensor::<i32, m![1]>::from_vec(vec![value as i32]);
     let start_value: Value = count(start).to_hbm(&mut device.pdma).await.unwrap();
     let rows_value: Value = count(rows).to_hbm(&mut device.pdma).await.unwrap();
-    let ((query_in, key_in), (query_out, key_out)) = match keys {
-        Keys::Hidden => {
-            assert_eq!(start, 0, "the stage projects keys of rows from the first");
-            let hidden = rows_of(Hidden::SIZE, &|row| {
-                (0..Hidden::SIZE)
-                    .map(|column| bf16::from_f32(feature(row, column)))
-                    .collect()
-            });
-            let hidden: HbmTensor<bf16, Chip, m![Rows, Hidden]> =
-                (HostTensor::<bf16, m![Rows, Hidden]>::from_vec(hidden).to_hbm(&mut device.pdma))
-                    .await
-                    .unwrap();
-            let inputs = (&hidden, &query_rows);
-            launch(
-                from_hidden,
-                (&mut *device, stage, inputs, (&rotation, &rows_value)),
-            )
+    let hidden = rows_of(Hidden::SIZE, &|row| {
+        (0..Hidden::SIZE)
+            .map(|column| bf16::from_f32(feature(row, column)))
+            .collect()
+    });
+    let hidden: HbmTensor<bf16, Chip, m![Rows, Hidden]> =
+        (HostTensor::<bf16, m![Rows, Hidden]>::from_vec(hidden).to_hbm(&mut device.pdma))
             .await
-        }
-        Keys::Projected => {
-            let key_rows = rows_of(KvWidth::SIZE, &|row| keys_of[row - start].clone());
-            let key_rows: HbmTensor<bf16, Chip, m![Rows, KvWidth]> =
-                (HostTensor::<bf16, m![Rows, KvWidth]>::from_vec(key_rows)
-                    .to_hbm(&mut device.pdma))
-                .await
-                .unwrap();
-            let inputs = (&query_rows, &key_rows);
-            let counts = (&rotation, &start_value, &rows_value);
-            launch(from_projections, (&mut *device, stage, inputs, counts)).await
-        }
-    }
-    .unwrap();
+            .unwrap();
+    let inputs = (&hidden, &query_rows);
+    let counts = (&rotation, &start_value, &rows_value);
+    let ((query_in, key_in), (query_out, key_out)) =
+        launch(from_hidden, (&mut *device, stage, inputs, counts))
+            .await
+            .unwrap();
     let mut values = Vec::new();
     for tensor in [query_in, query_out] {
         values.push(
@@ -398,10 +348,7 @@ async fn positions_the_live_rows_of_the_full_layers() {
     let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
     let qkv: Qkv = checkpoint().load(&mut device).unwrap();
     let stage = (&qkv, &Position::default());
-    for live in [(0, 9), (0, 64)] {
-        check(&mut device, stage, Keys::Hidden, live).await;
-    }
-    for live in [(7, 2), (13, 9), (40, 24)] {
-        check(&mut device, stage, Keys::Projected, live).await;
+    for live in [(0, 9), (0, 64), (7, 2), (13, 9), (40, 24)] {
+        check(&mut device, stage, live).await;
     }
 }
