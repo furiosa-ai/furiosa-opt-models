@@ -13,60 +13,139 @@ use std::io;
 use std::marker::PhantomData;
 
 axes![Query = 1024];
-// A chunk attends in tiles of `Cache` rows, over at most `Chunks` such tiles of history.
-axes![Cache = 128, Chunks = 320];
+// A chunk attends in tiles of `Cache` rows.
+axes![Cache = 128];
 
-/// Block table entries of one chunk: every block of a full history.
-const TABLE: usize = Chunks::SIZE * Cache::SIZE / Block::SIZE;
+/// The tiles of history a chunk attends at most: those of `W` 512-key windows.
+#[derive(Clone, Debug)]
+pub struct Chunks<W>(PhantomData<fn() -> W>);
 
-/// Words of a chunk's work-table row: shape, begins, then one a record slot, small counts packed
-/// low to high under their radix so the table fits the scalar tables a kernel stages once.
-const ROW: usize = 2 + SLOTS;
+impl<W: AxisName> AxisName for Chunks<W> {
+    const NAME: Ident = Ident::new("Chunks");
+    const SIZE: usize = W::SIZE * Keys512::SIZE / Cache::SIZE;
+}
+
+/// The identity slot table of chunks over `W` windows: every key's position in a full history.
+pub type SlotTable<W> = HbmTensor<i32, Chip, m![{ Symbol<Chunks<W>> }, Cache]>;
+
+impl<W: AxisName> Chunks<W> {
+    /// Block table entries of one chunk: every block of a full history.
+    const TABLE: usize = Self::SIZE * Cache::SIZE / Block::SIZE;
+    const KEYS: usize = Self::SIZE * Cache::SIZE;
+    /// A chunk's shape word: each query domain's record count (pairs, four-tile groups, single
+    /// tiles), then each history run's block count (double, wide, early, rest, half, narrow,
+    /// partial).
+    const SHAPE: [usize; 10] = [
+        DOMAINS[0],
+        DOMAINS[1],
+        DOMAINS[2],
+        Self::KEYS / Keys2048::SIZE + 1,
+        2,
+        2,
+        Self::KEYS / Keys1024::SIZE + 1,
+        2,
+        4,
+        2,
+    ];
+    /// A chunk's begins words: the first block of each run that does not start at block 0 (wide,
+    /// rest, half, narrow, partial).
+    const BEGINS: [usize; 5] = [
+        Self::KEYS / Keys1024::SIZE + 1,
+        2,
+        Self::KEYS / Keys512::SIZE + 1,
+        Self::SIZE + 1,
+        Self::SIZE + 1,
+    ];
+    /// Words of a chunk's work-table row: shape, begins, then one a record slot, small counts
+    /// packed low to high under their radix so the table fits the scalar tables a kernel stages
+    /// once.
+    const ROW: usize = 1 + Field::words(&Self::BEGINS) + SLOTS;
+}
+
 /// The records a chunk holds at most: one pair, two four-tile groups, two single tiles.
 const SLOTS: usize = 5;
-/// A chunk's shape word: each query domain's record count (pairs, four-tile groups, single tiles),
-/// then each history run's block count (double, wide, early, rest, half, narrow, partial).
-const SHAPE: [usize; 10] = [2, 3, 3, 21, 2, 2, 41, 2, 4, 2];
-/// A chunk's begins word: the first block of each run that does not start at block 0 (wide, rest,
-/// half, narrow, partial).
-const BEGINS: [usize; 5] = [41, 2, 81, 321, 321];
 /// A record's word: its first tile, its preceding whole fresh blocks, the first and the count of
 /// its fresh panels before it within its own block, its guest count, a bit for each of its tiles
 /// set where the tile holds rows past the chunk's last, and that last row within the tile.
 const RECORD: [usize; 7] = [8, 2, 5, 4, 2, 1 << TilePair::SIZE, Cache::SIZE];
+const _: () = assert!(Field::words(&RECORD) == 1);
 
-/// A field of a word packing fields below their radices: its divisor and radix.
+/// A field of words packing fields below their radices in turn, a field in the next word where
+/// the current one would pass I32: its word, divisor and radix.
 #[derive(Clone, Copy)]
 struct Field {
+    word: usize,
     divisor: usize,
     radix: usize,
 }
 
 impl Field {
-    /// Field `k` of a word packing fields below `radices`.
+    /// Field `k` of the words packing fields below `radices`.
     const fn new(radices: &[usize], k: usize) -> Self {
-        let mut divisor = 1;
+        let mut field = Self {
+            word: 0,
+            divisor: 1,
+            radix: radices[0],
+        };
         let mut at = 0;
         while at < k {
-            divisor *= radices[at];
             at += 1;
+            let divisor = field.divisor * field.radix;
+            field = match divisor * radices[at] <= i32::MAX as usize + 1 {
+                true => Self {
+                    word: field.word,
+                    divisor,
+                    radix: radices[at],
+                },
+                false => Self {
+                    word: field.word + 1,
+                    divisor: 1,
+                    radix: radices[at],
+                },
+            };
         }
-        Self {
-            divisor,
-            radix: radices[k],
-        }
+        field
     }
 
-    /// The largest word packing fields below `radices`.
-    const fn largest(radices: &[usize]) -> usize {
-        let last = Self::new(radices, radices.len() - 1);
-        last.divisor * last.radix - 1
+    /// The words packing fields below `radices`.
+    const fn words(radices: &[usize]) -> usize {
+        Self::new(radices, radices.len() - 1).word + 1
+    }
+
+    /// The largest word `word` of the words packing fields below `radices`.
+    const fn largest(radices: &[usize], word: usize) -> usize {
+        let (mut at, mut product) = (0, 1);
+        while at < radices.len() {
+            if Self::new(radices, at).word == word {
+                product *= radices[at];
+            }
+            at += 1;
+        }
+        product - 1
     }
 
     /// The field of `word`.
     fn unpack(self, word: usize) -> usize {
         word / self.divisor % self.radix
     }
+}
+
+/// The largest shape word of a chunk over `W` windows: the bound the epoch reads it under.
+#[derive(Clone, Debug)]
+struct Shape<W>(PhantomData<W>);
+
+impl<W: AxisName> AxisName for Shape<W> {
+    const NAME: Ident = Ident::new("Shape");
+    const SIZE: usize = Field::largest(&Chunks::<W>::SHAPE, 0);
+}
+
+/// The largest begins word `N` of a chunk over `W` windows.
+#[derive(Clone, Debug)]
+struct Begins<W, const N: usize>(PhantomData<W>);
+
+impl<W: AxisName, const N: usize> AxisName for Begins<W, N> {
+    const NAME: Ident = Ident::new("Begins");
+    const SIZE: usize = Field::largest(&Chunks::<W>::BEGINS, N);
 }
 
 /// A query domain: the records of a chunk whose tiles one `Self`-tile body attends, its count a
@@ -81,42 +160,45 @@ impl Domain for TilePair {
 }
 impl Domain for TileGroup {
     const COUNT: usize = 1;
-    const SLOT: usize = TilePair::SLOT + SHAPE[TilePair::COUNT] - 1;
+    const SLOT: usize = TilePair::SLOT + DOMAINS[TilePair::COUNT] - 1;
 }
 impl Domain for SingleTile {
     const COUNT: usize = 2;
-    const SLOT: usize = TileGroup::SLOT + SHAPE[TileGroup::COUNT] - 1;
+    const SLOT: usize = TileGroup::SLOT + DOMAINS[TileGroup::COUNT] - 1;
 }
-const _: () = assert!(SingleTile::SLOT + SHAPE[SingleTile::COUNT] - 1 == SLOTS);
+/// The radices of the shape word's record counts, the same for every history.
+const DOMAINS: [usize; 3] = [2, 3, 3];
+const _: () = assert!(SingleTile::SLOT + DOMAINS[SingleTile::COUNT] - 1 == SLOTS);
 
-/// The words of the work table of `S` chunks, one row each.
+/// The words of the work table of `S` chunks over `W` windows, one row each.
 #[derive(Clone, Debug)]
-pub struct Words<S>(PhantomData<S>);
+pub struct Words<S, W>(PhantomData<(S, W)>);
 
-impl<S: AxisName> AxisName for Words<S> {
+impl<S: AxisName, W: AxisName> AxisName for Words<S, W> {
     const NAME: Ident = Ident::new("Words");
-    const SIZE: usize = S::SIZE * ROW;
+    const SIZE: usize = S::SIZE * Chunks::<W>::ROW;
 }
 
-/// The metadata of the prompt chunks of one launch, one entry per slot of `Sequences`.
+/// The metadata of the prompt chunks of one launch, one entry per slot of `Sequences`, each over
+/// at most `W` windows of history.
 #[derive(DeviceSend)]
-pub struct Invocation<Sequences: AxisName> {
+pub struct Invocation<Sequences: AxisName, W: AxisName> {
     /// The number of live sequences, which come first.
     pub live: Value,
     pub h: HbmTensor<i32, Chip, m![Sequences]>,
     pub lanes: HbmTensor<i32, Chip, m![Sequences, Cache]>,
     pub start: HbmTensor<i32, Chip, m![Sequences]>,
-    pub tables: HbmTensor<i32, Chip, m![Sequences, Chunks, Cache / Block]>,
+    pub tables: HbmTensor<i32, Chip, m![Sequences, { Symbol<Chunks<W>> }, Cache / Block]>,
     /// Each chunk's query records and the runs of its history, as [`Plan::reads`] plans them.
-    pub work: HbmTensor<i32, Chip, m![{ Symbol<Words<Sequences>> }]>,
-    pub slots: HbmTensor<i32, Chip, m![Chunks, Cache]>,
+    pub work: HbmTensor<i32, Chip, m![{ Symbol<Words<Sequences, W>> }]>,
+    pub slots: SlotTable<W>,
     pub causal: append::Causal,
 }
 
 /// A launch's prompt chunks as the arrays the chunk body reads, at the capacities of `Sequences`
-/// chunks; the masks and the slot table are every launch's, placed once.
+/// chunks over `W` windows; the masks and the slot table are every launch's, placed once.
 #[derive(Clone, Debug)]
-pub struct Plan {
+pub struct Plan<W> {
     /// Chunks of the launch.
     pub count: usize,
     /// Per chunk: its rows, the history before them and its first row.
@@ -127,9 +209,10 @@ pub struct Plan {
     pub lanes: Vec<i32>,
     /// Per chunk: the pool byte offset of each block of its history and rows.
     pub tables: Vec<i32>,
+    history: PhantomData<W>,
 }
 
-impl Plan {
+impl<W: AxisName> Plan<W> {
     /// No chunk yet, at the capacities of `Sequences` chunks.
     pub fn new<Sequences: AxisName>() -> Self {
         Self {
@@ -138,7 +221,8 @@ impl Plan {
             h: vec![0; Sequences::SIZE],
             start: vec![0; Sequences::SIZE],
             lanes: vec![0; Sequences::SIZE * Cache::SIZE],
-            tables: vec![0; Sequences::SIZE * TABLE],
+            tables: vec![0; Sequences::SIZE * Chunks::<W>::TABLE],
+            history: PhantomData,
         }
     }
 
@@ -151,22 +235,27 @@ impl Plan {
         // fails before anything is staged when a chunk holds more rows or history than a chunk can.
         let work = || -> io::Result<Vec<i32>> {
             let pack = |radices: &[usize], values: &[usize]| {
-                let word = values
-                    .iter()
-                    .zip(radices)
-                    .rev()
-                    .fold(0, |word, (&value, &radix)| {
-                        assert!(value < radix, "a field fits its radix");
-                        word * radix + value
-                    });
-                i32::try_from(word).expect("a packed word fits I32")
+                let mut words = vec![0; Field::words(radices)];
+                for (k, &value) in values.iter().enumerate() {
+                    let field = Field::new(radices, k);
+                    assert!(value < field.radix, "a field fits its radix");
+                    words[field.word] += value * field.divisor;
+                }
+                (words.into_iter())
+                    .map(|word| i32::try_from(word).expect("a packed word fits I32"))
+                    .collect::<Vec<_>>()
             };
-            let mut table = vec![0; self.q.len() * ROW];
-            for (chunk, row) in table.chunks_exact_mut(ROW).enumerate().take(self.count) {
+            let (row_words, begins) = (Chunks::<W>::ROW, Field::words(&Chunks::<W>::BEGINS));
+            let mut table = vec![0; self.q.len() * row_words];
+            for (chunk, row) in table
+                .chunks_exact_mut(row_words)
+                .enumerate()
+                .take(self.count)
+            {
                 let fact =
                     |values: &[i32]| usize::try_from(values[chunk]).map_err(io::Error::other);
                 let (q, h) = (fact(&self.q)?, fact(&self.h)?);
-                if q > Query::SIZE || h + q > Chunks::SIZE * Cache::SIZE {
+                if q > Query::SIZE || h + q > Chunks::<W>::KEYS {
                     return Err(io::Error::other(format!(
                         "a chunk of {q} rows over {h} keys exceeds a chunk's capacity"
                     )));
@@ -201,7 +290,7 @@ impl Plan {
                         pack(
                             &RECORD,
                             &[first, block, within, first - within, guest, cut, last],
-                        )
+                        )[0]
                     })
                 });
                 let slots = [TilePair::SLOT, TileGroup::SLOT, SingleTile::SLOT];
@@ -210,7 +299,7 @@ impl Plan {
                     .zip(slots)
                     .flat_map(|(firsts, slot)| slot..slot + firsts.len());
                 for (slot, record) in slots.zip(records) {
-                    row[2 + slot] = record;
+                    row[1 + begins + slot] = record;
                 }
                 // A width's blocks lie between the next wider width's whole blocks and `h`; a
                 // pair's are 1024 keys wide, as its owners hold no 2048-key block.
@@ -239,8 +328,9 @@ impl Plan {
                     partial.1,
                 ];
                 let counts = domains.iter().map(Vec::len).chain(runs).collect::<Vec<_>>();
-                row[0] = pack(&SHAPE, &counts);
-                row[1] = pack(&BEGINS, &[wide.0, rest.0, half.0, narrow.0, partial.0]);
+                row[0] = pack(&Chunks::<W>::SHAPE, &counts)[0];
+                let starts = [wide.0, rest.0, half.0, narrow.0, partial.0];
+                row[1..1 + begins].copy_from_slice(&pack(&Chunks::<W>::BEGINS, &starts));
             }
             Ok(table)
         };
@@ -252,19 +342,20 @@ impl Plan {
             all(&self.h),
             used(&self.lanes, Cache::SIZE),
             all(&self.start),
-            used(&self.tables, TABLE),
+            used(&self.tables, Chunks::<W>::TABLE),
             all(&work()?),
         ])
     }
 }
 
-/// The causal masks and the identity slot table every launch's chunks read.
-pub struct Masks {
+/// The causal masks and the identity slot table every launch's chunks over `W` windows read.
+pub struct Masks<W> {
     causal: HbmBuffer,
     slots: HbmBuffer,
+    history: PhantomData<fn() -> W>,
 }
 
-impl Masks {
+impl<W: AxisName> Masks<W> {
     /// The masks, placed once.
     pub async fn new(device: &mut Device) -> io::Result<Self> {
         let tile = Cache::SIZE;
@@ -274,25 +365,25 @@ impl Masks {
         .to_hbm(&mut device.pdma)
         .await
         .map_err(io::Error::other)?;
-        let slots: HbmTensor<i32, Chip, m![Chunks, Cache]> =
-            HostTensor::<i32, m![Chunks, Cache]>::from_vec(
-                (0..Chunks::SIZE * tile).map(|at| i32::try_from(at).expect("a position fits I32")),
-            )
-            .to_hbm(&mut device.pdma)
-            .await
-            .map_err(io::Error::other)?;
+        let slots: SlotTable<W> = HostTensor::<i32, m![{ Symbol<Chunks<W>> }, Cache]>::from_vec(
+            (0..Chunks::<W>::KEYS).map(|at| i32::try_from(at).expect("a position fits I32")),
+        )
+        .to_hbm(&mut device.pdma)
+        .await
+        .map_err(io::Error::other)?;
         Ok(Self {
             causal: causal.into_buffer(),
             slots: slots.into_buffer(),
+            history: PhantomData,
         })
     }
 }
 
-impl<Sequences: AxisName> Invocation<Sequences> {
+impl<Sequences: AxisName, W: AxisName> Invocation<Sequences, W> {
     /// The chunks whose arrays [`Plan::reads`] lists, as `next` names each in turn, with `masks`.
     pub fn bind(
         mut next: impl FnMut() -> io::Result<HbmBuffer>,
-        masks: &Masks,
+        masks: &Masks<W>,
     ) -> io::Result<Self> {
         use crate::tensor::memory::alias;
         Ok(Self {
@@ -310,124 +401,140 @@ impl<Sequences: AxisName> Invocation<Sequences> {
 
 /// A chunk's work as its epoch reads it from the launch's work table, each word a staged scalar:
 /// its shape and its runs' first blocks once, a record's word where the record is attended.
-pub(crate) struct Epoch<'a, Sequences: AxisName> {
-    work: &'a HbmTensor<i32, Chip, m![{ Symbol<Words<Sequences>> }]>,
+pub(crate) struct Epoch<'a, Sequences: AxisName, W: AxisName> {
+    work: &'a HbmTensor<i32, Chip, m![{ Symbol<Words<Sequences, W>> }]>,
     row: usize,
-    runs: Runs,
+    runs: Runs<W>,
 }
 
-impl<'a, Sequences: AxisName> Epoch<'a, Sequences> {
+impl<'a, Sequences: AxisName, W: AxisName> Epoch<'a, Sequences, W> {
     /// Chunk `chunk`'s row of `work`.
     pub(crate) fn new(
-        work: &'a HbmTensor<i32, Chip, m![{ Symbol<Words<Sequences>> }]>,
+        work: &'a HbmTensor<i32, Chip, m![{ Symbol<Words<Sequences, W>> }]>,
         chunk: usize,
     ) -> Self {
-        let row = chunk * ROW;
+        const { assert!(Field::words(&Chunks::<W>::SHAPE) == 1) };
+        let row = chunk * Chunks::<W>::ROW;
+        let first = Self::word::<m![{ Symbol<Begins<W, 0>> }]>(work, row + 1);
+        // A history whose begins pass one word reads its second word too.
+        let second = match const { Field::words(&Chunks::<W>::BEGINS) } {
+            1 => first,
+            _ => Self::word::<m![{ Symbol<Begins<W, 1>> }]>(work, row + 2),
+        };
         let runs = Runs {
-            shape: Self::word::<Broadcast<{ Field::largest(&SHAPE) }>>(work, row),
-            begins: Self::word::<Broadcast<{ Field::largest(&BEGINS) }>>(work, row + 1),
+            shape: Self::word::<m![{ Symbol<Shape<W>> }]>(work, row),
+            begins: [first, second],
+            history: PhantomData,
         };
         Self { work, row, runs }
     }
 
     /// The chunk's record `index` of query domain `D`.
     pub(crate) fn record<D: Domain>(&self, index: usize) -> Record {
-        let at = self.row + 2 + D::SLOT + index;
-        Record(Self::word::<Broadcast<{ Field::largest(&RECORD) }>>(
+        let at = self.row + 1 + const { Field::words(&Chunks::<W>::BEGINS) } + D::SLOT + index;
+        Record(Self::word::<Broadcast<{ Field::largest(&RECORD, 0) }>>(
             self.work, at,
         ))
     }
 
     /// The runs of the chunk's history.
-    pub(crate) fn runs(&self) -> Runs {
+    pub(crate) fn runs(&self) -> Runs<W> {
         self.runs
     }
 
     /// Word `at` of `work`, which the host bounds by `Max::SIZE`.
     fn word<Max: M>(
-        work: &HbmTensor<i32, Chip, m![{ Symbol<Words<Sequences>> }]>,
+        work: &HbmTensor<i32, Chip, m![{ Symbol<Words<Sequences, W>> }]>,
         at: usize,
     ) -> usize {
         // SAFETY: one word of a table nothing writes.
         let word: Value = unsafe {
             work.view()
-                .tile::<m![{ Symbol<Words<Sequences>> }], 1,
-                    m![{ Symbol<Words<Sequences>> } = 1 # ({ Symbol<Words<Sequences>> })]>(at)
+                .tile::<m![{ Symbol<Words<Sequences, W>> }], 1,
+                    m![{ Symbol<Words<Sequences, W>> } = 1 # ({ Symbol<Words<Sequences, W>> })]>(at)
                 .alias()
         };
         word.extent::<Max>()
     }
 }
 
-/// A chunk's history as runs of whole blocks of each width, in the order a query attends them,
-/// and its partial last 128-key panel: its shape and begins words.
-#[derive(Clone, Copy)]
-pub(crate) struct Runs {
+/// A chunk's history over at most `W` windows as runs of whole blocks of each width, in the order
+/// a query attends them, and its partial last 128-key panel: its shape and begins words.
+pub(crate) struct Runs<W> {
     shape: usize,
-    begins: usize,
+    begins: [usize; 2],
+    history: PhantomData<W>,
 }
 
-impl Runs {
+impl<W> Clone for Runs<W> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<W> Copy for Runs<W> {}
+
+impl<W: AxisName> Runs<W> {
     /// The chunk's records in query domain `D`.
     pub(crate) fn records<D: Domain>(&self) -> usize {
-        const { Field::new(&SHAPE, D::COUNT) }.unpack(self.shape)
+        const { Field::new(&Chunks::<W>::SHAPE, D::COUNT) }.unpack(self.shape)
     }
 
     /// A four-tile group's or single tile's 2048-key blocks.
     pub(crate) fn double(&self) -> Run {
-        Run::first(const { Field::new(&SHAPE, 3) }.unpack(self.shape))
+        Run::first(const { Field::new(&Chunks::<W>::SHAPE, 3) }.unpack(self.shape))
     }
 
     /// A four-tile group's or single tile's 1024-key block after its 2048-key blocks.
     pub(crate) fn wide(&self) -> Run {
         self.after(
-            const { Field::new(&SHAPE, 4) }.unpack(self.shape),
-            const { Field::new(&BEGINS, 0) },
+            const { Field::new(&Chunks::<W>::SHAPE, 4) }.unpack(self.shape),
+            const { Field::new(&Chunks::<W>::BEGINS, 0) },
         )
     }
 
     /// A pair's first 1024-key block, which its early gather writes.
     pub(crate) fn early(&self) -> Run {
-        Run::first(const { Field::new(&SHAPE, 5) }.unpack(self.shape))
+        Run::first(const { Field::new(&Chunks::<W>::SHAPE, 5) }.unpack(self.shape))
     }
 
     /// A pair's 1024-key blocks after its first.
     pub(crate) fn rest(&self) -> Run {
         self.after(
-            const { Field::new(&SHAPE, 6) }.unpack(self.shape),
-            const { Field::new(&BEGINS, 1) },
+            const { Field::new(&Chunks::<W>::SHAPE, 6) }.unpack(self.shape),
+            const { Field::new(&Chunks::<W>::BEGINS, 1) },
         )
     }
 
     /// The 512-key block below the last 1024-key block.
     pub(crate) fn half(&self) -> Run {
         self.after(
-            const { Field::new(&SHAPE, 7) }.unpack(self.shape),
-            const { Field::new(&BEGINS, 2) },
+            const { Field::new(&Chunks::<W>::SHAPE, 7) }.unpack(self.shape),
+            const { Field::new(&Chunks::<W>::BEGINS, 2) },
         )
     }
 
     /// The whole 128-key panels below the last 512-key block.
     pub(crate) fn narrow(&self) -> Run {
         self.after(
-            const { Field::new(&SHAPE, 8) }.unpack(self.shape),
-            const { Field::new(&BEGINS, 3) },
+            const { Field::new(&Chunks::<W>::SHAPE, 8) }.unpack(self.shape),
+            const { Field::new(&Chunks::<W>::BEGINS, 3) },
         )
     }
 
     /// The partial last 128-key panel, when the history ends inside one.
     pub(crate) fn partial(&self) -> Run {
         self.after(
-            const { Field::new(&SHAPE, 9) }.unpack(self.shape),
-            const { Field::new(&BEGINS, 4) },
+            const { Field::new(&Chunks::<W>::SHAPE, 9) }.unpack(self.shape),
+            const { Field::new(&Chunks::<W>::BEGINS, 4) },
         )
     }
 
-    /// The `count` blocks from the begins word's field at `begin`.
+    /// The `count` blocks from the begins words' field at `begin`.
     fn after(&self, count: usize, begin: Field) -> Run {
         Run {
             count,
-            word: self.begins,
+            word: self.begins[begin.word],
             begin,
         }
     }
@@ -466,6 +573,7 @@ impl Record {
     pub(crate) fn cut(&self, t: usize) -> usize {
         let bits = const { Field::new(&RECORD, 5) };
         Field {
+            word: 0,
             divisor: bits.divisor << t,
             radix: 2,
         }
@@ -493,6 +601,7 @@ impl Run {
             count,
             word: 0,
             begin: Field {
+                word: 0,
                 divisor: 1,
                 radix: 1,
             },
@@ -516,6 +625,7 @@ impl<
     Head: AxisName,
     All: AxisName,
     Sequences: AxisName,
+    W: AxisName,
     H,
     S,
     Env: Copy,
@@ -527,7 +637,7 @@ impl<
                 &HbmTensor<bf16, Chip, m![All, KvHeads, Head]>,
                 &HbmTensor<bf16, Chip, m![All, KvHeads, Head]>,
             ),
-            (&Invocation<Sequences>, usize),
+            (&Invocation<Sequences, W>, usize),
             (&Gather, &Blocks<KvHeads, Head>),
             &mut append::Output<KvHeads, Groups, Head, All>,
             ((&H, &mut S), usize),
@@ -551,7 +661,7 @@ where
                 &HbmTensor<bf16, Chip, m![All, KvHeads, Head]>,
                 &HbmTensor<bf16, Chip, m![All, KvHeads, Head]>,
             ),
-            (&Invocation<Sequences>, usize),
+            (&Invocation<Sequences, W>, usize),
             (&Gather, &Blocks<KvHeads, Head>),
             &mut append::Output<KvHeads, Groups, Head, All>,
             ((&H, &mut S), usize),
@@ -574,9 +684,10 @@ where
                 )
             };
             // SAFETY: each immutable sequence window contains one complete table allocation.
-            let (table, lanes): (append::Table, HbmTensor<i32, Chip, m![Cache]>) = unsafe {
+            let (table, lanes): (append::Table<W>, HbmTensor<i32, Chip, m![Cache]>) = unsafe {
                 (invocation.tables.view().tile::<m![Sequences], 1,
-                    m![Sequences = 1 # Sequences, Chunks, Cache / Block]>(sequence).alias(),
+                    m![Sequences = 1 # Sequences, { Symbol<Chunks<W>> }, Cache / Block]>(sequence)
+                    .alias(),
                   invocation.lanes.view().tile::<m![Sequences], 1,
                     m![Sequences = 1 # Sequences, Cache]>(sequence).alias())
             };
@@ -621,23 +732,36 @@ mod tests {
     use super::*;
     use crate::tensor::axis::Rows;
 
+    // The history of a 40960-position context, and of a 131072-position one.
+    axes![Shared = 80, Long = 256];
+
     /// A query record of the work table: its domain's tiles, and its fields.
     type Decoded = (usize, [usize; RECORD.len()]);
 
     /// Each chunk's records in the order the domains' bodies attend them, and its history runs, as
     /// the bodies unpack them from `plan`'s work table.
-    fn decode(plan: &Plan) -> Vec<(Vec<Decoded>, [[usize; 2]; 7])> {
+    fn decode<W: AxisName>(plan: &Plan<W>) -> Vec<(Vec<Decoded>, [[usize; 2]; 7])> {
         let [.., (work, words)] = plan.reads().unwrap();
+        let row = Chunks::<W>::ROW;
         assert_eq!(
             (work.len(), words),
-            (plan.q.len() * ROW, plan.q.len() * ROW)
+            (plan.q.len() * row, plan.q.len() * row)
         );
-        let word = |chunk: usize, at: usize| usize::try_from(work[chunk * ROW + at]).unwrap();
+        let word = |chunk: usize, at: usize| usize::try_from(work[chunk * row + at]).unwrap();
+        let begins = Field::words(&Chunks::<W>::BEGINS);
         let mut chunks = Vec::new();
         for chunk in 0..plan.count {
-            let (shape, begins) = (word(chunk, 0), word(chunk, 1));
-            assert!(shape <= Field::largest(&SHAPE) && begins <= Field::largest(&BEGINS));
-            let runs = Runs { shape, begins };
+            let shape = word(chunk, 0);
+            let starts: Vec<usize> = (0..begins).map(|at| word(chunk, 1 + at)).collect();
+            assert!(shape <= Field::largest(&Chunks::<W>::SHAPE, 0));
+            for (at, &start) in starts.iter().enumerate() {
+                assert!(start <= Field::largest(&Chunks::<W>::BEGINS, at));
+            }
+            let runs = Runs::<W> {
+                shape,
+                begins: [starts[0], starts[begins - 1]],
+                history: PhantomData,
+            };
             let domains = [
                 (runs.records::<TilePair>(), TilePair::SIZE, TilePair::SLOT),
                 (
@@ -654,7 +778,7 @@ mod tests {
             let mut records = Vec::new();
             for (count, tiles, slot) in domains {
                 for r in 0..count {
-                    let record = Record(word(chunk, 2 + slot + r));
+                    let record = Record(word(chunk, 1 + begins + slot + r));
                     let within = record.within();
                     let fields = [record.first(), record.preceding(), within.begin()];
                     let [first, preceding, begin] = fields;
@@ -688,7 +812,7 @@ mod tests {
     }
 
     /// A launch of chunks of `(rows, history)` packed from row `start`.
-    fn launch(chunks: &[(usize, usize)], start: usize) -> Plan {
+    fn launch<W: AxisName>(chunks: &[(usize, usize)], start: usize) -> Plan<W> {
         let mut plan = Plan::new::<Rows<8>>();
         let mut row = start;
         for (index, &(q, h)) in chunks.iter().enumerate() {
@@ -741,18 +865,21 @@ mod tests {
     /// Every live row of every chunk of `plan` attends each key of its history and of its chunk's
     /// rows up to its own exactly once, through one record; a record reads no word its body
     /// skips, and the run counts and starts fit the bounds its body reads them with.
-    fn check_keys(plan: &Plan) {
+    fn check_keys<W: AxisName>(plan: &Plan<W>) {
+        let keys_of = |width: usize| Chunks::<W>::KEYS / width;
         for (chunk, (records, runs)) in decode(plan).into_iter().enumerate() {
             let (q, h) = (plan.q[chunk] as usize, plan.h[chunk] as usize);
             // Each run's blocks of its width in a full history, and the count its body reads.
+            let (doubles, wides) = (keys_of(Keys2048::SIZE), keys_of(Keys1024::SIZE));
+            let (halves, panels) = (keys_of(Keys512::SIZE), Chunks::<W>::SIZE);
             let bounds = [
-                (20, 20),
-                (40, 1),
-                (40, 1),
-                (40, 40),
-                (80, 1),
-                (320, 3),
-                (320, 1),
+                (doubles, doubles),
+                (wides, 1),
+                (wides, 1),
+                (wides, wides),
+                (halves, 1),
+                (panels, 3),
+                (panels, 1),
             ];
             for ([begin, count], (blocks, most)) in runs.iter().zip(bounds) {
                 assert!(
@@ -798,26 +925,31 @@ mod tests {
         }
     }
 
-    /// A chunk of any row count over a history at, below and above every block width's edge.
+    /// A chunk of any row count over a history at, below and above every block width's edge, and
+    /// up to its whole history, of a 40960-position context and a 131072-position one.
     #[test]
     fn attends_each_key_once() {
-        let edges = [
-            0, 1, 127, 128, 129, 511, 512, 513, 1023, 1024, 1025, 2047, 2048, 2049, 3000,
-        ];
-        let rows = [
-            1, 2, 127, 128, 129, 255, 256, 257, 383, 384, 385, 511, 512, 513, 639, 640,
-        ];
-        let rows = rows
-            .into_iter()
-            .chain([641, 767, 768, 769, 895, 896, 897, 1023, 1024]);
-        for q in rows {
-            for h in edges.into_iter().chain([Chunks::SIZE * Cache::SIZE - q]) {
-                check_keys(&launch(&[(q, h)], 0));
+        fn attends<W: AxisName>() {
+            let edges = [
+                0, 1, 127, 128, 129, 511, 512, 513, 1023, 1024, 1025, 2047, 2048, 2049, 3000,
+            ];
+            let rows = [
+                1, 2, 127, 128, 129, 255, 256, 257, 383, 384, 385, 511, 512, 513, 639, 640,
+            ];
+            let rows = rows
+                .into_iter()
+                .chain([641, 767, 768, 769, 895, 896, 897, 1023, 1024]);
+            for q in rows {
+                for h in edges.into_iter().chain([Chunks::<W>::KEYS - q]) {
+                    check_keys(&launch::<W>(&[(q, h)], 0));
+                }
+            }
+            for q in 0..=Query::SIZE {
+                check_keys(&launch::<W>(&[(q, 0), (q, 1000)], 0));
             }
         }
-        for q in 0..=Query::SIZE {
-            check_keys(&launch(&[(q, 0), (q, 1000)], 0));
-        }
+        attends::<Shared>();
+        attends::<Long>();
     }
 
     /// Adjacent chunks with unaligned starts, after item rows or none: every live row's output is
@@ -839,7 +971,7 @@ mod tests {
             [chunks.clone(), reversed]
         }) {
             for start in [0, 30] {
-                let plan = launch(&chunks, start);
+                let plan = launch::<Shared>(&chunks, start);
                 check_keys(&plan);
                 let mut writer = vec![None; 2 * Query::SIZE];
                 let mut guests = Vec::new();
@@ -867,19 +999,14 @@ mod tests {
     /// A chunk of more rows or history than a chunk holds is refused before any word is staged.
     #[test]
     fn refuses_a_chunk_past_its_capacity() {
-        assert!(launch(&[(Query::SIZE + 1, 0)], 0).reads().is_err());
-        assert!(
-            launch(&[(1, Chunks::SIZE * Cache::SIZE)], 0)
-                .reads()
-                .is_err()
-        );
-        assert!(
-            launch(
-                &[(Query::SIZE, Chunks::SIZE * Cache::SIZE - Query::SIZE)],
-                0
-            )
-            .reads()
-            .is_ok()
-        );
+        fn refuses<W: AxisName>() {
+            let keys = Chunks::<W>::KEYS;
+            assert!(launch::<W>(&[(Query::SIZE + 1, 0)], 0).reads().is_err());
+            assert!(launch::<W>(&[(1, keys)], 0).reads().is_err());
+            let whole = launch::<W>(&[(Query::SIZE, keys - Query::SIZE)], 0);
+            assert!(whole.reads().is_ok());
+        }
+        refuses::<Shared>();
+        refuses::<Long>();
     }
 }

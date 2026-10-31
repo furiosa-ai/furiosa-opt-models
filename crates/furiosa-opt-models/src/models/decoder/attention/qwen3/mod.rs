@@ -1,13 +1,13 @@
-//! Qwen3, by published size: the Hugging Face classes over a [`Size`], the [`Form`] of the
-//! projections, a placement, a KV cache form and a memory, e.g.
-//! `ForCausalLM<Size<"0.6B">, form::Affine, Parallel<1>, cache::Bf16, X>`.
+//! Qwen3, by published size: the [`Catalog`] binding over a [`Size`] and the [`Form`] of the
+//! projections, whose roots a launch runs, e.g. `launch::Model<Size<"0.6B">, form::Affine>`.
 //!
 //! - A size's [`Geometry`] is what its checkpoints declare; its [`Decode`] is how a call of it is
 //!   compiled today, the context it serves included.
-//! - [`Catalog`] is the one binding of `Qwen3ForCausalLM` both precisions instantiate: a projection
-//!   [`Form`] chooses only the six projection weights, BF16 dense matrices or block-scaled E4M3.
-//! - A size's [`Front`] is how its family computes a row's query, key and value heads from their
-//!   projection; Llama's sizes instantiate these classes and the catalog with the plain projection.
+//! - [`Catalog`] is the one binding of `Qwen3ForCausalLM` every projection form instantiates: a
+//!   [`Form`] chooses only the six projection weights, BF16 dense matrices, channel-scaled E4M3 or
+//!   block-scaled E4M3.
+//! - A size's [`Front`] is whether its family normalizes each query and key head; Llama's sizes
+//!   instantiate the catalog without the head norms.
 //! - Every size has eight key and value heads of 128 features, and its vocabulary compiles as
 //!   152064 rows.
 
@@ -21,64 +21,36 @@ use super::{Geometry, LlamaEmbeddingModel, Qwen2ForCausalLM};
 use crate::load::Named;
 use crate::models::Family;
 use crate::models::config::{self, scaling::Spectrum};
-use crate::models::decoder::attention::{
-    Chunks, Head, KvHeads, PaddedVocabulary, Prompts, Windows,
-};
-use crate::models::decoder::{self, Form};
-use crate::modules::attention::{self, Cached, NormalizedQkv, key_value};
-use crate::modules::feedforward::glu::Glu;
+use crate::models::decoder::attention::{Chunks, Head, KvHeads, PaddedVocabulary, Windows};
+use crate::models::decoder::{Form, launch};
+use crate::modules::attention::{self, NormalizedQkv};
 use crate::modules::generic::collection::Array;
 use crate::modules::generic::collection::{Stack, View};
-use crate::modules::language::{Backbone, Classifier, Greedy, Normalized};
-use crate::modules::lora::{self, Rank, Term};
-use crate::modules::transformer::PreNorm;
-use crate::ops::attention::Attention;
+use crate::modules::language::Greedy;
 use crate::ops::attention::full::{self, head::Replicated, paged};
-use crate::ops::attention::geometry::{
-    self, HeadRows, ProjectionWidth, QueryGroups, QueryWidth, scale,
-};
-use crate::ops::attention::gqa::Cache;
-use crate::ops::attention::{Packed, Split};
+use crate::ops::attention::geometry::{self, QueryGroups, QueryWidth, scale};
 use crate::ops::embedding::Embedding;
 use crate::ops::index::gather::Gather;
-use crate::ops::index::scatter::{Scatter, Store};
+use crate::ops::index::scatter::Scatter;
 use crate::ops::linear::Affine;
-use crate::ops::linear::Linear;
 use crate::ops::normalization::{RmsNorm, span::Tiled};
-use crate::ops::pointwise::{activation::Silu, add::Add, multiply::Multiply};
+use crate::ops::pointwise::add::Add;
 use crate::ops::reduction::Argmax;
 use crate::ops::rotary::Rotary;
 use crate::ops::swiglu;
-use crate::specialize::attention::{Decode, Strategy};
+use crate::specialize::attention::Decode;
 use crate::tensor::axis::{self, Limit};
 use crate::tensor::form::Weight;
 use crate::tensor::memory::Memory;
-use crate::tensor::parallel::{Chip, Parallelism};
+use crate::tensor::parallel::Chip;
 use crate::tensor::scalar::F32;
-use crate::{Layers, Rolled, Sequential, Then};
 use catalog::Depth;
 use furiosa_opt_std::prelude::*;
 
 pub mod fp8;
-pub mod launch;
 
 /// A published Qwen3 checkpoint size, by its hub spelling.
 pub struct Size<const N: &'static str>;
-
-/// HF `Qwen3ForCausalLM`: the base model, then the greedy vocabulary head.
-pub type ForCausalLM<S, P, Q, C, X> = super::ForCausalLM<S, Model<S, P, Q, C, X>, LmHead<S, X>, P>;
-
-/// HF `Qwen3ForSequenceClassification`: the base model, then the scores of its last row.
-pub type ForSequenceClassification<S, P, Q, C, X> =
-    super::ForSequenceClassification<S, Model<S, P, Q, C, X>, Classifier<Hidden<S>>, P>;
-
-/// HF `Qwen3Model`: the embedding, the layers and the final norm, and the constants that prepare a
-/// call's attention context.
-pub type Model<S, P, Q, C, X> = super::Model<S, Body<S, P, Q, C, X>, RotaryEmbedding<S, C, X>, P>;
-
-/// HF `Qwen3DecoderLayer`: one element of `model.layers`, a subtree that loads alone.
-pub type DecoderLayer<S, P, Q, C, X> =
-    PreNorm<SelfAttention<S, P, Q, C, X>, Mlp<S, P, Q, X>, Norm<S, Hidden<S>, X>, Add>;
 
 /// The greedy head over the vocabulary rows: the projection whose bias lowers the padded rows, and
 /// the first maximum of each row's scores.
@@ -96,150 +68,19 @@ type Hidden<S> = <S as Geometry>::Hidden;
 type Vocabulary<S> = <S as Geometry>::Vocabulary;
 type Groups<S> = <S as Geometry>::Groups;
 type Norm<S, W, X> = <S as Geometry>::Norm<W, X>;
-type Chips<Q> = <Q as Parallelism>::Chip;
-type Rows<S> = <S as Decode>::Rows;
 
-/// The embedding, the layers and the final norm, whose rows a call stores.
-type Body<S, P, Q, C, X> = Then<
-    Normalized<
-        Backbone<
-            Named<
-                "embed_tokens",
-                Embedding<
-                    Vocabulary<S>,
-                    Hidden<S>,
-                    Chips<Q>,
-                    <X as Memory>::Tensor<
-                        bf16,
-                        Chips<Q>,
-                        m![{ Symbol<Vocabulary<S>> }, { Symbol<Hidden<S>> }],
-                    >,
-                >,
-            >,
-            Layers<<S as Geometry>::Layers<DecoderLayer<S, P, Q, C, X>>, Rolled>,
-        >,
-        Norm<S, Hidden<S>, X>,
-    >,
-    Store,
->;
-
-/// The query, key and value heads of a row, as a family computes them from a `Projection`: Qwen3
-/// normalizes each query and key head by `Norm`, Llama takes them as projected.
+/// Whether a family normalizes each query and key head of a row: Qwen3 does by `Norm`, Llama
+/// takes the heads as projected.
 pub trait Front {
-    type Heads<Projection, Norm>;
     /// The norm of each query or key head of the catalog's layer: `Norm`, or none, `()`.
     type HeadNorm<Norm>;
 }
 
-/// The packed query, key and value projection of a size in form `P`, unpacked into heads.
-type Packing<S, P, X> = Sequential<
-    <P as Form>::Of<
-        Hidden<S>,
-        <S as Decode>::Width,
-        bf16,
-        Chip,
-        X,
-        Packed<<S as Geometry>::KvHeads, <S as Decode>::Packed, X, <P as Form>::Stored>,
-    >,
-    Split<<S as Decode>::Width, <S as Geometry>::KvHeads, Groups<S>, <S as Geometry>::Head>,
->;
-
 impl<const N: &'static str> Front for Size<N> {
-    type Heads<Projection, Norm> =
-        NormalizedQkv<Projection, Named<"q_norm", Norm>, Named<"k_norm", Norm>>;
     type HeadNorm<Norm> = Norm;
 }
 
-/// The size's query, key and value front, the rotation, the cache write, the attention over each
-/// row's whole history and the output projection.
-type SelfAttention<S, P, Q, C, X> = Cached<
-    <S as Front>::Heads<Packing<S, P, X>, Norm<S, <S as Geometry>::Head, X>>,
-    Rotary<<S as Geometry>::Head, <S as Geometry>::Head, C>,
-    Scatter,
-    (),
-    Attention<
-        PhantomData<(<S as Geometry>::KvHeads, Groups<S>, <S as Geometry>::Head)>,
-        F32<SCALE>,
-        { Strategy::Items },
-    >,
-    Named<"o_proj", Projection<P, <S as Geometry>::Queries, Hidden<S>, Q, X>>,
->;
-
-/// The gated feed-forward over the size's intermediate features.
-type Mlp<S, P, Q, X> = Glu<
-    Projection<P, Hidden<S>, Intermediate<S>, Q, X>,
-    Silu,
-    Projection<P, Hidden<S>, Intermediate<S>, Q, X>,
-    Multiply,
-    Projection<P, Intermediate<S>, Hidden<S>, Q, X>,
->;
-
-/// A projection in form `P` on the chips of placement `Q`, in memory `X`.
-type Projection<P, In, Out, Q, X> = decoder::Projection<P, In, Out, bf16, Chips<Q>, X>;
-
 type Intermediate<S> = <S as Geometry>::Intermediate;
-
-/// A LoRA adapter of the size `S` as PEFT saves it, over the memory `X`: each layer's update of
-/// its packed query, key and value projection, its output projection and its feed-forward's gate,
-/// up and down projections.
-pub type Adapter<S, X> = Named<
-    "base_model",
-    Named<
-        "model",
-        Named<
-            "model",
-            Named<
-                "layers",
-                <S as Geometry>::Layers<(
-                    Named<
-                        "self_attn",
-                        (
-                            lora::Packed<
-                                <S as Geometry>::KvHeads,
-                                <S as Geometry>::Queries,
-                                Factors<Rank<3>, Hidden<S>, <S as Decode>::Width, X>,
-                            >,
-                            Named<
-                                "o_proj",
-                                Factors<Rank<1>, <S as Geometry>::Queries, Hidden<S>, X>,
-                            >,
-                        ),
-                    >,
-                    Named<
-                        "mlp",
-                        (
-                            Named<"gate_proj", Factors<Rank<1>, Hidden<S>, Intermediate<S>, X>>,
-                            Named<"up_proj", Factors<Rank<1>, Hidden<S>, Intermediate<S>, X>>,
-                            Named<"down_proj", Factors<Rank<1>, Intermediate<S>, Hidden<S>, X>>,
-                        ),
-                    >,
-                )>,
-            >,
-        >,
-    >,
->;
-
-/// An update's `[K, In]` and `[Out, K]` factors in memory `X`.
-type Factors<K, In, Out, X> = Term<
-    <X as Memory>::Tensor<bf16, m![1], m![K, In]>,
-    <X as Memory>::Tensor<bf16, m![1], m![Out, K]>,
->;
-
-/// The constants that prepare a call's rotations, write slots and paged history reads, for the
-/// rows of a call and a cache of form `C`.
-type RotaryEmbedding<S, C, X> = key_value::Preparation<
-    Rows<S>,
-    key_value::Paging<
-        <S as Geometry>::KvHeads,
-        <S as Geometry>::Head,
-        Rows<S>,
-        <S as Decode>::Windows,
-        C,
-        X,
-    >,
-    Chip,
-    X,
->;
 
 /// The score multiplier of Qwen3's 128-feature heads.
 const SCALE: usize = scale(Head::SIZE);
@@ -433,24 +274,16 @@ where
     type Hf = Config;
 }
 
-/// The work a call's host plans for a size of `G` query heads a key and value head, in `WAVES`
-/// wide tiles.
-type Work<G, const WAVES: usize> = paged::Work<Prompts, KvHeads, G, Head, WAVES>;
-
 // The rotary tiles of a launch's 1024 rows.
 axes![Slots = 8];
 
 impl Decode for Size<"0.6B"> {
     type Rows = Limit<16, 64>;
     type Windows = Windows<256>;
-    type Width = ProjectionWidth<4096>;
-    type Packed = m![{ Symbol<ProjectionWidth<4096>> }, { Symbol<geometry::Hidden<1024>> }];
-    type Work = Work<QueryGroups<2>, { tiles::<Self>() }>;
     type Capacity = axis::Rows<1024>;
     type Reach = axis::Rows<2048>;
     type Sequences = axis::Rows<8>;
     type Slots = Slots;
-    type Positions = axis::Rows<32768>;
 }
 
 impl Tiled for geometry::Hidden<1024> {
@@ -461,14 +294,10 @@ impl Tiled for geometry::Hidden<1024> {
 impl Decode for Size<"1.7B"> {
     type Rows = Limit<16, 64>;
     type Windows = Windows<256>;
-    type Width = ProjectionWidth<4096>;
-    type Packed = m![{ Symbol<ProjectionWidth<4096>> }, { Symbol<geometry::Hidden<2048>> }];
-    type Work = Work<QueryGroups<2>, { tiles::<Self>() }>;
     type Capacity = axis::Rows<1024>;
     type Reach = axis::Rows<2048>;
     type Sequences = axis::Rows<8>;
     type Slots = Slots;
-    type Positions = axis::Rows<32768>;
 }
 
 impl Tiled for geometry::Hidden<2048> {
@@ -479,14 +308,10 @@ impl Tiled for geometry::Hidden<2048> {
 impl Decode for Size<"4B"> {
     type Rows = Limit<16, 64>;
     type Windows = Windows<256>;
-    type Width = ProjectionWidth<6144>;
-    type Packed = m![{ Symbol<ProjectionWidth<6144>> }, { Symbol<geometry::Hidden<2560>> }];
-    type Work = Work<QueryGroups<4>, { tiles::<Self>() }>;
     type Capacity = axis::Rows<1024>;
     type Reach = axis::Rows<2048>;
     type Sequences = axis::Rows<8>;
     type Slots = Slots;
-    type Positions = axis::Rows<32768>;
 }
 
 impl Tiled for geometry::Hidden<2560> {
@@ -499,14 +324,10 @@ impl Decode for Size<"8B"> {
     // The shared context its checkpoint declares, by choice: its call's 192 tiles would hold 96
     // windows a row, and more windows take more tiles, a kernel change to measure.
     type Windows = Chunks;
-    type Width = ProjectionWidth<6144>;
-    type Packed = m![KvHeads, { Symbol<HeadRows<6>> }, Head, { Symbol<geometry::Hidden<4096>> }];
-    type Work = Work<QueryGroups<4>, { tiles::<Self>() }>;
     type Capacity = axis::Rows<1024>;
     type Reach = axis::Rows<2048>;
     type Sequences = axis::Rows<8>;
     type Slots = Slots;
-    type Positions = axis::Rows<32768>;
 }
 
 impl Tiled for geometry::Hidden<4096> {
@@ -695,8 +516,8 @@ type Ffn<S, P, X> = swiglu::Mlp<
     <P as Form>::Down<Hidden<S>, Intermediate<S>, X>,
 >;
 
-/// One layer of the catalog binding.
-pub(crate) type Layer<S, P, C, X> = super::Qwen2Layer<
+/// One layer of the catalog binding, `model.layers.N`: a subtree that loads alone.
+pub type Layer<S, P, C, X> = super::Qwen2Layer<
     Heads<S, P, X>,
     Rotary<HeadOf<S>, HeadOf<S>, C>,
     Scatter,
@@ -744,8 +565,8 @@ pub type CatalogBody<S, P, C, X> = <<S as Geometry>::Layers<()> as Depth<S, P, C
 
 /// The wide tiles of the size `S`'s work: as many as a call of its rows takes when every row
 /// attends the whole context `S` is compiled for, so its call's work holds whatever it admits.
-const fn tiles<S: Geometry + Decode>() -> usize {
-    paged::Plan::waves::<S::Groups>(S::Rows::SIZE, S::Windows::SIZE * Cache::SIZE)
+pub(crate) const fn tiles<S: Geometry + Decode + 'static>() -> usize {
+    paged::Plan::waves::<S::Groups>(S::Rows::SIZE, launch::Positions::<S>::SIZE)
 }
 
 #[cfg(test)]
@@ -845,27 +666,28 @@ pub(in crate::models) mod tests {
     }
 
     /// A call of a size's rows, each attending its whole compiled context, plans within the tiles
-    /// the size's work is compiled for, under either tiling.
+    /// the size's launch work is compiled for, under either tiling.
     #[test]
     fn plans_every_row_over_the_whole_context() {
         fn rows<S: Decode>(keys: usize) -> Vec<[i32; FIELDS]> {
             let row = |at: usize| [at, 1, keys - 1, 0, keys.div_ceil(16)].map(|f| f as i32);
             (0..S::Rows::SIZE).map(row).collect()
         }
-        fn context<S: Decode>() -> usize {
-            S::Windows::SIZE * Cache::SIZE
+        fn context<S: Decode + 'static>() -> usize {
+            launch::Positions::<S>::SIZE
         }
         let ids = vec![1; 1 << 18];
-        type Small = <Size<"0.6B"> as Decode>::Work;
-        type Grouped = <Size<"4B"> as Decode>::Work;
-        type Large = <Size<"8B"> as Decode>::Work;
+        type Rows<S> = <S as Decode>::Rows;
         let small = rows::<Size<"0.6B">>(context::<Size<"0.6B">>());
         let grouped = rows::<Size<"4B">>(context::<Size<"4B">>());
         let large = rows::<Size<"8B">>(context::<Size<"8B">>());
         for tiling in [paged::Tiling::Adaptive, paged::Tiling::Fixed] {
-            Small::sequential::<Rows<Size<"0.6B">>>(&small, &ids, tiling).unwrap();
-            Grouped::sequential::<Rows<Size<"4B">>>(&grouped, &ids, tiling).unwrap();
-            Large::sequential::<Rows<Size<"8B">>>(&large, &ids, tiling).unwrap();
+            launch::Work::<Size<"0.6B">>::sequential::<Rows<Size<"0.6B">>>(&small, &ids, tiling)
+                .unwrap();
+            launch::Work::<Size<"4B">>::sequential::<Rows<Size<"4B">>>(&grouped, &ids, tiling)
+                .unwrap();
+            launch::Work::<Size<"8B">>::sequential::<Rows<Size<"8B">>>(&large, &ids, tiling)
+                .unwrap();
         }
     }
 

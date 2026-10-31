@@ -11,26 +11,24 @@ use furiosa_opt_engine::decoder::{Cache, Decoder, Instance, Keep, Request, Rows}
 use furiosa_opt_engine::{AsyncModule, Checkpoint, Hbm, Load, LoadError, LoadOptions, Tiling};
 use furiosa_opt_models::load::Context;
 use furiosa_opt_models::models::decoder::attention::qwen3;
-use furiosa_opt_models::models::decoder::form;
-use furiosa_opt_models::tensor::cache;
-use furiosa_opt_models::tensor::parallel::Parallel;
+use furiosa_opt_models::models::decoder::{form, launch};
 use furiosa_opt_std::prelude::{Device, HostBufferSlice, M, Topology, bf16};
 use safetensors::Dtype;
 use safetensors::tensor::TensorView;
 use serde_json::{Value, json};
 
-/// The hub revisions of Qwen/Qwen3-0.6B and Qwen/Qwen3-8B these tests read.
+/// The hub revisions of Qwen/Qwen3-0.6B and of the block-scaled E4M3 Qwen3-8B these tests read.
 const REVISION: &str = "c1899de289a04d12100db370d81485cdf75e47ca";
-const EIGHT: &str = "b968826d9c46dd6066d109eabc6255188de91218";
+const BLOCK_SCALED: &str = "6124ba90c39c8e2299ddd57f4b4f0df5845480c8";
 
 /// Qwen3-0.6B's adapter tree.
-type Adapter = qwen3::Adapter<qwen3::Size<"0.6B">, Hbm>;
+type Adapter = launch::Adapter<qwen3::Size<"0.6B">, Hbm>;
 
 /// Qwen3-0.6B's base model, which returns the kept rows' hidden values.
-type Base = qwen3::Model<qwen3::Size<"0.6B">, form::Affine, Parallel<1>, cache::Bf16, Hbm>;
+type Base = launch::Base<qwen3::Size<"0.6B">, form::Affine>;
 
 /// Qwen3-0.6B's causal model, whose base model a test serves.
-type Causal = qwen3::ForCausalLM<qwen3::Size<"0.6B">, form::Affine, Parallel<1>, cache::Bf16, Hbm>;
+type Causal = launch::Model<qwen3::Size<"0.6B">, form::Affine>;
 
 const HIDDEN: usize = 1024;
 
@@ -281,7 +279,7 @@ fn adapted_rows_match_merged_weights() {
         .map(|(peft, directory)| base(&peft.merged(&checkpoint, directory.path()), &mut device))
         .collect();
     runtime().block_on(async {
-        let cache = Cache::new(&mut device, &model.decoder().limits().cache, 4).unwrap();
+        let cache = Cache::new(&mut device, &model.decoder().limits(Tiling::Adaptive).cache, 4).unwrap();
         let mut requests = Vec::new();
         for (index, adapter) in [None, Some(0), Some(1)].into_iter().enumerate() {
             requests.push(request(&mut device, index, adapter).await);
@@ -297,7 +295,7 @@ fn adapted_rows_match_merged_weights() {
                            model: &Instance<Base>,
                            index,
                            adapter: Option<&Adapter>| {
-            let cache = Cache::new(device, &model.decoder().limits().cache, 4).unwrap();
+            let cache = Cache::new(device, &model.decoder().limits(Tiling::Adaptive).cache, 4).unwrap();
             let request = request(device, index, adapter.map(|_| 0)).await;
             let slots = [adapter];
             let rows = model
@@ -340,8 +338,8 @@ fn loads_for_adapters_only_lines_that_take_them() {
     let options = LoadOptions::new().adapters();
     let small = options.parse(&config("Qwen/Qwen3-0.6B", REVISION)).unwrap();
     assert_eq!(small.size(), "0.6B");
-    match options.parse(&config("Qwen/Qwen3-8B", EIGHT)) {
+    match options.parse(&config("furiosa-ai/Qwen3-8B-FP8", BLOCK_SCALED)) {
         Err(LoadError::Unsupported { name, .. }) => assert_eq!(name, "adapters"),
-        other => panic!("Qwen3-8B for adapters: {other:?}"),
+        other => panic!("block-scaled Qwen3-8B for adapters: {other:?}"),
     }
 }

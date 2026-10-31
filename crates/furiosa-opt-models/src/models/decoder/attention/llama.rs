@@ -1,6 +1,6 @@
-//! Llama 3, by published size: Qwen3's classes over a [`Size`] whose front takes each row's query,
-//! key and value heads as projected, e.g.
-//! `ForCausalLM<Size<"8B">, form::Affine, Parallel<1>, cache::Bf16, X>`.
+//! Llama 3, by published size: Qwen3's catalog binding over a [`Size`] whose front takes each
+//! row's query, key and value heads as projected, e.g.
+//! `launch::Model<Size<"8B">, form::Affine>`.
 //!
 //! - A size's [`Geometry`] is what its checkpoints declare; its [`Decode`] is how a call of it is
 //!   compiled, that of the Qwen3 size of the same attention geometry.
@@ -14,11 +14,11 @@ use serde::Deserialize;
 use super::qwen3::{self, Front};
 use super::{Geometry, Head, KvHeads};
 use crate::models::{Family, config};
-use crate::ops::attention::geometry::{self, HeadRows, ProjectionWidth, QueryGroups, QueryWidth};
+use crate::ops::attention::geometry::{self, QueryGroups, QueryWidth};
 use crate::ops::normalization::RmsNorm;
 use crate::ops::swiglu;
 use crate::specialize::attention::Decode;
-use crate::tensor::axis::{self, Limit};
+use crate::tensor::axis::Limit;
 use crate::tensor::form::Weight;
 use crate::tensor::memory::Memory;
 use furiosa_opt_std::prelude::*;
@@ -29,16 +29,6 @@ axes![Vocabulary = 131072, MistralVocabulary = 32768];
 
 /// A published Llama 3 checkpoint size, by its hub spelling.
 pub struct Size<const N: &'static str>;
-
-/// HF `LlamaForCausalLM`: the base model, then the greedy vocabulary head.
-pub type ForCausalLM<S, P, Q, C, X> = qwen3::ForCausalLM<S, P, Q, C, X>;
-
-/// HF `LlamaModel`: the embedding, the layers and the final norm, and the constants that prepare a
-/// call's attention context.
-pub type Model<S, P, Q, C, X> = qwen3::Model<S, P, Q, C, X>;
-
-/// HF `LlamaDecoderLayer`: one element of `model.layers`, a subtree that loads alone.
-pub type DecoderLayer<S, P, Q, C, X> = qwen3::DecoderLayer<S, P, Q, C, X>;
 
 /// The norm of every Llama 3 size: `rms_norm_eps` 1e-5.
 type LlamaNorm<W, X> =
@@ -67,14 +57,10 @@ impl Geometry for Size<"8B"> {
 impl Decode for Size<"8B"> {
     type Rows = Limit<64, 64>;
     type Windows = <qwen3::Size<"8B"> as Decode>::Windows;
-    type Width = ProjectionWidth<6144>;
-    type Packed = m![KvHeads, { Symbol<HeadRows<6>> }, Head, { Symbol<geometry::Hidden<4096>> }];
-    type Work = <qwen3::Size<"8B"> as Decode>::Work;
     type Capacity = <qwen3::Size<"8B"> as Decode>::Capacity;
     type Reach = <qwen3::Size<"8B"> as Decode>::Reach;
     type Sequences = <qwen3::Size<"8B"> as Decode>::Sequences;
     type Slots = <qwen3::Size<"8B"> as Decode>::Slots;
-    type Positions = axis::Rows<8192>;
 }
 
 /// Mistral 7B, whose tree is Llama's: Llama 3 8B's geometry over a 32768-token vocabulary.
@@ -98,20 +84,15 @@ impl Geometry for Size<"Mistral-7B"> {
 
 impl Decode for Size<"Mistral-7B"> {
     type Rows = <Size<"8B"> as Decode>::Rows;
-    type Width = <Size<"8B"> as Decode>::Width;
-    type Packed = <Size<"8B"> as Decode>::Packed;
-    type Work = <Size<"8B"> as Decode>::Work;
     type Windows = <Size<"8B"> as Decode>::Windows;
     type Capacity = <Size<"8B"> as Decode>::Capacity;
     type Reach = <Size<"8B"> as Decode>::Reach;
     type Sequences = <Size<"8B"> as Decode>::Sequences;
     type Slots = <Size<"8B"> as Decode>::Slots;
-    type Positions = <Size<"8B"> as Decode>::Positions;
 }
 
 /// Llama projects each row's query, key and value heads and rotates them unnormalized.
 impl<const N: &'static str> Front for Size<N> {
-    type Heads<Projection, Norm> = Projection;
     type HeadNorm<Norm> = ();
 }
 
@@ -229,10 +210,8 @@ where
 mod tests {
     use super::*;
     use crate::load::{Checkpoint, Load};
-    use crate::models::decoder::form;
-    use crate::tensor::cache;
+    use crate::models::decoder::{form, launch};
     use crate::tensor::memory::Hbm;
-    use crate::tensor::parallel::Parallel;
 
     /// Llama-3-8B's published config selects the size; a scaled spectrum is refused.
     #[test]
@@ -265,13 +244,13 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     }
 
-    /// The causal model and the BF16 instance of the catalog load from a checkpoint.
+    /// The causal root and the BF16 instance of the catalog load from a checkpoint.
     #[test]
     fn causal_model_loads() {
         fn loads<T: for<'a> Load<&'a Checkpoint>>() {}
-        loads::<ForCausalLM<Size<"8B">, form::Affine, Parallel<1>, cache::Bf16, Hbm>>();
+        loads::<launch::Model<Size<"8B">, form::Affine>>();
         loads::<qwen3::Catalog<Size<"8B">, form::Affine, bf16, Hbm>>();
-        loads::<ForCausalLM<Size<"Mistral-7B">, form::Affine, Parallel<1>, cache::Bf16, Hbm>>();
+        loads::<launch::Model<Size<"Mistral-7B">, form::Affine>>();
         loads::<qwen3::Catalog<Size<"Mistral-7B">, form::Affine, bf16, Hbm>>();
     }
 }

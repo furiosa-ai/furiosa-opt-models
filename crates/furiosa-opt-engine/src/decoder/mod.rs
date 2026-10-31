@@ -13,21 +13,41 @@
 //!   attention: under `Tiling::Fixed` a row's values do not depend on the other rows of its calls.
 //! - A call may run its requests with LoRA adapters: the caller's list of them, which a request
 //!   names an adapter of by its index (`adapter`); the batch keeps the list it checked.
+//! - A `Root` of the decoder family's catalog is a decoder of one launch a call: the host plans
+//!   the rows' positions, cache slots, attention work and selected rows, and the launch writes the
+//!   selected rows' outputs in kept order.
 
 mod adapters;
 mod batch;
 mod cache;
-mod qwen3;
 
 pub use adapters::{Adapter, Binding, Loader, SLOTS};
 pub use batch::{Batch, Rows, Staged, Table};
 pub use cache::{Cache, CacheSpec, Group, Kind, Pool};
 
-use crate::{AsyncModule, Checkpoint, LoadError};
-use furiosa_opt_models::ops::attention::full::paged::Tiling;
-use furiosa_opt_models::tensor::memory::{Dtype, dtype};
-use furiosa_opt_std::prelude::{Broadcast, Device, HbmBuffer, M, Scalar, m};
+use crate::{AsyncModule, Checkpoint, Load, LoadError, forward};
+use furiosa_opt_models::Module;
+use furiosa_opt_models::models::decoder::attention::qwen3::{LmHead, fp8};
+use furiosa_opt_models::models::decoder::attention::{
+    ForCausalLM, ForSequenceClassification, Geometry, Head, KvHeads,
+};
+use furiosa_opt_models::models::decoder::form;
+use furiosa_opt_models::models::decoder::launch;
+use furiosa_opt_models::modules::attention::key_value;
+use furiosa_opt_models::modules::language::{Classifier, Input, Selected};
+use furiosa_opt_models::modules::lora::{self, Rank, States};
+use furiosa_opt_models::ops::attention::full::paged::{Tiling, chunks::Masks};
+use furiosa_opt_models::ops::index::table::BlockIndex;
+use furiosa_opt_models::ops::linear::affine::Columns;
+use furiosa_opt_models::specialize::attention::Decode;
+use furiosa_opt_models::tensor::cache::{Block, Blocks};
+use furiosa_opt_models::tensor::memory::{Dtype, Hbm, alias, dtype};
+use furiosa_opt_models::tensor::parallel::Chip;
+use furiosa_opt_std::prelude::*;
+use furiosa_opt_std::runtime::DeviceOutput;
+use std::convert::Infallible;
 use std::io;
+use std::marker::PhantomData;
 use std::pin::Pin;
 
 /// One sequence chunk: `tokens` appended after the `cached` positions already in the cache.
@@ -153,7 +173,8 @@ pub trait Decoder: Send + Sync {
     /// adapter tree, or `Infallible` for a decoder that runs none.
     type Adapter: Send + Sync + 'static;
 
-    fn limits(&self) -> Limits;
+    /// What one call holds when its rows' attention is tiled as `tiling` says.
+    fn limits(&self, tiling: Tiling) -> Limits;
 
     /// Views of `storage`, the layers of a cache allocated for this decoder.
     fn layers(storage: &[HbmBuffer]) -> io::Result<Self::Layers>;
@@ -227,7 +248,8 @@ impl<'r, 'c, 'l, 'a, D: Decoder>
         (cache, adapters): (&'c Cache, &'l [Option<&'a D::Adapter>]),
         requests: &'r [Request],
     ) -> io::Result<D::Output> {
-        let batch = Batch::new(requests, &Decoder::limits(&self.decoder), cache, adapters)?;
+        let limits = Decoder::limits(&self.decoder, self.tiling);
+        let batch = Batch::new(requests, &limits, cache, adapters)?;
         let mut layers = cache.lend(D::layers)?;
         self.decoder
             .call(device, &mut layers, batch, self.tiling)
@@ -263,7 +285,7 @@ pub trait Served: Send + Sync {
 /// `Adapter`s.
 impl<D: Decoder> Served for Instance<D> {
     fn limits(&self) -> Limits {
-        Decoder::limits(&self.decoder)
+        Decoder::limits(&self.decoder, self.tiling)
     }
 
     fn output(&self) -> Output {
@@ -290,5 +312,448 @@ impl<D: Decoder> Served for Instance<D> {
             let rows = AsyncModule::forward(self, device, (), call, requests).await?;
             rows.try_into()
         })
+    }
+}
+
+/// A root of the decoder family's catalog, which a call launches once: of the size `Size`, writing
+/// each selected row's output, `Row` elements, into `Place` in order, its projections running
+/// with the adapters `Adapting` gives.
+pub trait Root {
+    type Size: Geometry + Decode + 'static;
+    type Place: Place;
+    type Row: M;
+    type Adapting: Adapting<Self::Size>;
+}
+
+/// The causal model writes the selected rows' tokens; its projections' form runs its adapters.
+impl<S: Geometry + Decode + 'static, B, P: Adapting<S>> Root
+    for ForCausalLM<S, launch::Over<S, B, P>, LmHead<S, Hbm>, P>
+{
+    type Size = S;
+    type Place = launch::Tokens<S>;
+    type Row = m![1];
+    type Adapting = P;
+}
+
+/// The base model writes the selected rows' hidden values; its projections' form runs its
+/// adapters.
+impl<S: Geometry + Decode + 'static, B, P: Adapting<S>> Root for launch::Over<S, B, P> {
+    type Size = S;
+    type Place = launch::Values<S>;
+    type Row = m![{ Symbol<<S as Geometry>::Hidden> }];
+    type Adapting = P;
+}
+
+/// The sequence classifier writes the selected rows' scores, label columns first; it runs no
+/// adapter.
+impl<S: Geometry + Decode + 'static, B, P> Root
+    for ForSequenceClassification<S, launch::Over<S, B, P>, Classifier<<S as Geometry>::Hidden>, P>
+{
+    type Size = S;
+    type Place = launch::Scores<S>;
+    type Row = m![{ Symbol<Columns> }];
+    type Adapting = Infallible;
+}
+
+/// Block-scaled FP8 Qwen3-8B writes the selected rows' tokens; it runs no adapter.
+impl Root for fp8::ForCausalLM {
+    type Size = Size8B;
+    type Place = launch::Tokens<Size8B>;
+    type Row = m![1];
+    type Adapting = Infallible;
+}
+
+type Size8B = furiosa_opt_models::models::decoder::attention::qwen3::Size<"8B">;
+
+/// The adapters a call of a root of the size `S` may run its rows with: LoRA terms of every dense
+/// BF16 projection, or none.
+pub trait Adapting<S: Geometry + Decode + 'static> {
+    /// An adapter: a PEFT checkpoint loaded as the root's adapter tree, or `Infallible`.
+    type Adapter: Send + Sync + 'static;
+    /// Each layer's projections' states in a call that runs [`SLOTS`] adapters.
+    type States<'t>: States;
+    /// Adapters a call runs at most.
+    const ADAPTERS: usize;
+
+    /// `checkpoint`, a PEFT LoRA checkpoint, loaded onto `device` as an adapter.
+    fn adapter(checkpoint: &Checkpoint, device: &mut Device) -> Result<Self::Adapter, LoadError>;
+
+    /// Layer `layer`'s states with the call's adapters `held` and their `selections`.
+    fn states<'t>(
+        held: [&'t Self::Adapter; SLOTS],
+        layer: usize,
+        selections: &'t launch::Selections<S, SLOTS>,
+    ) -> Self::States<'t>;
+}
+
+/// Dense BF16 projections add each adapter's update of the rows it selects.
+impl<S: Geometry + Decode + 'static> Adapting<S> for form::Affine
+where
+    launch::Adapter<S, Hbm>:
+        Send + Sync + 'static + for<'h> Load<&'h launch::Adapter<S, lora::Staged>>,
+    launch::Adapter<S, lora::Staged>: for<'c> Load<&'c Checkpoint>,
+    <S as Geometry>::Layers<launch::Terms<S, Hbm>>: AsRef<[launch::Terms<S, Hbm>]>,
+{
+    type Adapter = launch::Adapter<S, Hbm>;
+    type States<'t> = launch::Adapted<'t, S, SLOTS>;
+    const ADAPTERS: usize = SLOTS;
+
+    // A PEFT checkpoint's terms are built on host from the checkpoint read once, then uploaded.
+    fn adapter(checkpoint: &Checkpoint, device: &mut Device) -> Result<Self::Adapter, LoadError> {
+        lora::load::<launch::Adapter<S, Hbm>, launch::Adapter<S, lora::Staged>>(checkpoint, device)
+    }
+
+    fn states<'t>(
+        held: [&'t Self::Adapter; SLOTS],
+        layer: usize,
+        selections: &'t launch::Selections<S, SLOTS>,
+    ) -> Self::States<'t> {
+        launch::adapted(held, layer, selections)
+    }
+}
+
+/// Channel-scaled projections add no update: their roots run no adapter.
+impl<S: Geometry + Decode + 'static> Adapting<S> for form::ChannelScaled {
+    type Adapter = Infallible;
+    type States<'t> = ();
+    const ADAPTERS: usize = 0;
+
+    fn adapter(checkpoint: &Checkpoint, device: &mut Device) -> Result<Infallible, LoadError> {
+        <Infallible as Adapting<S>>::adapter(checkpoint, device)
+    }
+
+    fn states<'t>(
+        held: [&'t Infallible; SLOTS],
+        _: usize,
+        _: &'t launch::Selections<S, SLOTS>,
+    ) -> Self::States<'t> {
+        match *held[0] {}
+    }
+}
+
+/// A root that runs no adapter refuses a load of one; no call holds one.
+impl<S: Geometry + Decode + 'static> Adapting<S> for Infallible {
+    type Adapter = Infallible;
+    type States<'t> = ();
+    const ADAPTERS: usize = 0;
+
+    fn adapter(_: &Checkpoint, _: &mut Device) -> Result<Infallible, LoadError> {
+        Err(LoadError::Unsupported {
+            name: "adapters".into(),
+            reason: "the decoder's projections take no adapter".into(),
+        })
+    }
+
+    fn states<'t>(
+        held: [&'t Infallible; SLOTS],
+        _: usize,
+        _: &'t launch::Selections<S, SLOTS>,
+    ) -> Self::States<'t> {
+        match *held[0] {}
+    }
+}
+
+/// What a launch writes of each selected row, named by its element type: a token in I32, hidden
+/// values in BF16, scores in FP32.
+pub trait Place: DeviceOutput {
+    /// The element type of the rows a call returns.
+    type Scalar: Scalar;
+    /// What a call returns of each kept row.
+    const OUTPUT: Output;
+
+    fn into_buffer(self) -> HbmBuffer;
+}
+
+impl<E: M> Place for furiosa_opt_std::prelude::HbmTensor<i32, Chip, E> {
+    type Scalar = i32;
+    const OUTPUT: Output = Output::Tokens;
+
+    fn into_buffer(self) -> HbmBuffer {
+        furiosa_opt_std::prelude::HbmTensor::into_buffer(self)
+    }
+}
+
+impl<E: M> Place for furiosa_opt_std::prelude::HbmTensor<bf16, Chip, E> {
+    type Scalar = bf16;
+    const OUTPUT: Output = Output::Hidden;
+
+    fn into_buffer(self) -> HbmBuffer {
+        furiosa_opt_std::prelude::HbmTensor::into_buffer(self)
+    }
+}
+
+impl<E: M> Place for furiosa_opt_std::prelude::HbmTensor<f32, Chip, E> {
+    type Scalar = f32;
+    const OUTPUT: Output = Output::Scores;
+
+    fn into_buffer(self) -> HbmBuffer {
+        furiosa_opt_std::prelude::HbmTensor::into_buffer(self)
+    }
+}
+
+/// Block IDs of a call of `R` rows whose every row is a request spanning the whole context of `W`
+/// windows.
+#[derive(Clone, Debug)]
+struct Tables<R, W>(PhantomData<fn() -> (R, W)>);
+
+impl<R: AxisName, W: AxisName> AxisName for Tables<R, W> {
+    const NAME: Ident = Ident::new("Tables");
+    const SIZE: usize = R::SIZE * W::SIZE * BlockIndex::SIZE;
+}
+
+/// A catalog root as a decoder: a call plans its rows' positions, cache slots, attention work and
+/// selected rows on the host, then launches the root once over every layer's own blocks, which
+/// writes the selected rows' outputs in kept order; a call that runs adapters passes each layer's
+/// projections their terms and selections of the rows. Under a fixed tiling every row is a work
+/// item, so a launch holds the size's call rows.
+impl<R> Decoder for R
+where
+    R: Root + DeviceSend + Send + Sync,
+    for<'b, 't> <R::Size as Geometry>::Layers<launch::Layer<'b, Held<'t, R>>>:
+        TryFrom<Vec<launch::Layer<'b, Held<'t, R>>>> + DeviceSend,
+    for<'b> <R::Size as Geometry>::Layers<launch::Layer<'b>>:
+        TryFrom<Vec<launch::Layer<'b>>> + DeviceSend,
+    for<'i, 'a, 's, 'b> R: Module<
+            &'i mut launch::Input<'a, R::Size>,
+            (),
+            launch::State<'s, R::Size, <R::Size as Geometry>::Layers<launch::Layer<'b>>, R::Place>,
+            Output = (),
+        >,
+    for<'i, 'a, 's, 'b, 't> R: Module<
+            &'i mut launch::Input<'a, R::Size>,
+            (),
+            launch::State<
+                's,
+                R::Size,
+                <R::Size as Geometry>::Layers<launch::Layer<'b, Held<'t, R>>>,
+                R::Place,
+            >,
+            Output = (),
+        >,
+{
+    const OUTPUT: Output = <R::Place as Place>::OUTPUT;
+    const ADAPTERS: usize = <R::Adapting as Adapting<R::Size>>::ADAPTERS;
+    type Output = Rows<<R::Place as Place>::Scalar, R::Row>;
+    type Layers = Vec<Blocks<KvHeads, Head>>;
+    type Adapter = <R::Adapting as Adapting<R::Size>>::Adapter;
+
+    fn limits(&self, tiling: Tiling) -> Limits {
+        limits::<R::Size>(Self::ADAPTERS, tiling)
+    }
+
+    fn layers(storage: &[HbmBuffer]) -> io::Result<Self::Layers> {
+        (storage.iter())
+            .map(|layer| Blocks::from_buffer(layer.alias(..).map_err(io::Error::other)?))
+            .collect()
+    }
+
+    fn adapter(checkpoint: &Checkpoint, device: &mut Device) -> Result<Self::Adapter, LoadError> {
+        <R::Adapting as Adapting<R::Size>>::adapter(checkpoint, device)
+    }
+
+    // The root is captured and launched in place, never held across an await: that `Send` check
+    // erases lifetimes and cannot prove the root's higher-ranked bounds.
+    fn call(
+        &self,
+        device: &mut Device,
+        layers: &mut Self::Layers,
+        batch: Batch<'_, Self::Adapter>,
+        tiling: Tiling,
+    ) -> impl Future<Output = io::Result<Self::Output>> + Send {
+        let root = self;
+        async move {
+            let mut reads = batch.operands::<
+                launch::Capacity<R::Size>,
+                <R::Size as Decode>::Reach,
+                <R::Size as Decode>::Sequences,
+                KvHeads,
+                <R::Size as Geometry>::Groups,
+                Head,
+                launch::Waves<R::Size>,
+                <R::Size as Decode>::Windows,
+            >(0, tiling)?;
+            if let Some(binding) = batch.adapters() {
+                reads.extend(binding.selections::<launch::Capacity<R::Size>, Rank<1>>());
+                reads.extend(binding.selections::<launch::Capacity<R::Size>, Rank<2>>());
+            }
+            // ponytail: placed each call; a load-lifetime place would spare two small uploads a
+            // call.
+            let masks = Masks::<<R::Size as Decode>::Windows>::new(device).await?;
+            // Staged last, so nothing of the size's axes is held across an await.
+            let (staged, views) = batch
+                .stage::<
+                    launch::Capacity<R::Size>,
+                    Tables<launch::Capacity<R::Size>, <R::Size as Decode>::Windows>,
+                    Chip,
+                >(device, &reads, (0, Table::Blocks))
+                .await?;
+            let mut views = views.into_iter();
+            let mut next =
+                || (views.next()).ok_or_else(|| io::Error::other("a read array is missing"));
+            let operands: launch::Operands<R::Size> = key_value::Operands {
+                batch: key_value::Batch {
+                    positions: alias(&next()?, ..)?,
+                    slot: alias(&next()?, ..)?,
+                },
+                work: launch::Work::<R::Size>::bind(&mut next, &masks)?,
+                selected: Selected {
+                    live: alias(&next()?, ..)?,
+                    rows: alias(&next()?, ..)?,
+                },
+                slots: PhantomData,
+            };
+            let tokens: launch::Ids<R::Size> = alias(&staged.tokens, ..)?;
+            let mut input: launch::Input<'_, R::Size> = Input::new(tokens, staged.count, &operands);
+            let place = DeviceOutput::alloc(device).map_err(io::Error::other)?;
+            let place = match batch.adapters() {
+                None => {
+                    let slots = (layers.iter_mut())
+                        .map(|blocks| ((Default::default(), blocks, ()), ()))
+                        .collect();
+                    submit(device, root, &mut input, slots, place)?
+                }
+                Some(binding) => {
+                    let selections = (
+                        adapters::selected::<launch::Capacity<R::Size>, Rank<1>>(&mut next)?,
+                        adapters::selected::<launch::Capacity<R::Size>, Rank<2>>(&mut next)?,
+                    );
+                    let held = binding.held();
+                    let slots = (layers.iter_mut().enumerate())
+                        .map(|(at, blocks)| {
+                            let states =
+                                <R::Adapting as Adapting<R::Size>>::states(held, at, &selections);
+                            ((Default::default(), blocks, ()), states)
+                        })
+                        .collect();
+                    submit(device, root, &mut input, slots, place)?
+                }
+            };
+            Rows::new(&place.into_buffer(), 0..batch.kept().len())
+        }
+    }
+}
+
+/// What each layer's projections of the root `R` run with in a call of adapters.
+type Held<'t, R> = <<R as Root>::Adapting as Adapting<<R as Root>::Size>>::States<'t>;
+
+/// What a launch of the size `S` holds, its rows tiled as `tiling` says: the context its size is
+/// compiled for, one paged group of every layer's blocks, `adapters` adapters, and the launch's
+/// rows; a fixed tiling attends every row as a work item, so it holds the size's call rows, which
+/// its items hold over the whole context.
+fn limits<S: Geometry + Decode + 'static>(adapters: usize, tiling: Tiling) -> Limits {
+    let rows = match tiling {
+        Tiling::Fixed => S::Rows::SIZE,
+        Tiling::Adaptive => launch::Capacity::<S>::SIZE,
+    };
+    Limits {
+        window: launch::Positions::<S>::SIZE,
+        rows,
+        cache: CacheSpec {
+            pools: vec![Pool {
+                block: Block::SIZE,
+                bytes: Blocks::<KvHeads, Head>::BLOCK_STRIDE as usize,
+            }],
+            groups: vec![Group {
+                pool: 0,
+                layers: 0..S::LAYERS,
+                kind: Kind::Paged,
+                window: None,
+            }],
+        },
+        adapters,
+    }
+}
+
+/// One launch of `root` over a call's `input` and its layers' `slots`, writing the selected rows'
+/// outputs into `place`, which it returns once the device accepted the launch.
+fn submit<'i, 'a, R, L>(
+    device: &mut Device,
+    root: &R,
+    input: &'i mut launch::Input<'a, R::Size>,
+    slots: Vec<L>,
+    place: R::Place,
+) -> io::Result<R::Place>
+where
+    R: Root + DeviceSend,
+    <R::Size as Geometry>::Layers<L>: TryFrom<Vec<L>> + DeviceSend,
+    for<'s> R: Module<
+            &'i mut launch::Input<'a, R::Size>,
+            (),
+            launch::State<'s, R::Size, <R::Size as Geometry>::Layers<L>, R::Place>,
+            Output = (),
+        >,
+{
+    let slots: <R::Size as Geometry>::Layers<L> = (slots.try_into())
+        .unwrap_or_else(|_| unreachable!("a cache of the decoder's spec holds each layer"));
+    let hidden = DeviceOutput::alloc(device).map_err(io::Error::other)?;
+    let mut places = (((hidden, slots), ()), place);
+    let state: launch::State<'_, R::Size, _, R::Place> = &mut places;
+    launch(forward, (&mut *device, root, (), state, input))
+        .output(&mut ())
+        .submit()
+        .accepted()
+        .map(drop)
+        .map_err(io::Error::other)?;
+    Ok(places.1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use furiosa_opt_models::models::decoder::attention::qwen3;
+    use furiosa_opt_std::prelude::Topology;
+
+    /// A launch of Qwen3-4B admits and plans a call past the 40960 positions a Qwen3 checkpoint
+    /// declares, up to the context its size is compiled for: decode rows and a prompt that end at
+    /// its last position, under a fixed tiling as many as the launch admits.
+    #[test]
+    fn launches_plan_the_compiled_context() -> io::Result<()> {
+        type S = qwen3::Size<"4B">;
+        let device = Device::new(Topology { chips: 1, pes: 8 }).map_err(io::Error::other)?;
+        // A request of `rows` rows ending at position `end`: its history reads block 0, and its
+        // rows write their own blocks from `first`.
+        let request = |rows: usize, end: usize, first: usize| -> io::Result<Request> {
+            let cached = end - rows;
+            let blocks = (0..end.div_ceil(Block::SIZE))
+                .map(|at| (at.checked_sub(cached / Block::SIZE)).map_or(0, |own| first + own))
+                .map(|block| block as u32)
+                .collect();
+            let ids = HbmBuffer::alloc(&device, rows * Rows::<i32, m![1]>::bytes())
+                .map_err(io::Error::other)?;
+            Ok(Request {
+                rows: vec![blocks],
+                cached,
+                tokens: Rows::new(&ids, 0..rows)?,
+                keep: Keep::Last,
+                adapter: None,
+                positions: None,
+                mask: None,
+                overrides: Vec::new(),
+            })
+        };
+        for tiling in [Tiling::Adaptive, Tiling::Fixed] {
+            let limits = limits::<S>(0, tiling);
+            let context = limits.window;
+            assert!(context > 40960, "{tiling:?}: {context} positions");
+            // The rows every row of which the items hold over the whole context.
+            let rows = limits.rows.min(<S as Decode>::Rows::SIZE);
+            let cache = Cache::new(&device, &limits.cache, 2 + rows)?;
+            let mut requests = vec![request(rows / 2, context, 0)?];
+            for row in 0..rows / 2 {
+                requests.push(request(1, context, 2 + row)?);
+            }
+            let batch = Batch::<Infallible>::new(&requests, &limits, &cache, &[])?;
+            batch.operands::<
+                launch::Capacity<S>,
+                <S as Decode>::Reach,
+                <S as Decode>::Sequences,
+                KvHeads,
+                <S as Geometry>::Groups,
+                Head,
+                launch::Waves<S>,
+                <S as Decode>::Windows,
+            >(0, tiling)?;
+        }
+        Ok(())
     }
 }

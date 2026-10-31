@@ -23,14 +23,15 @@ impl<
     Head: AxisName,
     T: Group<KvHeads, Groups, Head>,
     All: AxisName,
+    W: AxisName,
     Q: QueryTiles<KvHeads, Groups, Head>,
 >
     Op<
         Begin<(
-            &Input<'_, KvHeads, Groups, Head, All>,
+            &Input<'_, KvHeads, Groups, Head, All, W>,
             (
                 fresh::Keys<KvHeads, Groups, Head>,
-                &mut Load<'_, '_, KvHeads, Groups, Head, All, T::Fresh>,
+                &mut Load<'_, '_, KvHeads, Groups, Head, All, W, T::Fresh>,
             ),
             &Q,
         )>,
@@ -42,17 +43,17 @@ impl<
         &self,
         context: &mut Device,
         Begin((input, (key, source), queries)): Begin<(
-            &Input<'_, KvHeads, Groups, Head, All>,
+            &Input<'_, KvHeads, Groups, Head, All, W>,
             (
                 fresh::Keys<KvHeads, Groups, Head>,
-                &mut Load<'_, '_, KvHeads, Groups, Head, All, T::Fresh>,
+                &mut Load<'_, '_, KvHeads, Groups, Head, All, W, T::Fresh>,
             ),
             &Q,
         )>,
     ) -> Self::Output {
         let scores = T::scores(input.attention, context, (&mut *source, key), queries);
         // Behind the key loads, so it arrives during the contractions.
-        let mask = T::mask::<All>(context, input);
+        let mask = T::mask::<All, W>(context, input);
         Scored { scores, mask }
     }
 }
@@ -64,13 +65,14 @@ impl<
     Head: AxisName,
     T: Group<KvHeads, Groups, Head>,
     All: AxisName,
+    W: AxisName,
     C: state::Tiles<KvHeads, Groups, Head>,
     R: state::Tiles<KvHeads, Groups, Head>,
 >
     Op<(
         Scored<KvHeads, Groups, Head, T>,
         (
-            &mut Load<'_, '_, KvHeads, Groups, Head, All, T::Fresh>,
+            &mut Load<'_, '_, KvHeads, Groups, Head, All, W, T::Fresh>,
             (&mut C, &mut R),
         ),
     )> for CausalBlock<T>
@@ -83,7 +85,7 @@ impl<
         (scored, (source, state)): (
             Scored<KvHeads, Groups, Head, T>,
             (
-                &mut Load<'_, '_, KvHeads, Groups, Head, All, T::Fresh>,
+                &mut Load<'_, '_, KvHeads, Groups, Head, All, W, T::Fresh>,
                 (&mut C, &mut R),
             ),
         ),
@@ -100,6 +102,7 @@ impl<
     Head: AxisName,
     T: Group<KvHeads, Groups, Head>,
     All: AxisName,
+    W: AxisName,
     Q: QueryTiles<KvHeads, Groups, Head>,
     C: state::Tiles<KvHeads, Groups, Head>,
     R: state::Tiles<KvHeads, Groups, Head>,
@@ -110,10 +113,10 @@ impl<
 >
     Module<
         (
-            &Input<'_, KvHeads, Groups, Head, All>,
+            &Input<'_, KvHeads, Groups, Head, All, W>,
             (
                 fresh::Keys<KvHeads, Groups, Head>,
-                &mut Load<'_, '_, KvHeads, Groups, Head, All, T::Fresh>,
+                &mut Load<'_, '_, KvHeads, Groups, Head, All, W, T::Fresh>,
             ),
             &Q,
             (&mut C, &mut R),
@@ -133,10 +136,10 @@ where
         env: Env,
         _: &mut (),
         (input, (key, source), queries, state, (guest, (boundary, place), keeps)): (
-            &Input<'_, KvHeads, Groups, Head, All>,
+            &Input<'_, KvHeads, Groups, Head, All, W>,
             (
                 fresh::Keys<KvHeads, Groups, Head>,
-                &mut Load<'_, '_, KvHeads, Groups, Head, All, T::Fresh>,
+                &mut Load<'_, '_, KvHeads, Groups, Head, All, W, T::Fresh>,
             ),
             &Q,
             (&mut C, &mut R),

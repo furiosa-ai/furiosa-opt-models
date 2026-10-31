@@ -308,7 +308,7 @@ Each response can carry its own timings beside the server's aggregated metrics:
 
 With vLLM, each request may name a LoRA adapter of the served model, saved as PEFT saves it; requests of different adapters and of the base model share a step.
 The engine adds an adapter's updates to the attention projections `q_proj`, `k_proj`, `v_proj` and `o_proj` and the MLP projections `gate_proj`, `up_proj` and `down_proj`, up to rank 32, at most two adapters a step.
-[Qwen3 0.6B](../models/qwen3-0.6b.md) on one chip runs them, its tokens those of Transformers with each adapter merged by PEFT; `--enable-lora` with [Qwen3 8B](../models/qwen3-8b.md) or with an online quantization is refused at startup, as those loads run no adapter.
+[Qwen3 0.6B](../models/qwen3-0.6b.md) on one chip runs them, its tokens those of Transformers with each adapter merged by PEFT; `--enable-lora` with a quantized checkpoint, such as the block-scaled FP8 [Qwen3 8B](../models/qwen3-8b.md), or with an online quantization is refused at startup, as those loads run no adapter.
 
 ```python
 from vllm import LLM, SamplingParams
