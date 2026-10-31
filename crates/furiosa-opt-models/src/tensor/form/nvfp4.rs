@@ -27,6 +27,9 @@ pub type Held<X> = <X as Memory>::Tensor<f32, Chip, m![1 # 8]>;
 /// One E4M3 scale for each 16 consecutive inputs of an output row.
 pub type Scales<In, Out> = m![Out, In / 16];
 
+/// The host value of a weight's [`Scales`] on every chip of `C`.
+pub(crate) type BlockScales<In, Out, C = Chip> = HostTensor<f8e4m3, m![{ C }, { Scales<In, Out> }]>;
+
 /// Each restored coefficient divided by the tensor scale before its one BF16 rounding, inputs in
 /// form `A`: a compressed-tensors checkpoint's `weight_global_scale`.
 #[derive(DeviceSend, Load)]
@@ -195,6 +198,32 @@ pub(crate) fn codes<C: M + 'static, S: M + 'static>(
     })
 }
 
+/// The E4M3 block scales at the context's name as stored, one for each 16 inputs of an output row
+/// (`[out, in / 16]`), on every chip of `C`; a leaf of [`Scales`] would read `[out, in]`.
+pub(crate) fn block_scales<In: AxisName, Out: AxisName, C: M + 'static>(
+    from: &Checkpoint,
+    context: &mut Context<'_>,
+) -> Result<BlockScales<In, Out, C>, LoadError> {
+    let (name, view) = context.tensor(from)?;
+    let shape = [Out::SIZE, In::SIZE / 16];
+    if view.dtype() != Dtype::F8_E4M3 || view.shape() != &shape[..] {
+        return Err(LoadError::InvalidData {
+            name,
+            reason: format!(
+                "{:?} {:?}, the leaf holds E4M3 block scales of shape {shape:?}",
+                view.dtype(),
+                view.shape()
+            ),
+        });
+    }
+    HostTensor::try_from(HostBuffer::from_vec(view.data().repeat(C::SIZE))).map_err(|error| {
+        LoadError::InvalidData {
+            name,
+            reason: error.to_string(),
+        }
+    })
+}
+
 /// The tensor scales `leaves` beside the context's name, absent ones reported together.
 fn scales<const N: usize>(
     from: &Checkpoint,
@@ -336,5 +365,70 @@ mod tests {
             );
         }
         assert_eq!(missing(read(&[], "", scale)), ["s"]);
+    }
+
+    /// The block scales are an E4M3 row of one a 16 inputs for each output, kept as stored; another
+    /// dtype or shape is refused, and absent scales are missing.
+    #[test]
+    fn reads_block_scales_as_stored() {
+        let stored_as = |dtype, shape: &[usize], bytes: usize| {
+            let bytes = (0..bytes).map(|byte| byte as u8).collect();
+            let tensors = [("weight_scale", dtype, shape, bytes)];
+            read(
+                &tensors,
+                "weight_scale",
+                block_scales::<Inputs, Outputs, m![1]>,
+            )
+        };
+        let stored = stored_as(Dtype::F8_E4M3, &[2, 2], 4).unwrap();
+        assert_eq!(Vec::<u8>::from(stored.into_buffer()), [0, 1, 2, 3]);
+        for (dtype, shape, bytes) in [
+            (Dtype::U8, &[2, 2][..], 4),
+            (Dtype::F8_E4M3, &[2, 32][..], 64),
+            (Dtype::F8_E4M3, &[4][..], 4),
+        ] {
+            let reason =
+                format!("{dtype:?} {shape:?}, the leaf holds E4M3 block scales of shape [2, 2]");
+            let refused = ("weight_scale".to_owned(), reason);
+            assert_eq!(invalid(stored_as(dtype, shape, bytes)), refused);
+        }
+        let absent = read(&[], "weight_scale", block_scales::<Inputs, Outputs, m![1]>);
+        assert_eq!(missing(absent), ["weight_scale"]);
+    }
+
+    /// A compressed-tensors projection reads its packed codes, block scales and tensor scale by
+    /// their names, and leaves its inputs' scale unread.
+    #[test]
+    fn reads_a_compressed_tensors_projection() {
+        use crate::load::Shapes;
+        use crate::tensor::form::BlockScaled;
+        type Leaf<D, S> = <Shapes as Memory>::Tensor<D, Chip, S>;
+        type Projection = BlockScaled<
+            Inputs,
+            Outputs,
+            f4e2m1,
+            f8e4m3,
+            Scales<Inputs, Outputs>,
+            Early<W4A16, Shapes>,
+            Chip,
+            Leaf<f4e2m1, m![Outputs, Inputs]>,
+            Leaf<f8e4m3, Scales<Inputs, Outputs>>,
+        >;
+        let scale = |value: f32| value.to_le_bytes().to_vec();
+        let tensors = [
+            ("proj.weight_packed", Dtype::U8, &[2, 16][..], vec![0; 32]),
+            ("proj.weight_scale", Dtype::F8_E4M3, &[2, 2][..], vec![0; 4]),
+            (
+                "proj.weight_global_scale",
+                Dtype::F32,
+                &[1][..],
+                scale(448.0),
+            ),
+            ("proj.input_global_scale", Dtype::F32, &[1][..], scale(6.0)),
+        ];
+        read(&tensors, "proj", |from, cx| {
+            <Projection as Load<&Checkpoint>>::load(cx, from)
+        })
+        .unwrap();
     }
 }
