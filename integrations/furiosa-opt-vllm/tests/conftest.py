@@ -8,6 +8,7 @@ are free before the next module's tests start.
 from __future__ import annotations
 
 import gc
+import math
 import os
 import socket
 import subprocess
@@ -16,7 +17,16 @@ import urllib.request
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from signal import SIGKILL, SIGTERM
-from typing import TYPE_CHECKING, Final, Literal, NamedTuple, NotRequired, Required, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    ClassVar,
+    Final,
+    Literal,
+    NamedTuple,
+    NotRequired,
+    Required,
+    TypeVar,
+)
 
 import pytest
 from pydantic import ConfigDict, JsonValue, TypeAdapter, ValidationError, with_config
@@ -303,3 +313,82 @@ def platform_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("NUMBA_NUM_THREADS", current or "1")
     if current is None:
         monkeypatch.delenv("NUMBA_NUM_THREADS")
+
+
+class Greedy:
+    """Transformers' greedy decoding of the checkpoints a session's checks read, in FP32.
+
+    A token is greedy when its probability given the tokens before it is at least `TIE` of the top
+    one's, which allows for the engine's BF16 rounding tying the top two; a BF16 reference could
+    not tell such a tie, as its scores past 8 are 1/16 apart, farther than `TIE` allows. The engine
+    computes a token through other calls than Transformers, so a continuation may part from
+    Transformers' at such a tie and is checked on its own prefix, token by token."""
+
+    TIE: ClassVar[float] = 0.95
+
+    def __init__(self) -> None:
+        self.models: dict[str, PreTrainedModel] = {}
+
+    def model(self, name: str) -> PreTrainedModel:
+        """Transformers' FP32 model of checkpoint `name`, loaded once a session."""
+        import torch
+        from transformers import AutoModelForCausalLM
+
+        if name not in self.models:
+            self.models[name] = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32)
+        return self.models[name]
+
+    def scores(self, name: str, tokens: list[int]) -> torch.Tensor:
+        """`name`'s scores after each of `tokens`, one forward of them all."""
+        import torch
+
+        with torch.inference_mode():
+            return self.model(name)(torch.tensor([tokens])).logits[0].float()
+
+    def far(self, scores: torch.Tensor, tokens: list[int]) -> list[tuple[int, int, float]]:
+        """Each of `tokens` that is no greedy token of its row of `scores`, with its position and
+        its probability as a share of the row's top one: not finite, or below `TIE`."""
+        import torch
+
+        chosen = scores.gather(1, torch.tensor(tokens)[:, None])[:, 0]
+        ratios: list[float] = (chosen - scores.max(dim=-1).values).exp().tolist()
+        return [
+            (at, token, ratio)
+            for at, (token, ratio) in enumerate(zip(tokens, ratios, strict=True))
+            if not (math.isfinite(ratio) and ratio >= self.TIE)
+        ]
+
+    def check(self, scores: torch.Tensor, tokens: list[int]) -> None:
+        """Each of `tokens` is a greedy token of its row of `scores`: finite, at least `TIE` of the
+        row's top probability."""
+        import torch
+
+        chosen = scores.gather(1, torch.tensor(tokens)[:, None])[:, 0]
+        least = min((chosen - scores.max(dim=-1).values).exp().tolist(), default=1.0)
+        ties = sum(token != int(row.argmax()) for token, row in zip(tokens, scores, strict=True))
+        print(f"GREEDY {len(tokens)} tokens, {ties} at a tie, least ratio {least:.3f}")
+        far = self.far(scores, tokens)
+        assert not far, far
+
+    def drafts(self, name: str, prefix: list[int], tokens: list[int]) -> None:
+        """Each of `tokens` is a greedy token of `name` after `prefix` and the tokens before it."""
+        start = len(prefix) - 1
+        self.check(self.scores(name, prefix + tokens)[start : start + len(tokens)], tokens)
+
+    def continuation(self, name: str, prompt: list[int], tokens: list[int], length: int) -> None:
+        """`tokens` are greedy decoding of `prompt` by `name`: each a greedy token, ending at the
+        first end-of-sequence token, vLLM's only stop token without a generation config, or after
+        `length` tokens."""
+        from transformers import AutoTokenizer
+
+        self.drafts(name, prompt, tokens)
+        stop = AutoTokenizer.from_pretrained(name).eos_token_id
+        ends = [at for at, token in enumerate(tokens) if token == stop]
+        expected = min(length, ends[0] + 1) if ends else length
+        assert len(tokens) == expected, (len(tokens), ends, length)
+
+
+@pytest.fixture(scope="session")
+def greedy() -> Greedy:
+    """One Transformers model of each target a session's checks read."""
+    return Greedy()

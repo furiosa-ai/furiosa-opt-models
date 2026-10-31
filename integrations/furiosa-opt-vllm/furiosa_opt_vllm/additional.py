@@ -42,7 +42,7 @@ class Section(BaseModel):
 
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
 
-    # Where the draft model loads; by default on the chips the target leaves free.
+    # Where the draft model loads; by default on the target's chips.
     draft_placement: Placement | None = None
 
     @classmethod
