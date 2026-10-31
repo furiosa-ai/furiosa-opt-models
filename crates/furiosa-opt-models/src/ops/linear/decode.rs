@@ -18,6 +18,8 @@ use super::kernel::Tiling;
 pub(crate) trait Matrix<X: M = m![1]> {
     type In: AxisName;
     type Out: AxisName;
+    /// The scalar the weight stores its values in: BF16 values, or the codes its scales restore.
+    type Stored: Scalar;
 
     /// Tile `at` of tiling `T`, in BF16.
     fn tile<T: Tiling<Self::In, Self::Out>>(
@@ -31,6 +33,7 @@ pub(crate) trait Matrix<X: M = m![1]> {
 impl<X: M, T: Matrix<X>> Matrix<X> for &T {
     type In = T::In;
     type Out = T::Out;
+    type Stored = T::Stored;
 
     fn tile<S: Tiling<Self::In, Self::Out>>(
         &self,
@@ -44,6 +47,7 @@ impl<X: M, T: Matrix<X>> Matrix<X> for &T {
 impl<In: AxisName, Out: AxisName, X: M> Matrix<X> for HbmTensor<bf16, X, m![Out, In]> {
     type In = In;
     type Out = Out;
+    type Stored = bf16;
 
     fn tile<T: Tiling<In, Out>>(
         &self,
@@ -63,6 +67,7 @@ where
 {
     type In = In;
     type Out = Out;
+    type Stored = f8e4m3;
 
     /// `bf16(coefficient * scale)` with the FP32 scale of the coefficient's output row.
     fn tile<T: Tiling<In, Out>>(
@@ -134,6 +139,7 @@ where
 {
     type In = In;
     type Out = Out;
+    type Stored = f4e2m1;
 
     /// `bf16(coefficient * block scale / global)`, a slice's rows in one restoration.
     fn tile<T: Tiling<In, Out>>(

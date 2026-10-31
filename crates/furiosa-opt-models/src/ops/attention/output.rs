@@ -392,9 +392,9 @@ where
             },
             |(device, output), row| {
                 projected.view().tile::<m![Rows], 1, m![
-                Hidden / (Hidden / ({ linear::kernel::Passes<QWidth, Hidden> })),
+                Hidden / (Hidden / ({ linear::kernel::Passes<QWidth, Hidden, Matrix::Stored> })),
                 Rows = 1 # Rows,
-                Hidden % ({ linear::kernel::Block<QWidth, Hidden> }) / 4,
+                Hidden % ({ linear::kernel::Block<QWidth, Hidden, Matrix::Stored> }) / 4,
                 Hidden % 4
             ]>(row).to_dm_view(&mut device.tdma,
                 output.view_mut().tile::<

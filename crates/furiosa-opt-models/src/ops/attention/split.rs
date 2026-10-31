@@ -267,6 +267,7 @@ where
 {
     type In = <X::Tensor<D, m![1], S> as linear::Matrix>::In;
     type Out = <X::Tensor<D, m![1], S> as linear::Matrix>::Out;
+    type Stored = <X::Tensor<D, m![1], S> as linear::Matrix>::Stored;
 
     fn tile<T: Tiling<Self::In, Self::Out>>(
         &self,

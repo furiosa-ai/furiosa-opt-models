@@ -31,9 +31,16 @@ const LANES: usize = 8;
 /// byte per 16 inputs, fill whole eight-byte data memory writes for every weight form.
 const SCALED: usize = 16 * 8;
 
-/// Rows of an HBM envelope one staging is written beside a resident weight slab: with the widest
-/// slab of [`tiling`] its staged copy still fits a slice's data memory.
+/// Rows of an HBM envelope one staging is written beside a resident weight slab: beside a slab
+/// [`tiling`] restores, its staged copy fits a slice's data memory if any pass count [`holds`] it.
 pub(crate) const BAND: usize = 64;
+
+/// Data memory a derived tiling's working set takes at most: fifteen pages, since the allocator
+/// leaves part of a page between them unused (measured: 469 KiB of them fit, 484 KiB do not).
+const WORKING: usize = 15 * PAGE;
+
+/// Bytes of an output row's FP32 scale, one in an eight-lane packet.
+const SCALE: usize = 8 * 4;
 
 /// Data memory a slice gives a row tile's weight slab, in bytes.
 const SLAB: usize = 301_056;
@@ -749,9 +756,14 @@ const ROW_TILES: [RowTile; 22] = [
     },
 ];
 
-/// The `(chunk, block, passes, routing)` of `(input, output)`: a listed shape's entry, else the
-/// widest legal replicated tiling of fewest passes, preferring parts of whole E2M1 scale blocks.
-pub(crate) const fn tiling(input: usize, output: usize) -> (usize, usize, usize, Routing) {
+/// The `(chunk, block, passes, routing)` of `(input, output)` of `bits`-bit coefficients: a listed
+/// shape's entry, else the widest legal replicated tiling of fewest passes, preferring parts of
+/// whole E2M1 scale blocks, over the fewest passes that hold a slab restored from codes, if any.
+pub(crate) const fn tiling(
+    input: usize,
+    output: usize,
+    bits: usize,
+) -> (usize, usize, usize, Routing) {
     let mut at = 0;
     while at < MEASURED.len() {
         let entry = &MEASURED[at];
@@ -769,8 +781,14 @@ pub(crate) const fn tiling(input: usize, output: usize) -> (usize, usize, usize,
     loop {
         let mut passes = 1;
         while passes <= output / 8 {
-            if let Some(choice) = widest(input, output, passes, unit) {
-                return choice;
+            if let Some((chunk, block, passes, routing)) = widest(input, output, passes, unit) {
+                // A BF16 slab is staged as stored; one restored from narrower codes must hold.
+                let (block, passes) = if bits < 8 * BF16 {
+                    held(input, output, (chunk, block, passes))
+                } else {
+                    (block, passes)
+                };
+                return (chunk, block, passes, routing);
             }
             passes += 1;
         }
@@ -828,6 +846,47 @@ const fn widest(
 /// rows fits the data memory beside the slab.
 const fn cheap(chunk: usize, block: usize) -> bool {
     2 * LANES * chunk * 2 <= super::TRF && 2 * BAND * chunk + 3 * block * chunk <= 16 * PAGE
+}
+
+/// The `(block, passes)` of the derived `(chunk, block, passes)`, unless a slice [`holds`] it only
+/// over more passes of the same parts: then of the fewest such, so every output keeps its sum.
+const fn held(
+    input: usize,
+    output: usize,
+    (chunk, block, passes): (usize, usize, usize),
+) -> (usize, usize) {
+    if holds(chunk, block, passes) {
+        return (block, passes);
+    }
+    let mut more = passes + 1;
+    while more <= output / 8 {
+        if output.is_multiple_of(2 * more) {
+            let half = output / (2 * more);
+            let mut blocks = super::SLICES / (input / chunk);
+            while blocks > 0
+                && !(half.is_multiple_of(blocks)
+                    && legal(input, output, (chunk, half / blocks, more)))
+            {
+                blocks /= 2;
+            }
+            if blocks > 0 && holds(chunk, half / blocks, more) {
+                return (half / blocks, more);
+            }
+        }
+        more += 1;
+    }
+    // No pass count holds a band beside a restoration, so the budget cannot choose one; fewer
+    // staged rows may still fit the derived tiling.
+    (block, passes)
+}
+
+/// Whether a slice holds `(chunk, block, passes)` while it restores a slab beside a band of staged
+/// rows: its codes as E4M3 (the widest), one restoration's BF16 rows, the slab, scales and sums.
+const fn holds(chunk: usize, block: usize, passes: usize) -> bool {
+    let staged = BAND * chunk * BF16;
+    let slab = block * chunk;
+    let restoring = restored(block) * chunk * BF16 + slab * BF16 + block * SCALE;
+    staged + slab + restoring + BAND * block * passes * BF16 <= WORKING
 }
 
 /// Whether `(chunk, block, passes)` partitions `input` by `output` into the slice layout and fits a

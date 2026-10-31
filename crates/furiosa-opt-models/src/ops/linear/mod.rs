@@ -155,22 +155,22 @@ where
 pub(crate) type Groups<Rows> = m![Rows / ({ Symbol<Lanes<Rows>> })];
 
 /// Projected rows in the resident contraction's native mapping.
-pub(crate) type Projected<In, Out, Rows> = kernel::Result<In, Out, Rows>;
+pub(crate) type Projected<In, Out, Code, Rows> = kernel::Result<In, Out, Code, Rows>;
 
 // Rows stay explicit while the feature partition belongs to the input tensor. A consumer does
 // not require the producer's hidden width or a particular cluster/slice placement.
-impl<'x, In: AxisName, Out: AxisName, Rows: AxisName, Chips: M, S: M, F: M, T>
+impl<'x, In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName, Chips: M, S: M, F: M, T>
     Op<&'x DmTensor<bf16, m![1], Chips, S, m![Rows, { F }]>> for Linear<In, Out, m![1], T>
 where
-    T: Matrix<In = In, Out = Out>,
+    T: Matrix<In = In, Out = Out, Stored = Code>,
 {
-    type Output = Projected<In, Out, Rows>;
+    type Output = Projected<In, Out, Code, Rows>;
 
     fn forward(
         &self,
         device: &mut Device,
         input: &'x DmTensor<bf16, m![1], Chips, S, m![Rows, { F }]>,
-    ) -> Projected<In, Out, Rows> {
+    ) -> Projected<In, Out, Code, Rows> {
         self.affine.forward(
             device,
             (Live::all().with(PhantomData), input.view(), |at| {
@@ -180,15 +180,15 @@ where
     }
 }
 
-impl<'x, In: AxisName, Out: AxisName, Rows: AxisName, Chips: M, S: M, F: M, T>
+impl<'x, In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName, Chips: M, S: M, F: M, T>
     Op<(
         Live<(), Rows>,
         &'x DmTensor<bf16, m![1], Chips, S, m![Rows, { F }]>,
     )> for Linear<In, Out, m![1], T>
 where
-    T: Matrix<In = In, Out = Out>,
+    T: Matrix<In = In, Out = Out, Stored = Code>,
 {
-    type Output = Projected<In, Out, Rows>;
+    type Output = Projected<In, Out, Code, Rows>;
 
     fn forward(
         &self,
@@ -197,7 +197,7 @@ where
             Live<(), Rows>,
             &'x DmTensor<bf16, m![1], Chips, S, m![Rows, { F }]>,
         ),
-    ) -> Projected<In, Out, Rows> {
+    ) -> Projected<In, Out, Code, Rows> {
         self.affine.forward(
             device,
             (live.with(PhantomData), input.view(), |at| {
@@ -417,18 +417,18 @@ impl<'x, 'w, In: AxisName, Out: AxisName, Rows: AxisName, Chips: M>
     }
 }
 
-impl<In: AxisName, Out: AxisName, Rows: AxisName, Chips: M, S: M, F: M, T>
+impl<In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName, Chips: M, S: M, F: M, T>
     Op<DmTensor<bf16, m![1], Chips, S, m![Rows, { F }]>> for Linear<In, Out, m![1], T>
 where
-    T: Matrix<In = In, Out = Out>,
+    T: Matrix<In = In, Out = Out, Stored = Code>,
 {
-    type Output = Projected<In, Out, Rows>;
+    type Output = Projected<In, Out, Code, Rows>;
 
     fn forward(
         &self,
         device: &mut Device,
         input: DmTensor<bf16, m![1], Chips, S, m![Rows, { F }]>,
-    ) -> Projected<In, Out, Rows> {
+    ) -> Projected<In, Out, Code, Rows> {
         self.affine.forward(
             device,
             (Live::all().with(PhantomData), input.view(), |at| {
@@ -490,7 +490,7 @@ pub(crate) mod tests {
     type Hidden = geometry::Hidden<2048>;
     type QkvWidth = geometry::ProjectionWidth<4096>;
     type Chip = m![1];
-    type Rows<In, Out, Count> = HbmTensor<bf16, Chip, Input<In, Out, Count>>;
+    type Rows<In, Out, Count> = HbmTensor<bf16, Chip, Input<In, Out, bf16, Count>>;
     type Projected<Out, Count> = HbmTensor<bf16, Chip, RowMajor<Out, Count>>;
 
     /// `R` rows in HBM project as the FP64 product rounded once to BF16: the `whole` rows, and

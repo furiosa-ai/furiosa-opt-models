@@ -1,5 +1,6 @@
-//! The Gemma 4 catalog's full attention layers on a launch's live rows: the catalog's head views
-//! and learned head norms, then its position op, over the rows attention reads.
+//! The Gemma 4 catalog's full attention layers on a launch's live rows: the catalog's query and
+//! key projections, head views and learned head norms, then its position op, over the rows
+//! attention reads.
 //!
 //! - Live rows start anywhere in the envelope; each turns by its own envelope row's rotation.
 //! - The rotated coordinates of a live row are the products of its normalized heads in FP32
@@ -107,25 +108,20 @@ fn position(
     (normalized, positioned)
 }
 
-/// The live rows `start..start + rows` positioned, the keys projected by the stage from `hidden`;
-/// the queries enter in the form their projection leaves them, whose weight exceeds the SRAM it
-/// stages.
+/// The live rows `start..start + rows` positioned, the queries and keys projected by the stage
+/// from `hidden`.
 #[device(chip = 1)]
 fn from_hidden(
     device: &mut Device,
     stage: (&Qkv, &Position),
-    (hidden, queries): (
-        &HbmTensor<bf16, Chip, m![Rows, Hidden]>,
-        &HbmTensor<bf16, Chip, m![Rows, QueryWidth]>,
-    ),
+    hidden: &HbmTensor<bf16, Chip, m![Rows, Hidden]>,
     (rotation, start, rows): (&Rotation<Rotated, Chip, Rows>, &Value, &Value),
 ) -> Positioned {
     let live =
         Live::<(), Rows>::all().subrange(start.extent::<m![Rows]>(), rows.extent::<m![Rows]>());
     let hidden: Live<Spread<Hidden, Rows, Chip>, Rows> = live.with(hidden.to_dm(&mut device.tdma));
-    let queries: Live<Spread<QueryWidth, Rows>, Rows> = live.with(queries.to_dm(&mut device.tdma));
     let projection = &stage.0.projection;
-    let query = Op::forward(&projection.query.0.1, &mut *device, queries);
+    let query = Module::forward(&projection.query, &mut *device, (), &mut ((), ()), &hidden);
     let key = Module::forward(&projection.key, &mut *device, (), &mut ((), ()), &hidden);
     position(device, stage, (query, key), rotation)
 }
@@ -256,11 +252,6 @@ async fn check(device: &mut Device, stage: (&Qkv, &Position), (start, rows): (us
         .clone()
         .map(|row| project(row, KvWidth::SIZE))
         .collect();
-    let query_rows = rows_of(QueryWidth::SIZE, &|row| queries[row - start].clone());
-    let query_rows: HbmTensor<bf16, Chip, m![Rows, QueryWidth]> =
-        (HostTensor::<bf16, m![Rows, QueryWidth]>::from_vec(query_rows).to_hbm(&mut device.pdma))
-            .await
-            .unwrap();
     let table = |values: Vec<bf16>| HostTensor::<bf16, m![Rows, Rotated]>::from_vec(values);
     let rotation = Rotation {
         low: table(low.clone()).to_hbm(&mut device.pdma).await.unwrap(),
@@ -278,10 +269,9 @@ async fn check(device: &mut Device, stage: (&Qkv, &Position), (start, rows): (us
         (HostTensor::<bf16, m![Rows, Hidden]>::from_vec(hidden).to_hbm(&mut device.pdma))
             .await
             .unwrap();
-    let inputs = (&hidden, &query_rows);
     let counts = (&rotation, &start_value, &rows_value);
     let ((query_in, key_in), (query_out, key_out)) =
-        launch(from_hidden, (&mut *device, stage, inputs, counts))
+        launch(from_hidden, (&mut *device, stage, &hidden, counts))
             .await
             .unwrap();
     let mut values = Vec::new();
