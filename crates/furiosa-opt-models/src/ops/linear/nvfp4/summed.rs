@@ -2,17 +2,16 @@
 //! restoring them: the fetch table lookup decodes each E2M1 code straight to BF16 into the
 //! contraction, which sums every 16-input block; the vector engine multiplies each block sum by its
 //! E4M3 scale, adds a row's blocks, divides by the tensor scale and adds the slices that hold parts
-//! of the row.
+//! of the row. The live rows of a launch through such a weight are a todo.
 
 use super::Vector;
+use crate::Op;
 use crate::ops::linear::block_einsum::scaled_block_sums;
+use crate::ops::normalization::Spread;
 use crate::tensor::form::BlockScaled;
 use crate::tensor::form::nvfp4::{Held, Scale, Scales, Summed, W4A16};
 use crate::tensor::memory::Memory;
-use crate::{
-    Op,
-    tensor::{parallel::Chip, scalar},
-};
+use crate::tensor::{live::Live, parallel::Chip, scalar};
 use core::borrow::Borrow;
 use furiosa_opt_std::prelude::*;
 
@@ -82,6 +81,47 @@ where
     fn forward(&self, device: &mut Device, input: &Vector<I>) -> Self::Output {
         let global: &Scale = self.contract.global.borrow();
         project(device, self.codes(), self.scales(), global, input.view())
+    }
+}
+
+/// The live rows of a launch in HBM through a weight under the summed contract, into HBM.
+impl<I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory>
+    Op<(Live<(), R>, &HbmTensor<bf16, Chip, m![R, I]>)>
+    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y>, Chip, K, V>
+where
+    K: Borrow<HbmTensor<f4e2m1, Chip, m![O, I]>>,
+    V: Borrow<HbmTensor<f8e4m3, Chip, Scales<I, O>>>,
+    Held<Y>: Borrow<Scale>,
+{
+    type Output = HbmTensor<bf16, Chip, m![R, O]>;
+
+    fn forward(
+        &self,
+        _: &mut Device,
+        _: (Live<(), R>, &HbmTensor<bf16, Chip, m![R, I]>),
+    ) -> Self::Output {
+        todo!("NPU summed NVFP4 projection of a launch's live rows, the codes left unrestored")
+    }
+}
+
+/// The live rows of a launch on chip through a weight under the summed contract, into the feature
+/// slices the next projection reads.
+impl<'x, I: AxisName, O: AxisName, R: AxisName, C: M, S: M, F: M, K, V, Y: Memory>
+    Op<&'x Live<DmTensor<bf16, Chip, C, S, m![R, { F }]>, R>>
+    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y>, Chip, K, V>
+where
+    K: Borrow<HbmTensor<f4e2m1, Chip, m![O, I]>>,
+    V: Borrow<HbmTensor<f8e4m3, Chip, Scales<I, O>>>,
+    Held<Y>: Borrow<Scale>,
+{
+    type Output = Live<Spread<O, R>, R>;
+
+    fn forward(
+        &self,
+        _: &mut Device,
+        _: &'x Live<DmTensor<bf16, Chip, C, S, m![R, { F }]>, R>,
+    ) -> Self::Output {
+        todo!("NPU summed NVFP4 projection of a launch's live rows, the codes left unrestored")
     }
 }
 
