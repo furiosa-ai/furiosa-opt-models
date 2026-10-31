@@ -223,6 +223,7 @@ impl LoadOptions {
         if self.layers.is_some() {
             return Err(unsupported("layers", "every implementation loads whole"));
         }
+        implementation.serves(self.tiling)?;
         if self.adapters && implementation.adapters() == 0 {
             return Err(LoadError::Unsupported {
                 name: "adapters".into(),

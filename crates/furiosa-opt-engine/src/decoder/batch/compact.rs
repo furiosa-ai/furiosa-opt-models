@@ -1,5 +1,9 @@
 //! A call's compact history: each request's call rows, cached positions and block table, in the
 //! I32 words its device preparation reads.
+//!
+//! - The device reads block `j` of a request, counted from its first, at entry `table + j`, and
+//!   only the blocks its rows' windows hold: a segment stores those, and its table start lies as
+//!   many entries before them as it skips blocks.
 
 use furiosa_opt_models::ops::index::table::BlockIndex;
 use furiosa_opt_models::ops::index::table::FIELDS;
@@ -8,11 +12,12 @@ use furiosa_opt_std::prelude::AxisName;
 use std::{io, ops::Range};
 
 /// One request in a call: its call rows, the positions cached before them and the blocks they
-/// use.
+/// use, the first `skipped` of which no row reads.
 pub(super) struct Segment<'a> {
     pub(super) rows: Range<usize>,
     pub(super) cached: usize,
     pub(super) blocks: &'a [u32],
+    pub(super) skipped: usize,
 }
 
 /// How far into a call's block table its device preparation reads.
@@ -26,9 +31,10 @@ pub enum Table {
 
 #[derive(Debug)]
 pub(super) struct Descriptor {
-    /// Each segment's first call row, rows, cached positions, table start and table length.
+    /// Each segment's first call row, rows, cached positions, and the start and length of its
+    /// table, both counted from its request's first block.
     segments: Vec<[i32; FIELDS]>,
-    /// Each segment's block IDs from a whole table row, the last one repeated to its end.
+    /// Each segment's stored block IDs from a whole table row, the last one repeated to its end.
     blocks: Vec<i32>,
     /// The call rows the call returns, ascending.
     selected: Vec<i32>,
@@ -36,7 +42,8 @@ pub(super) struct Descriptor {
 
 impl Descriptor {
     /// The segments in call order, and the rows the call returns; refuses segments that do not
-    /// cover the call's rows from row 0 one after another, or values past I32.
+    /// cover the call's rows from row 0 one after another with blocks to read, or values past
+    /// I32.
     pub(super) fn encode(segments: &[Segment<'_>], selected: &[usize]) -> io::Result<Self> {
         let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
         let int = |value| i32::try_from(value).map_err(|_| invalid("descriptor exceeds I32"));
@@ -51,7 +58,8 @@ impl Descriptor {
         };
         let mut end = 0;
         for segment in segments {
-            if segment.rows.start != end || segment.rows.end <= end || segment.blocks.is_empty() {
+            let read = segment.blocks.get(segment.skipped..).unwrap_or_default();
+            if segment.rows.start != end || segment.rows.end <= end || read.is_empty() {
                 return Err(invalid(
                     "segments are not a contiguous nonempty prefix with tables",
                 ));
@@ -60,7 +68,7 @@ impl Descriptor {
             int(segment.rows.end)?;
             int((segment.cached.checked_add(len)).ok_or_else(|| invalid("history overflows"))?)?;
             let start = descriptor.blocks.len();
-            let storage = (segment.blocks.len())
+            let storage = (read.len())
                 .checked_next_multiple_of(BlockIndex::SIZE)
                 .ok_or_else(|| invalid("table padding overflows"))?;
             int((start.checked_add(storage)).ok_or_else(|| invalid("table overflows"))?)?;
@@ -68,10 +76,10 @@ impl Descriptor {
                 int(end)?,
                 int(len)?,
                 int(segment.cached)?,
-                int(start)?,
+                int(start)? - int(segment.skipped)?,
                 int(segment.blocks.len())?,
             ]);
-            let blocks = (segment.blocks.iter().copied())
+            let blocks = (read.iter().copied())
                 .map(|id| i32::try_from(id).map_err(|_| invalid("block ID exceeds I32")));
             descriptor
                 .blocks

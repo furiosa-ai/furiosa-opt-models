@@ -5,7 +5,8 @@
 //!   the device, and the framework keeps each one in the vocabulary.
 //! - The call's rows are the appended rows of its one-row requests, then of the others, each in
 //!   request order; its compact history names each request's rows, its cached positions and the
-//!   blocks they use. A call returns its kept rows in request order.
+//!   blocks they read, from the table row holding its first row's window on. A call returns its
+//!   kept rows in request order.
 
 mod compact;
 mod operands;
@@ -15,7 +16,7 @@ pub use compact::Table;
 pub use staging::Staged;
 
 use super::{Binding, Cache, Group, Keep, Kind, Limits, Request};
-use furiosa_opt_models::ops::index::table::FIELDS;
+use furiosa_opt_models::ops::index::table::{BlockIndex, FIELDS};
 use furiosa_opt_std::prelude::*;
 use std::{collections::HashSet, io, marker::PhantomData, ops::Range};
 
@@ -215,9 +216,17 @@ impl<'a, A> Batch<'a, A> {
             slots[span.clone()].fill(request.adapter);
         }
         let groups = blocks.iter().enumerate().map(|(group, &block)| {
+            let window = limits.cache.groups[group].window;
+            // A row reads its blocks from the table row holding its window's first position on,
+            // so a request skips the whole table rows before its first row's.
+            let skipped = |cached: usize| {
+                let first = window.map_or(0, |window| (cached + 1).saturating_sub(window));
+                first / (block * BlockIndex::SIZE) * BlockIndex::SIZE
+            };
             let mut segments: Vec<compact::Segment<'_>> = (requests.iter().zip(&spans))
                 .map(|(request, rows)| compact::Segment {
                     blocks: &request.rows[group][..(request.cached + rows.len()).div_ceil(block)],
+                    skipped: skipped(request.cached),
                     cached: request.cached,
                     rows: rows.clone(),
                 })

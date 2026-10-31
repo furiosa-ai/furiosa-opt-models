@@ -19,6 +19,7 @@
 //! - Scheduling, cache block assignment and sampling stay in the framework.
 
 #![feature(register_tool)]
+#![feature(adt_const_params, unsized_const_params)]
 #![register_tool(furiosa_opt)]
 
 mod function;

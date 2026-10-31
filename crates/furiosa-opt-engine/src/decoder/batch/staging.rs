@@ -6,7 +6,7 @@ use furiosa_opt_models::modules::attention::key_value::History;
 use furiosa_opt_models::ops::index::{copy, table::FIELDS};
 use furiosa_opt_models::tensor::{memory::alias, scalar::Value};
 use furiosa_opt_std::prelude::*;
-use std::{borrow::Cow, io, ops::Range};
+use std::{borrow::Cow, io, iter, ops::Range};
 
 /// A call's staged operands for at most `R` rows, a copy on each chip of `Chips`: its history of
 /// block tables of `B` words, its live row count and its token rows.
@@ -33,6 +33,17 @@ impl<A> Batch<'_, A> {
             (selected, R::SIZE),
             (extents, 3),
         ])
+    }
+
+    /// The byte offset of each of the `R` rows a launch returns among its hidden rows of `bytes`
+    /// each, as values and capacity in words: a launch reads every one of them, so the kept rows'
+    /// lead, in order, and the first row's fill the rest, whose outputs the call drops.
+    pub fn returned<R: AxisName>(&self, bytes: usize) -> io::Result<(Vec<i32>, usize)> {
+        let mut offsets = (self.kept.iter())
+            .map(|&row| i32::try_from(row * bytes).map_err(io::Error::other))
+            .collect::<io::Result<Vec<_>>>()?;
+        offsets.extend(iter::repeat_n(0, R::SIZE.saturating_sub(offsets.len())));
+        Ok((offsets, R::SIZE))
     }
 
     /// Stages the call for at most `R` rows, a copy on every chip of `Chips`, and the arrays a

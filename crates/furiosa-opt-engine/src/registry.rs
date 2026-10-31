@@ -794,13 +794,15 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
 ];
 
 /// A type that implements an architecture at one size: its size, its class, the scope it reads a
-/// checkpoint at, the adapters its calls run, and its strict load into HBM.
+/// checkpoint at, the adapters its calls run, whether they attend under `Tiling::Fixed`, and its
+/// strict load into HBM.
 #[derive(Debug)]
 pub struct Implementation {
     size: &'static str,
     class: Class,
     scope: fn(&Checkpoint) -> Result<&'static str, LoadError>,
     adapters: usize,
+    fixed: bool,
     load: fn(&mut Context<'_>, &Checkpoint, Tiling) -> Result<Model, LoadError>,
 }
 
@@ -827,6 +829,10 @@ pub trait Listed: Implements + for<'a> Load<&'a Checkpoint> + Sized + 'static {
     /// Adapters a call of the model runs at most: none for a model whose projections take none.
     const ADAPTERS: usize = 0;
 
+    /// Whether the model's calls also attend under `Tiling::Fixed`: a model whose calls attend no
+    /// rows serves any tiling.
+    const FIXED: bool = true;
+
     /// Refuses a load of `part`, which the type does not read.
     fn reads(part: Part) -> Result<(), LoadError>;
 
@@ -837,6 +843,7 @@ pub trait Listed: Implements + for<'a> Load<&'a Checkpoint> + Sized + 'static {
 /// A decoder reads a whole model and serves requests as an instance of the load's tiling.
 impl<D: Implements + for<'a> Load<&'a Checkpoint> + Decoder + 'static> Listed for D {
     const ADAPTERS: usize = <D as Decoder>::ADAPTERS;
+    const FIXED: bool = <D as Decoder>::FIXED;
 
     fn reads(part: Part) -> Result<(), LoadError> {
         match part {
@@ -864,6 +871,7 @@ impl Implementation {
                 T::scope(source)
             },
             adapters: T::ADAPTERS,
+            fixed: T::FIXED,
             load: |context, source, tiling| Ok(T::load(context, source)?.served(tiling)),
         }
     }
@@ -920,15 +928,31 @@ impl Implementation {
     }
 
     /// A model of this implementation's type, loaded strictly from `source` at its scope, serving
-    /// its calls with the attention tiled as `tiling` says.
+    /// its calls with the attention tiled as `tiling` says; a tiling its calls do not attend under
+    /// is refused before any weight is read.
     pub fn load(
         &self,
         context: &mut Context<'_>,
         source: &Checkpoint,
         tiling: Tiling,
     ) -> Result<Model, LoadError> {
+        self.serves(tiling)?;
         let scope = (self.scope)(source)?;
         context.field("", scope, |cx| (self.load)(cx, source, tiling))
+    }
+
+    /// Refuses `tiling` unless the implementation's calls attend under it.
+    pub fn serves(&self, tiling: Tiling) -> Result<(), LoadError> {
+        match (tiling, self.fixed) {
+            (Tiling::Fixed, false) => Err(LoadError::Unsupported {
+                name: "batch_invariant".into(),
+                reason: format!(
+                    "the {} {} implementation's calls attend under the adaptive tiling only",
+                    self.class.family, self.size
+                ),
+            }),
+            _ => Ok(()),
+        }
     }
 
     /// The size, as the hub spells it.

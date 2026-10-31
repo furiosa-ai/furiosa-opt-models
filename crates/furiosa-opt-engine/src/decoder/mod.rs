@@ -1,9 +1,9 @@
 //! Serve a decoder: each request appends tokens to one sequence in the cache, and a call of several
 //! requests returns the rows they keep once the device accepted its launches.
 //!
-//! - Row `i` of a request is position `p = cached + i`; it writes slot `rows[0][p / B] * B + p % B`
-//!   of the paged cache group and attends to `p + 1` positions, where `B` is the group's block of
-//!   tokens.
+//! - Row `i` of a request is position `p = cached + i`; it writes slot `rows[g][p / B] * B + p % B`
+//!   of each paged cache group `g` and attends to `p + 1` positions, or the last of them a sliding
+//!   window holds, where `B` is the group's block of tokens.
 //! - `Batch::new` validates a call's requests and plans its operands, and nothing else validates
 //!   them; a request the decoder cannot serve is refused there as unsupported.
 //! - A call borrows the views its decoder keeps of the `Cache`; it reads no token ID on the host.
@@ -16,11 +16,14 @@
 //! - A `Root` of the decoder family's catalog is a decoder of one launch a call, which writes the
 //!   selected rows' outputs in kept order. Its base model's constants that prepare each launch's
 //!   attention context bind the call (`Groups`): a size's rotary table reads the rows' positions,
-//!   cache slots, attention work and selected rows the host plans in one cache group.
+//!   cache slots, attention work and selected rows the host plans in one cache group; one paging a
+//!   group prepares each group's rows on the device from the history the host stages
+//!   (`interleave`).
 
 mod adapters;
 mod batch;
 mod cache;
+mod interleave;
 
 pub use adapters::{Adapter, Binding, Loader, SLOTS};
 pub use batch::{Batch, Rows, Staged, Table};
@@ -165,6 +168,8 @@ pub trait Decoder: Send + Sync {
     /// Adapters a call runs at most, which its limits hold: none for a decoder whose projections
     /// take no adapter terms.
     const ADAPTERS: usize = 0;
+    /// Whether its calls' rows also attend under `Tiling::Fixed`, beside the adaptive tiling.
+    const FIXED: bool = true;
     /// What a call returns: the kept rows' token IDs, hidden values or scores.
     type Output: TryInto<HbmTensor, Error = io::Error>;
     /// The views a call borrows of a cache's layers.
@@ -206,8 +211,14 @@ pub struct Instance<D> {
     tiling: Tiling,
 }
 
-impl<D> Instance<D> {
+impl<D: Decoder> Instance<D> {
+    /// `decoder` serving calls tiled as `tiling` says, one of the tilings its calls attend under,
+    /// which a load checks before it makes one.
     pub fn new(decoder: D, tiling: Tiling) -> Self {
+        assert!(
+            D::FIXED || tiling != Tiling::Fixed,
+            "the decoder's calls attend under the adaptive tiling only"
+        );
         Self { decoder, tiling }
     }
 
@@ -396,11 +407,13 @@ impl Root for fp8::ForCausalLM {
 type Size8B = furiosa_opt_models::models::decoder::attention::qwen3::Size<"8B">;
 
 /// How a root's constants that prepare each launch's attention context bind a call of the root
-/// `R`: the cache groups its body's layers page, the views a call borrows of them, the adapters its
-/// calls run, and the one launch of the root over what a call stages.
+/// `R`: the cache groups its body's layers page, the views a call borrows of them, the adapters and
+/// tilings its calls run under, and the one launch of the root over what a call stages.
 pub trait Groups<R: Root> {
     /// Adapters a call runs at most.
     const ADAPTERS: usize;
+    /// Whether a call's rows also attend under `Tiling::Fixed`.
+    const FIXED: bool;
     /// An adapter a call may run its requests with, or `Infallible` for a root that runs none.
     type Adapter: Send + Sync + 'static;
     /// The views a call borrows of a cache's layers, each group's.
@@ -568,6 +581,7 @@ where
 {
     const OUTPUT: Output = <R::Place as Place>::OUTPUT;
     const ADAPTERS: usize = <R::Groups as Groups<R>>::ADAPTERS;
+    const FIXED: bool = <R::Groups as Groups<R>>::FIXED;
     type Output = Rows<<R::Place as Place>::Scalar, R::Row>;
     type Layers = <R::Groups as Groups<R>>::Layers;
     type Adapter = <R::Groups as Groups<R>>::Adapter;
@@ -629,6 +643,7 @@ where
         >,
 {
     const ADAPTERS: usize = <R::Adapting as Adapting<S>>::ADAPTERS;
+    const FIXED: bool = true;
     type Adapter = <R::Adapting as Adapting<S>>::Adapter;
     type Layers = Vec<Blocks<KvHeads, Head>>;
 
