@@ -178,7 +178,8 @@ where
 }
 
 // Repeated periods stay rolled; each period is unrolled for its layer types. Device code reads
-// the order through constant positions; a slice constant does not lower.
+// the order through constant positions and each layer's slot at its index, as neither a slice
+// constant nor the `Option` a slot iterator returns lowers.
 impl<
     's,
     X,
@@ -193,8 +194,8 @@ impl<
     const ORDER: &'static [Branch],
 > Module<X, (PEnv, QEnv), &'s mut ([PState; FIRST], [QState; SECOND])> for Interleave<(P, Q), ORDER>
 where
-    P: Collection<X, PEnv, &'s mut PState, Output = X>,
-    Q: Collection<X, QEnv, &'s mut QState, Output = X>,
+    P: for<'t> Collection<X, PEnv, &'t mut PState, Output = X>,
+    Q: for<'t> Collection<X, QEnv, &'t mut QState, Output = X>,
 {
     type Output = X;
 
@@ -220,15 +221,14 @@ where
                 order.counts,
             )
         };
-        let (mut first, mut second) = (first.iter_mut(), second.iter_mut());
         for group in 0..groups {
             let (mut a, mut b) = (0, 0);
             #[unroll]
             for offset in 0..period {
                 match a < counts[0] && positions[a] == offset {
                     true => {
-                        let slot = first.next().expect("one slot for each first layer");
                         let index = group * counts[0] + a;
+                        let slot = &mut first[index];
                         hidden = self
                             .layers
                             .0
@@ -236,8 +236,8 @@ where
                         a += 1;
                     }
                     false => {
-                        let slot = second.next().expect("one slot for each second layer");
                         let index = group * counts[1] + b;
+                        let slot = &mut second[index];
                         hidden = self
                             .layers
                             .1
@@ -270,9 +270,9 @@ impl<
 > Module<X, (PEnv, QEnv, REnv), &'s mut ([PState; FIRST], [QState; SECOND], [RState; THIRD])>
     for Interleave<(P, Q, R), ORDER>
 where
-    P: Collection<X, PEnv, &'s mut PState, Output = X>,
-    Q: Collection<X, QEnv, &'s mut QState, Output = X>,
-    R: Collection<X, REnv, &'s mut RState, Output = X>,
+    P: for<'t> Collection<X, PEnv, &'t mut PState, Output = X>,
+    Q: for<'t> Collection<X, QEnv, &'t mut QState, Output = X>,
+    R: for<'t> Collection<X, REnv, &'t mut RState, Output = X>,
 {
     type Output = X;
 
@@ -298,30 +298,29 @@ where
                 order.counts,
             )
         };
-        let mut slots = (first.iter_mut(), second.iter_mut(), third.iter_mut());
         for group in 0..groups {
             let (mut a, mut b, mut c) = (0, 0, 0);
             #[unroll]
             for offset in 0..period {
                 if a < counts[0] && positions.0[a] == offset {
-                    let slot = slots.0.next().expect("one slot for each first layer");
                     let index = group * counts[0] + a;
+                    let slot = &mut first[index];
                     hidden = self
                         .layers
                         .0
                         .apply(&mut *device, env.0, slot, hidden, index);
                     a += 1;
                 } else if b < counts[1] && positions.1[b] == offset {
-                    let slot = slots.1.next().expect("one slot for each second layer");
                     let index = group * counts[1] + b;
+                    let slot = &mut second[index];
                     hidden = self
                         .layers
                         .1
                         .apply(&mut *device, env.1, slot, hidden, index);
                     b += 1;
                 } else {
-                    let slot = slots.2.next().expect("one slot for each third layer");
                     let index = group * counts[2] + c;
+                    let slot = &mut third[index];
                     hidden = self
                         .layers
                         .2
