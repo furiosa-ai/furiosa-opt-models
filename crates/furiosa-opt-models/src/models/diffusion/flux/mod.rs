@@ -420,7 +420,7 @@ where
     type Error = io::Error;
 
     fn try_from(config: Config) -> io::Result<Self> {
-        let invalid = |reason: String| io::Error::new(io::ErrorKind::InvalidData, reason);
+        let unsupported = |reason: String| io::Error::new(io::ErrorKind::Unsupported, reason);
         let fixed = [
             ("patch_size", config.patch_size, 1),
             ("in_channels", config.in_channels, Latent::SIZE),
@@ -452,19 +452,19 @@ where
             .into_iter()
             .find(|(_, declared, held)| declared != held)
         {
-            return Err(invalid(format!(
+            return Err(unsupported(format!(
                 "{key}: {declared}, the size {N} holds {held}"
             )));
         }
         let axes = config.axes_dims_rope.unwrap_or_else(|| AXES.into());
         if axes != AXES {
-            return Err(invalid(format!(
+            return Err(unsupported(format!(
                 "axes_dims_rope: {axes:?}, the size {N} rotates {AXES:?}"
             )));
         }
         let guidance = <<Self as Geometry>::Guidance as Guidance>::PRESENT;
         if config.guidance_embeds != guidance {
-            return Err(invalid(format!(
+            return Err(unsupported(format!(
                 "guidance_embeds: {}, the size {N} embeds guidance: {guidance}",
                 config.guidance_embeds
             )));

@@ -195,7 +195,6 @@ where
     type Error = io::Error;
 
     fn try_from(config: Config) -> io::Result<Self> {
-        let invalid = |reason: String| io::Error::new(io::ErrorKind::InvalidData, reason);
         let unsupported = |reason: &str| io::Error::new(io::ErrorKind::Unsupported, reason);
         let heads = <Self as Geometry>::KvHeads::SIZE;
         let head = <Self as Geometry>::Head::SIZE;
@@ -229,19 +228,19 @@ where
             .into_iter()
             .find(|(_, declared, held)| declared != held)
         {
-            return Err(invalid(format!(
+            return Err(unsupported(&format!(
                 "{key}: {declared}, the size {N} holds {held}"
             )));
         }
         vocabulary::<<Self as Geometry>::Vocabulary>(config.vocab_size)?;
         let epsilon = config.rms_norm_eps.unwrap_or(1e-5);
         if (epsilon as f32).to_bits() as usize != Self::EPSILON {
-            return Err(invalid(format!(
+            return Err(unsupported(&format!(
                 "rms_norm_eps: {epsilon}, another than the size's"
             )));
         }
         if config.tie_word_embeddings != Self::TIED_EMBEDDINGS {
-            return Err(invalid(format!(
+            return Err(unsupported(&format!(
                 "tie_word_embeddings: {}, the size ties: {}",
                 config.tie_word_embeddings,
                 Self::TIED_EMBEDDINGS

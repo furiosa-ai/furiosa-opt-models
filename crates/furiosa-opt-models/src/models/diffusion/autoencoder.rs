@@ -264,7 +264,6 @@ where
     type Error = io::Error;
 
     fn try_from(config: Config) -> io::Result<Self> {
-        let invalid = |reason: String| io::Error::new(io::ErrorKind::InvalidData, reason);
         let unsupported = |reason: &str| io::Error::new(io::ErrorKind::Unsupported, reason);
         let fixed = [
             (
@@ -282,12 +281,12 @@ where
             .into_iter()
             .find(|(_, declared, held)| declared != held)
         {
-            return Err(invalid(format!(
+            return Err(unsupported(&format!(
                 "{key}: {declared}, the size {N} holds {held}"
             )));
         }
         if config.block_out_channels != LEVELS {
-            return Err(invalid(format!(
+            return Err(unsupported(&format!(
                 "block_out_channels: {:?}, the size {N} holds {LEVELS:?}",
                 config.block_out_channels
             )));
@@ -300,7 +299,7 @@ where
             .into_iter()
             .find(|(_, declared, _)| *declared == Some(false))
         {
-            return Err(invalid(format!(
+            return Err(unsupported(&format!(
                 "{key}: false, the size {N} holds the {projection} projection"
             )));
         }

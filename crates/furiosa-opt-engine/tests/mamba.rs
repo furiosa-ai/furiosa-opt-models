@@ -123,7 +123,7 @@ fn sizes_read_their_published_configs() {
         for (j, (_, config)) in sizes.iter().enumerate() {
             match (i == j, parse(config)) {
                 (true, Ok(())) => {}
-                (false, Err(error)) if error.kind() == io::ErrorKind::InvalidData => {
+                (false, Err(error)) if error.kind() == io::ErrorKind::Unsupported => {
                     refuses_by_difference(&error, config, own);
                 }
                 (own, result) => panic!("size {i}, config {j} (own: {own}): {result:?}"),
@@ -159,31 +159,31 @@ fn size_refuses_what_it_does_not_serve() {
         (
             "num_hidden_layers",
             json!(48),
-            InvalidData,
+            Unsupported,
             "num_hidden_layers: 48, the size 130m holds 24",
         ),
         (
             "expand",
             json!(4),
-            InvalidData,
+            Unsupported,
             "expand: 4, the size 130m holds 2",
         ),
         (
             "state_size",
             json!(64),
-            InvalidData,
+            Unsupported,
             "state_size: 64, the size 130m holds 16",
         ),
         (
             "conv_kernel",
             json!(3),
-            InvalidData,
+            Unsupported,
             "conv_kernel: 3, the size 130m holds 4",
         ),
         (
             "time_step_rank",
             json!(64),
-            InvalidData,
+            Unsupported,
             "time_step_rank: 64, the size 130m holds 48",
         ),
         (
@@ -195,7 +195,7 @@ fn size_refuses_what_it_does_not_serve() {
         (
             "hidden_size",
             json!(1024),
-            InvalidData,
+            Unsupported,
             "hidden_size: 1024, the size 130m holds 768",
         ),
         (
@@ -213,13 +213,13 @@ fn size_refuses_what_it_does_not_serve() {
         (
             "layer_norm_epsilon",
             json!(1e-6),
-            InvalidData,
+            Unsupported,
             "layer_norm_epsilon: 0.000001, another than the size's",
         ),
         (
             "tie_word_embeddings",
             json!(false),
-            InvalidData,
+            Unsupported,
             "tie_word_embeddings: false, the size ties: true",
         ),
         (

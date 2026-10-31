@@ -133,7 +133,7 @@ fn each_size_reads_its_published_config_alone() {
         for (size, (published, parse)) in SIZES.iter().enumerate() {
             match (size == served, parse(document)) {
                 (true, Ok(())) => {}
-                (false, Err(error)) if error.kind() == io::ErrorKind::InvalidData => {
+                (false, Err(error)) if error.kind() == io::ErrorKind::Unsupported => {
                     refuses_by_difference(&error, document, &configs[size]);
                 }
                 (_, parsed) => panic!("{published:?}'s size on config {served}: {parsed:?}"),
@@ -165,43 +165,43 @@ fn refuses_what_the_size_does_not_hold() {
         (
             "model_type",
             json!("mt5"),
-            InvalidData,
+            Unsupported,
             "model_type: mt5, the size small is t5",
         ),
         (
             "d_model",
             json!(768),
-            InvalidData,
+            Unsupported,
             "d_model: 768, the size small holds 512",
         ),
         (
             "d_ff",
             json!(1024),
-            InvalidData,
+            Unsupported,
             "d_ff: 1024, the size small holds 2048",
         ),
         (
             "d_kv",
             json!(128),
-            InvalidData,
+            Unsupported,
             "d_kv: 128, the size small holds 64",
         ),
         (
             "num_heads",
             json!(6),
-            InvalidData,
+            Unsupported,
             "num_heads: 6, the size small holds 8",
         ),
         (
             "num_layers",
             json!(8),
-            InvalidData,
+            Unsupported,
             "num_layers: 8, the size small holds 6",
         ),
         (
             "num_decoder_layers",
             json!(8),
-            InvalidData,
+            Unsupported,
             "num_decoder_layers: 8, the size small holds 6",
         ),
         (
@@ -219,25 +219,25 @@ fn refuses_what_the_size_does_not_hold() {
         (
             "relative_attention_num_buckets",
             json!(64),
-            InvalidData,
+            Unsupported,
             "relative_attention_num_buckets: 64, the size small holds 32",
         ),
         (
             "relative_attention_max_distance",
             json!(256),
-            InvalidData,
+            Unsupported,
             "relative_attention_max_distance: 256, the size small holds 128",
         ),
         (
             "layer_norm_epsilon",
             json!(1e-5),
-            InvalidData,
+            Unsupported,
             "layer_norm_epsilon: 0.00001, the size small holds 1e-6",
         ),
         (
             "feed_forward_proj",
             json!("gated-gelu"),
-            InvalidData,
+            Unsupported,
             "feed_forward_proj: gated-gelu, the size small holds relu",
         ),
         (
@@ -249,13 +249,13 @@ fn refuses_what_the_size_does_not_hold() {
         (
             "tie_word_embeddings",
             json!(false),
-            InvalidData,
+            Unsupported,
             "tie_word_embeddings: false, the size small ties: true",
         ),
         (
             "scale_decoder_outputs",
             json!(false),
-            InvalidData,
+            Unsupported,
             "scale_decoder_outputs: false, the size small ties: true",
         ),
     ];
@@ -276,7 +276,7 @@ fn refuses_what_the_size_does_not_hold() {
         .map(drop)
         .unwrap_err();
     let refused = "tie_word_embeddings: true, the size v1_1-small ties: false".to_owned();
-    assert_eq!((error.kind(), error.to_string()), (InvalidData, refused));
+    assert_eq!((error.kind(), error.to_string()), (Unsupported, refused));
 }
 
 /// An absent key holds the default of the config class `model_type` names: an mT5-base config
@@ -287,6 +287,6 @@ fn absent_key_holds_its_config_class_default() {
     let mut document = MT5_BASE.config();
     document.as_object_mut().unwrap().remove("d_ff");
     let error = mt5::Size::<"base">::parse(&document).map(drop).unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported, "{error}");
     assert_eq!(error.to_string(), "d_ff: 1024, the size base holds 2048");
 }

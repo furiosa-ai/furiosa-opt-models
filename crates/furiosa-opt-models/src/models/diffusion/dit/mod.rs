@@ -297,7 +297,6 @@ impl TryFrom<Config> for Size<"XL-2-256"> {
     type Error = io::Error;
 
     fn try_from(config: Config) -> io::Result<Self> {
-        let invalid = |reason: String| io::Error::new(io::ErrorKind::InvalidData, reason);
         let unsupported = |reason: &str| io::Error::new(io::ErrorKind::Unsupported, reason);
         let fixed = [
             (
@@ -329,20 +328,20 @@ impl TryFrom<Config> for Size<"XL-2-256"> {
             .into_iter()
             .find(|(_, declared, held)| declared != held)
         {
-            return Err(invalid(format!(
+            return Err(unsupported(&format!(
                 "{key}: {declared}, the size XL-2-256 holds {held}"
             )));
         }
         // Diffusers scales the positions of a sample of 64 rows or fewer by one.
         let scale = config.interpolation_scale.unwrap_or(1.0);
         if scale != 1.0 {
-            return Err(invalid(format!(
+            return Err(unsupported(&format!(
                 "interpolation_scale: {scale}, the size XL-2-256 holds 1"
             )));
         }
         let epsilon = config.norm_eps.unwrap_or(1e-5);
         if (epsilon as f32).to_bits() as usize != EPSILON {
-            return Err(invalid(format!(
+            return Err(unsupported(&format!(
                 "norm_eps: {epsilon}, another than the size's"
             )));
         }

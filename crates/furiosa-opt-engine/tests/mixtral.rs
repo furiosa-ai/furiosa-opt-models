@@ -55,49 +55,49 @@ fn size_refuses_what_it_does_not_serve() {
         (
             "hidden_size",
             json!(6144),
-            InvalidData,
+            Unsupported,
             "hidden_size: 6144, the size 8x7B holds 4096",
         ),
         (
             "intermediate_size",
             json!(16384),
-            InvalidData,
+            Unsupported,
             "intermediate_size: 16384, the size 8x7B holds 14336",
         ),
         (
             "num_hidden_layers",
             json!(56),
-            InvalidData,
+            Unsupported,
             "num_hidden_layers: 56, the size 8x7B holds 32",
         ),
         (
             "num_key_value_heads",
             json!(4),
-            InvalidData,
+            Unsupported,
             "num_key_value_heads: 4, the size 8x7B holds 8",
         ),
         (
             "num_attention_heads",
             json!(48),
-            InvalidData,
+            Unsupported,
             "num_attention_heads: 48, the size 8x7B holds 32",
         ),
         (
             "head_dim",
             json!(64),
-            InvalidData,
+            Unsupported,
             "head_dim: 64, the size 8x7B holds 128",
         ),
         (
             "num_local_experts",
             json!(16),
-            InvalidData,
+            Unsupported,
             "num_local_experts: 16, the size 8x7B holds 8",
         ),
         (
             "num_experts_per_tok",
             json!(1),
-            InvalidData,
+            Unsupported,
             "num_experts_per_tok: 1, the size 8x7B holds 2",
         ),
         (
@@ -115,13 +115,13 @@ fn size_refuses_what_it_does_not_serve() {
         (
             "rms_norm_eps",
             json!(1e-6),
-            InvalidData,
+            Unsupported,
             "rms_norm_eps: 0.000001, another than the size's",
         ),
         (
             "tie_word_embeddings",
             json!(true),
-            InvalidData,
+            Unsupported,
             "tie_word_embeddings: true, the size ties: false",
         ),
         (

@@ -246,11 +246,11 @@ pub const DEFAULTS: Defaults = Defaults {
 
 impl Hf {
     /// Refuses a config, absent keys read as `defaults`, whose values the size `G` does not hold
-    /// (invalid) or whose feed-forward form [`FORMS`] lacks (unsupported).
+    /// or whose feed-forward form [`FORMS`] lacks.
     pub fn check<G: Geometry>(&self, defaults: &Defaults) -> io::Result<()> {
-        let invalid = |reason: String| io::Error::new(io::ErrorKind::InvalidData, reason);
+        let unsupported = |reason: String| io::Error::new(io::ErrorKind::Unsupported, reason);
         if self.model_type != G::MODEL_TYPE {
-            return Err(invalid(format!(
+            return Err(unsupported(format!(
                 "model_type: {}, the size {} is {}",
                 self.model_type,
                 G::SIZE,
@@ -299,7 +299,7 @@ impl Hf {
             .into_iter()
             .find(|(_, declared, held)| declared != held)
         {
-            return Err(invalid(format!(
+            return Err(unsupported(format!(
                 "{key}: {declared}, the size {} holds {held}",
                 G::SIZE
             )));
@@ -308,7 +308,7 @@ impl Hf {
             .layer_norm_epsilon
             .unwrap_or(defaults.layer_norm_epsilon);
         if (epsilon as f32).to_bits() as usize != EPSILON {
-            return Err(invalid(format!(
+            return Err(unsupported(format!(
                 "layer_norm_epsilon: {epsilon}, the size {} holds 1e-6",
                 G::SIZE
             )));
@@ -319,18 +319,15 @@ impl Hf {
             .unwrap_or(defaults.feed_forward_proj);
         match (form == G::FEED_FORWARD, FORMS.contains(&form)) {
             (true, _) => Ok(()),
-            (false, true) => Err(invalid(format!(
+            (false, true) => Err(unsupported(format!(
                 "feed_forward_proj: {form}, the size {} holds {}",
                 G::SIZE,
                 G::FEED_FORWARD
             ))),
-            (false, false) => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "feed_forward_proj: {form}, T5 serves {}",
-                    FORMS.join(" and ")
-                ),
-            )),
+            (false, false) => Err(unsupported(format!(
+                "feed_forward_proj: {form}, T5 serves {}",
+                FORMS.join(" and ")
+            ))),
         }
     }
 }
@@ -352,7 +349,7 @@ where
         match tied == Self::TIED_EMBEDDINGS {
             true => Ok(Size),
             false => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+                io::ErrorKind::Unsupported,
                 format!(
                     "{key}: {tied}, the size {N} ties: {}",
                     Self::TIED_EMBEDDINGS

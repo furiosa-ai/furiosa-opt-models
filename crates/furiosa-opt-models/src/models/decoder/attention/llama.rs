@@ -149,7 +149,6 @@ where
     type Error = io::Error;
 
     fn try_from(config: Config) -> io::Result<Self> {
-        let invalid = |reason: String| io::Error::new(io::ErrorKind::InvalidData, reason);
         let unsupported = |reason: &str| io::Error::new(io::ErrorKind::Unsupported, reason);
         let heads = <Self as Geometry>::KvHeads::SIZE;
         // Transformers derives an absent `head_dim` from the hidden width.
@@ -179,19 +178,19 @@ where
             .into_iter()
             .find(|(_, declared, held)| declared != held)
         {
-            return Err(invalid(format!(
+            return Err(unsupported(&format!(
                 "{key}: {declared}, the size {N} holds {held}"
             )));
         }
         vocabulary::<<Self as Geometry>::Vocabulary>(config.vocab_size)?;
         if (config.rms_norm_eps as f32).to_bits() as usize != Self::EPSILON {
-            return Err(invalid(format!(
+            return Err(unsupported(&format!(
                 "rms_norm_eps: {}, another than the size's",
                 config.rms_norm_eps
             )));
         }
         if config.tie_word_embeddings != Self::TIED_EMBEDDINGS {
-            return Err(invalid(format!(
+            return Err(unsupported(&format!(
                 "tie_word_embeddings: {}, the size ties: {}",
                 config.tie_word_embeddings,
                 Self::TIED_EMBEDDINGS
@@ -256,6 +255,30 @@ mod tests {
     fn refuses_what_the_size_does_not_hold() {
         use io::ErrorKind::{InvalidData, Unsupported};
         let cases = [
+            (
+                "hidden_size",
+                serde_json::json!(5120),
+                Unsupported,
+                "hidden_size: 5120, the size 8B holds 4096",
+            ),
+            (
+                "num_key_value_heads",
+                serde_json::json!(4),
+                Unsupported,
+                "num_key_value_heads: 4, the size 8B holds 8",
+            ),
+            (
+                "rms_norm_eps",
+                serde_json::json!(1e-6),
+                Unsupported,
+                "rms_norm_eps: 0.000001, another than the size's",
+            ),
+            (
+                "tie_word_embeddings",
+                serde_json::json!(true),
+                Unsupported,
+                "tie_word_embeddings: true, the size ties: false",
+            ),
             (
                 "vocab_size",
                 serde_json::json!(131073),

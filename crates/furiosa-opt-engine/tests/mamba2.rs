@@ -65,49 +65,49 @@ fn size_refuses_what_it_does_not_serve() {
         (
             "hidden_size",
             json!(1024),
-            InvalidData,
+            Unsupported,
             "hidden_size: 1024, the size 130m holds 768",
         ),
         (
             "num_hidden_layers",
             json!(48),
-            InvalidData,
+            Unsupported,
             "num_hidden_layers: 48, the size 130m holds 24",
         ),
         (
             "expand",
             json!(4),
-            InvalidData,
+            Unsupported,
             "expand: 4, the size 130m holds 2",
         ),
         (
             "num_heads",
             json!(48),
-            InvalidData,
+            Unsupported,
             "num_heads: 48, the size 130m holds 24",
         ),
         (
             "head_dim",
             json!(32),
-            InvalidData,
+            Unsupported,
             "head_dim: 32, the size 130m holds 64",
         ),
         (
             "n_groups",
             json!(8),
-            InvalidData,
+            Unsupported,
             "n_groups: 8, the size 130m holds 1",
         ),
         (
             "state_size",
             json!(64),
-            InvalidData,
+            Unsupported,
             "state_size: 64, the size 130m holds 128",
         ),
         (
             "conv_kernel",
             json!(3),
-            InvalidData,
+            Unsupported,
             "conv_kernel: 3, the size 130m holds 4",
         ),
         (
@@ -125,13 +125,13 @@ fn size_refuses_what_it_does_not_serve() {
         (
             "layer_norm_epsilon",
             json!(1e-6),
-            InvalidData,
+            Unsupported,
             "layer_norm_epsilon: 0.000001, another than the size's",
         ),
         (
             "tie_word_embeddings",
             json!(false),
-            InvalidData,
+            Unsupported,
             "tie_word_embeddings: false, the size ties: true",
         ),
         (
@@ -212,10 +212,13 @@ fn scope_reads_the_config_of_its_size() {
         ),
         other => panic!("{other:?}"),
     }
-    match scope(&[("hidden_size", json!(1024))]) {
+    match scope(&[("hidden_size", json!("wide"))]) {
         Err(LoadError::InvalidData { name, reason }) => assert_eq!(
             (name.as_str(), reason.as_str()),
-            ("config.json", "hidden_size: 1024, the size 130m holds 768")
+            (
+                "config.json",
+                "hidden_size: invalid type: string \"wide\", expected usize"
+            )
         ),
         other => panic!("{other:?}"),
     }

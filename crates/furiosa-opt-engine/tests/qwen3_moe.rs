@@ -63,7 +63,7 @@ fn sizes_read_their_published_configs() {
         ),
     ] {
         let refusal = (error.kind(), error.to_string());
-        assert_eq!(refusal, (io::ErrorKind::InvalidData, reason.into()));
+        assert_eq!(refusal, (io::ErrorKind::Unsupported, reason.into()));
     }
 }
 
@@ -76,43 +76,43 @@ fn size_refuses_what_it_does_not_serve() {
         (
             "moe_intermediate_size",
             json!(1536),
-            InvalidData,
+            Unsupported,
             "moe_intermediate_size: 1536, the size 30B-A3B holds 768",
         ),
         (
             "num_hidden_layers",
             json!(94),
-            InvalidData,
+            Unsupported,
             "num_hidden_layers: 94, the size 30B-A3B holds 48",
         ),
         (
             "num_key_value_heads",
             json!(8),
-            InvalidData,
+            Unsupported,
             "num_key_value_heads: 8, the size 30B-A3B holds 4",
         ),
         (
             "num_attention_heads",
             json!(64),
-            InvalidData,
+            Unsupported,
             "num_attention_heads: 64, the size 30B-A3B holds 32",
         ),
         (
             "head_dim",
             json!(64),
-            InvalidData,
+            Unsupported,
             "head_dim: 64, the size 30B-A3B holds 128",
         ),
         (
             "num_experts",
             json!(64),
-            InvalidData,
+            Unsupported,
             "num_experts: 64, the size 30B-A3B holds 128",
         ),
         (
             "num_experts_per_tok",
             json!(4),
-            InvalidData,
+            Unsupported,
             "num_experts_per_tok: 4, the size 30B-A3B holds 8",
         ),
         (
@@ -130,13 +130,13 @@ fn size_refuses_what_it_does_not_serve() {
         (
             "rms_norm_eps",
             json!(1e-5),
-            InvalidData,
+            Unsupported,
             "rms_norm_eps: 0.00001, another than the size's",
         ),
         (
             "tie_word_embeddings",
             json!(true),
-            InvalidData,
+            Unsupported,
             "tie_word_embeddings: true, the size ties: false",
         ),
         (
