@@ -29,55 +29,25 @@ where
         &self,
         device: &mut Device,
         env: Env,
-        state: &mut (PredictState, UpdateState),
+        (prediction, update): &mut (PredictState, UpdateState),
         (latent, (condition, steps)): (X, (&'c C, J)),
     ) -> Self::Output {
-        let step = Step {
-            predict: &self.predict,
-            update: &self.update,
-        };
-        steps.into_iter().fold(latent, |latent, operands| {
-            step.forward(
-                &mut *device,
-                env,
-                &mut *state,
-                (latent, (condition, operands)),
-            )
-        })
-    }
-}
-
-/// One numerical update; the caller supplies its time, conditioning and solver operands.
-#[derive(DeviceSend)]
-pub struct Step<Predict, Update> {
-    pub predict: Predict,
-    pub update: Update,
-}
-
-/// The state holds the prediction's slot and the update's.
-impl<'s, 'c, X, Y, C, P, U, PredictState, UpdateState, Predict, Update, Env: Copy>
-    Module<(X, (&'c C, (P, U))), Env, &'s mut (PredictState, UpdateState)> for Step<Predict, Update>
-where
-    Predict: for<'x> Module<(&'x X, (&'c C, P)), Env, &'s mut PredictState, Output = Y>,
-    Update: Module<(X, Y, U), Env, &'s mut UpdateState, Output = X>,
-{
-    type Output = X;
-
-    fn forward(
-        &self,
-        device: &mut Device,
-        env: Env,
-        (prediction, update): &'s mut (PredictState, UpdateState),
-        (latent, (condition, (predict, operands))): (X, (&'c C, (P, U))),
-    ) -> Self::Output {
-        let predicted = self.predict.forward(
-            &mut *device,
-            env,
-            prediction,
-            (&latent, (condition, predict)),
-        );
-        self.update
-            .forward(device, env, update, (latent, predicted, operands))
+        steps
+            .into_iter()
+            .fold(latent, |latent, (predict, operands)| {
+                let predicted = self.predict.forward(
+                    &mut *device,
+                    env,
+                    &mut *prediction,
+                    (&latent, (condition, predict)),
+                );
+                self.update.forward(
+                    &mut *device,
+                    env,
+                    &mut *update,
+                    (latent, predicted, operands),
+                )
+            })
     }
 }
 

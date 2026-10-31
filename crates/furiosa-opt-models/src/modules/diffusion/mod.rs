@@ -13,7 +13,7 @@ pub use modulation::{
 pub use pipeline::{Chunked, Pipeline};
 pub use self_conditioning::{ConditionedEmbedding, SelfConditioning};
 pub use stream::{Dual, JointFinal, Stream};
-pub use trajectory::{Cascade, Experts, Guider, Sampler, Step, Values, ddim, flow_match};
+pub use trajectory::{Cascade, Experts, Guider, Sampler, Values, ddim, flow_match};
 
 mod block;
 pub mod coupled;
