@@ -18,8 +18,8 @@
 //! - The DMA engine serves transfers in issue order, so weights issue one part ahead of their use
 //!   and behind the small transfers of the work they overlap: the first down panel behind the
 //!   output projection's rows, the first gate/up pair behind the exchange of its partial sums,
-//!   the other down panels behind the gate/up pairs and the down's inputs, the next layer's key
-//!   and query projections behind them and its value projection under its input norm. An
+//!   the other down panels behind the gate/up pairs and the down's inputs, the next layer's query
+//!   projection behind them and its key and value projections under its input norm. An
 //!   attention's working set fills most of data memory, so only the output projection lands
 //!   during one, once its last history is in flight. A form whose leaves land nothing ahead takes
 //!   the same steps, doing nothing in them.
@@ -210,11 +210,10 @@ trait Cut<Z: Geometry + Decode + 'static, A: States> {
     fn update(&self, device: &mut Device, staged: Self::Staged, adapters: &mut A) -> RowTile<Z>;
 }
 
-/// The forms a layer's input norm, key and query projections and head norms take for a tile's
-/// rows, landed: the norm's gain, the key and query forms and the two head norms' forms.
-struct Front<G, K, Q, QN, KN> {
+/// The forms a layer's input norm, query projection and head norms take for a tile's rows,
+/// landed: the norm's gain, the query form and the two head norms' forms.
+struct Front<G, Q, QN, KN> {
     gain: G,
-    key: K,
     query: Q,
     query_norm: QN,
     key_norm: KN,
@@ -353,7 +352,7 @@ where
         + for<'x> Module<(DL, DP), (), &'x mut (), Output = DR>
         + for<'x> Module<Live<DR, Capacity<Z>>, (), &'x mut T::Down, Output = Owned<Width<Z>, Span>>,
 {
-    type Front = Front<<Stage as crate::Op<&'static Norm<Z>>>::Output, KB, QB, QNB, KNB>;
+    type Front = Front<<Stage as crate::Op<&'static Norm<Z>>>::Output, QB, QNB, KNB>;
     type Landed = OL;
     type Staged = Staged<DR, Z>;
 
@@ -364,7 +363,7 @@ where
                 Positioned {
                     projection:
                         NormalizedQkv {
-                            projection: Projection { query, key, .. },
+                            projection: Projection { query, .. },
                             query_norm,
                             key_norm,
                         },
@@ -372,14 +371,12 @@ where
                 },
             ..
         } = &attention.0;
-        let key = key.forward(&mut *device, tile, &mut (), Begin(()));
         let query = query.forward(&mut *device, tile, &mut (), Begin(()));
         let query_norm = query_norm.forward(&mut *device, tile, &mut (), Begin(()));
         let key_norm = key_norm.forward(&mut *device, tile, &mut (), Begin(()));
         let gain = crate::Op::forward(&Stage, &mut *device, &norm.0);
         Front {
             gain,
-            key,
             query,
             query_norm,
             key_norm,
@@ -400,7 +397,7 @@ where
                 Positioned {
                     projection:
                         NormalizedQkv {
-                            projection: Projection { value, .. },
+                            projection: Projection { key, value, .. },
                             ..
                         },
                     positions,
@@ -408,8 +405,9 @@ where
             ..
         } = &attention.0;
         let tile = rows.with(());
-        // The periods read the value projection last, so it lands here, under the input norm,
-        // behind the down projection's last transfer.
+        // The periods read the key and value projections after the queries', so they land here,
+        // under the input norm, behind the exchange that ends the down projection.
+        let key = key.forward(&mut *device, tile, &mut (), Begin(()));
         let value = value.forward(&mut *device, tile, &mut (), Begin(()));
         let mut launch = value.forward(&mut *device, tile, &mut (), Begin(()));
         let normalized = front.gain.forward(&mut *device, (), &mut (), &rows);
@@ -435,7 +433,7 @@ where
             period(
                 device,
                 positions,
-                (&front, &value),
+                (&front, &key, &value),
                 tile,
                 landed,
                 start,
@@ -453,7 +451,7 @@ where
             period(
                 device,
                 positions,
-                (&front, &value),
+                (&front, &key, &value),
                 tile,
                 landed,
                 start,
@@ -516,14 +514,14 @@ where
 }
 
 /// A period of `G` tiles of a tile's rows through a layer's projections, their forms begun in
-/// `front` and `value` and running with `adapters`, stored at row `start` of `stored`, its rows
-/// landed and its rotation's coefficients landed by `landing` from `index`: the queries projected,
-/// normalized, rotated and stored while the keys and values project, then the keys normalized,
-/// rotated and stored with the values.
+/// `front`, `key` and `value` and running with `adapters`, stored at row `start` of `stored`, its
+/// rows landed and its rotation's coefficients landed by `landing` from `index`: the queries
+/// projected, normalized, rotated and stored while the keys and values project, then the keys
+/// normalized, rotated and stored with the values.
 fn period<Z, G, P, GN, V, K, Q, QN, KN, QH, KH, T: States>(
     device: &mut Device,
     positions: &Rotary<Head>,
-    (front, value): (&Front<GN, K, Q, QN, KN>, &V),
+    (front, key, value): (&Front<GN, Q, QN, KN>, &K, &V),
     tile: Live<(), Capacity<Z>>,
     ((landing, index), rows): (Landing<'_, G, Z>, P),
     start: usize,
@@ -539,7 +537,6 @@ fn period<Z, G, P, GN, V, K, Q, QN, KN, QH, KH, T: States>(
 {
     let Front {
         query,
-        key,
         query_norm,
         key_norm,
         ..
