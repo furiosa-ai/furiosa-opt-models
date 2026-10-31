@@ -8,7 +8,7 @@
 //! - Slots and chunk tables are pool byte offsets, selected rows blocked hidden-row byte offsets.
 
 use super::Batch;
-use furiosa_opt_models::ops::attention::full::paged::{Plan, Tiling, chunks};
+use furiosa_opt_models::ops::attention::full::paged::{Options, Plan, Tiling, chunks};
 use furiosa_opt_models::ops::index::table::FIELDS;
 use furiosa_opt_models::tensor::cache::{Block, Blocks};
 use furiosa_opt_std::prelude::*;
@@ -49,7 +49,7 @@ struct Plans<W> {
 
 impl<W: AxisName> Plans<W> {
     /// The launch of `appended`, in call row order, returning the call rows `kept`, for the cache
-    /// blocks of `KvHeads` heads of `Head` features, tiled as `tiling` says; refuses what the
+    /// blocks of `KvHeads` heads of `Head` features, planned as `options` says; refuses what the
     /// launch cannot hold.
     fn new<
         Capacity: AxisName,
@@ -60,7 +60,7 @@ impl<W: AxisName> Plans<W> {
     >(
         appended: &[Appended],
         kept: &[usize],
-        tiling: Tiling,
+        options: Options,
     ) -> io::Result<Self> {
         let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
         let int =
@@ -83,13 +83,14 @@ impl<W: AxisName> Plans<W> {
                 .map(|&row| int(row * ROW_BYTES))
                 .collect::<io::Result<_>>()?,
         };
+        plans.chunks.window = options.window;
         for request in appended {
             for (row, position) in request.rows.clone().zip(request.cached..) {
                 let block = request.blocks[position / Block::SIZE] as usize;
                 plans.positions[row] = int(position)?;
                 plans.slots[row] = int((block * Block::SIZE + position % Block::SIZE) * slot)?;
             }
-            if request.rows.len() == 1 || tiling == Tiling::Fixed {
+            if request.rows.len() == 1 || options.tiling == Tiling::Fixed {
                 let ids = (request.blocks.iter()).map(|&id| int(id as usize));
                 let start = plans.history.len();
                 for (row, position) in request.rows.clone().zip(request.cached..) {
@@ -143,7 +144,8 @@ impl<A> Batch<'_, A> {
     /// write slots, the work items of `KvHeads` heads grouped `G` of `Head` features in `Waves`,
     /// the prompt chunks over at most `W` windows, the count of selected rows and the selected rows
     /// of cache group `group`; each as the values the launch uses and all its words. Its rows
-    /// attend tiled as `tiling` says. Refuses a call the launch cannot hold before anything moves.
+    /// attend tiled as `tiling` says, each over the group's window. Refuses a call the launch
+    /// cannot hold before anything moves.
     pub fn operands<
         Capacity: AxisName,
         Reach: AxisName,
@@ -158,13 +160,17 @@ impl<A> Batch<'_, A> {
         group: usize,
         tiling: Tiling,
     ) -> io::Result<Vec<(Vec<i32>, usize)>> {
+        let options = Options {
+            tiling,
+            window: self.windows[group],
+        };
         let plans = Plans::<W>::new::<Capacity, Reach, Sequences, KvHeads, Head>(
             &self.appended[group],
             &self.kept,
-            tiling,
+            options,
         )?;
         let items =
-            Plan::new::<KvHeads, G, Head, Waves, Reach>(&plans.decode, &plans.history, tiling);
+            Plan::new::<KvHeads, G, Head, Waves, Reach>(&plans.decode, &plans.history, options);
         let items = (items.reads()).map(|(values, words)| (values.to_vec(), words));
         let mut selected = plans.selected.clone();
         selected.resize(Capacity::SIZE, 0);
@@ -219,7 +225,7 @@ mod tests {
                 blocks: blocks.to_vec(),
             })
             .collect();
-        Plans::new::<Capacity, Reach, Sequences, KvHeads, Head>(&appended, kept, tiling)
+        Plans::new::<Capacity, Reach, Sequences, KvHeads, Head>(&appended, kept, tiling.into())
     }
 
     /// The plans of requests `(rows, cached, blocks)` in call row order, keeping `kept`.

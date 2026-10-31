@@ -87,6 +87,8 @@ pub struct Batch<'a, A> {
     /// Each cache group's appended rows of every request in call row order: what a launch's
     /// attention front plans.
     appended: Vec<Vec<operands::Appended>>,
+    /// Each cache group's sliding window, in spec order: the positions a row attends back to.
+    windows: Vec<Option<usize>>,
     /// The call rows the call returns, in order.
     kept: Vec<usize>,
     /// The call's adapters bound to its slots and rows; none when no row runs with one.
@@ -237,6 +239,9 @@ impl<'a, A> Batch<'a, A> {
         Ok(Self {
             compact,
             appended,
+            windows: (limits.cache.groups.iter())
+                .map(|group| group.window)
+                .collect(),
             tokens: (requests.iter().zip(spans))
                 .map(|(request, rows)| (request.tokens.clone(), rows))
                 .collect(),
