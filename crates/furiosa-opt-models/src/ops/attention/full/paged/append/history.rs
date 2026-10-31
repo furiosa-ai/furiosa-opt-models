@@ -88,7 +88,7 @@ type Panels<P> = m![{ Symbol<<P as Panel>::Span> }];
 type PanelOf<P> = m![{ Symbol<<P as Panel>::Span> } = 1 # ({ Symbol<<P as Panel>::Span> })];
 type PanelSlot<P> = m![{ Symbol<<P as Panel>::Span> } = 1 #{!} ({ Symbol<<P as Panel>::Span> })];
 type KeyTile<Head, P> = m![{ PanelOf<P> }, Cache % 2, Head];
-type ValueTile<Head, P> = m![{ PanelOf<P> }, Cache % 16, Head % 16];
+type ValueTile<Head, P> = m![{ PanelOf<P> }, { Parts<Head> }, Cache % 16, Head % 16];
 type Keys<P> = m![{ Symbol<<P as Panel>::Keys> }];
 type PanelCount<P, W> = m![{ Symbol<<P as Panel>::Count<W>> }];
 type Tiles<T> = m![{ Symbol<T> }];
@@ -107,7 +107,8 @@ pub(crate) type InDm<KvHeads, Head, P> = DmTensor<
     m![KvHeads % 4, { Keys<P> } % 128 / Block # 64],
     m![{ Keys<P> } / 128, Block, KeyValue, Head],
 >;
-type Staged<KvHeads, Head, P> = DmTensor<
+/// A block's keys staged in data memory for their fills.
+type KeyBlock<KvHeads, Head, P> = DmTensor<
     bf16,
     Chip,
     Cluster<KvHeads>,
@@ -230,7 +231,7 @@ struct ScoreStaged<P>(PhantomData<P>);
 impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName>
     Op<(
         &Attention<KvHeads, Groups, Head>,
-        &Staged<KvHeads, Head, P>,
+        &KeyBlock<KvHeads, Head, P>,
         &Group<KvHeads, Groups, Head, T>,
     )> for ScoreStaged<P>
 {
@@ -241,26 +242,84 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName>
         context: &mut Device,
         (attention, keys, query): (
             &Attention<KvHeads, Groups, Head>,
-            &Staged<KvHeads, Head, P>,
+            &KeyBlock<KvHeads, Head, P>,
             &Group<KvHeads, Groups, Head, T>,
         ),
     ) -> Self::Output {
-        let fill = |context: &mut Device, s| {
-            Op::forward(
-                &fresh::FillKeys::<Groups, Head>(PhantomData),
-                context,
-                keys.view().tile::<Panels<P>, 1, KeyTile<Head, P>>(s),
-            )
-        };
+        let mut source = StagedKeys::<KvHeads, Head, P>(keys);
         let mut scores = PanelScores::<KvHeads, Groups, P, T>::new();
-        // Each panel's fill is issued before the previous panel's contractions, so the two overlap.
-        let first = fill(context, 0);
+        // Each fill is issued before the previous fill's contractions, so the two overlap.
+        let first = source.key(context, 0);
         Op::forward(
             &ScoreBlock::<P>(PhantomData),
             context,
-            (attention, (first, fill), query, &mut scores),
+            (attention, (first, &mut source), query, &mut scores),
         );
         scores
+    }
+}
+
+/// A block's staged keys, filled a channel part of a panel at a time.
+struct StagedKeys<'a, KvHeads: AxisName, Head: AxisName, P: Panel>(&'a KeyBlock<KvHeads, Head, P>);
+
+impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel> KeySource<KvHeads, Groups, Head>
+    for StagedKeys<'_, KvHeads, Head, P>
+{
+    fn key(&mut self, context: &mut Device, s: usize) -> fresh::Keys<KvHeads, Groups, Head> {
+        self.key_part(context, s, 0)
+    }
+    fn key_part(
+        &mut self,
+        context: &mut Device,
+        s: usize,
+        j: usize,
+    ) -> fresh::Keys<KvHeads, Groups, Head> {
+        Op::forward(
+            &fresh::FillKeys::<Groups, Head>(PhantomData),
+            context,
+            self.0
+                .view()
+                .tile::<Panels<P>, 1, KeyTile<Head, P>>(s)
+                .tile::<Parts<Head>, 1,
+                    m![{ PanelOf<P> }, Cache % 2, { PartOf<Head> }, { Channels<Head> }]>(j),
+        )
+    }
+}
+
+/// A block's values staged in data memory, one 16 x 16 tile of each part per slice.
+type ValueBlock<KvHeads, Head, P> = DmTensor<
+    bf16,
+    Chip,
+    Cluster<KvHeads>,
+    fresh::ValueSlice<KvHeads, Head>,
+    m![{ Panels<P> }, { Parts<Head> }, Cache % 16, Head % 16],
+>;
+/// A block's staged values, filled a channel part of a panel at a time.
+struct StagedValues<'a, KvHeads: AxisName, Head: AxisName, P: Panel>(
+    &'a ValueBlock<KvHeads, Head, P>,
+);
+
+impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel>
+    ValueSource<KvHeads, Groups, Head> for StagedValues<'_, KvHeads, Head, P>
+{
+    fn value(&mut self, context: &mut Device, s: usize) -> fresh::Values<KvHeads, Groups, Head> {
+        self.value_part(context, s, 0)
+    }
+    fn value_part(
+        &mut self,
+        context: &mut Device,
+        s: usize,
+        j: usize,
+    ) -> fresh::Values<KvHeads, Groups, Head> {
+        Op::forward(
+            &fresh::FillValues::<Groups>(PhantomData),
+            context,
+            self.0
+                .view()
+                .tile::<Panels<P>, 1, ValueTile<Head, P>>(s)
+                .tile::<Parts<Head>, 1,
+                    m![{ PanelOf<P> }, { PartOf<Head> }, Cache % 16, Head % 16]>(j),
+        )
     }
 }
 
@@ -414,14 +473,8 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName,
                     m![{ Panels<P> }, Cache % Block, KeyValue, Head],
                 >()
         };
-        let mut keys = Staged::<KvHeads, Head, P>::new();
-        let mut values = DmTensor::<
-            bf16,
-            Chip,
-            Cluster<KvHeads>,
-            fresh::ValueSlice<KvHeads, Head>,
-            m![{ Panels<P> }, Cache % 16, Head % 16],
-        >::new();
+        let mut keys = KeyBlock::<KvHeads, Head, P>::new();
+        let mut values = ValueBlock::<KvHeads, Head, P>::new();
         rows.clone()
             .tile::<m![KeyValue], 1, m![{ Panels<P> }, Cache % Block, KeyValue = 1 # 2, Head]>(0)
             .to_dm_view(&mut context.tdma, keys.view_mut());
@@ -438,16 +491,10 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName,
             (&scores, &*running),
         );
         let partials = Op::forward(
-            &WeighBlock::<P>(PhantomData),
+            &WeighBlock::<P, Head>(PhantomData),
             &mut *context,
             (
-                |context: &mut Device, s| {
-                    Op::forward(
-                        &fresh::FillValues::<Groups>(PhantomData),
-                        context,
-                        values.view().tile::<Panels<P>, 1, ValueTile<Head, P>>(s),
-                    )
-                },
+                &mut StagedValues::<KvHeads, Head, P>(&values),
                 &probabilities,
             ),
         );
@@ -471,7 +518,7 @@ type Dims<KvHeads, Groups, Head> = TrfTensor<
     m![Head % 8],
     m![Head % 16 / 8, Span1024, Cache],
 >;
-type DimsTile<Head> = m![Head / 16 = 1 # 8, Head % 16, Cache % 16];
+type DimsTile<Head> = m![Head / 16 = 1 # (Head / 16), Head % 16, Cache % 16];
 type Weighted<KvHeads, Groups, Head, T> = DmTensor<
     f32,
     Chip,
@@ -522,7 +569,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, T: AxisName>
                     m![{ Panels<Wide> }, Cache % Block, KeyValue, Head],
                 >()
         };
-        let mut keys = Staged::<KvHeads, Head, Wide>::new();
+        let mut keys = KeyBlock::<KvHeads, Head, Wide>::new();
         let mut values =
             DmTensor::<bf16, Chip, Cluster<KvHeads>, Runs<KvHeads>, m![Cache % 16, Head]>::new();
         rows.clone()
@@ -644,7 +691,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, T: AxisName>
                 >()
                 .commit_trim::<m![Head % 2]>()
                 .commit_view(weighted.view_mut().tile::<m![Head / 16], 1,
-                    m![{ Tiles<T> }, Span128, Rows % 8, Head / 16 = 1 #{!} 8, Head % 16]>(d));
+                    m![{ Tiles<T> }, Span128, Rows % 8, Head / 16 = 1 #{!} (Head / 16), Head % 16]>(d));
         };
         #[unroll]
         for d in 1..Head::SIZE / 16 {
@@ -742,13 +789,37 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, T: AxisName, Q: M, E: 
             DmTensorViewMut<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, E>,
         ),
     ) {
-        context.main.begin(query)
-        .fetch::<m![{ Tiles<T> }, Rows % 8 / 2, Cache / 8 % 8, Head / 16],
+        Self::scaled(&mut context.main, attention, query, key)
+            .commit_cast::<bf16>()
+            .commit_view(scores);
+    }
+}
+
+impl<T: AxisName> ScoreTiles<T> {
+    /// One panel's scaled FP32 dot products of the `T` tiles `query` reads with one fill of keys,
+    /// ready to commit.
+    pub(crate) fn scaled<'a, KvHeads: AxisName, Groups: AxisName, Head: AxisName, Q: M>(
+        main: &'a mut TuContext<{ Tu::Main }>,
+        attention: &Attention<KvHeads, Groups, Head>,
+        query: DmTensorView<'a, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Q>,
+        key: &'a fresh::Keys<KvHeads, Groups, Head>,
+    ) -> CommitTrimTensor<
+        'a,
+        { Tu::Main },
+        f32,
+        Chip,
+        Cluster<KvHeads>,
+        Slice<KvHeads, Groups>,
+        m![{ Tiles<T> }, Rows % 8 / 2, Cache / 8 % 8, Cache / 64, Rows % 2],
+        m![Cache % 8],
+    > {
+        main.begin(query)
+        .fetch::<m![{ Tiles<T> }, Rows % 8 / 2, Cache / 8 % 8, { Channels<Head> } / 16],
             m![Rows % 2, Head % 16]>()
-        .collect::<m![{ Tiles<T> }, Rows % 8 / 2, Cache / 8 % 8, Head / 16, Rows % 2],
-            m![Head % 16]>()
-        .contract_outer::<m![{ Tiles<T> }, Rows % 8 / 2, Cache / 8 % 8, Head / 16, Cache / 64],
-            m![Rows % 2, Head % 16], _, _, _>(key)
+        .collect::<m![{ Tiles<T> }, Rows % 8 / 2, Cache / 8 % 8, { Channels<Head> } / 16,
+            Rows % 2], m![Head % 16]>()
+        .contract_outer::<m![{ Tiles<T> }, Rows % 8 / 2, Cache / 8 % 8, { Channels<Head> } / 16,
+            Cache / 64], m![Rows % 2, Head % 16], _, _, _>(key)
         .contract_packet::<m![Rows % 2]>()
         .contract_time::<m![{ Tiles<T> }, Rows % 8 / 2, Cache / 8 % 8, Cache / 64]>()
         .contract_lane::<m![{ Tiles<T> }, Rows % 8 / 2, Cache / 8 % 8, Cache / 64, Rows % 2],
@@ -762,12 +833,127 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, T: AxisName, Q: M, E: 
             m![Cache % 8]>()
         .vector_final()
         .commit_trim::<m![Cache % 8]>()
-        .commit_cast::<bf16>()
-        .commit_view(scores);
     }
 }
 
-/// Panel `s`'s probabilities times its values for every tile of the group, one contraction.
+/// Each of `R` tiles' FP32 scaled dot products over one panel.
+pub(crate) type Dot<KvHeads, Groups, R> = DmTensor<
+    f32,
+    Chip,
+    Cluster<KvHeads>,
+    Slice<KvHeads, Groups>,
+    m![{ Tiles<R> }, Rows % 8, Cache],
+>;
+
+/// `R` tiles' scaled dot products over one panel of a head wider than one fill: a fill and a
+/// contraction per channel part, the first fill already made. Returns the sum of every part's but
+/// the last, and the last part's, for one rounding; `next` makes the following fill before the
+/// last contraction, so the register file holds two fills throughout.
+pub(crate) struct Dots<R>(pub(crate) PhantomData<R>);
+
+impl<
+    'q,
+    KvHeads: AxisName,
+    Groups: AxisName,
+    Head: AxisName,
+    R: AxisName,
+    E: M,
+    V: Fn(usize) -> DmTensorView<'q, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, E>,
+    S: KeySource<KvHeads, Groups, Head>,
+    N,
+    F: FnOnce(&mut S, &mut Device) -> N,
+>
+    Op<(
+        &Attention<KvHeads, Groups, Head>,
+        V,
+        (fresh::Keys<KvHeads, Groups, Head>, &mut S, usize),
+        F,
+    )> for Dots<R>
+{
+    type Output = (Dot<KvHeads, Groups, R>, Dot<KvHeads, Groups, R>, N);
+
+    fn forward(
+        &self,
+        context: &mut Device,
+        (attention, parts, (first, source, s), next): (
+            &Attention<KvHeads, Groups, Head>,
+            V,
+            (fresh::Keys<KvHeads, Groups, Head>, &mut S, usize),
+            F,
+        ),
+    ) -> Self::Output {
+        let mut sum = Dot::<KvHeads, Groups, R>::new();
+        let mut last = Dot::<KvHeads, Groups, R>::new();
+        let later = source.key_part(context, s, 1);
+        ScoreTiles::<R>::scaled(&mut context.main, attention, parts(0), &first)
+            .commit_view(sum.view_mut());
+        let mut key = later;
+        #[unroll]
+        for j in 1..Part::<Head>::COUNT - 1 {
+            let later = source.key_part(context, s, j + 1);
+            ScoreTiles::<R>::scaled(&mut context.main, attention, parts(j), &key)
+                .commit_view(last.view_mut());
+            #[unroll]
+            for t in 0..R::SIZE {
+                Op::forward(&panel::Accumulate, &mut *context, (&mut sum, &last, t));
+            }
+            key = later;
+        }
+        let next = next(source, context);
+        ScoreTiles::<R>::scaled(
+            &mut context.main,
+            attention,
+            parts(Part::<Head>::COUNT - 1),
+            &key,
+        )
+        .commit_view(last.view_mut());
+        (sum, last, next)
+    }
+}
+
+/// Rounds each of `T` tiles' two FP32 sums of dot products into panel `s` of `scores`.
+pub(crate) struct RoundPanel<P>(pub(crate) PhantomData<P>);
+
+impl<KvHeads: AxisName, Groups: AxisName, P: Panel, T: AxisName>
+    Op<(
+        (&Dot<KvHeads, Groups, T>, &Dot<KvHeads, Groups, T>),
+        &mut PanelScores<KvHeads, Groups, P, T>,
+        usize,
+    )> for RoundPanel<P>
+{
+    type Output = ();
+
+    fn forward(
+        &self,
+        context: &mut Device,
+        ((sum, last), scores, s): (
+            (&Dot<KvHeads, Groups, T>, &Dot<KvHeads, Groups, T>),
+            &mut PanelScores<KvHeads, Groups, P, T>,
+            usize,
+        ),
+    ) {
+        type Row<T> = m![{ TileOf<T> }, Rows % 8, Cache];
+        #[unroll]
+        for t in 0..T::SIZE {
+            Op::forward(
+                &panel::Round,
+                &mut *context,
+                (
+                    sum.view().tile::<m![{ Symbol<T> }], 1, Row<T>>(t),
+                    last.view().tile::<m![{ Symbol<T> }], 1, Row<T>>(t),
+                    scores
+                        .view_mut()
+                        .tile::<Panels<P>, 1, m![{ Tiles<T> }, Rows % 8, { PanelSlot<P> }, Cache]>(s)
+                        .tile::<m![{ Symbol<T> }], 1,
+                            m![{ TileSlot<T> }, Rows % 8, { PanelSlot<P> }, Cache]>(t),
+                ),
+            );
+        }
+    }
+}
+
+/// Panel `s`'s probabilities times its values' part `j` for every tile of the group, one
+/// contraction, into the part's channels.
 pub(crate) struct Weigh<P>(pub(crate) PhantomData<P>);
 
 impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName>
@@ -788,7 +974,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName>
             Slice<KvHeads, Groups>,
             m![{ Tiles<T> }, { Panels<P> }, Rows % 8, Head],
         >,
-        usize,
+        (usize, usize),
     )> for Weigh<P>
 {
     type Output = ();
@@ -796,7 +982,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName>
     fn forward(
         &self,
         context: &mut Device,
-        (probabilities, value, partials, s): (
+        (probabilities, value, partials, (s, j)): (
             &DmTensorView<
                 '_,
                 bf16,
@@ -813,7 +999,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName>
                 Slice<KvHeads, Groups>,
                 m![{ Tiles<T> }, { Panels<P> }, Rows % 8, Head],
             >,
-            usize,
+            (usize, usize),
         ),
     ) {
         Op::forward(
@@ -826,7 +1012,9 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName>
                 value,
                 partials
                     .view_mut()
-                    .tile::<Panels<P>, 1, m![{ Tiles<T> }, { PanelSlot<P> }, Rows % 8, Head]>(s),
+                    .tile::<Panels<P>, 1, m![{ Tiles<T> }, { PanelSlot<P> }, Rows % 8, Head]>(s)
+                    .tile::<Parts<Head>, 1, m![{ Tiles<T> }, { PanelSlot<P> }, Rows % 8,
+                        { PartSlot<Head> }, { Channels<Head> }]>(j),
             ),
         );
     }
@@ -857,19 +1045,20 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, T: AxisName, Q: M, E: 
         context.main
             .begin(probabilities)
             .fetch::<
-                m![{ Tiles<T> }, Rows % 2, Head / 32, Cache / 8],
+                m![{ Tiles<T> }, Rows % 2, { Channels<Head> } / 32, Cache / 8],
                 m![Rows % 8 / 2, Cache % 8],
             >()
-            .collect::<m![{ Tiles<T> }, Rows % 2, Head / 32, Cache / 8, Rows % 8 / 4],
-                m![Rows % 4 / 2, Cache % 8]>()
-            .contract_outer::<m![{ Tiles<T> }, Rows % 2, Head / 32, Cache / 8, Head % 32 / 8],
-                m![Rows % 8 / 2, Cache % 8], _, _, _>(value)
+            .collect::<m![{ Tiles<T> }, Rows % 2, { Channels<Head> } / 32, Cache / 8,
+                Rows % 8 / 4], m![Rows % 4 / 2, Cache % 8]>()
+            .contract_outer::<m![{ Tiles<T> }, Rows % 2, { Channels<Head> } / 32, Cache / 8,
+                Head % 32 / 8], m![Rows % 8 / 2, Cache % 8], _, _, _>(value)
             .contract_packet::<m![Rows % 8 / 2]>()
-            .contract_time::<m![{ Tiles<T> }, Rows % 2, Head / 32, Head % 32 / 8]>()
-            .contract_lane::<m![{ Tiles<T> }, Rows % 2, Head / 32, Head % 32 / 8, Head % 8],
-                m![Rows % 8 / 2 # 8]>(LaneMode::Sequential)
+            .contract_time::<m![{ Tiles<T> }, Rows % 2, { Channels<Head> } / 32, Head % 32 / 8]>()
+            .contract_lane::<m![{ Tiles<T> }, Rows % 2, { Channels<Head> } / 32, Head % 32 / 8,
+                Head % 8], m![Rows % 8 / 2 # 8]>(LaneMode::Sequential)
             .vector_init().vector_intra_slice_tag(TagMode::Zero).vector_final()
-            .transpose::<m![{ Tiles<T> }, Rows % 2, Head / 2, Rows % 8 / 2], m![Head % 2 # 8]>()
+            .transpose::<m![{ Tiles<T> }, Rows % 2, { Channels<Head> } / 2, Rows % 8 / 2],
+                m![Head % 2 # 8]>()
             .commit_trim::<m![Head % 2]>()
             .commit_view(partials);
     }

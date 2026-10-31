@@ -3,6 +3,7 @@ use furiosa_opt_std::prelude::*;
 use super::Attention;
 use super::chunks::{Cache, Chunks, Epoch, Record, Run, Runs, SlotTable};
 use crate::ops::index::gather::Gather;
+use crate::specialize::attention;
 use crate::tensor::cache::Block;
 use crate::tensor::cache::KeyValue;
 use crate::tensor::parallel::Chip;
@@ -47,20 +48,20 @@ trait Group<KvHeads: AxisName, Groups: AxisName, Head: AxisName>: AxisName {
         attention: &Attention<KvHeads, Groups, Head>,
         context: &mut Device,
         source: (
-            &mut impl Source<KvHeads, Groups, Head, Self::Fresh>,
+            &mut impl KeySource<KvHeads, Groups, Head>,
             fresh::Keys<KvHeads, Groups, Head>,
         ),
         queries: &impl QueryTiles<KvHeads, Groups, Head>,
     ) -> history::PanelScores<KvHeads, Groups, Self::Fresh, Self>;
     /// Masks and normalizes the causal block's scores and seeds the group's state with the
     /// block's weighted values.
-    fn seed(
+    fn seed<S: ValueSource<KvHeads, Groups, Head>>(
         context: &mut Device,
         block: (
             &history::PanelScores<KvHeads, Groups, Self::Fresh, Self>,
             &GroupMask<KvHeads, Groups, Head, Self>,
         ),
-        source: &mut impl Source<KvHeads, Groups, Head, Self::Fresh>,
+        source: &mut S,
         state: (
             &mut impl state::Tiles<KvHeads, Groups, Head>,
             &mut impl state::Tiles<KvHeads, Groups, Head>,
@@ -115,50 +116,60 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> Group<KvHeads, Groups,
         Self::queries::<KvHeads, Groups, Head, All>(query, row).to_dm(&mut context.tdma)
     }
     /// Panel s for the tiles from s on, the tiles that see it; the scores of a tile before a
-    /// panel stay unwritten.
+    /// panel stay unwritten. A head wider than one fill scores every panel for all four tiles, in
+    /// one contraction a part.
     fn scores(
         attention: &Attention<KvHeads, Groups, Head>,
         context: &mut Device,
         (source, first): (
-            &mut impl Source<KvHeads, Groups, Head, Self::Fresh>,
+            &mut impl KeySource<KvHeads, Groups, Head>,
             fresh::Keys<KvHeads, Groups, Head>,
         ),
         queries: &impl QueryTiles<KvHeads, Groups, Head>,
     ) -> history::PanelScores<KvHeads, Groups, Self::Fresh, Self> {
         let mut scores = history::PanelScores::<KvHeads, Groups, Half, Self>::new();
-        let second = source.key(context, 1);
-        Op::forward(
-            &history::Score::<Half>(PhantomData),
-            &mut *context,
-            (attention, queries.group(), &first, &mut scores, 0),
-        );
-        let third = source.key(context, 2);
-        Op::forward(
-            &TailScore::<Tail3, { Tail3::SIZE }>(PhantomData),
-            &mut *context,
-            (attention, queries, &second, &mut scores, 1),
-        );
-        let fourth = source.key(context, 3);
-        Op::forward(
-            &TailScore::<Tail2, { Tail2::SIZE }>(PhantomData),
-            &mut *context,
-            (attention, queries, &third, &mut scores, 2),
-        );
-        Op::forward(
-            &TailScore::<SingleTile, { SingleTile::SIZE }>(PhantomData),
-            &mut *context,
-            (attention, queries, &fourth, &mut scores, 3),
-        );
+        if const { Part::<Head>::WHOLE } {
+            let second = source.key(context, 1);
+            Op::forward(
+                &history::Score::<Half>(PhantomData),
+                &mut *context,
+                (attention, queries.group(), &first, &mut scores, 0),
+            );
+            let third = source.key(context, 2);
+            Op::forward(
+                &TailScore::<Tail3, { Tail3::SIZE }>(PhantomData),
+                &mut *context,
+                (attention, queries, &second, &mut scores, 1),
+            );
+            let fourth = source.key(context, 3);
+            Op::forward(
+                &TailScore::<Tail2, { Tail2::SIZE }>(PhantomData),
+                &mut *context,
+                (attention, queries, &third, &mut scores, 2),
+            );
+            Op::forward(
+                &TailScore::<SingleTile, { SingleTile::SIZE }>(PhantomData),
+                &mut *context,
+                (attention, queries, &fourth, &mut scores, 3),
+            );
+        } else {
+            Op::forward(
+                &ScoreBlock::<Half>(PhantomData),
+                &mut *context,
+                (attention, (first, &mut *source), queries, &mut scores),
+            );
+        }
         scores
     }
-    /// Tile t sees panels 0..=t, so its softmax, weighing and sum read only those.
-    fn seed(
+    /// Tile t sees panels 0..=t, so its softmax, weighing and sum read only those; a head wider
+    /// than one fill weighs every panel for all four tiles, and the sums leave the rest unread.
+    fn seed<S: ValueSource<KvHeads, Groups, Head>>(
         context: &mut Device,
         (scores, mask): (
             &history::PanelScores<KvHeads, Groups, Self::Fresh, Self>,
             &GroupMask<KvHeads, Groups, Head, Self>,
         ),
-        source: &mut impl Source<KvHeads, Groups, Head, Self::Fresh>,
+        source: &mut S,
         (carry, running): (
             &mut impl state::Tiles<KvHeads, Groups, Head>,
             &mut impl state::Tiles<KvHeads, Groups, Head>,
@@ -211,7 +222,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> Group<KvHeads, Groups,
                 3,
             ),
         );
-        let partials = {
+        let partials = if const { Part::<Head>::WHOLE } {
             // SAFETY: the inverse relabel of the key rows.
             let probabilities = unsafe {
                 probabilities
@@ -225,7 +236,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> Group<KvHeads, Groups,
             Op::forward(
                 &history::Weigh::<Half>(PhantomData),
                 &mut *context,
-                (&probabilities, &first, &mut partials, 0),
+                (&probabilities, &first, &mut partials, (0, 0)),
             );
             let third = source.value(context, 2);
             Op::forward(
@@ -243,6 +254,58 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> Group<KvHeads, Groups,
                 &TailWeigh::<SingleTile, { SingleTile::SIZE }>(PhantomData),
                 &mut *context,
                 (&probabilities, &fourth, &mut partials, 3),
+            );
+            partials
+        } else {
+            // SAFETY: the inverse relabel of the key rows.
+            let probabilities = unsafe {
+                probabilities
+                    .view()
+                    .reshape::<Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>,
+                        m![{ Symbol<Self> }, Rows % 8, { Panels<Half> }, Cache]>()
+            };
+            let mut partials = history::Partials::<KvHeads, Groups, Head, Half, Self>::new();
+            // Each panel by its own index: a fresh panel's cut tests a tile known when compiling.
+            let first = source.value(context, 0);
+            let second = Op::forward(
+                &WeighPanel::<Half>(PhantomData),
+                &mut *context,
+                (
+                    &probabilities,
+                    (first, &mut *source, 0),
+                    &mut partials,
+                    |source: &mut S, context: &mut Device| source.value(context, 1),
+                ),
+            );
+            let third = Op::forward(
+                &WeighPanel::<Half>(PhantomData),
+                &mut *context,
+                (
+                    &probabilities,
+                    (second, &mut *source, 1),
+                    &mut partials,
+                    |source: &mut S, context: &mut Device| source.value(context, 2),
+                ),
+            );
+            let fourth = Op::forward(
+                &WeighPanel::<Half>(PhantomData),
+                &mut *context,
+                (
+                    &probabilities,
+                    (third, &mut *source, 2),
+                    &mut partials,
+                    |source: &mut S, context: &mut Device| source.value(context, 3),
+                ),
+            );
+            Op::forward(
+                &WeighPanel::<Half>(PhantomData),
+                &mut *context,
+                (
+                    &probabilities,
+                    (fourth, &mut *source, 3),
+                    &mut partials,
+                    |_: &mut S, _: &mut Device| (),
+                ),
             );
             partials
         };
@@ -474,7 +537,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> Group<KvHeads, Groups,
         attention: &Attention<KvHeads, Groups, Head>,
         context: &mut Device,
         source: (
-            &mut impl Source<KvHeads, Groups, Head, Self::Fresh>,
+            &mut impl KeySource<KvHeads, Groups, Head>,
             fresh::Keys<KvHeads, Groups, Head>,
         ),
         queries: &impl QueryTiles<KvHeads, Groups, Head>,
@@ -484,22 +547,17 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> Group<KvHeads, Groups,
         Op::forward(
             &ScoreBlock::<Narrow>(PhantomData),
             context,
-            (
-                attention,
-                (first, |context: &mut Device, s| source.key(context, s)),
-                queries,
-                &mut scores,
-            ),
+            (attention, (first, source), queries, &mut scores),
         );
         scores
     }
-    fn seed(
+    fn seed<S: ValueSource<KvHeads, Groups, Head>>(
         context: &mut Device,
         (scores, mask): (
             &history::PanelScores<KvHeads, Groups, Self::Fresh, Self>,
             &GroupMask<KvHeads, Groups, Head, Self>,
         ),
-        source: &mut impl Source<KvHeads, Groups, Head, Self::Fresh>,
+        source: &mut S,
         (carry, running): (
             &mut impl state::Tiles<KvHeads, Groups, Head>,
             &mut impl state::Tiles<KvHeads, Groups, Head>,
@@ -552,12 +610,9 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> Group<KvHeads, Groups,
             );
         }
         let partials = Op::forward(
-            &WeighBlock::<Narrow>(PhantomData),
+            &WeighBlock::<Narrow, Head>(PhantomData),
             &mut *context,
-            (
-                |context: &mut Device, s| source.value(context, s),
-                &probabilities,
-            ),
+            (source, &probabilities),
         );
         Op::forward(&state::Seed, context, (carry, &partials, &total));
     }
@@ -572,33 +627,34 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> Group<KvHeads, Groups,
             &mut state::Running<KvHeads, Groups, Self>,
         ),
     ) {
-        let query = queries
-            .view()
-            .tile::<m![{ Symbol<Self> }], 1, TileRows<Head, Self>>(0);
         let within = record.within();
         for r in 0..within.count() {
             let j = within.begin() + r;
-            let key = Op::forward(
-                &fresh::LoadKeys::<KvHeads, Groups, Head>(PhantomData),
-                &mut *context,
-                Cache::rows(input.key, input.start + j * 128),
-            );
+            let mut keys: fresh::KeyPanel<KvHeads, Head> =
+                Cache::rows(input.key, input.start + j * 128).to_dm(&mut context.tdma);
+            let key = keys.key(context, 0);
             let mut scores = Scores::<KvHeads, Groups>::new();
             Op::forward(
-                &fresh::FreshScores,
+                &fresh::TileScores,
                 &mut *context,
-                (input.attention, query.clone(), &key, scores.view_mut()),
+                (
+                    input.attention,
+                    (queries, 0),
+                    (key, &mut keys),
+                    scores.view_mut(),
+                ),
             );
             let (probabilities, lse) = Op::forward(&panel::Normalize, &mut *context, scores.view());
-            let value = Op::forward(
-                &fresh::LoadValues::<KvHeads, Groups, Head>(PhantomData),
+            let mut values = fresh::Staged::<KvHeads, Head>::new();
+            Op::forward(
+                &fresh::StageValues,
                 &mut *context,
-                Cache::rows(input.value, input.start + j * 128),
+                (Cache::rows(input.value, input.start + j * 128), &mut values),
             );
             let partial = Op::forward(
-                &panel::Weight,
+                &panel::WeighParts::<Head>(PhantomData),
                 &mut *context,
-                (probabilities.view(), &value),
+                (probabilities.view(), &mut values),
             );
             Op::forward(
                 &state::Merge,
@@ -681,7 +737,6 @@ type Keys<P> = m![{ Symbol<<P as Panel>::Keys> }];
 type TileOf<T> = m![{ Symbol<T> } = 1 # ({ Symbol<T> })];
 type TileSlot<T> = m![{ Symbol<T> } = 1 #{!} ({ Symbol<T> })];
 type TileRows<Head, T> = m![{ TileOf<T> }, Rows % 8, Head];
-type TileRowSlot<Head, T> = m![{ TileSlot<T> }, Rows % 8, Head];
 type TileStatistic<T> = m![{ TileOf<T> }, Rows % 8, 1 # 8];
 type TileStatisticSlot<T> = m![{ TileSlot<T> }, Rows % 8, 1 # 8];
 type CachePanel<KvHeads, Head> = HbmTensor<bf16, Chip, m![Cache, KvHeads, Head]>;
@@ -689,6 +744,26 @@ type Cluster<KvHeads> = m![KvHeads / 4];
 /// A slice's KV head of its cluster's four, its query group of four, and its eight rows of a tile;
 /// fewer query groups leave the slices of the absent ones empty.
 type Slice<KvHeads, Groups> = m![KvHeads % 4, Groups # 4, Rows / 8];
+/// The channels of a head one register fill of a panel holds: the head, or a part of it.
+#[derive(Clone, Debug)]
+pub(crate) struct Part<Head>(PhantomData<Head>);
+impl<Head: AxisName> AxisName for Part<Head> {
+    const NAME: Ident = Ident::new("Part");
+    const SIZE: usize = attention::channels(Head::SIZE, Cache::SIZE);
+}
+impl<Head: AxisName> Part<Head> {
+    /// The parts of a head.
+    const COUNT: usize = Head::SIZE / <Self as AxisName>::SIZE;
+    /// Whether one fill holds the whole head. A wider head doubles each owner per head, so its
+    /// groups of four tiles attend apart, not paired, over history blocks of at most 1024 keys.
+    const WHOLE: bool = Self::COUNT == 1;
+}
+/// A part's channels of a head, and the parts.
+type Channels<Head> = m![Head % ({ Symbol<Part<Head>> })];
+type Parts<Head> = m![Head / ({ Symbol<Part<Head>> })];
+/// One part of an owner over a head's parts: read, and written in place.
+type PartOf<Head> = m![{ Parts<Head> } = 1 # ({ Parts<Head> })];
+type PartSlot<Head> = m![{ Parts<Head> } = 1 #{!} ({ Parts<Head> })];
 type Scalar<KvHeads, Groups> =
     VrfTensor<f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, m![Rows % 8, 1 # 8]>;
 type Local<KvHeads, Groups> =
@@ -814,21 +889,63 @@ where
             );
         }
         let committed = (runs, (&last_key, &last_value));
-        // Pairs cover whole chunks with or without history: a pair stores its tiles after both
-        // groups, so the second group's loads do not queue behind the first group's stores.
         const { assert!(All::SIZE >= TilePair::SIZE * Rows::SIZE) };
-        for r in 0..runs.records::<TilePair>() {
-            Pairs.forward(
-                &mut *context,
-                env,
-                &mut (),
-                (
-                    &input,
-                    (pool, &mut *output),
-                    (committed, epoch.record::<TilePair>(r)),
-                    ((boundary, &mut *state), keeps),
-                ),
-            );
+        const {
+            assert!(
+                Groups::SIZE <= 4,
+                "a KV head's query groups fill at most four slices"
+            )
+        };
+        if const { Part::<Head>::WHOLE } {
+            // Pairs cover whole chunks with or without history: a pair stores its tiles after
+            // both groups, so the second group's loads do not queue behind the first's stores.
+            for r in 0..runs.records::<TilePair>() {
+                Pairs.forward(
+                    &mut *context,
+                    env,
+                    &mut (),
+                    (
+                        &input,
+                        (pool, &mut *output),
+                        (committed, epoch.record::<TilePair>(r)),
+                        ((boundary, &mut *state), keeps),
+                    ),
+                );
+            }
+        } else {
+            // A pair's two groups attend apart, the second after the first's panels; only the
+            // first runs `boundary`.
+            for r in 0..runs.records::<TilePair>() {
+                let record = epoch.record::<TilePair>(r);
+                let mut kept = (DmTensor::new(), DmTensor::new());
+                let mut own = (DmTensor::new(), DmTensor::new());
+                Grouped::<TileGroup, 0>(PhantomData).forward(
+                    &mut *context,
+                    env,
+                    &mut (),
+                    (
+                        &input,
+                        (pool, &mut *output),
+                        committed,
+                        record,
+                        ((boundary, &mut *state), keeps),
+                        (&mut kept, &own),
+                    ),
+                );
+                Grouped::<TileGroup, 1>(PhantomData).forward(
+                    &mut *context,
+                    env,
+                    &mut (),
+                    (
+                        &input,
+                        (pool, &mut *output),
+                        committed,
+                        record,
+                        ((boundary, &mut *state), 0),
+                        (&mut own, &kept),
+                    ),
+                );
+            }
         }
         // A chunk holds at most two groups, so the block before any group or remainder tile is the
         // last group's own fresh panels: their fill layouts carry over from it.
@@ -836,7 +953,7 @@ where
         let mut previous: Kept<KvHeads, Head, Half> = (DmTensor::new(), DmTensor::new());
         for r in 0..runs.records::<TileGroup>() {
             let mut own = (DmTensor::new(), DmTensor::new());
-            Grouped::<TileGroup>(PhantomData).forward(
+            Grouped::<TileGroup, 0>(PhantomData).forward(
                 &mut *context,
                 env,
                 &mut (),
@@ -853,7 +970,7 @@ where
         }
         for r in 0..runs.records::<SingleTile>() {
             let mut own = (DmTensor::new(), DmTensor::new());
-            Grouped::<SingleTile>(PhantomData).forward(
+            Grouped::<SingleTile, 0>(PhantomData).forward(
                 &mut *context,
                 env,
                 &mut (),
@@ -877,9 +994,30 @@ type Committed<'a, KvHeads, Head, W> = (
     (&'a CachePanel<KvHeads, Head>, &'a CachePanel<KvHeads, Head>),
 );
 
-/// Attends `T` consecutive query tiles from the record's first: each tile's fresh keys, then every
-/// history block and full panel once for all of them, then the partial last panel per tile.
-struct Grouped<T>(PhantomData<T>);
+/// Attends `T` consecutive query tiles from the first of the record's group `G`: each tile's fresh
+/// keys, then every history block and full panel once for all of them, then the partial last panel
+/// per tile.
+struct Grouped<T, const G: usize>(PhantomData<T>);
+
+impl<T: AxisName, const G: usize> Grouped<T, G> {
+    /// The group's first tile: group `G` of a record starts `G` groups past its first tile.
+    fn first(record: Record) -> usize {
+        if const { G == 0 } {
+            record.first()
+        } else {
+            record.first() + G * T::SIZE
+        }
+    }
+
+    /// The whole fresh blocks before the group's tiles: the record's, then its groups before `G`.
+    fn preceding(record: Record) -> usize {
+        if const { G == 0 } {
+            record.preceding()
+        } else {
+            record.preceding() + G
+        }
+    }
+}
 
 impl<
     KvHeads: AxisName,
@@ -891,6 +1029,7 @@ impl<
     H,
     S,
     Env: Copy,
+    const G: usize,
 >
     Module<
         (
@@ -909,7 +1048,7 @@ impl<
         ),
         Env,
         &mut (),
-    > for Grouped<T>
+    > for Grouped<T, G>
 where
     H: for<'d, 's> Module<&'s mut S, Env, &'d mut (), Output = ()>,
 {
@@ -935,13 +1074,13 @@ where
             ),
         ),
     ) {
-        let first = record.first();
+        let first = Self::first(record);
         let mut source = Load {
             input,
             start: input.start + first * 128,
             kept: own,
             record,
-            tile: 0,
+            tile: const { G * T::SIZE },
         };
         // The first key panel loads ahead of the queries, so its fill runs under their copy.
         let key = source.key(context, 0);
@@ -963,7 +1102,7 @@ where
             ),
         );
         // At most one block precedes a group's tiles: the previous group's panels.
-        for _ in 0..record.preceding() {
+        for _ in 0..Self::preceding(record) {
             Module::forward(
                 &Preceding::<Half, T>(PhantomData),
                 &mut *context,
@@ -971,7 +1110,7 @@ where
                 &mut (),
                 (
                     input.attention,
-                    &mut Reuse::<KvHeads, Head, _>(previous),
+                    &mut Reuse::<KvHeads, Head, Half>(previous),
                     &queries,
                     (&mut carry, &mut running),
                 ),
@@ -980,19 +1119,44 @@ where
         T::within::<All, W>(context, input, record, &queries, (&mut carry, &mut running));
         let double = runs.double();
         for b in 0..double.count() {
-            Module::forward(
-                &history::FoldBlock::<Double>(PhantomData),
-                &mut *context,
-                env,
-                &mut (),
-                (
-                    input.attention,
-                    (input.table, pool),
-                    double.begin() + b,
-                    &queries,
-                    (&mut carry, &mut running),
-                ),
-            );
+            if const { Part::<Head>::WHOLE } {
+                Module::forward(
+                    &history::FoldBlock::<Double>(PhantomData),
+                    &mut *context,
+                    env,
+                    &mut (),
+                    (
+                        input.attention,
+                        (input.table, pool),
+                        double.begin() + b,
+                        &queries,
+                        (&mut carry, &mut running),
+                    ),
+                );
+            } else {
+                // A wider head's 2048-key block is gathered and folded a 1024-key half at a time.
+                #[unroll]
+                for half in 0..Keys2048::SIZE / Keys1024::SIZE {
+                    let block = Op::forward(
+                        &history::Gathered::<Wide>(PhantomData),
+                        &mut *context,
+                        (
+                            (input.table, pool),
+                            (double.begin() + b) * (Keys2048::SIZE / Keys1024::SIZE) + half,
+                        ),
+                    );
+                    Op::forward(
+                        &history::FoldWide,
+                        &mut *context,
+                        (
+                            input.attention,
+                            &block,
+                            &queries,
+                            (&mut carry, &mut running),
+                        ),
+                    );
+                }
+            }
         }
         Module::forward(
             &Fold,
@@ -1176,7 +1340,7 @@ where
             &mut (),
             (
                 input.attention,
-                &mut Reuse::<KvHeads, Head, _>(&kept),
+                &mut Reuse::<KvHeads, Head, Half>(&kept),
                 &Paired::<_, 1>(&queries),
                 (
                     &mut Paired::<_, 1>(&mut carry),
@@ -1265,10 +1429,16 @@ type HalfTile<E> = m![{ Symbol<Halves> } = 1 # ({ Symbol<Halves> }), { TileOf<Ti
 type HalfTileSlot<E> = m![{ Symbol<Halves> } = 1 #{!} ({ Symbol<Halves> }),
     { TileSlot<TileGroup> }, Rows % 8, { E }];
 
+/// A view of query tiles in their slices.
+type QueryView<'a, KvHeads, Groups, E> =
+    DmTensorView<'a, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, E>;
+
 /// A group's queries: an owner of its own, or its half of a pair's.
 trait QueryTiles<KvHeads: AxisName, Groups: AxisName, Head: AxisName> {
     type Group: M;
     type From<R: AxisName>: M;
+    type GroupPart: M;
+    type FromPart<R: AxisName>: M;
     fn group(
         &self,
     ) -> DmTensorView<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Self::Group>;
@@ -1277,12 +1447,23 @@ trait QueryTiles<KvHeads: AxisName, Groups: AxisName, Head: AxisName> {
         &self,
         s: usize,
     ) -> DmTensorView<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Self::From<R>>;
+    /// Channel part `j` of every tile.
+    fn group_part(&self, j: usize) -> QueryView<'_, KvHeads, Groups, Self::GroupPart>;
+    /// Channel part `j` of tiles `s..s + N` as a run of `R`.
+    fn part_from<R: AxisName, const N: usize>(
+        &self,
+        s: usize,
+        j: usize,
+    ) -> QueryView<'_, KvHeads, Groups, Self::FromPart<R>>;
 }
 impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, T: AxisName>
     QueryTiles<KvHeads, Groups, Head> for history::Group<KvHeads, Groups, Head, T>
 {
     type Group = m![{ Symbol<T> }, Rows % 8, Head];
     type From<R: AxisName> = m![{ Symbol<R> } # ({ Symbol<T> }), Rows % 8, Head];
+    type GroupPart = m![{ Symbol<T> }, Rows % 8, { PartOf<Head> }, { Channels<Head> }];
+    type FromPart<R: AxisName> =
+        m![{ Symbol<R> } # ({ Symbol<T> }), Rows % 8, { PartOf<Head> }, { Channels<Head> }];
     fn group(
         &self,
     ) -> DmTensorView<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Self::Group> {
@@ -1303,6 +1484,17 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, T: AxisName>
             .reshape()
         }
     }
+    fn group_part(&self, j: usize) -> QueryView<'_, KvHeads, Groups, Self::GroupPart> {
+        self.view().tile::<Parts<Head>, 1, Self::GroupPart>(j)
+    }
+    fn part_from<R: AxisName, const N: usize>(
+        &self,
+        s: usize,
+        j: usize,
+    ) -> QueryView<'_, KvHeads, Groups, Self::FromPart<R>> {
+        self.from::<R, N>(s)
+            .tile::<Parts<Head>, 1, Self::FromPart<R>>(j)
+    }
 }
 impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const G: usize>
     QueryTiles<KvHeads, Groups, Head> for Paired<&Halved<KvHeads, Groups, bf16, m![Head]>, G>
@@ -1310,6 +1502,9 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const G: usize>
     type Group = HalfOf<m![Head]>;
     type From<R: AxisName> = m![{ Symbol<Halves> } = 1 # ({ Symbol<Halves> }),
         { Symbol<R> } # ({ Symbol<TileGroup> }), Rows % 8, Head];
+    type GroupPart = HalfOf<m![{ PartOf<Head> }, { Channels<Head> }]>;
+    type FromPart<R: AxisName> = m![{ Symbol<Halves> } = 1 # ({ Symbol<Halves> }),
+        { Symbol<R> } # ({ Symbol<TileGroup> }), Rows % 8, { PartOf<Head> }, { Channels<Head> }];
     fn group(
         &self,
     ) -> DmTensorView<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Self::Group> {
@@ -1329,6 +1524,17 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const G: usize>
             .reshape()
         }
     }
+    fn group_part(&self, j: usize) -> QueryView<'_, KvHeads, Groups, Self::GroupPart> {
+        self.group().tile::<Parts<Head>, 1, Self::GroupPart>(j)
+    }
+    fn part_from<R: AxisName, const N: usize>(
+        &self,
+        s: usize,
+        j: usize,
+    ) -> QueryView<'_, KvHeads, Groups, Self::FromPart<R>> {
+        self.from::<R, N>(s)
+            .tile::<Parts<Head>, 1, Self::FromPart<R>>(j)
+    }
 }
 
 /// Group `G`'s tiles of a pair's owner, through a shared or a mutable reference `O`.
@@ -1340,6 +1546,8 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, E: M, const G: usize>
     type GroupSlot = HalfSlot<E>;
     type Tile = HalfTile<E>;
     type TileSlot = HalfTileSlot<E>;
+    type TilePart = HalfTile<m![{ PartOf<Head> }, { Channels<Head> }]>;
+    type TilePartSlot = HalfTileSlot<m![{ PartSlot<Head> }, { Channels<Head> }]>;
     fn group(
         &self,
     ) -> DmTensorView<'_, f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, HalfOf<E>> {
@@ -1368,6 +1576,23 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, E: M, const G: usize>
     {
         <Self as state::Tiles<KvHeads, Groups, Head>>::group_mut(self)
             .tile::<m![{ Symbol<TileGroup> }], 1, HalfTileSlot<E>>(t)
+    }
+    fn tile_part(
+        &self,
+        t: usize,
+        j: usize,
+    ) -> DmTensorView<'_, f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Self::TilePart> {
+        <Self as state::Tiles<KvHeads, Groups, Head>>::tile(self, t)
+            .tile::<Parts<Head>, 1, Self::TilePart>(j)
+    }
+    fn tile_part_mut(
+        &mut self,
+        t: usize,
+        j: usize,
+    ) -> DmTensorViewMut<'_, f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Self::TilePartSlot>
+    {
+        <Self as state::Tiles<KvHeads, Groups, Head>>::tile_mut(self, t)
+            .tile::<Parts<Head>, 1, Self::TilePartSlot>(j)
     }
 }
 
@@ -1506,51 +1731,100 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, T: AxisName, All: Axis
             );
         }
         // Only the partial last panel, masked to the committed keys, is attended per tile; its key
-        // and value fills and its mask serve every tile.
+        // and value fills and its mask serve every tile. A head wider than one fill keeps the
+        // panel staged and fills a tile's parts one after another.
         let partial = runs.partial();
         for _ in 0..partial.count() {
-            let key = Op::forward(
-                &fresh::LoadKeys::<KvHeads, Groups, Head>(PhantomData),
-                &mut *context,
-                last.0.view(),
-            );
-            let mask = Op::forward(
-                &history::LastKeys::<KvHeads, Groups>(PhantomData),
-                &mut *context,
-                (input.lanes, input.slots, partial.begin()),
-            );
-            let value = Op::forward(
-                &fresh::LoadValues::<KvHeads, Groups, Head>(PhantomData),
-                &mut *context,
-                last.1.view(),
-            );
-            #[unroll]
-            for i in 0..T::SIZE {
-                let query = queries
-                    .view()
-                    .tile::<m![{ Symbol<T> }], 1, TileRows<Head, T>>(i);
-                let mut scores = Scores::<KvHeads, Groups>::new();
+            if const { Part::<Head>::WHOLE } {
+                let key = Op::forward(
+                    &fresh::LoadKeys::<KvHeads, Groups, Head>(PhantomData),
+                    &mut *context,
+                    last.0.view(),
+                );
+                let mask = Op::forward(
+                    &history::LastKeys::<KvHeads, Groups>(PhantomData),
+                    &mut *context,
+                    (input.lanes, input.slots, partial.begin()),
+                );
+                let value = Op::forward(
+                    &fresh::LoadValues::<KvHeads, Groups, Head>(PhantomData),
+                    &mut *context,
+                    last.1.view(),
+                );
+                #[unroll]
+                for i in 0..T::SIZE {
+                    let query = queries
+                        .view()
+                        .tile::<m![{ Symbol<T> }], 1, TileRows<Head, T>>(i);
+                    let mut scores = Scores::<KvHeads, Groups>::new();
+                    Op::forward(
+                        &fresh::FreshScores,
+                        &mut *context,
+                        (input.attention, query, &key, scores.view_mut()),
+                    );
+                    let scores = Op::forward(&history::MaskScores, &mut *context, (&scores, &mask));
+                    let (probabilities, lse) =
+                        Op::forward(&panel::Normalize, &mut *context, scores.view());
+                    let mut partial = Partial::<KvHeads, Groups, Head>::new();
+                    Op::forward(
+                        &panel::Weight,
+                        &mut *context,
+                        (probabilities.view(), &value, partial.view_mut()),
+                    );
+                    Op::forward(
+                        &state::Merge,
+                        &mut *context,
+                        (
+                            (&mut *carry, &mut *running, i),
+                            (partial.view(), lse.view()),
+                        ),
+                    );
+                }
+            } else {
+                let mut keys: fresh::KeyPanel<KvHeads, Head> =
+                    last.0.view().to_dm(&mut context.tdma);
+                let mask = Op::forward(
+                    &history::LastKeys::<KvHeads, Groups>(PhantomData),
+                    &mut *context,
+                    (input.lanes, input.slots, partial.begin()),
+                );
+                let mut values = fresh::Staged::<KvHeads, Head>::new();
                 Op::forward(
-                    &fresh::FreshScores,
+                    &fresh::StageValues,
                     &mut *context,
-                    (input.attention, query, &key, scores.view_mut()),
+                    (last.1.view(), &mut values),
                 );
-                let scores = Op::forward(&history::MaskScores, &mut *context, (&scores, &mask));
-                let (probabilities, lse) =
-                    Op::forward(&panel::Normalize, &mut *context, scores.view());
-                let partial = Op::forward(
-                    &panel::Weight,
-                    &mut *context,
-                    (probabilities.view(), &value),
-                );
-                Op::forward(
-                    &state::Merge,
-                    &mut *context,
-                    (
-                        (&mut *carry, &mut *running, i),
-                        (partial.view(), lse.view()),
-                    ),
-                );
+                #[unroll]
+                for i in 0..T::SIZE {
+                    let key = keys.key(context, 0);
+                    let mut scores = Scores::<KvHeads, Groups>::new();
+                    Op::forward(
+                        &fresh::TileScores,
+                        &mut *context,
+                        (
+                            input.attention,
+                            (queries, i),
+                            (key, &mut keys),
+                            scores.view_mut(),
+                        ),
+                    );
+                    let scores = Op::forward(&history::MaskScores, &mut *context, (&scores, &mask));
+                    let (probabilities, lse) =
+                        Op::forward(&panel::Normalize, &mut *context, scores.view());
+                    let partial = Op::forward(
+                        &panel::WeighParts::<Head>(PhantomData),
+                        &mut *context,
+                        (probabilities.view(), &mut values),
+                    );
+                    Op::forward(
+                        &state::Merge,
+                        &mut *context,
+                        (
+                            (&mut *carry, &mut *running, i),
+                            (partial.view(), lse.view()),
+                        ),
+                    );
+                }
             }
         }
     }
@@ -1582,7 +1856,7 @@ impl<
     Head: AxisName,
     P: Panel,
     T: AxisName,
-    S: Source<KvHeads, Groups, Head, P>,
+    S: KeySource<KvHeads, Groups, Head> + ValueSource<KvHeads, Groups, Head>,
     Q: QueryTiles<KvHeads, Groups, Head>,
     C: state::Tiles<KvHeads, Groups, Head>,
     R: state::Tiles<KvHeads, Groups, Head>,
@@ -1611,12 +1885,7 @@ impl<
         Op::forward(
             &ScoreBlock::<P>(PhantomData),
             &mut *context,
-            (
-                attention,
-                (key, |context: &mut Device, s| source.key(context, s)),
-                queries,
-                &mut scores,
-            ),
+            (attention, (key, &mut *source), queries, &mut scores),
         );
         // SAFETY: the panel axis is outer to Cache, so each row keeps every key in its block order.
         let score_rows = unsafe {
@@ -1639,12 +1908,9 @@ impl<
             );
         }
         let partials = Op::forward(
-            &WeighBlock::<P>(PhantomData),
+            &WeighBlock::<P, Head>(PhantomData),
             &mut *context,
-            (
-                |context: &mut Device, s| source.value(context, s),
-                &probabilities,
-            ),
+            (source, &probabilities),
         );
         Op::forward(
             &state::Absorb,
@@ -1654,30 +1920,51 @@ impl<
     }
 }
 
-/// A block's panels in the layouts their register-file fills read, kept for another group.
+/// A block's panels in the layouts their register-file fills read, each part's apart, kept for
+/// another group.
 type Kept<KvHeads, Head, P> = (
     DmTensor<
         bf16,
         Chip,
         Cluster<KvHeads>,
         fresh::Switched<KvHeads, Head>,
-        m![{ Panels<P> }, Cache % 8, Head % 32],
+        m![{ Panels<P> }, { Parts<Head> }, Cache % 8, Head % 32],
     >,
     DmTensor<
         bf16,
         Chip,
         Cluster<KvHeads>,
         fresh::ValueSlice<KvHeads, Head>,
-        m![{ Panels<P> }, Head % 16, Cache % 16],
+        m![{ Panels<P> }, { Parts<Head> }, Head % 16, Cache % 16],
     >,
 );
 type KeptPanel<P> = m![{ Symbol<<P as Panel>::Span> } = 1 # ({ Symbol<<P as Panel>::Span> })];
 type KeptSlot<P> = m![{ Symbol<<P as Panel>::Span> } = 1 #{!} ({ Symbol<<P as Panel>::Span> })];
 
-/// Where a fresh block's panel `s` comes from, as one register-file fill of keys or values.
-trait Source<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel> {
+/// Where a block's keys come from: one register-file fill a channel part of a panel.
+trait KeySource<KvHeads: AxisName, Groups: AxisName, Head: AxisName> {
+    /// Panel `s`'s first part, the panel relaid first where it is fresh.
     fn key(&mut self, context: &mut Device, s: usize) -> fresh::Keys<KvHeads, Groups, Head>;
+    /// Panel `s`'s part `j`, once its first is filled.
+    fn key_part(
+        &mut self,
+        context: &mut Device,
+        s: usize,
+        j: usize,
+    ) -> fresh::Keys<KvHeads, Groups, Head>;
+}
+
+/// Where a block's values come from: one register-file fill a channel part of a panel.
+trait ValueSource<KvHeads: AxisName, Groups: AxisName, Head: AxisName> {
+    /// Panel `s`'s first part, the panel relaid first where it is fresh.
     fn value(&mut self, context: &mut Device, s: usize) -> fresh::Values<KvHeads, Groups, Head>;
+    /// Panel `s`'s part `j`, once its first is filled.
+    fn value_part(
+        &mut self,
+        context: &mut Device,
+        s: usize,
+        j: usize,
+    ) -> fresh::Values<KvHeads, Groups, Head>;
 }
 
 /// The fresh rows from `start`, loaded and relaid once, their fill layouts kept in `kept` for a
@@ -1699,36 +1986,53 @@ struct Load<
     tile: usize,
 }
 impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, All: AxisName, W: AxisName, P: Panel>
-    Source<KvHeads, Groups, Head, P> for Load<'_, '_, KvHeads, Groups, Head, All, W, P>
+    KeySource<KvHeads, Groups, Head> for Load<'_, '_, KvHeads, Groups, Head, All, W, P>
 {
     fn key(&mut self, context: &mut Device, s: usize) -> fresh::Keys<KvHeads, Groups, Head> {
-        let staged: DmTensor<
-            bf16,
-            Chip,
-            Cluster<KvHeads>,
-            fresh::KeyStage<KvHeads>,
-            m![Cache % 2, Head],
-        > = Cache::rows(self.input.key, self.start + s * 128).to_dm(&mut context.tdma);
-        Op::forward(
-            &fresh::SwitchKeys,
-            &mut *context,
-            (
-                staged.view(),
-                self.kept
-                    .0
-                    .view_mut()
-                    .tile::<Panels<P>, 1, m![{ KeptSlot<P> }, Cache % 8, Head % 32]>(s),
-            ),
-        );
+        let staged: fresh::KeyPanel<KvHeads, Head> =
+            Cache::rows(self.input.key, self.start + s * 128).to_dm(&mut context.tdma);
+        #[unroll]
+        for j in 0..Part::<Head>::COUNT {
+            Op::forward(
+                &fresh::SwitchKeys,
+                &mut *context,
+                (
+                    staged.view().tile::<
+                        Parts<Head>,
+                        1,
+                        m![Cache % 2, { PartOf<Head> }, { Channels<Head> }],
+                    >(j),
+                    self.kept
+                        .0
+                        .view_mut()
+                        .tile::<Panels<P>, 1,
+                            m![{ KeptSlot<P> }, { Parts<Head> }, Cache % 8, Head % 32]>(s)
+                        .tile::<Parts<Head>, 1,
+                            m![{ KeptSlot<P> }, { PartSlot<Head> }, Cache % 8, Head % 32]>(j),
+                ),
+            );
+        }
         Reuse::<KvHeads, Head, P>(&*self.kept).key(context, s)
     }
+    fn key_part(
+        &mut self,
+        context: &mut Device,
+        s: usize,
+        j: usize,
+    ) -> fresh::Keys<KvHeads, Groups, Head> {
+        Reuse::<KvHeads, Head, P>(&*self.kept).key_part(context, s, j)
+    }
+}
+impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, All: AxisName, W: AxisName, P: Panel>
+    ValueSource<KvHeads, Groups, Head> for Load<'_, '_, KvHeads, Groups, Head, All, W, P>
+{
     fn value(&mut self, context: &mut Device, s: usize) -> fresh::Values<KvHeads, Groups, Head> {
         let values = Cache::rows(self.input.value, self.start + s * 128);
         let mut staged = fresh::Staged::<KvHeads, Head>::new();
         Op::forward(
             &fresh::StageValues,
             &mut *context,
-            (values.clone(), staged.view_mut()),
+            (values.clone(), &mut staged),
         );
         // Rows past the chunk's last may hold any bits, and a key's zero probability times NaN is
         // NaN; only the chunk's last tile holds such rows.
@@ -1738,54 +2042,95 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, All: AxisName, W: Axis
                 &mut *context,
                 (
                     (values.clone(), (self.input.causal, self.record.last())),
-                    staged.view_mut(),
+                    &mut staged,
                 ),
             );
         }
-        Op::forward(
-            &fresh::TransposeValues,
-            &mut *context,
-            (
-                staged.view(),
-                self.kept
-                    .1
-                    .view_mut()
-                    .tile::<Panels<P>, 1, m![{ KeptSlot<P> }, Head % 16, Cache % 16]>(s),
-            ),
-        );
+        #[unroll]
+        for j in 0..Part::<Head>::COUNT {
+            Op::forward(
+                &fresh::TransposeValues,
+                &mut *context,
+                (
+                    staged
+                        .view()
+                        .tile::<Parts<Head>, 1, m![{ PartOf<Head> }, Cache % 16, Head % 16]>(j),
+                    self.kept
+                        .1
+                        .view_mut()
+                        .tile::<Panels<P>, 1,
+                            m![{ KeptSlot<P> }, { Parts<Head> }, Head % 16, Cache % 16]>(s)
+                        .tile::<Parts<Head>, 1,
+                            m![{ KeptSlot<P> }, { PartSlot<Head> }, Head % 16, Cache % 16]>(j),
+                ),
+            );
+        }
         Reuse::<KvHeads, Head, P>(&*self.kept).value(context, s)
+    }
+    fn value_part(
+        &mut self,
+        context: &mut Device,
+        s: usize,
+        j: usize,
+    ) -> fresh::Values<KvHeads, Groups, Head> {
+        Reuse::<KvHeads, Head, P>(&*self.kept).value_part(context, s, j)
     }
 }
 
 /// Panels another group's block already relaid, filled straight from their kept layouts.
 struct Reuse<'a, KvHeads: AxisName, Head: AxisName, P: Panel>(&'a Kept<KvHeads, Head, P>);
-impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel> Source<KvHeads, Groups, Head, P>
+impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel> KeySource<KvHeads, Groups, Head>
     for Reuse<'_, KvHeads, Head, P>
 {
     fn key(&mut self, context: &mut Device, s: usize) -> fresh::Keys<KvHeads, Groups, Head> {
+        self.key_part(context, s, 0)
+    }
+    fn key_part(
+        &mut self,
+        context: &mut Device,
+        s: usize,
+        j: usize,
+    ) -> fresh::Keys<KvHeads, Groups, Head> {
         Op::forward(
             &fresh::RegisterKeys::<Groups>(PhantomData),
             context,
             self.0
                 .0
                 .view()
-                .tile::<Panels<P>, 1, m![{ KeptPanel<P> }, Cache % 8, Head % 32]>(s),
+                .tile::<Panels<P>, 1, m![{ KeptPanel<P> }, { Parts<Head> }, Cache % 8, Head % 32]>(s)
+                .tile::<Parts<Head>, 1,
+                    m![{ KeptPanel<P> }, { PartOf<Head> }, Cache % 8, Head % 32]>(j),
         )
     }
+}
+impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel>
+    ValueSource<KvHeads, Groups, Head> for Reuse<'_, KvHeads, Head, P>
+{
     fn value(&mut self, context: &mut Device, s: usize) -> fresh::Values<KvHeads, Groups, Head> {
+        self.value_part(context, s, 0)
+    }
+    fn value_part(
+        &mut self,
+        context: &mut Device,
+        s: usize,
+        j: usize,
+    ) -> fresh::Values<KvHeads, Groups, Head> {
         Op::forward(
             &fresh::RegisterValues::<Groups>(PhantomData),
             context,
             self.0
                 .1
                 .view()
-                .tile::<Panels<P>, 1, m![{ KeptPanel<P> }, Head % 16, Cache % 16]>(s),
+                .tile::<Panels<P>, 1, m![{ KeptPanel<P> }, { Parts<Head> }, Head % 16, Cache % 16]>(s)
+                .tile::<Parts<Head>, 1,
+                    m![{ KeptPanel<P> }, { PartOf<Head> }, Head % 16, Cache % 16]>(j),
         )
     }
 }
 
-/// The scaled scores of a block's `P::Span` panels for every tile of the group, into `scores`:
-/// one fill, the first already made, and one contraction per panel.
+/// The scaled scores of a block's `P::Span` panels for every tile of the group, into `scores`,
+/// the first panel's first fill already made: a head one fill holds takes a contraction a panel,
+/// a wider one a contraction a part, whose FP32 dot products sum before one rounding.
 struct ScoreBlock<P>(PhantomData<P>);
 
 impl<
@@ -1794,12 +2139,12 @@ impl<
     Head: AxisName,
     P: Panel,
     T: AxisName,
-    F: FnMut(&mut Device, usize) -> fresh::Keys<KvHeads, Groups, Head>,
+    S: KeySource<KvHeads, Groups, Head>,
     Q: QueryTiles<KvHeads, Groups, Head>,
 >
     Op<(
         &Attention<KvHeads, Groups, Head>,
-        (fresh::Keys<KvHeads, Groups, Head>, F),
+        (fresh::Keys<KvHeads, Groups, Head>, &mut S),
         &Q,
         &mut history::PanelScores<KvHeads, Groups, P, T>,
     )> for ScoreBlock<P>
@@ -1809,35 +2154,74 @@ impl<
     fn forward(
         &self,
         context: &mut Device,
-        (attention, (first, mut fill), queries, scores): (
+        (attention, (first, source), queries, scores): (
             &Attention<KvHeads, Groups, Head>,
-            (fresh::Keys<KvHeads, Groups, Head>, F),
+            (fresh::Keys<KvHeads, Groups, Head>, &mut S),
             &Q,
             &mut history::PanelScores<KvHeads, Groups, P, T>,
         ),
     ) {
         let mut key = first;
-        #[unroll]
-        for s in 1..P::Span::SIZE {
-            let next = fill(context, s);
+        if const { Part::<Head>::WHOLE } {
+            #[unroll]
+            for s in 1..P::Span::SIZE {
+                let next = source.key(context, s);
+                Op::forward(
+                    &history::Score::<P>(PhantomData),
+                    &mut *context,
+                    (attention, queries.group(), &key, &mut *scores, s - 1),
+                );
+                key = next;
+            }
             Op::forward(
                 &history::Score::<P>(PhantomData),
-                &mut *context,
-                (attention, queries.group(), &key, &mut *scores, s - 1),
+                context,
+                (attention, queries.group(), &key, scores, P::Span::SIZE - 1),
             );
-            key = next;
+        } else {
+            let parts = move |j| queries.group_part(j);
+            #[unroll]
+            for s in 0..P::Span::SIZE - 1 {
+                let (sum, last, next) = Op::forward(
+                    &history::Dots::<T>(PhantomData),
+                    &mut *context,
+                    (
+                        attention,
+                        parts,
+                        (key, &mut *source, s),
+                        move |source: &mut S, context: &mut Device| source.key(context, s + 1),
+                    ),
+                );
+                Op::forward(
+                    &history::RoundPanel::<P>(PhantomData),
+                    &mut *context,
+                    ((&sum, &last), &mut *scores, s),
+                );
+                key = next;
+            }
+            let (sum, last, ()) = Op::forward(
+                &history::Dots::<T>(PhantomData),
+                &mut *context,
+                (
+                    attention,
+                    parts,
+                    (key, &mut *source, P::Span::SIZE - 1),
+                    |_: &mut S, _: &mut Device| (),
+                ),
+            );
+            Op::forward(
+                &history::RoundPanel::<P>(PhantomData),
+                context,
+                ((&sum, &last), scores, P::Span::SIZE - 1),
+            );
         }
-        Op::forward(
-            &history::Score::<P>(PhantomData),
-            context,
-            (attention, queries.group(), &key, scores, P::Span::SIZE - 1),
-        );
     }
 }
 
 /// Each tile's per-panel weighted values of a block's panels under the block's probabilities:
-/// one value fill and one contraction per panel.
-struct WeighBlock<P>(PhantomData<P>);
+/// one value fill and one contraction per channel part of a panel, each into that part's
+/// channels.
+struct WeighBlock<P, Head>(PhantomData<(P, Head)>);
 
 impl<
     KvHeads: AxisName,
@@ -1845,15 +2229,15 @@ impl<
     Head: AxisName,
     P: Panel,
     T: AxisName,
-    F: FnMut(&mut Device, usize) -> fresh::Values<KvHeads, Groups, Head>,
-> Op<(F, &history::Keyed<KvHeads, Groups, P, T>)> for WeighBlock<P>
+    S: ValueSource<KvHeads, Groups, Head>,
+> Op<(&mut S, &history::Keyed<KvHeads, Groups, P, T>)> for WeighBlock<P, Head>
 {
     type Output = history::Partials<KvHeads, Groups, Head, P, T>;
 
     fn forward(
         &self,
         context: &mut Device,
-        (mut fill, probabilities): (F, &history::Keyed<KvHeads, Groups, P, T>),
+        (source, probabilities): (&mut S, &history::Keyed<KvHeads, Groups, P, T>),
     ) -> Self::Output {
         // SAFETY: the inverse relabel of the key rows.
         let probabilities = unsafe {
@@ -1861,47 +2245,135 @@ impl<
                 m![{ Symbol<T> }, Rows % 8, { Panels<P> }, Cache]>()
         };
         let mut partials = history::Partials::<KvHeads, Groups, Head, P, T>::new();
-        let mut value = fill(context, 0);
+        let mut value = source.value(context, 0);
         #[unroll]
         for s in 1..P::Span::SIZE {
-            let next = fill(context, s);
+            value = Op::forward(
+                &WeighPanel::<P>(PhantomData),
+                &mut *context,
+                (
+                    &probabilities,
+                    (value, &mut *source, s - 1),
+                    &mut partials,
+                    move |source: &mut S, context: &mut Device| source.value(context, s),
+                ),
+            );
+        }
+        Op::forward(
+            &WeighPanel::<P>(PhantomData),
+            &mut *context,
+            (
+                &probabilities,
+                (value, source, P::Span::SIZE - 1),
+                &mut partials,
+                |_: &mut S, _: &mut Device| (),
+            ),
+        );
+        partials
+    }
+}
+
+/// Panel `s`'s probabilities times its values for every tile of the group, one contraction a
+/// channel part into that part's channels, the first part's fill already made; `next` makes the
+/// following fill before the last contraction.
+struct WeighPanel<P>(PhantomData<P>);
+
+impl<
+    KvHeads: AxisName,
+    Groups: AxisName,
+    Head: AxisName,
+    P: Panel,
+    T: AxisName,
+    S: ValueSource<KvHeads, Groups, Head>,
+    N,
+    F: FnOnce(&mut S, &mut Device) -> N,
+>
+    Op<(
+        &DmTensorView<
+            '_,
+            bf16,
+            Chip,
+            Cluster<KvHeads>,
+            Slice<KvHeads, Groups>,
+            m![{ Symbol<T> }, Rows % 8, { Panels<P> }, Cache],
+        >,
+        (fresh::Values<KvHeads, Groups, Head>, &mut S, usize),
+        &mut history::Partials<KvHeads, Groups, Head, P, T>,
+        F,
+    )> for WeighPanel<P>
+{
+    type Output = N;
+
+    fn forward(
+        &self,
+        context: &mut Device,
+        (probabilities, (first, source, s), partials, next): (
+            &DmTensorView<
+                '_,
+                bf16,
+                Chip,
+                Cluster<KvHeads>,
+                Slice<KvHeads, Groups>,
+                m![{ Symbol<T> }, Rows % 8, { Panels<P> }, Cache],
+            >,
+            (fresh::Values<KvHeads, Groups, Head>, &mut S, usize),
+            &mut history::Partials<KvHeads, Groups, Head, P, T>,
+            F,
+        ),
+    ) -> Self::Output {
+        let mut value = first;
+        #[unroll]
+        for j in 1..Part::<Head>::COUNT {
+            let later = source.value_part(context, s, j);
             Op::forward(
                 &history::Weigh::<P>(PhantomData),
                 &mut *context,
-                (&probabilities, &value, &mut partials, s - 1),
+                (probabilities, &value, &mut *partials, (s, j - 1)),
             );
-            value = next;
+            value = later;
         }
+        let next = next(source, context);
         Op::forward(
             &history::Weigh::<P>(PhantomData),
-            &mut *context,
-            (&probabilities, &value, &mut partials, P::Span::SIZE - 1),
+            context,
+            (
+                probabilities,
+                &value,
+                partials,
+                (s, Part::<Head>::COUNT - 1),
+            ),
         );
-        partials
+        next
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::chunks::{self, Words};
+    use super::super::gqa::items::tests::{QueryPairs, UNIT, Wide};
     use super::*;
     use crate::tensor::axis::Rows;
     use crate::tensor::cache::Blocks;
     use crate::tensor::live::tests::count;
+    use crate::tensor::scalar::F32;
     use crate::tests::DEVICE;
     use furiosa_opt_std::runtime::launch;
     axes![KvHeads = 8, Groups = 4, Pairs = 2, Head = 128, Windows = 80];
     type FixtureRows = Rows<1024>;
     type Sequences = Rows<1>;
-    type Queries<G> = HbmTensor<bf16, Chip, m![Query, KvHeads, G, Head]>;
-    type Fresh = HbmTensor<bf16, Chip, m![FixtureRows, KvHeads, Head]>;
-    type Output<G> = HbmTensor<bf16, Chip, m![FixtureRows, KvHeads, G, Head]>;
+    type Queries<H, G, D> = HbmTensor<bf16, Chip, m![Query, H, G, D]>;
+    type Fresh<H, D> = HbmTensor<bf16, Chip, m![FixtureRows, H, D]>;
+    type Output<H, G, D> = HbmTensor<bf16, Chip, m![FixtureRows, H, G, D]>;
+
+    /// The score multiplier of 128-wide heads, `1 / sqrt(128)` rounded to BF16 (0.08837890625), as
+    /// FP32 bits.
+    const SCALE: usize = 0x3db5_0000;
 
     #[derive(DeviceSend)]
-    struct Chunk<G: AxisName> {
-        query: Queries<G>,
-        key: Fresh,
-        value: Fresh,
+    struct Chunk<H: AxisName, G: AxisName, D: AxisName> {
+        query: Queries<H, G, D>,
+        key: Fresh<H, D>,
+        value: Fresh<H, D>,
         causal: Causal,
         table: Table<Windows>,
         h: Value,
@@ -1911,24 +2383,24 @@ mod tests {
     }
 
     #[device(chip = 1)]
-    fn attend_chunk<G: AxisName>(
+    fn attend_chunk<H: AxisName, G: AxisName, D: AxisName, const SCALE: usize>(
         device: &mut Device,
-        chunk: &Chunk<G>,
-        blocks: &mut Blocks<KvHeads, Head>,
-        output: &mut Output<G>,
+        scale: &F32<SCALE>,
+        chunk: &Chunk<H, G, D>,
+        blocks: &mut Blocks<H, D>,
+        output: &mut Output<H, G, D>,
     ) {
         // SAFETY: fixture query rows are contiguous and share the same length.
         let query = unsafe {
             chunk
                 .query
                 .view()
-                .reshape::<Chip, m![FixtureRows, KvHeads, G, Head]>()
+                .reshape::<Chip, m![FixtureRows, H, G, D]>()
                 .alias()
         };
-        // A local: device code cannot read the constant that `&Attention {..}` is promoted to.
         let attention = Attention {
             heads: PhantomData,
-            scale: 0.08837890625f32,
+            scale: f32::from(*scale),
         };
         Attend.forward(
             device,
@@ -1936,7 +2408,7 @@ mod tests {
             &mut (),
             (
                 (
-                    Input::<KvHeads, G, Head, FixtureRows, Windows> {
+                    Input::<H, G, D, FixtureRows, Windows> {
                         attention: &attention,
                         query: &query,
                         key: &chunk.key,
@@ -1974,10 +2446,32 @@ mod tests {
         ((j + head * 3 + group * 5) % 15) as f32 / 32.0 - 0.21875
     }
 
-    /// The attended rows of a chunk of `q` rows of `G` query groups a KV head over `h` keys of a
-    /// poisoned, shuffled pool; scratch rows past the chunk's hold `past`, or else a NaN query and
-    /// the next key's key and value, and live row `nan` holds a NaN value.
-    async fn attend<G: AxisName>(
+    /// A query's and a key's factors on channel `channel`, constant over 16-channel runs of
+    /// periods 3 and 5, so no two 128-channel parts of a head are alike.
+    fn factors(channel: usize) -> (f32, f32) {
+        let run = channel / 16;
+        ((1 + run % 3) as f32, (1 + run % 5) as f32)
+    }
+
+    /// The power of two each key of `D`-wide heads is divided by, which keeps every score under
+    /// the multiplier of bits `SCALE` below 1.6, and that score per unit query and key.
+    fn gain<D: AxisName, const SCALE: usize>() -> (f32, f64) {
+        let products: f64 = (0..D::SIZE)
+            .map(|channel| {
+                let (query, key) = factors(channel);
+                f64::from(query * key)
+            })
+            .sum();
+        let gain = f64::from(f32::from(F32::<SCALE>)) * products;
+        let shrink = 2.0f32.powi(gain.log2().floor() as i32 - 3);
+        (shrink, gain / f64::from(shrink))
+    }
+
+    /// The attended rows of a chunk of `q` rows over `h` keys of a poisoned, shuffled pool of `H`
+    /// KV heads of `D` channels, `G` query groups each, under the score multiplier of bits
+    /// `SCALE`; scratch rows past the chunk's hold `past`, or else a NaN query and the next key's
+    /// key and value, and live row `nan` holds a NaN value. Attending leaves the pool's bytes.
+    async fn attend<H: AxisName, G: AxisName, D: AxisName, const SCALE: usize>(
         context: &mut Device,
         (q, h): (usize, usize),
         (past, nan): (Option<f32>, Option<usize>),
@@ -1985,24 +2479,28 @@ mod tests {
         let scratch = |row: usize, own: f32, next: f32| {
             bf16::from_f32(if row < q { own } else { past.unwrap_or(next) })
         };
+        let (heads, groups, width) = (H::SIZE, G::SIZE, D::SIZE);
+        let (shrink, _) = gain::<D, SCALE>();
+        let key = |k: usize, head: usize, channel: usize| kv(k, head) * factors(channel).1 / shrink;
         let blocks = 256;
         let physical = |logical: usize| (logical * 17 + 7) % blocks;
-        let mut allocation = Blocks::<KvHeads, Head> {
+        let mut allocation = Blocks::<H, D> {
             tokens: (0..blocks)
                 .map(|_| HbmTensor::alloc(&mut *context))
                 .collect::<Result<_, _>>()
                 .unwrap(),
         };
-        let mut data: Vec<bf16> = (0..blocks * 16 * 2 * 8 * 128)
+        let row = KeyValue::SIZE * heads * width;
+        let mut data: Vec<bf16> = (0..blocks * Block::SIZE * row)
             .map(|at| bf16::from_f32([f32::NAN, f32::INFINITY, f32::NEG_INFINITY][at % 3]))
             .collect();
         for k in 0..q + h {
-            let token = physical(k / 16) * 16 + k % 16;
-            for head in 0..8 {
-                for channel in 0..128 {
-                    let at = (token * 2 * 8 + head) * 128 + channel;
-                    data[at] = bf16::from_f32(kv(k, head));
-                    data[at + 8 * 128] = bf16::from_f32(value(k, head) * scale(channel));
+            let token = physical(k / Block::SIZE) * Block::SIZE + k % Block::SIZE;
+            for head in 0..heads {
+                for channel in 0..width {
+                    let at = token * row + head * width + channel;
+                    data[at] = bf16::from_f32(key(k, head, channel));
+                    data[at + heads * width] = bf16::from_f32(value(k, head) * scale(channel));
                 }
             }
         }
@@ -2012,8 +2510,9 @@ mod tests {
             .unwrap();
         let table: Table<Windows> =
             HostTensor::<i32, m![{ Symbol<Chunks<Windows>> }, Cache / Block]>::from_vec(
-                (0..Chunks::<Windows>::SIZE * 8)
-                    .map(|i| i32::try_from(physical(i % blocks) * 16 * 2 * 8 * 128 * 2).unwrap()),
+                (0..Chunks::<Windows>::SIZE * Cache::SIZE / Block::SIZE).map(|i| {
+                    i32::try_from(physical(i % blocks)).unwrap() * Blocks::<H, D>::BLOCK_STRIDE
+                }),
             )
             .to_hbm(&mut context.pdma)
             .await
@@ -2022,11 +2521,11 @@ mod tests {
             .to_hbm(&mut context.pdma)
             .await
             .expect("host transfer");
-        let groups = G::SIZE;
-        let query: Queries<G> = HostTensor::<bf16, m![Query, KvHeads, G, Head]>::from_vec(
-            (0..1024 * 8 * groups * 128).map(|at| {
-                let j = at / (8 * groups * 128);
-                let own = query_value(j, at / (groups * 128) % 8, at / 128 % groups);
+        let query: Queries<H, G, D> = HostTensor::<bf16, m![Query, H, G, D]>::from_vec(
+            (0..Query::SIZE * heads * groups * width).map(|at| {
+                let j = at / (heads * groups * width);
+                let (head, group) = (at / (groups * width) % heads, at / width % groups);
+                let own = query_value(j, head, group) * factors(at % width).0;
                 scratch(j, own, f32::NAN)
             }),
         )
@@ -2034,48 +2533,48 @@ mod tests {
         .await
         .expect("host transfer");
         let lanes: HbmTensor<i32, Chip, m![Cache]> =
-            HostTensor::<i32, m![Cache]>::from_vec([i32::try_from(h).unwrap(); 128])
+            HostTensor::<i32, m![Cache]>::from_vec(vec![i32::try_from(h).unwrap(); Cache::SIZE])
                 .to_hbm(&mut context.pdma)
                 .await
                 .expect("host transfer");
-        let mut output: Output<G> =
-            HostTensor::<bf16, m![FixtureRows, KvHeads, G, Head]>::from_vec(vec![
+        let mut output: Output<H, G, D> =
+            HostTensor::<bf16, m![FixtureRows, H, G, D]>::from_vec(vec![
                 bf16::from_f32(
                     f32::INFINITY
                 );
-                1024 * 8
+                FixtureRows::SIZE
+                    * heads
                     * groups
-                    * 128
+                    * width
             ])
             .to_hbm(&mut context.pdma)
             .await
             .expect("host transfer");
-        let fresh: HbmTensor<bf16, Chip, m![FixtureRows, KvHeads, Head]> =
-            HostTensor::<bf16, m![FixtureRows, KvHeads, Head]>::from_vec((0..1024 * 8 * 128).map(
-                |at| {
-                    let (row, head) = (at / (8 * 128), at / 128 % 8);
-                    scratch(row, kv(h + row, head), kv(h + row, head))
-                },
-            ))
-            .to_hbm(&mut context.pdma)
-            .await
-            .expect("host transfer");
-        let values: HbmTensor<bf16, Chip, m![FixtureRows, KvHeads, Head]> =
-            HostTensor::<bf16, m![FixtureRows, KvHeads, Head]>::from_vec((0..1024 * 8 * 128).map(
-                |at| {
-                    let (row, head) = (at / (8 * 128), at / 128 % 8);
-                    let own = match nan == Some(row) {
-                        true => f32::NAN,
-                        false => value(h + row, head) * scale(at % 128),
-                    };
-                    scratch(row, own, own)
-                },
-            ))
-            .to_hbm(&mut context.pdma)
-            .await
-            .expect("host transfer");
+        let fresh: Fresh<H, D> = HostTensor::<bf16, m![FixtureRows, H, D]>::from_vec(
+            (0..FixtureRows::SIZE * heads * width).map(|at| {
+                let (row, head, channel) = (at / (heads * width), at / width % heads, at % width);
+                let own = key(h + row, head, channel);
+                scratch(row, own, own)
+            }),
+        )
+        .to_hbm(&mut context.pdma)
+        .await
+        .expect("host transfer");
+        let values: Fresh<H, D> = HostTensor::<bf16, m![FixtureRows, H, D]>::from_vec(
+            (0..FixtureRows::SIZE * heads * width).map(|at| {
+                let (row, head, channel) = (at / (heads * width), at / width % heads, at % width);
+                let own = match nan == Some(row) {
+                    true => f32::NAN,
+                    false => value(h + row, head) * scale(channel),
+                };
+                scratch(row, own, own)
+            }),
+        )
+        .to_hbm(&mut context.pdma)
+        .await
+        .expect("host transfer");
         let causal: Causal = HostTensor::<i8, m![Cache, Cache]>::from_vec(
-            (0..128 * 128).map(|at| i8::from(at % 128 > at / 128)),
+            (0..Cache::SIZE * Cache::SIZE).map(|at| i8::from(at % Cache::SIZE > at / Cache::SIZE)),
         )
         .to_hbm(&mut context.pdma)
         .await
@@ -2100,17 +2599,63 @@ mod tests {
             lanes,
             slots,
         };
-        launch(
-            attend_chunk,
-            (&mut *context, &chunk, &mut allocation, &mut output),
-        )
-        .await
-        .expect("device launch");
+        let arguments = (
+            &mut *context,
+            &F32::<SCALE>,
+            &chunk,
+            &mut allocation,
+            &mut output,
+        );
+        launch(attend_chunk, arguments)
+            .await
+            .expect("device launch");
+        let cache = allocation.read(&mut *context, 0..blocks).await.unwrap();
+        let written = cache
+            .iter()
+            .zip(&data)
+            .position(|(found, put)| found.to_bits() != put.to_bits());
+        assert_eq!(written, None, "q={q} h={h}: attending wrote the pool");
         output
-            .to_host::<m![FixtureRows, KvHeads, G, Head]>(&mut context.pdma)
+            .to_host::<m![FixtureRows, H, G, D]>(&mut context.pdma)
             .await
             .expect("host transfer")
             .into_vec()
+    }
+
+    /// Each of the `q` live rows of `attend`'s chunk over `h` keys attends every key up to its own
+    /// as an f64 softmax does, to 0.004 of each channel's magnitude, at least 1.
+    fn check<H: AxisName, G: AxisName, D: AxisName, const SCALE: usize>(
+        (q, h): (usize, usize),
+        got: &[bf16],
+    ) {
+        let (_, gain) = gain::<D, SCALE>();
+        let mut max_error = 0.0f64;
+        for j in 0..q {
+            for head in 0..H::SIZE {
+                for group in 0..G::SIZE {
+                    let query = f64::from(query_value(j, head, group)) * gain;
+                    let score = |k: usize| query * f64::from(kv(k, head));
+                    let top = (0..=h + j).map(score).fold(f64::NEG_INFINITY, f64::max);
+                    let (weighted, mass) = (0..=h + j).fold((0.0, 0.0), |(weighted, mass), k| {
+                        let weight = (score(k) - top).exp();
+                        (weighted + weight * f64::from(value(k, head)), mass + weight)
+                    });
+                    for channel in 0..D::SIZE {
+                        let want = weighted / mass * f64::from(scale(channel));
+                        let at = ((j * H::SIZE + head) * G::SIZE + group) * D::SIZE + channel;
+                        let found = f64::from(got[at].to_f32());
+                        let error = (found - want).abs();
+                        max_error = max_error.max(error);
+                        assert!(
+                            error <= 0.004 * want.abs().max(1.0),
+                            "q={q} h={h} row={j} head={head} group={group} channel={channel}: \
+                             {found} != {want}"
+                        );
+                    }
+                }
+            }
+        }
+        println!("q={q} h={h} max_error={max_error}");
     }
 
     /// Scratch rows of NaN or infinities past live rows that end inside a 128-key panel give the
@@ -2134,16 +2679,17 @@ mod tests {
             (613, 2049),
             (1000, 0),
         ];
-        let row = 8 * G::SIZE * 128;
+        let row = <m![KvHeads, G, Head]>::SIZE;
+        let attend = attend::<KvHeads, G, Head, SCALE>;
         for (q, h) in cases {
-            let zeroed = attend::<G>(&mut *context, (q, h), (Some(0.0), None)).await;
+            let zeroed = attend(&mut *context, (q, h), (Some(0.0), None)).await;
             let runs = [
                 (f32::NAN, None),
                 (f32::INFINITY, None),
                 (f32::NAN, Some(q - 1)),
             ];
             for (past, nan) in runs {
-                let got = attend::<G>(&mut *context, (q, h), (Some(past), nan)).await;
+                let got = attend(&mut *context, (q, h), (Some(past), nan)).await;
                 let clean = nan.unwrap_or(q) * row;
                 for (at, (got, zeroed)) in got[..clean].iter().zip(&zeroed[..clean]).enumerate() {
                     let (got, zeroed) = (got.to_f32(), zeroed.to_f32());
@@ -2196,45 +2742,29 @@ mod tests {
             (1023, 2049),
         ];
         for (q, h) in cases {
-            let got = attend::<G>(&mut *context, (q, h), (None, None)).await;
-            let mut max_error = 0.0f32;
-            for j in 0..q {
-                for head in 0..8 {
-                    for group in 0..G::SIZE {
-                        let scores: Vec<f32> = (0..=h + j)
-                            .map(|k| {
-                                query_value(j, head, group) * kv(k, head) * 128.0 / 128.0f32.sqrt()
-                            })
-                            .collect();
-                        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                        let mut sum = 0.0f32;
-                        let mut weighted = 0.0f32;
-                        for (k, score) in scores.into_iter().enumerate() {
-                            let weight = (score - max).exp();
-                            sum += weight;
-                            weighted += weight * value(k, head);
-                        }
-                        for channel in 0..128 {
-                            let expected = weighted / sum * scale(channel);
-                            let at = ((j * 8 + head) * G::SIZE + group) * 128 + channel;
-                            let actual = got[at].to_f32();
-                            assert!(
-                                actual.is_finite(),
-                                "{} groups q={q} h={h} row={j} head={head} group={group}",
-                                G::SIZE
-                            );
-                            let error = (actual - expected).abs();
-                            max_error = max_error.max(error);
-                            assert!(
-                                error <= 0.004,
-                                "{} groups q={q} h={h} row={j}: {actual} != {expected}",
-                                G::SIZE
-                            );
-                        }
-                    }
-                }
-            }
-            println!("{} groups q={q} h={h} max_error={max_error}", G::SIZE);
+            let got = attend::<KvHeads, G, Head, SCALE>(&mut *context, (q, h), (None, None));
+            check::<KvHeads, G, Head, SCALE>((q, h), &got.await);
+        }
+    }
+
+    /// Chunks of 256-wide heads, two query groups to each of eight KV heads, attend causally under
+    /// a unit score multiplier over their own rows, a partial last tile among them, and over every
+    /// history block width, a 2048-key block among them: four tiles, two groups of a pair's
+    /// eight, two single tiles and a group before a single tile.
+    #[tokio::test(flavor = "current_thread")]
+    async fn attends_causally_over_wide_heads() {
+        let _lease = DEVICE.lock().await;
+        let mut context = Device::new(attend_chunk.topology()).unwrap();
+        let cases = [
+            (300, 2866),
+            (1024, 1100),
+            (129, 2049),
+            (513, 3000),
+            (1023, 0),
+        ];
+        for (q, h) in cases {
+            let got = attend::<KvHeads, QueryPairs, Wide, UNIT>(&mut context, (q, h), (None, None));
+            check::<KvHeads, QueryPairs, Wide, UNIT>((q, h), &got.await);
         }
     }
 }

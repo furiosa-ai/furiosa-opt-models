@@ -700,48 +700,197 @@ impl<KvHeads: AxisName, Groups: AxisName, Q: M, L: M>
     }
 }
 
-/// One 128-key panel's probabilities times its values.
+/// One 128-key panel's probabilities times one fill of its values, into `output`.
 pub(crate) struct Weight;
 
-impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: M>
+impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: M, E: M>
     Op<(
         DmTensorView<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, P>,
         &fresh::Values<KvHeads, Groups, Head>,
+        DmTensorViewMut<'_, f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, E>,
     )> for Weight
 {
-    type Output = Partial<KvHeads, Groups, Head>;
+    type Output = ();
 
     fn forward(
         &self,
         context: &mut Device,
-        (probabilities, value): (
+        (probabilities, value, output): (
             DmTensorView<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, P>,
             &fresh::Values<KvHeads, Groups, Head>,
+            DmTensorViewMut<'_, f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, E>,
         ),
-    ) -> Self::Output {
-        let mut output = Partial::<KvHeads, Groups, Head>::new();
+    ) {
         context.main.begin(probabilities)
-                .fetch::<m![Rows % 2, Head / 32, Cache / 8], m![Rows % 8 / 2, Cache % 8]>()
+                .fetch::<
+                    m![Rows % 2, { Channels<Head> } / 32, Cache / 8],
+                    m![Rows % 8 / 2, Cache % 8],
+                >()
                 .collect::<
-                    m![Rows % 2, Head / 32, Cache / 8, Rows % 8 / 4],
+                    m![Rows % 2, { Channels<Head> } / 32, Cache / 8, Rows % 8 / 4],
                     m![Rows % 4 / 2, Cache % 8],
                 >()
                 .contract_outer::<
-                    m![Rows % 2, Head / 32, Cache / 8, Head % 32 / 8],
+                    m![Rows % 2, { Channels<Head> } / 32, Cache / 8, Head % 32 / 8],
                     m![Rows % 8 / 2, Cache % 8],
                     _,
                     _,
                     _,
                 >(value)
                 .contract_packet::<m![Rows % 8 / 2]>()
-                .contract_time::<m![Rows % 2, Head / 32, Head % 32 / 8]>()
+                .contract_time::<m![Rows % 2, { Channels<Head> } / 32, Head % 32 / 8]>()
                 .contract_lane::<
-                    m![Rows % 2, Head / 32, Head % 32 / 8, Head % 8],
+                    m![Rows % 2, { Channels<Head> } / 32, Head % 32 / 8, Head % 8],
                     m![Rows % 8 / 2 # 8],
                 >(LaneMode::Sequential)
                 .vector_init().vector_intra_slice_tag(TagMode::Zero).vector_final()
-                .transpose::<m![Rows % 2, Head / 2, Rows % 8 / 2], m![Head % 2 # 8]>()
-                .commit_trim::<m![Head % 2]>().commit_view(output.view_mut());
+                .transpose::<m![Rows % 2, { Channels<Head> } / 2, Rows % 8 / 2], m![Head % 2 # 8]>()
+                .commit_trim::<m![Head % 2]>().commit_view(output);
+    }
+}
+
+/// One 128-key panel's probabilities times every channel part of its values, a fill a part.
+pub(crate) struct WeighParts<Head>(pub(crate) PhantomData<Head>);
+
+impl<
+    KvHeads: AxisName,
+    Groups: AxisName,
+    Head: AxisName,
+    P: M,
+    S: ValueSource<KvHeads, Groups, Head>,
+>
+    Op<(
+        DmTensorView<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, P>,
+        &mut S,
+    )> for WeighParts<Head>
+{
+    type Output = Partial<KvHeads, Groups, Head>;
+
+    fn forward(
+        &self,
+        context: &mut Device,
+        (probabilities, source): (
+            DmTensorView<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, P>,
+            &mut S,
+        ),
+    ) -> Self::Output {
+        type Slot<Head> = m![Rows % 8, { PartSlot<Head> }, { Channels<Head> }];
+        let mut value = source.value(context, 0);
+        let mut output = Partial::<KvHeads, Groups, Head>::new();
+        #[unroll]
+        for j in 1..Part::<Head>::COUNT {
+            let next = source.value_part(context, 0, j);
+            Op::forward(
+                &Weight,
+                &mut *context,
+                (
+                    probabilities.clone(),
+                    &value,
+                    output.view_mut().tile::<Parts<Head>, 1, Slot<Head>>(j - 1),
+                ),
+            );
+            value = next;
+        }
+        Op::forward(
+            &Weight,
+            context,
+            (
+                probabilities,
+                &value,
+                output
+                    .view_mut()
+                    .tile::<Parts<Head>, 1, Slot<Head>>(Part::<Head>::COUNT - 1),
+            ),
+        );
         output
+    }
+}
+
+/// A tile row group's FP32 dot products with one panel's keys, in vector registers.
+type DotRow<KvHeads, Groups> =
+    VrfTensor<f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, m![Rows % 8, Cache]>;
+
+/// The sum of two FP32 dot products of one tile's 128 keys, rounded into `scores`.
+pub(crate) struct Round;
+
+impl<KvHeads: AxisName, Groups: AxisName, A: M, B: M, E: M>
+    Op<(
+        DmTensorView<'_, f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, A>,
+        DmTensorView<'_, f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, B>,
+        DmTensorViewMut<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, E>,
+    )> for Round
+{
+    type Output = ();
+
+    fn forward(
+        &self,
+        context: &mut Device,
+        (sum, last, scores): (
+            DmTensorView<'_, f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, A>,
+            DmTensorView<'_, f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, B>,
+            DmTensorViewMut<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, E>,
+        ),
+    ) {
+        let sum: DotRow<KvHeads, Groups> = context
+            .sub
+            .begin(sum)
+            .fetch::<m![Rows % 8, Cache / 8], m![Cache % 8]>()
+            .collect::<m![Rows % 8, Cache / 8], m![Cache % 8]>()
+            .to_vrf();
+        context
+            .main
+            .begin(last)
+            .fetch::<m![Rows % 8, Cache / 8], m![Cache % 8]>()
+            .collect::<m![Rows % 8, Cache / 8], m![Cache % 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_clip(ClipBinaryOpF32::Add, &sum)
+            .vector_final()
+            .cast::<bf16, m![Cache % 8 # 16]>()
+            .commit_trim::<m![Cache % 8]>()
+            .commit_view(scores);
+    }
+}
+
+/// Adds tile `t` of `last` into tile `t` of `sum`, both a part's FP32 dot products or their sum.
+pub(crate) struct Accumulate;
+
+impl<KvHeads: AxisName, Groups: AxisName, R: AxisName>
+    Op<(
+        &mut history::Dot<KvHeads, Groups, R>,
+        &history::Dot<KvHeads, Groups, R>,
+        usize,
+    )> for Accumulate
+{
+    type Output = ();
+
+    fn forward(
+        &self,
+        context: &mut Device,
+        (sum, last, t): (
+            &mut history::Dot<KvHeads, Groups, R>,
+            &history::Dot<KvHeads, Groups, R>,
+            usize,
+        ),
+    ) {
+        type Row<R> = m![{ TileOf<R> }, Rows % 8, Cache];
+        type RowSlot<R> = m![{ TileSlot<R> }, Rows % 8, Cache];
+        let held: DotRow<KvHeads, Groups> = context
+            .sub
+            .begin(sum.view().tile::<m![{ Symbol<R> }], 1, Row<R>>(t))
+            .fetch::<m![Rows % 8, Cache / 8], m![Cache % 8]>()
+            .collect::<m![Rows % 8, Cache / 8], m![Cache % 8]>()
+            .to_vrf();
+        context
+            .main
+            .begin(last.view().tile::<m![{ Symbol<R> }], 1, Row<R>>(t))
+            .fetch::<m![Rows % 8, Cache / 8], m![Cache % 8]>()
+            .collect::<m![Rows % 8, Cache / 8], m![Cache % 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_clip(ClipBinaryOpF32::Add, &held)
+            .vector_final()
+            .commit_trim::<m![Cache % 8]>()
+            .commit_view(sum.view_mut().tile::<m![{ Symbol<R> }], 1, RowSlot<R>>(t));
     }
 }

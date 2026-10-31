@@ -1,12 +1,20 @@
 use super::*;
 use crate::Op;
 
-pub(crate) type ValueSlice<KvHeads, Head> = m![KvHeads % 4, Head / 16, Cache / 16];
-/// One panel's values staged one 16 × 16 tile per slice.
-pub(crate) type Staged<KvHeads, Head> =
-    DmTensor<bf16, Chip, Cluster<KvHeads>, ValueSlice<KvHeads, Head>, m![Cache % 16, Head % 16]>;
+pub(crate) type ValueSlice<KvHeads, Head> = m![KvHeads % 4, { Channels<Head> } / 16, Cache / 16];
+/// One panel's values staged one 16 × 16 tile of each part per slice.
+pub(crate) type Staged<KvHeads, Head> = DmTensor<
+    bf16,
+    Chip,
+    Cluster<KvHeads>,
+    ValueSlice<KvHeads, Head>,
+    m![{ Parts<Head> }, Cache % 16, Head % 16],
+>;
 /// Where a panel's keys wait in data memory before their switch into the register file.
 pub(crate) type KeyStage<KvHeads> = m![KvHeads % 4, Cache / 8 % 8, Cache / 64, Cache / 2 % 4];
+/// One panel's keys staged in data memory for their fills.
+pub(crate) type KeyPanel<KvHeads, Head> =
+    DmTensor<bf16, Chip, Cluster<KvHeads>, KeyStage<KvHeads>, m![Cache % 2, Head]>;
 type ValueStage<KvHeads> = m![KvHeads % 4, Cache % 16 / 2, Cache / 16];
 pub(crate) type Keys<KvHeads, Groups, Head> = TrfTensor<
     bf16,
@@ -18,7 +26,7 @@ pub(crate) type Keys<KvHeads, Groups, Head> = TrfTensor<
         Head % 32 / 16,
         Cache / 8 % 8,
         Cache / 64,
-        Head / 32,
+        { Channels<Head> } / 32,
         Head % 16
     ],
 >;
@@ -28,7 +36,7 @@ pub(crate) type Values<KvHeads, Groups, Head> = TrfTensor<
     Cluster<KvHeads>,
     Slice<KvHeads, Groups>,
     m![Head % 8],
-    m![Head % 16 / 8, Head / 16, Cache],
+    m![Head % 16 / 8, { Channels<Head> } / 16, Cache],
 >;
 
 /// Fills the register file with one panel's keys from HBM.
@@ -44,9 +52,30 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, K: M> Op<HbmTensorView
         context: &mut Device,
         keys: HbmTensorView<'_, bf16, Chip, K>,
     ) -> Self::Output {
-        let keys: DmTensor<bf16, Chip, Cluster<KvHeads>, KeyStage<KvHeads>, m![Cache % 2, Head]> =
-            keys.to_dm(&mut context.tdma);
+        let keys: KeyPanel<KvHeads, Head> = keys.to_dm(&mut context.tdma);
         Op::forward(&FillKeys::<Groups, Head>(PhantomData), context, keys.view())
+    }
+}
+
+/// The panel's keys, filled a channel part at a time.
+impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> KeySource<KvHeads, Groups, Head>
+    for KeyPanel<KvHeads, Head>
+{
+    fn key(&mut self, context: &mut Device, s: usize) -> Keys<KvHeads, Groups, Head> {
+        self.key_part(context, s, 0)
+    }
+    fn key_part(
+        &mut self,
+        context: &mut Device,
+        _: usize,
+        j: usize,
+    ) -> Keys<KvHeads, Groups, Head> {
+        Op::forward(
+            &FillKeys::<Groups, Head>(PhantomData),
+            context,
+            self.view()
+                .tile::<Parts<Head>, 1, m![Cache % 2, { PartOf<Head> }, { Channels<Head> }]>(j),
+        )
     }
 }
 
@@ -76,7 +105,8 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, E: M>
 }
 
 /// The slices a panel's switched keys occupy, the layout their register-file fill reads.
-pub(crate) type Switched<KvHeads, Head> = m![KvHeads % 4, Cache / 8 % 8, Cache / 64, Head / 32];
+pub(crate) type Switched<KvHeads, Head> =
+    m![KvHeads % 4, Cache / 8 % 8, Cache / 64, { Channels<Head> } / 32];
 
 /// Switches one panel's staged keys into `output`, where their fills read them.
 pub(crate) struct SwitchKeys;
@@ -117,7 +147,7 @@ impl SwitchKeys {
         m![Head % 16],
     > {
         main.begin(keys)
-            .fetch::<m![Cache % 2, Head / 16], m![Head % 16]>()
+            .fetch::<m![Cache % 2, { Channels<Head> } / 16], m![Head % 16]>()
             .switch::<Switched<KvHeads, Head>, m![Cache % 2, Head % 32 / 16, Cache / 2 % 4]>(
                 SwitchConfig::InterTranspose {
                     slice1: 4,
@@ -153,7 +183,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, E: M>
                 Head % 32 / 16,
                 Cache / 8 % 8,
                 Cache / 64,
-                Head / 32
+                { Channels<Head> } / 32
             ]>(SwitchConfig::Broadcast01 {
                 slice1: 8,
                 slice0: 8,
@@ -164,9 +194,71 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, E: M>
                 Head % 32 / 16,
                 Cache / 8 % 8,
                 Cache / 64,
-                Head / 32
+                { Channels<Head> } / 32
             ], m![Head % 16]>()
             .to_trf()
+    }
+}
+
+/// Scaled scores of query tile `i` of a group over one 128-key panel, into `scores`, the panel's
+/// first fill already made: one contraction for a head one fill holds, else one a part, whose FP32
+/// dot products sum before one rounding.
+pub(crate) struct TileScores;
+
+impl<
+    KvHeads: AxisName,
+    Groups: AxisName,
+    Head: AxisName,
+    T: AxisName,
+    S: KeySource<KvHeads, Groups, Head>,
+    E: M,
+>
+    Op<(
+        &Attention<KvHeads, Groups, Head>,
+        (&history::Group<KvHeads, Groups, Head, T>, usize),
+        (Keys<KvHeads, Groups, Head>, &mut S),
+        DmTensorViewMut<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, E>,
+    )> for TileScores
+{
+    type Output = ();
+
+    fn forward(
+        &self,
+        context: &mut Device,
+        (attention, (queries, i), (first, source), scores): (
+            &Attention<KvHeads, Groups, Head>,
+            (&history::Group<KvHeads, Groups, Head, T>, usize),
+            (Keys<KvHeads, Groups, Head>, &mut S),
+            DmTensorViewMut<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, E>,
+        ),
+    ) {
+        if const { Part::<Head>::WHOLE } {
+            let query = queries
+                .view()
+                .tile::<m![{ Symbol<T> }], 1, TileRows<Head, T>>(i);
+            Op::forward(&FreshScores, context, (attention, query, &first, scores));
+        } else {
+            type Row = m![{ TileOf<SingleTile> }, Rows % 8, Cache];
+            let (sum, last, ()) = Op::forward(
+                &history::Dots::<SingleTile>(PhantomData),
+                &mut *context,
+                (
+                    attention,
+                    move |j| queries.part_from::<SingleTile, 1>(i, j),
+                    (first, source, 0),
+                    |_: &mut S, _: &mut Device| (),
+                ),
+            );
+            Op::forward(
+                &panel::Round,
+                context,
+                (
+                    sum.view().tile::<m![{ Symbol<SingleTile> }], 1, Row>(0),
+                    last.view().tile::<m![{ Symbol<SingleTile> }], 1, Row>(0),
+                    scores,
+                ),
+            );
+        }
     }
 }
 
@@ -194,10 +286,11 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, Q: M, E: M>
         ),
     ) {
         context.main.begin(projected)
-        .fetch::<m![Rows % 8 / 2, Cache / 8 % 8, Head / 16], m![Rows % 2, Head % 16]>()
-        .collect::<m![Rows % 8 / 2, Cache / 8 % 8, Head / 16, Rows % 2], m![Head % 16]>()
+        .fetch::<m![Rows % 8 / 2, Cache / 8 % 8, { Channels<Head> } / 16], m![Rows % 2, Head % 16]>()
+        .collect::<m![Rows % 8 / 2, Cache / 8 % 8, { Channels<Head> } / 16, Rows % 2],
+            m![Head % 16]>()
         .contract_outer::<
-            m![Rows % 8 / 2, Cache / 8 % 8, Head / 16, Cache / 64],
+            m![Rows % 8 / 2, Cache / 8 % 8, { Channels<Head> } / 16, Cache / 64],
             m![Rows % 2, Head % 16],
             _,
             _,
@@ -243,29 +336,29 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, V: M> Op<HbmTensorView
         values: HbmTensorView<'_, bf16, Chip, V>,
     ) -> Self::Output {
         let mut staged = Staged::<KvHeads, Head>::new();
-        Op::forward(&StageValues, &mut *context, (values, staged.view_mut()));
-        Op::forward(&FillValues::<Groups>(PhantomData), context, staged.view())
+        Op::forward(&StageValues, &mut *context, (values, &mut staged));
+        Op::forward(
+            &FillValues::<Groups>(PhantomData),
+            context,
+            staged
+                .view()
+                .tile::<Parts<Head>, 1, m![{ PartOf<Head> }, Cache % 16, Head % 16]>(0),
+        )
     }
 }
 
-/// One panel's values from HBM, repartitioned one 16 × 16 tile per slice into `output`.
+/// One panel's values from HBM, each part repartitioned one 16 × 16 tile per slice into `output`.
 pub(crate) struct StageValues;
 
-impl<KvHeads: AxisName, Head: AxisName, V: M, O: M>
-    Op<(
-        HbmTensorView<'_, bf16, Chip, V>,
-        DmTensorViewMut<'_, bf16, Chip, Cluster<KvHeads>, ValueSlice<KvHeads, Head>, O>,
-    )> for StageValues
+impl<KvHeads: AxisName, Head: AxisName, V: M>
+    Op<(HbmTensorView<'_, bf16, Chip, V>, &mut Staged<KvHeads, Head>)> for StageValues
 {
     type Output = ();
 
     fn forward(
         &self,
         context: &mut Device,
-        (values, output): (
-            HbmTensorView<'_, bf16, Chip, V>,
-            DmTensorViewMut<'_, bf16, Chip, Cluster<KvHeads>, ValueSlice<KvHeads, Head>, O>,
-        ),
+        (values, output): (HbmTensorView<'_, bf16, Chip, V>, &mut Staged<KvHeads, Head>),
     ) {
         let values: DmTensor<
             bf16,
@@ -274,20 +367,53 @@ impl<KvHeads: AxisName, Head: AxisName, V: M, O: M>
             ValueStage<KvHeads>,
             m![Cache % 2, Head],
         > = values.to_dm(&mut context.tdma);
-        context
-            .main
-            .begin(values.view())
-            .fetch::<m![Cache % 2, Head / 16], m![Head % 16]>()
-            .switch::<ValueSlice<KvHeads, Head>, m![Cache % 2, Cache % 16 / 2]>(
-                SwitchConfig::InterTranspose {
-                    slice1: 8,
-                    slice0: 8,
-                    time0: 1,
-                },
-            )
-            .collect::<m![Cache % 2, Cache % 16 / 2], m![Head % 16]>()
-            .commit_trim::<m![Head % 16]>()
-            .commit_view(output);
+        #[unroll]
+        for j in 0..Part::<Head>::COUNT {
+            context
+                .main
+                .begin(
+                    values
+                        .view()
+                        .tile::<Parts<Head>, 1, m![Cache % 2, { PartOf<Head> }, { Channels<Head> }]>(j),
+                )
+                .fetch::<m![Cache % 2, { Channels<Head> } / 16], m![Head % 16]>()
+                .switch::<ValueSlice<KvHeads, Head>, m![Cache % 2, Cache % 16 / 2]>(
+                    SwitchConfig::InterTranspose {
+                        slice1: 8,
+                        slice0: 8,
+                        time0: 1,
+                    },
+                )
+                .collect::<m![Cache % 2, Cache % 16 / 2], m![Head % 16]>()
+                .commit_trim::<m![Head % 16]>()
+                .commit_view(
+                    output
+                        .view_mut()
+                        .tile::<Parts<Head>, 1, m![{ PartSlot<Head> }, Cache % 16, Head % 16]>(j),
+                );
+        }
+    }
+}
+
+/// The panel's values, filled a channel part at a time.
+impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> ValueSource<KvHeads, Groups, Head>
+    for Staged<KvHeads, Head>
+{
+    fn value(&mut self, context: &mut Device, s: usize) -> Values<KvHeads, Groups, Head> {
+        self.value_part(context, s, 0)
+    }
+    fn value_part(
+        &mut self,
+        context: &mut Device,
+        _: usize,
+        j: usize,
+    ) -> Values<KvHeads, Groups, Head> {
+        Op::forward(
+            &FillValues::<Groups>(PhantomData),
+            context,
+            self.view()
+                .tile::<Parts<Head>, 1, m![{ PartOf<Head> }, Cache % 16, Head % 16]>(j),
+        )
     }
 }
 
@@ -295,10 +421,10 @@ impl<KvHeads: AxisName, Head: AxisName, V: M, O: M>
 /// `last` of the causal tile marks the keys past it.
 pub(crate) struct Cut;
 
-impl<KvHeads: AxisName, Head: AxisName, V: M, O: M>
+impl<KvHeads: AxisName, Head: AxisName, V: M>
     Op<(
         (HbmTensorView<'_, bf16, Chip, V>, (&Causal, usize)),
-        DmTensorViewMut<'_, bf16, Chip, Cluster<KvHeads>, ValueSlice<KvHeads, Head>, O>,
+        &mut Staged<KvHeads, Head>,
     )> for Cut
 {
     type Output = ();
@@ -308,7 +434,7 @@ impl<KvHeads: AxisName, Head: AxisName, V: M, O: M>
         context: &mut Device,
         ((values, (causal, last)), output): (
             (HbmTensorView<'_, bf16, Chip, V>, (&Causal, usize)),
-            DmTensorViewMut<'_, bf16, Chip, Cluster<KvHeads>, ValueSlice<KvHeads, Head>, O>,
+            &mut Staged<KvHeads, Head>,
         ),
     ) {
         let tokens: history::Tokens<KvHeads, Head> = values.to_dm(&mut context.tdma);
@@ -404,14 +530,20 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, E: M>
             .sub
             .begin(values)
             .fetch::<m![Head % 8, Head % 16 / 8], m![Cache % 16]>()
-            .switch::<Slice<KvHeads, Groups>, m![Head % 8, Head % 16 / 8, Head / 16, Cache / 16]>(
+            .switch::<
+                Slice<KvHeads, Groups>,
+                m![Head % 8, Head % 16 / 8, { Channels<Head> } / 16, Cache / 16],
+            >(
                 SwitchConfig::Broadcast01 {
                     slice1: 8,
                     slice0: 8,
                     time0: 1,
                 },
             )
-            .collect::<m![Head % 8, Head % 16 / 8, Head / 16, Cache / 16], m![Cache % 16]>()
+            .collect::<
+                m![Head % 8, Head % 16 / 8, { Channels<Head> } / 16, Cache / 16],
+                m![Cache % 16],
+            >()
             .to_trf()
     }
 }

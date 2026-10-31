@@ -72,6 +72,24 @@ pub(crate) const fn landing(head: usize, heads: usize) -> usize {
     slots
 }
 
+/// Channels of a `head`-channel head one register fill of `keys` keys holds: all of them, or the
+/// widest halving whose fill takes half the tensor registers, so the next fill lands beside it.
+pub(crate) const fn channels(head: usize, keys: usize) -> usize {
+    let mut width = head;
+    while keys * width * size_of::<bf16>() > super::TRF / 2 {
+        width /= 2;
+    }
+    assert!(
+        width >= 32 && head.is_multiple_of(width),
+        "a part holds whole 32-channel packets of the head"
+    );
+    assert!(
+        LANES * width * size_of::<f32>() <= super::VRF / 2,
+        "a row group's FP32 part fits half the vector registers"
+    );
+    width
+}
+
 /// Rows one pass of windowed attention attends at most: 32, or fewer so a slice's tensor registers
 /// hold the `keys` keys of `head` BF16 channels it scores for each row group of the pass, and its
 /// vector registers the mask and the bias of those scores, `groups` query groups a row.

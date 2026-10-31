@@ -26,6 +26,8 @@ pub(crate) trait Tiles<KvHeads: AxisName, Groups: AxisName, Head: AxisName> {
     type GroupSlot: M;
     type Tile: M;
     type TileSlot: M;
+    type TilePart: M;
+    type TilePartSlot: M;
     fn group(
         &self,
     ) -> DmTensorView<'_, f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Self::Group>;
@@ -40,6 +42,17 @@ pub(crate) trait Tiles<KvHeads: AxisName, Groups: AxisName, Head: AxisName> {
         &mut self,
         t: usize,
     ) -> DmTensorViewMut<'_, f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Self::TileSlot>;
+    /// Channel part `j` of tile `t` of an owner of attended values.
+    fn tile_part(
+        &self,
+        t: usize,
+        j: usize,
+    ) -> DmTensorView<'_, f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Self::TilePart>;
+    fn tile_part_mut(
+        &mut self,
+        t: usize,
+        j: usize,
+    ) -> DmTensorViewMut<'_, f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Self::TilePartSlot>;
 }
 
 /// Either owner of a group of its own: its tiles' attended values or their running lse.
@@ -57,6 +70,8 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, T: AxisName, E: M>
     type GroupSlot = m![{ Symbol<T> }, Rows % 8, { E }];
     type Tile = m![{ TileOf<T> }, Rows % 8, { E }];
     type TileSlot = m![{ TileSlot<T> }, Rows % 8, { E }];
+    type TilePart = m![{ TileOf<T> }, Rows % 8, { PartOf<Head> }, { Channels<Head> }];
+    type TilePartSlot = m![{ TileSlot<T> }, Rows % 8, { PartSlot<Head> }, { Channels<Head> }];
     fn group(
         &self,
     ) -> DmTensorView<'_, f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Self::Group> {
@@ -81,6 +96,23 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, T: AxisName, E: M>
     {
         self.view_mut()
             .tile::<m![{ Symbol<T> }], 1, Self::TileSlot>(t)
+    }
+    fn tile_part(
+        &self,
+        t: usize,
+        j: usize,
+    ) -> DmTensorView<'_, f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Self::TilePart> {
+        <Self as Tiles<KvHeads, Groups, Head>>::tile(self, t)
+            .tile::<Parts<Head>, 1, Self::TilePart>(j)
+    }
+    fn tile_part_mut(
+        &mut self,
+        t: usize,
+        j: usize,
+    ) -> DmTensorViewMut<'_, f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Self::TilePartSlot>
+    {
+        <Self as Tiles<KvHeads, Groups, Head>>::tile_mut(self, t)
+            .tile::<Parts<Head>, 1, Self::TilePartSlot>(j)
     }
 }
 
@@ -301,33 +333,39 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, T: AxisName, P: M, L: 
             &mut *context,
             (partial, &new_share),
         );
-        let value: VrfTensor<
-            f32,
-            Chip,
-            Cluster<KvHeads>,
-            Slice<KvHeads, Groups>,
-            m![Rows % 8, Head],
-        > = context
-            .sub
-            .begin(new_value.view())
-            .fetch::<m![Rows % 8, Head / 8], m![Head % 8]>()
-            .collect::<m![Rows % 8, Head / 8], m![Head % 8]>()
-            .to_vrf();
-        context
-            .main
-            .begin(old_value.view())
-            .fetch::<m![Rows % 8, Head / 8], m![Head % 8]>()
-            .collect::<m![Rows % 8, Head / 8], m![Head % 8]>()
-            .vector_init()
-            .vector_intra_slice_tag(TagMode::Zero)
-            .vector_clip(ClipBinaryOpF32::Add, &value)
-            .vector_final()
-            .commit_trim::<m![Head % 8]>()
-            .commit_view(
-                carry
-                    .view_mut()
-                    .tile::<m![{ Symbol<T> }], 1, TileRowSlot<Head, T>>(at),
-            );
+        // A row group's FP32 part fills half the vector registers, so each part's sum takes its
+        // own pass.
+        type RowsPart<Head> = m![Rows % 8, { PartOf<Head> }, { Channels<Head> }];
+        #[unroll]
+        for j in 0..Part::<Head>::COUNT {
+            let value: VrfTensor<
+                f32,
+                Chip,
+                Cluster<KvHeads>,
+                Slice<KvHeads, Groups>,
+                m![Rows % 8, { Channels<Head> }],
+            > = context
+                .sub
+                .begin(new_value.view().tile::<Parts<Head>, 1, RowsPart<Head>>(j))
+                .fetch::<m![Rows % 8, { Channels<Head> } / 8], m![Head % 8]>()
+                .collect::<m![Rows % 8, { Channels<Head> } / 8], m![Head % 8]>()
+                .to_vrf();
+            context
+                .main
+                .begin(old_value.view().tile::<Parts<Head>, 1, RowsPart<Head>>(j))
+                .fetch::<m![Rows % 8, { Channels<Head> } / 8], m![Head % 8]>()
+                .collect::<m![Rows % 8, { Channels<Head> } / 8], m![Head % 8]>()
+                .vector_init()
+                .vector_intra_slice_tag(TagMode::Zero)
+                .vector_clip(ClipBinaryOpF32::Add, &value)
+                .vector_final()
+                .commit_trim::<m![Head % 8]>()
+                .commit_view(Tiles::<KvHeads, Groups, Head>::tile_part_mut(
+                    &mut *carry,
+                    at,
+                    j,
+                ));
+        }
     }
 }
 
@@ -578,6 +616,10 @@ impl<
             .vector_final()
             .commit_trim::<m![1 # 8]>()
             .commit();
+        // A row group's FP32 part fills half the vector registers, so each part's old values take
+        // their own pass, the tile's scalars shared.
+        type PanelsPart<Head, T, S> =
+            m![{ TileOf<T> }, { Symbol<S> }, Rows % 8, { PartOf<Head> }, { Channels<Head> }];
         #[unroll]
         for t in 0..T::SIZE {
             let kept = Op::forward(
@@ -586,46 +628,55 @@ impl<
                 kept.view()
                     .tile::<m![{ Symbol<T> }], 1, TileStatistic<T>>(t),
             );
-            let old: VrfTensor<
-                f32,
-                Chip,
-                Cluster<KvHeads>,
-                Slice<KvHeads, Groups>,
-                m![Rows % 8, Head],
-            > = context
-                .main
-                .begin(carry.tile(t))
-                .fetch::<m![Rows % 8, Head / 8], m![Head % 8]>()
-                .collect::<m![Rows % 8, Head / 8], m![Head % 8]>()
-                .vector_init()
-                .vector_intra_slice_tag(TagMode::Zero)
-                .vector_narrow_split::<m![Rows % 8, Head / 4], m![Head % 4]>()
-                .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &kept)
-                .vector_widen_concat::<m![Rows % 8, Head / 8], m![Head % 8]>()
-                .vector_final()
-                .to_vrf(&mut context.sub);
-            let divisor = Op::forward(
-                &Operand,
-                &mut *context,
-                mass.view()
-                    .tile::<m![{ Symbol<T> }], 1, TileStatistic<T>>(t),
-            );
-            context.main.begin(partials.view().tile::<m![{ Symbol<T> }], 1, Panels<Head, T, S>>(t))
-                .fetch::<m![Rows % 8, Head / 8, { Symbol<S> }], m![Head % 8]>()
-                .collect::<m![Rows % 8, Head / 8, { Symbol<S> }], m![Head % 8]>()
-                .vector_init()
-                .vector_intra_slice_tag(TagMode::Zero)
-                .vector_narrow_split::<m![Rows % 8, Head / 8, { Symbol<S> }, Head % 8 / 4],
-                    m![Head % 4]>()
-                .vector_intra_slice_reduce::<S, m![Rows % 8, Head / 8, Head % 8 / 4], m![Head % 4]>(
-                    IntraSliceReduceOpF32::Add,
-                )
-                .vector_fp_div(&divisor)
-                .vector_widen_concat::<m![Rows % 8, Head / 8], m![Head % 8]>()
-                .vector_clip(ClipBinaryOpF32::Add, &old)
-                .vector_final()
-                .commit_trim::<m![Head % 8]>()
-                .commit_view(carry.tile_mut(t));
+            #[unroll]
+            for j in 0..Part::<Head>::COUNT {
+                let old: VrfTensor<
+                    f32,
+                    Chip,
+                    Cluster<KvHeads>,
+                    Slice<KvHeads, Groups>,
+                    m![Rows % 8, { Channels<Head> }],
+                > = context
+                    .main
+                    .begin(carry.tile_part(t, j))
+                    .fetch::<m![Rows % 8, { Channels<Head> } / 8], m![Head % 8]>()
+                    .collect::<m![Rows % 8, { Channels<Head> } / 8], m![Head % 8]>()
+                    .vector_init()
+                    .vector_intra_slice_tag(TagMode::Zero)
+                    .vector_narrow_split::<m![Rows % 8, { Channels<Head> } / 4], m![Head % 4]>()
+                    .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &kept)
+                    .vector_widen_concat::<m![Rows % 8, { Channels<Head> } / 8], m![Head % 8]>()
+                    .vector_final()
+                    .to_vrf(&mut context.sub);
+                let divisor = Op::forward(
+                    &Operand,
+                    &mut *context,
+                    mass.view()
+                        .tile::<m![{ Symbol<T> }], 1, TileStatistic<T>>(t),
+                );
+                context.main.begin(partials.view()
+                        .tile::<m![{ Symbol<T> }], 1, Panels<Head, T, S>>(t)
+                        .tile::<Parts<Head>, 1, PanelsPart<Head, T, S>>(j))
+                    .fetch::<m![Rows % 8, { Channels<Head> } / 8, { Symbol<S> }], m![Head % 8]>()
+                    .collect::<m![Rows % 8, { Channels<Head> } / 8, { Symbol<S> }], m![Head % 8]>()
+                    .vector_init()
+                    .vector_intra_slice_tag(TagMode::Zero)
+                    .vector_narrow_split::<
+                        m![Rows % 8, { Channels<Head> } / 8, { Symbol<S> }, Head % 8 / 4],
+                        m![Head % 4],
+                    >()
+                    .vector_intra_slice_reduce::<
+                        S,
+                        m![Rows % 8, { Channels<Head> } / 8, Head % 8 / 4],
+                        m![Head % 4],
+                    >(IntraSliceReduceOpF32::Add)
+                    .vector_fp_div(&divisor)
+                    .vector_widen_concat::<m![Rows % 8, { Channels<Head> } / 8], m![Head % 8]>()
+                    .vector_clip(ClipBinaryOpF32::Add, &old)
+                    .vector_final()
+                    .commit_trim::<m![Head % 8]>()
+                    .commit_view(carry.tile_part_mut(t, j));
+            }
         }
     }
 }
