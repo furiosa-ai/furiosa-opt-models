@@ -6,8 +6,13 @@ cache through host buffers, continues as a server without a connector continues 
   ended. Here over stand-in buffers whose bytes land only when a copy is waited for.
 - The offloading host tier, over the same stand-ins, copies the cache the runner holds at each copy,
   as the copy above does.
+- Under vLLM's MultiConnector, the runner gives the plugin's offloading connector its host tier
+  and a connector staging blocks in host buffers the views and the copy above, and a step reports
+  each connector's received requests and jobs.
 - On RNGD, a decode server's greedy tokens of a prompt a prefill server sent equal a server's own,
-  and the decode server took the prompt's blocks from its connector.
+  and the decode server took the prompt's blocks from its connector. Under a MultiConnector that
+  also offloads, the decode server answers the prompt the same once its blocks were evicted and
+  reloaded from host memory.
 """
 
 from __future__ import annotations
@@ -16,7 +21,8 @@ import json
 import os
 import secrets
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Final, Literal, cast, final
 
 import numpy as np
@@ -24,26 +30,57 @@ import pytest
 import torch
 from conftest import post, serve
 from typing_extensions import override
+from vllm.config import KVTransferConfig
+from vllm.distributed.kv_transfer import kv_transfer_state
+from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+from vllm.distributed.kv_transfer.kv_connector.v1 import (
+    KVConnectorBase_V1,
+    KVConnectorRole,
+    SupportsHMA,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+    MultiConnector,
+    MultiKVConnectorMetadata,
+    MultiKVConnectorWorkerMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    OffloadingConnectorMetadata,
+    OffloadingWorkerMetadata,
+    TransferJob,
+)
+from vllm.engine.arg_utils import EngineArgs
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest, CompletionResponse
 from vllm.utils import random_uuid
 from vllm.utils.network_utils import get_open_port
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
 from vllm.v1.kv_offload.base import GPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 
 import furiosa_opt_engine as engine
-from furiosa_opt_vllm import connector
+from furiosa_opt_vllm import connector, offload, paging
+from furiosa_opt_vllm.decoder import Decoder
+from furiosa_opt_vllm.model_runner import FuriosaModelRunner
 from furiosa_opt_vllm.offload import worker
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
     from contextlib import AbstractContextManager
     from http.client import HTTPResponse
     from pathlib import Path
 
     from numpy.typing import NDArray
     from pydantic import JsonValue
+    from vllm.config import VllmConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
+    from vllm.forward_context import ForwardContext
+    from vllm.v1.attention.backend import AttentionMetadata
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.outputs import KVConnectorOutput
+    from vllm.v1.request import Request
 
+    from furiosa_opt_vllm.checkpoint import Location
     from furiosa_opt_vllm.runner import Runner
 
 # A cache of `BLOCKS` blocks of `TOKENS` tokens in each of `LAYERS` layers, `HEADS` KV heads of
@@ -82,6 +119,11 @@ class Copy:
                 self.land()
         if self.failure is not None:
             raise self.failure
+
+    def done(self) -> bool:
+        if self.ended and self.failure is not None:
+            raise self.failure
+        return self.ended
 
 
 @dataclass
@@ -360,6 +402,209 @@ def test_host_tier_copies_the_cache_waking_allocates(chip: Chip) -> None:
     assert not freed.layers[0].data.any()
 
 
+# Through vLLM's MultiConnector
+
+
+@final
+class Plan(KVConnectorMetadata):
+    """A step's metadata for `Staged`, which plans no transfer."""
+
+
+@final
+class Staged(KVConnectorBase_V1, SupportsHMA):
+    """A connector that stages blocks in host buffers as NIXL does, which this host lacks: it keeps
+    the caches and the copy the runner registers, and reports `received` as received."""
+
+    def __init__(
+        self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig
+    ) -> None:
+        super().__init__(vllm_config, role, kv_cache_config)
+        self.caches: dict[str, torch.Tensor] = {}
+        self.copy: CopyBlocksOp | None = None
+        self.received: set[str] = set()
+
+    @override
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        self.caches = kv_caches
+
+    @override
+    def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp) -> None:
+        self.copy = copy_operation
+
+    @override
+    def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
+        received, self.received = self.received, set()
+        return set(), received
+
+    @override
+    def start_load_kv(self, forward_context: ForwardContext, **kwargs: object) -> None:
+        pass
+
+    @override
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        pass
+
+    @override
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        **kwargs: object,
+    ) -> None:
+        pass
+
+    @override
+    def wait_for_save(self) -> None:
+        pass
+
+    @override
+    def get_num_new_matched_tokens(
+        self, request: Request, num_computed_tokens: int
+    ) -> tuple[int, bool]:
+        return 0, False
+
+    @override
+    def update_state_after_alloc(
+        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
+    ) -> None:
+        pass
+
+    @override
+    def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
+        return Plan()
+
+    @override
+    def request_finished_all_groups(
+        self, request: Request, block_ids: tuple[list[int], ...]
+    ) -> tuple[bool, dict[str, object] | None]:
+        return False, None
+
+
+@dataclass(frozen=True)
+class Connected:
+    """A runner whose engine cache vLLM's MultiConnector connects through `staged` and the
+    plugin's `offloading` connector, in that order."""
+
+    runner: FuriosaModelRunner
+    cache: Cache
+    staged: Staged
+    offloading: offload.RNGDOffloadingConnector
+
+    @classmethod
+    def on(cls, chip: Chip, served: Path, monkeypatch: pytest.MonkeyPatch) -> Connected:
+        """The runner after vLLM's worker initialized its cache, a stand-in on `chip`."""
+        config = EngineArgs(
+            model=str(served),
+            dtype="bfloat16",
+            skip_tokenizer_init=True,
+            block_size=TOKENS,
+            kv_offloading_size=1,
+        ).create_engine_config()
+        # Set past the platform's check, which admits NIXL in place of `Staged`.
+        config.kv_transfer_config = KVTransferConfig(
+            kv_connector="MultiConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "connectors": [
+                    {
+                        "kv_connector": "Staged",
+                        "kv_connector_module_path": __name__,
+                        "kv_role": "kv_both",
+                    },
+                    {
+                        "kv_connector": "RNGDOffloadingConnector",
+                        "kv_connector_module_path": offload.__name__,
+                        "kv_role": "kv_both",
+                        "kv_connector_extra_config": {"cpu_bytes_to_use": 1 << 16},
+                    },
+                ]
+            },
+        )
+        multi = KVConnectorFactory.create_connector(config, KVConnectorRole.WORKER, CONFIG)
+        assert isinstance(multi, MultiConnector)
+        staged, offloading = multi.sub_connectors
+        assert isinstance(staged, Staged)
+        assert isinstance(offloading, offload.RNGDOffloadingConnector)
+        monkeypatch.setattr(kv_transfer_state, "_KV_CONNECTOR_AGENT", multi)
+        runner = FuriosaModelRunner(config)
+        # The connectors read only the parallel chips of the engine's decoder.
+        unread = cast("object", None)
+        runner.model = Decoder(
+            cast("engine.Decoder", cast("object", SimpleNamespace(parallel=1))),
+            None,
+            cast("Location", unread),
+            cast("engine.LoadOptions", unread),
+            cast("engine.Device", unread),
+            0,
+        )
+        cache = Cache.on(chip)
+
+        def initialize(runner: Runner, _: KVCacheConfig) -> None:
+            runner.cache = cast("engine.decoder.Cache", cast("object", cache))
+
+        monkeypatch.setattr(paging, "initialize", initialize)
+        runner.initialize_kv_cache(CONFIG)
+        return cls(runner, cache, staged, offloading)
+
+    def step(self, offloading: OffloadingConnectorMetadata) -> KVConnectorOutput:
+        """A step without tokens, as vLLM's runner drives the connector around it, whose metadata
+        gives the offloading connector `offloading`."""
+        metadata = MultiKVConnectorMetadata((Plan(), offloading))
+        scheduled = replace(SchedulerOutput.make_empty(), kv_connector_metadata=metadata)
+        output = self.runner.kv_connector.no_forward(scheduled).kv_connector_output
+        assert output is not None
+        return output
+
+
+@pytest.mark.usefixtures("platform_env")
+@pytest.mark.feature("KV cache offloading")
+def test_connects_the_cache_to_each_child_connector(
+    chip: Chip, served: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under vLLM's MultiConnector, the plugin's offloading connector copies the engine cache
+    through its host tier, and a connector staging blocks in host buffers takes the cache's
+    NIXL views and the engine's copy."""
+    connected = Connected.on(chip, served, monkeypatch)
+    assert isinstance(connected.offloading.worker.worker, worker.Host)
+    staged = connected.staged
+    assert {name: (view.shape, view.device.type) for name, view in staged.caches.items()} == {
+        name: ((BLOCKS, HEADS, TOKENS, 2 * WIDTH), "meta") for name in NAMES
+    }
+    cache = connected.cache
+    _ = cache.blocks_of(0).copy_(random_blocks(3, (BLOCKS, TOKENS, 2, HEADS, WIDTH)))
+    sent = host_buffers(staged.caches)
+    assert staged.copy is not None
+    staged.copy(staged.caches, sent, [2], [2], "d2h")
+    assert torch.equal(sent[NAMES[0]][2], nixl_order(cache.blocks_of(0)[2]))
+
+
+@pytest.mark.usefixtures("platform_env")
+@pytest.mark.feature("KV cache offloading")
+def test_reports_each_child_connectors_transfers(
+    chip: Chip, served: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under vLLM's MultiConnector, a step reports each connector's received requests: the staging
+    connector's at once, and an offloaded load's once its copies ended, with its job in the
+    offloading connector's report alone."""
+    connected = Connected.on(chip, served, monkeypatch)
+    connected.staged.received = {"remote"}
+    load = TransferJob("local", CPULoadStoreSpec([0]), GPULoadStoreSpec([1], [1], [0]))
+    first = connected.step(OffloadingConnectorMetadata({3: load}, {}))
+    assert first.finished_recving == {"remote"}
+    assert first.kv_connector_worker_meta is None
+    for copy in chip.copies:
+        copy.wait()
+    second = connected.step(OffloadingConnectorMetadata({}, {}))
+    assert second.finished_recving == {"local"}
+    report = second.kv_connector_worker_meta
+    assert isinstance(report, MultiKVConnectorWorkerMetadata)
+    staged, offloaded = report.metadata
+    assert staged is None
+    assert isinstance(offloaded, OffloadingWorkerMetadata)
+    assert offloaded.completed_jobs == {3: 1}
+
+
 # On RNGD
 
 MODEL: Final = "Qwen/Qwen3-0.6B"
@@ -393,9 +638,16 @@ class Routed:
     transfer: dict[str, JsonValue]
 
 
-def complete(url: str, model: str, tokens: int, routed: Routed | None = None) -> CompletionResponse:
+def complete(
+    url: str,
+    model: str,
+    tokens: int,
+    routed: Routed | None = None,
+    *,
+    headers: Mapping[str, str] | None = None,
+) -> CompletionResponse:
     """The greedy completion of `PROMPT` under `model` by the server at `url`, its tokens listed,
-    routed as `routed` says."""
+    routed as `routed` says, with `headers`."""
     body: dict[str, JsonValue] = {
         "model": model,
         "prompt": PROMPT,
@@ -407,7 +659,7 @@ def complete(url: str, model: str, tokens: int, routed: Routed | None = None) ->
     if routed is not None:
         body |= {"request_id": routed.request_id, "kv_transfer_params": routed.transfer}
     request = CompletionRequest.model_validate(body)
-    return post(f"{url}/v1/completions", request, CompletionResponse)
+    return post(f"{url}/v1/completions", request, CompletionResponse, headers=headers)
 
 
 def generated(response: CompletionResponse) -> list[int]:
@@ -525,3 +777,111 @@ def test_decodes_a_remote_prefill(
     assert len(expected) == ANSWER
     assert taken > 0
     assert moved > 0
+
+
+# Notes longer than `PROMPT`, whose blocks evict most of its blocks from a decode server of
+# `DEVICE_BLOCKS` blocks.
+FILLER: Final = f"Run {secrets.token_hex(8)}. " + " ".join(
+    f"Line {i} names a fruit that grows on a tall tree." for i in range(30)
+)
+DEVICE_BLOCKS: Final = 34
+
+
+@dataclass(frozen=True)
+class Composed:
+    """A decode server's MultiConnector over NIXL and the plugin's offloading connector: the NIXL
+    case of both servers, and whether the offloading connector comes first."""
+
+    case: Case = field(default_factory=Case)
+    offloading_first: bool = False
+
+
+COMPOSED: Final = {
+    "pull": Composed(),
+    "push": Composed(CASES["push"]),
+    "offloading-first": Composed(offloading_first=True),
+    "data-parallel": Composed(CASES["data-parallel"]),
+    "sleep": Composed(CASES["sleep"]),
+}
+
+
+@pytest.mark.feature("Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache)")
+@pytest.mark.feature("KV cache offloading")
+@pytest.mark.parametrize("composed", COMPOSED.values(), ids=COMPOSED.keys())
+def test_offloads_a_remote_prefill(
+    composed: Composed, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """A decode server whose MultiConnector runs NIXL and the plugin's offloading connector
+    decodes a prompt the prefill server sent as a server decodes it alone, then answers it the same
+    after other notes evicted its blocks, from the blocks its host tier stored."""
+    case = composed.case
+    chips = os.environ["FURIOSA_VISIBLE_CHIPS"].split(",")
+    assert len(chips) >= 1 + case.chips, chips
+    flags = [MODEL, "--max-model-len", "512", "--num-gpu-blocks-override", str(DEVICE_BLOCKS)]
+    with serve(flags, tmp_path_factory, {"FURIOSA_VISIBLE_CHIPS": chips[0]}) as single:
+        expected = generated(complete(single, MODEL, ANSWER))
+    nixl = {"kv_connector": case.connector, "kv_buffer_device": "cpu"}
+    offloading = {
+        "kv_connector": "RNGDOffloadingConnector",
+        "kv_connector_module_path": offload.__name__,
+        "kv_role": "kv_both",
+        "kv_connector_extra_config": {"cpu_bytes_to_use": 1 << 30},
+    }
+    entries = [{**nixl, "kv_role": "kv_consumer"}, offloading]
+    consumer = {
+        "kv_connector": "MultiConnector",
+        "kv_role": "kv_both",
+        "kv_connector_extra_config": {
+            "connectors": entries[::-1] if composed.offloading_first else entries
+        },
+    }
+
+    def connected(
+        transfer: Mapping[str, object], visible: list[str], extra: tuple[str, ...]
+    ) -> AbstractContextManager[str]:
+        env = {
+            "FURIOSA_VISIBLE_CHIPS": ",".join(visible),
+            "VLLM_NIXL_SIDE_CHANNEL_HOST": "127.0.0.1",
+            "VLLM_NIXL_SIDE_CHANNEL_PORT": str(get_open_port()),
+            "VLLM_SERVER_DEV_MODE": "1",
+        }
+        arguments = [*flags, *extra, "--kv-transfer-config", json.dumps(transfer)]
+        return serve(arguments, tmp_path_factory, env)
+
+    # Every decode request goes to one replica, whose host tier alone stores the prompt's blocks.
+    pinned = {"X-data-parallel-rank": "0"} if case.chips > 1 else None
+    producer = {**nixl, "kv_role": "kv_producer"}
+    with (
+        connected(producer, chips[:1], ()) as prefill,
+        connected(consumer, chips[1 : 1 + case.chips], case.decode) as decode,
+    ):
+        if case.slept:
+            for action in ("/sleep?level=1", "/wake_up"):
+                answer: HTTPResponse = urllib.request.urlopen(
+                    urllib.request.Request(f"{decode}{action}", method="POST"), timeout=300
+                )
+                with answer:
+                    assert answer.status == 200
+        pair = random_uuid()
+        prefilled = Routed(pair, {"do_remote_decode": True, "do_remote_prefill": False})
+        sent = complete(prefill, MODEL, 1, prefilled)
+        assert sent.kv_transfer_params is not None
+        routed = Routed(pair, sent.kv_transfer_params)
+        decoded = generated(complete(decode, MODEL, ANSWER, routed, headers=pinned))
+        taken = metric(decode, "vllm:external_prefix_cache_hits_total")
+        moved = metric(prefill, "vllm:nixl_bytes_transferred_sum") + metric(
+            decode, "vllm:nixl_bytes_transferred_sum"
+        )
+        filled = CompletionRequest.model_validate(
+            {"model": MODEL, "prompt": FILLER, "max_tokens": 1, "temperature": 0}
+        )
+        _ = post(f"{decode}/v1/completions", filled, CompletionResponse, headers=pinned)
+        reloaded = generated(complete(decode, MODEL, ANSWER, headers=pinned))
+        stored = metric(decode, "vllm:kv_offload_store_bytes_total")
+        loaded = metric(decode, "vllm:kv_offload_load_bytes_total")
+    assert decoded == expected
+    assert reloaded == expected
+    assert taken > 0
+    assert moved > 0
+    assert stored > 0
+    assert loaded > 0

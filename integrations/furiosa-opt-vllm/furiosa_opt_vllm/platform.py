@@ -4,6 +4,7 @@ does not serve."""
 from __future__ import annotations
 
 import os
+from contextlib import suppress
 from typing import TYPE_CHECKING, final
 
 import torch
@@ -20,7 +21,7 @@ from furiosa_opt_vllm.admission import (
     speculative,
     verify_checkpoint,
 )
-from furiosa_opt_vllm.transfer import offload
+from furiosa_opt_vllm.transfer import CONNECTOR, CONNECTOR_MODULE, offload
 
 if TYPE_CHECKING:
     from vllm.config import CacheConfig, ModelConfig, VllmConfig
@@ -51,9 +52,14 @@ class FuriosaPlatform(Platform):
     @classmethod
     @override
     def pre_register_and_update(cls, parser: FlexibleArgumentParser | None = None) -> None:
+        from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
         from vllm.model_executor.models import ModelRegistry
 
         ModelRegistry.register_model("BambaForCausalLM", "furiosa_opt_vllm.recurrent:Bamba")
+        # vLLM's MultiConnector finds a connector's stats class by its registered name when its
+        # stats arrive serialized; vLLM calls this hook again for each config it creates.
+        with suppress(ValueError):
+            KVConnectorFactory.register_connector(CONNECTOR, CONNECTOR_MODULE, CONNECTOR)
 
     @classmethod
     @override
