@@ -14,7 +14,7 @@
 use crate::decoder::{Decoder, Instance, Served};
 use crate::vision_language::Encoder;
 use furiosa_opt_models::load::{Checkpoint, Context, Load, LoadError, Part};
-use furiosa_opt_models::models::decoder::attention::{llama, qwen3};
+use furiosa_opt_models::models::decoder::attention::{gemma4, llama, qwen3};
 use furiosa_opt_models::models::decoder::form;
 use furiosa_opt_models::models::decoder::launch;
 use furiosa_opt_models::models::vision_language::gemma4_unified;
@@ -474,7 +474,10 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
     ("Gemma3nForConditionalGeneration", &[]),
     (
         "Gemma4UnifiedForConditionalGeneration",
-        &[Implementation::of::<gemma4_unified::Encoder<Hbm>>()],
+        &[
+            Implementation::of::<gemma4_unified::Encoder<Hbm>>(),
+            Implementation::of::<gemma4::ForCausalLM>(),
+        ],
     ),
     ("Glm4vForConditionalGeneration", &[]),
     ("Glm4vMoeForConditionalGeneration", &[]),
@@ -1125,10 +1128,12 @@ mod tests {
             "audio_config": {"audio_embed_dim": 640, "rms_norm_eps": 1e-6},
         });
         let media = Checkpoint::new(empty.path(), Some(config)).unwrap();
-        let (name, encoders) =
+        let (name, row) =
             Implementation::listed(&["Gemma4UnifiedForConditionalGeneration"]).unwrap();
-        let chosen = Implementation::choose(name, encoders, &media.encoder()).unwrap();
-        assert_eq!(chosen.size(), "12B");
+        let chosen = Implementation::choose(name, row, &media.encoder()).unwrap();
+        assert_eq!((chosen.size(), chosen.class().name), ("12B", "Encoder"));
+        let (encoders, decoders) = row.split_at(1);
+        assert_eq!(decoders[0].class().family, "gemma4");
         let small = Checkpoint::new(empty.path(), Some(serde_json::json!({ "size": "small" })));
         let small = small.unwrap();
         assert_eq!(
@@ -1139,6 +1144,7 @@ mod tests {
         );
         for refused in [
             Implementation::choose(name, encoders, &media),
+            Implementation::choose(name, decoders, &media.encoder()),
             Implementation::choose("Causal", &SIZES[..1], &small.encoder()),
         ] {
             assert!(
