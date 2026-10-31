@@ -12,6 +12,7 @@ use crate::Sequential;
 use crate::load::{Checkpoint, LoadError};
 use crate::models::Family;
 use crate::models::config::{self, scaling::Spectrum};
+use crate::modules::attention::key_value;
 use crate::modules::feedforward::glu::Glu;
 use crate::modules::language::Greedy;
 use crate::modules::parallel::RowParallel;
@@ -886,6 +887,26 @@ pub type HeadView<Count, Head> = m![Count, Head];
 /// The op that positions group `A`'s queries and keys of scalar `D` on chips `Chips`.
 pub type Position<A, D = bf16, Chips = Chip> =
     <<A as Attention>::Rotated as Rotation>::Position<<A as Attention>::Head, D, Chips>;
+
+/// Group `A`'s constants that prepare a call of `R` rows over a cache of `C`: the rows' rotations,
+/// write slots and paged history reads, bound to the group's rotary spectrum and window; in memory
+/// `X`.
+pub type Paging<A, R, C = bf16, X = Hbm> = key_value::Preparation<
+    R,
+    key_value::Paging<
+        <A as Attention>::Heads,
+        <A as Attention>::Head,
+        R,
+        <A as Attention>::Windows,
+        C,
+        X,
+        Chip,
+        <A as Attention>::Rotated,
+        A,
+    >,
+    Chip,
+    X,
+>;
 
 /// Grouped-query attention of group `A` over each chip's heads of placement `P`, its scores
 /// multiplied by `SCALE` (FP32 bits), over the windows of history a call pages.

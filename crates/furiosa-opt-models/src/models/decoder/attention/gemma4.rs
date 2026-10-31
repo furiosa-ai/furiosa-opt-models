@@ -17,7 +17,7 @@ use crate::models::config::{
 };
 use crate::models::decoder::{self, Attention, Forms, Rotation, form};
 use crate::models::{Family, vocabulary};
-use crate::modules::attention::{self, key_value};
+use crate::modules::attention;
 use crate::modules::language::{self, Greedy};
 use crate::modules::{multimodal, transformer};
 use crate::ops::attention::gqa::Cache;
@@ -148,27 +148,9 @@ type Scale<X> = multiply::Scale<<X as Memory>::Tensor<f32, Chip, m![1 # 8]>>;
 /// The constants that prepare a call's rotations, write slots and paged history reads, one set
 /// a group, for calls of `R` rows and a cache of `C`.
 type RotaryEmbedding<C, X, R> = (
-    Preparation<sliding::Group, C, X, R>,
-    Preparation<full::Group, C, X, R>,
+    decoder::Paging<sliding::Group, R, C, X>,
+    decoder::Paging<full::Group, R, C, X>,
 );
-
-/// Group `A`'s constants, bound to its layer type's rotary spectrum and window.
-type Preparation<A, C, X, R> = key_value::Preparation<
-    R,
-    key_value::Paging<
-        <A as Attention>::Heads,
-        <A as Attention>::Head,
-        R,
-        <A as Attention>::Windows,
-        C,
-        X,
-        Chip,
-        <A as Attention>::Rotated,
-        A,
-    >,
-    Chip,
-    X,
->;
 
 /// The rows a call prepares its attention context for.
 pub type Rows = axis::Rows<64>;
