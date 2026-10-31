@@ -74,12 +74,20 @@ If `/dev/rngd` is missing, install the RNGD driver as described in [Installing P
 ### A chip index is malformed
 
 ```text
-ValueError: Non-integer device ID 'a' is not supported by cpu.
-ValueError: invalid literal for int() with base 10: 'a'
 FURIOSA_VISIBLE_CHIPS: `a` is not a chip index
+ValueError: Non-integer device ID 'a' is not supported by cpu.
 ```
 
-vLLM, the SGLang plugin and the runtime's automatic placement each read `FURIOSA_VISIBLE_CHIPS`, which takes comma-separated chip numbers, such as `0,1` ([Environment variables](environment.md)).
+The engine's `Placement.visible`, which both plugins open their chips with, and the runtime's automatic placement read `FURIOSA_VISIBLE_CHIPS` as comma-separated chip numbers, such as `0,1` ([Environment variables](environment.md)); vLLM also reads it when it applies `--device-ids`.
+
+### Too few chips are listed
+
+```text
+IndexError: FURIOSA_VISIBLE_CHIPS lists 2 chips, none at position 2
+```
+
+A server opens one listed chip for every tensor-parallel rank of every data-parallel replica.
+List as many chips in `FURIOSA_VISIBLE_CHIPS`, or lower the tensor- or data-parallel size.
 
 ### Profiling records nothing
 

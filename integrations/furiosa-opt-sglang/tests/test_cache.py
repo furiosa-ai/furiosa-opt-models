@@ -178,13 +178,13 @@ def copy_blocks() -> None:
 
     import furiosa_opt_engine as engine
     from furiosa_opt_sglang.cache import Cache, Pages
-    from furiosa_opt_sglang.decoder import PES, Decoder, Location, chips
+    from furiosa_opt_sglang.decoder import PES, Decoder, Location
 
     # Hub overloads include untyped progress and user-agent parameters.
     download = cast("Callable[[str], str]", huggingface_hub.snapshot_download)
     directory = download("Qwen/Qwen3-1.7B")
     config = AutoConfig.from_pretrained(directory)
-    device = engine.Device(engine.Placement(chips(0, 1), PES))
+    device = engine.Device(engine.Placement.visible([0], PES))
     decoder = Decoder.load(
         Location(directory, None), engine.LoadOptions(), device, config.vocab_size
     )
@@ -217,14 +217,14 @@ def follow_layout() -> None:
 
     import furiosa_opt_engine as engine
     from furiosa_opt_sglang.cache import Cache, Pages
-    from furiosa_opt_sglang.decoder import PES, Decoder, Location, chips
+    from furiosa_opt_sglang.decoder import PES, Decoder, Location
 
     # Hub overloads include untyped progress and user-agent parameters.
     download = cast("Callable[[str], str]", huggingface_hub.snapshot_download)
     directory = download("Qwen/Qwen3-0.6B")
     config = AutoConfig.from_pretrained(directory)
     tokenizer = AutoTokenizer.from_pretrained(directory)
-    device = engine.Device(engine.Placement(chips(0, 1), PES))
+    device = engine.Device(engine.Placement.visible([0], PES))
     # The base model's hidden rows tell apart attention over any other cache rows.
     options = engine.LoadOptions().architecture("Qwen3Model")
     decoder = Decoder.load(Location(directory, None), options, device, config.vocab_size)

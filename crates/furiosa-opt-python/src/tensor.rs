@@ -20,7 +20,7 @@ use furiosa_opt_std::prelude;
 use half::bf16;
 use numpy::IntoPyArray;
 use pyo3::buffer::PyBuffer;
-use pyo3::exceptions::{PyMemoryError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyIndexError, PyMemoryError, PyTypeError, PyValueError};
 use pyo3::types::{
     IntoPyDict, PyByteArray, PyInt, PyList, PyMemoryView, PyRange, PyRangeMethods, PySlice,
     PySliceMethods, PyString, PyTuple,
@@ -28,6 +28,7 @@ use pyo3::types::{
 use pyo3::{ffi, prelude::*};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use pyo3_stub_gen::{PyStubType, TypeInfo};
+use std::env::{self, VarError};
 use std::ffi::{c_int, c_void};
 use std::ops::Range;
 use std::pin::Pin;
@@ -64,6 +65,26 @@ impl Placement {
         }))
     }
 
+    /// The chips at `positions` of `FURIOSA_VISIBLE_CHIPS`, with `pes` on each: position `i` is
+    /// the `i`-th chip the variable lists, or chip `i` while it lists none, as a framework numbers
+    /// the devices a process sees.
+    ///
+    /// Raises:
+    ///     ValueError: An entry of the variable is no chip index, or `pes` has a step other
+    ///         than 1.
+    ///     IndexError: A position lies past the chips the variable lists.
+    #[staticmethod]
+    fn visible(
+        #[gen_stub(override_type(type_repr = "collections.abc.Sequence[int]", imports = ("collections.abc",)))]
+        positions: Vec<u8>,
+        #[gen_stub(override_type(type_repr = "range"))] pes: &Bound<'_, PyRange>,
+    ) -> PyResult<Self> {
+        Self::new(
+            Self::listed(env::var("FURIOSA_VISIBLE_CHIPS"), &positions)?,
+            pes,
+        )
+    }
+
     #[getter]
     fn chips(&self) -> Vec<usize> {
         self.0.chips.iter().map(|&chip| chip.into()).collect()
@@ -81,6 +102,42 @@ impl Placement {
             "Placement(chips={chips:?}, pes=range({}, {}))",
             pes.start, pes.end
         )
+    }
+}
+
+impl Placement {
+    /// The chips `Placement.visible` places at `positions` while `FURIOSA_VISIBLE_CHIPS` holds
+    /// `value`, read as the runtime reads it: split at commas, entries trimmed, empty ones skipped.
+    fn listed(value: Result<String, VarError>, positions: &[u8]) -> PyResult<Vec<u8>> {
+        let value = match value {
+            Err(VarError::NotPresent) => String::new(),
+            value => value
+                .map_err(|why| PyValueError::new_err(format!("FURIOSA_VISIBLE_CHIPS: {why}")))?,
+        };
+        let listed = value
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| {
+                entry.parse().map_err(|_| {
+                    PyValueError::new_err(format!(
+                        "FURIOSA_VISIBLE_CHIPS: `{entry}` is not a chip index"
+                    ))
+                })
+            })
+            .collect::<PyResult<Vec<u8>>>()?;
+        positions
+            .iter()
+            .map(|&position| match listed.as_slice() {
+                [] => Ok(position),
+                chips => chips.get(usize::from(position)).copied().ok_or_else(|| {
+                    PyIndexError::new_err(format!(
+                        "FURIOSA_VISIBLE_CHIPS lists {} chips, none at position {position}",
+                        chips.len()
+                    ))
+                }),
+            })
+            .collect()
     }
 }
 
@@ -1047,6 +1104,36 @@ pub(crate) mod tests {
             let reason = refused.value(py).to_string();
             assert_eq!(reason, "pes must be a range of consecutive PEs");
         });
+    }
+
+    /// A visible placement takes the `i`-th listed chip for position `i`, or chip `i` while none is
+    /// listed, reads the list as the runtime does and refuses a bad entry or a position past it.
+    #[test]
+    fn places_positions_on_visible_chips() {
+        Python::initialize();
+        let placed = |value: Option<&str>, positions: &[u8]| {
+            let value = value.map(str::to_owned).ok_or(VarError::NotPresent);
+            Placement::listed(value, positions).map_err(|error| error.to_string())
+        };
+        let refused = |reason: &str| Err(reason.to_owned());
+        assert_eq!(placed(None, &[0, 1]), Ok(vec![0, 1]));
+        assert_eq!(placed(None, &[2, 3]), Ok(vec![2, 3]));
+        assert_eq!(placed(Some(""), &[1]), Ok(vec![1]));
+        assert_eq!(placed(Some("5,3"), &[0, 1]), Ok(vec![5, 3]));
+        assert_eq!(placed(Some("5,3"), &[1]), Ok(vec![3]));
+        assert_eq!(placed(Some(" 5, ,3,"), &[0, 1]), Ok(vec![5, 3]));
+        assert_eq!(
+            placed(Some("0-3"), &[0]),
+            refused("ValueError: FURIOSA_VISIBLE_CHIPS: `0-3` is not a chip index"),
+        );
+        assert_eq!(
+            placed(Some("5,a"), &[0]),
+            refused("ValueError: FURIOSA_VISIBLE_CHIPS: `a` is not a chip index"),
+        );
+        assert_eq!(
+            placed(Some("5,3"), &[2]),
+            refused("IndexError: FURIOSA_VISIBLE_CHIPS lists 2 chips, none at position 2"),
+        );
     }
 
     /// Dtypes outside the supported element types are refused with `ValueError` by every way of

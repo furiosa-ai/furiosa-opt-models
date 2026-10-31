@@ -4,7 +4,6 @@ instance, which hands them to the encoder cache connector."""
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -101,8 +100,7 @@ def test_encoder_embeds_each_item_as_transformers_does(
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         """The rows of each of `images`, patches and their positions, from one call, and of each
         of `clips` from another, read before the device objects drop."""
-        chip = int(os.environ.get("FURIOSA_VISIBLE_CHIPS", "0").split(",")[0])
-        device = engine.Device(engine.Placement([chip], range(8)))
+        device = engine.Device(engine.Placement.visible([0], range(8)))
         encoder = engine.LoadOptions().encoder().load(engine.Checkpoint(directory), device)
         assert isinstance(encoder, engine.Encoder)
 

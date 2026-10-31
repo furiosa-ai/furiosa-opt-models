@@ -9,12 +9,10 @@
   back by a new load. With a backup, the decoder loads a copy of the checkpoint's tensors in host
   memory and keeps it, so the weights come back as the server loaded them whatever happens to the
   files.
-- `chips` maps SGLang's device index of a scheduler to the physical chips it drives.
 """
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Final
 
@@ -27,19 +25,6 @@ if TYPE_CHECKING:
 PES: Final = range(8)
 
 RELEASED: Final = "SGLang's memory saver released the device memory this call reads: resume it"
-
-
-def chips(first: int, count: int) -> list[int]:
-    """The `count` chips from position `first` of `FURIOSA_VISIBLE_CHIPS`, or of every installed
-    chip in index order when it is unset, as SGLang maps a device index to a visible device."""
-    visible = os.environ.get("FURIOSA_VISIBLE_CHIPS", "")
-    listed = [int(chip) for chip in visible.split(",") if chip.strip()]
-    chosen = listed[first : first + count] if listed else list(range(first, first + count))
-    if len(chosen) != count:
-        raise ValueError(
-            f"FURIOSA_VISIBLE_CHIPS lists {len(listed)} chips; the scheduler needs {first + count}"
-        )
-    return chosen
 
 
 @dataclass(frozen=True, slots=True)
