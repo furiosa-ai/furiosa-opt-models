@@ -74,6 +74,25 @@ impl<'a, Hidden: AxisName, G: Group, All: AxisName>
                         .tile::<m![Tile / 32], 1, m![Tile % 32 / 8 = 1 #{!} 4, Tile / 32 = 1 #{!} 4,
                         Hidden % 64 / 16, Tile % 8, Hidden % 16]>(0),
                 );
+            } else if groups <= 8 {
+                let rows = normalized
+                    .view()
+                    .tile::<m![All / 8], 8, m![All / 8 = 8 # (All / 8), Hidden / 16, All % 8,
+                        Hidden % 16]>(start / 8);
+                // SAFETY: the window's row groups are the wave's first half, in order.
+                let rows = unsafe {
+                    rows.reshape::<
+                        Chip,
+                        m![Tile / 8 = 8 # (All / 8), Hidden / 16, Tile % 8, Hidden % 16],
+                    >()
+                };
+                rows.to_dm_view(
+                    &mut context.tdma,
+                    in_dm.view_mut().tile::<m![Tile / 32], 2, m![Tile % 32 / 8,
+                        Tile / 32 = 2 #{!} 4, Hidden % 64 / 16, Tile % 8, Hidden % 16]>(
+                        0
+                    ),
+                );
             } else {
                 let rows = normalized
                     .view()
