@@ -3001,24 +3001,26 @@ mod tests {
     /// each row's last [`WINDOW`] keys, causally, as an f64 softmax does: a row whose window opens
     /// inside a block, rows whose windows reach exactly the history's first key and one past it,
     /// whole tiles whose first row sees all of a short history and whose last row sees none, and
-    /// chunks of every tile domain, though poison fills the keys below the first row's window and
-    /// one poisoned block every block wholly below it.
+    /// chunks of every tile domain; and chunks in windows narrower than a panel. Poison fills the
+    /// keys below the first row's window, and one poisoned block every block wholly below it.
     #[tokio::test(flavor = "current_thread")]
     async fn attends_only_each_row_window() {
         let _lease = DEVICE.lock().await;
         let mut context = Device::new(attend_chunk.topology()).unwrap();
         let cases = [
-            (1, 2 * WINDOW + 16),
-            (2, WINDOW),
-            (17, WINDOW - 17),
-            (128, WINDOW),
-            (300, 2866),
-            (1024, 1100),
-            (129, 2049),
-            (513, 3000),
+            (1, 2 * WINDOW + 16, WINDOW),
+            (2, WINDOW, WINDOW),
+            (17, WINDOW - 17, WINDOW),
+            (128, WINDOW, WINDOW),
+            (300, 2866, WINDOW),
+            (1024, 1100, WINDOW),
+            (129, 2049, WINDOW),
+            (513, 3000, WINDOW),
+            (100, 3000, 128),
+            (64, 1000, 100),
         ];
-        for (q, h) in cases {
-            let chunk = (q, h, Some(WINDOW));
+        for (q, h, window) in cases {
+            let chunk = (q, h, Some(window));
             let got = attend::<KvHeads, Groups, Head, SCALE>(&mut context, chunk, (None, None));
             check::<KvHeads, Groups, Head, SCALE>(chunk, &got.await);
             let got = attend::<KvHeads, QueryPairs, Wide, UNIT>(&mut context, chunk, (None, None));

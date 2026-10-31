@@ -943,40 +943,50 @@ pub(crate) mod tests {
         }
     }
 
-    /// Rows past a window of [`WINDOW`] keys, alone, all of them, many and beside short rows, of
-    /// 128-wide heads in four query groups and of 256-wide heads in two, attend only their last
-    /// [`WINDOW`] keys as a host softmax does under either tiling, though poison fills their keys
-    /// below the window and the null block takes the place of every block wholly below it.
+    /// Rows past a window of [`WINDOW`] keys, alone, all of them, many and beside short rows, and
+    /// rows past a window narrower than a packed column, of 128-wide heads in four query groups
+    /// and of 256-wide heads in two, attend only their window as a host softmax does under either
+    /// tiling, though poison fills their keys below the window and the null block takes the place
+    /// of every block wholly below it.
     #[tokio::test(flavor = "current_thread")]
     async fn attends_only_each_row_window() {
         let _lease = DEVICE.lock().await;
         let mut device = Device::new(attend_items.topology()).unwrap();
         let device = &mut device;
+        let narrow = [1, 25, 100, 101, 117, 300, 1089, 2065];
         let cases = [
-            vec![2 * WINDOW + 17],
-            WINDOWED.to_vec(),
-            (0..40).map(|row| WINDOWED[row % WINDOWED.len()]).collect(),
-            [25; 40].into_iter().chain([WINDOW + 1, LONG]).collect(),
+            (vec![2 * WINDOW + 17], WINDOW),
+            (WINDOWED.to_vec(), WINDOW),
+            (
+                (0..40).map(|row| WINDOWED[row % WINDOWED.len()]).collect(),
+                WINDOW,
+            ),
+            (
+                [25; 40].into_iter().chain([WINDOW + 1, LONG]).collect(),
+                WINDOW,
+            ),
+            (narrow.to_vec(), 100),
         ];
-        for lengths in &cases {
+        for (lengths, window) in &cases {
             for tiling in [Tiling::Adaptive, Tiling::Fixed] {
-                within::<KvHeads, Groups, Head, SCALE>(device, lengths, tiling).await;
-                within::<KvHeads, Pairs, Wide, UNIT>(device, lengths, tiling).await;
+                let rows = (&lengths[..], *window);
+                within::<KvHeads, Groups, Head, SCALE>(device, rows, tiling).await;
+                within::<KvHeads, Pairs, Wide, UNIT>(device, rows, tiling).await;
             }
         }
     }
 
     /// Rows of `lengths` keys of `H` KV heads of `G` groups of `D` channels, tiled as `tiling`
-    /// says, each attend their last [`WINDOW`] keys as a host softmax does.
+    /// says, each attend their last `window` keys as a host softmax does.
     async fn within<H: AxisName, G: AxisName, D: AxisName, const SCALE: usize>(
         device: &mut Device,
-        lengths: &[usize],
+        (lengths, window): (&[usize], usize),
         tiling: Tiling,
     ) {
-        let (mut pool, tables) = windowed::<H, D>(device, lengths, WINDOW).await;
+        let (mut pool, tables) = windowed::<H, D>(device, lengths, window).await;
         let options = Options {
             tiling,
-            window: Some(WINDOW),
+            window: Some(window),
         };
         let rows = lengths.iter().copied().zip(tables);
         let plan = planned::<H, G, D, WAVES, Reach>(rows, options);
@@ -984,7 +994,7 @@ pub(crate) mod tests {
         let output = run::<H, G, D, SCALE, WAVES>(device, &mut pool, &plan, fixture).await;
         let rows = output.chunks_exact(stride::<H, G, D>()).zip(lengths);
         for (row, (got, &length)) in rows.enumerate() {
-            let seen = (row, lowest(length, WINDOW)..length);
+            let seen = (row, lowest(length, window)..length);
             check::<H, G, D, SCALE>(row, seen, got, lengths.len());
         }
     }
