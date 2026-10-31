@@ -124,9 +124,9 @@ type Queries<G, Z> = query::Queries<G, QueryHeads<Z>, Head>;
 type Pairs<G> = query::Pairs<G, KvHeads, Head>;
 /// A launch's rotation: each slot's coefficients.
 type Rotation<Z> = SplitHalf<Head, group::Rotation<<Z as Decode>::Slots, Row<Head>>>;
-/// A period's rotation coefficients in the slices of its queries, for periods of `G` tiles.
-type Coefficients<G, Z> =
-    <ToDm<G, QueryHeads<Z>> as crate::Op<(&'static Rotation<Z>, usize)>>::Output;
+/// The landing of a period's rotation coefficients into the slices of its queries, for periods of
+/// `G` tiles, with the rotation and the period index it lands them from.
+type Landing<'r, G, Z> = (ToDm<G, QueryHeads<Z>>, (&'r Rotation<Z>, usize));
 /// A span tile of the attended rows as the output projection's steps take it, with what its form
 /// landed.
 type Projecting<'o, 'r, Z, L> = (&'o mut L, Live<&'r QueryRows<Z>, Capacity<Z>>);
@@ -426,11 +426,9 @@ where
         for at in 0..pairs {
             let start = tile.tile::<Pair>(at).start();
             let landing = ToDm::<TilePair, QueryHeads<Z>>(PhantomData);
-            let index = (rotation, start / Pair::SIZE);
-            let coefficients = crate::Op::forward(&landing, &mut *device, index);
             let next = front.launch.period::<TilePair>(&home, at);
             let landed = (
-                coefficients,
+                (landing, (rotation, start / Pair::SIZE)),
                 front.value.forward(&mut *device, tile, &mut (), next),
             );
             period(
@@ -446,11 +444,9 @@ where
         for _ in 0..tile.count::<Tile>() % 2 {
             let start = tile.tile::<Tile>(2 * pairs).start();
             let landing = ToDm::<Tiles<1>, QueryHeads<Z>>(PhantomData);
-            let index = (rotation, start / Tile::SIZE);
-            let coefficients = crate::Op::forward(&landing, &mut *device, index);
             let next = front.launch.period::<Tiles<1>>(&home, pairs);
             let landed = (
-                coefficients,
+                (landing, (rotation, start / Tile::SIZE)),
                 front.value.forward(&mut *device, tile, &mut (), next),
             );
             period(
@@ -519,14 +515,15 @@ where
 
 /// A period of `G` tiles of a tile's rows through a layer's projections, their forms begun in
 /// `front` and running with `adapters`, stored at row `start` of `stored`, its rows landed and its
-/// rotation's coefficients before them: the queries projected, normalized, rotated and stored
-/// while the keys and values project, then the keys normalized, rotated and stored with the values.
+/// rotation's coefficients landed by `landing` from `index`: the queries projected, normalized,
+/// rotated and stored while the keys and values project, then the keys normalized, rotated and
+/// stored with the values.
 fn period<Z, G, P, GN, V, LA, K, Q, QN, KN, QH, KH, T: States>(
     device: &mut Device,
     positions: &Rotary<Head>,
     front: &Front<GN, V, LA, K, Q, QN, KN>,
     tile: Live<(), Capacity<Z>>,
-    (coefficients, rows): (Coefficients<G, Z>, P),
+    ((landing, index), rows): (Landing<'_, G, Z>, P),
     start: usize,
     (stored, adapters): (&mut Stored<Z>, &mut T),
 ) where
@@ -548,6 +545,8 @@ fn period<Z, G, P, GN, V, LA, K, Q, QN, KN, QH, KH, T: States>(
     } = front;
     let Stored { queries, retained } = stored;
     let projected = query.forward(&mut *device, tile, adapters.query(), &rows);
+    // Behind the period's rows and the queries' squares, which the projection reads first.
+    let coefficients = crate::Op::forward(&landing, &mut *device, index);
     let normalized = query_norm.forward(&mut *device, tile, &mut (), projected);
     let rotation = crate::Op::forward(&group::Stage, &mut *device, &coefficients);
     let rotated = positions.forward(&mut *device, tile, &mut (), (&normalized, &rotation));
