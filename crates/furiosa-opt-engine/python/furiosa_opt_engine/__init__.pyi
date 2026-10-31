@@ -500,6 +500,18 @@ class Placement:
         Raises:
         ValueError: `pes` has a step other than 1.
         """
+    @staticmethod
+    def visible(positions: collections.abc.Sequence[int], pes: range) -> Placement:
+        r"""
+        The chips at `positions` of `FURIOSA_VISIBLE_CHIPS`, with `pes` on each: position `i` is
+        the `i`-th chip the variable lists, or chip `i` while it lists none, as a framework numbers
+        the devices a process sees.
+
+        Raises:
+            ValueError: An entry of the variable is no chip index, or `pes` has a step other
+                than 1.
+            IndexError: A position lies past the chips the variable lists.
+        """
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
