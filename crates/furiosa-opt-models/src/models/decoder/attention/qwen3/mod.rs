@@ -59,6 +59,7 @@ use crate::{Layers, Rolled, Sequential, Then};
 use catalog::Depth;
 use furiosa_opt_std::prelude::*;
 
+mod catalog;
 pub mod fp8;
 pub mod launch;
 
@@ -610,16 +611,6 @@ pub type Qwen3Model<
     Pool,
     DEPTH,
 >;
-
-/// What the one catalog binding is generic over, private to Qwen3.
-mod catalog {
-    /// The catalog binding of a size `S` in projection form `P`, at the count of layers the
-    /// size's layer array holds, and its body.
-    pub trait Depth<S, P, C, X> {
-        type Catalog;
-        type Body;
-    }
-}
 
 /// The query heads of a size `S`: `num_attention_heads`, its key and value heads' groups.
 pub struct QueryHeads<S>(PhantomData<fn() -> S>);
