@@ -6,7 +6,6 @@
 
 use super::Vector;
 use crate::Op;
-use crate::ops::linear::block_einsum::scaled_block_sums;
 use crate::ops::normalization::Spread;
 use crate::tensor::form::BlockScaled;
 use crate::tensor::form::nvfp4::{Held, Scale, Scales, Summed, W4A16};
@@ -62,9 +61,6 @@ type Part<I> = m![I % (I / ({ Ways<I> }))];
 /// The four rows of every block one pass covers: the transpose to the output packet takes at
 /// most four, and a commit packet at least eight bytes.
 type Elements<I, O> = m![O % ({ Block<I, O> }) = 4];
-/// A pass's block sums: its rows, the 16-input blocks of a slice's part, and the `1` of the input's
-/// TRF element, which the contraction keeps.
-type Sums<I, O> = m![{ Elements<I, O> }, { Part<I> } / 16, 1];
 
 /// One contiguous BF16 row through a weight under the summed contract.
 impl<I: AxisName, O: AxisName, K, V, Y: Memory> Op<&Vector<I>>
@@ -180,7 +176,22 @@ fn project<I: AxisName, O: AxisName>(
             .view()
             .tile::<m![O % ({ Block<I, O> })], 4, m![O / (O / 2), O % (O / 2) / ({ Block<I, O> }), { Elements<I, O> } # ({ Block<I, O> }), I]>(at)
             .to_dm(&mut device.tdma);
-        scaled_block_sums::<I, Elements<I, O>, Part<I>, Sums<I, O>, _, _, _, _>(device, codes.view(), &input, &scale)
+        // A packet is one block of 16 BF16 values, which the packet reducer sums, so each block
+        // sum meets its scale as a broadcast VRF read.
+        device
+            .main
+            .begin(codes.view())
+            .fetch::<m![{ Elements<I, O> }, { Part<I> } / 64], m![I % 64]>()
+            .fetch_table_lookup::<bf16>()
+            .collect::<m![{ Elements<I, O> }, { Part<I> } / 16], m![I % 16]>()
+            .contract_outer::<m![{ Elements<I, O> }, { Part<I> } / 16, 1], m![I % 16], _, _, _>(&input)
+            .contract_packet::<m![1]>()
+            .contract_time::<m![{ Elements<I, O> }, { Part<I> } / 16, 1]>()
+            .contract_lane::<m![{ Elements<I, O> }, { Part<I> } / 16, 1], m![1 # 8]>(LaneMode::Sequential)
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_trim::<m![1 # 4]>()
+            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &scale)
             .vector_intra_slice_reduce::<I, m![{ Elements<I, O> }, 1], m![1 # 4]>(IntraSliceReduceOpF32::Add)
             .vector_fp_div(&global)
             .vector_widen_pad::<m![1 # 8]>()
