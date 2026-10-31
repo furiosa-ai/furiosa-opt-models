@@ -290,7 +290,7 @@ mod tests {
                 pools: vec![Pool { block, bytes: 64 }],
                 groups: vec![Group {
                     pool: 0,
-                    layers: 0..1,
+                    layers: vec![0],
                     kind: Kind::Paged,
                     window: None,
                 }],
@@ -380,7 +380,7 @@ mod tests {
         let mut limits = limits(4);
         limits.cache.groups.push(Group {
             pool: 0,
-            layers: 1..2,
+            layers: vec![1],
             kind: Kind::Paged,
             window: Some(8),
         });

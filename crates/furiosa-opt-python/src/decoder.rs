@@ -351,12 +351,10 @@ impl Group {
         self.0.pool
     }
 
-    /// The model layers the group caches.
+    /// The model layers the group caches, by index in the model and ascending.
     #[getter]
-    #[gen_stub(override_return_type(type_repr = "range"))]
-    fn layers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyRange>> {
-        let layers = &self.0.layers;
-        PyRange::new(py, layers.start.try_into()?, layers.end.try_into()?)
+    fn layers(&self) -> Vec<usize> {
+        self.0.layers.clone()
     }
 
     /// What the group's blocks hold.

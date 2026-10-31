@@ -655,7 +655,7 @@ fn limits<S: Geometry + Attention + Decode + 'static>(adapters: usize, tiling: T
             }],
             groups: vec![Group {
                 pool: 0,
-                layers: 0..S::LAYERS,
+                layers: (0..S::LAYERS).collect(),
                 kind: Kind::Paged,
                 window: None,
             }],

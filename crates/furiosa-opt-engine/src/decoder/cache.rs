@@ -14,7 +14,7 @@ use std::any::Any;
 use std::io;
 use std::iter;
 use std::mem;
-use std::ops::{Deref, DerefMut, Range};
+use std::ops::{Deref, DerefMut};
 use std::sync::{Mutex, PoisonError};
 
 /// The cache a decoder's calls read: block formats, and the groups of layers that use them.
@@ -40,8 +40,9 @@ pub struct Pool {
 pub struct Group {
     /// Index of the pool in `CacheSpec::pools`.
     pub pool: usize,
-    /// The model layers the group caches.
-    pub layers: Range<usize>,
+    /// The model layers the group caches, by index in the model and ascending: the layers of
+    /// two groups may interleave.
+    pub layers: Vec<usize>,
     pub kind: Kind,
     /// Positions a row attends back to in a sliding window; `None` attends the whole history.
     pub window: Option<usize>,
@@ -205,6 +206,7 @@ impl<V: Send + 'static> Drop for Lent<'_, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Range;
 
     /// One pool of `bytes`-byte pages, one paged group over `layers`.
     fn paged(bytes: usize, layers: Range<usize>) -> CacheSpec {
@@ -212,7 +214,7 @@ mod tests {
             pools: vec![Pool { block: 16, bytes }],
             groups: vec![Group {
                 pool: 0,
-                layers,
+                layers: layers.collect(),
                 kind: Kind::Paged,
                 window: None,
             }],
@@ -229,21 +231,23 @@ mod tests {
         }
     }
 
-    /// Every layer of every group holds a page of its pool for each block, group by group.
+    /// Every layer of every group holds a page of its pool for each block, group by group, also
+    /// when the groups' layers interleave.
     #[test]
     fn sizes_each_layer_a_page_a_block() -> io::Result<()> {
         let mut spec = paged(64, 0..2);
+        spec.groups[0].layers.push(3);
         spec.pools.push(Pool {
             block: 16,
             bytes: 32,
         });
         spec.groups.push(Group {
             pool: 1,
-            layers: 2..3,
+            layers: vec![2],
             kind: Kind::State,
             window: None,
         });
-        assert_eq!(spec.sizes(3)?, [192, 192, 96]);
+        assert_eq!(spec.sizes(3)?, [192, 192, 192, 96]);
         Ok(())
     }
 

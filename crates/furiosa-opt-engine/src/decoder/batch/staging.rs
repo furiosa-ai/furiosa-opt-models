@@ -258,7 +258,7 @@ mod tests {
                     }],
                     groups: vec![Group {
                         pool: 0,
-                        layers: 0..1,
+                        layers: vec![0],
                         kind: Kind::Paged,
                         window: None,
                     }],

@@ -118,9 +118,9 @@ class Group:
         Index of the pool in `CacheSpec.pools`.
         """
     @property
-    def layers(self) -> range:
+    def layers(self) -> builtins.list[builtins.int]:
         r"""
-        The model layers the group caches.
+        The model layers the group caches, by index in the model and ascending.
         """
     @property
     def kind(self) -> Kind:
