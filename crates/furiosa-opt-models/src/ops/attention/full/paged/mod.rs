@@ -390,7 +390,7 @@ mod tests {
     use furiosa_opt_std::runtime::launch;
     use gqa::items::tests::{
         self as items, Heads as KvHeads, KEYS, LONG, QueryEights as Eights, QueryGroups as Groups,
-        QueryPairs as Pairs, QuerySingle as Single, QuerySixteens as Sixteens, SCALE,
+        QueryPairs as Pairs, QuerySingle as Single, QuerySixteens as Sixteens, SCALE, UNIT, Wide,
         Width as Head, stride,
     };
 
@@ -706,6 +706,28 @@ mod tests {
         }
         for lengths in [vec![LONG; 64], mixed] {
             check::<Rows<64>, Groups, HISTORY_WAVES>(device, &mut pool, &masks, &lengths).await;
+        }
+    }
+
+    /// Rows of 256-wide heads, two query groups to each of eight KV heads, attend under a unit
+    /// score multiplier as a host softmax does, as work items and through the windowed leaf: a
+    /// 32-row envelope all live, a 17-row tail of mixed lengths, and the whole history beside two
+    /// short rows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn attends_every_live_row_of_wide_heads() {
+        let _lease = DEVICE.lock().await;
+        let mut device = Device::new(attend_rows.topology()).unwrap();
+        let mut pool = items::pool::<KvHeads, Wide>(&mut device).await;
+        let masks = chunks::Masks::new(&mut device).await.unwrap();
+        let device = &mut device;
+        let tail: Vec<usize> = (0..17).map(|row| items::MIXED[row % 16]).collect();
+        for lengths in [vec![KEYS; 32], tail, vec![LONG, 17, 1]] {
+            let output = as_items::<Rows<32>, KvHeads, Pairs, Wide, UNIT, WAVES>;
+            let output = output(device, &mut pool, &masks, &lengths).await;
+            check_rows::<KvHeads, Pairs, Wide, UNIT>(&lengths, &output);
+            let output = by_windows::<Rows<32>, KvHeads, Pairs, Wide, UNIT>;
+            let output = output(device, &mut pool, &lengths).await;
+            check_rows::<KvHeads, Pairs, Wide, UNIT>(&lengths, &output);
         }
     }
 }

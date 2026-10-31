@@ -54,6 +54,9 @@ pub const DECODES: usize = 1024;
 /// Items a merge combines into one row.
 pub const INPUTS: usize = 64;
 
+/// Rows of a row group, the lanes of a vector packet.
+const LANES: usize = 8;
+
 /// Slots each slice holds of a work item's landed history, a key and a value of `heads` KV heads
 /// of `head` BF16 channels a slot: 64, or fewer so a landing takes at most a quarter of the slice's
 /// data memory and the two a domain keeps in flight leave half of it to the rest of the layer.
@@ -67,4 +70,18 @@ pub(crate) const fn landing(head: usize, heads: usize) -> usize {
         "a landing holds whole 16-slot probability packets"
     );
     slots
+}
+
+/// Rows one pass of windowed attention attends at most: 32, or fewer so a slice's tensor registers
+/// hold the `keys` keys of `head` BF16 channels it scores for each row group of the pass, and its
+/// vector registers the mask and the bias of those scores, `groups` query groups a row.
+pub(crate) const fn pass(head: usize, groups: usize, keys: usize) -> usize {
+    let mut rows = 32;
+    while rows / LANES * keys * head * size_of::<bf16>() > super::TRF
+        || 2 * (rows / LANES) * groups * keys * size_of::<f32>() > super::VRF
+    {
+        rows /= 2;
+    }
+    assert!(rows >= LANES, "a pass attends a whole row group");
+    rows
 }

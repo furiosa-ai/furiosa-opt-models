@@ -4,7 +4,7 @@ use furiosa_opt_std::prelude::*;
 
 use super::{Attention, Chip, KeyValue, TileGroups};
 use crate::ops::index::table::{BlockCounts, BlockIndex};
-use crate::specialize::attention::Strategy;
+use crate::specialize::attention::{self, Strategy};
 use crate::tensor::cache::{Block, Blocks};
 use crate::tensor::scalar::{F32, Value};
 use std::marker::PhantomData;
@@ -72,8 +72,8 @@ type Merged<Rows, KvHeads> = m![KvHeads, { Layout<Rows>::Lanes } # 8 % 4, 1 # 8]
 
 type RowGroups<Rows> = linear::Groups<Rows>;
 
-/// The row groups of an `N`-row tile; at 32 rows the four independent row groups that fill the
-/// 64 KiB register file, the most one pass attends.
+/// The row groups of an `N`-row tile; at 32 rows the four independent row groups whose 128-wide
+/// keys fill the 64 KiB register file, the most one pass attends.
 type TileRows<Rows, const N: usize = 32> =
     m![{ RowGroups<Rows> } % ({ Symbol<TileGroups<Rows, N>> })];
 
@@ -304,7 +304,8 @@ where
     type Output = Attended<Rows, KvHeads, Groups, Head>;
 
     /// Attends each row's history and merges its shard-local softmax terms, window zero seeding the
-    /// carries; row groups run in shared passes when all hold a live row, else only the live ones.
+    /// carries; row groups run in shared passes when all hold a live row and a pass holds 32 rows,
+    /// else only the live ones, in the widest passes a slice's registers hold.
     fn forward(
         &self,
         device: &mut Device,
@@ -324,7 +325,8 @@ where
                 "one pass of the partition holds eight KV heads of four lanes and eight shards"
             )
         };
-        if live.count::<Lanes<Rows>>() == <RowGroups<Rows> as M>::SIZE {
+        if const { Self::ROWS == 32 } && live.count::<Lanes<Rows>>() == <RowGroups<Rows> as M>::SIZE
+        {
             // A slice holds the query rows of the head it owns: each head is copied once, then
             // broadcast to the eight shards inside its processing element.
             let projected: Query<Rows, KvHeads, Groups, Head> = device
@@ -357,27 +359,41 @@ where
         let rest = rest.extent::<m![{ Symbol<Rest<Windows>> }]>();
         let mut attended = Attended::<Rows, KvHeads, Groups, Head>::new();
         let inputs = (query, history, bias, rest);
-        // Passes over 32-row tiles, then at most one over 16 rows and one over 8: most of a pass's
-        // cost is paid once whatever its groups, so the live groups take the fewest passes.
+        // Passes over the widest tiles a pass holds, then at most one over each narrower tile: most
+        // of a pass's cost is paid once whatever its groups, so the live groups take the fewest.
         let (groups, wide, half) = (
             live.count::<Lanes<Rows>>(),
             <TileGroups<Rows, 32> as AxisName>::SIZE,
             <TileGroups<Rows, 16> as AxisName>::SIZE,
         );
-        for tile in 0..groups / wide {
-            self.pass(device, inputs, Pass::<32>(tile), &mut attended);
-        }
-        for tile in 0..groups % wide / half {
-            let pass = Pass::<16>(groups / wide * (wide / half) + tile);
-            self.pass(device, inputs, pass, &mut attended);
-        }
-        for tile in 0..groups % half {
-            self.pass(
-                device,
-                inputs,
-                Pass::<8>(groups / half * half + tile),
-                &mut attended,
-            );
+        if const { Self::ROWS == 32 } {
+            for tile in 0..groups / wide {
+                self.pass(device, inputs, Pass::<32>(tile), &mut attended);
+            }
+            for tile in 0..groups % wide / half {
+                let pass = Pass::<16>(groups / wide * (wide / half) + tile);
+                self.pass(device, inputs, pass, &mut attended);
+            }
+            for tile in 0..groups % half {
+                self.pass(
+                    device,
+                    inputs,
+                    Pass::<8>(groups / half * half + tile),
+                    &mut attended,
+                );
+            }
+        } else if const { Self::ROWS == 16 } {
+            for tile in 0..groups / half {
+                self.pass(device, inputs, Pass::<16>(tile), &mut attended);
+            }
+            for tile in 0..groups % half {
+                let pass = Pass::<8>(groups / half * half + tile);
+                self.pass(device, inputs, pass, &mut attended);
+            }
+        } else {
+            for tile in 0..groups {
+                self.pass(device, inputs, Pass::<8>(tile), &mut attended);
+            }
         }
         attended
     }
@@ -386,6 +402,10 @@ where
 impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
     Windowed<KvHeads, Groups, Head, SCALE>
 {
+    /// Rows a pass attends at most: 32, 16 or 8, the most whose keys and score masks a slice's
+    /// registers hold.
+    const ROWS: usize = attention::pass(Head::SIZE, Groups::SIZE, <m![Cache % 64] as M>::SIZE);
+
     /// Attends the row groups of `pass` over their histories and writes their rows in `attended`.
     fn pass<Rows: AxisName, Windows: AxisName, Source, const N: usize>(
         &self,
