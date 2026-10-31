@@ -264,7 +264,9 @@ where
     }
 }
 
-/// The rows of a launch's tokens in the decoder's feature mapping, with the launch's live rows.
+/// The rows of a launch's tokens in the decoder's feature mapping, with the launch's live rows:
+/// each token's table row gathered whole at its byte offset, so any width a row's slices hold
+/// serves, then landed in the feature slices.
 impl<
     'x,
     Vocabulary: AxisName,
@@ -283,12 +285,18 @@ where
     fn forward(
         &self,
         device: &mut Device,
-        env: Env,
+        _: Env,
         _: &mut (),
         (ids, tiles): (&'x Ids<Rows, Chips>, Live<(), Rows>),
     ) -> Self::Output {
-        let rows = tiles.with(Module::forward(&self, &mut *device, env, &mut (), ids));
-        Module::forward(&Reorder::<Hidden>::default(), device, env, &mut (), rows)
+        let offsets = Op::forward(
+            &ByteOffset::<bf16, m![Hidden], m![Rows]>::default(),
+            &mut *device,
+            ids,
+        );
+        let rows: HbmTensor<bf16, Chips, m![Rows, Hidden]> =
+            Op::forward(&Gather, &mut *device, (self.weight.borrow(), &offsets));
+        tiles.with(rows.to_dm(&mut device.tdma))
     }
 }
 
