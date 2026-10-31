@@ -13,7 +13,7 @@ use serde::Deserialize;
 
 use super::qwen3::{self, Front};
 use super::{Geometry, Head, KvHeads};
-use crate::models::{Family, config};
+use crate::models::{Family, config, vocabulary};
 use crate::ops::attention::geometry::{self, HeadRows, ProjectionWidth, QueryGroups, QueryWidth};
 use crate::ops::normalization::RmsNorm;
 use crate::ops::swiglu;
@@ -149,7 +149,6 @@ where
     type Error = io::Error;
 
     fn try_from(config: Config) -> io::Result<Self> {
-        let invalid = |reason: String| io::Error::new(io::ErrorKind::InvalidData, reason);
         let unsupported = |reason: &str| io::Error::new(io::ErrorKind::Unsupported, reason);
         let heads = <Self as Geometry>::KvHeads::SIZE;
         // Transformers derives an absent `head_dim` from the hidden width.
@@ -179,25 +178,19 @@ where
             .into_iter()
             .find(|(_, declared, held)| declared != held)
         {
-            return Err(invalid(format!(
+            return Err(unsupported(&format!(
                 "{key}: {declared}, the size {N} holds {held}"
             )));
         }
-        let rows = <Self as Geometry>::Vocabulary::SIZE;
-        if !(1..=rows).contains(&config.vocab_size) {
-            return Err(invalid(format!(
-                "vocab_size: {}, the size compiles {rows} rows",
-                config.vocab_size
-            )));
-        }
+        vocabulary::<<Self as Geometry>::Vocabulary>(config.vocab_size)?;
         if (config.rms_norm_eps as f32).to_bits() as usize != Self::EPSILON {
-            return Err(invalid(format!(
+            return Err(unsupported(&format!(
                 "rms_norm_eps: {}, another than the size's",
                 config.rms_norm_eps
             )));
         }
         if config.tie_word_embeddings != Self::TIED_EMBEDDINGS {
-            return Err(invalid(format!(
+            return Err(unsupported(&format!(
                 "tie_word_embeddings: {}, the size ties: {}",
                 config.tie_word_embeddings,
                 Self::TIED_EMBEDDINGS
@@ -234,19 +227,78 @@ mod tests {
     use crate::tensor::memory::Hbm;
     use crate::tensor::parallel::Parallel;
 
-    /// Llama-3-8B's published config selects the size; a scaled spectrum is refused.
-    #[test]
-    fn parses_the_published_config() {
-        let mut config = serde_json::json!({
+    /// Llama-3-8B's published config.
+    fn published() -> serde_json::Value {
+        serde_json::json!({
             "hidden_size": 4096, "intermediate_size": 14336, "num_hidden_layers": 32,
             "num_attention_heads": 32, "num_key_value_heads": 8, "vocab_size": 128256,
             "rms_norm_eps": 1e-5, "max_position_embeddings": 8192, "rope_scaling": null,
             "rope_theta": 500000.0, "tie_word_embeddings": false, "attention_bias": false,
-        });
+        })
+    }
+
+    /// Llama-3-8B's published config selects the size; a scaled spectrum is refused.
+    #[test]
+    fn parses_the_published_config() {
+        let mut config = published();
         assert!(Size::<"8B">::parse(&config).is_ok());
-        config["rope_scaling"] = serde_json::json!({"rope_type": "llama3", "factor": 8.0});
+        config["rope_scaling"] = serde_json::json!({
+            "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0, "original_max_position_embeddings": 8192,
+        });
         let error = Size::<"8B">::parse(&config).err().expect("refused");
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    /// A config the 8B size does not serve is refused, each case by its kind and reason.
+    #[test]
+    fn refuses_what_the_size_does_not_hold() {
+        use io::ErrorKind::{InvalidData, Unsupported};
+        let cases = [
+            (
+                "hidden_size",
+                serde_json::json!(5120),
+                Unsupported,
+                "hidden_size: 5120, the size 8B holds 4096",
+            ),
+            (
+                "num_key_value_heads",
+                serde_json::json!(4),
+                Unsupported,
+                "num_key_value_heads: 4, the size 8B holds 8",
+            ),
+            (
+                "rms_norm_eps",
+                serde_json::json!(1e-6),
+                Unsupported,
+                "rms_norm_eps: 0.000001, another than the size's",
+            ),
+            (
+                "tie_word_embeddings",
+                serde_json::json!(true),
+                Unsupported,
+                "tie_word_embeddings: true, the size ties: false",
+            ),
+            (
+                "vocab_size",
+                serde_json::json!(131073),
+                Unsupported,
+                "vocab_size: 131073, the size holds 1 to 131072",
+            ),
+            (
+                "vocab_size",
+                serde_json::json!(0),
+                InvalidData,
+                "vocab_size: 0, the size holds 1 to 131072",
+            ),
+        ];
+        for (field, value, kind, reason) in cases {
+            let mut config = published();
+            config[field] = value;
+            let error = Size::<"8B">::parse(&config).map(drop).unwrap_err();
+            let refusal = (error.kind(), error.to_string());
+            assert_eq!(refusal, (kind, reason.to_string()), "{field}");
+        }
     }
 
     /// Mistral-7B-v0.3's published config selects the Mistral size; v0.1's sliding window is

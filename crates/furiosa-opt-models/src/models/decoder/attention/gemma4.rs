@@ -6,7 +6,6 @@
 //!   whose axes this module declares.
 
 use crate::Sequential;
-use crate::models::Family;
 use crate::models::config::decoder::Language;
 use crate::models::config::{
     self, Constant, Disabled, Enabled, Literal, Positive, Quantization, Scheme, Size, compiled,
@@ -15,6 +14,7 @@ use crate::models::config::{
 use crate::models::decoder::{
     self, Attention, Declaration, Forms, Requirement, Rotation, Shape, form,
 };
+use crate::models::{Family, vocabulary};
 use crate::modules::attention;
 use crate::modules::{language, multimodal, transformer};
 use crate::ops::attention::gqa::Cache;
@@ -301,7 +301,7 @@ struct Text<G: Shape> {
     hidden_size: Size<G::Hidden>,
     intermediate_size: Size<G::Intermediate>,
     num_attention_heads: Size<G::Queries>,
-    vocab_size: Size<G::Vocabulary>,
+    vocab_size: usize,
     hidden_activation: Literal<"gelu_pytorch_tanh">,
     attention_bias: Disabled,
     enable_moe_block: Disabled,
@@ -309,7 +309,8 @@ struct Text<G: Shape> {
     num_kv_shared_layers: Constant<0>,
     hidden_size_per_layer_input: Constant<0>,
     attention_k_eq_v: Enabled,
-    tie_word_embeddings: Enabled,
+    // Transformers' Gemma 4 configurations default to a tied head.
+    tie_word_embeddings: Option<Enabled>,
     final_logit_softcapping: Positive,
     #[serde(flatten, deserialize_with = "config::declared")]
     max_position_embeddings: NonZeroUsize,
@@ -339,13 +340,13 @@ impl<G: Shape, P: Forms, const S: usize, const F: usize, const O: &'static [Bran
             num_kv_shared_layers: Constant,
             hidden_size_per_layer_input: Constant,
             attention_k_eq_v: Enabled,
-            tie_word_embeddings: Enabled,
+            tie_word_embeddings: None | Some(Enabled),
             hidden_size: Size { .. },
             intermediate_size: Size { .. },
             num_attention_heads: Size { .. },
-            vocab_size: Size { .. },
             ..
         } = text.extra;
+        vocabulary::<G::Vocabulary>(text.extra.vocab_size)?;
         let [sliding, full] = LAYER_TYPES;
         let (own, global) = (text.group(sliding), text.group(full));
         for (field, found, expected) in [
@@ -383,27 +384,16 @@ impl<G: Shape, P: Forms, const S: usize, const F: usize, const O: &'static [Bran
             .map(|branch| LAYER_TYPES[*branch as usize].to_owned())
             .collect();
         compiled("layer_types", text.layer_types(), order.as_slice())?;
-        let positions = text.extra.max_position_embeddings.get();
+        let positions = (text.extra.max_position_embeddings.get())
+            .min(<Full<G> as Attention>::Windows::SIZE * Cache::SIZE);
         let window = text.extra.sliding_window.get();
-        for (field, found, maximum) in [
-            (
-                "max_position_embeddings",
-                positions,
-                <Full<G> as Attention>::Windows::SIZE * Cache::SIZE,
-            ),
-            (
-                "sliding_window",
-                window,
-                // An unaligned start reserves one cache window for the partial prefix.
-                (<Sliding<G> as Attention>::Windows::SIZE - 1) * Cache::SIZE,
-            ),
-        ] {
-            if found > maximum {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("{field}: found {found}, compiled maximum {maximum}"),
-                ));
-            }
+        // An unaligned start reserves one cache window for the partial prefix.
+        let maximum = (<Sliding<G> as Attention>::Windows::SIZE - 1) * Cache::SIZE;
+        if window > maximum {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("sliding_window: found {window}, compiled maximum {maximum}"),
+            ));
         }
         let within = |layer: &'static str| {
             move |error: io::Error| {
@@ -970,26 +960,61 @@ mod tests {
         }
     }
 
-    /// A context or a sliding window past the compiled cache windows is refused by its field;
-    /// the sliding window keeps one window for an unaligned prefix.
+    /// A config that omits the head's tying declares Gemma 4's tied head; an untied head is
+    /// unsupported.
     #[test]
-    fn refuses_contexts_past_the_compiled_windows() {
+    fn reads_an_omitted_tying_as_tied() {
+        let mut document = document::<super::Sizes, { super::ORDER }>();
+        let fields = document.as_object_mut().unwrap();
+        fields.remove("tie_word_embeddings");
+        <Config>::parse(&document).unwrap();
+        document["tie_word_embeddings"] = serde_json::json!(false);
+        let error = <Config>::parse(&document).err().unwrap();
+        assert_eq!(
+            (error.kind(), error.to_string()),
+            (
+                io::ErrorKind::Unsupported,
+                "tie_word_embeddings: found false, compiled true".into()
+            )
+        );
+    }
+
+    /// A vocabulary of at most the compiled rows is served; a larger one is unsupported.
+    #[test]
+    fn serves_a_vocabulary_up_to_its_rows() {
+        let rows = <super::Sizes as Shape>::Vocabulary::SIZE;
+        let mut document = document::<super::Sizes, { super::ORDER }>();
+        document["vocab_size"] = serde_json::json!(rows - 1);
+        <Config>::parse(&document).unwrap();
+        document["vocab_size"] = serde_json::json!(rows + 1);
+        let error = <Config>::parse(&document).err().unwrap();
+        let reason = format!("vocab_size: {}, the size holds 1 to {rows}", rows + 1);
+        assert_eq!(
+            (error.kind(), error.to_string()),
+            (io::ErrorKind::Unsupported, reason)
+        );
+    }
+
+    /// A context past the compiled cache windows is served up to them; a sliding window past them
+    /// is refused, keeping one window for an unaligned prefix.
+    #[test]
+    fn serves_a_context_up_to_the_compiled_windows() {
         let positions = <Full<super::Sizes> as Attention>::Windows::SIZE * Cache::SIZE;
         let window = (<Sliding<super::Sizes> as Attention>::Windows::SIZE - 1) * Cache::SIZE;
-        for (field, maximum) in [
-            ("max_position_embeddings", positions),
-            ("sliding_window", window),
-        ] {
-            let mut document = document::<super::Sizes, { super::ORDER }>();
-            document[field] = serde_json::json!(maximum);
-            <Config>::parse(&document).unwrap();
-            document[field] = serde_json::json!(maximum + 1);
-            let error = <Config>::parse(&document).err().unwrap();
-            let reason = format!("{field}: found {}, compiled maximum {maximum}", maximum + 1);
-            assert_eq!(
-                (error.kind(), error.to_string()),
-                (io::ErrorKind::Unsupported, reason)
-            );
-        }
+        let mut document = document::<super::Sizes, { super::ORDER }>();
+        document["max_position_embeddings"] = serde_json::json!(positions + 1);
+        assert_eq!(<Config>::parse(&document).unwrap().positions, positions);
+        document["sliding_window"] = serde_json::json!(window);
+        <Config>::parse(&document).unwrap();
+        document["sliding_window"] = serde_json::json!(window + 1);
+        let error = <Config>::parse(&document).err().unwrap();
+        let reason = format!(
+            "sliding_window: found {}, compiled maximum {window}",
+            window + 1
+        );
+        assert_eq!(
+            (error.kind(), error.to_string()),
+            (io::ErrorKind::Unsupported, reason)
+        );
     }
 }

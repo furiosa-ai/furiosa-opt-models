@@ -8,7 +8,7 @@
 
 pub use crate::models::Ids;
 use crate::models::decoder::recurrent::Geometry;
-use crate::models::{Family, Scalar};
+use crate::models::{Family, Scalar, vocabulary};
 use crate::modules::recurrent::Gate;
 use crate::modules::recurrent::{Convolution, Projection};
 use crate::modules::{language, recurrent, residual};
@@ -229,7 +229,6 @@ where
     type Error = io::Error;
 
     fn try_from(config: Config) -> io::Result<Self> {
-        let invalid = |reason: String| io::Error::new(io::ErrorKind::InvalidData, reason);
         let unsupported = |reason: &str| io::Error::new(io::ErrorKind::Unsupported, reason);
         let hidden = <Self as Geometry>::Hidden::SIZE;
         let rank = axis::Rank::<<Self as Geometry>::Hidden>::SIZE;
@@ -268,27 +267,23 @@ where
             .into_iter()
             .find(|(_, declared, held)| *declared != Some(*held))
         {
-            let declared = declared.map_or("not a count".into(), |count| count.to_string());
-            return Err(invalid(format!(
-                "{key}: {declared}, the size {N} holds {held}"
-            )));
+            let (kind, declared) = match declared {
+                Some(count) => (io::ErrorKind::Unsupported, count.to_string()),
+                None => (io::ErrorKind::InvalidData, "not a count".into()),
+            };
+            let reason = format!("{key}: {declared}, the size {N} holds {held}");
+            return Err(io::Error::new(kind, reason));
         }
-        let rows = <Self as Geometry>::Vocabulary::SIZE;
-        if !(1..=rows).contains(&config.vocab_size) {
-            return Err(invalid(format!(
-                "vocab_size: {}, the size compiles {rows} rows",
-                config.vocab_size
-            )));
-        }
+        vocabulary::<<Self as Geometry>::Vocabulary>(config.vocab_size)?;
         let epsilon = config.layer_norm_epsilon.unwrap_or(1e-5);
         if (epsilon as f32).to_bits() as usize != Self::EPSILON {
-            return Err(invalid(format!(
+            return Err(unsupported(&format!(
                 "layer_norm_epsilon: {epsilon}, another than the size's"
             )));
         }
         let tied = config.tie_word_embeddings.unwrap_or(true);
         if tied != Self::TIED_EMBEDDINGS {
-            return Err(invalid(format!(
+            return Err(unsupported(&format!(
                 "tie_word_embeddings: {tied}, the size ties: {}",
                 Self::TIED_EMBEDDINGS
             )));

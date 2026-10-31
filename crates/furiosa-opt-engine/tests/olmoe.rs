@@ -80,6 +80,15 @@ fn size_reads_its_published_config() {
     Size::<"1B-7B">::parse(&OLMOE_1B_7B.config()).unwrap();
 }
 
+/// A config declaring a context past the size's compiled one parses: the size serves it up to its
+/// own.
+#[test]
+fn size_serves_a_longer_context_up_to_its_own() {
+    let mut document = OLMOE_1B_7B.config();
+    document["max_position_embeddings"] = json!(65536);
+    Size::<"1B-7B">::parse(&document).unwrap();
+}
+
 /// A config the size does not serve is refused, each case by its kind and reason.
 #[test]
 fn size_refuses_what_it_does_not_serve() {
@@ -89,80 +98,74 @@ fn size_refuses_what_it_does_not_serve() {
         (
             "hidden_size",
             json!(4096),
-            InvalidData,
+            Unsupported,
             "hidden_size: 4096, the size 1B-7B holds 2048",
         ),
         (
             "intermediate_size",
             json!(2048),
-            InvalidData,
+            Unsupported,
             "intermediate_size: 2048, the size 1B-7B holds 1024",
         ),
         (
             "num_hidden_layers",
             json!(32),
-            InvalidData,
+            Unsupported,
             "num_hidden_layers: 32, the size 1B-7B holds 16",
         ),
         (
             "num_key_value_heads",
             json!(8),
-            InvalidData,
+            Unsupported,
             "num_key_value_heads: 8, the size 1B-7B holds 16",
         ),
         (
             "num_attention_heads",
             json!(32),
-            InvalidData,
+            Unsupported,
             "num_attention_heads: 32, the size 1B-7B holds 16",
         ),
         (
             "head_dim",
             json!(64),
-            InvalidData,
+            Unsupported,
             "head_dim: 64, the size 1B-7B holds 128",
         ),
         (
             "num_experts",
             json!(128),
-            InvalidData,
+            Unsupported,
             "num_experts: 128, the size 1B-7B holds 64",
         ),
         (
             "num_experts_per_tok",
             json!(2),
-            InvalidData,
+            Unsupported,
             "num_experts_per_tok: 2, the size 1B-7B holds 8",
         ),
         (
             "vocab_size",
             json!(100352),
-            InvalidData,
-            "vocab_size: 100352, the size compiles 50304 rows",
+            Unsupported,
+            "vocab_size: 100352, the size holds 1 to 50304",
         ),
         (
             "vocab_size",
             json!(0),
             InvalidData,
-            "vocab_size: 0, the size compiles 50304 rows",
+            "vocab_size: 0, the size holds 1 to 50304",
         ),
         (
             "rms_norm_eps",
             json!(1e-6),
-            InvalidData,
+            Unsupported,
             "rms_norm_eps: 0.000001, another than the size's",
         ),
         (
             "tie_word_embeddings",
             json!(true),
-            InvalidData,
-            "tie_word_embeddings: true, the size ties: false",
-        ),
-        (
-            "max_position_embeddings",
-            json!(65536),
             Unsupported,
-            "max_position_embeddings: past the compiled context of 40960",
+            "tie_word_embeddings: true, the size ties: false",
         ),
         (
             "hidden_act",

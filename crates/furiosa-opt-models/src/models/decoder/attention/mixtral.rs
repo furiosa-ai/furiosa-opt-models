@@ -5,8 +5,8 @@
 //!   renormalized.
 //! - [`Model`] is the catalog's composition, over the [`DbrxForCausalLM`] template.
 
-use crate::models::decoder::attention::{Chunks, Geometry, Qwen2ForCausalLM};
-use crate::models::{Family, config};
+use crate::models::decoder::attention::{Geometry, Qwen2ForCausalLM};
+use crate::models::{Family, config, vocabulary};
 use crate::modules::feedforward::moe::Normalize;
 use crate::modules::feedforward::moe::Reduce;
 use crate::modules::feedforward::moe::TopK;
@@ -20,7 +20,7 @@ use crate::ops::pointwise::multiply::Multiply;
 use crate::ops::rotary::Rotary;
 use crate::ops::swiglu;
 use crate::ops::{
-    attention::{geometry, gqa::Cache},
+    attention::geometry,
     linear::{Affine, Experts},
     normalization::RmsNorm,
 };
@@ -151,7 +151,6 @@ pub struct Config {
     num_experts_per_tok: usize,
     vocab_size: usize,
     rms_norm_eps: f64,
-    max_position_embeddings: usize,
     #[serde(default)]
     tie_word_embeddings: bool,
     #[serde(default)]
@@ -162,8 +161,9 @@ pub struct Config {
     _rotary: config::decoder::Rotary,
 }
 
-/// A config is of a size when it declares the size's values, at most its compiled vocabulary rows
-/// and context, and none of the features Mixtral does not serve.
+/// A config is of a size when it declares the size's values, at most its compiled vocabulary rows,
+/// and none of the features Mixtral does not serve. A longer declared context is served up to the
+/// compiled one.
 impl<const N: &'static str> TryFrom<Config> for Size<N>
 where
     Self: Geometry,
@@ -171,7 +171,6 @@ where
     type Error = io::Error;
 
     fn try_from(config: Config) -> io::Result<Self> {
-        let invalid = |reason: String| io::Error::new(io::ErrorKind::InvalidData, reason);
         let unsupported = |reason: &str| io::Error::new(io::ErrorKind::Unsupported, reason);
         let heads = <Self as Geometry>::KvHeads::SIZE;
         let head = <Self as Geometry>::Head::SIZE;
@@ -209,34 +208,22 @@ where
             .into_iter()
             .find(|(_, declared, held)| declared != held)
         {
-            return Err(invalid(format!(
+            return Err(unsupported(&format!(
                 "{key}: {declared}, the size {N} holds {held}"
             )));
         }
-        let rows = <Self as Geometry>::Vocabulary::SIZE;
-        if !(1..=rows).contains(&config.vocab_size) {
-            return Err(invalid(format!(
-                "vocab_size: {}, the size compiles {rows} rows",
-                config.vocab_size
-            )));
-        }
+        vocabulary::<<Self as Geometry>::Vocabulary>(config.vocab_size)?;
         if (config.rms_norm_eps as f32).to_bits() as usize != Self::EPSILON {
-            return Err(invalid(format!(
+            return Err(unsupported(&format!(
                 "rms_norm_eps: {}, another than the size's",
                 config.rms_norm_eps
             )));
         }
         if config.tie_word_embeddings != Self::TIED_EMBEDDINGS {
-            return Err(invalid(format!(
+            return Err(unsupported(&format!(
                 "tie_word_embeddings: {}, the size ties: {}",
                 config.tie_word_embeddings,
                 Self::TIED_EMBEDDINGS
-            )));
-        }
-        let context = Chunks::SIZE * Cache::SIZE;
-        if config.max_position_embeddings > context {
-            return Err(unsupported(&format!(
-                "max_position_embeddings: past the compiled context of {context}"
             )));
         }
         match (

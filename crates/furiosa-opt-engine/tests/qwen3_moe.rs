@@ -63,8 +63,17 @@ fn sizes_read_their_published_configs() {
         ),
     ] {
         let refusal = (error.kind(), error.to_string());
-        assert_eq!(refusal, (io::ErrorKind::InvalidData, reason.into()));
+        assert_eq!(refusal, (io::ErrorKind::Unsupported, reason.into()));
     }
+}
+
+/// A config declaring a context past the size's compiled one parses: the size serves it up to its
+/// own.
+#[test]
+fn size_serves_a_longer_context_up_to_its_own() {
+    let mut document = QWEN3_30B_A3B.config();
+    document["max_position_embeddings"] = json!(131072);
+    Size::<"30B-A3B">::parse(&document).unwrap();
 }
 
 /// A config the size does not serve is refused, each case by its kind and reason.
@@ -76,74 +85,68 @@ fn size_refuses_what_it_does_not_serve() {
         (
             "moe_intermediate_size",
             json!(1536),
-            InvalidData,
+            Unsupported,
             "moe_intermediate_size: 1536, the size 30B-A3B holds 768",
         ),
         (
             "num_hidden_layers",
             json!(94),
-            InvalidData,
+            Unsupported,
             "num_hidden_layers: 94, the size 30B-A3B holds 48",
         ),
         (
             "num_key_value_heads",
             json!(8),
-            InvalidData,
+            Unsupported,
             "num_key_value_heads: 8, the size 30B-A3B holds 4",
         ),
         (
             "num_attention_heads",
             json!(64),
-            InvalidData,
+            Unsupported,
             "num_attention_heads: 64, the size 30B-A3B holds 32",
         ),
         (
             "head_dim",
             json!(64),
-            InvalidData,
+            Unsupported,
             "head_dim: 64, the size 30B-A3B holds 128",
         ),
         (
             "num_experts",
             json!(64),
-            InvalidData,
+            Unsupported,
             "num_experts: 64, the size 30B-A3B holds 128",
         ),
         (
             "num_experts_per_tok",
             json!(4),
-            InvalidData,
+            Unsupported,
             "num_experts_per_tok: 4, the size 30B-A3B holds 8",
         ),
         (
             "vocab_size",
             json!(152064),
-            InvalidData,
-            "vocab_size: 152064, the size compiles 151936 rows",
+            Unsupported,
+            "vocab_size: 152064, the size holds 1 to 151936",
         ),
         (
             "vocab_size",
             json!(0),
             InvalidData,
-            "vocab_size: 0, the size compiles 151936 rows",
+            "vocab_size: 0, the size holds 1 to 151936",
         ),
         (
             "rms_norm_eps",
             json!(1e-5),
-            InvalidData,
+            Unsupported,
             "rms_norm_eps: 0.00001, another than the size's",
         ),
         (
             "tie_word_embeddings",
             json!(true),
-            InvalidData,
-            "tie_word_embeddings: true, the size ties: false",
-        ),
-        (
-            "max_position_embeddings",
-            json!(131072),
             Unsupported,
-            "max_position_embeddings: past the compiled context of 40960",
+            "tie_word_embeddings: true, the size ties: false",
         ),
         (
             "hidden_act",
