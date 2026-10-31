@@ -255,11 +255,15 @@ def stop(process: subprocess.Popen[bytes], timeout: float) -> None:
     raise TimeoutError(f"processes of group {process.pid} outlived SIGKILL by {timeout} s")
 
 
-def post(url: str, request: BaseModel, reply: type[Reply]) -> Reply:
-    """The server's answer to `request` posted to `url`, parsed as vLLM's `reply`."""
+def post(
+    url: str, request: BaseModel, reply: type[Reply], *, headers: Mapping[str, str] | None = None
+) -> Reply:
+    """The server's answer to `request` posted to `url` with `headers`, parsed as vLLM's
+    `reply`."""
     body = request.model_dump_json(exclude_unset=True).encode()
+    sent = {"Content-Type": "application/json", **(headers or {})}
     response: HTTPResponse = urllib.request.urlopen(
-        urllib.request.Request(url, body, {"Content-Type": "application/json"}), timeout=300
+        urllib.request.Request(url, body, sent), timeout=300
     )
     with response:
         return reply.model_validate_json(response.read())

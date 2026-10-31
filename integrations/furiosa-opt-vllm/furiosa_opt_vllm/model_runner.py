@@ -4,6 +4,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, assert_never, final
 
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 from vllm.v1.worker.gpu.kv_connector import get_kv_connector
 
 from furiosa_opt_vllm import embedding, generation, load, multimodal, paging, request
@@ -16,6 +17,7 @@ from furiosa_opt_vllm.runner import Runner
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
     from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
@@ -44,12 +46,15 @@ class FuriosaModelRunner(Runner):
         # The platform admits a connector only for the cache of a decoder the engine holds.
         assert self.cache is not None
         assert isinstance(self.model, Decoder) and self.model.model is not None
-        if isinstance(connector, RNGDOffloadingConnector):
-            connector.register(self.cache, self.model.model.parallel)
+        children = leaves(connector)
+        for child in children:
+            if isinstance(child, RNGDOffloadingConnector):
+                child.register(self.cache, self.model.model.parallel)
+        if all(isinstance(child, RNGDOffloadingConnector) for child in children):
             # vLLM's attention layers, which the engine replaces, hold no cache tensors to register.
             self.kv_connector = get_kv_connector(self.vllm_config, {})
             return
-        # NIXL reads only metadata tensors; the engine cache itself remains in its native layout.
+        # NIXL reads metadata tensors; the engine cache itself remains in its native layout.
         layers = Layers(self, kv_cache_config, self.vllm_config.model_config.max_model_len)
         self.kv_connector = get_kv_connector(self.vllm_config, layers.views)
         connector.set_host_xfer_buffer_ops(layers.copy)
@@ -81,3 +86,11 @@ class FuriosaModelRunner(Runner):
         self, grammar_output: GrammarOutput | None
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return generation.sample(self, grammar_output)
+
+
+def leaves(connector: KVConnectorBase_V1) -> list[KVConnectorBase_V1]:
+    """The connectors that move blocks for `connector`: those vLLM's MultiConnector runs, or
+    `connector` itself."""
+    if isinstance(connector, MultiConnector):
+        return [leaf for child in connector.sub_connectors for leaf in leaves(child)]
+    return [connector]
