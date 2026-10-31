@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, final
 import torch
 from pydantic import ValidationError
 from typing_extensions import override
-from vllm.platforms.interface import Platform, PlatformEnum
+from vllm.platforms.interface import Platform, PlatformEnum, get_assigned_physical_gpu_ids
 
 from furiosa_opt_vllm.additional import Section
 from furiosa_opt_vllm.admission import (
@@ -58,6 +58,18 @@ class FuriosaPlatform(Platform):
     @override
     def get_device_name(cls, device_id: int = 0) -> str:
         return "rngd"
+
+    @classmethod
+    @override
+    def device_id_to_physical_device_id(cls, device_id: int) -> int:
+        if get_assigned_physical_gpu_ids() is not None:
+            # A worker publishes the chips vLLM assigned its replica, whose ranks index them.
+            return super().device_id_to_physical_device_id(device_id)
+        # The engine loads once vLLM maps a device, not when vLLM imports the platform.
+        import furiosa_opt_engine as engine
+        from furiosa_opt_vllm.decoder import PES
+
+        return engine.Placement.visible([device_id], PES).chips[0]
 
     @override
     def uses_host_device_handling(self) -> bool:
