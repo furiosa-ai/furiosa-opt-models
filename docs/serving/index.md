@@ -34,7 +34,7 @@ Install a plugin first ([Installation](../getting-started/installation.md)); [Qu
 | Data parallelism | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Run data-parallel replicas](#run-data-parallel-replicas) |
 | Pipeline, expert and context parallelism | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | LoRA | <span class="support support-yes">Supported</span> | <span class="support support-no">Not yet</span> | [Serve LoRA adapters](#serve-lora-adapters) |
-| Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache) | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
+| Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache) | <span class="support support-yes">Supported</span> (NIXL) | <span class="support support-no">Not yet</span> | [Disaggregate prefill and decode](#disaggregate-prefill-and-decode) |
 | Disaggregated encoder and encoder caches | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Per-request metrics | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Report per-request metrics](#report-per-request-metrics) |
 | Batch invariance | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Keep outputs independent of the batch](#keep-outputs-independent-of-the-batch) |
@@ -161,6 +161,28 @@ Both servers copy the cache blocks of computed prompts to a tier of host memory,
 Only the attention cache moves, so both servers refuse offloading at startup for a model with recurrent state, and vLLM also for one with encoder memory; the [vLLM](vllm.md#options) and [SGLang](sglang.md#options) option pages name the other refused settings.
 A failed copy poisons the memory it touched, and neither server recovers once it observes the failure, so vLLM's `kv_load_failure_policy` takes only `fail`.
 vLLM observes the failure as soon as the copy ends; SGLang may observe it only later, when a call or copy next uses that memory.
+
+## Disaggregate prefill and decode
+
+With vLLM, a prefill server computes a prompt's cache and a decode server continues the request from it, through vLLM's NIXL connectors (`NixlConnector`, which names `NixlPullConnector`, or `NixlPushConnector`) in their host-buffer mode:
+
+```bash
+vllm serve Qwen/Qwen3-0.6B --port 8100 \
+  --kv-transfer-config '{"kv_connector": "NixlConnector", "kv_role": "kv_producer", "kv_buffer_device": "cpu"}'
+VLLM_NIXL_SIDE_CHANNEL_PORT=5601 vllm serve Qwen/Qwen3-0.6B --port 8200 \
+  --kv-transfer-config '{"kv_connector": "NixlConnector", "kv_role": "kv_consumer", "kv_buffer_device": "cpu"}'
+```
+
+A request goes to the prefill server with `"kv_transfer_params": {"do_remote_decode": true}` and `max_tokens` 1, then to the decode server with the `kv_transfer_params` that response returns, both under one request ID (`X-Request-Id` or `request_id`), as vLLM's disaggregation proxies route it; `NixlPushConnector` pairs the decode with its prefill by that ID.
+NIXL cannot register the device's memory, so it stages blocks in host buffers of its own and the runner copies each request's blocks between them and the engine cache; `kv_buffer_device` must be `cpu`.
+Each copy ends before NIXL sends the blocks or reports them received, and a failed copy stops the server.
+The decode server's `vllm:external_prefix_cache_hits` counts the prompt tokens it took from its connector, and `vllm:nixl_bytes_transferred` the bytes NIXL moved.
+
+Both servers take the same model, quantization and speculative method, which NIXL's handshake compares; a request's LoRA adapter is named on both.
+Data-parallel replicas and sleep mode are served with a connector.
+One worker drives every chip while vLLM awaits each tensor-parallel rank, so a connector serves one chip a replica.
+Only the attention cache moves, so startup refuses a connector for a model with recurrent state or encoder memory and on an encoder-only instance.
+Mooncake and MoRIIO register the cache's device memory, which the engine does not map for them, and LMCache copies the cache's torch tensors itself, so startup refuses them.
 
 ## Put the server to sleep
 
@@ -391,4 +413,4 @@ Why each feature is not served yet:
 - **Online quantization** with SGLang, and with vLLM any method but `fp8_per_tensor`: the other methods quantize the activations too or use other formats, and the SGLang plugin passes no quantization to the load.
 - **Tensor, pipeline, expert and context parallelism**, and serving across nodes: each served checkpoint runs on one chip.
 - **LoRA with SGLang**: `--enable-lora` and `--lora-paths` are refused; the SGLang plugin runs no adapter yet.
-- **Disaggregated prefill, KV connectors and a disaggregated encoder**: no cache row moves to another instance, and of a disaggregated encoder only the [encoder-only instance](#embed-media-on-an-encoder-only-instance) runs.
+- **Disaggregated prefill with SGLang, KV connectors other than vLLM's NIXL ones, and a disaggregated encoder**: the SGLang plugin moves no cache row to another instance, Mooncake, MoRIIO and LMCache reach the cache without host buffers, and of a disaggregated encoder only the [encoder-only instance](#embed-media-on-an-encoder-only-instance) runs.

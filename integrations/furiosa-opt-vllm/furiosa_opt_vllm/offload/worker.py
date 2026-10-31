@@ -29,7 +29,7 @@ from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 
 import furiosa_opt_engine as engine
 from furiosa_opt_vllm import residency
-from furiosa_opt_vllm.cache import runs
+from furiosa_opt_vllm.cache import runs, settle, submit
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -140,13 +140,7 @@ class Job:
 
     def settle(self) -> RuntimeError | None:
         """Wait until every copy ended, then return the first failure among them."""
-        failure: RuntimeError | None = None
-        for transfer in self.transfers:
-            try:
-                transfer.wait()
-            except RuntimeError as error:
-                failure = failure or error
-        return failure
+        return settle(self.transfers)
 
 
 @final
@@ -165,14 +159,7 @@ class Jobs:
         is read, and the job keeps it at once. A copy that fails to submit raises once the copies
         submitted before it ended."""
         started = monotonic()
-        submitted: list[_Transfer] = []
-        try:
-            for transfer in transfers:
-                submitted.append(transfer)
-        except RuntimeError:
-            _ = Job(tuple(submitted), size, started).settle()
-            raise
-        self.running[job_id] = Job(tuple(submitted), size, started)
+        self.running[job_id] = Job(submit(transfers), size, started)
 
     def finished(self) -> list[TransferResult]:
         """The jobs whose copies ended since the last call, without waiting."""
