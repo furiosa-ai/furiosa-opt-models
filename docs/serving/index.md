@@ -25,7 +25,7 @@ Install a plugin first ([Installation](../getting-started/installation.md)); [Qu
 | Automatic prefix caching | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Reuse cached prefixes](#reuse-cached-prefixes) |
 | FP8 KV cache | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Quantized checkpoints (FP8, NVFP4) | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
-| Online quantization | <span class="support support-yes">Supported</span> | <span class="support support-no">Not yet</span> | [Quantize a BF16 checkpoint at load](#quantize-a-bf16-checkpoint-at-load) |
+| Online quantization | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Quantize a BF16 checkpoint at load](#quantize-a-bf16-checkpoint-at-load) |
 | KV cache offloading | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Offload the KV cache to host memory](#offload-the-kv-cache-to-host-memory) |
 | Sleep mode | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> (without speculative decoding) | [Put the server to sleep](#put-the-server-to-sleep) |
 | Long contexts, up to the compiled window | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Serve long contexts](#serve-long-contexts) |
@@ -251,17 +251,33 @@ Without the copy, waking reads the checkpoint's files as they are then.
 
 ## Quantize a BF16 checkpoint at load
 
-vLLM's per-tensor online FP8 quantizes a Qwen3-0.6B, Qwen3-1.7B or Qwen3-4B BF16 checkpoint as it loads:
+Each framework's online FP8 method quantizes a Qwen3-0.6B, Qwen3-1.7B or Qwen3-4B BF16 checkpoint as it loads:
 
-```bash
-vllm serve Qwen/Qwen3-0.6B --quantization fp8_per_tensor
-```
+=== "vLLM"
 
-The load stores each decoder projection's weight as E4M3 codes with FP32 scales, as vLLM's method computes them: one scale per projection, shared by the projections vLLM fuses into one matrix (a layer's query, key and value; its gate and up), the largest magnitude over 448.
-Each projection restores the codes to BF16 before its product, so the activations stay in BF16, as vLLM computes this method without an FP8 matrix unit; the embedding and the vocabulary head stay in BF16.
+    ```bash
+    vllm serve Qwen/Qwen3-0.6B --quantization fp8_per_tensor
+    ```
+
+    Each projection has one scale, shared by the projections vLLM fuses into one matrix (a layer's query, key and value; its gate and up).
+    Startup refuses `--quantization` on a quantized checkpoint.
+
+=== "SGLang"
+
+    ```bash
+    python -m sglang.launch_server --model-path Qwen/Qwen3-0.6B --quantization fp8
+    ```
+
+    Each output channel of a projection has its own scale, so the projections SGLang fuses into one matrix keep the scales of their own rows.
+    A STANDALONE draft model takes the target's quantization, as in SGLang; `--speculative-draft-model-quantization unquant` loads it as stored.
+    On a quantized checkpoint, `--quantization fp8` changes nothing: the load reads the checkpoint's own weights, as SGLang's does.
+    Waking from [sleep](#put-the-server-to-sleep) quantizes the BF16 weights again, so a woken server answers as before.
+
+The load stores each decoder projection's weight as E4M3 codes with FP32 scales, as the framework's method computes them, each scale the largest magnitude it covers over 448.
+Each projection restores the codes to BF16 before its product, so the activations stay in BF16, as each framework computes its method without an FP8 matrix unit; the embedding and the vocabulary head stay in BF16.
+Where SGLang has FP8 matrix units, its `fp8` also quantizes the activations of each token, so its answers there may differ slightly from these.
 Startup refuses Qwen3-8B, whose packed query, key and value projection has no FP8 form, before downloading its weights.
-Startup also refuses the other methods, which quantize the activations too (`fp8_per_channel`, `fp8_per_block`) or use other formats (MX, NVFP4), and `--quantization` on a quantized checkpoint.
-SGLang refuses `--quantization` for a BF16 checkpoint at startup.
+Startup also refuses the other methods, which quantize the activations too (vLLM's `fp8_per_channel` and `fp8_per_block`, SGLang's `w8a8_fp8`) or use other formats (MX, NVFP4).
 
 ## Serve long contexts
 
@@ -423,7 +439,7 @@ Why each feature is not served yet:
 - **Multimodal inputs**: no served checkpoint answers about images, video or audio; Gemma 4 unified's media encoder runs [on an encoder-only instance](#embed-media-on-an-encoder-only-instance), but the engine serves no language model of it.
 - **Speculative methods other than ngram and suffix** (vLLM, which also has no draft model yet) or NGRAM and STANDALONE (SGLang).
 - **FP8 KV cache and quantized checkpoints**: the served checkpoints load BF16 weights and cache keys and values in BF16.
-- **Online quantization** with SGLang, and with vLLM any method but `fp8_per_tensor`: the other methods quantize the activations too or use other formats, and the SGLang plugin passes no quantization to the load.
+- **Online quantization** with methods other than vLLM's `fp8_per_tensor` and SGLang's `fp8`: the other methods quantize the activations too or use other formats.
 - **Tensor, pipeline, expert and context parallelism**, and serving across nodes: each served checkpoint runs on one chip.
 - **LoRA with SGLang**: `--enable-lora` and `--lora-paths` are refused; the SGLang plugin runs no adapter yet.
 - **Disaggregated prefill with SGLang, KV connectors other than vLLM's NIXL ones, and a disaggregated encoder**: the SGLang plugin moves no cache row to another instance, Mooncake, MoRIIO and LMCache reach the cache without host buffers, and of a disaggregated encoder only the [encoder-only instance](#embed-media-on-an-encoder-only-instance) runs.

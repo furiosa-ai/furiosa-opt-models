@@ -1,8 +1,10 @@
 """Translate framework load options into engine load options.
 
 - `options` is the engine's options of the load of SGLang's checkpoint, which the platform checks
-  at startup and the scheduler loads with, so the engine alone decides which chips, cache dtypes
-  and models load.
+  at startup and the scheduler loads with, so the engine alone decides which chips, cache dtypes,
+  quantizations and models load.
+- `quantization` is the engine's quantization of a load SGLang quantizes, of the served checkpoint
+  and of a draft model alike.
 - `bind` loads the checkpoint onto a scheduler's chips.
 """
 
@@ -16,6 +18,8 @@ from pydantic import JsonValue, TypeAdapter
 from furiosa_opt_sglang.platform import CACHE_DTYPES, CacheDtype, Refused
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from sglang.srt.configs.model_config import ModelConfig
     from transformers import PretrainedConfig
 
@@ -27,8 +31,9 @@ def options(
     model_config: ModelConfig, tensor: int, dtype: CacheDtype, *, deterministic: bool
 ) -> engine.LoadOptions:
     """The engine's options of the load of `model_config`'s checkpoint: on `tensor` chips, with the
-    cache dtype SGLang spells `dtype`, batch invariant under deterministic inference, as its base
-    model when SGLang pools the hidden rows of a causal checkpoint."""
+    cache dtype SGLang spells `dtype`, batch invariant under deterministic inference, quantized
+    where SGLang quantizes it at load, as its base model when SGLang pools the hidden rows of a
+    causal checkpoint."""
     from sglang.srt.configs.model_config import is_generation_model
     from transformers.models.auto.modeling_auto import MODEL_MAPPING_NAMES
 
@@ -40,6 +45,11 @@ def options(
         loads = loads.kv_cache(cache_dtype)
     if deterministic:
         loads = loads.batch_invariant()
+    # SGLang's model config leaves the type of the method it resolves partly unknown: the operator's
+    # `--quantization`, or the checkpoint's own when it declares one.
+    method = cast("str | None", model_config.quantization)
+    if (name := quantization(method, hf_config)) is not None:
+        loads = loads.quantization(name)
     if not model_config.is_generation and is_generation_model(hf_config.architectures or []):
         # SGLang pools the hidden rows of a causal checkpoint's base model.
         base = MODEL_MAPPING_NAMES.get(hf_config.model_type)
@@ -47,6 +57,20 @@ def options(
             raise ValueError(f"{hf_config.architectures} has no base model to embed with")
         loads = loads.architecture(base)
     return loads
+
+
+def quantization(
+    method: str | None, config: Mapping[str, JsonValue] | PretrainedConfig
+) -> str | None:
+    """The engine's quantization of a checkpoint of `config` that SGLang loads under `method`, the
+    operator's or the checkpoint's own, or none: SGLang quantizes at load only with `fp8` and only a
+    checkpoint whose config declares no quantization, each output channel of a projection under
+    its own scale."""
+    from sglang.srt.model_loader.checkpoint_quantization import resolve_checkpoint_quant_spec
+
+    if method == "fp8" and resolve_checkpoint_quant_spec(config) is None:
+        return "fp8_per_channel"
+    return None
 
 
 def bind(model_config: ModelConfig, first: int) -> Model:
