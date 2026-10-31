@@ -1,7 +1,6 @@
 //! Mistral NeMo's dense decoder of separate query, key and value projections, sized by type data;
 //! every default is the served checkpoint, whose projections are independently scaled FP8.
 
-use crate::models::Family;
 use crate::models::config::{
     self, Absent, Constant, Disabled, Scheme, Size, compiled, flattened, scaling,
 };
@@ -9,6 +8,7 @@ use crate::models::decoder::attention::{Qwen2ForCausalLM, Qwen2Layer};
 use crate::models::decoder::{
     self, Attention, Declaration, Envelope, Forms, Query, Requirement, Shape, form,
 };
+use crate::models::{Family, vocabulary};
 use crate::modules::{attention, language};
 use crate::ops::attention::gqa::Read;
 use crate::ops::embedding::Embedding;
@@ -370,7 +370,6 @@ struct Compiled<G: Shape, const N: usize> {
     num_hidden_layers: Constant<N>,
     num_attention_heads: Size<G::Queries>,
     num_key_value_heads: Size<<G::First as Attention>::Heads>,
-    vocab_size: Size<G::Vocabulary>,
     // Transformers' Mistral configurations default to an untied head.
     #[serde(default)]
     tie_word_embeddings: Disabled,
@@ -414,9 +413,9 @@ where
                     num_hidden_layers: Constant,
                     num_attention_heads: Size { .. },
                     num_key_value_heads: Size { .. },
-                    vocab_size: Size { .. },
                 },
         } = hf;
+        vocabulary::<G::Vocabulary>(decoder.geometry.vocab_size.get())?;
         // A checkpoint may leave the head width to its default, so the width it implies compares.
         compiled(
             "head_dim",
@@ -571,6 +570,24 @@ mod tests {
         assert_eq!(
             refusal(tied),
             Some((io::ErrorKind::Unsupported, reason.into()))
+        );
+    }
+
+    /// A vocabulary of at most the compiled rows is served; a larger one is unsupported.
+    #[test]
+    fn serves_a_vocabulary_up_to_its_rows() {
+        let mut document = checkpoint(json!({"rope_theta": 1e6}));
+        document["vocab_size"] = json!(Vocabulary::SIZE - 1);
+        assert_eq!(refusal(Unquantized::<()>::parse(&document)), None);
+        document["vocab_size"] = json!(Vocabulary::SIZE + 1);
+        let reason = format!(
+            "vocab_size: {}, the size holds 1 to {}",
+            Vocabulary::SIZE + 1,
+            Vocabulary::SIZE
+        );
+        assert_eq!(
+            refusal(Unquantized::<()>::parse(&document)),
+            Some((io::ErrorKind::Unsupported, reason))
         );
     }
 

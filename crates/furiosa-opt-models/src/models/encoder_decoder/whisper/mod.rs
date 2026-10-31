@@ -8,7 +8,7 @@
 //!   unscaled.
 
 use super::CrossDecoder;
-use crate::models::Family;
+use crate::models::{Family, vocabulary};
 pub use crate::models::{Ids, Scalar};
 use crate::modules::{attention, feedforward, language, multimodal, transformer};
 use crate::ops::attention::Attention;
@@ -245,10 +245,9 @@ where
     type Error = io::Error;
 
     fn try_from(config: Config) -> io::Result<Self> {
-        let invalid = |reason: String| io::Error::new(io::ErrorKind::InvalidData, reason);
         let unsupported = |reason: &str| io::Error::new(io::ErrorKind::Unsupported, reason);
         if config.model_type != "whisper" {
-            return Err(invalid(format!(
+            return Err(unsupported(&format!(
                 "model_type: {}, the size {N} is whisper",
                 config.model_type
             )));
@@ -296,23 +295,19 @@ where
                 config.max_target_positions,
                 <Self as Geometry>::Positions::SIZE,
             ),
-            (
-                "vocab_size",
-                config.vocab_size,
-                <Self as Geometry>::Vocabulary::SIZE,
-            ),
         ];
         if let Some((key, declared, held)) = fixed
             .into_iter()
             .find(|(_, declared, held)| declared != held)
         {
-            return Err(invalid(format!(
+            return Err(unsupported(&format!(
                 "{key}: {declared}, the size {N} holds {held}"
             )));
         }
+        vocabulary::<<Self as Geometry>::Vocabulary>(config.vocab_size)?;
         if !config.tie_word_embeddings {
-            return Err(invalid(
-                "tie_word_embeddings: false, the size ties: true".into(),
+            return Err(unsupported(
+                "tie_word_embeddings: false, the size ties: true",
             ));
         }
         match (config.activation_function.as_str(), config.scale_embedding) {

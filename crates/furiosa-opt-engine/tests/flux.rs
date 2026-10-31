@@ -44,13 +44,13 @@ fn sizes_read_their_published_config() {
     let config = FLUX_1_SCHNELL.config();
     flux::Size::<"schnell">::parse(&config).unwrap();
     let error = flux::Size::<"dev">::parse(&config).err().unwrap();
-    assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+    assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
     let reason = "guidance_embeds: false, the size dev embeds guidance: true";
     assert_eq!(error.to_string(), reason);
 }
 
-/// A value the size does not hold is invalid data and a feature it does not serve is unsupported,
-/// each refused with its reason, which names the key it is read at.
+/// A value the size does not hold and a feature it does not serve are unsupported, each refused
+/// with its reason, which names the key it is read at.
 #[test]
 fn size_refuses_what_it_does_not_hold() {
     use serde_json::json;
@@ -59,67 +59,67 @@ fn size_refuses_what_it_does_not_hold() {
         (
             "patch_size",
             json!(2),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "patch_size: 2, the size schnell holds 1",
         ),
         (
             "in_channels",
             json!(16),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "in_channels: 16, the size schnell holds 64",
         ),
         (
             "out_channels",
             json!(16),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "out_channels: 16, the size schnell holds 64",
         ),
         (
             "num_layers",
             json!(8),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "num_layers: 8, the size schnell holds 19",
         ),
         (
             "num_single_layers",
             json!(20),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "num_single_layers: 20, the size schnell holds 38",
         ),
         (
             "attention_head_dim",
             json!(64),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "attention_head_dim: 64, the size schnell holds 128",
         ),
         (
             "num_attention_heads",
             json!(48),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "num_attention_heads: 48, the size schnell holds 24",
         ),
         (
             "joint_attention_dim",
             json!(2048),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "joint_attention_dim: 2048, the size schnell holds 4096",
         ),
         (
             "pooled_projection_dim",
             json!(1024),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "pooled_projection_dim: 1024, the size schnell holds 768",
         ),
         (
             "axes_dims_rope",
             json!([32, 48, 48]),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "axes_dims_rope: [32, 48, 48], the size schnell rotates [16, 56, 56]",
         ),
         (
             "guidance_embeds",
             json!(true),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "guidance_embeds: true, the size schnell embeds guidance: false",
         ),
         (

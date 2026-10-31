@@ -53,13 +53,13 @@ fn sizes_read_their_published_config() {
         let reason = format!("sample_size: 256, the size {size} holds {size}");
         assert_eq!(
             (error.kind(), error.to_string()),
-            (ErrorKind::InvalidData, reason)
+            (ErrorKind::Unsupported, reason)
         );
     }
 }
 
-/// A value the size does not hold is invalid data and a feature it does not serve is unsupported,
-/// each refused with its reason, which names the key it is read at.
+/// A value the size does not hold and a feature it does not serve are unsupported, each refused
+/// with its reason, which names the key it is read at.
 #[test]
 fn size_refuses_what_it_does_not_hold() {
     use serde_json::json;
@@ -68,49 +68,49 @@ fn size_refuses_what_it_does_not_hold() {
         (
             "in_channels",
             json!(4),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "in_channels: 4, the size 256 holds 3",
         ),
         (
             "out_channels",
             json!(1),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "out_channels: 1, the size 256 holds 3",
         ),
         (
             "latent_channels",
             json!(16),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "latent_channels: 16, the size 256 holds 4",
         ),
         (
             "block_out_channels",
             json!([128, 256, 512]),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "block_out_channels: [128, 256, 512], the size 256 holds [128, 256, 512, 512]",
         ),
         (
             "layers_per_block",
             json!(1),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "layers_per_block: 1, the size 256 holds 2",
         ),
         (
             "norm_num_groups",
             json!(16),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "norm_num_groups: 16, the size 256 holds 32",
         ),
         (
             "use_quant_conv",
             json!(false),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "use_quant_conv: false, the size 256 holds the moment projection",
         ),
         (
             "use_post_quant_conv",
             json!(false),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "use_post_quant_conv: false, the size 256 holds the latent projection",
         ),
         (

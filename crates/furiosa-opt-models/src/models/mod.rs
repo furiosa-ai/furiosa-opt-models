@@ -22,7 +22,7 @@
 use serde::de::DeserializeOwned;
 
 use crate::load::{Checkpoint, LoadError};
-use furiosa_opt_std::prelude::{Broadcast, HbmTensor, Symbol, m};
+use furiosa_opt_std::prelude::{AxisName, Broadcast, HbmTensor, Symbol, m};
 use std::io;
 
 // Declarations and configuration parsing.
@@ -70,4 +70,18 @@ pub trait Implements {
 
     /// The scope a checkpoint is read at, or why the type does not serve it.
     fn scope(source: &Checkpoint) -> Result<&'static str, LoadError>;
+}
+
+/// Refuses a `vocab_size` that a size of `V` rows does not serve: no token is invalid data, more
+/// tokens than its rows unsupported. A smaller vocabulary is served, the rows past it padded.
+pub fn vocabulary<V: AxisName>(tokens: usize) -> io::Result<()> {
+    let refused = |kind| {
+        let reason = format!("vocab_size: {tokens}, the size holds 1 to {}", V::SIZE);
+        Err(io::Error::new(kind, reason))
+    };
+    match tokens {
+        0 => refused(io::ErrorKind::InvalidData),
+        _ if tokens > V::SIZE => refused(io::ErrorKind::Unsupported),
+        _ => Ok(()),
+    }
 }

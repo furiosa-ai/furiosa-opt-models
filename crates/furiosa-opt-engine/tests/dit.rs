@@ -43,8 +43,8 @@ fn size_reads_its_published_config() {
     dit::Size::<"XL-2-256">::parse(&DIT_XL_2_256.config()).unwrap();
 }
 
-/// A value the size does not hold is invalid data and a feature it does not serve is unsupported,
-/// each refused with its reason, which names the key it is read at.
+/// A value the size does not hold and a feature it does not serve are unsupported, each refused
+/// with its reason, which names the key it is read at.
 #[test]
 fn size_refuses_what_it_does_not_hold() {
     use serde_json::json;
@@ -53,61 +53,61 @@ fn size_refuses_what_it_does_not_hold() {
         (
             "num_attention_heads",
             json!(12),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "num_attention_heads: 12, the size XL-2-256 holds 16",
         ),
         (
             "attention_head_dim",
             json!(64),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "attention_head_dim: 64, the size XL-2-256 holds 72",
         ),
         (
             "num_layers",
             json!(24),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "num_layers: 24, the size XL-2-256 holds 28",
         ),
         (
             "in_channels",
             json!(3),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "in_channels: 3, the size XL-2-256 holds 4",
         ),
         (
             "out_channels",
             json!(4),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "out_channels: 4, the size XL-2-256 holds 8",
         ),
         (
             "sample_size",
             json!(64),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "sample_size: 64, the size XL-2-256 holds 32",
         ),
         (
             "patch_size",
             json!(4),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "patch_size: 4, the size XL-2-256 holds 2",
         ),
         (
             "num_embeds_ada_norm",
             json!(100),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "num_embeds_ada_norm: 100, the size XL-2-256 holds 1000",
         ),
         (
             "norm_eps",
             json!(1e-6),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "norm_eps: 0.000001, another than the size's",
         ),
         (
             "interpolation_scale",
             json!(2.0),
-            ErrorKind::InvalidData,
+            ErrorKind::Unsupported,
             "interpolation_scale: 2, the size XL-2-256 holds 1",
         ),
         (
