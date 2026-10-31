@@ -10,16 +10,16 @@ from sglang.srt.runtime_context import get_model, get_serving
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 import furiosa_opt_engine as engine
+from furiosa_opt_sglang.admission import Refused
 from furiosa_opt_sglang.batch import operand
 from furiosa_opt_sglang.checkpoint import checkout
 from furiosa_opt_sglang.decoder import RELEASED, Decoder, Location
 from furiosa_opt_sglang.load import quantization
-from furiosa_opt_sglang.platform import Refused
 
 if TYPE_CHECKING:
     from collections.abc import Set
 
-    from furiosa_opt_sglang.platform import Standalone
+    from furiosa_opt_sglang.admission import Standalone
     from furiosa_opt_sglang.speculative import Decoding
 
 

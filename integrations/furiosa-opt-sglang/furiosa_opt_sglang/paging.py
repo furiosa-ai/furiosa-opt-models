@@ -12,7 +12,8 @@ from sglang.srt.runtime_context import get_memory, get_schedule
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from typing_extensions import override
 
-from furiosa_opt_sglang.cache import Allocator, Cache, Pages
+from furiosa_opt_sglang.cache import Allocator, Cache
+from furiosa_opt_sglang.cache.pages import Pages
 from furiosa_opt_sglang.decoder import RELEASED, Decoder
 from furiosa_opt_sglang.generation.model import Model
 from furiosa_opt_sglang.speculative import Speculative

@@ -13,11 +13,9 @@ engine's token pool, whose pages move to and from the engine cache's layers.
 
 from __future__ import annotations
 
-from itertools import pairwise
-from typing import TYPE_CHECKING, Final, cast, final
+from typing import TYPE_CHECKING, cast, final
 
 import torch
-from pydantic import ConfigDict, TypeAdapter
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import HybridCacheController
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -31,8 +29,9 @@ from sglang.srt.runtime_context import get_memory
 from typing_extensions import override
 
 import furiosa_opt_engine as engine
+from furiosa_opt_sglang.admission import Hierarchical
 from furiosa_opt_sglang.cache import Cache
-from furiosa_opt_sglang.platform import Hierarchical
+from furiosa_opt_sglang.cache.runs import PAGES, SLOTS, runs
 
 if TYPE_CHECKING:
     from threading import Event
@@ -202,11 +201,6 @@ class Host(HostKVCache):
         return cast("list[engine.HostBuffer]", self.kv_buffer)
 
 
-# The dtypes in which SGLang's pools name token slots.
-SLOTS: Final = frozenset({torch.int32, torch.int64})
-PAGES: Final = TypeAdapter(list[int], config=ConfigDict(strict=True))
-
-
 def pages(indices: torch.Tensor, size: int) -> list[int]:
     """The pages of `size` token slots whose slots `indices` lists, each page whole and in order."""
     if indices.dim() != 1 or indices.dtype not in SLOTS:
@@ -219,19 +213,3 @@ def pages(indices: torch.Tensor, size: int) -> list[int]:
     if (first % size).any() or not torch.equal(rows - first, offsets):
         raise ValueError("a hierarchical cache page is a page's consecutive token slots")
     return PAGES.validate_python((first.flatten() // size).tolist())
-
-
-def runs(device: list[int], host: list[int], chips: int) -> list[tuple[int, int, int]]:
-    """`device` pages beside the `host` pages they move to or from, as `(block, page, length)`
-    runs that each move in one copy: pages that both step by one. A copy moves each chip's part of
-    its pages in turn while a host page holds every chip's part of one page, so on more than one
-    chip a run is one page."""
-    assert len(device) == len(host)
-    starts = [
-        i
-        for i in range(len(device))
-        if i == 0 or chips > 1 or (device[i] - device[i - 1], host[i] - host[i - 1]) != (1, 1)
-    ]
-    return [
-        (device[start], host[start], end - start) for start, end in pairwise([*starts, len(device)])
-    ]
