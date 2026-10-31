@@ -142,12 +142,6 @@ TRANSFER: Final[tuple[tuple[str, Callable[[VllmConfig], bool], str], ...]] = (
         lambda c: offloading(c) is None or c.parallel_config.pipeline_parallel_size == 1,
         "offloads at pipeline_parallel_size=1: vLLM awaits each rank; one worker drives all chips",
     ),
-    # The worker joins vLLM's process groups as rank 0 of 1, which data parallelism renumbers.
-    (
-        "data_parallel_size",
-        lambda c: offloading(c) is None or c.parallel_config.data_parallel_size == 1,
-        "offloads at data_parallel_size=1: vLLM ranks each replica's worker among all replicas",
-    ),
     (
         "kv_offloading_size",
         lambda c: offloading(c) is None or engine_cache(c.model_config),
@@ -157,14 +151,5 @@ TRANSFER: Final[tuple[tuple[str, Callable[[VllmConfig], bool], str], ...]] = (
         "kv_offloading_size",
         lambda c: offloading(c) is None or not c.is_mm_encoder_only,
         "offloads the attention cache of a decoder, which an encoder-only instance does not run",
-    ),
-    # Sleep mode frees the cache storage and allocates new storage on waking, while the host tier
-    # keeps copying the storage it was built over.
-    (
-        "enable_sleep_mode",
-        lambda c: (
-            offloading(c) is None or not (c.model_config and c.model_config.enable_sleep_mode)
-        ),
-        "offloads the KV cache without sleep mode, which frees the cache its host tier copies",
     ),
 )
