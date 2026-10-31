@@ -40,51 +40,22 @@ impl<Hidden: AxisName, Heads: AxisName, Head: AxisName> Op<&mut ValueScale<Hidde
     }
 }
 
-/// One half of the query weight's head dimension, written into its half of the resident weight.
-pub(crate) struct Half<'a, Hidden: AxisName, Heads: AxisName, Head: AxisName, const HALF: usize>(
-    pub(crate) &'a Stored<Hidden, Heads, Head>,
-);
-
-impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, const HALF: usize>
-    Op<&mut Affine<Weight<Hidden, Heads, Head>, ()>> for Half<'_, Hidden, Heads, Head, HALF>
-{
-    type Output = ();
-
-    fn forward(&self, context: &mut Device, output: &mut Affine<Weight<Hidden, Heads, Head>, ()>) {
-        const { assert!(Head::SIZE == 128 && HALF < 2) };
-        self.0
-            .view()
-            .tile::<m![Head / 64], 1, m![
-                Heads / (Heads / 2), Heads % (Heads / 2) / (Heads / 4),
-                Heads % (Heads / 4) / (Heads / 8), Hidden / 64, Head / 64 = 1 # 2,
-                Heads % (Heads / 8), Head % 64, Hidden % 64
-            ]>(HALF)
-            .to_dm_view(
-                &mut context.tdma,
-                output.weight.view_mut().tile::<m![Head / 64], 1, m![
-                    Head / 64 = 1 #{!} 2, Heads % (Heads / 8), Head % 64, Hidden % 64
-                ]>(HALF),
-            );
-    }
-}
-
-/// The query projection written to DM: each half of its head dimension in turn, then its heads'
-/// squared scales in the slices of both period groups' outputs, so no period waits for them.
+/// The query projection written to DM, then its heads' squared scales in the slices of both period
+/// groups' outputs, so no period waits for them.
 impl<Hidden: AxisName, Heads: AxisName, Head: AxisName> Op<Begin<()>>
     for Affine<Weights<Hidden, Heads, Head, HeadSquares<Heads>>, ()>
 {
     type Output = Affine<(Weight<Hidden, Heads, Head>, QuerySquares<Heads>), ()>;
 
     fn forward(&self, device: &mut Device, _: Begin<()>) -> Self::Output {
-        let mut output = Affine::new(DmTensor::new(), ());
-        Half::<_, _, _, 0>(&self.weight.0).forward(&mut *device, &mut output);
-        Half::<_, _, _, 1>(&self.weight.0).forward(&mut *device, &mut output);
+        let mut weight = DmTensor::new();
+        Panel(&self.weight.0).forward(&mut *device, &mut weight);
         let stored = &self.weight.1.0;
         let squares = Grouped {
             pair: squares(&mut *device, stored),
             single: squares(device, stored),
         };
-        Affine::new((output.weight, squares), ())
+        Affine::new((weight, squares), ())
     }
 }
 
