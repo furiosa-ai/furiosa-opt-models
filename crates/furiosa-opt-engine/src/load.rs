@@ -12,10 +12,10 @@
 //!   other choice is unsupported until the registry holds an implementation that makes it.
 //! - A batch-invariant load asks every implementation's calls to tile their attention fixed, which
 //!   they serve as an `Instance` of their decoder.
-//! - A quantization reads the checkpoint quantized, so an implementation whose projections a load
-//!   quantizes serves it: Qwen3 of 0.6B to 4B; every other one holds BF16 projections.
+//! - A quantization reads the checkpoint quantized, so only an implementation whose projections a
+//!   load quantizes serves it; every other one holds BF16 projections.
 //! - A load for calls that run LoRA adapters selects only an implementation whose projections take
-//!   them: BF16 Qwen3 of 0.6B to 4B.
+//!   them.
 
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -51,7 +51,7 @@ pub enum Quantization {
     /// One scale per projection, shared by the projections of one input that vLLM fuses (a layer's
     /// query, key and value; its gate and up): vLLM's `fp8_per_tensor`.
     Fp8PerTensor,
-    /// One scale per output channel: SGLang's `fp8` on a BF16 checkpoint.
+    /// One scale per output channel.
     Fp8PerChannel,
 }
 

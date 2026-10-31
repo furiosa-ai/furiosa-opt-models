@@ -60,7 +60,7 @@ class Draft:
         if target.model is None:
             raise RuntimeError(RELEASED)
         try:
-            loads = engine.LoadOptions().chips(target.model.parallel)
+            loads = engine.LoadOptions().chips(target.model.chips)
             loads.parse(checkpoint.mapped())
         except (NotImplementedError, ValueError) as error:
             raise Refused("speculative_draft_model_path", str(error)) from None

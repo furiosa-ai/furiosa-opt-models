@@ -7,25 +7,16 @@ mod common;
 
 use std::io;
 
-use furiosa_opt_engine::Checkpoint;
-use furiosa_opt_engine::registry::Implementation;
-use furiosa_opt_models::load::LoadError;
 use furiosa_opt_models::models::Family;
 use furiosa_opt_models::models::decoder::attention::mixtral::Size;
 use serde_json::json;
 
-use common::Published;
+use common::{Published, size};
 
 const MIXTRAL_8X7B: Published = Published::new(
     "mistralai/Mixtral-8x7B-v0.1",
     "fc7ac94680e38d7348cfa806e51218e6273104b0",
 );
-
-/// The size of the implementation the registry chooses under `architecture` for `source`.
-fn load(architecture: &str, source: &Checkpoint) -> Result<&'static str, LoadError> {
-    let (name, implementations) = Implementation::listed(&[architecture])?;
-    Implementation::choose(name, implementations, source).map(Implementation::size)
-}
 
 // # Strict loads of the published checkpoints
 
@@ -35,7 +26,7 @@ fn load(architecture: &str, source: &Checkpoint) -> Result<&'static str, LoadErr
 #[should_panic(expected = "Unsupported")]
 fn mixtral_8x7b_loads_strictly() {
     let checkpoint = MIXTRAL_8X7B.declared();
-    assert_eq!(load("MixtralForCausalLM", &checkpoint).unwrap(), "8x7B");
+    assert_eq!(size("MixtralForCausalLM", &checkpoint).unwrap(), "8x7B");
 }
 
 // # Configs

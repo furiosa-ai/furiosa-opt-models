@@ -8,13 +8,12 @@ mod common;
 use std::io;
 
 use furiosa_opt_engine::Checkpoint;
-use furiosa_opt_engine::registry::Implementation;
 use furiosa_opt_models::load::LoadError;
 use furiosa_opt_models::models::Family;
 use furiosa_opt_models::models::decoder::recurrent::mamba2::Size;
 use serde_json::json;
 
-use common::Published;
+use common::{Published, size};
 
 const MAMBA2_130M: Published = Published::new(
     "AntonV/mamba2-130m-hf",
@@ -25,12 +24,6 @@ const MAMBA2_130M_ORIGINAL: Published = Published::new(
     "ea6060f68a4289e9c06f80effa896629ba519216",
 );
 
-/// The size of the implementation the registry chooses under `architecture` for `source`.
-fn load(architecture: &str, source: &Checkpoint) -> Result<&'static str, LoadError> {
-    let (name, implementations) = Implementation::listed(&[architecture])?;
-    Implementation::choose(name, implementations, source).map(Implementation::size)
-}
-
 // # Strict loads of the published checkpoints
 
 /// Mamba2-130m selects its size and loads strictly, its head tied to the embedding.
@@ -39,7 +32,7 @@ fn load(architecture: &str, source: &Checkpoint) -> Result<&'static str, LoadErr
 #[should_panic(expected = "Unsupported")]
 fn mamba2_130m_loads_strictly() {
     let checkpoint = MAMBA2_130M.declared();
-    assert_eq!(load("Mamba2ForCausalLM", &checkpoint).unwrap(), "130m");
+    assert_eq!(size("Mamba2ForCausalLM", &checkpoint).unwrap(), "130m");
 }
 
 // # Configs

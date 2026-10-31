@@ -8,14 +8,11 @@ mod common;
 
 use std::io;
 
-use furiosa_opt_engine::Checkpoint;
-use furiosa_opt_engine::registry::Implementation;
-use furiosa_opt_models::load::LoadError;
 use furiosa_opt_models::models::Family;
 use furiosa_opt_models::models::decoder::attention::qwen3_moe::Size;
 use serde_json::json;
 
-use common::Published;
+use common::{Published, size};
 
 const QWEN3_30B_A3B: Published = Published::new(
     "Qwen/Qwen3-30B-A3B",
@@ -26,12 +23,6 @@ const QWEN3_235B_A22B: Published = Published::new(
     "8efa61729e24bd65b1d152b5ab5409052aa80e65",
 );
 
-/// The size of the implementation the registry chooses under `architecture` for `source`.
-fn load(architecture: &str, source: &Checkpoint) -> Result<&'static str, LoadError> {
-    let (name, implementations) = Implementation::listed(&[architecture])?;
-    Implementation::choose(name, implementations, source).map(Implementation::size)
-}
-
 // # Strict loads of the published checkpoints
 
 /// Qwen3-30B-A3B selects its size and loads strictly.
@@ -40,7 +31,7 @@ fn load(architecture: &str, source: &Checkpoint) -> Result<&'static str, LoadErr
 #[should_panic(expected = "Unsupported")]
 fn qwen3_30b_a3b_loads_strictly() {
     let checkpoint = QWEN3_30B_A3B.declared();
-    assert_eq!(load("Qwen3MoeForCausalLM", &checkpoint).unwrap(), "30B-A3B");
+    assert_eq!(size("Qwen3MoeForCausalLM", &checkpoint).unwrap(), "30B-A3B");
 }
 
 // # Configs

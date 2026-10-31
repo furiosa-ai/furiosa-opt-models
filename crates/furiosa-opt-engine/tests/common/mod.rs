@@ -1,6 +1,8 @@
-//! The published checkpoints the engine's tests read: a folder of a Hugging Face hub repository at a
-//! pinned commit, its config and its safetensors headers, fetched once into the hub's cache.
+//! What the engine's tests share: the published checkpoints they read, the size a load chooses, and
+//! how a size refuses another size's config.
 //!
+//! - A published checkpoint is a folder of a Hugging Face hub repository at a pinned commit, its
+//!   config and its safetensors headers, fetched once into the hub's cache.
 //! - The cache is `$HF_HOME`, else `~/.cache/huggingface`, as the hub's own tools find it; a folder's
 //!   files sit under `assets/furiosa-opt-engine/<org>--<name>/<revision>`, each safetensors file cut
 //!   to its header, so no tensor value is fetched or kept.
@@ -12,11 +14,13 @@
     reason = "each test file compiles this module and calls what it reads"
 )]
 
-use std::io::Write;
+use std::io::{self, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use furiosa_opt_engine::Checkpoint;
+use furiosa_opt_engine::{Checkpoint, LoadError, LoadOptions};
+use furiosa_opt_models::models::Family;
+use serde_json::Value;
 
 /// The weights of a model folder stored whole, and the index of weights stored in shards, as
 /// Transformers names them.
@@ -166,4 +170,31 @@ impl Published {
             Err(error) => panic!("{url}: {error}"),
         }
     }
+}
+
+/// The size of the implementation a load of `checkpoint` chooses under `architecture`.
+pub fn size(architecture: &str, checkpoint: &Checkpoint) -> Result<&'static str, LoadError> {
+    Ok(LoadOptions::new()
+        .architecture(architecture)?
+        .parse(checkpoint)?
+        .size())
+}
+
+/// `S` parses `config`, the parsed size dropped.
+pub fn parse<S: Family>(config: &Value) -> io::Result<()> {
+    S::parse(config).map(drop)
+}
+
+/// That `error`, a size's refusal of `config`, names a field where `config` differs from `own`, the
+/// size's own config, with both values.
+pub fn refuses_by_difference(error: &io::Error, config: &Value, own: &Value) {
+    let reason = error.to_string();
+    let text = |value: &Value| value.as_str().map_or(value.to_string(), str::to_owned);
+    let field = reason
+        .split_once(": ")
+        .map_or(reason.as_str(), |(field, _)| field);
+    let (found, held) = (text(&config[field]), text(&own[field]));
+    assert_ne!(found, held, "{reason}");
+    let named = reason.starts_with(&format!("{field}: {found}, ")) && reason.ends_with(&held);
+    assert!(named, "{reason}");
 }

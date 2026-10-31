@@ -20,12 +20,13 @@ The framework assigns blocks, and the plugin translates its assignment into bloc
 
 === "SGLang"
 
-    SGLang assigns token locations, and its page size equals the compiled block size, 16.
-    A page's start location divided by 16 is its block ID:
+    SGLang assigns token locations, and its page size equals the compiled block size.
+    A page's start location divided by the block size is its block ID:
 
     ```python
+    block = decoder.cache.pools[0].block  # tokens one cache block holds
     pages = [32, 80]  # page-start locations from SGLang's request table
-    blocks = [location // 16 for location in pages]  # [2, 5]
+    blocks = [location // block for location in pages]  # [2, 5] for blocks of 16 tokens
     request = engine.decoder.Request([blocks], 20, tokens, engine.decoder.Keep.LAST)
     ```
 

@@ -1,5 +1,6 @@
 """Page variables read from the plugin manifests and the workspace, so versions have one owner."""
 
+import ast
 import json
 import re
 import tomllib
@@ -43,9 +44,23 @@ def model_types(nav: list[Any]) -> dict[str, str]:
     }
 
 
+def decoder_classes(package: Path) -> list[str]:
+    """Each model class the engine's type stubs in `package` declare, as `module.Class`: the classes
+    that derive from `Decoder`."""
+    return [
+        f"{stub.stem}.{node.name}"
+        for stub in sorted(package.glob("*.pyi"))
+        for node in ast.parse(stub.read_text()).body
+        if isinstance(node, ast.ClassDef)
+        and any(ast.unparse(base) == "engine.Decoder" for base in node.bases)
+    ]
+
+
 def define_env(env: Any) -> None:
     root = Path(env.project_dir)
     env.variables["model_types"] = model_types(env.conf["nav"])
+    stubs = root / "crates/furiosa-opt-engine/python/furiosa_opt_engine"
+    env.variables["decoder_classes"] = decoder_classes(stubs)
     for plugin in ("vllm", "sglang"):
         manifest = root / f"integrations/furiosa-opt-{plugin}/pyproject.toml"
         project = tomllib.loads(manifest.read_text())["project"]

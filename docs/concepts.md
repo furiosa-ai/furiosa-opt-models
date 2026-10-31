@@ -26,7 +26,7 @@ A step split into several calls runs them one after another, so its time grows w
 ## The framework and the engine
 
 The framework decides which requests run in each step; the plugin turns that step into engine calls, and the engine runs them on the device.
-A step of eligible greedy requests takes its tokens from the device; a step that needs token scores or changes the token distribution sends its logits to the framework's sampler on the host.
+A step of greedy requests takes its tokens from the device; the plugins refuse a request that needs token scores or changes the token distribution, since a decoder's calls return no scores yet.
 [Integrating frameworks](engine/frameworks.md) gives each framework's eligibility rules, and [Architecture](design/architecture.md#boundaries) states what each part owns.
 
 ## Calls are asynchronous
