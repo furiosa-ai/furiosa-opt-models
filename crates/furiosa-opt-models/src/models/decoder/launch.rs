@@ -2,7 +2,7 @@
 //! state a launch passes it, and the context its rotary table prepares from them once.
 //!
 //! - The model's rotary table prepares a launch's [`Context`] from its [`Operands`] once (the
-//!   work's counts read, the rows' rotation gathered); the body and head then stream over spans of
+//!   work's counts read, the rows' rotation gathered); the body and head then run over spans of
 //!   the live rows, each layer on its own cache blocks, and the head reads the selected rows'
 //!   tokens out tile by tile.
 //! - The envelope a launch is compiled for is the size's [`Decode`]: its rows, and the context its
@@ -14,7 +14,7 @@ use crate::models::decoder::attention::{
     ForCausalLM, ForSequenceClassification, Geometry, Head, KvHeads,
 };
 use crate::modules::attention::{self, key_value};
-use crate::modules::language::{self, Call, Selected};
+use crate::modules::language::{self, Selected};
 use crate::modules::lora::{self, Rank};
 use crate::ops::attention::full::paged;
 use crate::ops::attention::gqa::Cache;
@@ -223,8 +223,8 @@ pub type Adapted<'t, S, const N: usize> = lora::Layer<
 type Projected<'t, S, Out, In, K, const N: usize> =
     lora::Adapters<'t, Factors<K, In, Out, Hbm>, Selection<S, K>, N>;
 
-/// What a launch's nodes read beside its token IDs and live rows, prepared once before its first
-/// node runs: its rows' rotation and cache slots, its attention work and the rows it returns.
+/// What a launch's leaves read beside its token IDs, prepared once before its first layer runs:
+/// its rows' rotation and cache slots, its attention work and the rows it returns.
 pub type Context<'a, Capacity, Reach, Sequences, Slots, Groups, Waves, W> = (
     attention::Context<
         SplitHalf<Head, group::Rotation<Slots, rotary::Row<Head>>>,
@@ -233,31 +233,6 @@ pub type Context<'a, Capacity, Reach, Sequences, Slots, Groups, Waves, W> = (
     >,
     &'a Selected<Capacity>,
 );
-
-/// The rows the readout reads tokens of.
-impl<'c, T, Capacity, Reach, Sequences, Slots, Groups, Waves, W>
-    From<Call<'c, Context<'_, Capacity, Reach, Sequences, Slots, Groups, Waves, W>, T, Capacity>>
-    for &'c Selected<Capacity>
-where
-    Capacity: AxisName,
-    Reach: AxisName,
-    Sequences: AxisName,
-    Slots: AxisName,
-    Groups: AxisName,
-    Waves: AxisName,
-    W: AxisName,
-{
-    fn from(
-        call: Call<
-            'c,
-            Context<'_, Capacity, Reach, Sequences, Slots, Groups, Waves, W>,
-            T,
-            Capacity,
-        >,
-    ) -> Self {
-        call.context.1
-    }
-}
 
 /// Layer `layer`'s adapters of `held`, a call's adapters, with their `selections`.
 pub fn adapted<'t, S: Geometry + Decode + 'static, const N: usize>(
