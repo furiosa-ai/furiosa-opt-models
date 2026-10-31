@@ -330,7 +330,8 @@ type CoefficientSlices<Rows, Rotated, Chips = Chip> =
 
 /// Produce each row's rotation from the frequency of each rotated coordinate and the row's token
 /// position; each constant is held as `T`: the HBM tensor, or a borrow of it in a borrowed tree.
-#[derive(DeviceSend)]
+#[derive(DeviceSend, Load)]
+#[load(tree)]
 pub struct Coefficients<Rotated: AxisName, Chips: M = Chip, T = Parameters<Rotated, Chips>> {
     /// The first input half's coefficients.
     low: Component<T>,
@@ -342,7 +343,8 @@ pub struct Coefficients<Rotated: AxisName, Chips: M = Chip, T = Parameters<Rotat
 }
 
 /// The constants of one half's coefficients: the sine of each angle times `sign` plus `phase`.
-#[derive(DeviceSend)]
+#[derive(DeviceSend, Load)]
+#[load(tree)]
 pub struct Component<T> {
     /// Phase shifts in radians.
     phase: T,
@@ -398,30 +400,6 @@ where
             low: context.field("low", "low", |cx| component(cx, low))?,
             high: context.field("high", "high", |cx| component(cx, high))?,
             amplitude: constant(context, "amplitude", halves(amplitude, amplitude))?,
-            shape: core::marker::PhantomData,
-        })
-    }
-}
-
-/// A tree's constants borrowed, or held as another tree holds them.
-impl<'a, Rotated: AxisName, Chips: M, T: Load<&'a U>, U> Load<&'a Coefficients<Rotated, Chips, U>>
-    for Coefficients<Rotated, Chips, T>
-{
-    fn load(
-        context: &mut Context<'_>,
-        from: &'a Coefficients<Rotated, Chips, U>,
-    ) -> Result<Self, LoadError> {
-        let component = |cx: &mut Context<'_>, from: &'a Component<U>| {
-            Ok(Component {
-                phase: cx.field("phase", "phase", |cx| T::load(cx, &from.phase))?,
-                sign: cx.field("sign", "sign", |cx| T::load(cx, &from.sign))?,
-            })
-        };
-        Ok(Self {
-            low: context.field("low", "low", |cx| component(cx, &from.low))?,
-            high: context.field("high", "high", |cx| component(cx, &from.high))?,
-            amplitude: context
-                .field("amplitude", "amplitude", |cx| T::load(cx, &from.amplitude))?,
             shape: core::marker::PhantomData,
         })
     }

@@ -40,9 +40,11 @@ pub struct Early<A, X: Memory = Hbm> {
 }
 
 /// The reduced FP32 sum times the tensor scales once, inputs in form `A`.
-#[derive(DeviceSend)]
+#[derive(DeviceSend, Load)]
+#[load(tree)]
 pub struct Late<A, X: Memory = Hbm> {
     /// The form inputs enter the contraction in.
+    #[load(rename = "")]
     pub input: A,
     /// Returns the contracted sum to output units: `input_scale * weight_scale_2` for [`W4A4`]
     /// inputs, `weight_scale_2` for [`W4A16`] ones.
@@ -56,7 +58,8 @@ pub struct W4A16;
 
 /// Inputs quantized at run time as the weights are, under FP32 scalars derived from a
 /// checkpoint's input scale: its calibrated input maximum over 6 x 448.
-#[derive(DeviceSend)]
+#[derive(DeviceSend, Load)]
+#[load(tree)]
 pub struct W4A4<X: Memory = Hbm> {
     /// `1 / input_scale`: block scales are E4M3 in these units.
     pub global: Held<X>,
@@ -65,6 +68,7 @@ pub struct W4A4<X: Memory = Hbm> {
 }
 
 /// A ModelOpt checkpoint's weight tensor scale `weight_scale_2` beside the projection's leaves.
+/// By hand, with the update below: one impl per input form, where a derived impl is generic.
 impl<'a, X: Memory> Load<&'a Checkpoint> for Late<W4A16, X>
 where
     Held<X>: Load<&'a Checkpoint>,
@@ -163,69 +167,6 @@ impl<X: Memory> W4A4<X> {
             Held::<X>::load(cx, factor(1.0 / (1.0 / input)))
         })?;
         Ok(Self { global, restore })
-    }
-}
-
-impl<'a, A: Load<&'a B>, B, X: Memory, Y: Memory> Load<&'a Late<B, Y>> for Late<A, X>
-where
-    Held<X>: Load<&'a Held<Y>>,
-{
-    fn load(context: &mut Context<'_>, from: &'a Late<B, Y>) -> Result<Self, LoadError> {
-        Ok(Self {
-            input: context.field("input", "", |cx| A::load(cx, &from.input))?,
-            output: context.field("output", "output", |cx| Held::<X>::load(cx, &from.output))?,
-        })
-    }
-}
-
-impl<'t, A, X: Memory> Load<(&'t mut Late<A, X>, Late<A, X>)> for &'t mut Late<A, X>
-where
-    for<'u> &'u mut A: Load<(&'u mut A, A)>,
-    for<'u> &'u mut Held<X>: Load<(&'u mut Held<X>, Held<X>)>,
-{
-    fn load(
-        context: &mut Context<'_>,
-        (into, from): (&'t mut Late<A, X>, Late<A, X>),
-    ) -> Result<Self, LoadError> {
-        context.field("input", "", |cx| {
-            <&mut A as Load<_>>::load(cx, (&mut into.input, from.input))
-        })?;
-        context.field("output", "output", |cx| {
-            <&mut Held<X> as Load<_>>::load(cx, (&mut into.output, from.output))
-        })?;
-        Ok(into)
-    }
-}
-
-impl<'a, X: Memory, Y: Memory> Load<&'a W4A4<Y>> for W4A4<X>
-where
-    Held<X>: Load<&'a Held<Y>>,
-{
-    fn load(context: &mut Context<'_>, from: &'a W4A4<Y>) -> Result<Self, LoadError> {
-        Ok(Self {
-            global: context.field("global", "global", |cx| Held::<X>::load(cx, &from.global))?,
-            restore: context.field("restore", "restore", |cx| {
-                Held::<X>::load(cx, &from.restore)
-            })?,
-        })
-    }
-}
-
-impl<'t, X: Memory> Load<(&'t mut W4A4<X>, W4A4<X>)> for &'t mut W4A4<X>
-where
-    for<'u> &'u mut Held<X>: Load<(&'u mut Held<X>, Held<X>)>,
-{
-    fn load(
-        context: &mut Context<'_>,
-        (into, from): (&'t mut W4A4<X>, W4A4<X>),
-    ) -> Result<Self, LoadError> {
-        context.field("global", "global", |cx| {
-            <&mut Held<X> as Load<_>>::load(cx, (&mut into.global, from.global))
-        })?;
-        context.field("restore", "restore", |cx| {
-            <&mut Held<X> as Load<_>>::load(cx, (&mut into.restore, from.restore))
-        })?;
-        Ok(into)
     }
 }
 

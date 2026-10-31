@@ -487,12 +487,16 @@ where
         const { assert!(K::SIZE == 2 * RANK && Out::SIZE.is_multiple_of(2)) };
         let rows = Out::SIZE / 2;
         context.checkpoint(from, |cx| {
-            let mut stored = Vec::with_capacity(2);
-            for part in ["gate_proj", "up_proj"] {
-                stored.push(cx.field(part, part, |cx| {
-                    Stored::read(from, cx, (In::SIZE, rows), RANK)
-                })?);
-            }
+            let mut children = Children::default();
+            let stored = ["gate_proj", "up_proj"]
+                .into_iter()
+                .map(|part| {
+                    children.ask(cx.field(part, part, |cx| {
+                        Stored::read(from, cx, (In::SIZE, rows), RANK)
+                    }))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let stored = children.node(stored.into_iter().collect::<Option<Vec<_>>>())?;
             let zero = bf16::from_f32(0.0);
             let (mut a, mut b) = (
                 vec![zero; K::SIZE * In::SIZE],
