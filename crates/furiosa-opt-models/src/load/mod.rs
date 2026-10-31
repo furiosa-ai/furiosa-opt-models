@@ -1,8 +1,8 @@
 //! Loading weight trees: one trait for every direction a tree is loaded in.
 //!
 //! - A tree is built from a [`Checkpoint`] into HBM, updated in place from one (an [`Update`]
-//!   gathers the chunks), borrowed for a call, or written in place from a value of its own type.
-//!   Each direction is an impl of [`Load`]; `#[derive(Load)]` writes them field-wise, and every
+//!   gathers the chunks), borrowed for a call, or written in place from a value of its own type
+//!   or from a borrowed tree of another memory. Each direction is an impl of [`Load`]; `#[derive(Load)]` writes them field-wise, and every
 //!   one fails with [`LoadError`].
 //! - Names: a field's checkpoint segment is its name or `rename`; array elements and the layers of
 //!   a stack are "0".."N-1", a stack's leaves each filling one backing of every layer; a
@@ -44,6 +44,7 @@ use std::marker::PhantomData;
 
 use furiosa_opt_std::prelude::{HbmTensor, M, Scalar};
 
+mod array;
 mod checkpoint;
 mod context;
 mod leaf;
@@ -161,10 +162,6 @@ impl<D: Scalar, C: M, S: M> Footprint for HbmTensor<D, C, S> {
     const SIZE: usize = HbmTensor::<D, C, S>::size();
 }
 
-impl<T: Footprint, const N: usize> Footprint for [T; N] {
-    const SIZE: usize = N * T::SIZE;
-}
-
 impl Footprint for () {
     const SIZE: usize = 0;
 }
@@ -180,76 +177,6 @@ pub struct Rule {
     pub tree: String,
     pub required: Vec<String>,
     pub absent: Vec<String>,
-}
-
-/// Array elements: element `i` under segment `"i"` in both paths.
-impl<'a, T: Load<&'a Checkpoint>, const N: usize> Load<&'a Checkpoint> for [T; N] {
-    fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
-        context.checkpoint(from, |cx| {
-            let mut children = Children::default();
-            let built = (0..N)
-                .map(|i| {
-                    let element = cx.field(&i.to_string(), &i.to_string(), |cx| T::load(cx, from));
-                    children.ask(element)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let built = children.node(built.into_iter().collect::<Option<Vec<T>>>())?;
-            Ok(built.try_into().ok().expect("one element per index"))
-        })
-    }
-}
-
-impl<'t, 's, T, const N: usize> Load<(&'t mut [T; N], &'s Checkpoint)> for &'t mut [T; N]
-where
-    for<'u> &'u mut T: Load<(&'u mut T, &'s Checkpoint)>,
-{
-    fn load(
-        context: &mut Context<'_>,
-        (into, from): (&'t mut [T; N], &'s Checkpoint),
-    ) -> Result<Self, LoadError> {
-        context.checkpoint(from, |cx| {
-            into.iter_mut().enumerate().try_for_each(|(i, t)| {
-                cx.field(&i.to_string(), &i.to_string(), |cx| {
-                    <&mut T as Load<_>>::load(cx, (t, from))
-                })
-                .map(|_| ())
-            })
-        })?;
-        Ok(into)
-    }
-}
-
-impl<'a, T: Load<&'a U>, U, const N: usize> Load<&'a [U; N]> for [T; N] {
-    fn load(context: &mut Context<'_>, from: &'a [U; N]) -> Result<Self, LoadError> {
-        let built = from
-            .iter()
-            .enumerate()
-            .map(|(i, u)| context.field(&i.to_string(), &i.to_string(), |cx| T::load(cx, u)))
-            .collect::<Result<Vec<T>, LoadError>>()?;
-        Ok(built.try_into().ok().expect("one element per element"))
-    }
-}
-
-impl<'t, T, const N: usize> Load<(&'t mut [T; N], [T; N])> for &'t mut [T; N]
-where
-    for<'u> &'u mut T: Load<(&'u mut T, T)>,
-{
-    fn load(
-        context: &mut Context<'_>,
-        (into, from): (&'t mut [T; N], [T; N]),
-    ) -> Result<Self, LoadError> {
-        into.iter_mut()
-            .zip(from)
-            .enumerate()
-            .try_for_each(|(i, (t, value))| {
-                context
-                    .field(&i.to_string(), &i.to_string(), |cx| {
-                        <&mut T as Load<_>>::load(cx, (t, value))
-                    })
-                    .map(|_| ())
-            })?;
-        Ok(into)
-    }
 }
 
 /// A child without weights: it reads nothing and is no update target.
