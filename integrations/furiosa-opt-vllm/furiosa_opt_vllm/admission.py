@@ -304,6 +304,14 @@ def quantization(config: ModelConfig, scope: str = "") -> Quantization | None:
     return "fp8_per_tensor"
 
 
+ROLLBACK: Final = "cannot roll back recurrent state for speculative decoding"
+
+
+def recurrent(model: ModelConfig) -> bool:
+    """Whether `model` keeps a recurrent state, which a rejected draft cannot roll back."""
+    return model.is_hybrid or model.hf_text_config.model_type in ("mamba", "mamba2", "bamba")
+
+
 class Method(StrEnum):
     """A speculative method the plugin serves, under its vLLM name."""
 
@@ -330,7 +338,7 @@ class Draft:
 
     model: ModelConfig
     parallel: ParallelConfig
-    # By default the draft model loads on the chips the target leaves free.
+    # By default the draft model loads on the target's chips.
     placement: Placement | None
     download_dir: str | None
     # The engine's dtype name; `None` keeps the engine's.
@@ -343,6 +351,10 @@ class Draft:
         """The draft model of `config`'s speculative `settings`, whose load config and cache dtype
         default to the target's; refuses a setting the drafter would not honor, naming its
         option."""
+        # A rejected draft is undone by rewriting the draft's attention blocks; the engine reads
+        # no checkpoint first.
+        if recurrent(settings.draft_model_config):
+            raise Refused("speculative_config.model", ROLLBACK)
         if settings.draft_sample_method != "greedy":
             raise Refused(
                 "speculative_config.draft_sample_method",
@@ -481,13 +493,8 @@ def speculative(config: VllmConfig, section: Section) -> Speculative | None:
             "speculative_config.rejection_sample_method",
             "requires speculative_config.rejection_sample_method=standard",
         )
-    model = config.model_config
-    if model and (
-        model.is_hybrid or model.hf_text_config.model_type in ("mamba", "mamba2", "bamba")
-    ):
-        raise Refused(
-            "speculative_config", "cannot roll back recurrent state for speculative decoding"
-        )
+    if config.model_config and recurrent(config.model_config):
+        raise Refused("speculative_config", ROLLBACK)
     match method:
         case Method.NGRAM:
             return method

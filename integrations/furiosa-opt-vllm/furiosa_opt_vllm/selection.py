@@ -32,16 +32,17 @@ if TYPE_CHECKING:
 
     import furiosa_opt_engine as engine
     from furiosa_opt_vllm.admission import Speculative
+    from furiosa_opt_vllm.decoder import Decoder
     from furiosa_opt_vllm.replay import Replay
 
 
 def choose(
     config: VllmConfig,
     speculative: Speculative | None,
-    target: engine.decoder.CacheSpec | None,
+    target: Decoder | None,
     requests: Mapping[str, CachedRequestState],
 ) -> Sampling | Speculation:
-    """Choose sampling or rejection; a draft model loads beside the target cache."""
+    """Choose sampling or rejection; a draft model loads beside the `target` decoder."""
     model = config.model_config
 
     def sampler() -> Sampler:
@@ -133,7 +134,7 @@ class Sampling:
             masks,
         )
 
-    def capacity(self, blocks: int) -> int:
+    def capacity(self, blocks: int, _block: int) -> int:
         """`blocks`, since sampling holds no cache."""
         return blocks
 
@@ -205,13 +206,14 @@ class Speculation:
             result.sampled_token_ids, batch.vocab_size, logprobs_tensors=result.logprobs_tensors
         )
 
-    def capacity(self, blocks: int) -> int:
-        """The target's cache `blocks`, or fewer when a draft model's cache must hold as many."""
+    def capacity(self, blocks: int, block: int) -> int:
+        """The target's cache `blocks` of `block` bytes each, or fewer when a draft model's cache
+        must hold as many."""
         match self.proposer:
             case NgramProposer() | SuffixDecodingProposer():
                 return blocks
             case (Drafter() as drafter) | Drafting(drafter=drafter):
-                return min(blocks, drafter.capacity())
+                return drafter.capacity(blocks, block)
             case _:
                 assert_never(self.proposer)
 
