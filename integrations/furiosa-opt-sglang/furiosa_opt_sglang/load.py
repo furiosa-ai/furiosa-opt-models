@@ -58,7 +58,7 @@ def bind(model_config: ModelConfig, first: int) -> Model:
 
     import furiosa_opt_engine as engine
     from furiosa_opt_sglang.checkpoint import checkout, text
-    from furiosa_opt_sglang.decoder import PES, Decoder, Location, chips
+    from furiosa_opt_sglang.decoder import PES, Decoder, Location
 
     settings, features = get_model(), get_exec().features
     # SGLang's namespace bags and model overrides do not preserve their field types.
@@ -84,7 +84,7 @@ def bind(model_config: ModelConfig, first: int) -> Model:
         loads.parse(checkpoint.mapped())
     except (NotImplementedError, ValueError) as error:
         raise Refused("model_path", str(error)) from None
-    device = engine.Device(engine.Placement(chips(first, tensor), PES))
+    device = engine.Device(engine.Placement.visible(range(first, first + tensor), PES))
     # Only the memory saver releases the weights, so only it keeps the backup they resume from.
     backup = cast("bool", features.enable_memory_saver and features.enable_weights_cpu_backup)
     try:
