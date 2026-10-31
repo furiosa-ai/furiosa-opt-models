@@ -1,5 +1,8 @@
 """The plugin rejects unsupported server options before a scheduler loads the model."""
 
+import pickle
+from typing import cast
+
 import pytest
 from sglang.srt.server_args import ServerArgs, prepare_server_args
 
@@ -10,6 +13,8 @@ from furiosa_opt_sglang.platform import (
     Refused,
     Requested,
     Resolved,
+    Speculations,
+    Standalone,
 )
 
 
@@ -29,12 +34,6 @@ from furiosa_opt_sglang.platform import (
             ["--quantization", "awq"],
             "quantization",
             marks=pytest.mark.feature("Online quantization"),
-        ),
-        pytest.param(
-            ["--quantization", "fp8"],
-            "quantization",
-            marks=pytest.mark.feature("Online quantization"),
-            id="fp8",
         ),
         (["--device", "cuda"], "device"),
         (["--dtype", "float32"], "dtype"),
@@ -107,6 +106,79 @@ STANDALONE = (
     "--speculative-draft-model-path",
     "Qwen/Qwen3-0.6B",
 )
+FP8 = ("--quantization", "fp8")
+
+
+@pytest.mark.feature("Online quantization")
+@pytest.mark.parametrize(
+    "flags",
+    [(), NGRAM, STANDALONE, (*STANDALONE, "--speculative-draft-model-quantization", "unquant")],
+    ids=["alone", "ngram", "inherited-draft", "unquantized-draft"],
+)
+def test_accepts_online_quantization(flags: tuple[str, ...]) -> None:
+    """`--quantization fp8` on a BF16 checkpoint starts, alone and with a speculative algorithm,
+    whether a draft model takes the target's quantization or none."""
+    arguments = prepare_server_args(["--model-path", "Qwen/Qwen3-1.7B", *FP8, *flags])
+    arguments.resolve_once()
+    assert arguments.resolved_dict()["quantization"] == "fp8"
+
+
+@pytest.mark.feature("Online quantization")
+@pytest.mark.parametrize(
+    ("checkpoint", "reason"),
+    [
+        pytest.param(
+            "Qwen/Qwen3-8B",
+            "a load quantizes the checkpoint, the line holds BF16 projections",
+            id="8B",
+        ),
+        # The engine names its refusal of the stored form, not of a quantization at load.
+        pytest.param(
+            "Qwen/Qwen3-0.6B-FP8",
+            "quantization_config: the size's lines here read BF16 checkpoints",
+            id="quantized",
+        ),
+    ],
+)
+def test_refuses_unserved_quantization(checkpoint: str, reason: str) -> None:
+    """Startup refuses `--quantization fp8` with the engine's reason, before a scheduler starts:
+    on a size with no FP8 form, and on a quantized checkpoint whose stored form no line serves,
+    which loads as stored, as SGLang loads it."""
+    arguments = prepare_server_args(["--model-path", checkpoint, *FP8])
+    with pytest.raises(Refused) as error:
+        arguments.resolve_once()
+    assert error.value.option == "model_path"
+    assert reason in error.value.requirement
+
+
+@pytest.mark.feature("Online quantization")
+@pytest.mark.parametrize(
+    ("flags", "quantization"),
+    [((), "fp8"), (("--speculative-draft-model-quantization", "unquant"), None)],
+    ids=["inherited", "unquant"],
+)
+def test_schedules_the_resolved_draft_quantization(
+    flags: tuple[str, ...], quantization: str | None
+) -> None:
+    """A scheduler reads the draft quantization SGLang resolved in the server options it receives:
+    the target's by default, none for `unquant`."""
+    arguments = prepare_server_args(["--model-path", "Qwen/Qwen3-1.7B", *FP8, *STANDALONE, *flags])
+    arguments.resolve_once()
+    received = cast("ServerArgs", pickle.loads(pickle.dumps(arguments)))
+    options = Speculations.parse(received)
+    assert isinstance(options, Standalone)
+    assert options.speculative_draft_model_quantization == quantization
+
+
+@pytest.mark.feature("Online quantization")
+def test_quantizes_each_output_channel() -> None:
+    """SGLang's `fp8` of a BF16 checkpoint scales each output channel of a projection by its own
+    scale, which the engine names `fp8_per_channel`; any other method SGLang resolves, such as a
+    ModelOpt checkpoint's own, quantizes nothing at load."""
+    from furiosa_opt_sglang.load import quantization
+
+    assert quantization("fp8", {}) == "fp8_per_channel"
+    assert quantization("modelopt_fp8", {}) is None
 
 
 def test_accepts_embedding_offload_options_without_the_offload() -> None:
@@ -243,8 +315,23 @@ def test_accepts_hierarchical_cache_of_given_size(size: tuple[str, str]) -> None
             "enable_memory_saver",
             "releases no memory under speculative decoding yet; omit --enable-memory-saver",
         ),
+        pytest.param(
+            (*STANDALONE, "--speculative-draft-model-quantization", "awq"),
+            "speculative_draft_model_quantization",
+            "quantizes a BF16 draft model at load only with fp8, one scale per output channel",
+            marks=pytest.mark.feature("Online quantization"),
+        ),
     ],
-    ids=["max-breadth", "min-breadth", "topk", "adaptive", "corpus", "sam-budget", "sleep"],
+    ids=[
+        "max-breadth",
+        "min-breadth",
+        "topk",
+        "adaptive",
+        "corpus",
+        "sam-budget",
+        "sleep",
+        "draft-quantization",
+    ],
 )
 @pytest.mark.feature("Speculative decoding (ngram, suffix, draft model)")
 def test_refuses_speculation(flags: tuple[str, ...], option: str, requirement: str) -> None:
