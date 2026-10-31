@@ -635,7 +635,7 @@ pub mod form {
     use crate::tensor;
     use crate::tensor::form::fp8::Block;
     use crate::tensor::form::fp8::Scales;
-    use crate::tensor::form::nvfp4::{self, Early, Late, W4A4, W4A16};
+    use crate::tensor::form::nvfp4::{self, Early, Late, Summed, W4A4, W4A16};
     use crate::tensor::parallel::Chip;
     use furiosa_opt_std::prelude::*;
 
@@ -656,6 +656,11 @@ pub mod form {
     /// FP4 weights with per-16 FP8 block scales and one global scale, as a compressed-tensors
     /// checkpoint stores them; inputs stay BF16.
     pub struct Nvfp4;
+
+    /// [`Nvfp4`]'s weights under the experimental summed contract: a row's FP32 sum divides by the
+    /// global scale, so no coefficient rounds to BF16. Opt in by naming it in place of [`Nvfp4`];
+    /// it projects one row at a time.
+    pub struct Nvfp4Summed;
 
     /// FP4 weights with per-16 FP8 block scales under a late FP32 tensor scale, whose inputs enter
     /// in form `A`: quantized at run time as the weights are, or as the BF16 they are.
@@ -785,6 +790,27 @@ pub mod form {
                 f8e4m3,
                 nvfp4::Scales<In, Out>,
                 Early<W4A16, X>,
+                Chip,
+                V,
+                X::Tensor<f8e4m3, Chip, nvfp4::Scales<In, Out>>,
+            >;
+
+        const REQUIREMENT: Requirement = Requirement::declared(Declaration::Nvfp4);
+
+        type Caches = (bf16,);
+    }
+
+    impl Form for Nvfp4Summed {
+        type Stored = f4e2m1;
+
+        type Of<In: AxisName, Out: AxisName, D: Scalar, Chips: M + 'static, X: Memory, V> =
+            tensor::form::BlockScaled<
+                In,
+                Out,
+                f4e2m1,
+                f8e4m3,
+                nvfp4::Scales<In, Out>,
+                Summed<W4A16, X>,
                 Chip,
                 V,
                 X::Tensor<f8e4m3, Chip, nvfp4::Scales<In, Out>>,
@@ -1022,7 +1048,7 @@ mod tests {
     #[test]
     fn requires_each_declaration_its_forms_read() {
         use crate::tensor::form::nvfp4::W4A16;
-        use form::{Affine, BlockScaled, ChannelScaled, Nvfp4, Nvfp4BlockScaled};
+        use form::{Affine, BlockScaled, ChannelScaled, Nvfp4, Nvfp4BlockScaled, Nvfp4Summed};
         let channel = Declaration::Fp8(config::Scheme::Channel);
         let nvfp4 = Declaration::Nvfp4;
         type Mixed<F> = Projections<ChannelScaled, ChannelScaled, ChannelScaled, ChannelScaled, F>;
@@ -1040,6 +1066,10 @@ mod tests {
                 (true, Some(channel), true),
             ),
             (<Mixed<Nvfp4> as Forms>::REQUIREMENT, (true, None, false)),
+            (
+                <Mixed<Nvfp4Summed> as Forms>::REQUIREMENT,
+                (true, None, false),
+            ),
             (
                 <Mlp<Nvfp4BlockScaled> as Forms>::REQUIREMENT,
                 (true, Some(nvfp4), false),
