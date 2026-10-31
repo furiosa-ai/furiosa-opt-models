@@ -119,6 +119,10 @@ impl<X, R: AxisName> Live<X, R> {
             assert!(T::SIZE > 0 && R::SIZE.is_multiple_of(T::SIZE));
             R::SIZE / T::SIZE
         };
+        // An envelope of one tile is its own tile: its rows, which a leaf bounds by the count.
+        if const { R::SIZE == T::SIZE } {
+            return self.with(());
+        }
         let whole = (self.count::<T>() + tiles - 1 - index) / (tiles + 1);
         let tail = (self.rows + T::SIZE - 1) % T::SIZE + 1;
         Live {
