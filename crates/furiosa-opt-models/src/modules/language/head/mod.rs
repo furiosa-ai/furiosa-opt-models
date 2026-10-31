@@ -7,10 +7,11 @@ use crate::ops::embedding::{Embedding, Table};
 use crate::ops::index::gather::{self, Rows};
 use crate::ops::index::scatter::Store;
 use crate::ops::linear::affine::{self, COLUMNS, Weights};
-use crate::ops::linear::stream::{Columns, ToDm};
+use crate::ops::linear::stream::{Columns, Logits, ToDm};
 use crate::ops::linear::{Affine, Bias, Biased};
 use crate::ops::normalization::span::Span;
 use crate::ops::normalization::{Blocked, Spread};
+use crate::ops::pointwise::activation::Softcap;
 use crate::ops::reduction::{self, Argmax};
 use crate::tensor::live::Live;
 use crate::tensor::{axis::Tile, parallel::Chip};
@@ -248,48 +249,55 @@ where
 }
 
 /// Each row's first maximum among a padded vocabulary's tokens: the head's logits reach the argmax
-/// pass by pass, as candidates, so no row's logits are stored whole.
+/// pass by pass, through its cap, as candidates, so no row's logits are stored whole.
 #[derive(DeviceSend)]
-pub struct Greedy<H: AxisName, V: AxisName, Head = Biased<H, V>, Select = Argmax<V>> {
+pub struct Greedy<H: AxisName, V: AxisName, Head = Biased<H, V>, Select = Argmax<V>, Bound = ()> {
     /// The projection onto the padded vocabulary; its bias is zero for the checkpoint's tokens and
     /// the lowest finite score for the padded rows.
     pub head: Head,
     /// The first maximum of each row's logits.
     pub argmax: Select,
+    /// The cap on every logit the argmax compares, the config's `final_logit_softcapping`: `()`
+    /// for a head whose logits take none.
+    pub cap: Bound,
     shape: PhantomData<(H, V)>,
 }
 
-impl<H: AxisName, V: AxisName, Head, Select> Greedy<H, V, Head, Select> {
-    pub const fn new(head: Head, argmax: Select) -> Self {
+impl<H: AxisName, V: AxisName, Head, Select, Bound> Greedy<H, V, Head, Select, Bound> {
+    pub const fn new(head: Head, argmax: Select, cap: Bound) -> Self {
         Self {
             head,
             argmax,
+            cap,
             shape: PhantomData,
         }
     }
 }
 
 /// A greedy head with its bias and the argmax's indices in data memory, where each call's passes
-/// read them.
-pub(crate) type InDm<'a, H, V> = Greedy<
-    H,
-    V,
-    Affine<&'a HbmTensor<bf16, Chip, m![V, H]>, Columns<H, V, f32>>,
-    Argmax<V, Chip, Columns<H, V, i32>>,
->;
+/// read them, and its cap borrowed.
+pub(crate) type InDm<'a, H, V, C> =
+    Greedy<H, V, Streamed<'a, H, V>, Argmax<V, Chip, Columns<H, V, i32>>, &'a C>;
+
+/// A greedy head's projection as a call's passes stream it: its weight in HBM, its bias in data
+/// memory.
+type Streamed<'a, H, V> = Affine<&'a HbmTensor<bf16, Chip, m![V, H]>, Columns<H, V, f32>>;
 
 /// A greedy head whose projection's weight, bias and argmax ranks are held as `W`, `B` and `I`:
-/// HBM tensors, or borrows of them in a borrowed tree.
-type Tree<H, V, W, B, I> = Greedy<H, V, Affine<W, B>, Argmax<V, Chip, I>>;
+/// HBM tensors, or borrows of them in a borrowed tree; `C` caps its logits.
+type Tree<H, V, W, B, I, C> = Greedy<H, V, Affine<W, B>, Argmax<V, Chip, I>, C>;
 
-impl<H: AxisName, V: AxisName, W, B, I> Tree<H, V, W, B, I>
+/// The config key a head's cap reads its bound under.
+const CAP: &str = "final_logit_softcapping";
+
+impl<H: AxisName, V: AxisName, W, B, I, C> Tree<H, V, W, B, I, C>
 where
     W: Borrow<HbmTensor<bf16, Chip, m![V, H]>>,
     B: Borrow<HbmTensor<f32, Chip, m![V]>>,
     I: Borrow<HbmTensor<i32, Chip, m![V]>>,
 {
     /// This head with its bias and indices written in data memory.
-    pub(crate) fn to_dm(&self, device: &mut Device) -> InDm<'_, H, V> {
+    pub(crate) fn to_dm(&self, device: &mut Device) -> InDm<'_, H, V, C> {
         let columns = ToDm::<H>(PhantomData);
         Greedy::new(
             Affine::new(
@@ -297,17 +305,20 @@ where
                 columns.forward(&mut *device, (), &mut (), self.head.bias.borrow()),
             ),
             self.argmax.to_dm(device),
+            &self.cap,
         )
     }
 }
 
 /// The projection's weight under `weight`, checked as [`Embedding::table`] checks a token table
-/// and read by a leaf that holds values; its bias and the argmax's ranks come from the config.
-impl<'a, H: AxisName, V: AxisName, W, B, I> Load<&'a Checkpoint> for Tree<H, V, W, B, I>
+/// and read by a leaf that holds values; its bias, the argmax's ranks and the cap come from the
+/// config.
+impl<'a, H: AxisName, V: AxisName, W, B, I, C> Load<&'a Checkpoint> for Tree<H, V, W, B, I, C>
 where
     W: for<'t> Load<&'t Table<'t, V, H, Chip>>,
     B: Load<HostTensor<f32, m![{ Chip }, { m![V] }]>>,
     Argmax<V, Chip, I>: Load<&'a Checkpoint>,
+    C: Load<&'a Checkpoint>,
 {
     fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
         context.checkpoint(from, |cx| {
@@ -335,24 +346,26 @@ where
                 Argmax::<V, Chip, I>::load(cx, from)
             });
             let argmax = children.ask(argmax)?;
-            let parts = weight.zip(bias).zip(argmax);
-            children
-                .node(parts)
-                .map(|((weight, bias), argmax)| Greedy::new(Affine::new(weight, bias), argmax))
+            let cap = cx.field("cap", "", |cx| cx.config(CAP, |cx| C::load(cx, from)));
+            let cap = children.ask(cap)?;
+            let parts = weight.zip(bias).zip(argmax).zip(cap);
+            children.node(parts).map(|(((weight, bias), argmax), cap)| {
+                Greedy::new(Affine::new(weight, bias), argmax, cap)
+            })
         })
     }
 }
 
-/// The projection's weight written in place: one rule of an update; the bias and the ranks are
-/// no update targets.
-impl<'t, 's, H: AxisName, V: AxisName, W: 'static, B, I>
-    Load<(&'t mut Tree<H, V, W, B, I>, &'s Checkpoint)> for &'t mut Tree<H, V, W, B, I>
+/// The projection's weight written in place: one rule of an update; the bias, the ranks and the
+/// cap are no update targets.
+impl<'t, 's, H: AxisName, V: AxisName, W: 'static, B, I, C>
+    Load<(&'t mut Tree<H, V, W, B, I, C>, &'s Checkpoint)> for &'t mut Tree<H, V, W, B, I, C>
 where
     for<'u> &'u mut W: Load<(&'u mut W, HostTensor<bf16, m![{ Chip }, { m![V, H] }]>)>,
 {
     fn load(
         context: &mut Context<'_>,
-        (into, from): (&'t mut Tree<H, V, W, B, I>, &'s Checkpoint),
+        (into, from): (&'t mut Tree<H, V, W, B, I, C>, &'s Checkpoint),
     ) -> Result<Self, LoadError> {
         let write = |cx: &mut Context<'_>| {
             let table = Embedding::<V, H, Chip>::table(from, cx)?;
@@ -369,46 +382,59 @@ where
     }
 }
 
-impl<'a, H: AxisName, V: AxisName, W, B, I, SourceWeight, SourceBias, SourceIndex>
-    Load<&'a Tree<H, V, SourceWeight, SourceBias, SourceIndex>> for Tree<H, V, W, B, I>
+impl<'a, H: AxisName, V: AxisName, W, B, I, C, SourceWeight, SourceBias, SourceIndex, SourceCap>
+    Load<&'a Tree<H, V, SourceWeight, SourceBias, SourceIndex, SourceCap>>
+    for Tree<H, V, W, B, I, C>
 where
     Affine<W, B>: Load<&'a Affine<SourceWeight, SourceBias>>,
     Argmax<V, Chip, I>: Load<&'a Argmax<V, Chip, SourceIndex>>,
+    C: Load<&'a SourceCap>,
 {
     fn load(
         context: &mut Context<'_>,
-        from: &'a Tree<H, V, SourceWeight, SourceBias, SourceIndex>,
+        from: &'a Tree<H, V, SourceWeight, SourceBias, SourceIndex, SourceCap>,
     ) -> Result<Self, LoadError> {
         let head = context.field("head", "", |cx| Load::load(cx, &from.head))?;
         let argmax = context.field("argmax", "argmax", |cx| Load::load(cx, &from.argmax))?;
-        Ok(Greedy::new(head, argmax))
+        let cap = context.field("cap", "", |cx| Load::load(cx, &from.cap))?;
+        Ok(Greedy::new(head, argmax, cap))
     }
 }
 
-impl<'t, H: AxisName, V: AxisName, W, B, I> Load<(&'t mut Tree<H, V, W, B, I>, Tree<H, V, W, B, I>)>
-    for &'t mut Tree<H, V, W, B, I>
+impl<'t, H: AxisName, V: AxisName, W, B, I, C>
+    Load<(&'t mut Tree<H, V, W, B, I, C>, Tree<H, V, W, B, I, C>)>
+    for &'t mut Tree<H, V, W, B, I, C>
 where
     for<'u> &'u mut Affine<W, B>: Load<(&'u mut Affine<W, B>, Affine<W, B>)>,
     for<'u> &'u mut Argmax<V, Chip, I>: Load<(&'u mut Argmax<V, Chip, I>, Argmax<V, Chip, I>)>,
+    for<'u> &'u mut C: Load<(&'u mut C, C)>,
 {
     fn load(
         context: &mut Context<'_>,
-        (into, from): (&'t mut Tree<H, V, W, B, I>, Tree<H, V, W, B, I>),
+        (into, from): (&'t mut Tree<H, V, W, B, I, C>, Tree<H, V, W, B, I, C>),
     ) -> Result<Self, LoadError> {
-        let Greedy { head, argmax, .. } = from;
+        let Greedy {
+            head, argmax, cap, ..
+        } = from;
         context.field("head", "", |cx| {
             <&mut Affine<W, B> as Load<_>>::load(cx, (&mut into.head, head))
         })?;
         context.field("argmax", "argmax", |cx| {
             <&mut Argmax<V, Chip, I> as Load<_>>::load(cx, (&mut into.argmax, argmax))
         })?;
+        context.field("cap", "", |cx| {
+            <&mut C as Load<_>>::load(cx, (&mut into.cap, cap))
+        })?;
         Ok(into)
     }
 }
 
-/// Each row's token; every row of the envelope is projected.
-impl<H: AxisName, V: AxisName, R: AxisName, Env: Copy> Module<&Spread<H, R>, Env, &mut ()>
-    for InDm<'_, H, V>
+/// Each row's token: the projection's logits, through the cap, reach the argmax's candidates a
+/// pass at a time; every row of the envelope is projected.
+impl<H: AxisName, V: AxisName, R: AxisName, C, Env: Copy> Module<&Spread<H, R>, Env, &mut ()>
+    for InDm<'_, H, V, C>
+where
+    C: Cap<H, V>,
 {
     type Output = reduction::Selected<R>;
 
@@ -420,18 +446,68 @@ impl<H: AxisName, V: AxisName, R: AxisName, Env: Copy> Module<&Spread<H, R>, Env
         input: &Spread<H, R>,
     ) -> reduction::Selected<R> {
         let mut candidates = self.argmax.candidates::<R>();
-        self.head
-            .forward(&mut *device, env, &mut (), (input, &mut candidates));
+        self.cap.project(
+            &mut *device,
+            (&self.head, input),
+            |device: &mut Device, logits: &Logits<H, V, R>, pass| {
+                candidates.push(device, logits, pass);
+            },
+        );
         self.argmax.forward(device, env, &mut (), candidates)
     }
 }
 
-impl<H: AxisName, V: AxisName, R: AxisName, W, B, I, Env: Copy>
-    Module<&mut Rows<'_, bf16, H, R>, Env, &mut ()> for Tree<H, V, W, B, I>
+/// How each pass's logits reach a greedy head's argmax: as the projection leaves them for `()`, or
+/// through the head's cap.
+pub(crate) trait Cap<H: AxisName, V: AxisName> {
+    /// Every pass's logits of `projection`'s input rows, capped, into `push` with the pass.
+    fn project<R: AxisName>(
+        &self,
+        device: &mut Device,
+        projection: (&Streamed<'_, H, V>, &Spread<H, R>),
+        push: impl FnMut(&mut Device, &Logits<H, V, R>, usize),
+    );
+}
+
+impl<H: AxisName, V: AxisName> Cap<H, V> for () {
+    fn project<R: AxisName>(
+        &self,
+        device: &mut Device,
+        (head, input): (&Streamed<'_, H, V>, &Spread<H, R>),
+        push: impl FnMut(&mut Device, &Logits<H, V, R>, usize),
+    ) {
+        crate::Op::forward(head, device, (input, push));
+    }
+}
+
+/// The softcap's bound and reciprocal reach the vector registers before the first pass, since each
+/// pass's DMA queue holds the next pass's weights; each pass caps its logits before `push`.
+impl<H: AxisName, V: AxisName, F> Cap<H, V> for Softcap<F>
+where
+    F: Borrow<HbmTensor<f32, Chip, m![1 # 8]>>,
+{
+    fn project<R: AxisName>(
+        &self,
+        device: &mut Device,
+        (head, input): (&Streamed<'_, H, V>, &Spread<H, R>),
+        mut push: impl FnMut(&mut Device, &Logits<H, V, R>, usize),
+    ) {
+        let cap = self.to_vrf::<H, V, Chip>(&mut *device);
+        let capped = |device: &mut Device, logits: &Logits<H, V, R>, pass| {
+            let logits = crate::Op::forward(&cap, &mut *device, logits);
+            push(device, &logits, pass);
+        };
+        crate::Op::forward(head, device, (input, capped));
+    }
+}
+
+impl<H: AxisName, V: AxisName, R: AxisName, W, B, I, C, Env: Copy>
+    Module<&mut Rows<'_, bf16, H, R>, Env, &mut ()> for Tree<H, V, W, B, I, C>
 where
     W: Borrow<HbmTensor<bf16, Chip, m![V, H]>>,
     B: Borrow<HbmTensor<f32, Chip, m![V]>>,
     I: Borrow<HbmTensor<i32, Chip, m![V]>>,
+    C: Cap<H, V>,
 {
     type Output = HbmTensor<i32, Chip, m![R]>;
 
@@ -640,6 +716,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ops::pointwise::activation::Softcap;
     use crate::tensor::axis::{Eight, Rows};
     use crate::tests::DEVICE;
 
@@ -651,15 +728,87 @@ mod tests {
     const LIVE: usize = 151_936 - 256;
 
     #[device(chip = 1)]
-    fn selected<V: AxisName, R: AxisName>(
+    fn selected<V: AxisName, R: AxisName, C>(
         device: &mut Device,
-        head: &Greedy<Hidden, V>,
+        head: &Greedy<Hidden, V, Biased<Hidden, V>, Argmax<V>, C>,
         input: &HbmTensor<bf16, Chip, m![R, Hidden]>,
-    ) -> HbmTensor<i32, Chip, m![R]> {
+    ) -> HbmTensor<i32, Chip, m![R]>
+    where
+        C: DeviceSend + Cap<Hidden, V>,
+    {
         let input: Spread<Hidden, R> = input.to_dm(&mut device.tdma);
         head.to_dm(&mut *device)
             .forward(&mut *device, (), &mut (), &input)
             .to_hbm(&mut device.tdma)
+    }
+
+    /// Input rows and coefficients giving row `r` each `(token, logit)` of `logits(r)`, else -1: two
+    /// BF16 coefficients on its features `2r` and `2r + 1` carry a logit exactly through FP32 sums.
+    fn projection<'a, V: AxisName, R: AxisName>(
+        logits: impl Fn(usize) -> &'a [(usize, f32)],
+    ) -> (Vec<bf16>, Vec<bf16>) {
+        let mut weight = vec![bf16::from_f32(0.0); V::SIZE * Hidden::SIZE];
+        for token in 0..V::SIZE {
+            for row in 0..R::SIZE {
+                weight[token * Hidden::SIZE + 2 * row] = bf16::from_f32(-1.0);
+            }
+        }
+        let mut input = vec![bf16::from_f32(0.0); R::SIZE * Hidden::SIZE];
+        for row in 0..R::SIZE {
+            input[row * Hidden::SIZE + 2 * row] = bf16::from_f32(1.0);
+            input[row * Hidden::SIZE + 2 * row + 1] = bf16::from_f32(1.0);
+            for &(token, value) in logits(row) {
+                let high = bf16::from_f32(value);
+                let low = bf16::from_f32(value - high.to_f32());
+                assert_eq!(high.to_f32() + low.to_f32(), value);
+                weight[token * Hidden::SIZE + 2 * row] = high;
+                weight[token * Hidden::SIZE + 2 * row + 1] = low;
+            }
+        }
+        (weight, input)
+    }
+
+    /// A greedy head over `weight` whose bias masks the tokens from `live` on, its logits capped
+    /// by `cap`.
+    async fn greedy<V: AxisName, C>(
+        device: &mut Device,
+        weight: Vec<bf16>,
+        live: usize,
+        cap: C,
+    ) -> Greedy<Hidden, V, Biased<Hidden, V>, Argmax<V>, C> {
+        let weight = HostTensor::<bf16, m![V, Hidden]>::from_vec(weight)
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap();
+        let mask = (0..V::SIZE).map(|token| if token < live { 0.0 } else { f32::MIN });
+        let mask = HostTensor::<f32, m![V]>::from_vec(mask)
+            .to_hbm::<Chip, m![V]>(&mut device.pdma)
+            .await
+            .unwrap();
+        let argmax = Argmax::<V>::load(&mut Context::new(&mut *device), &Checkpoint::default());
+        Greedy::new(Affine::new(weight, mask), argmax.unwrap(), cap)
+    }
+
+    async fn tokens<V: AxisName, R: AxisName, C>(
+        device: &mut Device,
+        head: &Greedy<Hidden, V, Biased<Hidden, V>, Argmax<V>, C>,
+        input: Vec<bf16>,
+    ) -> Vec<usize>
+    where
+        C: DeviceSend + Cap<Hidden, V>,
+    {
+        let input = HostTensor::<bf16, m![R, Hidden]>::from_vec(input)
+            .to_hbm::<Chip, m![R, Hidden]>(&mut device.pdma)
+            .await
+            .unwrap();
+        let tokens = launch(selected, (&mut *device, head, &input))
+            .await
+            .unwrap()
+            .to_host::<m![R]>(&mut device.pdma)
+            .await
+            .unwrap()
+            .into_vec();
+        tokens.into_iter().map(|token| token as usize).collect()
     }
 
     /// Greedy selects each row's first maximum among the checkpoint's tokens across ties and pass
@@ -694,51 +843,137 @@ mod tests {
             (&[(live - 1, 3.0), (live, 3.0)], live - 1),
         ];
         let case = |row: usize| cases[row % cases.len()];
-        let mut weight = vec![bf16::from_f32(0.0); V::SIZE * Hidden::SIZE];
-        for token in 0..V::SIZE {
-            for row in 0..R::SIZE {
-                weight[token * Hidden::SIZE + 2 * row] = bf16::from_f32(-1.0);
-            }
-        }
-        let mut input = vec![bf16::from_f32(0.0); R::SIZE * Hidden::SIZE];
-        for row in 0..R::SIZE {
-            input[row * Hidden::SIZE + 2 * row] = bf16::from_f32(1.0);
-            input[row * Hidden::SIZE + 2 * row + 1] = bf16::from_f32(1.0);
-            for &(token, value) in case(row).0 {
-                // Two BF16 coefficients preserve the FP32 next_down case through the contraction.
-                let high = bf16::from_f32(value);
-                let low = bf16::from_f32(value - high.to_f32());
-                assert_eq!(high.to_f32() + low.to_f32(), value);
-                weight[token * Hidden::SIZE + 2 * row] = high;
-                weight[token * Hidden::SIZE + 2 * row + 1] = low;
-            }
-        }
+        let (weight, input) = projection::<V, R>(|row| case(row).0);
         let _lease = DEVICE.lock().await;
         let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
-        let weight = HostTensor::<bf16, m![V, Hidden]>::from_vec(weight)
-            .to_hbm(&mut device.pdma)
-            .await
-            .unwrap();
-        let input = HostTensor::<bf16, m![R, Hidden]>::from_vec(input)
-            .to_hbm::<Chip, m![R, Hidden]>(&mut device.pdma)
-            .await
-            .unwrap();
-        let mask = (0..V::SIZE).map(|token| if token < live { 0.0 } else { f32::MIN });
-        let mask = HostTensor::<f32, m![V]>::from_vec(mask)
-            .to_hbm::<Chip, m![V]>(&mut device.pdma)
-            .await
-            .unwrap();
-        let argmax = Argmax::<V>::load(&mut Context::new(&mut device), &Checkpoint::default());
-        let head = Greedy::<Hidden, V>::new(Affine::new(weight, mask), argmax.unwrap());
-        let tokens = launch(selected, (&mut device, &head, &input))
-            .await
-            .unwrap()
-            .to_host::<m![R]>(&mut device.pdma)
-            .await
-            .unwrap()
-            .into_vec();
+        let head = greedy::<V, ()>(&mut device, weight, live, ()).await;
+        let tokens = tokens::<V, R, ()>(&mut device, &head, input).await;
         for (row, &token) in tokens.iter().enumerate() {
-            assert_eq!(token as usize, case(row).1, "row {row}");
+            assert_eq!(token, case(row).1, "row {row}");
+        }
+    }
+
+    /// The softcap a head's load places for a config whose `final_logit_softcapping` is `bound`.
+    fn softcap(device: &mut Device, bound: f32) -> Softcap {
+        let directory = tempfile::tempdir().unwrap();
+        let config = serde_json::json!({ "final_logit_softcapping": bound });
+        let checkpoint = Checkpoint::new(directory.path(), Some(config)).unwrap();
+        let mut context = Context::new(device);
+        let loaded = context.config("final_logit_softcapping", |cx| {
+            Softcap::load(cx, &checkpoint)
+        });
+        loaded.unwrap()
+    }
+
+    /// The first token of the largest `bound * tanh((z + bias) * (1 / bound))` in FP32, dividing by
+    /// a scalar as PyTorch's CUDA kernels do, its capped logit and the largest of the others.
+    fn capped_first_maximum<V: AxisName>(
+        bound: f32,
+        live: usize,
+        logit: impl Fn(usize) -> f32,
+    ) -> (usize, f32, f32) {
+        let inverse = (1.0 / f64::from(bound)) as f32;
+        (0..V::SIZE).fold((0, f32::NEG_INFINITY, f32::NEG_INFINITY), |best, token| {
+            let bias = if token < live { 0.0 } else { f32::MIN };
+            let capped = bound * ((logit(token) + bias) * inverse).tanh();
+            match capped > best.1 {
+                true => (token, capped, best.1),
+                false => (best.0, best.1, best.2.max(capped)),
+            }
+        })
+    }
+
+    /// Row `row`'s FP32 logit of `token` through `weight`, as the contraction sums its two
+    /// coefficients.
+    fn logit(weight: &[bf16], row: usize, token: usize) -> f32 {
+        let at = token * Hidden::SIZE + 2 * row;
+        weight[at].to_f32() + weight[at + 1].to_f32()
+    }
+
+    /// A head capping its logits at `c` takes each row's first maximum of `c * tanh(z / c)` in FP32:
+    /// logits that saturate tie at `c` and choose the first, across passes and clusters too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn selects_first_maximum_of_capped_logits() {
+        type V = Padded;
+        const BOUND: f32 = 30.0;
+        let third = V::SIZE / 3;
+        let cases: [(&[(usize, f32)], usize); 8] = [
+            (&[(11, 480.0), (third + 19, 960.0)], 11),
+            (&[(5, 3.0e4), (2 * third + 5, 1.0e6)], 5),
+            (&[(42, 150.0), (99_999, 151.0)], 99_999),
+            (&[(1233, 600.0), (1234, 800.0)], 1233),
+            (
+                &[(LIVE - 1, 2.0), (LIVE, 1.0e5), (V::SIZE - 1, 1.0e5)],
+                LIVE - 1,
+            ),
+            (&[(777, 2.5), (third + 1, 2.5)], 777),
+            (&[(2 * third + 5, 3.0)], 2 * third + 5),
+            (&[(third - 1, 600.0), (third, 2.0e5)], third - 1),
+        ];
+        let (weight, input) = projection::<V, Eight>(|row| cases[row].0);
+        let wanted: Vec<usize> = (0..Eight::SIZE)
+            .map(|row| capped_first_maximum::<V>(BOUND, LIVE, |token| logit(&weight, row, token)).0)
+            .collect();
+        assert_eq!(wanted, cases.map(|case| case.1));
+        let _lease = DEVICE.lock().await;
+        let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+        let cap = softcap(&mut device, BOUND);
+        let head = greedy::<V, _>(&mut device, weight, LIVE, cap).await;
+        assert_eq!(
+            tokens::<V, Eight, _>(&mut device, &head, input).await,
+            wanted
+        );
+    }
+
+    /// Rows of random logits through a head capped at 30 and at 20 take the first maximum the FP32
+    /// cap gives them; in half the rows some logits saturate, and the first of those wins.
+    #[tokio::test(flavor = "current_thread")]
+    async fn selects_first_maximum_of_random_capped_logits() {
+        type V = Padded;
+        const BOUNDS: [f32; 2] = [30.0, 20.0];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |below: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as usize % below
+        };
+        // Logits below the caps 1/32 apart at least, at random tokens, and saturating ones.
+        let rows: Vec<Vec<(usize, f32)>> = (0..Eight::SIZE)
+            .map(|row| {
+                let below = (0..960).map(|at| {
+                    let logit = at as f32 / 32.0 + next(16) as f32 / 1024.0;
+                    (next(LIVE), logit)
+                });
+                let mut logits: Vec<_> = below.collect();
+                logits.extend((0..50 * (row % 2)).map(|_| (next(LIVE), (400 + next(3600)) as f32)));
+                logits
+            })
+            .collect();
+        let (weight, input) = projection::<V, Eight>(|row| &rows[row][..]);
+        let wanted = BOUNDS.map(|bound| {
+            (0..Eight::SIZE)
+                .map(|row| {
+                    let (token, best, next) =
+                        capped_first_maximum::<V>(bound, LIVE, |token| logit(&weight, row, token));
+                    // A tie at the cap is exact in any FP32 tanh; another maximum leads by more than
+                    // two such tanh round apart, so the cap decides the token, not a rounding.
+                    assert!(
+                        best == bound || best - next > best * 2f32.powi(-17),
+                        "row {row}"
+                    );
+                    token
+                })
+                .collect::<Vec<_>>()
+        });
+        let _lease = DEVICE.lock().await;
+        let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+        let cap = softcap(&mut device, BOUNDS[0]);
+        let mut head = greedy::<V, _>(&mut device, weight, LIVE, cap).await;
+        for (bound, wanted) in BOUNDS.into_iter().zip(wanted) {
+            head.cap = softcap(&mut device, bound);
+            let tokens = tokens::<V, Eight, _>(&mut device, &head, input.clone()).await;
+            assert_eq!(tokens, wanted, "cap {bound}");
         }
     }
 }

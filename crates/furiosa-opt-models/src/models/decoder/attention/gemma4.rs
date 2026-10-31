@@ -25,7 +25,7 @@ use crate::ops::embedding::Embedding;
 use crate::ops::index::scatter::Scatter;
 use crate::ops::linear::Affine;
 use crate::ops::normalization::{RmsNorm, UnitRmsNorm};
-use crate::ops::pointwise::activation::NewGelu;
+use crate::ops::pointwise::activation::{NewGelu, Softcap};
 use crate::ops::pointwise::{add, multiply};
 use crate::ops::reduction::Argmax;
 use crate::tensor::axis;
@@ -79,8 +79,8 @@ pub type Catalog<P, C, X> = Gemma4ForCausalLM<
 >;
 
 /// The greedy head over the vocabulary rows: the projection by the tied embedding table, whose
-/// bias lowers no row, and the first maximum of each row's scores; a logit softcap, being
-/// monotone, leaves that maximum.
+/// bias lowers no row, and the first maximum of each row's scores, each capped at the config's
+/// `final_logit_softcapping`.
 pub type LmHead<X = Hbm> = Greedy<
     Hidden,
     Vocabulary,
@@ -89,6 +89,7 @@ pub type LmHead<X = Hbm> = Greedy<
         <X as Memory>::Tensor<f32, Chip, m![Vocabulary]>,
     >,
     Argmax<Vocabulary, Chip, <X as Memory>::Tensor<i32, Chip, m![Vocabulary]>>,
+    Softcap<<X as Memory>::Tensor<f32, Chip, m![1 # 8]>>,
 >;
 
 /// The token table.

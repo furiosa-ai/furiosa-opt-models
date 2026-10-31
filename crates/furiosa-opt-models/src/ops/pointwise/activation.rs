@@ -4,12 +4,14 @@ use super::{
     Factors, Float, Registers, Rows, Segment, SpreadPacket, SpreadPairs, SpreadTime, Width, Window,
 };
 use crate::Op;
-use crate::load::Load;
+use crate::load::{Checkpoint, Context, Load, LoadError};
 use crate::ops::index::packed::Timestep;
+use crate::ops::linear::{Groups, stream};
 use crate::ops::normalization::{Chunk, Cluster, Element, FeatureSlices, Spread};
 use crate::ops::vector::Silu as _;
-use crate::tensor::live::Live;
+use crate::tensor::{live::Live, mapping::Rows as Layout, parallel::Chip, scalar};
 use furiosa_opt_std::prelude::*;
+use std::borrow::Borrow;
 
 /// Elementwise activation selected by a model's configuration.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -346,6 +348,113 @@ impl<D: Float, S: M + 'static, Chips: M + 'static> Op<&HbmTensor<D, Chips, S>> f
         })
     }
 }
+
+/// `c * tanh(x / c)`, which bounds each value by `c` and keeps the values near zero; `c` and `1 / c`
+/// are FP32 scalars in the first cell of eight a load places.
+#[derive(DeviceSend, Load)]
+#[load(tree)]
+pub struct Softcap<Factor = HbmTensor<f32, Chip, m![1 # 8]>> {
+    inverse: Factor,
+    bound: Factor,
+}
+
+/// `c` is the positive finite config value at the key the softcap's position enters, and `1 / c`
+/// rounds once from its FP64 reciprocal, as PyTorch's CUDA kernels round a scalar's.
+impl<'a, Factor> Load<&'a Checkpoint> for Softcap<Factor>
+where
+    Factor: Load<HostTensor<f32, m![{ Chip }, { m![1 # 8] }]>>,
+{
+    fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
+        context.checkpoint(from, |cx| {
+            let key = cx.config_key().map(str::to_owned);
+            let key = key.expect("a softcap reads its bound under a config key");
+            let (name, bound) = cx.config_number(from, &key)?;
+            if !bound.is_finite() || bound <= 0.0 {
+                return Err(LoadError::InvalidData {
+                    name,
+                    reason: format!("found {bound}, expected a positive finite value"),
+                });
+            }
+            let packet = |value: f64| {
+                HostTensor::from_vec([value as f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            };
+            let inverse = cx.field("inverse", "", |cx| Factor::load(cx, packet(1.0 / bound)))?;
+            let bound = cx.field("bound", "", |cx| Factor::load(cx, packet(bound)))?;
+            Ok(Self { inverse, bound })
+        })
+    }
+}
+
+/// The bound and its reciprocal are no update targets.
+impl<'t, 's, Factor> Load<(&'t mut Softcap<Factor>, &'s Checkpoint)> for &'t mut Softcap<Factor> {
+    fn load(
+        context: &mut Context<'_>,
+        (into, from): (&'t mut Softcap<Factor>, &'s Checkpoint),
+    ) -> Result<Self, LoadError> {
+        context.checkpoint(from, |_| Ok(()))?;
+        Ok(into)
+    }
+}
+
+impl<Factor> Softcap<Factor> {
+    /// The bound and its reciprocal in the vector registers of a vocabulary pass's logits, for the
+    /// passes of a call to read.
+    pub(crate) fn to_vrf<Hidden: AxisName, V: AxisName, Chips: M + 'static>(
+        &self,
+        device: &mut Device,
+    ) -> Softcap<Register<Hidden, V, Chips>>
+    where
+        Factor: Borrow<HbmTensor<f32, Chips, m![1 # 8]>>,
+    {
+        type Placed<Hidden, V, Chips> =
+            DmTensor<f32, Chips, stream::Cluster<V>, stream::Reduced<Hidden, V>, m![1 # 8]>;
+        let inverse: Placed<Hidden, V, Chips> = self.inverse.borrow().to_dm(&mut device.tdma);
+        let bound: Placed<Hidden, V, Chips> = self.bound.borrow().to_dm(&mut device.tdma);
+        Softcap {
+            inverse: scalar::register(device, &inverse),
+            bound: scalar::register(device, &bound),
+        }
+    }
+}
+
+/// Each logit `z` of a vocabulary pass becomes `c * tanh(z * (1 / c))` in FP32, the reciprocal
+/// multiplying as PyTorch's CUDA kernels divide by a scalar.
+impl<H: AxisName, V: AxisName, R: AxisName, Chips: M + 'static> Op<&stream::Logits<H, V, R, Chips>>
+    for Softcap<Register<H, V, Chips>>
+{
+    type Output = stream::Logits<H, V, R, Chips>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        logits: &stream::Logits<H, V, R, Chips>,
+    ) -> Self::Output {
+        type Time<H, V, R> = m![V % ({ stream::PassRows<H, V> }), { Groups<R> }];
+        type Lanes<R> = m![{ Layout<R>::Lanes } # 8];
+        device
+            .main
+            .begin(logits.view())
+            .fetch::<Time<H, V, R>, Lanes<R>>()
+            .collect::<Time<H, V, R>, Lanes<R>>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_split::<
+                m![V % ({ stream::PassRows<H, V> }), { Groups<R> }, { Layout<R>::Lanes } # 8 / 4],
+                m![{ Layout<R>::Lanes } # 8 % 4],
+            >()
+            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &self.inverse)
+            .vector_fp_unary(FpUnaryOp::Tanh)
+            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), &self.bound)
+            .vector_widen_concat::<Time<H, V, R>, Lanes<R>>()
+            .vector_final()
+            .commit_trim::<Lanes<R>>()
+            .commit()
+    }
+}
+
+/// One FP32 scalar in every slice of a vocabulary pass's logits.
+type Register<Hidden, V, Chips> =
+    VrfTensor<f32, Chips, stream::Cluster<V>, stream::Reduced<Hidden, V>, m![1 # 8]>;
 
 /// `x * sigmoid(x)` of every row of one launch in feature slices, in FP32, rounded to BF16 once;
 /// the result keeps their live rows.

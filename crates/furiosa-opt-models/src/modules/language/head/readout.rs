@@ -1,6 +1,6 @@
 //! A greedy head over a body's normalized rows: it reads the tokens of the rows a launch selects.
 
-use super::{InDm, Tree};
+use super::{Cap, InDm, Tree};
 use crate::Module;
 use crate::ops::index::scatter::Store;
 use crate::ops::normalization::span::{Selection, Span, Tile};
@@ -58,7 +58,7 @@ impl<Capacity: AxisName> Selected<Capacity> {
     }
 }
 
-impl<Width: AxisName, V: AxisName, W, B, I> Tree<Width, V, W, B, I>
+impl<Width: AxisName, V: AxisName, W, B, I, C> Tree<Width, V, W, B, I, C>
 where
     W: Borrow<HbmTensor<bf16, Chip, m![V, Width]>>,
     B: Borrow<HbmTensor<f32, Chip, m![V]>>,
@@ -72,7 +72,9 @@ where
         hidden: &HbmTensor<bf16, Chip, Blocked<Width, Capacity>>,
         selected: &Selected<Capacity>,
         tokens: &mut HbmTensor<i32, Chip, m![Capacity]>,
-    ) {
+    ) where
+        C: Cap<Width, V>,
+    {
         // Read after the rows: waiting for the read drains the DMA queue, retiring at once every
         // transfer the rows left pending, whose completion ids and memory the head reuses.
         let chosen = Live::<(), Capacity>::read(&selected.live);
@@ -99,15 +101,17 @@ where
 
 /// One span's tiles: each read by the head, and its tokens stored where its rows sit among the
 /// launch's.
-struct Tiles<'a, Width: AxisName, V: AxisName, Capacity: AxisName> {
+struct Tiles<'a, Width: AxisName, V: AxisName, C, Capacity: AxisName> {
     rows: &'a Spread<Width, Span>,
-    head: &'a InDm<'a, Width, V>,
+    head: &'a InDm<'a, Width, V, C>,
     tokens: &'a mut HbmTensor<i32, Chip, m![Capacity]>,
     tile: Live<(), Capacity>,
 }
 
-impl<R: AxisName, Width: AxisName, V: AxisName, Capacity: AxisName> OnTile<Device, R>
-    for Tiles<'_, Width, V, Capacity>
+impl<R: AxisName, Width: AxisName, V: AxisName, C, Capacity: AxisName> OnTile<Device, R>
+    for Tiles<'_, Width, V, C, Capacity>
+where
+    C: Cap<Width, V>,
 {
     fn run(&mut self, device: &mut Device, index: usize) {
         let mut rows: Spread<Width, R> = DmTensor::new();
@@ -275,7 +279,7 @@ mod tests {
                     .unwrap(),
             };
             let argmax = Load::load(&mut Context::new(None), &ranks).unwrap();
-            let head: Head<'_> = Greedy::new(Affine::new(&weight, &mask), argmax);
+            let head: Head<'_> = Greedy::new(Affine::new(&weight, &mask), argmax, ());
             let tokens = launch(read_out, (&mut device, &head, &selected, &input_rows))
                 .await
                 .unwrap();

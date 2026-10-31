@@ -2,17 +2,16 @@
 //! one pass of its block of weight rows at a time, and each pass issues the next pass's weights
 //! before its own contraction, so the weights stream under the compute.
 //!
-//! - A pass's logits, each plus its bias, go to a consumer while the pass is live: argmax's
-//!   candidates, or the rows' scores in HBM.
-//! - Every row of the input's envelope is projected. Candidates stage the rows' lanes once a
-//!   call; scores stage a 32-row tile's lanes each pass, the most a transposition takes.
+//! - A pass's logits, each plus its bias, go to a consumer while the pass is live: a function the
+//!   caller passes, such as one taking argmax's candidates, or the rows' scores in HBM.
+//! - Every row of the input's envelope is projected. Logits for a function stage the rows' lanes
+//!   once a call; scores stage a 32-row tile's lanes each pass, the most a transposition takes.
 
 use crate::Op;
 use crate::ops::index::gather;
 use crate::ops::linear::kernel::{self, Unrounded};
 use crate::ops::linear::{Affine, Groups};
 use crate::ops::normalization::{self, FeatureSlices, Spread};
-use crate::ops::reduction::Candidates;
 use crate::specialize::vocabulary;
 use crate::tensor::{axis::Tile, mapping::Rows as Layout, parallel::Chip};
 use core::marker::PhantomData;
@@ -123,38 +122,32 @@ pub(crate) type Column<Hidden, V> = m![
     V % ({ PassRows<Hidden, V> })
 ];
 
-/// Every row's logits into `candidates`, pass by pass while each pass is live.
-impl<'c, Hidden, V, Rows, Matrix, Offset, Chips: M + 'static>
-    Op<(
-        &Spread<Hidden, Rows, Chips>,
-        &mut Candidates<'c, Hidden, V, Rows, Chips>,
-    )> for Affine<Matrix, Offset>
+/// Every row's logits into `push` with their pass, pass by pass while each pass is live.
+impl<Hidden, V, Rows, Offset, Push, Chips: M + 'static> Op<(&Spread<Hidden, Rows, Chips>, Push)>
+    for Affine<&HbmTensor<bf16, Chips, m![V, Hidden]>, Offset>
 where
     Hidden: AxisName,
     V: AxisName,
     Rows: AxisName,
-    Matrix: Borrow<HbmTensor<bf16, Chips, m![V, Hidden]>>,
     Offset: Borrow<Columns<Hidden, V, f32, Chips>>,
+    Push: FnMut(&mut Device, &Logits<Hidden, V, Rows, Chips>, usize),
 {
     type Output = ();
 
     fn forward(
         &self,
         device: &mut Device,
-        (input, candidates): (
-            &Spread<Hidden, Rows, Chips>,
-            &mut Candidates<'c, Hidden, V, Rows, Chips>,
-        ),
+        (input, mut push): (&Spread<Hidden, Rows, Chips>, Push),
     ) {
         let bias = self.bias.borrow();
         let lanes = stage::<Hidden, V, Rows, Groups<Rows>, _, _>(device, input.view());
-        stream(device, self.weight.borrow(), |device, weight, pass| {
+        stream(device, self.weight, |device, weight, pass| {
             let logits: Logits<Hidden, V, Rows, Chips> =
                 biased(device, (weight, &lanes, bias), pass, |sums| {
                     sums.commit_trim::<m![{ Layout<Rows>::Lanes } # 8]>()
                         .commit()
                 });
-            candidates.push(device, &logits, pass);
+            push(device, &logits, pass);
         });
     }
 }
