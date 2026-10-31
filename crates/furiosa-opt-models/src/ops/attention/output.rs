@@ -57,7 +57,7 @@ type Read<'x, Width, Rows, KvHeads> = DmTensorView<
     bf16,
     Chip,
     gqa::Cluster<Rows>,
-    m![Width / (Width / KvHeads), { Layout<Rows>::Lanes } # 8 % 4, 1 # 8],
+    gqa::Merged<Rows, KvHeads, m![Width / (Width / KvHeads)]>,
     m![{ linear::Groups<Rows> }, Width % (Width / KvHeads)],
 >;
 
@@ -100,7 +100,7 @@ where
             let rows = unsafe {
                 rows.reshape::<
                     Chip, gqa::Cluster<Rows>,
-                    m![InputWidth / (QWidth / KvHeads), { Layout<Rows>::Lanes } # 8 % 4, 1 # 8],
+                    gqa::Merged<Rows, KvHeads, m![InputWidth / (QWidth / KvHeads)]>,
                 m![{ linear::Groups<Rows> }, InputWidth % (QWidth / KvHeads)],
                 >()
             };

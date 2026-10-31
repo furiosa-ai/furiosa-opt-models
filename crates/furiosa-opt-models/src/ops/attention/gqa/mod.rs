@@ -37,11 +37,50 @@ pub(crate) type Partition<
     Count,
     m![Groups],
     m![Head],
-    m![Cache % 64],
+    ShardKeys<KvHeads>,
     Cache,
-    8,
     SCALE,
 >;
+
+/// The shards each head's window splits into, one a slice: as many as a cluster's slices hold
+/// beside the heads and their four row lanes, each at least one cache block.
+#[derive(Clone, Debug)]
+pub struct Shards<KvHeads>(PhantomData<KvHeads>);
+
+impl<KvHeads: AxisName> AxisName for Shards<KvHeads> {
+    const NAME: Ident = Ident::new("Shards");
+    const SIZE: usize = attention::shards(KvHeads::SIZE, Cache::SIZE, Block::SIZE);
+}
+
+/// The keys of a window one shard holds.
+#[derive(Clone, Debug)]
+pub struct Keys<KvHeads>(PhantomData<KvHeads>);
+
+impl<KvHeads: AxisName> AxisName for Keys<KvHeads> {
+    const NAME: Ident = Ident::new("Keys");
+    const SIZE: usize = Cache::SIZE / Shards::<KvHeads>::SIZE;
+}
+
+/// The consecutive blocks of a row's table one shard holds.
+#[derive(Clone, Debug)]
+struct ShardBlocks<KvHeads>(PhantomData<KvHeads>);
+
+impl<KvHeads: AxisName> AxisName for ShardBlocks<KvHeads> {
+    const NAME: Ident = Ident::new("ShardBlocks");
+    const SIZE: usize = Keys::<KvHeads>::SIZE / Block::SIZE;
+}
+
+/// The heads a cluster's slices hold at a head's shards of four row lanes; the slots past a
+/// layer's heads stay empty.
+#[derive(Clone, Debug)]
+pub struct HeadSlots<KvHeads>(PhantomData<KvHeads>);
+
+impl<KvHeads: AxisName> AxisName for HeadSlots<KvHeads> {
+    const NAME: Ident = Ident::new("HeadSlots");
+    const SIZE: usize = attention::heads(Shards::<KvHeads>::SIZE);
+}
+
+type ShardKeys<KvHeads> = m![Cache % ({ Symbol<Keys<KvHeads>> })];
 
 /// The shards of the row groups of one `N`-row tile, which one pass attends.
 type TileShards<Rows, KvHeads, Groups, Head, const SCALE: usize, const N: usize> =
@@ -60,15 +99,27 @@ impl<Windows: AxisName> AxisName for Rest<Windows> {
 /// Four lanes per cluster fill the chip with eight rows; fewer rows leave padded lanes.
 pub(super) type Cluster<Rows> = m![{ Layout<Rows>::Lanes } # 8 / 4];
 
-/// A head's eight shards are consecutive slices so the inter-slice reducer can combine them.
-/// The four lanes stay within each head's processing element, each occupying its own eight slices.
-type CacheSlices<Rows, KvHeads> = m![KvHeads, { Layout<Rows>::Lanes } # 8 % 4, Cache / 64];
+/// A head's shards are consecutive slices so the inter-slice reducer can combine them; each of
+/// its four row lanes holds shards of its own.
+type CacheSlices<Rows, KvHeads> = m![
+    KvHeads # ({ Symbol<HeadSlots<KvHeads>> }),
+    { Layout<Rows>::Lanes } # 8 % 4,
+    Cache / ({ Symbol<Keys<KvHeads>> })
+];
 
-/// All eight shard slices hold a copy of the same reduced statistic.
-type Agreed<Rows, KvHeads> = m![KvHeads, { Layout<Rows>::Lanes } # 8 % 4, 8];
+/// All shard slices of a head hold a copy of the same reduced statistic.
+type Agreed<Rows, KvHeads> = m![
+    KvHeads # ({ Symbol<HeadSlots<KvHeads>> }),
+    { Layout<Rows>::Lanes } # 8 % 4,
+    { Symbol<Shards<KvHeads>> }
+];
 
-/// One slice per row and head holds the merged attention.
-type Merged<Rows, KvHeads> = m![KvHeads, { Layout<Rows>::Lanes } # 8 % 4, 1 # 8];
+/// One slice per row and head holds the merged attention, `Heads` naming the head.
+pub(super) type Merged<Rows, KvHeads, Heads = m![KvHeads]> = m![
+    { Heads } # ({ Symbol<HeadSlots<KvHeads>> }),
+    { Layout<Rows>::Lanes } # 8 % 4,
+    1 # ({ Symbol<Shards<KvHeads>> })
+];
 
 type RowGroups<Rows> = linear::Groups<Rows>;
 
@@ -84,14 +135,14 @@ type Tiles<Rows, const N: usize = 32> = m![{ RowGroups<Rows> } / ({ Symbol<TileG
 #[derive(Clone, Copy)]
 pub struct Pass<const N: usize>(pub usize);
 
-/// The cache rows a step reads, 64 whole rows of one head per slice, each row its token's key
-/// and value; `Count` row groups of them, every group unless one is named.
+/// The cache rows a step reads, a shard's whole rows of one head per slice, each row its token's
+/// key and value; `Count` row groups of them, every group unless one is named.
 type Chunk<Rows, KvHeads, Head, Count = RowGroups<Rows>> = DmTensor<
     bf16,
     Chip,
     Cluster<Rows>,
     CacheSlices<Rows, KvHeads>,
-    m![{ Count }, KeyValue, Cache % 64, Head],
+    m![{ Count }, KeyValue, { ShardKeys<KvHeads> }, Head],
 >;
 
 /// Every window of every row's history, for rows that carry it outright; in DRAM, since a slice's
@@ -100,13 +151,17 @@ pub(super) type Envelope<Rows, KvHeads, Head, Windows> =
     HbmTensor<bf16, Chip, m![Rows, Windows, Cache, KeyValue, KvHeads, Head]>;
 
 /// One chunk as the gather writes it, needing no repartition: each table entry's token block on its
-/// shard and its heads over their eight slices, the cells of [`Chunk`].
+/// shard and its heads over their slices, the cells of [`Chunk`].
 type InDm<Rows, KvHeads, Head, Count = RowGroups<Rows>> = DmTensor<
     bf16,
     Chip,
     Cluster<Rows>,
-    m![KvHeads, { Layout<Rows>::Lanes } # 8 % 4, BlockIndex / 4],
-    m![{ Count }, KeyValue, BlockIndex % 4, Block, Head],
+    m![
+        KvHeads # ({ Symbol<HeadSlots<KvHeads>> }),
+        { Layout<Rows>::Lanes } # 8 % 4,
+        BlockIndex / ({ Symbol<ShardBlocks<KvHeads>> })
+    ],
+    m![{ Count }, KeyValue, BlockIndex % ({ Symbol<ShardBlocks<KvHeads>> }), Block, Head],
 >;
 
 /// One chunk's entries of a step's table, the only shape a gather takes an index in.
@@ -183,8 +238,8 @@ impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName> Op<us
             // Every table entry is readable and the bias masks a row's tokens past its prefix.
             .overfetch()
             .to_dm(&mut device.tdma);
-        // SAFETY: a shard's four blocks are its 64 consecutive slots, so both nests name the same
-        // cells in the same order.
+        // SAFETY: a shard's blocks are its consecutive slots, so both nests name the same cells in
+        // the same order.
         unsafe { in_dm.reshape() }
     }
 }
@@ -223,14 +278,14 @@ impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName, const
             .prefix::<m![BlockIndex], _>(&lengths, 0)
             .overfetch()
             .to_dm(&mut device.tdma);
-        // SAFETY: a shard's four blocks are its 64 consecutive slots, so both nests name the same
-        // cells in the same order.
+        // SAFETY: a shard's blocks are its consecutive slots, so both nests name the same cells in
+        // the same order.
         unsafe { in_dm.reshape() }
     }
 }
 
 /// One of the chunk's two halves, the keys or the values of its tokens.
-type Half<Count, Head> = m![{ Count }, KeyValue = 1 # 2, Cache % 64, Head];
+type Half<Count, KvHeads, Head> = m![{ Count }, KeyValue = 1 # 2, { ShardKeys<KvHeads> }, Head];
 
 /// The query rows of the head a slice owns, for `Count` row groups.
 type Query<Rows, KvHeads, Groups, Head, Count = RowGroups<Rows>> =
@@ -245,14 +300,14 @@ pub type Heads<Rows, KvHeads, Groups, Head> = DmTensor<
     m![{ RowGroups<Rows> }, Groups, Head],
 >;
 
-/// Each shard's bias of its 64 slots, held per query row: a register operand repeats a single flit,
+/// Each shard's bias of its slots, held per query row: a register operand repeats a single flit,
 /// so an operand eight flits wide names the `Groups` axis of the logits it multiplies.
 type Bias<Rows, KvHeads, Groups, Count = RowGroups<Rows>> = DmTensor<
     f32,
     Chip,
     Cluster<Rows>,
     CacheSlices<Rows, KvHeads>,
-    m![{ Count }, Groups, Cache % 64],
+    m![{ Count }, Groups, { ShardKeys<KvHeads> }],
 >;
 
 pub(super) type Local<Rows, KvHeads, Groups, Head, const SCALE: usize> =
@@ -319,22 +374,18 @@ where
             Source,
         >,
     ) -> Self::Output {
-        const {
-            assert!(
-                KvHeads::SIZE == 8,
-                "one pass of the partition holds eight KV heads of four lanes and eight shards"
-            )
-        };
         if const { Self::ROWS == 32 } && live.count::<Lanes<Rows>>() == <RowGroups<Rows> as M>::SIZE
         {
             // A slice holds the query rows of the head it owns: each head is copied once, then
-            // broadcast to the eight shards inside its processing element.
+            // broadcast to the head's shards.
             let projected: Query<Rows, KvHeads, Groups, Head> = device
                 .sub
                 .begin(query.view())
                 .fetch::<m![{ RowGroups<Rows> }, Groups, Head / 16], m![Head % 16]>()
                 .switch::<CacheSlices<Rows, KvHeads>, m![{ RowGroups<Rows> }, Groups, Head / 16]>(
-                    SwitchConfig::CustomBroadcast { ring_size: 8 },
+                    SwitchConfig::CustomBroadcast {
+                        ring_size: Shards::<KvHeads>::SIZE,
+                    },
                 )
                 .collect::<m![{ RowGroups<Rows> }, Groups, Head / 16], m![Head % 16]>()
                 .commit_trim::<m![Head % 16]>()
@@ -403,8 +454,8 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
     Windowed<KvHeads, Groups, Head, SCALE>
 {
     /// Rows a pass attends at most: 32, 16 or 8, the most whose keys and score masks a slice's
-    /// registers hold.
-    const ROWS: usize = attention::pass(Head::SIZE, Groups::SIZE, <m![Cache % 64] as M>::SIZE);
+    /// registers hold and whose attention its data memory holds.
+    const ROWS: usize = attention::pass(Head::SIZE, Groups::SIZE, Keys::<KvHeads>::SIZE);
 
     /// Attends the row groups of `pass` over their histories and writes their rows in `attended`.
     fn pass<Rows: AxisName, Windows: AxisName, Source, const N: usize>(
@@ -428,7 +479,9 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
             ]>(pass.0))
             .fetch::<m![{ TileRows<Rows, N> }, Groups, Head / 16], m![Head % 16]>()
             .switch::<CacheSlices<Rows, KvHeads>, m![{ TileRows<Rows, N> }, Groups, Head / 16]>(
-                SwitchConfig::CustomBroadcast { ring_size: 8 },
+                SwitchConfig::CustomBroadcast {
+                    ring_size: Shards::<KvHeads>::SIZE,
+                },
             )
             .collect::<m![{ TileRows<Rows, N> }, Groups, Head / 16], m![Head % 16]>()
             .commit_trim::<m![Head % 16]>()
@@ -463,10 +516,10 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                         projected.view(),
                         chunk
                             .view()
-                            .tile::<m![KeyValue], 1, Half<TileRows<Rows, N>, Head>>(0),
+                            .tile::<m![KeyValue], 1, Half<TileRows<Rows, N>, KvHeads, Head>>(0),
                         chunk
                             .view()
-                            .tile::<m![KeyValue], 1, Half<TileRows<Rows, N>, Head>>(1),
+                            .tile::<m![KeyValue], 1, Half<TileRows<Rows, N>, KvHeads, Head>>(1),
                         admitted.view(),
                         partial.view_mut(),
                         lse.view_mut(),
@@ -484,7 +537,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
     }
 }
 
-/// Attention in the partition the chunk was gathered in: each shard scores its own 64 slots and
+/// Attention in the partition the chunk was gathered in: each shard scores its own slots and
 /// normalises them by its own sum, so the partial it returns is already the shard's attention.
 fn attend<
     Rows: AxisName,
@@ -512,18 +565,23 @@ fn attend<
                 .tile::<Tiles<Rows>, 1, m![{ Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, Groups, Head]>(tile),
             chunk
                 .view()
-                .tile::<m![KeyValue], 1, Half<RowGroups<Rows>, Head>>(0)
+                .tile::<m![KeyValue], 1, Half<RowGroups<Rows>, KvHeads, Head>>(0)
                 .tile::<Tiles<Rows>, 1, m![
-                    { Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, KeyValue = 1 # 2, Cache % 64, Head
+                    { Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, KeyValue = 1 # 2,
+                    { ShardKeys<KvHeads> }, Head
                 ]>(tile),
             chunk
                 .view()
-                .tile::<m![KeyValue], 1, Half<RowGroups<Rows>, Head>>(1)
+                .tile::<m![KeyValue], 1, Half<RowGroups<Rows>, KvHeads, Head>>(1)
                 .tile::<Tiles<Rows>, 1, m![
-                    { Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, KeyValue = 1 # 2, Cache % 64, Head
+                    { Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, KeyValue = 1 # 2,
+                    { ShardKeys<KvHeads> }, Head
                 ]>(tile),
             bias.view()
-                .tile::<Tiles<Rows>, 1, m![{ Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, Groups, Cache % 64]>(tile),
+                .tile::<Tiles<Rows>, 1, m![
+                    { Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, Groups,
+                    { ShardKeys<KvHeads> }
+                ]>(tile),
             partial
                 .view_mut()
                 .tile::<Tiles<Rows>, 1, m![{ Tiles<Rows> } = 1 #{!} ({ Tiles<Rows> }), { TileRows<Rows> }, Groups, Head]>(tile),

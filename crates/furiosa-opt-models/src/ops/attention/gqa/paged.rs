@@ -60,7 +60,6 @@ type Partition<Heads, Groups, Head, const SCALE: usize, Chips> = Geometry<
     m![Head],
     m![Cache % 32],
     Cache,
-    16,
     SCALE,
 >;
 

@@ -1,26 +1,28 @@
 //! The Gemma 4 catalog's sliding layers interleaved in two collections, one layer of each a
-//! period, over a call of rows that attend a history in their layers' caches.
+//! period, over a call of rows that attend a history in their layers' caches; and the full
+//! layers' attention leaf alone.
 
 #![feature(register_tool)]
 #![register_tool(furiosa_opt)]
 
 use furiosa_opt_models::load::Checkpoint;
 use furiosa_opt_models::load::Named;
-use furiosa_opt_models::models::decoder::Attention;
-use furiosa_opt_models::models::decoder::attention::gemma4::{self, sliding};
+use furiosa_opt_models::models::decoder::attention::gemma4::{self, full, sliding};
+use furiosa_opt_models::models::decoder::{self, Attention};
 use furiosa_opt_models::modules::{attention, language};
-use furiosa_opt_models::ops::attention::gqa::{Cache, Pages};
+use furiosa_opt_models::ops::attention::gqa::{Attended, Cache, Pages};
 use furiosa_opt_models::ops::index::table::{BlockIndex, PADDING_BIAS};
 use furiosa_opt_models::ops::normalization::Spread;
 use furiosa_opt_models::ops::rotary::{PairFrequencies, Rotation};
 use furiosa_opt_models::schedule::Decoder;
 use furiosa_opt_models::schedule::decoder::Places;
+use furiosa_opt_models::tensor::axis::Lanes;
 use furiosa_opt_models::tensor::cache::{Block, Blocks, KeyValue};
 use furiosa_opt_models::tensor::live::Live;
 use furiosa_opt_models::tensor::memory::Hbm;
 use furiosa_opt_models::tensor::parallel::Chip;
 use furiosa_opt_models::tensor::scalar::Value;
-use furiosa_opt_models::{Branch, Interleave, Module};
+use furiosa_opt_models::{Branch, Interleave, Module, Op};
 use furiosa_opt_std::prelude::*;
 use furiosa_opt_std::runtime::{HbmBuffer, launch};
 use safetensors::Dtype;
@@ -298,6 +300,61 @@ fn visible(row: usize, live: usize) -> usize {
     if row < live { HISTORY + row + 1 } else { 0 }
 }
 
+/// Pages of `Windows` windows: row `row` sees its first `visible(row)` keys, its table's entry `e`
+/// naming the block at byte offset `block(row, e)`; a row that sees none still names a readable
+/// block.
+async fn pages<Windows: AxisName>(
+    device: &mut Device,
+    visible: impl Fn(usize) -> usize,
+    block: impl Fn(usize, usize) -> i32,
+) -> Pages<Rows, Windows, Chip> {
+    let (windows, entries) = (Windows::SIZE, BlockIndex::SIZE);
+    let table: Vec<i32> = (0..Rows::SIZE * windows * entries)
+        .map(|at| {
+            let (row, entry) = (at / (windows * entries), at % (windows * entries));
+            let used = visible(row).div_ceil(Block::SIZE).max(1);
+            block(row, entry.min(used - 1))
+        })
+        .collect();
+    let counts: Vec<i32> = (0..windows * Rows::SIZE)
+        .map(|at| {
+            let (window, row) = (at / Rows::SIZE, at % Rows::SIZE);
+            let seen = visible(row).saturating_sub(window * Cache::SIZE);
+            seen.min(Cache::SIZE).div_ceil(Block::SIZE) as i32
+        })
+        .collect();
+    let bias: Vec<f32> = (0..Rows::SIZE * windows * Cache::SIZE)
+        .map(|at| {
+            let (row, key) = (at / (windows * Cache::SIZE), at % (windows * Cache::SIZE));
+            if key < visible(row) {
+                0.0
+            } else {
+                PADDING_BIAS
+            }
+        })
+        .collect();
+    let rest = (0..Rows::SIZE)
+        .filter(|&row| visible(row) > 0)
+        .map(|row| (visible(row) - 1) / Cache::SIZE)
+        .max();
+    let rest = HostTensor::<i32, m![1]>::from_vec([rest.unwrap_or(0) as i32]);
+    Pages {
+        table: HostTensor::<i32, m![Rows, Windows, BlockIndex]>::from_vec(table)
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap(),
+        lengths: HostTensor::<i32, m![Windows, Rows]>::from_vec(counts)
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap(),
+        bias: HostTensor::<f32, m![Rows, Windows, Cache]>::from_vec(bias)
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap(),
+        rest: rest.to_hbm(&mut device.pdma).await.unwrap(),
+    }
+}
+
 /// The call's context: each row's rotation at its position, its slot after the history and the
 /// pages of the history and the rows before it, in the blocks of a layer's cache.
 async fn context(device: &mut Device, live: usize) -> Context {
@@ -326,50 +383,12 @@ async fn context(device: &mut Device, live: usize) -> Context {
         false => 0,
     });
     let write = HostTensor::<i32, m![Rows]>::from_vec(slots.collect::<Vec<_>>());
-    let (windows, entries) = (Windows::SIZE, BlockIndex::SIZE);
-    let table: Vec<i32> = (0..Rows::SIZE * windows * entries)
-        .map(|at| {
-            let (row, entry) = (at / (windows * entries), at % (windows * entries));
-            let used = visible(row, live).div_ceil(Block::SIZE).max(1);
-            entry.min(used - 1) as i32 * Pool::BLOCK_STRIDE
-        })
-        .collect();
-    let counts: Vec<i32> = (0..windows * Rows::SIZE)
-        .map(|at| {
-            let (window, row) = (at / Rows::SIZE, at % Rows::SIZE);
-            let seen = visible(row, live).saturating_sub(window * Cache::SIZE);
-            seen.min(Cache::SIZE).div_ceil(Block::SIZE) as i32
-        })
-        .collect();
-    let bias: Vec<f32> = (0..Rows::SIZE * windows * Cache::SIZE)
-        .map(|at| {
-            let (row, key) = (at / (windows * Cache::SIZE), at % (windows * Cache::SIZE));
-            if key < visible(row, live) {
-                0.0
-            } else {
-                PADDING_BIAS
-            }
-        })
-        .collect();
-    let rest = (0..live)
-        .map(|row| (visible(row, live) - 1) / Cache::SIZE)
-        .max();
-    let rest = HostTensor::<i32, m![1]>::from_vec([rest.unwrap_or(0) as i32]);
-    let read = Pages {
-        table: HostTensor::<i32, m![Rows, Windows, BlockIndex]>::from_vec(table)
-            .to_hbm(&mut device.pdma)
-            .await
-            .unwrap(),
-        lengths: HostTensor::<i32, m![Windows, Rows]>::from_vec(counts)
-            .to_hbm(&mut device.pdma)
-            .await
-            .unwrap(),
-        bias: HostTensor::<f32, m![Rows, Windows, Cache]>::from_vec(bias)
-            .to_hbm(&mut device.pdma)
-            .await
-            .unwrap(),
-        rest: rest.to_hbm(&mut device.pdma).await.unwrap(),
-    };
+    let read = pages::<Windows>(
+        device,
+        |row| visible(row, live),
+        |_, entry| entry as i32 * Pool::BLOCK_STRIDE,
+    )
+    .await;
     attention::Context {
         positions: rotation,
         write: write.to_hbm(&mut device.pdma).await.unwrap(),
@@ -534,6 +553,152 @@ async fn schedules_the_layers_as_they_run_in_order() {
                 same, None,
                 "layer {layer}, {live} rows: first differing cache element"
             );
+        }
+    }
+}
+
+type FullHeads = <full::Group as Attention>::Heads;
+type FullGroups = <full::Group as Attention>::Groups;
+type FullHead = <full::Group as Attention>::Head;
+/// A full layer's cache blocks.
+type FullPool = Blocks<FullHeads, FullHead>;
+/// Each row's query heads of the full group, in head order.
+type FullQueries = HbmTensor<bf16, Chip, m![Rows, FullHeads, FullGroups, FullHead]>;
+/// The live rows' full query heads as the projection leaves them for attention.
+type FullQueryHeads = Live<
+    DmTensor<
+        bf16,
+        Chip,
+        m![1 # 2],
+        m![Rows % ({ Symbol<Lanes<Rows>> }) # 8, FullHeads # 8, 1 # 4],
+        m![
+            { m![Rows / ({ Symbol<Lanes<Rows>> }), FullGroups] },
+            FullHead
+        ],
+    >,
+    Rows,
+>;
+
+/// A score multiplier of one, as the catalog's normalized queries and keys take.
+const UNIT: usize = 1.0_f32.to_bits() as usize;
+
+/// The full group's attention leaf over each live row's pages of `pool`.
+#[device(chip = 1)]
+fn attend_full(
+    device: &mut Device,
+    (queries, live): (&FullQueries, &Value),
+    pool: &FullPool,
+    read: &Pages<Rows, <full::Group as Attention>::Windows, Chip>,
+    attended: &mut FullQueries,
+) {
+    let live = Live::<(), Rows>::read(live);
+    let query: FullQueryHeads = live.with(queries.to_dm(&mut device.tdma));
+    let attention = decoder::Attend::<full::Group, UNIT>::default();
+    let output: Live<Attended<Rows, FullHeads, FullGroups, FullHead>, Rows> =
+        Op::forward(&attention, &mut *device, (&query, pool, read));
+    (output.value().view()).to_hbm_view(&mut device.tdma, attended.view_mut());
+}
+
+/// Each history a bank of the leaf's pool holds, in keys: within and across blocks, shards and
+/// windows.
+const LENGTHS: [usize; 16] = [
+    1, 2, 15, 16, 17, 33, 100, 511, 512, 513, 777, 1024, 1025, 1536, 2047, 2048,
+];
+
+/// Keys a bank of the leaf's pool holds at most.
+const BANK: usize = 2048;
+
+/// The one KV head of a full layer attends each live row's own history, every shard and window
+/// of it, as an FP64 softmax over the same BF16 operands does, to the agreement BF16 scores and
+/// weights leave; the slots past a history hold NaN and infinities nothing may read.
+#[tokio::test(flavor = "current_thread")]
+async fn one_head_attends_each_live_row_as_the_host() {
+    let _lease = DEVICE.lock().await;
+    let mut device = Device::new(attend_full.topology()).unwrap();
+    let (heads, head) = (FullGroups::SIZE, FullHead::SIZE);
+    let width = KeyValue::SIZE * FullHeads::SIZE * FullHead::SIZE;
+    let data = values(LENGTHS.len() * BANK * width, 0x3c6e_f372, 0.5);
+    let poisons = [f32::NAN, -f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+    let cells = (data.iter().enumerate()).map(|(at, &value)| {
+        let (bank, key) = (at / (BANK * width), at / width % BANK);
+        match key < LENGTHS[bank] {
+            true => value,
+            false => bf16::from_f32(poisons[at % poisons.len()]),
+        }
+    });
+    let cells: Vec<bf16> = cells.collect();
+    let storage = HostBufferSlice::from(&bf16::to_buf(&cells))
+        .to_hbm(&mut device.pdma)
+        .await
+        .unwrap();
+    let pool = FullPool::from_buffer(storage).unwrap();
+    let bank = |row: usize| (row * 5 + row / LENGTHS.len()) % LENGTHS.len();
+    let stride = FullPool::BLOCK_STRIDE;
+    let banks = BANK / Block::SIZE;
+    let read = pages::<<full::Group as Attention>::Windows>(
+        &mut device,
+        |row| LENGTHS[bank(row)],
+        |row, entry| (bank(row) * banks + entry) as i32 * stride,
+    )
+    .await;
+    let queries = values(Rows::SIZE * heads * head, 0x7f4a_7c15, 0.125);
+    let query: FullQueries =
+        HostTensor::<bf16, m![Rows, FullHeads, FullGroups, FullHead]>::from_vec(queries.clone())
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap();
+    let key = |row: usize, token: usize, channel: usize| {
+        cells[(bank(row) * BANK + token) * width + channel].to_f32() as f64
+    };
+    let value = |row: usize, token: usize, channel: usize| key(row, token, head + channel);
+    for live in [Rows::SIZE, 9] {
+        let count: Value = HostTensor::<i32, m![1]>::from_vec([live as i32])
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap();
+        let poison = vec![bf16::from_bits(POISON); Rows::SIZE * heads * head];
+        let mut attended =
+            HostTensor::<bf16, m![Rows, FullHeads, FullGroups, FullHead]>::from_vec(poison)
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+        let arguments = (&mut device, (&query, &count), &pool, &read, &mut attended);
+        launch(attend_full, arguments).await.unwrap();
+        let found = attended
+            .to_host::<m![Rows, FullHeads, FullGroups, FullHead]>(&mut device.pdma)
+            .await
+            .unwrap()
+            .into_vec();
+        for row in 0..live {
+            let length = LENGTHS[bank(row)];
+            for group in 0..heads {
+                let query = &queries[(row * heads + group) * head..][..head];
+                let scores: Vec<f64> = (0..length)
+                    .map(|token| {
+                        let dot = query.iter().enumerate();
+                        dot.map(|(c, q)| q.to_f32() as f64 * key(row, token, c))
+                            .sum()
+                    })
+                    .collect();
+                let top = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let weights: Vec<f64> = scores.iter().map(|score| (score - top).exp()).collect();
+                let total: f64 = weights.iter().sum();
+                for channel in 0..head {
+                    let weighted = weights.iter().enumerate();
+                    let want = weighted
+                        .map(|(token, weight)| weight * value(row, token, channel))
+                        .sum::<f64>()
+                        / total;
+                    let at = (row * heads + group) * head + channel;
+                    let got = found[at].to_f32();
+                    let place = format!("{live} rows: row {row} (length {length}), head {group}");
+                    assert!(got.is_finite(), "{place}, channel {channel}: {got}");
+                    assert!(
+                        (got as f64 - want).abs() <= 1.0 / 128.0,
+                        "{place}, channel {channel}: {got} != {want}"
+                    );
+                }
+            }
         }
     }
 }
