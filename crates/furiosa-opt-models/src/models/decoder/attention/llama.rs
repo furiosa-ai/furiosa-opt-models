@@ -244,7 +244,10 @@ mod tests {
             "rope_theta": 500000.0, "tie_word_embeddings": false, "attention_bias": false,
         });
         assert!(Size::<"8B">::parse(&config).is_ok());
-        config["rope_scaling"] = serde_json::json!({"rope_type": "llama3", "factor": 8.0});
+        config["rope_scaling"] = serde_json::json!({
+            "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0, "original_max_position_embeddings": 8192,
+        });
         let error = Size::<"8B">::parse(&config).err().expect("refused");
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     }
