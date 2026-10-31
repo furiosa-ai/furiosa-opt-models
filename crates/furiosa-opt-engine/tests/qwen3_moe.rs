@@ -67,6 +67,15 @@ fn sizes_read_their_published_configs() {
     }
 }
 
+/// A config declaring a context past the size's compiled one parses: the size serves it up to its
+/// own.
+#[test]
+fn size_serves_a_longer_context_up_to_its_own() {
+    let mut document = QWEN3_30B_A3B.config();
+    document["max_position_embeddings"] = json!(131072);
+    Size::<"30B-A3B">::parse(&document).unwrap();
+}
+
 /// A config the size does not serve is refused, each case by its kind and reason.
 #[test]
 fn size_refuses_what_it_does_not_serve() {
@@ -138,12 +147,6 @@ fn size_refuses_what_it_does_not_serve() {
             json!(true),
             Unsupported,
             "tie_word_embeddings: true, the size ties: false",
-        ),
-        (
-            "max_position_embeddings",
-            json!(131072),
-            Unsupported,
-            "max_position_embeddings: past the compiled context of 40960",
         ),
         (
             "hidden_act",

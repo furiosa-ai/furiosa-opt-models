@@ -5,7 +5,7 @@
 //!   row to 8 of 64 SwiGLU experts, weighed by their router probabilities as they are.
 //! - [`Model`] is the catalog's composition, over the [`DbrxForCausalLM`] template.
 
-use crate::models::decoder::attention::{Chunks, Geometry, mixtral::DbrxForCausalLM};
+use crate::models::decoder::attention::{Geometry, mixtral::DbrxForCausalLM};
 use crate::models::{Family, config, vocabulary};
 use crate::modules::feedforward::moe::Reduce;
 use crate::modules::feedforward::moe::TopK;
@@ -19,7 +19,7 @@ use crate::ops::pointwise::multiply::Multiply;
 use crate::ops::rotary::Rotary;
 use crate::ops::swiglu;
 use crate::ops::{
-    attention::{geometry, gqa::Cache},
+    attention::geometry,
     linear::{Affine, Experts},
     normalization::RmsNorm,
 };
@@ -171,7 +171,6 @@ pub struct Config {
     /// Transformers reads an absent one as 1e-5.
     #[serde(default)]
     rms_norm_eps: Option<f64>,
-    max_position_embeddings: usize,
     #[serde(default)]
     tie_word_embeddings: bool,
     #[serde(default)]
@@ -186,8 +185,9 @@ pub struct Config {
     _rotary: config::decoder::Rotary,
 }
 
-/// A config is of a size when it declares the size's values, at most its compiled vocabulary rows
-/// and context, and none of the features OLMoE does not serve.
+/// A config is of a size when it declares the size's values, at most its compiled vocabulary rows,
+/// and none of the features OLMoE does not serve. A longer declared context is served up to the
+/// compiled one.
 impl<const N: &'static str> TryFrom<Config> for Size<N>
 where
     Self: Geometry,
@@ -244,12 +244,6 @@ where
                 "tie_word_embeddings: {}, the size ties: {}",
                 config.tie_word_embeddings,
                 Self::TIED_EMBEDDINGS
-            )));
-        }
-        let context = Chunks::SIZE * Cache::SIZE;
-        if config.max_position_embeddings > context {
-            return Err(unsupported(&format!(
-                "max_position_embeddings: past the compiled context of {context}"
             )));
         }
         let features = [

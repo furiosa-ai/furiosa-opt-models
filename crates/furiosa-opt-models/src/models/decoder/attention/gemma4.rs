@@ -383,27 +383,16 @@ impl<G: Shape, P: Forms, const S: usize, const F: usize, const O: &'static [Bran
             .map(|branch| LAYER_TYPES[*branch as usize].to_owned())
             .collect();
         compiled("layer_types", text.layer_types(), order.as_slice())?;
-        let positions = text.extra.max_position_embeddings.get();
+        let positions = (text.extra.max_position_embeddings.get())
+            .min(<Full<G> as Attention>::Windows::SIZE * Cache::SIZE);
         let window = text.extra.sliding_window.get();
-        for (field, found, maximum) in [
-            (
-                "max_position_embeddings",
-                positions,
-                <Full<G> as Attention>::Windows::SIZE * Cache::SIZE,
-            ),
-            (
-                "sliding_window",
-                window,
-                // An unaligned start reserves one cache window for the partial prefix.
-                (<Sliding<G> as Attention>::Windows::SIZE - 1) * Cache::SIZE,
-            ),
-        ] {
-            if found > maximum {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("{field}: found {found}, compiled maximum {maximum}"),
-                ));
-            }
+        // An unaligned start reserves one cache window for the partial prefix.
+        let maximum = (<Sliding<G> as Attention>::Windows::SIZE - 1) * Cache::SIZE;
+        if window > maximum {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("sliding_window: found {window}, compiled maximum {maximum}"),
+            ));
         }
         let within = |layer: &'static str| {
             move |error: io::Error| {
@@ -986,26 +975,26 @@ mod tests {
         );
     }
 
-    /// A context or a sliding window past the compiled cache windows is refused by its field;
-    /// the sliding window keeps one window for an unaligned prefix.
+    /// A context past the compiled cache windows is served up to them; a sliding window past them
+    /// is refused, keeping one window for an unaligned prefix.
     #[test]
-    fn refuses_contexts_past_the_compiled_windows() {
+    fn serves_a_context_up_to_the_compiled_windows() {
         let positions = <Full<super::Sizes> as Attention>::Windows::SIZE * Cache::SIZE;
         let window = (<Sliding<super::Sizes> as Attention>::Windows::SIZE - 1) * Cache::SIZE;
-        for (field, maximum) in [
-            ("max_position_embeddings", positions),
-            ("sliding_window", window),
-        ] {
-            let mut document = document::<super::Sizes, { super::ORDER }>();
-            document[field] = serde_json::json!(maximum);
-            <Config>::parse(&document).unwrap();
-            document[field] = serde_json::json!(maximum + 1);
-            let error = <Config>::parse(&document).err().unwrap();
-            let reason = format!("{field}: found {}, compiled maximum {maximum}", maximum + 1);
-            assert_eq!(
-                (error.kind(), error.to_string()),
-                (io::ErrorKind::Unsupported, reason)
-            );
-        }
+        let mut document = document::<super::Sizes, { super::ORDER }>();
+        document["max_position_embeddings"] = serde_json::json!(positions + 1);
+        assert_eq!(<Config>::parse(&document).unwrap().positions, positions);
+        document["sliding_window"] = serde_json::json!(window);
+        <Config>::parse(&document).unwrap();
+        document["sliding_window"] = serde_json::json!(window + 1);
+        let error = <Config>::parse(&document).err().unwrap();
+        let reason = format!(
+            "sliding_window: found {}, compiled maximum {window}",
+            window + 1
+        );
+        assert_eq!(
+            (error.kind(), error.to_string()),
+            (io::ErrorKind::Unsupported, reason)
+        );
     }
 }
