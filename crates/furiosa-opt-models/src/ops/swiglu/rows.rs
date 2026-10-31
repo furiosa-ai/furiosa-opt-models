@@ -82,91 +82,6 @@ type Part<I, R, Chips = Chip> =
 /// A span's packed gate/up rows as their tiles.
 type Tiled<'a, I, R, Chips> = HbmTensorView<'a, bf16, Chips, m![{ Ts<R> }, { T<R> }, Term, I]>;
 
-/// The packed gate/up rows of `input` as their tiles.
-fn tiled<I: AxisName, R: AxisName, Chips: M>(
-    input: &HbmTensor<bf16, Chips, m![R, { Symbol<GateUp<I>> }]>,
-) -> Tiled<'_, I, R, Chips> {
-    // SAFETY: a packed row is its gate features followed by its up features, and the tiles split
-    // the rows in order.
-    unsafe {
-        input
-            .view()
-            .reshape::<Chips, m![{ Ts<R> }, { T<R> }, Term, I]>()
-    }
-}
-
-/// Writes the gate and up halves of tile `at` of `rows` to `gate` and `up`.
-fn load<I: AxisName, R: AxisName, Chips: M>(
-    device: &mut Device,
-    rows: &Tiled<'_, I, R, Chips>,
-    at: usize,
-    (gate, up): (&mut Part<I, R, Chips>, &mut Part<I, R, Chips>),
-) {
-    let tile =
-        rows.tile::<m![{ Ts<R> }], 1, m![{ Ts<R> } = 1 # ({ Ts<R> }), { T<R> }, Term, I]>(at);
-    tile.tile::<m![Term], 1, m![{ Ts<R> } = 1 # ({ Ts<R> }), { T<R> }, Term = 1 # 2, I]>(0)
-        .to_dm_view(&mut device.tdma, gate.view_mut());
-    tile.tile::<m![Term], 1, m![{ Ts<R> } = 1 # ({ Ts<R> }), { T<R> }, Term = 1 # 2, I]>(1)
-        .to_dm_view(&mut device.tdma, up.view_mut());
-}
-
-/// `bf16(bf16(silu(gate)) * up)` of one tile's halves into `product`.
-fn multiply<I: AxisName, R: AxisName, Chips: M>(
-    device: &mut Device,
-    (gate, up): (&Part<I, R, Chips>, &Part<I, R, Chips>),
-    product: &mut Part<I, R, Chips>,
-) {
-    let activated: Part<I, R, Chips> = device
-        .main
-        .begin(gate.view())
-        .fetch::<m![I % ({ F<I, R> }) / 8], m![I % 8]>()
-        .fetch_cast::<f32>()
-        .collect::<m![I % ({ F<I, R> }) / 8], m![I % 8]>()
-        .vector_init()
-        .vector_intra_slice_tag(TagMode::Zero)
-        .vector_narrow_split::<m![I % ({ F<I, R> }) / 8, I % 8 / 4], m![I % 4]>()
-        .vector_silu()
-        .vector_widen_concat::<m![I % ({ F<I, R> }) / 8], m![I % 8]>()
-        .vector_final()
-        .cast::<bf16, m![I % 8 # 16]>()
-        .commit_trim::<m![I % 8]>()
-        .commit();
-    device.main.begin_interleaved::<Term, _, _, _, _, _>(activated.view(), up.view())
-        .fetch::<m![I % ({ F<I, R> }) / 64, Term, I % 64 / 8], m![I % 8]>()
-        .fetch_cast::<f32>()
-        .collect::<m![I % ({ F<I, R> }) / 64, Term, I % 64 / 8], m![I % 8]>()
-        .vector_init()
-        .vector_zip::<
-            Term,
-            m![I % ({ F<I, R> }) / 64, I % 64 / 8],
-            m![I % ({ F<I, R> }) / 64, I % 64 / 4],
-            m![I % 4],
-        >(FpBinaryOp::MulF(FpMulAlu::Mul0))
-        .vector_final()
-        .cast::<bf16, m![I % 8 # 16]>()
-        .commit_trim::<m![I % 8]>()
-        .commit_view(product.view_mut());
-}
-
-/// Stores `product` as tile `at` of `output`.
-fn store<I: AxisName, R: AxisName, Chips: M>(
-    device: &mut Device,
-    product: &Part<I, R, Chips>,
-    output: &mut HbmTensor<bf16, Chips, m![R, I]>,
-    at: usize,
-) {
-    // SAFETY: the tiles split the rows in order.
-    let rows = unsafe {
-        output
-            .view_mut()
-            .reshape::<Chips, m![{ Ts<R> }, { T<R> }, I]>()
-    };
-    product.view().to_hbm_view(
-        &mut device.tdma,
-        rows.tile::<m![{ Ts<R> }], 1, m![{ Ts<R> } = 1 #{!} ({ Ts<R> }), { T<R> }, I]>(at),
-    );
-}
-
 /// `bf16(bf16(silu(gate)) * up)` of every row of `input` into `output`.
 impl<'x, 'y, I: AxisName, R: AxisName, Chips: M>
     Op<(
@@ -252,4 +167,89 @@ impl<'x, 'y, I: AxisName, R: AxisName, Chips: M, Capacity: AxisName>
             store(device, &kept, output, at);
         }
     }
+}
+
+/// The packed gate/up rows of `input` as their tiles.
+fn tiled<I: AxisName, R: AxisName, Chips: M>(
+    input: &HbmTensor<bf16, Chips, m![R, { Symbol<GateUp<I>> }]>,
+) -> Tiled<'_, I, R, Chips> {
+    // SAFETY: a packed row is its gate features followed by its up features, and the tiles split
+    // the rows in order.
+    unsafe {
+        input
+            .view()
+            .reshape::<Chips, m![{ Ts<R> }, { T<R> }, Term, I]>()
+    }
+}
+
+/// Writes the gate and up halves of tile `at` of `rows` to `gate` and `up`.
+fn load<I: AxisName, R: AxisName, Chips: M>(
+    device: &mut Device,
+    rows: &Tiled<'_, I, R, Chips>,
+    at: usize,
+    (gate, up): (&mut Part<I, R, Chips>, &mut Part<I, R, Chips>),
+) {
+    let tile =
+        rows.tile::<m![{ Ts<R> }], 1, m![{ Ts<R> } = 1 # ({ Ts<R> }), { T<R> }, Term, I]>(at);
+    tile.tile::<m![Term], 1, m![{ Ts<R> } = 1 # ({ Ts<R> }), { T<R> }, Term = 1 # 2, I]>(0)
+        .to_dm_view(&mut device.tdma, gate.view_mut());
+    tile.tile::<m![Term], 1, m![{ Ts<R> } = 1 # ({ Ts<R> }), { T<R> }, Term = 1 # 2, I]>(1)
+        .to_dm_view(&mut device.tdma, up.view_mut());
+}
+
+/// `bf16(bf16(silu(gate)) * up)` of one tile's halves into `product`.
+fn multiply<I: AxisName, R: AxisName, Chips: M>(
+    device: &mut Device,
+    (gate, up): (&Part<I, R, Chips>, &Part<I, R, Chips>),
+    product: &mut Part<I, R, Chips>,
+) {
+    let activated: Part<I, R, Chips> = device
+        .main
+        .begin(gate.view())
+        .fetch::<m![I % ({ F<I, R> }) / 8], m![I % 8]>()
+        .fetch_cast::<f32>()
+        .collect::<m![I % ({ F<I, R> }) / 8], m![I % 8]>()
+        .vector_init()
+        .vector_intra_slice_tag(TagMode::Zero)
+        .vector_narrow_split::<m![I % ({ F<I, R> }) / 8, I % 8 / 4], m![I % 4]>()
+        .vector_silu()
+        .vector_widen_concat::<m![I % ({ F<I, R> }) / 8], m![I % 8]>()
+        .vector_final()
+        .cast::<bf16, m![I % 8 # 16]>()
+        .commit_trim::<m![I % 8]>()
+        .commit();
+    device.main.begin_interleaved::<Term, _, _, _, _, _>(activated.view(), up.view())
+        .fetch::<m![I % ({ F<I, R> }) / 64, Term, I % 64 / 8], m![I % 8]>()
+        .fetch_cast::<f32>()
+        .collect::<m![I % ({ F<I, R> }) / 64, Term, I % 64 / 8], m![I % 8]>()
+        .vector_init()
+        .vector_zip::<
+            Term,
+            m![I % ({ F<I, R> }) / 64, I % 64 / 8],
+            m![I % ({ F<I, R> }) / 64, I % 64 / 4],
+            m![I % 4],
+        >(FpBinaryOp::MulF(FpMulAlu::Mul0))
+        .vector_final()
+        .cast::<bf16, m![I % 8 # 16]>()
+        .commit_trim::<m![I % 8]>()
+        .commit_view(product.view_mut());
+}
+
+/// Stores `product` as tile `at` of `output`.
+fn store<I: AxisName, R: AxisName, Chips: M>(
+    device: &mut Device,
+    product: &Part<I, R, Chips>,
+    output: &mut HbmTensor<bf16, Chips, m![R, I]>,
+    at: usize,
+) {
+    // SAFETY: the tiles split the rows in order.
+    let rows = unsafe {
+        output
+            .view_mut()
+            .reshape::<Chips, m![{ Ts<R> }, { T<R> }, I]>()
+    };
+    product.view().to_hbm_view(
+        &mut device.tdma,
+        rows.tile::<m![{ Ts<R> }], 1, m![{ Ts<R> } = 1 #{!} ({ Ts<R> }), { T<R> }, I]>(at),
+    );
 }
