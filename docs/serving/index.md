@@ -184,6 +184,19 @@ One worker drives every chip while vLLM awaits each tensor-parallel rank, so a c
 Only the attention cache moves, so startup refuses a connector for a model with recurrent state or encoder memory and on an encoder-only instance.
 Mooncake and MoRIIO register the cache's device memory, which the engine does not map for them, and LMCache copies the cache's torch tensors itself, so startup refuses them.
 
+vLLM's `MultiConnector` runs a NIXL connector and offloading together; the offloading entry names the plugin's connector and its module, since `--kv-offloading-size` replaces any other connector:
+
+```bash
+VLLM_NIXL_SIDE_CHANNEL_PORT=5601 vllm serve Qwen/Qwen3-0.6B --port 8200 --kv-transfer-config '{
+  "kv_connector": "MultiConnector", "kv_role": "kv_both", "kv_connector_extra_config": {"connectors": [
+    {"kv_connector": "NixlConnector", "kv_role": "kv_consumer", "kv_buffer_device": "cpu"},
+    {"kv_connector": "RNGDOffloadingConnector", "kv_connector_module_path": "furiosa_opt_vllm.offload",
+     "kv_role": "kv_both", "kv_connector_extra_config": {"cpu_bytes_to_use": 17179869184}}]}}'
+```
+
+vLLM loads a request's blocks from the first of its connectors that has them and stores them through each; each connector takes the settings it takes alone.
+The NIXL entry may be `NixlPushConnector`, the entries may come in either order, and the decode server may run data-parallel replicas or sleep mode; each replica keeps its own host tier, so route a request's reloads to the replica that decoded it (`X-data-parallel-rank`).
+
 ## Put the server to sleep
 
 A sleeping server frees the device memory of the model's weights and KV cache for another process; freeing the cache forgets what it held, and the compiled kernels stay loaded.
