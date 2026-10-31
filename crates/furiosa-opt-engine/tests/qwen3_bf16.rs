@@ -187,7 +187,9 @@ fn device() -> Device {
 
 /// The decoder `checkpoint` selects, loaded onto `device` by the options' selection.
 fn causal(checkpoint: &Checkpoint, device: &mut Device) -> Box<dyn Served> {
+    let depth = checkpoint.depth().unwrap();
     LoadOptions::new()
+        .layers(0..depth)
         .load(device, checkpoint)
         .unwrap()
         .decoder()
@@ -286,7 +288,7 @@ macro_rules! continues {
         fn $test() {
             let checkpoint = checkpoint(($published.repo, $published.revision));
             let mut device = device();
-            let model = LoadOptions::new().load(&mut device, &checkpoint).unwrap().decoder().unwrap();
+            let model = causal(&checkpoint, &mut device);
             runtime().block_on(async {
                 let cache = Cache::new(&mut device, &model.limits().cache, CACHED).unwrap();
                 let (mut selected, mut continued) = (0, Vec::new());
@@ -527,7 +529,8 @@ macro_rules! body_rows {
         fn $test() {
             let checkpoint = checkpoint(($published.repo, $published.revision));
             let mut device = device();
-            let options = LoadOptions::new().architecture("Qwen3Model").unwrap();
+            let depth = checkpoint.depth().unwrap();
+            let options = LoadOptions::new().layers(0..depth).architecture("Qwen3Model").unwrap();
             let base = options.load(&mut device, &checkpoint).unwrap().decoder().unwrap();
             let causal: Causal<$size> =
                 Load::load(&mut Context::new(&mut device), &checkpoint).unwrap();
@@ -672,7 +675,7 @@ macro_rules! scores {
             }
             let checkpoint = Checkpoint::new(directory, Some(config)).unwrap();
             let mut device = device();
-            let model = LoadOptions::new().load(&mut device, &checkpoint).unwrap().decoder().unwrap();
+            let model = causal(&checkpoint, &mut device);
             let score = runtime().block_on(async {
                 let cache = Cache::new(&mut device, &model.limits().cache, CACHED).unwrap();
                 let mut last = [0; 4];
@@ -719,7 +722,8 @@ macro_rules! embeds {
         fn $test() {
             let checkpoint = checkpoint(($embedder.repo, $embedder.revision));
             let mut device = device();
-            let options = LoadOptions::new().architecture("Qwen3Model").unwrap();
+            let depth = checkpoint.depth().unwrap();
+            let options = LoadOptions::new().layers(0..depth).architecture("Qwen3Model").unwrap();
             let model = options.load(&mut device, &checkpoint).unwrap().decoder().unwrap();
             let last = runtime().block_on(async {
                 let cache = Cache::new(&mut device, &model.limits().cache, CACHED).unwrap();
@@ -770,7 +774,12 @@ embeds! {
 fn batch_invariant_rows_keep_their_bits() {
     let checkpoint = checkpoint((QWEN3_0_6B.repo, QWEN3_0_6B.revision));
     let mut device = device();
-    let options = (LoadOptions::new().architecture("Qwen3Model").unwrap()).batch_invariant();
+    let depth = checkpoint.depth().unwrap();
+    let options = (LoadOptions::new()
+        .layers(0..depth)
+        .architecture("Qwen3Model")
+        .unwrap())
+    .batch_invariant();
     let model = options
         .load(&mut device, &checkpoint)
         .unwrap()
@@ -937,7 +946,7 @@ fn refusals_read_no_weight() {
             (
                 "unsupported",
                 "layers",
-                "every implementation loads whole".into(),
+                "this decoder requires whole-model execution".into(),
             ),
         ),
         (
