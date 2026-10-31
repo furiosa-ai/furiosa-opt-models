@@ -117,13 +117,14 @@ impl<D: MaterializableScalar, C: M + 'static, S: M + 'static, E: M> Load<HostTen
     }
 }
 
-/// A leaf whose value is built on host, laid out as `E`, written into `into`'s storage.
-impl<'t, D: MaterializableScalar, C: M + 'static, S: M + 'static, E: M>
-    Load<(&'t mut HbmTensor<D, C, S>, HostTensor<D, E>)> for &'t mut HbmTensor<D, C, S>
+/// A leaf whose value is built on host, laid out as `E`, written into `into`'s storage; the host
+/// value stays its owner's.
+impl<'t, 'h, D: MaterializableScalar, C: M + 'static, S: M + 'static, E: M>
+    Load<(&'t mut HbmTensor<D, C, S>, &'h HostTensor<D, E>)> for &'t mut HbmTensor<D, C, S>
 {
     fn load(
         context: &mut Context<'_>,
-        (into, host): (&'t mut HbmTensor<D, C, S>, HostTensor<D, E>),
+        (into, host): (&'t mut HbmTensor<D, C, S>, &'h HostTensor<D, E>),
     ) -> Result<Self, LoadError> {
         let path = context.path();
         let device = context.device();
@@ -131,6 +132,18 @@ impl<'t, D: MaterializableScalar, C: M + 'static, S: M + 'static, E: M>
         futures_executor::block_on(task::unconstrained(write.into_future()))
             .map_err(|source| LoadError::Device { path, source })?;
         Ok(into)
+    }
+}
+
+/// The same write from a host value the caller gives up.
+impl<'t, D: MaterializableScalar, C: M + 'static, S: M + 'static, E: M>
+    Load<(&'t mut HbmTensor<D, C, S>, HostTensor<D, E>)> for &'t mut HbmTensor<D, C, S>
+{
+    fn load(
+        context: &mut Context<'_>,
+        (into, host): (&'t mut HbmTensor<D, C, S>, HostTensor<D, E>),
+    ) -> Result<Self, LoadError> {
+        <&mut HbmTensor<D, C, S> as Load<_>>::load(context, (into, &host))
     }
 }
 
@@ -168,11 +181,11 @@ impl<'t, 'f, D: MaterializableScalar, C: M + 'static, S: M + 'static, E: M>
 #[cfg(test)]
 mod tests {
     use super::super::Update;
-    use super::super::checkpoint::tests::{checkpoint, host};
+    use super::super::checkpoint::tests::{checkpoint, device, host};
     use super::*;
-    use crate::load::Failed;
+    use crate::load::{Failed, Named};
     use crate::tensor::memory::{Hbm, Memory};
-    use crate::tensor::parallel::Shard;
+    use crate::tensor::parallel::{Chip, Shard};
     use crate::tests::DEVICE;
     use furiosa_opt_std::prelude::*;
     use safetensors::Dtype;
@@ -235,5 +248,83 @@ mod tests {
             Err(Failed::Refused(_, error) | Failed::Poisoned(error)) => panic!("{error}"),
         }
         assert_held(&leaves, &written, &mut device);
+    }
+
+    /// A tree written in place from a borrowed tree of host values holds those values in the
+    /// storage its load allocated, write after write, through every structural node.
+    #[test]
+    fn writes_a_host_tree_into_a_loaded_one() {
+        type Tree<A, B> = Named<"tree", ([A; 2], (Named<"a", A>, Named<"b", B>))>;
+        type Leaf<S> = HbmTensor<f32, Chip, S>;
+        type Staged<S> = HostTensor<f32, m![{ Chip }, { S }]>;
+        type Matrix = m![O, I];
+        type Vector = m![I];
+
+        let values = |tree: f32| {
+            let leaf = |index: f32, len: u8| -> Vec<f32> {
+                (0..len)
+                    .map(|i| 100.0 * tree + 10.0 * index + f32::from(i))
+                    .collect()
+            };
+            [leaf(0.0, 8), leaf(1.0, 8), leaf(2.0, 8), leaf(3.0, 4)]
+        };
+        let staged = |[l0, l1, a, b]: &[Vec<f32>; 4]| -> Tree<Staged<Matrix>, Staged<Vector>> {
+            Named((
+                [
+                    HostTensor::from_vec(l0.iter().copied()),
+                    HostTensor::from_vec(l1.iter().copied()),
+                ],
+                (
+                    Named(HostTensor::from_vec(a.iter().copied())),
+                    Named(HostTensor::from_vec(b.iter().copied())),
+                ),
+            ))
+        };
+        let matrix = |leaf: &Leaf<Matrix>, device: &mut Device| {
+            host::<f32, Chip, Matrix, m![{ Chip }, { Matrix }]>(leaf, device).into_vec()
+        };
+        let vector = |leaf: &Leaf<Vector>, device: &mut Device| {
+            host::<f32, Chip, Vector, m![{ Chip }, { Vector }]>(leaf, device).into_vec()
+        };
+        let bytes = |values: &[f32]| -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect()
+        };
+        let (matrix_shape, vector_shape): (&[usize], &[usize]) = (&[2, 4], &[4]);
+        let initial = values(1.0);
+        let stored = checkpoint(&[
+            ("tree.0", Dtype::F32, matrix_shape, bytes(&initial[0])),
+            ("tree.1", Dtype::F32, matrix_shape, bytes(&initial[1])),
+            ("tree.a", Dtype::F32, matrix_shape, bytes(&initial[2])),
+            ("tree.b", Dtype::F32, vector_shape, bytes(&initial[3])),
+        ]);
+
+        let _lease = DEVICE.blocking_lock();
+        let mut device = device();
+        let mut tree: Tree<Leaf<Matrix>, Leaf<Vector>> = stored.load(&mut device).unwrap();
+        let free = device.memory().usage().available;
+        for written in [values(2.0), values(3.0)] {
+            let from = staged(&written);
+            <&mut Tree<Leaf<Matrix>, Leaf<Vector>> as Load<_>>::load(
+                &mut Context::new(&mut device),
+                (&mut tree, &from),
+            )
+            .unwrap();
+            let Named(([l0, l1], (Named(a), Named(b)))) = &tree;
+            let held = [
+                matrix(l0, &mut device),
+                matrix(l1, &mut device),
+                matrix(a, &mut device),
+                vector(b, &mut device),
+            ];
+            assert_eq!(held, written);
+            assert_eq!(
+                device.memory().usage().available,
+                free,
+                "a write allocates no HBM"
+            );
+        }
     }
 }

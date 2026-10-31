@@ -68,6 +68,22 @@ macro_rules! tuples {
                 Ok(into)
             }
         }
+
+        impl<'t, 'h, $($T, $U),+> Load<(&'t mut ($($T,)+), &'h ($($U,)+))>
+            for &'t mut ($($T,)+)
+        where
+            $(for<'u> &'u mut $T: Load<(&'u mut $T, &'h $U)>,)+
+        {
+            fn load(
+                context: &mut Context<'_>,
+                (into, from): (&'t mut ($($T,)+), &'h ($($U,)+)),
+            ) -> Result<Self, LoadError> {
+                $(context.field(stringify!($i), "", |cx| {
+                    <&mut $T as Load<_>>::load(cx, (&mut into.$i, &from.$i))
+                })?;)+
+                Ok(into)
+            }
+        }
     )+};
 }
 
