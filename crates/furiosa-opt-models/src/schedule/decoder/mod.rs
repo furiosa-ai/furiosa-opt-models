@@ -544,7 +544,7 @@ fn period<Z, G, P, GN, V, K, Q, QN, KN, QH, KH, T: States>(
     } = front;
     let Stored { queries, retained } = stored;
     let projected = query.forward(&mut *device, tile, adapters.query(), &rows);
-    // Behind the period's rows and the queries' squares, which the projection reads first.
+    // Behind the period's rows, which the projection reads first.
     let coefficients = crate::Op::forward(&landing, &mut *device, index);
     let normalized = query_norm.forward(&mut *device, tile, &mut (), projected);
     let rotation = crate::Op::forward(&group::Stage, &mut *device, &coefficients);
