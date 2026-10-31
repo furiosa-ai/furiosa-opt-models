@@ -20,7 +20,6 @@ use crate::tensor::mapping;
 use crate::tensor::{axis::Lanes, live::Live};
 
 pub mod affine;
-pub(crate) mod block_einsum;
 mod decode;
 pub(crate) mod experts;
 pub(crate) mod fp8;
