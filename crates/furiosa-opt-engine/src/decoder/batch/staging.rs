@@ -18,26 +18,34 @@ pub struct Staged<R: AxisName, B: AxisName, Chips: M> {
     pub tokens: HbmBuffer,
 }
 
-impl<R: AxisName, B: AxisName, Chips: M> Staged<R, B, Chips> {
-    /// Words of the history's segments, blocks, selected rows and extents at their compiled
-    /// capacities, then of the live count, in the one buffer a call stages.
-    const fn capacities() -> [usize; 5] {
-        [R::SIZE * FIELDS, B::SIZE, R::SIZE, 3, 1]
-    }
-}
-
 impl<A> Batch<'_, A> {
-    /// Stages the call for at most `R` rows, a copy on every chip of `Chips`, and `reads` (values
-    /// and capacities in words) in one transfer, with a view of each; `table` forms the history of
-    /// cache group `group`.
+    /// Cache group `group`'s history for at most `R` rows: its segments, block tables of `B` words
+    /// and selected rows, then its three extents, each as its values and capacity in words; `table`
+    /// forms the block tables.
+    pub fn history<R: AxisName, B: AxisName>(
+        &self,
+        (group, table): (usize, Table),
+    ) -> io::Result<[(Vec<i32>, usize); 4]> {
+        let [segments, blocks, selected, extents] = self.compact[group].arrays::<R, B, R>(table)?;
+        Ok([
+            (segments, R::SIZE * FIELDS),
+            (blocks, B::SIZE),
+            (selected, R::SIZE),
+            (extents, 3),
+        ])
+    }
+
+    /// Stages the call for at most `R` rows, a copy on every chip of `Chips`, and the arrays a
+    /// launch writes, then those it only reads (values and capacities in words), in one transfer,
+    /// with a view of each in that order; `table` forms the history of cache group `group`.
     pub async fn stage<R: AxisName, B: AxisName, Chips: M>(
         &self,
         device: &mut Device,
-        reads: &[(Vec<i32>, usize)],
+        (written, reads): (&[(Vec<i32>, usize)], &[(Vec<i32>, usize)]),
         (group, table): (usize, Table),
     ) -> io::Result<(Staged<R, B, Chips>, Vec<HbmBuffer>)> {
         let compact = &self.compact[group];
-        let history = compact.arrays::<R, B, R>(table)?;
+        let history = self.history::<R, B>((group, table))?;
         if compact.rows() > R::SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -46,8 +54,9 @@ impl<A> Batch<'_, A> {
         }
         let live = [i32::try_from(compact.rows()).map_err(io::Error::other)?];
         let staging = Staging::new(
-            (history.iter().map(Vec::as_slice).chain([&live[..]]))
-                .zip(Staged::<R, B, Chips>::capacities()),
+            (history.iter().map(|(values, words)| (&values[..], *words)))
+                .chain([(&live[..], 1)])
+                .chain(written.iter().map(|(values, words)| (&values[..], *words))),
             reads.iter().map(|(values, words)| (&values[..], *words)),
         );
         let bytes = R::SIZE * Rows::<i32, m![1]>::bytes();
@@ -289,7 +298,7 @@ mod tests {
             let (staged, views) = batch
                 .stage::<Envelope, Tables, Chip>(
                     &mut device,
-                    &[(read.clone(), 70)],
+                    (&[], &[(read.clone(), 70)]),
                     (0, Table::Capacity),
                 )
                 .await?;

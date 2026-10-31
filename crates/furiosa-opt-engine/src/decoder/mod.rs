@@ -31,13 +31,12 @@ use furiosa_opt_models::models::decoder::attention::qwen3::{LmHead, fp8};
 use furiosa_opt_models::models::decoder::attention::{
     ForCausalLM, ForSequenceClassification, Geometry, Head, KvHeads,
 };
-use furiosa_opt_models::models::decoder::launch;
+use furiosa_opt_models::models::decoder::launch::{self, Tables};
 use furiosa_opt_models::models::decoder::{Attention, form};
 use furiosa_opt_models::modules::attention::key_value;
 use furiosa_opt_models::modules::language::{Classifier, Input, Selected};
 use furiosa_opt_models::modules::lora::{self, Rank, States};
 use furiosa_opt_models::ops::attention::full::paged::{Tiling, chunks::Masks};
-use furiosa_opt_models::ops::index::table::BlockIndex;
 use furiosa_opt_models::ops::linear::affine::Columns;
 use furiosa_opt_models::specialize::attention::Decode;
 use furiosa_opt_models::tensor::cache::{Block, Blocks};
@@ -491,16 +490,6 @@ impl<E: M> Place for furiosa_opt_std::prelude::HbmTensor<f32, Chip, E> {
     }
 }
 
-/// Block IDs of a call of `R` rows whose every row is a request spanning the whole context of `W`
-/// windows.
-#[derive(Clone, Debug)]
-struct Tables<R, W>(PhantomData<fn() -> (R, W)>);
-
-impl<R: AxisName, W: AxisName> AxisName for Tables<R, W> {
-    const NAME: Ident = Ident::new("Tables");
-    const SIZE: usize = R::SIZE * W::SIZE * BlockIndex::SIZE;
-}
-
 /// A catalog root as a decoder: a call plans its rows' positions, cache slots, attention work and
 /// selected rows on the host, then launches the root once over every layer's own blocks, which
 /// writes the selected rows' outputs in kept order; a call that runs adapters passes each layer's
@@ -585,7 +574,7 @@ where
                     launch::Capacity<R::Size>,
                     Tables<launch::Capacity<R::Size>, <R::Size as Decode>::Windows>,
                     Chip,
-                >(device, &reads, (0, Table::Blocks))
+                >(device, (&[], &reads), (0, Table::Blocks))
                 .await?;
             let mut views = views.into_iter();
             let mut next =
