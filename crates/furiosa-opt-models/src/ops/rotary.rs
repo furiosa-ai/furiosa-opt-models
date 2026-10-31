@@ -1391,19 +1391,30 @@ where
     }
 }
 
-/// Query and key head rows as attention projects them, for `Group` heads per key/value head.
-type HeadRows<Rows, Slice, Group, Head> =
-    Live<DmTensor<bf16, Chip, Cluster, Slice, m![{ RowGroups<Rows, Group> }, Head]>, Rows>;
+/// `Width` coordinates of each row's `Group` heads per key/value head, as attention projects them.
+type HeadValues<Rows, Slice, Group, Width> =
+    DmTensor<bf16, Chip, Cluster, Slice, m![{ RowGroups<Rows, Group> }, Width]>;
 
-/// Each live row's query and key rotated by its own row of the rotation.
-impl<Head: AxisName, Rows: AxisName, Slice: M, Query: AxisName, Key: AxisName>
+/// Query and key head rows as attention projects them, for `Group` heads per key/value head.
+type HeadRows<Rows, Slice, Group, Head> = Live<HeadValues<Rows, Slice, Group, Head>, Rows>;
+
+/// Each live row's query and key rotated by its own row of the rotation, over the first
+/// `Rotated / 2` coordinates of each head half; the other coordinates keep their values.
+impl<Head, Rotated, Rows, Slice, Query, Key>
     crate::Op<(
         (
             HeadRows<Rows, Slice, Query, Head>,
             HeadRows<Rows, Slice, Key, Head>,
         ),
-        &Rotation<Head, Chip, Rows>,
-    )> for Rotary<Head, Head, bf16, Chip>
+        &Rotation<Rotated, Chip, Rows>,
+    )> for Rotary<Head, Rotated, bf16, Chip>
+where
+    Head: AxisName,
+    Rotated: AxisName,
+    Rows: AxisName,
+    Slice: M,
+    Query: AxisName,
+    Key: AxisName,
 {
     type Output = (
         HeadRows<Rows, Slice, Query, Head>,
@@ -1418,20 +1429,121 @@ impl<Head: AxisName, Rows: AxisName, Slice: M, Query: AxisName, Key: AxisName>
                 HeadRows<Rows, Slice, Query, Head>,
                 HeadRows<Rows, Slice, Key, Head>,
             ),
-            &Rotation<Head, Chip, Rows>,
+            &Rotation<Rotated, Chip, Rows>,
         ),
     ) -> Self::Output {
-        let (rotated_query, rotated_key) = RotaryEmbedding::<Query, Key, Rows>::new().forward(
-            device,
+        let live = query.with(());
+        let rotate = |device: &mut Device,
+                      query: &HeadValues<Rows, Slice, Query, Rotated>,
+                      key: &HeadValues<Rows, Slice, Key, Rotated>| {
+            RotaryEmbedding::<Query, Key, Rows>::new()
+                .forward(device, (query, key, &rotation.low, &rotation.high, live))
+        };
+        let (query, key) = (query.into_value(), key.into_value());
+        if const { Rotated::SIZE == Head::SIZE } {
+            // SAFETY: the rotated coordinates are the whole head, in the same order.
+            let (query, key) = rotate(device, &unsafe { query.reshape() }, &unsafe {
+                key.reshape()
+            });
+            // SAFETY: as above.
+            unsafe { (live.with(query.reshape()), live.with(key.reshape())) }
+        } else {
+            let prefix = Prefix::<Head, Rotated>(PhantomData);
+            let leading = (
+                prefix.forward(&mut *device, &query),
+                prefix.forward(&mut *device, &key),
+            );
+            let (rotated_query, rotated_key) = rotate(&mut *device, &leading.0, &leading.1);
             (
-                query.value(),
-                key.value(),
-                &rotation.low,
-                &rotation.high,
-                query.with(()),
-            ),
+                live.with(prefix.forward(&mut *device, (rotated_query, query))),
+                live.with(prefix.forward(device, (rotated_key, key))),
+            )
+        }
+    }
+}
+
+/// The first `Rotated / 2` coordinates of each half of every head, gathered in head order, and
+/// put back in place.
+struct Prefix<Head, Rotated>(PhantomData<(Head, Rotated)>);
+
+/// The halves of every head, each holding its leading `Rotated / 2` coordinates alone.
+type Leading<Rows, Group, Head, Rotated> =
+    m![{ RowGroups<Rows, Group> }, Half, { Symbol<Row<Head>> } = (Rotated / 2)];
+
+impl<Head: AxisName, Rotated: AxisName, Rows: AxisName, Slice: M, Group: AxisName>
+    crate::Op<&HeadValues<Rows, Slice, Group, Head>> for Prefix<Head, Rotated>
+{
+    type Output = HeadValues<Rows, Slice, Group, Rotated>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        heads: &HeadValues<Rows, Slice, Group, Head>,
+    ) -> Self::Output {
+        const { assert!(Rotated::SIZE % 2 == 0 && Head::SIZE % Rotated::SIZE == 0) };
+        let mut leading: DmTensor<bf16, Chip, Cluster, Slice, Leading<Rows, Group, Head, Rotated>> =
+            DmTensor::new();
+        // SAFETY: a head is its two halves in order.
+        unsafe {
+            heads.view().reshape::<
+                Chip,
+                Cluster,
+                Slice,
+                m![{ RowGroups<Rows, Group> }, Half, { Symbol<Row<Head>> }],
+            >()
+        }
+        .tile::<m![{ Symbol<Row<Head>> } / (Rotated / 2)], 1, m![
+            { RowGroups<Rows, Group> },
+            Half,
+            { Symbol<Row<Head>> } / (Rotated / 2) = 1 # (Head / Rotated),
+            { Symbol<Row<Head>> } % (Rotated / 2)
+        ]>(0)
+        .to_dm_view(&mut device.tdma, leading.view_mut());
+        // SAFETY: the leading coordinates of the two halves, in order, are the rotated ones.
+        unsafe { leading.reshape() }
+    }
+}
+
+impl<Head: AxisName, Rotated: AxisName, Rows: AxisName, Slice: M, Group: AxisName>
+    crate::Op<(
+        HeadValues<Rows, Slice, Group, Rotated>,
+        HeadValues<Rows, Slice, Group, Head>,
+    )> for Prefix<Head, Rotated>
+{
+    type Output = HeadValues<Rows, Slice, Group, Head>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (rotated, heads): (
+            HeadValues<Rows, Slice, Group, Rotated>,
+            HeadValues<Rows, Slice, Group, Head>,
+        ),
+    ) -> Self::Output {
+        // SAFETY: as the gather above, in reverse.
+        let rotated: DmTensor<bf16, Chip, Cluster, Slice, Leading<Rows, Group, Head, Rotated>> =
+            unsafe { rotated.reshape() };
+        // SAFETY: a head is its two halves in order.
+        let mut heads: DmTensor<
+            bf16,
+            Chip,
+            Cluster,
+            Slice,
+            m![{ RowGroups<Rows, Group> }, Half, { Symbol<Row<Head>> }],
+        > = unsafe { heads.reshape() };
+        rotated.view().to_dm_view(
+            &mut device.tdma,
+            heads
+                .view_mut()
+                .tile::<m![{ Symbol<Row<Head>> } / (Rotated / 2)], 1, m![
+                    { RowGroups<Rows, Group> },
+                    Half,
+                    { Symbol<Row<Head>> } / (Rotated / 2) = 1 #{!} (Head / Rotated),
+                    { Symbol<Row<Head>> } % (Rotated / 2)
+                ]>(0),
         );
-        (query.with(rotated_query), key.with(rotated_key))
+        // SAFETY: a head is its two halves in order.
+        unsafe { heads.reshape() }
     }
 }
 
