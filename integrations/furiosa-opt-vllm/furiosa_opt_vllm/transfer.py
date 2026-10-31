@@ -11,17 +11,41 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Literal
 
 from vllm import envs
 
 if TYPE_CHECKING:
-    from vllm.config import ModelConfig, VllmConfig
+    from vllm.config import KVTransferConfig, ModelConfig, VllmConfig
 
 
 # The KV connector `--kv-offloading-size` selects, by the class and module vLLM's factory loads.
 CONNECTOR: Final = "RNGDOffloadingConnector"
 CONNECTOR_MODULE: Final = "furiosa_opt_vllm.offload"
+
+# vLLM's own NIXL connectors, which stage blocks in host buffers of their own with
+# `kv_buffer_device="cpu"`; `NixlConnector` names the pull one.
+NIXL: Final = ("NixlConnector", "NixlPullConnector", "NixlPushConnector")
+
+# The engine maps no device memory for another process or library to register.
+DEVICE_MEMORY: Final = (
+    "registers the cache's device memory, which the engine does not map for it, rather than "
+    "staging blocks in host buffers"
+)
+TENSORS: Final = (
+    "copies blocks of the cache's torch tensors itself, rather than staging blocks in host buffers"
+)
+# vLLM's connectors that reach the cache other than through host buffers of their own.
+UNSTAGED: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "MooncakeConnector": f"serves no Mooncake connector: it {DEVICE_MEMORY}",
+        "MooncakeStoreConnector": f"serves no Mooncake connector: it {DEVICE_MEMORY}",
+        "MoRIIOConnector": f"serves no MoRIIOConnector: it {DEVICE_MEMORY}",
+        "LMCacheConnectorV1": f"serves no LMCache connector: it {TENSORS}",
+        "LMCacheMPConnector": f"serves no LMCache connector: it {TENSORS}",
+    }
+)
 
 
 def offload(config: VllmConfig) -> None:
@@ -71,6 +95,18 @@ def offloading(config: VllmConfig) -> Offloading | None:
     )
 
 
+def nixl(config: VllmConfig) -> KVTransferConfig | None:
+    """`config`'s transfer config when it names one of vLLM's own NIXL connectors."""
+    transfer = config.kv_transfer_config
+    if (
+        transfer is None
+        or transfer.kv_connector not in NIXL
+        or transfer.kv_connector_module_path is not None
+    ):
+        return None
+    return transfer
+
+
 def engine_cache(model: ModelConfig | None) -> bool:
     """Whether the engine holds `model`'s cache: the paged attention cache of a generating decoder
     with no recurrent state or encoder memory."""
@@ -102,16 +138,54 @@ TRANSFER: Final[tuple[tuple[str, Callable[[VllmConfig], bool], str], ...]] = (
         f"offloads through {CONNECTOR}, which --kv-offloading-size selects: vLLM's "
         + "OffloadingConnector copies through CUDA streams",
     ),
+    *(
+        (
+            "kv_transfer_config",
+            lambda c, name=name: (
+                c.kv_transfer_config is None or c.kv_transfer_config.kv_connector != name
+            ),
+            requirement,
+        )
+        for name, requirement in UNSTAGED.items()
+    ),
     (
         "kv_transfer_config",
         lambda c: (
             c.kv_transfer_config is None
+            or nixl(c) is not None
             or (
                 c.kv_transfer_config.kv_connector == CONNECTOR
                 and c.kv_transfer_config.kv_connector_module_path == CONNECTOR_MODULE
             )
         ),
-        f"serves no KV connector but {CONNECTOR}, which --kv-offloading-size selects",
+        f"serves no KV connector but {CONNECTOR}, which --kv-offloading-size selects, and vLLM's "
+        + f"own {', '.join(NIXL[:-1])} and {NIXL[-1]}, which stage blocks in host buffers",
+    ),
+    # The runner copies blocks between the engine cache and NIXL's host buffers; NIXL registers
+    # only those.
+    (
+        "kv_transfer_config.kv_buffer_device",
+        lambda c: (transfer := nixl(c)) is None or transfer.kv_buffer_device == "cpu",
+        "stages NIXL's blocks in host buffers, so it takes kv_buffer_device=cpu: NIXL cannot "
+        + "register device memory, which the engine does not map for it",
+    ),
+    # vLLM's scheduler takes a request's blocks as received once each rank's worker reports them,
+    # and one worker drives every chip of the replica.
+    (
+        "tensor_parallel_size",
+        lambda c: nixl(c) is None or c.parallel_config.tensor_parallel_size == 1,
+        "connects through NIXL at tensor_parallel_size=1: vLLM awaits each rank; one worker "
+        + "drives all chips",
+    ),
+    (
+        "kv_transfer_config",
+        lambda c: nixl(c) is None or engine_cache(c.model_config),
+        "connects the attention cache of a decoder, not recurrent state or encoder memory",
+    ),
+    (
+        "kv_transfer_config",
+        lambda c: nixl(c) is None or not c.is_mm_encoder_only,
+        "connects the attention cache of a decoder, which an encoder-only instance does not run",
     ),
     (
         "kv_connector_extra_config",
