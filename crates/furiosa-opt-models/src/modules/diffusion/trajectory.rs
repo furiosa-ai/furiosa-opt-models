@@ -184,9 +184,17 @@ where
     }
 }
 
+/// A launch's context for one solver update: the sample, the prediction and the solver's timestep.
+#[derive(DeviceSend)]
+pub struct Context<S: M, T> {
+    pub sample: Values<S>,
+    pub prediction: Values<S>,
+    pub timestep: T,
+}
+
 /// Deterministic DDIM updates from an epsilon prediction and explicit timestep indices.
 pub mod ddim {
-    use super::Values;
+    use super::{Context, Values};
     use crate::Module;
     use furiosa_opt_std::prelude::*;
     use std::{borrow::Borrow, marker::PhantomData};
@@ -238,15 +246,8 @@ pub mod ddim {
         }
     }
 
-    #[derive(DeviceSend)]
-    pub struct Context<S: M> {
-        pub sample: Values<S>,
-        pub prediction: Values<S>,
-        pub timestep: Timestep,
-    }
-
     /// The sample, the prediction and the timestep a launch's context holds.
-    impl<S: M, Training: AxisName, Env: Copy> Module<&mut Context<S>, Env, &mut ()>
+    impl<S: M, Training: AxisName, Env: Copy> Module<&mut Context<S, Timestep>, Env, &mut ()>
         for Update<S, Training>
     {
         type Output = Values<S>;
@@ -256,7 +257,7 @@ pub mod ddim {
             device: &mut Device,
             env: Env,
             _: &mut (),
-            context: &mut Context<S>,
+            context: &mut Context<S, Timestep>,
         ) -> Values<S> {
             self.forward(
                 device,
@@ -270,7 +271,7 @@ pub mod ddim {
 
 /// Deterministic Euler integration of a velocity field along an explicit sigma schedule.
 pub mod flow_match {
-    use super::Values;
+    use super::{Context, Values};
     use crate::Module;
     use furiosa_opt_std::prelude::*;
     use std::{borrow::Borrow, marker::PhantomData};
@@ -294,15 +295,8 @@ pub mod flow_match {
         }
     }
 
-    #[derive(DeviceSend)]
-    pub struct Context<S: M> {
-        pub sample: Values<S>,
-        pub prediction: Values<S>,
-        pub timestep: Timestep,
-    }
-
     /// The sample, the prediction and the timestep a launch's context holds.
-    impl<S: M, Env: Copy> Module<&mut Context<S>, Env, &mut ()> for Update<S> {
+    impl<S: M, Env: Copy> Module<&mut Context<S, Timestep>, Env, &mut ()> for Update<S> {
         type Output = Values<S>;
 
         fn forward(
@@ -310,7 +304,7 @@ pub mod flow_match {
             device: &mut Device,
             env: Env,
             _: &mut (),
-            context: &mut Context<S>,
+            context: &mut Context<S, Timestep>,
         ) -> Values<S> {
             self.forward(
                 device,
