@@ -8,7 +8,7 @@ pub use head::{
 };
 
 use crate::load::Named;
-use crate::tensor::{live::Live, parallel::Chip, scalar::Value};
+use crate::tensor::{parallel::Chip, scalar::Value};
 use crate::{Branch, Collection, Interleave, Layers, Module, Then};
 use furiosa_opt_std::prelude::*;
 use std::marker::PhantomData;
@@ -38,26 +38,19 @@ impl<R, Tokens, Cache, Chips: M> Input<R, Tokens, Cache, Chips> {
     }
 }
 
-/// What a call's leaves read: the context its preparation computed, its tokens and its live rows.
-pub struct Call<'c, C, T, R> {
+/// What a call's leaves read: the context its preparation computed and its tokens.
+pub struct Call<'c, C, T> {
     pub(crate) context: &'c C,
     pub(crate) tokens: &'c T,
-    pub(crate) live: Live<(), R>,
 }
 
-impl<C, T, R> Clone for Call<'_, C, T, R> {
+impl<C, T> Clone for Call<'_, C, T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<C, T, R> Copy for Call<'_, C, T, R> {}
-
-impl<C, T, R> From<Call<'_, C, T, R>> for Live<(), R> {
-    fn from(call: Call<'_, C, T, R>) -> Self {
-        call.live
-    }
-}
+impl<C, T> Copy for Call<'_, C, T> {}
 
 /// The iterations of a loop: one body for every iteration, each followed by its own norm.
 #[derive(DeviceSend)]

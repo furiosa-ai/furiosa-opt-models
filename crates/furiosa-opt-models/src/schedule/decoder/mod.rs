@@ -100,8 +100,7 @@ type KeyRows<Z> = HbmTensor<bf16, Chip, m![{ Symbol<Reach<Z>> }, KvHeads, Head]>
 type Norm<Z> = <Z as Geometry>::Norm<Width<Z>, Hbm>;
 /// The final norm, where the head starts.
 type FinalNorm<Z> = Named<"norm", Norm<Z>>;
-/// A launch's call as its layers read it: the context its rotary table prepares, its token IDs
-/// and its live rows.
+/// A launch's call as its layers read it: the context its rotary table prepares and its token IDs.
 type Launched<'c, 'a, Z> = Call<
     'c,
     launch::Context<
@@ -115,7 +114,6 @@ type Launched<'c, 'a, Z> = Call<
         <Z as Decode>::Windows,
     >,
     launch::Ids<Z>,
-    Capacity<Z>,
 >;
 /// A row tile of a launch, as the work between two attentions passes it on.
 type RowTile<Z> = Live<Owned<Width<Z>, Span>, Capacity<Z>>;
@@ -702,7 +700,6 @@ where
         let call = Call {
             context: &context,
             tokens: &input.tokens,
-            live,
         };
         let ((embedded, slots), ()) = body;
         let Then(Backbone { embedding, body }, norm) = &model.body;
