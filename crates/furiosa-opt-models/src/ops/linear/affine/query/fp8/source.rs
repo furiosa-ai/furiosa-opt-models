@@ -1,4 +1,7 @@
-use super::{HeadScales, HeadSquares, Squared, Stored, ValueScale, Weight, Weights};
+use super::{
+    Grouped, HeadScales, HeadSquares, KeySquares, QuerySquares, Stored, ValueScale, Weight,
+    Weights, squares,
+};
 use crate::Begin;
 use crate::Op;
 use crate::ops::linear::Affine;
@@ -65,32 +68,40 @@ impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, const HALF: usize>
     }
 }
 
-/// The query projection written to DM: each half of its head dimension in turn, its heads'
-/// squared scales copied beside it for each period to write into its output's slices.
+/// The query projection written to DM: each half of its head dimension in turn, then its heads'
+/// squared scales in the slices of both period groups' outputs, so no period waits for them.
 impl<Hidden: AxisName, Heads: AxisName, Head: AxisName> Op<Begin<()>>
     for Affine<Weights<Hidden, Heads, Head, HeadSquares<Heads>>, ()>
 {
-    type Output = Affine<(Weight<Hidden, Heads, Head>, Squared<Heads>), ()>;
+    type Output = Affine<(Weight<Hidden, Heads, Head>, QuerySquares<Heads>), ()>;
 
     fn forward(&self, device: &mut Device, _: Begin<()>) -> Self::Output {
         let mut output = Affine::new(DmTensor::new(), ());
         Half::<_, _, _, 0>(&self.weight.0).forward(&mut *device, &mut output);
         Half::<_, _, _, 1>(&self.weight.0).forward(&mut *device, &mut output);
-        let squares = self.weight.1.0.to_hbm(&mut device.tdma);
+        let stored = &self.weight.1.0;
+        let squares = Grouped {
+            pair: squares(&mut *device, stored),
+            single: squares(device, stored),
+        };
         Affine::new((output.weight, squares), ())
     }
 }
 
-/// The key projection written to DM, its heads' squared scales copied beside it.
+/// The key projection written to DM, then its heads' squared scales as the query projection's.
 impl<Hidden: AxisName, Heads: AxisName, Head: AxisName> Op<Begin<()>>
     for Affine<(Weights<Hidden, Heads, Head, HeadSquares<Heads>>, ()), ()>
 {
-    type Output = Affine<((Weight<Hidden, Heads, Head>, Squared<Heads>), ()), ()>;
+    type Output = Affine<((Weight<Hidden, Heads, Head>, KeySquares<Heads>), ()), ()>;
 
     fn forward(&self, device: &mut Device, _: Begin<()>) -> Self::Output {
         let mut weight = DmTensor::new();
         Panel(&self.weight.0.0).forward(&mut *device, &mut weight);
-        let squares = self.weight.0.1.0.to_hbm(&mut device.tdma);
+        let stored = &self.weight.0.1.0;
+        let squares = Grouped {
+            pair: squares(&mut *device, stored),
+            single: squares(device, stored),
+        };
         Affine::new(((weight, squares), ()), ())
     }
 }
