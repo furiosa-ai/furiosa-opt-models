@@ -18,18 +18,23 @@ use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
 use std::borrow::Borrow;
 
-/// A slice's vocabulary rows one pass holds: the most rows, at most `vocabulary::ROWS` and whole
-/// multiples of `vocabulary::STEP`, that split the slice's `Block` of rows into passes.
+/// A slice's vocabulary rows one pass holds: the most rows, at most what two passes' weights of
+/// the slice's `Hidden` chunk fit and whole multiples of `vocabulary::STEP`, that split the
+/// slice's `Block` of rows into passes.
 #[derive(Clone, Debug)]
-pub(crate) struct Pass<Block>(PhantomData<Block>);
+pub(crate) struct Pass<Hidden, Block>(PhantomData<(Hidden, Block)>);
 
-impl<Block: M + 'static> AxisName for Pass<Block> {
+impl<Hidden: AxisName, Block: M + 'static> AxisName for Pass<Hidden, Block> {
     const NAME: Ident = Ident::new("Pass");
 
-    const SIZE: usize = vocabulary::pass(<Block as M>::SIZE, vocabulary::ROWS, vocabulary::STEP);
+    const SIZE: usize = vocabulary::pass(
+        <Block as M>::SIZE,
+        vocabulary::rows(vocabulary::chunk(Hidden::SIZE)),
+        vocabulary::STEP,
+    );
 }
 
-pub(crate) type PassRows<Hidden, V> = Symbol<Pass<Block<Hidden, V>>>;
+pub(crate) type PassRows<Hidden, V> = Symbol<Pass<Hidden, Block<Hidden, V>>>;
 
 /// The hidden features each slice contracts, its block of every hidden row.
 #[derive(Clone, Debug)]
