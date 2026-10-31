@@ -441,8 +441,7 @@ checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 
 [[package]]
 name = "furiosa-mapping"
-version = "0.9.0+gcc921070"
-source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=0dc3ceab827a859882860c32eae51d02aa2e2634#0dc3ceab827a859882860c32eae51d02aa2e2634"
+version = "0.9.0"
 dependencies = [
  "abi_stable",
  "furiosa-mapping-macro",
@@ -452,8 +451,7 @@ dependencies = [
 
 [[package]]
 name = "furiosa-mapping-macro"
-version = "0.9.0+gcc921070"
-source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=0dc3ceab827a859882860c32eae51d02aa2e2634#0dc3ceab827a859882860c32eae51d02aa2e2634"
+version = "0.9.0"
 dependencies = [
  "lalrpop",
  "lalrpop-util 0.22.2",
@@ -464,8 +462,7 @@ dependencies = [
 
 [[package]]
 name = "furiosa-mapping-types"
-version = "0.9.0+gcc921070"
-source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=0dc3ceab827a859882860c32eae51d02aa2e2634#0dc3ceab827a859882860c32eae51d02aa2e2634"
+version = "0.9.0"
 dependencies = [
  "abi_stable",
  "furiosa-mapping-macro",
@@ -479,8 +476,7 @@ dependencies = [
 
 [[package]]
 name = "furiosa-opt-abi"
-version = "0.9.0+gcc921070"
-source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=0dc3ceab827a859882860c32eae51d02aa2e2634#0dc3ceab827a859882860c32eae51d02aa2e2634"
+version = "0.9.0"
 dependencies = [
  "bincode",
  "thiserror",
@@ -489,8 +485,7 @@ dependencies = [
 
 [[package]]
 name = "furiosa-opt-common-ir"
-version = "0.9.0+gcc921070"
-source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=0dc3ceab827a859882860c32eae51d02aa2e2634#0dc3ceab827a859882860c32eae51d02aa2e2634"
+version = "0.9.0"
 dependencies = [
  "furiosa-opt-macro",
  "serde",
@@ -519,8 +514,7 @@ dependencies = [
 
 [[package]]
 name = "furiosa-opt-ipc"
-version = "0.9.0+gcc921070"
-source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=0dc3ceab827a859882860c32eae51d02aa2e2634#0dc3ceab827a859882860c32eae51d02aa2e2634"
+version = "0.9.0"
 dependencies = [
  "bincode",
  "bytemuck",
@@ -530,8 +524,7 @@ dependencies = [
 
 [[package]]
 name = "furiosa-opt-lower"
-version = "0.9.0+gcc921070"
-source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=0dc3ceab827a859882860c32eae51d02aa2e2634#0dc3ceab827a859882860c32eae51d02aa2e2634"
+version = "0.9.0"
 dependencies = [
  "abi_stable",
  "furiosa-mapping",
@@ -541,8 +534,7 @@ dependencies = [
 
 [[package]]
 name = "furiosa-opt-lower-types"
-version = "0.9.0+gcc921070"
-source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=0dc3ceab827a859882860c32eae51d02aa2e2634#0dc3ceab827a859882860c32eae51d02aa2e2634"
+version = "0.9.0"
 dependencies = [
  "abi_stable",
  "furiosa-mapping-types",
@@ -552,8 +544,7 @@ dependencies = [
 
 [[package]]
 name = "furiosa-opt-macro"
-version = "0.9.0+gcc921070"
-source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=0dc3ceab827a859882860c32eae51d02aa2e2634#0dc3ceab827a859882860c32eae51d02aa2e2634"
+version = "0.9.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -606,8 +597,7 @@ dependencies = [
 
 [[package]]
 name = "furiosa-opt-rt"
-version = "0.9.0+gcc921070"
-source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=0dc3ceab827a859882860c32eae51d02aa2e2634#0dc3ceab827a859882860c32eae51d02aa2e2634"
+version = "0.9.0"
 dependencies = [
  "arrayvec",
  "bytemuck",
@@ -625,8 +615,7 @@ dependencies = [
 
 [[package]]
 name = "furiosa-opt-std"
-version = "0.9.0+gcc921070"
-source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=0dc3ceab827a859882860c32eae51d02aa2e2634#0dc3ceab827a859882860c32eae51d02aa2e2634"
+version = "0.9.0"
 dependencies = [
  "abi_stable",
  "arrayvec",
