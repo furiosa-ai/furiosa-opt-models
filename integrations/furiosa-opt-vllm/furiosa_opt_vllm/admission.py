@@ -31,6 +31,7 @@ from furiosa_opt_vllm.offloading import (
     direct_offloadings,
     offloading_contracts,
 )
+from furiosa_opt_vllm.transfer import TRANSFER
 
 if TYPE_CHECKING:
     from vllm.config import (
@@ -178,8 +179,7 @@ CONTRACTS: Final = (
         lambda c: not c.aux_output_config.enable_return_routed_experts,
         "returns no routed experts",
     ),
-    *offloading_contracts(direct_offloadings),
-    *direct_connector_contracts(),
+    *(Contract(option, accepts, requirement) for option, accepts, requirement in TRANSFER),
     # A consumer needs the checkpoint's language model, which the engine does not serve; of vLLM's
     # connectors, the example one saves a producer's host rows as they are.
     Contract(
