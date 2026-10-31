@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Annotated, ClassVar, Final, Literal, Self, final
+from typing import Annotated, ClassVar, Final, Literal, Self, TypeAlias, final
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, RootModel, ValidationError
 from typing_extensions import override
@@ -33,6 +33,8 @@ def unset(value: object) -> object:
 
 # A feature the plugin does not serve: any false, empty or missing value leaves it off.
 Unset = Annotated[object, AfterValidator(unset)]
+# A server's part in prefill-decode disaggregation, as SGLang names it.
+Mode: TypeAlias = Literal["null", "prefill", "decode"]
 
 
 class Served(BaseModel):
@@ -121,7 +123,9 @@ class Resolved(Served):
     # The engine places every weight it loads; SGLang's per-layer embedding offload moves tables of
     # its own model, and its backend and directory options take effect only with it.
     ple_offload_embedding: Unset
-    disaggregation_mode: Literal["null"] = Field(description="requires disaggregation_mode=null")
+    disaggregation_mode: Mode = Field(
+        description="requires disaggregation_mode null, prefill or decode"
+    )
     startup_weight_load_mode: Literal["serial"] = Field(
         description="requires startup_weight_load_mode=serial"
     )
@@ -252,6 +256,56 @@ class Speculations(
                     ) from None
                 case _:
                     raise
+
+
+BACKEND: Final = "moves the cache only over --disaggregation-transfer-backend mooncake_tcp"
+FAKE: Final = (
+    "moves no KV over the fake transfer backend, a synthetic decode benchmark; use "
+    + "--disaggregation-transfer-backend mooncake_tcp"
+)
+
+
+class Disaggregation(Served):
+    """The prefill-decode disaggregation options the plugin serves: a transfer backend that
+    registers the token pool's host image, whose pages the plugin keeps equal to the device's."""
+
+    # SGLang's nixl and mori backends register the token pool as device memory, and the ascend
+    # backend moves Ascend NPU memory.
+    disaggregation_transfer_backend: Literal["mooncake", "fake"] = Field(description=BACKEND)
+    # SGLang's host receive registers the hierarchical cache's host pool beside the token pool's
+    # key and value buffers, which only its dense MHA pool exposes.
+    disaggregation_decode_host_receive_threshold: float = Field(
+        ge=1,
+        description="receives KV only into the token pool's host image: SGLang receives into a "
+        + "host pool only beside an MHA token pool's separate key and value buffers",
+    )
+    # SGLang's radix cache backs a retracted request up to its host pool only over an MHA token
+    # pool (unified_radix_cache.supports_retraction_backup) and raises once the weights loaded.
+    disaggregation_decode_retraction_backup: Literal["cpu_tensor", "none"] | None = Field(
+        description="backs a retracted request up only by the token pool's cpu_tensor copies: "
+        + "SGLang's host-pool backup needs an MHA token pool"
+    )
+    disaggregation_decode_enable_offload_kvcache: Unset = Field(
+        description="offloads no decode server's cache: the engine's host pool serves no storage "
+        + "backend"
+    )
+    disaggregation_enable_kv_checksum: Unset = Field(
+        description="computes no KV checksum: SGLang's checksum runs a CUDA kernel over the "
+        + "transfer regions"
+    )
+    enable_pd_role_switch: bool
+    # SGLang's decode server stashes a received request's first token as a token relay
+    # (ScheduleBatch.process_prebuilt), which its NGRAM future map reads as accepted drafts it
+    # lacks (FutureMap.stash), and its scheduler raises.
+    speculative_algorithm: Literal["STANDALONE"] | None = Field(
+        description="drafts no NGRAM candidates with disaggregation: SGLang's decode server hands "
+        + "a received request's first token to an NGRAM schedule in a form it cannot read"
+    )
+    # The platform reports tp_size 1 to SGLang, so neither server can check the other's chips.
+    tp_size: Literal[1] = Field(
+        description="requires tp_size=1 with disaggregation: an image page holds each chip's part "
+        + "in turn, which a server split over other chips reads differently"
+    )
 
 
 class Recurrent(Served):
