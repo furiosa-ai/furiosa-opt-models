@@ -2,6 +2,7 @@
 
 pub use backbone::Backbone;
 pub use embedding::{ConditionedEmbedding, Embeddings, NgramEmbedding};
+pub(crate) use head::Cap;
 pub use head::{
     Classifier, FeatureHead, Greedy, MaskedHead, Pooler, Readout, RetrievalHead, RowWise,
     SelectRow, Selected, SequenceHead, SparseHead,

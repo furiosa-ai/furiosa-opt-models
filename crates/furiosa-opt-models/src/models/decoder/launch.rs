@@ -7,6 +7,8 @@
 //!   tokens out tile by tile.
 //! - The envelope a launch is compiled for is the size's [`Decode`]: its rows, and the context its
 //!   rotary table, prompt chunks and work items cover, its windows' [`Positions`].
+//! - A model whose layers interleave in two collections, each paging its own cache group, launches
+//!   with the types of [`interleaved`].
 
 use crate::load::Named;
 use crate::models::decoder;
@@ -20,6 +22,7 @@ use crate::modules::lora::{self, Rank};
 use crate::ops::attention::full::paged;
 use crate::ops::attention::gqa::Cache;
 use crate::ops::embedding;
+use crate::ops::index::table::BlockIndex;
 use crate::ops::linear::affine::Columns;
 use crate::ops::linear::query::matrix::Width;
 use crate::ops::normalization::Blocked;
@@ -35,6 +38,8 @@ use crate::tensor::parallel::Chip;
 use furiosa_opt_std::prelude::*;
 use std::fmt;
 use std::marker::PhantomData;
+
+pub mod interleaved;
 
 /// The rows of a launch of size `S`; a runtime count of them is live.
 pub type Capacity<S> = <S as Decode>::Capacity;
@@ -55,6 +60,16 @@ pub struct Waves<S>(PhantomData<fn() -> S>);
 impl<S: decoder::Attention + Decode + 'static> AxisName for Waves<S> {
     const NAME: Ident = Ident::new("Waves");
     const SIZE: usize = tiles::<S>();
+}
+
+/// Block IDs of a call of `R` rows whose every row is a request spanning the whole context of `W`
+/// windows.
+#[derive(Clone, Debug)]
+pub struct Tables<R, W>(PhantomData<fn() -> (R, W)>);
+
+impl<R: AxisName, W: AxisName> AxisName for Tables<R, W> {
+    const NAME: Ident = Ident::new("Tables");
+    const SIZE: usize = R::SIZE * W::SIZE * BlockIndex::SIZE;
 }
 
 impl<S> Clone for Positions<S> {

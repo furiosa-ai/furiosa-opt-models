@@ -8,13 +8,28 @@
 //!   the final norm instead.
 //! - Each group's layers share its places: a layer stores into them once the group's previous
 //!   attention read them.
+//! - A causal model over such collections launches once a call: each group's context prepared from
+//!   its history, the embedded tokens in the home, the schedule, then the head's tokens of the
+//!   rows the launch returns.
 
 use super::{Cut, Decoder, Places, Pool, Tokenwise};
 use crate::load::Named;
-use crate::models::decoder;
-use crate::tensor::live::Live;
-use crate::{Branch, Interleave, Module, Order};
+use crate::models::decoder::attention::{ForCausalLM, Geometry, Model};
+use crate::models::decoder::{self, launch::interleaved};
+use crate::modules::attention;
+use crate::modules::language::{Backbone, Cap, Greedy, Normalized};
+use crate::ops::attention::gqa::Pages;
+use crate::ops::embedding::Ids;
+use crate::ops::index::gather::Gather;
+use crate::ops::linear::Affine;
+use crate::ops::normalization::{RowMajor, Spread};
+use crate::ops::reduction::Argmax;
+use crate::ops::rotary::Rotation;
+use crate::tensor::live::{Live, Spill};
+use crate::tensor::parallel::Chip;
+use crate::{Branch, Interleave, Module, Order, Then};
 use furiosa_opt_std::prelude::*;
+use std::borrow::Borrow;
 
 /// A launch's rows through two collections of layers in their interleaved order and then the
 /// final norm, in place in `home`: the layers of `X` attend in group `A` over `CX`, run with `T`
@@ -216,5 +231,138 @@ where
             period_of(group, false);
         }
         period_of(groups - 1, true);
+    }
+}
+
+/// A call's context of `R` rows in group `A`: their rotation, write slots and pages.
+type Context<A, R> = attention::Context<
+    Rotation<<A as decoder::Attention>::Rotated, Chip, R>,
+    HbmTensor<i32, Chip, m![R]>,
+    Pages<R, <A as decoder::Attention>::Windows, Chip>,
+>;
+
+/// A launch's `R` rows of `Hidden` features in HBM, where a tile of them waits between two
+/// attentions.
+type Home<Hidden, R> = HbmTensor<bf16, Chip, RowMajor<Hidden, R>>;
+
+/// A launch of a causal model whose layers interleave in two collections, those of `X` attending
+/// in group `A` and those of `Y` in group `B`, each over pages of its group's cache: both groups'
+/// contexts prepared from their histories, the tokens embedded into the home, the layers and the
+/// final norm by the schedule over each group's places, then the greedy token of each row the
+/// launch returns, in its order.
+impl<
+    'i,
+    's,
+    'b,
+    G,
+    Hidden,
+    E,
+    X,
+    Y,
+    F,
+    A,
+    B,
+    R,
+    P,
+    V,
+    W,
+    Bias,
+    I,
+    C,
+    Env,
+    const FIRST: usize,
+    const SECOND: usize,
+    const ORDER: &'static [Branch],
+>
+    Module<
+        &'i mut interleaved::Input<R, A, B>,
+        Env,
+        interleaved::State<'s, 'b, R, A, B, FIRST, SECOND>,
+    >
+    for ForCausalLM<
+        G,
+        Model<
+            G,
+            Normalized<Backbone<E, Interleave<([X; FIRST], [Y; SECOND]), ORDER>>, F>,
+            (decoder::Paging<A, R>, decoder::Paging<B, R>),
+            P,
+        >,
+        Greedy<Hidden, V, Affine<W, Bias>, Argmax<V, Chip, I>, C>,
+        P,
+    >
+where
+    G: Geometry<Hidden = Hidden>,
+    Hidden: AxisName,
+    A: decoder::Attention<Rotated: AxisName>,
+    B: decoder::Attention<Rotated: AxisName>,
+    R: AxisName,
+    V: AxisName,
+    W: Borrow<HbmTensor<bf16, Chip, m![V, Hidden]>>,
+    Bias: Borrow<HbmTensor<f32, Chip, m![V]>>,
+    I: Borrow<HbmTensor<i32, Chip, m![V]>>,
+    C: Cap<Hidden, V>,
+    decoder::Paging<A, R>: for<'x> Module<
+            (Live<(), R>, &'x mut interleaved::History<R, A>),
+            (),
+            &'x mut (),
+            Output = Context<A, R>,
+        >,
+    decoder::Paging<B, R>: for<'x> Module<
+            (Live<(), R>, &'x mut interleaved::History<R, B>),
+            (),
+            &'x mut (),
+            Output = Context<B, R>,
+        >,
+    E: for<'x, 'y> Module<
+            (&'x Ids<R>, Live<(), R>),
+            (),
+            &'y mut ((), ()),
+            Output = Live<Spread<Hidden, R, Chip>, R>,
+        >,
+    for<'m, 'c, 'h, 'x> Decoder<(
+        &'m Interleave<([X; FIRST], [Y; SECOND]), ORDER>,
+        &'m Named<"norm", F>,
+    )>: Module<
+            (&'h mut Home<Hidden, R>, Live<(), R>),
+            (&'c Context<A, R>, &'c Context<B, R>),
+            &'x mut (
+                (Places<A, R>, [interleaved::Layer<'b, A>; FIRST]),
+                (Places<B, R>, [interleaved::Layer<'b, B>; SECOND]),
+            ),
+            Output = (),
+        >,
+{
+    type Output = ();
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        _: Env,
+        ((first, second), tokens): interleaved::State<'s, 'b, R, A, B, FIRST, SECOND>,
+        input: &'i mut interleaved::Input<R, A, B>,
+    ) {
+        let live = Live::<(), R>::read(&input.count);
+        let (a, b, returned) = &mut input.cache;
+        let rotary = &self.model.rotary_emb;
+        let contexts = (
+            rotary.0.forward(&mut *device, (), &mut (), (live, a)),
+            rotary.1.forward(&mut *device, (), &mut (), (live, b)),
+        );
+        let Then(Backbone { embedding, body }, norm) = &self.model.body;
+        let embedded = embedding.forward(&mut *device, (), &mut ((), ()), (&input.tokens, live));
+        let mut home: Home<Hidden, R> = HbmTensor::new();
+        (embedded.value().view()).to_hbm_view(&mut device.tdma, home.view_mut());
+        let mut places = (
+            (Places::<A, R>::new(), first),
+            (Places::<B, R>::new(), second),
+        );
+        let call = (&contexts.0, &contexts.1);
+        Decoder((body, norm)).forward(&mut *device, call, &mut places, (&mut home, live));
+        let rows: HbmTensor<bf16, Chip, m![R, Hidden]> =
+            crate::Op::forward(&Gather, &mut *device, (&home, &*returned));
+        let rows: Spread<Hidden, R, Chip> = rows.to_dm(&mut device.tdma);
+        let head = self.lm_head.to_dm(&mut *device);
+        let chosen = head.forward(&mut *device, (), &mut (), &rows);
+        tokens.spill(device, &chosen, (live, 0));
     }
 }
