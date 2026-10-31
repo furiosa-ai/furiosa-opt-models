@@ -6,6 +6,7 @@ use super::*;
 use crate::modules::lora;
 use crate::ops::linear::{Matrix, fp8};
 use crate::tensor::form::Weight;
+use crate::tensor::live::Fill;
 use crate::tensor::memory::{Hbm, Memory};
 
 /// A launch's attended rows in HBM: `Groups` query heads of `Head` features for each of `KvHeads`.
@@ -51,7 +52,7 @@ impl<W> Affine<W, ()> {
         let live = Live::<(), Reach>::all().subrange(tile.start(), tile.rows());
         let mut lines = HbmTensor::<bf16, Chip, m![Span, Hidden]>::new();
         self.forward(&mut *device, env, &mut (), (live, &attended, &mut lines));
-        lines.to_dm(&mut device.tdma)
+        lines.fill(device, Live::all().subrange(0, tile.rows()))
     }
 }
 
