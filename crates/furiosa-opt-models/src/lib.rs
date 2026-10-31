@@ -9,7 +9,6 @@
 #![feature(adt_const_params, unsized_const_params)]
 #![feature(const_trait_impl)]
 #![feature(negative_impls, with_negative_coherence)]
-#![cfg_attr(test, feature(float_erf))]
 #![register_tool(furiosa_opt)]
 #![deny(rustdoc::broken_intra_doc_links)]
 #![warn(unreachable_pub)]
