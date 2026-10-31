@@ -27,7 +27,7 @@ pub use cache::{Cache, CacheSpec, Group, Kind, Pool};
 
 use crate::{AsyncModule, Checkpoint, Load, LoadError, forward};
 use furiosa_opt_models::Module;
-use furiosa_opt_models::models::decoder::attention::qwen3::{LmHead, fp8};
+use furiosa_opt_models::models::decoder::attention::qwen3::{Depth, LmHead, fp8};
 use furiosa_opt_models::models::decoder::attention::{
     ForCausalLM, ForSequenceClassification, Geometry, Head, KvHeads,
 };
@@ -323,36 +323,77 @@ pub trait Root {
     type Place: Place;
     type Row: M;
     type Adapting: Adapting<Self::Size>;
+    type View<'a>
+    where
+        Self: 'a;
 }
+
+type LaunchStack = furiosa_opt_models::modules::generic::collection::Stack<
+    furiosa_opt_models::modules::generic::collection::Interval<
+        furiosa_opt_models::tensor::scalar::Value,
+    >,
+>;
+type Rotation<'a, S> = &'a furiosa_opt_models::ops::rotary::group::Table<
+    launch::Positions<S>,
+    furiosa_opt_models::ops::rotary::Row<Head>,
+>;
 
 /// The causal model writes the selected rows' tokens; its projections' form runs its adapters.
 impl<S: Geometry + Decode + 'static, B, P: Adapting<S>> Root
     for ForCausalLM<S, launch::Over<S, B, P>, LmHead<S, Hbm>, P>
+where
+    for<'a> <S as Geometry>::Layers<()>: Depth<S, P, bf16, &'a Hbm, LaunchStack>,
 {
     type Size = S;
     type Place = launch::Tokens<S>;
     type Row = m![1];
     type Adapting = P;
+    type View<'a>
+        = launch::Model<S, P, &'a Hbm, LaunchStack, Rotation<'a, S>>
+    where
+        Self: 'a;
 }
 
 /// The base model writes the selected rows' hidden values; its projections' form runs its
 /// adapters.
-impl<S: Geometry + Decode + 'static, B, P: Adapting<S>> Root for launch::Over<S, B, P> {
+impl<S: Geometry + Decode + 'static, B, P: Adapting<S>> Root for launch::Over<S, B, P>
+where
+    for<'a> <S as Geometry>::Layers<()>: Depth<S, P, bf16, &'a Hbm, LaunchStack>,
+{
     type Size = S;
     type Place = launch::Values<S>;
     type Row = m![{ Symbol<<S as Geometry>::Hidden> }];
     type Adapting = P;
+    type View<'a>
+        = launch::Base<S, P, &'a Hbm, LaunchStack, Rotation<'a, S>>
+    where
+        Self: 'a;
 }
 
 /// The sequence classifier writes the selected rows' scores, label columns first; it runs no
 /// adapter.
 impl<S: Geometry + Decode + 'static, B, P> Root
     for ForSequenceClassification<S, launch::Over<S, B, P>, Classifier<<S as Geometry>::Hidden>, P>
+where
+    for<'a> <S as Geometry>::Layers<()>: Depth<S, P, bf16, &'a Hbm, LaunchStack>,
 {
     type Size = S;
     type Place = launch::Scores<S>;
     type Row = m![{ Symbol<Columns> }];
     type Adapting = Infallible;
+    type View<'a>
+        = ForSequenceClassification<
+        S,
+        launch::Base<S, P, &'a Hbm, LaunchStack, Rotation<'a, S>>,
+        Classifier<
+            <S as Geometry>::Hidden,
+            &'a furiosa_opt_models::ops::linear::affine::Weights<<S as Geometry>::Hidden>,
+            &'a furiosa_opt_models::ops::linear::affine::Bias,
+        >,
+        P,
+    >
+    where
+        Self: 'a;
 }
 
 /// Block-scaled FP8 Qwen3-8B writes the selected rows' tokens; it runs no adapter.
@@ -361,6 +402,15 @@ impl Root for fp8::ForCausalLM {
     type Place = launch::Tokens<Size8B>;
     type Row = m![1];
     type Adapting = Infallible;
+    type View<'a> = fp8::ForCausalLM<
+        launch::Model<
+            Size8B,
+            furiosa_opt_models::models::decoder::form::BlockScaled,
+            &'a Hbm,
+            LaunchStack,
+            Rotation<'a, Size8B>,
+        >,
+    >;
 }
 
 type Size8B = furiosa_opt_models::models::decoder::attention::qwen3::Size<"8B">;
@@ -508,18 +558,19 @@ impl<R: AxisName, W: AxisName> AxisName for Tables<R, W> {
 /// item, so a launch holds the size's call rows.
 impl<R> Decoder for R
 where
-    R: Root + DeviceSend + Send + Sync,
+    R: Root + Send + Sync,
+    for<'v> R::View<'v>: Load<&'v R> + DeviceSend,
     for<'b, 't> <R::Size as Geometry>::Layers<launch::Layer<'b, Held<'t, R>>>:
         TryFrom<Vec<launch::Layer<'b, Held<'t, R>>>> + DeviceSend,
     for<'b> <R::Size as Geometry>::Layers<launch::Layer<'b>>:
         TryFrom<Vec<launch::Layer<'b>>> + DeviceSend,
-    for<'i, 'a, 's, 'b> R: Module<
+    for<'v, 'i, 'a, 's, 'b> R::View<'v>: Module<
             &'i mut launch::Input<'a, R::Size>,
             (),
             launch::State<'s, R::Size, <R::Size as Geometry>::Layers<launch::Layer<'b>>, R::Place>,
             Output = (),
         >,
-    for<'i, 'a, 's, 'b, 't> R: Module<
+    for<'v, 'i, 'a, 's, 'b, 't> R::View<'v>: Module<
             &'i mut launch::Input<'a, R::Size>,
             (),
             launch::State<
@@ -666,29 +717,35 @@ fn limits<S: Geometry + Decode + 'static>(adapters: usize, tiling: Tiling) -> Li
 
 /// One launch of `root` over a call's `input` and its layers' `slots`, writing the selected rows'
 /// outputs into `place`, which it returns once the device accepted the launch.
-fn submit<'i, 'a, R, L>(
+fn submit<'r, 'i, 'a, R, L>(
     device: &mut Device,
-    root: &R,
+    root: &'r R,
     input: &'i mut launch::Input<'a, R::Size>,
     slots: Vec<L>,
     place: R::Place,
 ) -> io::Result<R::Place>
 where
-    R: Root + DeviceSend,
+    R: Root,
+    R::View<'r>: Load<&'r R> + DeviceSend,
     <R::Size as Geometry>::Layers<L>: TryFrom<Vec<L>> + DeviceSend,
-    for<'s> R: Module<
+    for<'s> R::View<'r>: Module<
             &'i mut launch::Input<'a, R::Size>,
             (),
             launch::State<'s, R::Size, <R::Size as Geometry>::Layers<L>, R::Place>,
             Output = (),
         >,
 {
+    let root = R::View::load(
+        &mut furiosa_opt_models::load::Context::new(&mut *device),
+        root,
+    )
+    .map_err(io::Error::other)?;
     let slots: <R::Size as Geometry>::Layers<L> = (slots.try_into())
         .unwrap_or_else(|_| unreachable!("a cache of the decoder's spec holds each layer"));
     let hidden = DeviceOutput::alloc(device).map_err(io::Error::other)?;
     let mut places = (((hidden, slots), ()), place);
     let state: launch::State<'_, R::Size, _, R::Place> = &mut places;
-    launch(forward, (&mut *device, root, (), state, input))
+    launch(forward, (&mut *device, &root, (), state, input))
         .output(&mut ())
         .submit()
         .accepted()

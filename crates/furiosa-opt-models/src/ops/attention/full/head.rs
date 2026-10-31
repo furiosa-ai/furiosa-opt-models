@@ -10,6 +10,7 @@ use crate::tensor::form::Weight;
 use crate::tensor::parallel::Chip;
 use crate::tensor::scalar::F32;
 use furiosa_opt_std::prelude::*;
+use std::borrow::Borrow;
 use std::marker::PhantomData;
 
 axes![Replica = 512];
@@ -36,19 +37,23 @@ where
     }
 }
 
-/// A head norm whose gain the checkpoint stores, and the same norm with the gain written.
-pub(crate) type Stored<Head, const EPSILON: usize> =
-    HeadNorm<Head, Chip, Weight<Replicated<Head>, Chip>, F32<EPSILON>>;
+/// A head norm whose gain the checkpoint stores, held as `T`, and the same norm with the gain
+/// written.
+pub(crate) type Stored<Head, const EPSILON: usize, T = HbmTensor<bf16, Chip, Replicated<Head>>> =
+    HeadNorm<Head, Chip, Weight<Replicated<Head>, Chip, T>, F32<EPSILON>>;
 pub(crate) type Staged<Head, const EPSILON: usize> =
     HeadNorm<Head, Chip, Scale<Head>, F32<EPSILON>>;
 
 /// A head norm with its replicated gain written once in DM, where its forward reads it.
 pub(crate) struct Stage;
 
-impl<Head: AxisName, const EPSILON: usize> Op<&Stored<Head, EPSILON>> for Stage {
+impl<Head: AxisName, const EPSILON: usize, T> Op<&Stored<Head, EPSILON, T>> for Stage
+where
+    T: Borrow<HbmTensor<bf16, Chip, Replicated<Head>>>,
+{
     type Output = Staged<Head, EPSILON>;
 
-    fn forward(&self, device: &mut Device, norm: &Stored<Head, EPSILON>) -> Self::Output {
+    fn forward(&self, device: &mut Device, norm: &Stored<Head, EPSILON, T>) -> Self::Output {
         HeadNorm {
             weight: norm.weight.tensor().to_dm(&mut device.tdma),
             epsilon: F32,
@@ -58,7 +63,10 @@ impl<Head: AxisName, const EPSILON: usize> Op<&Stored<Head, EPSILON>> for Stage 
 }
 
 /// The head norm's gain written, as a front's norm writes it before any rows arrive.
-impl<Head: AxisName, const EPSILON: usize> Op<Begin<()>> for Stored<Head, EPSILON> {
+impl<Head: AxisName, const EPSILON: usize, T> Op<Begin<()>> for Stored<Head, EPSILON, T>
+where
+    T: Borrow<HbmTensor<bf16, Chip, Replicated<Head>>>,
+{
     type Output = Staged<Head, EPSILON>;
 
     fn forward(&self, device: &mut Device, _: Begin<()>) -> Self::Output {

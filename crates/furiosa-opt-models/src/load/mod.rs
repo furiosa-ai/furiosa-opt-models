@@ -360,13 +360,13 @@ mod shapes {
     /// A stack of shapes holds no value: one shape stands for every layer's.
     impl<D, C, S, const N: usize> View<N> for Shape<D, C, S> {
         type Storage = Self;
-        type Layer = Self;
+        type Layer<'a> = Self;
 
-        fn view(_: &Self, _: usize) -> Self {
+        fn view<'a>(_: &'a Self, _: usize) -> Self {
             Self(PhantomData)
         }
 
-        fn stack(_: [Self; N], _: &mut Context<'_>) -> Self {
+        fn stack(_: Vec<Self>, _: &mut Context<'_>) -> Self {
             Self(PhantomData)
         }
     }

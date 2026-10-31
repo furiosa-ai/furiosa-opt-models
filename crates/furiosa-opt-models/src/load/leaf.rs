@@ -3,10 +3,17 @@
 
 use std::future::IntoFuture;
 
+use furiosa_opt_std::prelude::Slice;
 use furiosa_opt_std::prelude::{HbmTensor, HostTensor, M, MaterializableScalar, Pair, m};
 use tokio::task;
 
 use super::{Checkpoint, Context, Load, LoadError};
+
+impl<'a, T> Load<&'a Slice<T>> for &'a Slice<T> {
+    fn load(_: &mut Context<'_>, from: &'a Slice<T>) -> Result<Self, LoadError> {
+        Ok(from)
+    }
+}
 
 /// The leaf at the current name, in HBM; a leaf of a tie target is split into two owners of its
 /// storage, one for each tied field of its type. Chips that each hold every value read one copy.

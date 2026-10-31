@@ -76,9 +76,9 @@ impl TryFrom<&decoder::Config<Spectrum>> for Config {
 
 /// HF `Qwen3ForCausalLM` of a block-scaled E4M3 Qwen3-8B checkpoint: the model its launches run.
 #[derive(DeviceSend, Load)]
-pub struct ForCausalLM {
+pub struct ForCausalLM<M = launch::Model<Size<"8B">, BlockScaled>> {
     #[load(rename = "")]
-    pub model: launch::Model<Size<"8B">, BlockScaled>,
+    pub model: M,
 }
 
 /// Block-scaled E4M3 Qwen3-8B reads a checkpoint at its root, and refuses one whose config is not of

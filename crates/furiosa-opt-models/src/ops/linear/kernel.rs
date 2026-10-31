@@ -13,6 +13,9 @@ use crate::tensor::axis;
 use crate::tensor::live::Live;
 use crate::tensor::mapping::Rows as Layout;
 
+pub(crate) use tiling::Tiling;
+mod tiling;
+
 /// A projection's tiling: the measured choices and the geometry they fix.
 struct Config {
     /// Input features one contraction part holds.
@@ -456,29 +459,6 @@ impl<In: AxisName, Out: AxisName, Rows: AxisName, X: M, B: AxisName> Op<(usize, 
     }
 }
 
-/// How a contraction holds a weight tile: the clusters and slices it spreads over, the rows and
-/// inputs each slice keeps, and the restorations that scale those rows.
-pub(crate) trait Tiling<In: AxisName, Out: AxisName>: 'static {
-    type Cluster: M;
-    type Slices: M;
-    /// Output rows of a tile one slice keeps.
-    type Rows: M;
-    /// Inputs of a row one slice keeps.
-    type Inputs: M;
-    /// The restorations of a slice's rows, each few enough rows that their FP32 scales fit the VRF.
-    type Restorations: prelude::Count;
-    /// Rows one restoration scales.
-    type Restored: M;
-
-    /// Tile `at` of an `[Out, K]` tensor, `K` a row's inputs or its scales, each slice keeping
-    /// `E`: its rows' share of `K`.
-    fn to_dm<D: MaterializableScalar, X: M, K: M, E: M>(
-        device: &mut Device,
-        tensor: &HbmTensor<D, X, m![Out, { K }]>,
-        at: usize,
-    ) -> DmTensor<D, X, Self::Cluster, Self::Slices, E>;
-}
-
 impl<In, Out, Rows, V, U, W, Group> Op<(Live<PhantomData<Rows>, Rows>, V, Group)> for Affine<W, ()>
 where
     In: AxisName,
@@ -835,55 +815,6 @@ where
         }
     }
 }
-
-/// The contraction tiles the tiling names: they divide the widths, fill the slices and fit a
-/// slice's registers and data memory.
-impl<In: AxisName, Out: AxisName> Contraction<In, Out> {
-    const TILED: () = {
-        let c = Self::config();
-        assert!(contraction::legal(
-            In::SIZE,
-            Out::SIZE,
-            (c.chunk, c.block, c.passes)
-        ));
-    };
-}
-
-/// Each slice keeps one output block of a tile over one contraction part; tile `at` is the
-/// `at`-th of the passes.
-impl<In: AxisName, Out: AxisName> Tiling<In, Out> for Contraction<In, Out> {
-    type Cluster = Cluster<In, Out>;
-    type Slices = ProjectionSlices<In, Out>;
-    type Rows = m![Out % ({ Block<In, Out> })];
-    type Inputs = Chunked<In, Out>;
-    type Restorations = Restorations<In, Out>;
-    type Restored = m![Out % ({ Symbol<RestoredRows<In, Out>> })];
-
-    fn to_dm<D: MaterializableScalar, X: M, K: M, E: M>(
-        device: &mut Device,
-        tensor: &HbmTensor<D, X, m![Out, { K }]>,
-        at: usize,
-    ) -> DmTensor<D, X, Cluster<In, Out>, ProjectionSlices<In, Out>, E> {
-        const { Self::TILED };
-        tensor
-            .view()
-            .tile::<SlabIndex<In, Out>, 1, m![Out % (Out / ({ Passes<In, Out> })) # Out, { K }]>(at)
-            .to_dm(&mut device.tdma)
-    }
-}
-
-/// Output rows of a block one restoration scales: a power of two dividing the block, at most 64,
-/// so their FP32 scales take at most 2 KiB of the VRF.
-#[derive(Clone, Debug)]
-pub(crate) struct RestoredRows<In, Out>(PhantomData<(In, Out)>);
-
-impl<In: AxisName, Out: AxisName> AxisName for RestoredRows<In, Out> {
-    const NAME: Ident = Ident::new("RestoredRows");
-    const SIZE: usize = contraction::restored(Contraction::<In, Out>::config().block);
-}
-
-/// The restorations of a slice's block.
-type Restorations<In, Out> = m![Out % ({ Block<In, Out> }) / ({ Symbol<RestoredRows<In, Out>> })];
 
 /// One pass's FP32 sums of a batch of `B` of the `Rows`: every output of each slice's block for
 /// every row lane, before the contraction parts meet.
@@ -1288,7 +1219,7 @@ impl<'i, In: AxisName, Out: AxisName, Rows: AxisName, Chips: M, S: M, E: M, X: M
                 Cluster<In, Out>,
                 ProjectionSlices<In, Out>,
                 m![Out % ({ Block<In, Out> }), 1 # 8],
-            > = Contraction::<In, Out>::to_dm(device, bias, slab);
+            > = Contraction::<In, Out>::to_dm(device, bias.view(), slab);
             Offset(
                 device
                     .main

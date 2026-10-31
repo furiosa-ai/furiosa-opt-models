@@ -174,7 +174,10 @@ mod tests {
             .to_hbm::<Chip, m![H]>(&mut device.pdma)
             .await
             .unwrap();
-        Mlp::new((gate_up, channels), (down, scales))
+        Mlp::new(
+            crate::tensor::form::fp8::Rows::new(gate_up, channels),
+            crate::tensor::form::fp8::Rows::new(down, scales),
+        )
     }
 
     /// The BF16 MLP of the same logical weights.

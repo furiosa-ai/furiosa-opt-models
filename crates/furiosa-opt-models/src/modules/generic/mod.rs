@@ -9,7 +9,7 @@ pub use each::Each;
 pub use fork::Fork;
 use furiosa_opt_std::prelude::{Device, DeviceSend};
 pub use interleave::{Branch, Interleave};
-pub(crate) use layers::Collection;
+pub(crate) use layers::{Collection, Full};
 pub use layers::{Layers, Repeat, Rolled, Unrolled};
 pub(crate) use order::Order;
 pub use sequential::{Sequential, Then};
