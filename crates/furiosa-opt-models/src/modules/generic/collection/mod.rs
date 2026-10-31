@@ -2,6 +2,8 @@ use furiosa_opt_std::prelude::*;
 
 use crate::load::{Checkpoint, Context, Load, LoadError};
 
+pub use interval::Interval;
+
 /// A layer collection owning one backing per parameter kind.
 #[derive(DeviceSend)]
 pub struct Stacked<L: View<N>, const N: usize> {
@@ -195,6 +197,7 @@ impl<'a, D: MaterializableScalar, C: M, S: M, const N: usize> View<N> for &'a Hb
     }
 }
 
+mod interval;
 mod view;
 
 #[cfg(test)]

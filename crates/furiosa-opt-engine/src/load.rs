@@ -24,6 +24,7 @@ use std::str::FromStr;
 
 use crate::registry::{Implementation, Model};
 use furiosa_opt_models::load::{Checkpoint, Context, LoadError, Part};
+use furiosa_opt_models::modules::generic::collection::Interval;
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
 use furiosa_opt_models::tensor::form::fp8::Granularity;
 use furiosa_opt_std::prelude::Device;
@@ -62,7 +63,7 @@ pub enum Quantization {
 pub struct Config {
     architecture: &'static str,
     implementation: &'static Implementation,
-    part: Part,
+    part: Part<Interval<usize>>,
     precision: Dtype,
     kv_cache: Dtype,
     chips: usize,
@@ -176,8 +177,20 @@ impl LoadOptions {
         checkpoint: &Checkpoint,
         visit: impl FnOnce(&Checkpoint) -> Result<R, LoadError>,
     ) -> Result<R, LoadError> {
-        let encoder = (self.part == Part::Encoder).then(|| checkpoint.encoder());
-        let checkpoint = encoder.as_ref().unwrap_or(checkpoint);
+        let part = match (&self.part, &self.layers) {
+            (Part::Encoder, Some(_)) => {
+                return Err(LoadError::InvalidData {
+                    name: "layers".into(),
+                    reason: "decoder layers cannot be selected for a media encoder".into(),
+                });
+            }
+            (Part::Whole | Part::Layers(_), Some(layers)) => Some(Part::Layers(layers.clone())),
+            (Part::Encoder, None) => Some(Part::Encoder),
+            (Part::Whole, None) => None,
+            (Part::Layers(layers), None) => Some(Part::Layers(layers.clone())),
+        };
+        let selected = part.map(|part| checkpoint.selected(part)).transpose()?;
+        let checkpoint = selected.as_ref().unwrap_or(checkpoint);
         let granularity = match self.quantization {
             Some(Quantization::Fp8PerTensor) => Granularity::Tensor,
             Some(Quantization::Fp8PerChannel) => Granularity::Channel,
@@ -203,7 +216,16 @@ impl LoadOptions {
             });
         }
         let (architecture, implementations) = Implementation::listed(&names)?;
-        let implementation = Implementation::choose(architecture, implementations, checkpoint)?;
+        let whole = match checkpoint.part() {
+            Part::Layers(_) => Some(checkpoint.selected(Part::Whole)?),
+            Part::Whole | Part::Encoder => None,
+        };
+        let implementation = Implementation::choose(
+            architecture,
+            implementations,
+            whole.as_ref().unwrap_or(checkpoint),
+        )?;
+        implementation.reads(checkpoint)?;
         let unsupported = |name: &str, reason: &str| LoadError::Unsupported {
             name: name.into(),
             reason: reason.into(),
@@ -220,9 +242,6 @@ impl LoadOptions {
                 "every implementation caches keys and values in BF16",
             ));
         }
-        if self.layers.is_some() {
-            return Err(unsupported("layers", "every implementation loads whole"));
-        }
         if self.adapters && implementation.adapters() == 0 {
             return Err(LoadError::Unsupported {
                 name: "adapters".into(),
@@ -235,7 +254,7 @@ impl LoadOptions {
         Ok(Config {
             architecture,
             implementation,
-            part: checkpoint.part(),
+            part: checkpoint.part().clone(),
             // An implementation serving a quantization holds E4M3 projections: the block-FP8 one
             // serves a checkpoint declaring one, the channel-scaled ones a checkpoint a load
             // quantizes. A media encoder holds BF16 ones whatever its language model's.
@@ -244,7 +263,7 @@ impl LoadOptions {
                 checkpoint.declaration(),
                 checkpoint.quantization(),
             ) {
-                (Part::Encoder, ..) | (Part::Whole, None, None) => Dtype::BF16,
+                (Part::Encoder, ..) | (Part::Whole | Part::Layers(_), None, None) => Dtype::BF16,
                 _ => Dtype::F8_E4M3,
             },
             kv_cache: Dtype::BF16,
@@ -271,8 +290,8 @@ impl Config {
     }
 
     /// The part of the model the implementation reads.
-    pub fn part(&self) -> Part {
-        self.part
+    pub fn part(&self) -> &Part<Interval<usize>> {
+        &self.part
     }
 
     /// The form of the implementation's projection weights.
@@ -323,6 +342,27 @@ mod tests {
     use super::LoadOptions;
     use furiosa_opt_models::load::{Checkpoint, LoadError};
     use serde_json::json;
+
+    /// An encoder load refuses a decoder interval before its reader runs, so no weight is read.
+    #[test]
+    fn refuses_encoder_interval() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = json!({"num_hidden_layers": 2});
+        let checkpoint = Checkpoint::new(directory.path(), Some(config)).unwrap();
+        let mut read = false;
+        let refused = LoadOptions::new()
+            .encoder()
+            .layers(0..1)
+            .read(&checkpoint, |_| {
+                read = true;
+                Ok(())
+            });
+        assert!(
+            !read,
+            "the reader ran for an encoder load of a decoder interval"
+        );
+        assert!(matches!(refused, Err(LoadError::InvalidData { name, .. }) if name == "layers"));
+    }
 
     /// A config's architecture is the first of its `architectures`, then its `_class_name`, that the
     /// registry lists, refused or not, past any unknown name; names it lists none of are invalid.

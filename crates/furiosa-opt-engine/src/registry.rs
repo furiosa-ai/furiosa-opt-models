@@ -19,6 +19,7 @@ use furiosa_opt_models::models::decoder::form;
 use furiosa_opt_models::models::decoder::launch;
 use furiosa_opt_models::models::vision_language::gemma4_unified;
 use furiosa_opt_models::models::{Class, Implements};
+use furiosa_opt_models::modules::generic::collection::Interval;
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
 use furiosa_opt_models::tensor::memory::Hbm;
 
@@ -800,6 +801,7 @@ pub struct Implementation {
     size: &'static str,
     class: Class,
     scope: fn(&Checkpoint) -> Result<&'static str, LoadError>,
+    reads: fn(&Part<Interval<usize>>) -> Result<(), LoadError>,
     adapters: usize,
     load: fn(&mut Context<'_>, &Checkpoint, Tiling) -> Result<Model, LoadError>,
 }
@@ -828,7 +830,7 @@ pub trait Listed: Implements + for<'a> Load<&'a Checkpoint> + Sized + 'static {
     const ADAPTERS: usize = 0;
 
     /// Refuses a load of `part`, which the type does not read.
-    fn reads(part: Part) -> Result<(), LoadError>;
+    fn reads(part: &Part<Interval<usize>>) -> Result<(), LoadError>;
 
     /// The type as a framework serves it, its calls attending tiled as `tiling` says.
     fn served(self, tiling: Tiling) -> Model;
@@ -838,12 +840,16 @@ pub trait Listed: Implements + for<'a> Load<&'a Checkpoint> + Sized + 'static {
 impl<D: Implements + for<'a> Load<&'a Checkpoint> + Decoder + 'static> Listed for D {
     const ADAPTERS: usize = <D as Decoder>::ADAPTERS;
 
-    fn reads(part: Part) -> Result<(), LoadError> {
+    fn reads(part: &Part<Interval<usize>>) -> Result<(), LoadError> {
         match part {
             Part::Whole => Ok(()),
             Part::Encoder => Err(LoadError::Unsupported {
                 name: "encoder".into(),
                 reason: "a decoder holds no media encoder that loads alone".into(),
+            }),
+            Part::Layers(_) => Err(LoadError::Unsupported {
+                name: "layers".into(),
+                reason: "this decoder requires whole-model execution".into(),
             }),
         }
     }
@@ -859,10 +865,8 @@ impl Implementation {
         Self {
             size: T::SIZE,
             class: T::CLASS,
-            scope: |source| {
-                T::reads(source.part())?;
-                T::scope(source)
-            },
+            scope: T::scope,
+            reads: T::reads,
             adapters: T::ADAPTERS,
             load: |context, source, tiling| Ok(T::load(context, source)?.served(tiling)),
         }
@@ -895,7 +899,10 @@ impl Implementation {
     ) -> Result<&'static Self, LoadError> {
         let (mut served, mut refused) = (Vec::new(), Vec::new());
         for implementation in implementations {
-            match (implementation.scope)(source) {
+            match implementation
+                .reads(source)
+                .and_then(|()| (implementation.scope)(source))
+            {
                 Ok(_) => served.push(implementation),
                 Err(refusal) => refused.push(refusal),
             }
@@ -927,6 +934,7 @@ impl Implementation {
         source: &Checkpoint,
         tiling: Tiling,
     ) -> Result<Model, LoadError> {
+        self.reads(source)?;
         let scope = (self.scope)(source)?;
         context.field("", scope, |cx| (self.load)(cx, source, tiling))
     }
@@ -944,6 +952,18 @@ impl Implementation {
     /// Adapters a call of the decoder runs at most: none when its projections take none.
     pub fn adapters(&self) -> usize {
         self.adapters
+    }
+
+    pub(crate) fn reads(&self, source: &Checkpoint) -> Result<(), LoadError> {
+        match source.part() {
+            Part::Layers(interval) => {
+                if interval.origin() == 0 && source.depth().ok() == Some(interval.count()) {
+                    return (self.reads)(&Part::Whole);
+                }
+                (self.reads)(source.part())
+            }
+            Part::Whole | Part::Encoder => (self.reads)(source.part()),
+        }
     }
 }
 
@@ -1019,6 +1039,44 @@ mod tests {
         Implementation::of::<Fixture<false>>(),
         Implementation::of::<Fixture<true>>(),
     ];
+
+    /// A full layer interval keeps whole-model admission and its checked coordinates.
+    #[test]
+    fn admits_full_interval() {
+        use furiosa_opt_models::load::Part;
+        let directory = tempfile::tempdir().unwrap();
+        let source = Checkpoint::new(
+            directory.path(),
+            Some(serde_json::json!({
+                "size": "small", "num_hidden_layers": 4,
+            })),
+        )
+        .unwrap()
+        .selected(Part::Layers(0..4))
+        .unwrap();
+        let chosen = Implementation::choose("Causal", SIZES, &source).unwrap();
+        assert_eq!(chosen.size(), "small");
+        assert!(matches!(source.part(), Part::Layers(interval) if interval.range() == (0..4)));
+    }
+
+    /// A valid partial selection is refused before loading a decoder that executes every layer.
+    #[test]
+    fn refuses_partial_interval() {
+        use furiosa_opt_models::load::Part;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = Checkpoint::new(
+            directory.path(),
+            Some(serde_json::json!({
+                "size": "small", "num_hidden_layers": 4,
+            })),
+        )
+        .unwrap()
+        .selected(Part::Layers(1..3))
+        .unwrap();
+        let refused = SIZES[0].reads(&source);
+        assert!(matches!(refused, Err(LoadError::Unsupported { name, .. }) if name == "layers"));
+    }
 
     /// Every name is listed once, and parses to its row: one with implementations to them, a
     /// refused one as unsupported, by its name.
