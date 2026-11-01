@@ -67,9 +67,10 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -yqq libgl1 libglib2.0-0t64
           python -c 'import cv2'
-      # SGLang pins a pre-release dependency, which uv resolves only when allowed.
+      # SGLang pins a pre-release dependency, which uv resolves only when allowed. PEFT merges the
+      # LoRA adapters of the tests' Transformers reference.
       - if: matrix.framework == 'sglang'
-        run: uv pip install --prerelease=allow products/furiosa_opt_{engine,sglang}-*.whl pytest
+        run: uv pip install --prerelease=allow products/furiosa_opt_{engine,sglang}-*.whl pytest peft==0.21.2
       # Run outside the checkout so the installed wheel, not the source package, is imported.
       - working-directory: ${{ runner.temp }}
         run: pytest -p no:cacheprovider "$GITHUB_WORKSPACE/integrations/furiosa-opt-$FRAMEWORK/tests"

@@ -16,14 +16,13 @@ from furiosa_opt_sglang.admission import (
     Speculations,
     Standalone,
 )
+from furiosa_opt_sglang.lora.options import Lora
 from furiosa_opt_sglang.platform import Platform
 
 
 @pytest.mark.parametrize(
     ("flags", "option"),
     [
-        pytest.param(["--enable-lora"], "enable_lora", marks=pytest.mark.feature("LoRA")),
-        (["--lora-paths", "adapter=/nonexistent"], "lora_paths"),
         pytest.param(
             ["--speculative-algorithm", "EAGLE"],
             "speculative_algorithm",
@@ -89,7 +88,7 @@ def test_refuses_unserved_cache(dtype: str) -> None:
 def test_reads_only_options_sglang_declares() -> None:
     """Every option the platform reads is an SGLang server option, so none reads as missing."""
     declared = set(ServerArgs.__annotations__)
-    for served in (Requested, Resolved, Recurrent, Hierarchical, Disaggregation):
+    for served in (Requested, Resolved, Recurrent, Hierarchical, Disaggregation, Lora):
         assert set(served.model_fields) <= declared, served.__name__
 
 

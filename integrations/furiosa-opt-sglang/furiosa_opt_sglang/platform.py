@@ -80,6 +80,10 @@ class Platform(SRTPlatform):
         server_args.device = "cpu"
         server_args.dtype = "bfloat16"
         model_config = model_config_of(server_args)
+        if resolved.lora:
+            from furiosa_opt_sglang.lora.options import admit
+
+            admit(server_args)
         # The engine refuses from the config alone, before a scheduler starts or a weight downloads,
         # what the scheduler's load of these options would.
         from furiosa_opt_sglang.checkpoint import configured
@@ -92,6 +96,7 @@ class Platform(SRTPlatform):
                 tensor,
                 resolved.kv_cache_dtype,
                 deterministic=resolved.enable_deterministic_inference,
+                adapters=resolved.lora,
             ).parse(configured(server_args.model_path, server_args.revision, overrides))
         except (NotImplementedError, ValueError) as error:
             raise Refused("model_path", str(error)) from None
