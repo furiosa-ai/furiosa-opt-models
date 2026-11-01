@@ -296,7 +296,13 @@ where
 
 /// The HF layer type whose rotary spectrum and attention window a paging load binds.
 pub trait LayerType {
+    /// The name `rope_parameters` keys the type's spectrum by; `None` reads the config's one
+    /// spectrum.
     const NAME: Option<&'static str>;
+
+    /// The config field that bounds the positions a row of the type attends back to; `None` for a
+    /// type that attends over the context its spectrum was trained for.
+    const WINDOW: Option<&'static str> = None;
 }
 
 impl LayerType for () {
@@ -327,11 +333,12 @@ where
             max_position_embeddings: NonZeroUsize,
         }
         context.checkpoint(from, |cx| {
-            let (spectrum, trained) = match Layer::NAME {
+            let (spectrum, positions) = match Layer::NAME {
                 None => {
                     let spectrum: Spectrum = config::parse(from.config()).map_err(refusal)?;
                     let trained: Trained = config::parse(from.config()).map_err(refusal)?;
-                    (spectrum, trained.max_position_embeddings)
+                    let positions = spectrum.context(trained.max_position_embeddings);
+                    (spectrum, positions)
                 }
                 Some(layer) => {
                     let (_, spectra) = cx.config_value(from, "rope_parameters")?;
@@ -344,16 +351,19 @@ where
                             name: "config.json:rope_parameters".into(),
                             reason: format!("layer type {layer:?} has no rotary spectrum"),
                         })?;
-                    let key = match layer {
-                        "sliding_attention" => "sliding_window",
-                        _ => "max_position_embeddings",
+                    let mut extent = |field| -> Result<NonZeroUsize, LoadError> {
+                        let (_, extent) = cx.config_value(from, field)?;
+                        config::parse(extent).map_err(refusal)
                     };
-                    let (_, trained) = cx.config_value(from, key)?;
-                    (spectrum, config::parse(trained).map_err(refusal)?)
+                    // A window is no trained context: the spectrum does not rescale it.
+                    let positions = match Layer::WINDOW {
+                        Some(window) => extent(window)?.get(),
+                        None => spectrum.context(extent("max_position_embeddings")?),
+                    };
+                    (spectrum, positions)
                 }
             };
             let frequencies = spectrum.bind::<Head, Rotated>().map_err(refusal)?;
-            let positions = spectrum.context(trained);
             Load::load(cx, (&frequencies, positions))
         })
     }

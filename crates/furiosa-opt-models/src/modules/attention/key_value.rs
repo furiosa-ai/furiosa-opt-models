@@ -22,6 +22,7 @@ use crate::tensor::memory::{Hbm, Memory};
 use crate::tensor::scalar::Value;
 use crate::tensor::{live::Live, parallel::Chip};
 use furiosa_opt_std::prelude::*;
+use furiosa_opt_std::runtime::{Access, Bind};
 use std::borrow::Borrow;
 use std::marker::PhantomData;
 
@@ -186,6 +187,8 @@ pub struct Paging<
     coefficients: Coefficients<Rotated, Chips, X::Tensor<f32, Chips, m![Rotated]>>,
     /// Longest visible history in tokens.
     window: X::Tensor<i32, Chips, m![1]>,
+    /// The same, on the host.
+    visible: Visible,
     /// Window `w`'s first token, negated: `-512 w` on every row.
     starts: X::Tensor<i32, Chips, m![Windows, { Packets<Rows> }]>,
     /// Window `w`'s first table row in bytes: `128 w` on every row.
@@ -195,6 +198,34 @@ pub struct Paging<
     /// The middle of each window slot, `t + 1/2`, on every row.
     slots: X::Tensor<f32, Chips, m![Rows, Cache]>,
     shape: PhantomData<fn() -> (Heads, Head, D, Layer)>,
+}
+
+/// A paging's longest visible history in tokens as the host keeps it: a launch binds none of it.
+#[derive(Clone, Copy, Debug)]
+struct Visible(usize);
+
+impl DeviceSend for Visible {
+    fn arguments<'a>(&'a self, _: Access, _: &mut Bind<'a, '_>) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+impl<
+    Heads: AxisName,
+    Head: AxisName,
+    Rows: AxisName,
+    Windows: AxisName,
+    D,
+    X: Memory,
+    Chips: M + 'static,
+    Rotated: AxisName,
+    Layer,
+> Paging<Heads, Head, Rows, Windows, D, X, Chips, Rotated, Layer>
+{
+    /// The longest history a row attends, in tokens, as the load bound it.
+    pub fn window(&self) -> usize {
+        self.visible.0
+    }
 }
 
 /// The constants of rows that turn at `frequencies` and attend at most `positions` positions,
@@ -250,6 +281,7 @@ where
             Load::load(cx, frequencies)
         })?;
         let frequencies = frequencies.coordinates().repeat(Rows::SIZE * Chips::SIZE);
+        let visible = Visible(window);
         let window = vec![window as i32; Chips::SIZE];
         let block = (BlockIndex::SIZE * size_of::<i32>()) as i32;
         let zeros = vec![0; Rows::SIZE * Chips::SIZE];
@@ -263,6 +295,7 @@ where
             window: cx.field("window", "window", |cx| {
                 Load::load(cx, HostTensor::from_vec(window))
             })?,
+            visible,
             starts: cx.field("starts", "starts", |cx| {
                 let starts = windows(&|w| -((w * Cache::SIZE) as i32));
                 Load::load(cx, HostTensor::from_vec(starts))
@@ -348,6 +381,7 @@ where
             })?,
             coefficients,
             window: context.field("window", "window", |cx| Load::load(cx, &from.window))?,
+            visible: from.visible,
             starts: context.field("starts", "starts", |cx| Load::load(cx, &from.starts))?,
             rows: context.field("rows", "rows", |cx| Load::load(cx, &from.rows))?,
             zeros: context.field("zeros", "zeros", |cx| Load::load(cx, &from.zeros))?,
@@ -670,6 +704,14 @@ mod tests {
         const NAME: Option<&'static str> = Some(NAME);
     }
 
+    /// A layer type whose rows attend back as far as its config's field `WINDOW` says.
+    struct Windowed<const NAME: &'static str, const WINDOW: &'static str>;
+
+    impl<const NAME: &'static str, const WINDOW: &'static str> LayerType for Windowed<NAME, WINDOW> {
+        const NAME: Option<&'static str> = Some(NAME);
+        const WINDOW: Option<&'static str> = Some(WINDOW);
+    }
+
     /// Scoped layer types bind their own window and the frequencies of their rotated coordinates.
     #[test]
     fn binds_layer_constants() {
@@ -683,7 +725,7 @@ mod tests {
             Host,
             Chip,
             Sliding,
-            Layer<"sliding_attention">,
+            Windowed<"sliding_attention", "sliding_window">,
         >;
         type FullPaging =
             Paging<Heads, Full, Eight, Windows, bf16, Host, Chip, Rotated, Layer<"full_attention">>;
@@ -713,6 +755,10 @@ mod tests {
             serde_json::from_value(serde_json::json!({"rope_parameters": sliding})).unwrap();
         let full: Spectrum =
             serde_json::from_value(serde_json::json!({"rope_parameters": full})).unwrap();
+        assert_eq!(
+            (sliding_paging.window(), full_paging.window()),
+            (1024, 36864)
+        );
         assert_eq!(sliding_paging.window.0.into_vec(), [1024]);
         assert_eq!(full_paging.window.0.into_vec(), [36864]);
         assert_eq!(

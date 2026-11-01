@@ -225,6 +225,7 @@ pub mod full {
 
 impl LayerType for sliding::Group {
     const NAME: Option<&'static str> = Some(LAYER_TYPES[0]);
+    const WINDOW: Option<&'static str> = Some("sliding_window");
 }
 
 impl LayerType for full::Group {
