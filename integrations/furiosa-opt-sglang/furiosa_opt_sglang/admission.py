@@ -77,7 +77,6 @@ class Requested(Served):
     )
 
 
-LORA: Final = "serves no LoRA adapter; omit --enable-lora and --lora-paths"
 # SGLang's quantizations at load whose computation the engine serves: E4M3 weights restored to
 # BF16 before each product, the activations kept in BF16.
 Quantization = Literal["fp8"]
@@ -97,8 +96,8 @@ class Resolved(Served):
     dcp_size: Literal[1] = Field(description="requires dcp_size=1")
     attn_cp_size: Literal[1] = Field(description="requires attn_cp_size=1")
     attn_dp_size: Literal[1] = Field(description="requires attn_dp_size=1")
-    enable_lora: Unset = Field(description=LORA)
-    lora_paths: Unset = Field(description=LORA)
+    enable_lora: bool | None
+    lora_paths: object
     quantization: Quantization | None = Field(description=QUANTIZATION)
     quantization_param_path: Unset
     enable_hisparse: Unset
@@ -138,6 +137,12 @@ class Resolved(Served):
     disable_overlap_schedule: bool
     enable_deterministic_inference: bool
     enable_hierarchical_cache: bool
+
+    @property
+    def lora(self) -> bool:
+        """Whether SGLang serves LoRA adapters: `--enable-lora`, or `--lora-paths` unless LoRA is
+        disabled, as SGLang resolves them after the platform."""
+        return bool(self.enable_lora) or (self.enable_lora is None and bool(self.lora_paths))
 
 
 class Hierarchical(Served):

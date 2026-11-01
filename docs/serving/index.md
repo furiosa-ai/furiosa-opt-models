@@ -33,7 +33,7 @@ Install a plugin first ([Installation](../getting-started/installation.md)); [Qu
 | Tensor parallelism over a compiled chip count | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Data parallelism | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Run data-parallel replicas](#run-data-parallel-replicas) |
 | Pipeline, expert and context parallelism | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
-| LoRA | <span class="support support-yes">Supported</span> | <span class="support support-no">Not yet</span> | [Serve LoRA adapters](#serve-lora-adapters) |
+| LoRA | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Serve LoRA adapters](#serve-lora-adapters) |
 | Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache) | <span class="support support-yes">Supported</span> (NIXL) | <span class="support support-yes">Supported</span> (Mooncake over TCP) | [Disaggregate prefill and decode](#disaggregate-prefill-and-decode) |
 | Disaggregated encoder and encoder caches | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Per-request metrics | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Report per-request metrics](#report-per-request-metrics) |
@@ -389,25 +389,43 @@ Each response can carry its own timings beside the server's aggregated metrics:
 
 ## Serve LoRA adapters
 
-With vLLM, each request may name a LoRA adapter of the served model, saved as PEFT saves it; requests of different adapters and of the base model share a step.
+Each request may name a LoRA adapter of the served model, saved as PEFT saves it; requests of different adapters and of the base model share a step.
 The engine adds an adapter's updates to the attention projections `q_proj`, `k_proj`, `v_proj` and `o_proj` and the MLP projections `gate_proj`, `up_proj` and `down_proj`, up to rank 32, at most two adapters a step.
 [Qwen3 0.6B](../models/qwen3-0.6b.md) on one chip runs them, its tokens those of Transformers with each adapter merged by PEFT; `--enable-lora` with a quantized checkpoint, such as the block-scaled FP8 [Qwen3 8B](../models/qwen3-8b.md), or with an online quantization is refused at startup, as those loads run no adapter.
 
-```python
-from vllm import LLM, SamplingParams
-from vllm.lora.request import LoRARequest
+=== "vLLM"
 
-llm = LLM("Qwen/Qwen3-0.6B", enable_lora=True, max_loras=2, max_lora_rank=32)
-sky = LoRARequest("sky", 1, "/path/to/adapter")
-outputs = llm.generate(["Why is the sky blue?"], SamplingParams(temperature=0), lora_request=sky)
-```
+    ```python
+    from vllm import LLM, SamplingParams
+    from vllm.lora.request import LoRARequest
 
-A loaded adapter is held in host memory; the device holds the `max_loras` active ones, in adapter storage taken before the KV cache sizes, so a load after startup takes no device memory.
-`max_loras` sets the adapters a step runs, at most 2, and `max_cpu_loras` the adapters kept loaded, the least recently used unloaded first; an inactive adapter a step names is copied into the storage of a free slot or of the least recently used unpinned active adapter.
-`llm.llm_engine.add_lora`, `pin_lora` and `remove_lora` act on the loaded adapters: a load also makes its adapter one of the `max_loras` active ones, as vLLM activates every adapter it adds, and a pinned adapter stays loaded and active until it is removed, so a load while `max_loras` pinned adapters are active is refused and changes nothing; a `LoRARequest` with `load_inplace=True` replaces the adapter of its ID.
+    llm = LLM("Qwen/Qwen3-0.6B", enable_lora=True, max_loras=2, max_lora_rank=32)
+    sky = LoRARequest("sky", 1, "/path/to/adapter")
+    outputs = llm.generate(["Why is the sky blue?"], SamplingParams(temperature=0), lora_request=sky)
+    ```
+
+    A loaded adapter is held in host memory; the device holds the `max_loras` active ones, in adapter storage taken before the KV cache sizes, so a load after startup takes no device memory.
+    `max_loras` sets the adapters a step runs, at most 2, and `max_cpu_loras` the adapters kept loaded, the least recently used unloaded first; an inactive adapter a step names is copied into the storage of a free slot or of the least recently used unpinned active adapter.
+    `llm.llm_engine.add_lora`, `pin_lora` and `remove_lora` act on the loaded adapters: a load also makes its adapter one of the `max_loras` active ones, as vLLM activates every adapter it adds, and a pinned adapter stays loaded and active until it is removed, so a load while `max_loras` pinned adapters are active is refused and changes nothing; a `LoRARequest` with `load_inplace=True` replaces the adapter of its ID.
+
+=== "SGLang"
+
+    ```bash
+    python -m sglang.launch_server --model-path Qwen/Qwen3-0.6B --enable-lora --lora-paths sky=/path/to/adapter
+    ```
+
+    A `/generate` or `/encode` request names its adapter in `lora_path`, and an OpenAI request in its model, as `"model": "Qwen/Qwen3-0.6B:sky"`.
+    `/load_lora_adapter` with `{"lora_name": ..., "lora_path": ...}` adds an adapter while the server runs, `/load_lora_adapter_from_tensors` adds one from its configuration and serialized factors, and `/unload_lora_adapter` with `{"lora_name": ...}` removes it; a request that names an adapter unloaded this way loads it again.
+    Each load is a new adapter under a new ID: a request reads no prefix that a request of an earlier load of the same name cached, and an unload frees the adapter once the steps already running with it end.
+    A loaded adapter is held in host memory; the device holds `--max-loras-per-batch` of them, the base model's entry included, in the entries of SGLang's own adapter pool, which take their device memory before the KV cache sizes, so a load after startup takes no device memory and `--max-loaded-loras` bounds the loaded adapters as SGLang does.
+    A batch that names an adapter no entry holds loads it into the entry SGLang's `--lora-eviction-policy` frees, never one the batch or a pinned adapter holds; SGLang refuses to pin the last entry.
+    A batch runs at most two adapters, the adapters one engine call runs, within SGLang's own bound of `--max-loras-per-batch`; requests of other adapters wait for a later batch.
+    A load whose configuration, added tokens or factors are malformed is refused, and the server keeps serving.
+    NGRAM speculation verifies each request's drafts with its adapter; SGLang itself refuses LoRA with STANDALONE speculation.
 
 The adapter directory holds `adapter_config.json` and `adapter_model.safetensors`.
-An adapter that adapts another module, such as the embedding or the output head, or that uses DoRA, bias terms or per-module ranks is refused when it loads, naming what it holds, before any of it reaches the device; [vLLM options](vllm.md#options) lists the refused settings.
+An adapter that adapts another module, such as the embedding or the output head, or that uses DoRA, bias terms or per-module ranks is refused when it loads, naming what it holds, before any of it reaches the device; [vLLM options](vllm.md#options) and [SGLang options](sglang.md#options) list the refused settings.
+An embedding model's adapter names its modules as PEFT names those of the causal model of the same checkpoint.
 
 ## Keep outputs independent of the batch
 
@@ -473,6 +491,5 @@ Why each feature is not served yet:
 - **FP8 KV cache and quantized checkpoints**: the served checkpoints load BF16 weights and cache keys and values in BF16.
 - **Online quantization** with methods other than vLLM's `fp8_per_tensor` and SGLang's `fp8`: the other methods quantize the activations too or use other formats.
 - **Tensor, pipeline, expert and context parallelism**, and serving across nodes: each served checkpoint runs on one chip.
-- **LoRA with SGLang**: `--enable-lora` and `--lora-paths` are refused; the SGLang plugin runs no adapter yet.
 - **KV connectors other than vLLM's NIXL ones, and transports other than Mooncake over TCP with SGLang**: Mooncake, MoRIIO and LMCache reach vLLM's cache without host buffers ([Disaggregate prefill and decode](#disaggregate-prefill-and-decode)).
 - **A disaggregated encoder**: only the [encoder-only instance](#embed-media-on-an-encoder-only-instance) runs.

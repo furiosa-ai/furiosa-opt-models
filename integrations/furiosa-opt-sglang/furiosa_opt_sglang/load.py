@@ -28,12 +28,17 @@ if TYPE_CHECKING:
 
 
 def options(
-    model_config: ModelConfig, tensor: int, dtype: CacheDtype, *, deterministic: bool
+    model_config: ModelConfig,
+    tensor: int,
+    dtype: CacheDtype,
+    *,
+    deterministic: bool,
+    adapters: bool,
 ) -> engine.LoadOptions:
     """The engine's options of the load of `model_config`'s checkpoint: on `tensor` chips, with the
     cache dtype SGLang spells `dtype`, batch invariant under deterministic inference, quantized
     where SGLang quantizes it at load, as its base model when SGLang pools the hidden rows of a
-    causal checkpoint."""
+    causal checkpoint, and for calls that run LoRA adapters when SGLang enables LoRA."""
     from sglang.srt.configs.model_config import is_generation_model
     from transformers.models.auto.modeling_auto import MODEL_MAPPING_NAMES
 
@@ -56,7 +61,7 @@ def options(
         if base is None:
             raise ValueError(f"{hf_config.architectures} has no base model to embed with")
         loads = loads.architecture(base)
-    return loads
+    return loads.adapters() if adapters else loads
 
 
 def quantization(
@@ -78,7 +83,7 @@ def bind(model_config: ModelConfig, first: int) -> Model:
     options the platform checked at startup: its causal model to generate with, or its base model
     when SGLang pools hidden rows."""
     from sglang.srt.environ import envs
-    from sglang.srt.runtime_context import get_exec, get_model, get_server_args
+    from sglang.srt.runtime_context import get_exec, get_lora, get_model, get_server_args
 
     import furiosa_opt_engine as engine
     from furiosa_opt_sglang.checkpoint import checkout, text
@@ -90,6 +95,8 @@ def bind(model_config: ModelConfig, first: int) -> Model:
     # The platform admitted only cache dtypes it spells for the engine.
     dtype = cast("CacheDtype", settings.kv_cache_dtype)
     deterministic = cast("bool", get_exec().deterministic.enable_deterministic_inference)
+    # SGLang resolved `--lora-paths` into `enable_lora` after the platform.
+    adapters = bool(cast("bool | None", get_lora().enable_lora))
     overrides = cast("dict[str, JsonValue]", model_config.model_override_args)
     # SGLang's environment accessor returns Any even for string options.
     if cast("str | None", envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.get()) is not None:
@@ -104,7 +111,7 @@ def bind(model_config: ModelConfig, first: int) -> Model:
     # The operator's options keep the tensor degree the platform resolved to one scheduler.
     tensor = cast("int", get_server_args().tp_size)
     try:
-        loads = options(model_config, tensor, dtype, deterministic=deterministic)
+        loads = options(model_config, tensor, dtype, deterministic=deterministic, adapters=adapters)
         loads.parse(checkpoint.mapped())
     except (NotImplementedError, ValueError) as error:
         raise Refused("model_path", str(error)) from None

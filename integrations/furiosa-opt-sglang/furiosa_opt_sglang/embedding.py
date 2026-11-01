@@ -24,7 +24,9 @@ def pool(
     """Every prompt row's hidden state, pooled."""
     lengths = batch.extend_lens
     snapshot = Batch.parse(integers(batch.input_ids), lengths, integers(batch.seq_lens))
-    hidden = sequence.forward(runner, batch, snapshot, every=True, feed={})
+    hidden = sequence.forward(
+        runner, batch, snapshot, adapters=runner.bound(batch), every=True, feed={}
+    )
     rows = torch.cat([torch.as_tensor(block.to_host().numpy()) for _, block in hidden])
     output = model.pooler.forward(rows, forward_batch)
     if forward_batch.return_pooled_hidden_states:

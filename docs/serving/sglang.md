@@ -27,10 +27,15 @@ The platform accepts these values:
 | `--enable-hierarchical-cache` | A model without recurrent state, with the host tier sized by `--hicache-ratio` or `--hicache-size` and kept in memory: `--hicache-host-memory-mode cache`, `--hicache-io-backend kernel`, `--hicache-mem-layout page_first`, no `--hicache-storage-backend` and no memory saver |
 | `--quantization` | Unset, or `fp8` to [quantize a BF16 checkpoint at load](index.md#quantize-a-bf16-checkpoint-at-load) |
 | `--speculative-draft-model-quantization` | Unset, which takes the target's, `unquant`, or `fp8` |
+| `--max-lora-rank` | Unset or at most 32, the rank the engine's adapter terms hold ([Serve LoRA adapters](index.md#serve-lora-adapters)) |
+| `--lora-target-modules` | Unset, `all`, or attention and MLP projections: `q_proj`, `k_proj`, `v_proj`, `qkv_proj`, `o_proj`, `gate_proj`, `up_proj`, `gate_up_proj`, `down_proj` |
+| `--max-loras-per-batch` | Any: the entries of SGLang's adapter pool, each an adapter on the device taken before the KV cache sizes; a batch still runs at most two adapters, the adapters one engine call runs |
+| `--lora-backend`, `--max-lora-chunk-size`, `--lora-strict-loading` | Any, without effect: the engine computes the updates and refuses an adapter tensor no update reads |
 
 These features are not supported yet, and the plugin refuses them at startup rather than ignore them:
 
-- LoRA and speculative algorithms other than NGRAM and STANDALONE.
+- Speculative algorithms other than NGRAM and STANDALONE.
+- LoRA on a model whose load runs no adapter, such as the block-scaled FP8 Qwen3 8B, with overlapped adapter loading (`--enable-lora-overlap-loading`) or on experts (`--experts-shared-outer-loras`, `--lora-use-virtual-experts`); an adapter that adds tokens to the vocabulary or holds no `adapter_model.safetensors` is refused when it loads.
 - Speculative decoding with more than one candidate a position, adaptive speculation or an external n-gram corpus.
 - Watermarking (`--enable-watermark`) and strict thinking (`--enable-strict-thinking`), which change the scores of each step.
 - Quantization methods other than `fp8`, of the target or of a STANDALONE draft model, and quantization parameter files.
