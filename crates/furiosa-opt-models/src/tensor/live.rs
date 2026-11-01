@@ -165,10 +165,14 @@ impl<X, R: AxisName> Live<X, R> {
         if self.rows == R::SIZE {
             every(context);
         } else {
-            let first = (T::SIZE - self.start % T::SIZE) % T::SIZE;
-            let first = first.min(self.rows);
-            for lane in 0..first {
-                row(context, self.start + lane);
+            let lead = (T::SIZE - self.start % T::SIZE) % T::SIZE;
+            let first = lead.min(self.rows);
+            // Built only for a lead that may be nonzero, as a device loop must be able to run: a
+            // start known aligned when the kernel compiles has no leading rows.
+            if lead > 0 {
+                for lane in 0..first {
+                    row(context, self.start + lane);
+                }
             }
             let tiles = (self.rows - first) / T::SIZE;
             for tile in 0..tiles {
