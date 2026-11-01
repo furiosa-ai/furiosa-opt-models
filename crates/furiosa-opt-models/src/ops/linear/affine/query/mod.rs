@@ -146,7 +146,8 @@ mod tests {
                 let value = value.forward(&mut *device, live, &mut (), Begin(()));
                 let mut launch = value.forward(&mut *device, live, &mut (), Begin(()));
                 let key = key.forward(&mut *device, live, &mut (), Begin(()));
-                let query = query.forward(&mut *device, live, &mut (), Begin(()));
+                let begun = query.forward(&mut *device, live, &mut (), Begin(Begin(())));
+                let query = query.forward(&mut *device, live, &mut (), begun);
                 let mut rows = Normalized::new();
                 for span in 0..live.count::<Span>() {
                     let tile = live.tile::<Span>(span);
@@ -546,7 +547,8 @@ mod tests {
         let value = value.forward(&mut *device, live, &mut (), Begin(()));
         let mut launch = value.forward(&mut *device, live, &mut (), Begin(()));
         let key = key.forward(&mut *device, live, &mut (), Begin(()));
-        let query = query.forward(&mut *device, live, &mut (), Begin(()));
+        let begun = query.forward(&mut *device, live, &mut (), Begin(Begin(())));
+        let query = query.forward(&mut *device, live, &mut (), begun);
         let query_norm = norms.0.forward(&mut *device, live, &mut (), Begin(()));
         let key_norm = norms.1.forward(&mut *device, live, &mut (), Begin(()));
         let stage = KeyValue {

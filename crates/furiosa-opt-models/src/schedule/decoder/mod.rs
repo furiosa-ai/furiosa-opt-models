@@ -18,11 +18,12 @@
 //! - The DMA engine serves transfers in issue order, so weights issue one part ahead of their use
 //!   and behind the small transfers of the work they overlap: the first down panel behind the
 //!   output projection's rows, the first gate/up pair behind the exchange of its partial sums,
-//!   the other down panels behind the gate/up pairs and the down's inputs, the next layer's query
-//!   projection behind them and its key and value projections under its input norm. An
-//!   attention's working set fills most of data memory, so only the output projection lands
-//!   during one, once its last history is in flight. A form whose leaves land nothing ahead takes
-//!   the same steps, doing nothing in them.
+//!   the other down panels behind the last gate/up pair, the next layer's value and key
+//!   projections and its query projection's first half behind the down's inputs, and the second
+//!   half behind the exchange that ends the down projection. An attention's working set fills
+//!   most of data memory, so only the output projection lands during one, once its last history
+//!   is in flight. A form whose leaves land nothing ahead takes the same steps, doing nothing in
+//!   them.
 
 use crate::Begin;
 use crate::Module;
@@ -210,10 +211,12 @@ trait Cut<Z: Geometry + Decode + 'static, A: States> {
     fn update(&self, device: &mut Device, staged: Self::Staged, adapters: &mut A) -> RowTile<Z>;
 }
 
-/// The forms a layer's input norm, query projection and head norms take for a tile's rows,
-/// landed: the norm's gain, the query form and the two head norms' forms.
-struct Front<G, Q, QN, KN> {
+/// The forms a layer's input norm, projections and head norms take for a tile's rows, landed: the
+/// norm's gain, the value and key forms, the query form begun, and the two head norms' forms.
+struct Front<G, V, K, Q, QN, KN> {
     gain: G,
+    value: V,
+    key: K,
     query: Q,
     query_norm: QN,
     key_norm: KN,
@@ -229,10 +232,11 @@ struct Staged<R, Z: Geometry + Decode> {
 /// The pre-norm layer, in every form whose leaves take each step. The value projection's form
 /// `VB`, begun, begins the launch whose periods it stages in `F` and gives as `PP` (pairs of tiles)
 /// and `PS` (single tiles); the key and query forms `KB`, `QB` give a period's heads `KHP`, `QHP`
-/// (`KHS`, `QHS`), which the head norms' forms `KNB`, `QNB` leave as the rotation reads them. The
-/// output projection lands as `OL`; the MLP's gate/up form `GB` gives `GO` and its gating `SO`,
-/// whose down projection lands a weight panel as `DP`, stages the product as `DS`, lands its
-/// inputs as `DL` and, with its last panel, as `DR`.
+/// (`KHS`, `QHS`), which the head norms' forms `KNB`, `QNB` leave as the rotation reads them; the
+/// query form lands as `QS` first. The output projection lands as `OL`; the MLP's gate/up form
+/// `GB` begins as `GS` and gives `GO` and its gating `SO`, whose down projection lands a weight
+/// panel as `DP`, stages the product as `DS`, lands its inputs as `DL` and, with its last panel,
+/// as `DR`.
 impl<
     Z,
     H,
@@ -251,6 +255,7 @@ impl<
     VB,
     F,
     KB,
+    QS,
     QB,
     QNB,
     KNB,
@@ -262,6 +267,7 @@ impl<
     KHS,
     OL,
     GB,
+    GS,
     GO,
     SO,
     DP,
@@ -312,7 +318,8 @@ where
     K: for<'x> Module<Begin<()>, Live<(), Capacity<Z>>, &'x mut (), Output = KB>,
     KB: for<'r, 'x> Module<&'r PP, Live<(), Capacity<Z>>, &'x mut T::Key, Output = KHP>
         + for<'r, 'x> Module<&'r PS, Live<(), Capacity<Z>>, &'x mut T::Key, Output = KHS>,
-    Q: for<'x> Module<Begin<()>, Live<(), Capacity<Z>>, &'x mut (), Output = QB>,
+    Q: for<'x> Module<Begin<Begin<()>>, Live<(), Capacity<Z>>, &'x mut (), Output = Begin<QS>>
+        + for<'x> Module<Begin<QS>, Live<(), Capacity<Z>>, &'x mut (), Output = QB>,
     QB: for<'r, 'x> Module<&'r PP, Live<(), Capacity<Z>>, &'x mut T::Query, Output = QHP>
         + for<'r, 'x> Module<&'r PS, Live<(), Capacity<Z>>, &'x mut T::Query, Output = QHS>,
     QN: for<'x> Module<Begin<()>, Live<(), Capacity<Z>>, &'x mut (), Output = QNB>,
@@ -340,7 +347,12 @@ where
         >,
     G: for<'x> Module<Begin<()>, (), &'x mut (), Output = GB>
         + for<'r, 'x> Module<
-            (GB, Live<&'r Owned<Width<Z>, Span>, Capacity<Z>>),
+            Begin<(GB, Live<&'r Owned<Width<Z>, Span>, Capacity<Z>>)>,
+            (),
+            &'x mut (),
+            Output = GS,
+        > + for<'r, 'x> Module<
+            (GS, Live<&'r Owned<Width<Z>, Span>, Capacity<Z>>),
             (),
             &'x mut T::GateUp,
             Output = GO,
@@ -352,7 +364,7 @@ where
         + for<'x> Module<(DL, DP), (), &'x mut (), Output = DR>
         + for<'x> Module<Live<DR, Capacity<Z>>, (), &'x mut T::Down, Output = Owned<Width<Z>, Span>>,
 {
-    type Front = Front<<Stage as crate::Op<&'static Norm<Z>>>::Output, QB, QNB, KNB>;
+    type Front = Front<<Stage as crate::Op<&'static Norm<Z>>>::Output, VB, KB, Begin<QS>, QNB, KNB>;
     type Landed = OL;
     type Staged = Staged<DR, Z>;
 
@@ -363,7 +375,7 @@ where
                 Positioned {
                     projection:
                         NormalizedQkv {
-                            projection: Projection { query, .. },
+                            projection: Projection { query, key, value },
                             query_norm,
                             key_norm,
                         },
@@ -371,12 +383,16 @@ where
                 },
             ..
         } = &attention.0;
-        let query = query.forward(&mut *device, tile, &mut (), Begin(()));
+        let value = value.forward(&mut *device, tile, &mut (), Begin(()));
+        let gain = crate::Op::forward(&Stage, &mut *device, &norm.0);
+        let key = key.forward(&mut *device, tile, &mut (), Begin(()));
+        let query = query.forward(&mut *device, tile, &mut (), Begin(Begin(())));
         let query_norm = query_norm.forward(&mut *device, tile, &mut (), Begin(()));
         let key_norm = key_norm.forward(&mut *device, tile, &mut (), Begin(()));
-        let gain = crate::Op::forward(&Stage, &mut *device, &norm.0);
         Front {
             gain,
+            value,
+            key,
             query,
             query_norm,
             key_norm,
@@ -397,20 +413,26 @@ where
                 Positioned {
                     projection:
                         NormalizedQkv {
-                            projection: Projection { key, value, .. },
+                            projection: Projection { query, .. },
                             ..
                         },
                     positions,
                 },
             ..
         } = &attention.0;
+        let Front {
+            gain,
+            value,
+            key,
+            query: begun,
+            query_norm,
+            key_norm,
+        } = front;
         let tile = rows.with(());
-        // The periods read the key and value projections after the queries', so they land here,
-        // under the input norm, behind the exchange that ends the down projection.
-        let key = key.forward(&mut *device, tile, &mut (), Begin(()));
-        let value = value.forward(&mut *device, tile, &mut (), Begin(()));
+        // The query's second half lands behind the down's exchange, which it would delay.
+        let query = query.forward(&mut *device, tile, &mut (), begun);
         let mut launch = value.forward(&mut *device, tile, &mut (), Begin(()));
-        let normalized = front.gain.forward(&mut *device, (), &mut (), &rows);
+        let normalized = gain.forward(&mut *device, (), &mut (), &rows);
         // The rows the periods read lie apart from the launch, which the period loops carry.
         let mut home = Normalized::new();
         home.spill(&mut *device, normalized.value(), (tile, tile.rows()));
@@ -433,7 +455,7 @@ where
             period(
                 device,
                 positions,
-                (&front, &key, &value),
+                ((&query, &key, &value), (&query_norm, &key_norm)),
                 tile,
                 landed,
                 start,
@@ -451,7 +473,7 @@ where
             period(
                 device,
                 positions,
-                (&front, &key, &value),
+                ((&query, &key, &value), (&query_norm, &key_norm)),
                 tile,
                 landed,
                 start,
@@ -489,16 +511,16 @@ where
         let attended = sum.forward(&mut *device, (), &mut (), (&input, &projected));
         let normalized = gain.forward(&mut *device, (), &mut (), &attended);
         let rows = tile.with(normalized.value());
-        let projected = gate_up.forward(&mut *device, (), adapters.gate_up(), (ahead, rows));
-        // The second down panel lands under the last gate/up pair and the gating, the third behind
-        // the down projection's inputs, so the projection starts on its first two panels; the next
-        // part's weights land behind the third.
+        let begun = gate_up.forward(&mut *device, (), &mut (), Begin((ahead, rows)));
+        // The other down panels land behind the last gate/up pair, under its contractions, so the
+        // down's inputs follow them and the next part's weights land under the down projection.
         let second = down.forward(&mut *device, (), &mut (), Begin(1usize));
+        let third = down.forward(&mut *device, (), &mut (), Begin(2usize));
+        let projected = gate_up.forward(&mut *device, (), adapters.gate_up(), (begun, rows));
         let product = SwiGlu.forward(&mut *device, (), &mut (), tile.with(projected));
         let product = tile.with(product);
         let staged = down.forward(&mut *device, (), &mut (), Begin((product, first)));
         let landing = down.forward(&mut *device, (), &mut (), tile.with((staged, second)));
-        let third = down.forward(&mut *device, (), &mut (), Begin(2usize));
         let ready = down.forward(&mut *device, (), &mut (), (landing, third));
         Staged { ready, attended }
     }
@@ -513,15 +535,15 @@ where
     }
 }
 
-/// A period of `G` tiles of a tile's rows through a layer's projections, their forms begun in
-/// `front`, `key` and `value` and running with `adapters`, stored at row `start` of `stored`, its
+/// A period of `G` tiles of a tile's rows through a layer's projections and head norms, their
+/// forms landed and the projections running with `adapters`, stored at row `start` of `stored`, its
 /// rows landed and its rotation's coefficients landed by `landing` from `index`: the queries
 /// projected, normalized, rotated and stored while the keys and values project, then the keys
 /// normalized, rotated and stored with the values.
-fn period<Z, G, P, GN, V, K, Q, QN, KN, QH, KH, T: States>(
+fn period<Z, G, P, V, K, Q, QN, KN, QH, KH, T: States>(
     device: &mut Device,
     positions: &Rotary<Head>,
-    (front, key, value): (&Front<GN, Q, QN, KN>, &K, &V),
+    ((query, key, value), (query_norm, key_norm)): ((&Q, &K, &V), (&QN, &KN)),
     tile: Live<(), Capacity<Z>>,
     ((landing, index), rows): (Landing<'_, G, Z>, P),
     start: usize,
@@ -535,12 +557,6 @@ fn period<Z, G, P, GN, V, K, Q, QN, KN, QH, KH, T: States>(
     QN: for<'x> Module<QH, Live<(), Capacity<Z>>, &'x mut (), Output = Queries<G, Z>>,
     KN: for<'x> Module<KH, Live<(), Capacity<Z>>, &'x mut (), Output = Pairs<G>>,
 {
-    let Front {
-        query,
-        query_norm,
-        key_norm,
-        ..
-    } = front;
     let Stored { queries, retained } = stored;
     let projected = query.forward(&mut *device, tile, adapters.query(), &rows);
     // Behind the period's rows, which the projection reads first.
