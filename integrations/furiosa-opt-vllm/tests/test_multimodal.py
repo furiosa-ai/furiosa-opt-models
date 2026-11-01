@@ -17,8 +17,8 @@ if TYPE_CHECKING:
 pytestmark = pytest.mark.filterwarnings(
     "ignore:`max_length` is ignored when `padding`=`True`:UserWarning:transformers.*"
 )
-# The checkpoints whose media encoder the engine loads alone; the engine serves no language model of
-# theirs yet, so the inventory lists none of them for media.
+# The checkpoints whose media encoder the engine loads alone; their language models take token IDs,
+# so the inventory lists none of them for media.
 ENCODERS = [
     pytest.param(
         "unsloth/gemma-4-12b-it-NVFP4", "b1f649734b34aa5575b03d186abd1b9be3d0d5c4", id="gemma4"

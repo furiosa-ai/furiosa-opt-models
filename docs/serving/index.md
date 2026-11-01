@@ -360,7 +360,7 @@ vllm serve unsloth/gemma-4-12b-it-NVFP4 \
   --ec-transfer-config '{"ec_connector": "ECExampleConnector", "ec_role": "ec_producer", "ec_connector_extra_config": {"shared_storage_path": "/tmp/encoder-cache"}}'
 ```
 
-Each item's rows, one for each of its placeholder tokens, are written to `<shared_storage_path>/<item hash>/encoder_cache.safetensors`. No instance reads them yet: the engine serves no language model of the checkpoint, so the plugin refuses the `ec_consumer` and `ec_both` roles, and SGLang serves neither half.
+Each item's rows, one for each of its placeholder tokens, are written to `<shared_storage_path>/<item hash>/encoder_cache.safetensors`. No instance reads them yet: the checkpoint's language model takes token IDs, not these rows, so the plugin refuses the `ec_consumer` and `ec_both` roles, and SGLang serves neither half.
 
 ## Choose the chips
 
@@ -385,7 +385,7 @@ Why each feature is not served yet:
 - **Sampling, logprobs and logit changes**: structured outputs (and so a `required` or named tool choice), custom logits processors, watermarking, penalties and logit bias. A decoder call returns each row's greedy token, not the scores of the vocabulary.
 - **Reranking and score heads**: SGLang's reranking reads the logprobs of two tokens; vLLM's reranking and either plugin's classification run a score head, which the engine loads but neither plugin calls yet.
 - **Prompt embeddings**: a decoder call takes token IDs.
-- **Multimodal inputs**: no served checkpoint answers about images, video or audio; Gemma 4 unified's media encoder runs [on an encoder-only instance](#embed-media-on-an-encoder-only-instance), but the engine serves no language model of it.
+- **Multimodal inputs**: no served checkpoint answers about images, video or audio. Gemma 4 12B's language model serves text under `--language-model-only`, as its calls take token IDs, and its media encoder runs [on an encoder-only instance](#embed-media-on-an-encoder-only-instance), whose rows no instance reads yet.
 - **Speculative methods other than ngram and suffix** (vLLM, which also has no draft model yet) or NGRAM and STANDALONE (SGLang).
 - **FP8 KV cache and quantized checkpoints**: the served checkpoints load BF16 weights and cache keys and values in BF16.
 - **Online quantization** with SGLang, and with vLLM any method but `fp8_per_tensor`: the other methods quantize the activations too or use other formats, and the SGLang plugin passes no quantization to the load.

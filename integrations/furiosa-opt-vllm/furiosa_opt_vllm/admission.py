@@ -327,8 +327,8 @@ CONTRACTS: Final = (
         ),
         "offloads the KV cache without sleep mode, which frees the cache its host tier copies",
     ),
-    # A consumer needs the checkpoint's language model, which the engine does not serve; of vLLM's
-    # connectors, the example one saves a producer's host rows as they are.
+    # A consumer hands the rows to the checkpoint's language model, whose calls take token IDs; of
+    # vLLM's connectors, the example one saves a producer's host rows as they are.
     Contract(
         "ec_transfer_config",
         lambda c: (
