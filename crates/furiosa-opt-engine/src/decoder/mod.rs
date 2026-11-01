@@ -13,9 +13,10 @@
 //!   attention: under `Tiling::Fixed` a row's values do not depend on the other rows of its calls.
 //! - A call may run its requests with LoRA adapters: the caller's list of them, which a request
 //!   names an adapter of by its index (`adapter`); the batch keeps the list it checked.
-//! - A `Root` of the decoder family's catalog is a decoder of one launch a call: the host plans
-//!   the rows' positions, cache slots, attention work and selected rows, and the launch writes the
-//!   selected rows' outputs in kept order.
+//! - A `Root` of the decoder family's catalog is a decoder of one launch a call, which writes the
+//!   selected rows' outputs in kept order. Its base model's constants that prepare each launch's
+//!   attention context bind the call (`Groups`): a size's rotary table reads the rows' positions,
+//!   cache slots, attention work and selected rows the host plans in one cache group.
 
 mod adapters;
 mod batch;
@@ -27,7 +28,7 @@ pub use cache::{Cache, CacheSpec, Group, Kind, Pool};
 
 use crate::{AsyncModule, Checkpoint, Load, LoadError, forward};
 use furiosa_opt_models::Module;
-use furiosa_opt_models::models::decoder::attention::qwen3::{LmHead, fp8};
+use furiosa_opt_models::models::decoder::attention::qwen3::{self, LmHead, fp8};
 use furiosa_opt_models::models::decoder::attention::{
     ForCausalLM, ForSequenceClassification, Geometry, Head, KvHeads,
 };
@@ -314,33 +315,51 @@ impl<D: Decoder> Served for Instance<D> {
     }
 }
 
-/// A root of the decoder family's catalog, which a call launches once: of the size `Size`, writing
-/// each selected row's output, `Row` elements, into `Place` in order, its projections running
-/// with the adapters `Adapting` gives.
+/// A root of the decoder family's catalog, which a call launches once: of the size `Size`, its
+/// base model's body `Body` and the constants `Groups` that prepare each launch's attention context
+/// from what a call stages, which bind the call; the place its launch writes each selected row's
+/// output in, `Row` elements, in order; and the adapters its projections run with, `Adapting`.
 pub trait Root {
-    type Size: Geometry + Attention + Decode + 'static;
+    type Size: Geometry;
+    type Groups;
+    type Body;
     type Place: Place;
     type Row: M;
-    type Adapting: Adapting<Self::Size>;
+    type Adapting;
+
+    /// The constants that prepare each call's attention context.
+    fn groups(&self) -> &Self::Groups;
 }
 
 /// The causal model writes the selected rows' tokens; its projections' form runs its adapters.
-impl<S: Geometry + Attention + Decode + 'static, B, P: Adapting<S>> Root
+impl<S: Geometry + Attention + Decode + 'static, B, P> Root
     for ForCausalLM<S, launch::Over<S, B, P>, LmHead<S, Hbm>, P>
 {
     type Size = S;
+    type Groups = launch::Position<S>;
+    type Body = B;
     type Place = launch::Tokens<S>;
     type Row = m![1];
     type Adapting = P;
+
+    fn groups(&self) -> &Self::Groups {
+        &self.model.rotary_emb
+    }
 }
 
 /// The base model writes the selected rows' hidden values; its projections' form runs its
 /// adapters.
-impl<S: Geometry + Attention + Decode + 'static, B, P: Adapting<S>> Root for launch::Over<S, B, P> {
+impl<S: Geometry + Attention + Decode + 'static, B, P> Root for launch::Over<S, B, P> {
     type Size = S;
+    type Groups = launch::Position<S>;
+    type Body = B;
     type Place = launch::Values<S>;
     type Row = m![{ Symbol<<S as Geometry>::Hidden> }];
     type Adapting = P;
+
+    fn groups(&self) -> &Self::Groups {
+        &self.rotary_emb
+    }
 }
 
 /// The sequence classifier writes the selected rows' scores, label columns first; it runs no
@@ -349,20 +368,70 @@ impl<S: Geometry + Attention + Decode + 'static, B, P> Root
     for ForSequenceClassification<S, launch::Over<S, B, P>, Classifier<<S as Geometry>::Hidden>, P>
 {
     type Size = S;
+    type Groups = launch::Position<S>;
+    type Body = B;
     type Place = launch::Scores<S>;
     type Row = m![{ Symbol<Columns> }];
     type Adapting = Infallible;
+
+    fn groups(&self) -> &Self::Groups {
+        &self.model.rotary_emb
+    }
 }
 
 /// Block-scaled FP8 Qwen3-8B writes the selected rows' tokens; it runs no adapter.
 impl Root for fp8::ForCausalLM {
     type Size = Size8B;
+    type Groups = launch::Position<Size8B>;
+    type Body = qwen3::CatalogBody<Size8B, form::BlockScaled, bf16, Hbm>;
     type Place = launch::Tokens<Size8B>;
     type Row = m![1];
     type Adapting = Infallible;
+
+    fn groups(&self) -> &Self::Groups {
+        &self.model.model.rotary_emb
+    }
 }
 
 type Size8B = furiosa_opt_models::models::decoder::attention::qwen3::Size<"8B">;
+
+/// How a root's constants that prepare each launch's attention context bind a call of the root
+/// `R`: the cache groups its body's layers page, the views a call borrows of them, the adapters its
+/// calls run, and the one launch of the root over what a call stages.
+pub trait Groups<R: Root> {
+    /// Adapters a call runs at most.
+    const ADAPTERS: usize;
+    /// An adapter a call may run its requests with, or `Infallible` for a root that runs none.
+    type Adapter: Send + Sync + 'static;
+    /// The views a call borrows of a cache's layers, each group's.
+    type Layers: Send + 'static;
+
+    /// What one call holds when its rows' attention is tiled as `tiling` says.
+    fn limits(&self, tiling: Tiling) -> Limits;
+
+    /// Views of `storage`, the layers of a cache allocated for the root.
+    fn layers(storage: &[HbmBuffer]) -> io::Result<Self::Layers>;
+
+    /// `checkpoint`, a PEFT LoRA checkpoint, loaded onto `device` as an adapter of the root;
+    /// refused for a root that runs none.
+    fn adapter(_: &Checkpoint, _: &mut Device) -> Result<Self::Adapter, LoadError> {
+        Err(LoadError::Unsupported {
+            name: "adapters".into(),
+            reason: "the decoder's projections take no adapter".into(),
+        })
+    }
+
+    /// Launches `root` once over the call `batch` plans on `layers`, its rows' attention tiled as
+    /// `tiling` says, and returns the place the launch writes the selected rows' outputs in, once
+    /// the device accepted it.
+    fn launch(
+        root: &R,
+        device: &mut Device,
+        layers: &mut Self::Layers,
+        batch: Batch<'_, Self::Adapter>,
+        tiling: Tiling,
+    ) -> impl Future<Output = io::Result<R::Place>> + Send;
+}
 
 /// The adapters a call of a root of the size `S` may run its rows with: LoRA terms of every dense
 /// BF16 projection, or none.
@@ -490,44 +559,81 @@ impl<E: M> Place for furiosa_opt_std::prelude::HbmTensor<f32, Chip, E> {
     }
 }
 
-/// A catalog root as a decoder: a call plans its rows' positions, cache slots, attention work and
-/// selected rows on the host, then launches the root once over every layer's own blocks, which
-/// writes the selected rows' outputs in kept order; a call that runs adapters passes each layer's
-/// projections their terms and selections of the rows. Under a fixed tiling every row is a work
-/// item, so a launch holds the size's call rows.
+/// A catalog root as a decoder: a call is the one launch its constants' groups bind, which writes
+/// the selected rows' outputs in kept order.
 impl<R> Decoder for R
 where
-    R: Root + DeviceSend + Send + Sync,
-    for<'b, 't> <R::Size as Geometry>::Layers<launch::Layer<'b, Held<'t, R>>>:
-        TryFrom<Vec<launch::Layer<'b, Held<'t, R>>>> + DeviceSend,
-    for<'b> <R::Size as Geometry>::Layers<launch::Layer<'b>>:
+    R: Root + Send + Sync,
+    R::Groups: Groups<R>,
+{
+    const OUTPUT: Output = <R::Place as Place>::OUTPUT;
+    const ADAPTERS: usize = <R::Groups as Groups<R>>::ADAPTERS;
+    type Output = Rows<<R::Place as Place>::Scalar, R::Row>;
+    type Layers = <R::Groups as Groups<R>>::Layers;
+    type Adapter = <R::Groups as Groups<R>>::Adapter;
+
+    fn limits(&self, tiling: Tiling) -> Limits {
+        self.groups().limits(tiling)
+    }
+
+    fn layers(storage: &[HbmBuffer]) -> io::Result<Self::Layers> {
+        <R::Groups as Groups<R>>::layers(storage)
+    }
+
+    fn adapter(checkpoint: &Checkpoint, device: &mut Device) -> Result<Self::Adapter, LoadError> {
+        <R::Groups as Groups<R>>::adapter(checkpoint, device)
+    }
+
+    fn call(
+        &self,
+        device: &mut Device,
+        layers: &mut Self::Layers,
+        batch: Batch<'_, Self::Adapter>,
+        tiling: Tiling,
+    ) -> impl Future<Output = io::Result<Self::Output>> + Send {
+        let kept = batch.kept().len();
+        let place = <R::Groups as Groups<R>>::launch(self, device, layers, batch, tiling);
+        async move { Rows::new(&place.await?.into_buffer(), 0..kept) }
+    }
+}
+
+/// The rotary table of a size's launch binds one cache group, every layer's blocks, whose rows'
+/// positions, cache slots, attention work and selected rows the host plans; a call that runs
+/// adapters passes each layer's projections their terms and selections of the rows. Under a fixed
+/// tiling every row is a work item, so a launch holds the size's call rows.
+impl<R, S> Groups<R> for launch::Position<S>
+where
+    R: Root + DeviceSend + Sync,
+    S: Geometry + Attention + Decode + 'static,
+    R::Adapting: Adapting<S>,
+    for<'b, 't> <S as Geometry>::Layers<launch::Layer<'b, Held<'t, R, S>>>:
+        TryFrom<Vec<launch::Layer<'b, Held<'t, R, S>>>> + DeviceSend,
+    for<'b> <S as Geometry>::Layers<launch::Layer<'b>>:
         TryFrom<Vec<launch::Layer<'b>>> + DeviceSend,
     for<'i, 'a, 's, 'b> R: Module<
-            &'i mut launch::Input<'a, R::Size>,
+            &'i mut launch::Input<'a, S>,
             (),
-            launch::State<'s, R::Size, <R::Size as Geometry>::Layers<launch::Layer<'b>>, R::Place>,
+            launch::State<'s, S, <S as Geometry>::Layers<launch::Layer<'b>>, R::Place>,
             Output = (),
         >,
     for<'i, 'a, 's, 'b, 't> R: Module<
-            &'i mut launch::Input<'a, R::Size>,
+            &'i mut launch::Input<'a, S>,
             (),
             launch::State<
                 's,
-                R::Size,
-                <R::Size as Geometry>::Layers<launch::Layer<'b, Held<'t, R>>>,
+                S,
+                <S as Geometry>::Layers<launch::Layer<'b, Held<'t, R, S>>>,
                 R::Place,
             >,
             Output = (),
         >,
 {
-    const OUTPUT: Output = <R::Place as Place>::OUTPUT;
-    const ADAPTERS: usize = <R::Adapting as Adapting<R::Size>>::ADAPTERS;
-    type Output = Rows<<R::Place as Place>::Scalar, R::Row>;
+    const ADAPTERS: usize = <R::Adapting as Adapting<S>>::ADAPTERS;
+    type Adapter = <R::Adapting as Adapting<S>>::Adapter;
     type Layers = Vec<Blocks<KvHeads, Head>>;
-    type Adapter = <R::Adapting as Adapting<R::Size>>::Adapter;
 
     fn limits(&self, tiling: Tiling) -> Limits {
-        limits::<R::Size>(Self::ADAPTERS, tiling)
+        limits::<S>(<Self as Groups<R>>::ADAPTERS, tiling)
     }
 
     fn layers(storage: &[HbmBuffer]) -> io::Result<Self::Layers> {
@@ -537,93 +643,91 @@ where
     }
 
     fn adapter(checkpoint: &Checkpoint, device: &mut Device) -> Result<Self::Adapter, LoadError> {
-        <R::Adapting as Adapting<R::Size>>::adapter(checkpoint, device)
+        <R::Adapting as Adapting<S>>::adapter(checkpoint, device)
     }
 
     // The root is captured and launched in place, never held across an await: that `Send` check
     // erases lifetimes and cannot prove the root's higher-ranked bounds.
-    fn call(
-        &self,
+    fn launch(
+        root: &R,
         device: &mut Device,
         layers: &mut Self::Layers,
         batch: Batch<'_, Self::Adapter>,
         tiling: Tiling,
-    ) -> impl Future<Output = io::Result<Self::Output>> + Send {
-        let root = self;
+    ) -> impl Future<Output = io::Result<R::Place>> + Send {
         async move {
             let mut reads = batch.operands::<
-                launch::Capacity<R::Size>,
-                <R::Size as Decode>::Reach,
-                <R::Size as Decode>::Sequences,
+                launch::Capacity<S>,
+                <S as Decode>::Reach,
+                <S as Decode>::Sequences,
                 KvHeads,
-                <R::Size as Attention>::Groups,
+                <S as Attention>::Groups,
                 Head,
-                launch::Waves<R::Size>,
-                <R::Size as Decode>::Windows,
+                launch::Waves<S>,
+                <S as Decode>::Windows,
             >(0, tiling)?;
             if let Some(binding) = batch.adapters() {
-                reads.extend(binding.selections::<launch::Capacity<R::Size>, Rank<1>>());
-                reads.extend(binding.selections::<launch::Capacity<R::Size>, Rank<2>>());
+                reads.extend(binding.selections::<launch::Capacity<S>, Rank<1>>());
+                reads.extend(binding.selections::<launch::Capacity<S>, Rank<2>>());
             }
             // ponytail: placed each call; a load-lifetime place would spare two small uploads a
             // call.
-            let masks = Masks::<<R::Size as Decode>::Windows>::new(device).await?;
+            let masks = Masks::<<S as Decode>::Windows>::new(device).await?;
             // Staged last, so nothing of the size's axes is held across an await.
             let (staged, views) = batch
                 .stage::<
-                    launch::Capacity<R::Size>,
-                    Tables<launch::Capacity<R::Size>, <R::Size as Decode>::Windows>,
+                    launch::Capacity<S>,
+                    Tables<launch::Capacity<S>, <S as Decode>::Windows>,
                     Chip,
                 >(device, (&[], &reads), (0, Table::Blocks))
                 .await?;
             let mut views = views.into_iter();
             let mut next =
                 || (views.next()).ok_or_else(|| io::Error::other("a read array is missing"));
-            let operands: launch::Operands<R::Size> = key_value::Operands {
+            let operands: launch::Operands<S> = key_value::Operands {
                 batch: key_value::Batch {
                     positions: alias(&next()?, ..)?,
                     slot: alias(&next()?, ..)?,
                 },
-                work: launch::Work::<R::Size>::bind(&mut next, &masks)?,
+                work: launch::Work::<S>::bind(&mut next, &masks)?,
                 selected: Selected {
                     live: alias(&next()?, ..)?,
                     rows: alias(&next()?, ..)?,
                 },
                 slots: PhantomData,
             };
-            let tokens: launch::Ids<R::Size> = alias(&staged.tokens, ..)?;
-            let mut input: launch::Input<'_, R::Size> = Input::new(tokens, staged.count, &operands);
+            let tokens: launch::Ids<S> = alias(&staged.tokens, ..)?;
+            let mut input: launch::Input<'_, S> = Input::new(tokens, staged.count, &operands);
             let place = DeviceOutput::alloc(device).map_err(io::Error::other)?;
-            let place = match batch.adapters() {
+            match batch.adapters() {
                 None => {
                     let slots = (layers.iter_mut())
                         .map(|blocks| ((Default::default(), blocks, ()), ()))
                         .collect();
-                    submit(device, root, &mut input, slots, place)?
+                    launched::<R, S, _>(device, root, &mut input, slots, place)
                 }
                 Some(binding) => {
                     let selections = (
-                        adapters::selected::<launch::Capacity<R::Size>, Rank<1>>(&mut next)?,
-                        adapters::selected::<launch::Capacity<R::Size>, Rank<2>>(&mut next)?,
+                        adapters::selected::<launch::Capacity<S>, Rank<1>>(&mut next)?,
+                        adapters::selected::<launch::Capacity<S>, Rank<2>>(&mut next)?,
                     );
                     let held = binding.held();
                     let slots = (layers.iter_mut().enumerate())
                         .map(|(at, blocks)| {
                             let states =
-                                <R::Adapting as Adapting<R::Size>>::states(held, at, &selections);
+                                <R::Adapting as Adapting<S>>::states(held, at, &selections);
                             ((Default::default(), blocks, ()), states)
                         })
                         .collect();
-                    submit(device, root, &mut input, slots, place)?
+                    launched::<R, S, _>(device, root, &mut input, slots, place)
                 }
-            };
-            Rows::new(&place.into_buffer(), 0..batch.kept().len())
+            }
         }
     }
 }
 
-/// What each layer's projections of the root `R` run with in a call of adapters.
-type Held<'t, R> = <<R as Root>::Adapting as Adapting<<R as Root>::Size>>::States<'t>;
+/// What each layer's projections of the root `R` of the size `S` run with in a call of adapters.
+type Held<'t, R, S> = <<R as Root>::Adapting as Adapting<S>>::States<'t>;
 
 /// What a launch of the size `S` holds, its rows tiled as `tiling` says: the context its size is
 /// compiled for, one paged group of every layer's blocks, `adapters` adapters, and the launch's
@@ -653,37 +757,48 @@ fn limits<S: Geometry + Attention + Decode + 'static>(adapters: usize, tiling: T
     }
 }
 
-/// One launch of `root` over a call's `input` and its layers' `slots`, writing the selected rows'
-/// outputs into `place`, which it returns once the device accepted the launch.
-fn submit<'i, 'a, R, L>(
+/// The one launch of a size `S`'s root over a call's `input` and its layers' `slots`, writing the
+/// selected rows' outputs into `place`, which it returns once the device accepted the launch.
+fn launched<'i, 'a, R, S, L>(
     device: &mut Device,
     root: &R,
-    input: &'i mut launch::Input<'a, R::Size>,
+    input: &'i mut launch::Input<'a, S>,
     slots: Vec<L>,
     place: R::Place,
 ) -> io::Result<R::Place>
 where
     R: Root + DeviceSend,
-    <R::Size as Geometry>::Layers<L>: TryFrom<Vec<L>> + DeviceSend,
+    S: Geometry + Attention + Decode + 'static,
+    <S as Geometry>::Layers<L>: TryFrom<Vec<L>> + DeviceSend,
     for<'s> R: Module<
-            &'i mut launch::Input<'a, R::Size>,
+            &'i mut launch::Input<'a, S>,
             (),
-            launch::State<'s, R::Size, <R::Size as Geometry>::Layers<L>, R::Place>,
+            launch::State<'s, S, <S as Geometry>::Layers<L>, R::Place>,
             Output = (),
         >,
 {
-    let slots: <R::Size as Geometry>::Layers<L> = (slots.try_into())
+    let slots: <S as Geometry>::Layers<L> = (slots.try_into())
         .unwrap_or_else(|_| unreachable!("a cache of the decoder's spec holds each layer"));
     let hidden = DeviceOutput::alloc(device).map_err(io::Error::other)?;
     let mut places = (((hidden, slots), ()), place);
-    let state: launch::State<'_, R::Size, _, R::Place> = &mut places;
+    let state: launch::State<'_, S, _, R::Place> = &mut places;
+    submit(device, root, state, input)?;
+    Ok(places.1)
+}
+
+/// One launch of `root` over a call's `state` and `input`, once the device accepted it.
+fn submit<'i, R, S, I>(device: &mut Device, root: &R, state: S, input: &'i mut I) -> io::Result<()>
+where
+    R: DeviceSend + Module<&'i mut I, (), S, Output = ()>,
+    S: DeviceSend,
+    I: DeviceSend,
+{
     launch(forward, (&mut *device, root, (), state, input))
         .output(&mut ())
         .submit()
         .accepted()
         .map(drop)
-        .map_err(io::Error::other)?;
-    Ok(places.1)
+        .map_err(io::Error::other)
 }
 
 #[cfg(test)]
