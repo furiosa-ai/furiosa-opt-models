@@ -20,6 +20,7 @@ The platform accepts these values:
 | Data, prefill context and decode context parallel degrees, `--nnodes` | 1 |
 | `--logits-processors` | Processors of vLLM's V1 interface, under `VLLM_USE_V2_MODEL_RUNNER=0` |
 | `VLLM_BATCH_INVARIANT` | `0`, or `1` to load the model [batch invariant](index.md#keep-outputs-independent-of-the-batch) |
+| `--language-model-only` | Required for a multimodal checkpoint whose language model the engine serves, such as Gemma 4 12B: a decoder call takes token IDs, so the flag turns every media input away ([Multimodal inputs](index.md#features-not-supported-yet) are not supported yet) |
 | `--ec-transfer-config` | An encoder-only instance (`ec_role` `ec_producer`) through `ECExampleConnector`, for a checkpoint whose media encoder the engine loads alone |
 | `--kv-offloading-size` | Native offloading through `RNGDOffloadingConnector` ([Offload the KV cache to host memory](index.md#offload-the-kv-cache-to-host-memory)), at tensor, pipeline and data parallel degrees 1, without sleep mode, for a model without recurrent state or encoder memory and not on an encoder-only instance; `--kv-transfer-config` beside it adds `kv_connector_extra_config` options of vLLM's CPU offloading |
 

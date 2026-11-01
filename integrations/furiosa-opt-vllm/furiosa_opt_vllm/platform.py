@@ -16,6 +16,7 @@ from furiosa_opt_vllm.admission import (
     CONTRACTS,
     Refused,
     adapters,
+    media,
     offload,
     options,
     speculative,
@@ -97,6 +98,7 @@ class FuriosaPlatform(Platform):
         if model_config:
             recurrent_state(model_config, vllm_config.cache_config)
             verify_checkpoint(model_config, vllm_config.load_config, "model", options(vllm_config))
+            media(vllm_config)
             adapters(vllm_config)
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "furiosa_opt_vllm.worker.FuriosaWorker"

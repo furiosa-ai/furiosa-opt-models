@@ -26,15 +26,19 @@ def test_refuses_extension(served: Path) -> None:
     assert refusal(arguments) == "model"
 
 
+@pytest.mark.usefixtures("platform_env")
 @pytest.mark.feature("Multimodal inputs (images, video, audio)")
 def test_refuses_multimodal(tmp_path: Path) -> None:
-    """A load of a vision-language checkpoint whole is refused before any weight is read, since the
-    engine lists only its media encoder; a load of the media encoder alone is admitted."""
+    """A vision-language checkpoint serves its language model, whose calls take token IDs: startup
+    refuses it unless `--language-model-only` turns every media input away, and admits it then; a
+    load of the media encoder alone is admitted."""
     AutoConfig.from_pretrained("unsloth/gemma-4-12b-it-NVFP4").save_pretrained(tmp_path)
-    checkpoint = engine.Checkpoint(tmp_path)
-    with pytest.raises(NotImplementedError, match="a media encoder loads alone"):
-        engine.LoadOptions().parse(checkpoint)
-    engine.LoadOptions().encoder().parse(checkpoint)
+    assert refusal(EngineArgs(model=str(tmp_path), skip_tokenizer_init=True)) == (
+        "language_model_only"
+    )
+    text = EngineArgs(model=str(tmp_path), skip_tokenizer_init=True, language_model_only=True)
+    _ = text.create_engine_config()
+    engine.LoadOptions().encoder().parse(engine.Checkpoint(tmp_path))
 
 
 @pytest.mark.usefixtures("platform_env")

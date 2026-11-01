@@ -10,7 +10,8 @@
   the load both take, so the engine alone decides which chips, cache dtypes, models and LoRA
   adapters load.
 - `verify_checkpoint` refuses a checkpoint the engine cannot load, before the engine core starts,
-  whose startup error vLLM reports without its reason; `adapters` refuses LoRA settings past the
+  whose startup error vLLM reports without its reason; `media` refuses the media inputs of a
+  multimodal checkpoint whose language model it loads; `adapters` refuses LoRA settings past the
   adapter terms the engine compiles.
 """
 
@@ -592,6 +593,19 @@ def verify_checkpoint(
         options.parse(checkpoint.located(model, load.download_dir).mapped())
     except (NotImplementedError, ValueError) as error:
         raise Refused(option, str(error)) from None
+
+
+def media(config: VllmConfig) -> None:
+    """Refuse media inputs to the language model of a multimodal checkpoint, unless
+    `--language-model-only` turns every one away: a decoder's calls take token IDs."""
+    multimodal = config.model_config.multimodal_config
+    if multimodal is None or multimodal.language_model_only or config.is_mm_encoder_only:
+        return
+    raise Refused(
+        "language_model_only",
+        "serves a multimodal checkpoint's language model, whose calls take token IDs, only with "
+        + "--language-model-only",
+    )
 
 
 def adapters(config: VllmConfig) -> None:
