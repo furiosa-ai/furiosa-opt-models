@@ -8,7 +8,7 @@ loads or allocates it again.
 - Waking restores one tag after another, each awake once restored, so a retry after a failure
   restores only what still sleeps.
 - `reload` loads the awake weights again from the checkpoint's files, into the device memory the
-  served ones free first.
+  served ones free first, and unloads every LoRA adapter.
 """
 
 from __future__ import annotations
@@ -109,3 +109,6 @@ def reload(runner: Runner) -> None:
     runner.model = released = replace(served, model=None)
     del served
     runner.model = replace(released, copy=copy).loaded(mapped if copy is None else copy)
+    if runner.adapters is not None:
+        # As vLLM's workers end a reload, with no adapter loaded.
+        runner.adapters.remove_all()

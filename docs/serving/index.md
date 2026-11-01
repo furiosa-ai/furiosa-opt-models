@@ -402,8 +402,8 @@ sky = LoRARequest("sky", 1, "/path/to/adapter")
 outputs = llm.generate(["Why is the sky blue?"], SamplingParams(temperature=0), lora_request=sky)
 ```
 
-A loaded adapter stays on the device, out of the memory the KV cache leaves free.
-`max_loras` sets the adapters a step runs, at most 2, and `max_cpu_loras` the adapters kept loaded, the least recently used unloaded first.
+A loaded adapter is held in host memory; the device holds the `max_loras` active ones, in adapter storage taken before the KV cache sizes, so a load after startup takes no device memory.
+`max_loras` sets the adapters a step runs, at most 2, and `max_cpu_loras` the adapters kept loaded, the least recently used unloaded first; an inactive adapter a step names is copied into the storage of a free slot or of the least recently used unpinned active adapter.
 `llm.llm_engine.add_lora`, `pin_lora` and `remove_lora` act on the loaded adapters: a load also makes its adapter one of the `max_loras` active ones, as vLLM activates every adapter it adds, and a pinned adapter stays loaded and active until it is removed, so a load while `max_loras` pinned adapters are active is refused and changes nothing; a `LoRARequest` with `load_inplace=True` replaces the adapter of its ID.
 
 The adapter directory holds `adapter_config.json` and `adapter_model.safetensors`.
