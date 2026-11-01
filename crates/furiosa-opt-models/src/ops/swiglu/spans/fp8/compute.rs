@@ -109,10 +109,12 @@ impl<'t, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: Axi
         let waves = (normalized.count::<axis::Rows<128>>(), normalized.rows());
         let (live, rows) = waves;
         let normalized = *normalized.value();
+        // The row scales' pass runs before the rows' store, which queues behind the first pair's
+        // transfer.
+        let scales = InputScales.forward(&mut *context, normalized);
         let packed =
             gate::Pack::<Rows, Hidden, _, _>(PhantomData).forward(&mut *context, normalized.view());
         let stored = gate::Store.forward(&mut *context, (&packed, (live, rows)));
-        let scales = InputScales.forward(&mut *context, normalized);
         let scales: DmTensor<
             bf16,
             Chip,
