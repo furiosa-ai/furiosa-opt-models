@@ -3,7 +3,8 @@
 //!
 //! - One adapter's update of one projection is a [`Term`]: PEFT's `lora_A`, `[rank, inputs]`, and
 //!   `lora_B`, `[outputs, rank]`, each a linear. [`load`] applies a PEFT checkpoint's configuration
-//!   once, the scale into `lora_B`, builds every term on host, the rank zero-padded, then uploads.
+//!   once, the scale into `lora_B`, and builds every term on host, the rank zero-padded; a tree in
+//!   HBM loads from it, new or into the storage of one it holds.
 //! - In a call that runs adapters, a projection's state is its [`Adapters`]: each adapter's term and
 //!   its selection of the call's rows, one on the rows that run with it and zero on every other. The
 //!   projection adds each adapter's update of the rows it selects to its own output; a call without
