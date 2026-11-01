@@ -40,16 +40,60 @@ impl<Hidden: AxisName, Heads: AxisName, Head: AxisName> Op<&mut ValueScale<Hidde
     }
 }
 
-/// The query projection written to DM, then its heads' squared scales in the slices of both period
-/// groups' outputs, so no period waits for them.
-impl<Hidden: AxisName, Heads: AxisName, Head: AxisName> Op<Begin<()>>
+/// One half of the query weight's head dimension, written into its half of the weight on chip.
+struct Half<'a, Hidden: AxisName, Heads: AxisName, Head: AxisName, const HALF: usize>(
+    &'a Stored<Hidden, Heads, Head>,
+);
+
+impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, const HALF: usize>
+    Op<&mut Weight<Hidden, Heads, Head>> for Half<'_, Hidden, Heads, Head, HALF>
+{
+    type Output = ();
+
+    fn forward(&self, device: &mut Device, weight: &mut Weight<Hidden, Heads, Head>) {
+        const { assert!(Head::SIZE == 128 && HALF < 2) };
+        self.0
+            .view()
+            .tile::<m![Head / 64], 1, m![
+                Heads / (Heads / 2), Heads % (Heads / 2) / (Heads / 4),
+                Heads % (Heads / 4) / (Heads / 8), Hidden / 64, Head / 64 = 1 # 2,
+                Heads % (Heads / 8), Head % 64, Hidden % 64
+            ]>(HALF)
+            .to_dm_view(
+                &mut device.tdma,
+                weight.view_mut().tile::<m![Head / 64], 1, m![
+                    Head / 64 = 1 #{!} 2, Heads % (Heads / 8), Head % 64, Hidden % 64
+                ]>(HALF),
+            );
+    }
+}
+
+/// The query projection begun: the first half of its weight's head dimension written to DM.
+impl<Hidden: AxisName, Heads: AxisName, Head: AxisName> Op<Begin<Begin<()>>>
+    for Affine<Weights<Hidden, Heads, Head, HeadSquares<Heads>>, ()>
+{
+    type Output = Begin<Weight<Hidden, Heads, Head>>;
+
+    fn forward(&self, device: &mut Device, _: Begin<Begin<()>>) -> Self::Output {
+        let mut weight = DmTensor::new();
+        Half::<_, _, _, 0>(&self.weight.0).forward(device, &mut weight);
+        Begin(weight)
+    }
+}
+
+/// The begun query projection's second half written, then its heads' squared scales in the slices
+/// of both period groups' outputs, so no period waits for them.
+impl<Hidden: AxisName, Heads: AxisName, Head: AxisName> Op<Begin<Weight<Hidden, Heads, Head>>>
     for Affine<Weights<Hidden, Heads, Head, HeadSquares<Heads>>, ()>
 {
     type Output = Affine<(Weight<Hidden, Heads, Head>, QuerySquares<Heads>), ()>;
 
-    fn forward(&self, device: &mut Device, _: Begin<()>) -> Self::Output {
-        let mut weight = DmTensor::new();
-        Panel(&self.weight.0).forward(&mut *device, &mut weight);
+    fn forward(
+        &self,
+        device: &mut Device,
+        Begin(mut weight): Begin<Weight<Hidden, Heads, Head>>,
+    ) -> Self::Output {
+        Half::<_, _, _, 1>(&self.weight.0).forward(&mut *device, &mut weight);
         let stored = &self.weight.1.0;
         let squares = Grouped {
             pair: squares(&mut *device, stored),
