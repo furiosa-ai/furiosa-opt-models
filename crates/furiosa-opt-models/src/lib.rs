@@ -20,8 +20,8 @@ mod module;
 pub use module::{Begin, Module, Op};
 pub(crate) use modules::generic::Order;
 pub use modules::generic::{
-    Branch, Each, First, Fork, Identity, Interleave, Layers, Repeat, Rolled, Sequential, Then,
-    Unrolled,
+    Branch, Each, First, Fork, Identity, Interleave, Layers, Repeat, Rolled, Sequential, Slot,
+    Then, Unrolled,
 };
 pub(crate) use modules::generic::{Collection, Either};
 

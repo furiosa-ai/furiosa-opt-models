@@ -13,6 +13,7 @@ pub(crate) use layers::Collection;
 pub use layers::{Layers, Repeat, Rolled, Unrolled};
 pub(crate) use order::Order;
 pub use sequential::{Sequential, Then};
+pub use slot::Slot;
 
 /// Returns the input unchanged.
 #[derive(Clone, Default, DeviceSend, Load)]
@@ -98,6 +99,8 @@ pub mod collection;
 mod interleave;
 
 mod order;
+
+mod slot;
 
 #[cfg(test)]
 mod tests {
