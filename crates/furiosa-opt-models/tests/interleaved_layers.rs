@@ -96,9 +96,6 @@ type HiddenRows = HbmTensor<bf16, Chip, m![Rows, Hidden]>;
 type Qkv = ((((), ()), ((), ()), (((), ()), ())), (), ());
 type Units = ((((), ()), ()), ((), ()));
 type State<'b, A> = ((((Qkv, &'b mut Pool<A>, ()), ()), (Units, ())), ());
-/// What a layer's leaves run with in the schedule: its query/key/value stage's, its output
-/// projection's and its MLP's slots.
-type Leaves = (Qkv, (), Units);
 
 fn state<A: Attention>(pool: &mut Pool<A>) -> State<'_, A> {
     let qkv = ((((), ()), ((), ()), (((), ()), ())), (), ());
@@ -204,10 +201,9 @@ fn scheduled(
     let mut home: HiddenRows = HbmTensor::new();
     hidden.view().to_hbm_view(&mut device.tdma, home.view_mut());
     let ([a, b], [c, d]) = pools;
-    let slots: Leaves = Default::default();
     let mut state = (
-        (Places::<Group, Rows>::new(), [(a, slots), (b, slots)]),
-        (Places::<Group, Rows>::new(), [(c, slots), (d, slots)]),
+        (Places::<Group, Rows>::new(), [(a, ()), (b, ())]),
+        (Places::<Group, Rows>::new(), [(c, ()), (d, ())]),
     );
     let schedule = Decoder((layers, norm));
     Module::forward(
@@ -257,10 +253,9 @@ fn scheduled_mixed(
     let mut home: HiddenRows = HbmTensor::new();
     hidden.view().to_hbm_view(&mut device.tdma, home.view_mut());
     let ([a, b], [c, d]) = pools;
-    let slots: Leaves = Default::default();
     let mut state = (
-        (Places::<Group, Rows>::new(), [(a, slots), (b, slots)]),
-        (Places::<full::Group, Rows>::new(), [(c, slots), (d, slots)]),
+        (Places::<Group, Rows>::new(), [(a, ()), (b, ())]),
+        (Places::<full::Group, Rows>::new(), [(c, ()), (d, ())]),
     );
     let schedule = Decoder((layers, norm));
     Module::forward(
@@ -315,11 +310,10 @@ fn scheduled_period(
     let mut home: HiddenRows = HbmTensor::new();
     hidden.view().to_hbm_view(&mut device.tdma, home.view_mut());
     let ([a, b, c, d, e], [f]) = pools;
-    let slots: Leaves = Default::default();
-    let sliding = [(a, slots), (b, slots), (c, slots), (d, slots), (e, slots)];
+    let sliding = [(a, ()), (b, ()), (c, ()), (d, ()), (e, ())];
     let mut state = (
         (Places::<Group, Rows>::new(), sliding),
-        (Places::<full::Group, Rows>::new(), [(f, slots)]),
+        (Places::<full::Group, Rows>::new(), [(f, ())]),
     );
     let schedule = Decoder((layers, norm));
     Module::forward(
@@ -1077,7 +1071,7 @@ fn every_root_runs_by_the_loop() {
 /// sliding across a period and full to the final norm, is the one tokenwise work.
 #[test]
 fn schedules_the_catalog_order() {
-    type Slot<'b, A> = (&'b mut Pool<A>, Leaves);
+    type Slot<'b, A> = (&'b mut Pool<A>, ());
     type Order = Interleave<([Sliding; gemma4::SLIDING], [Full; gemma4::FULL]), { gemma4::ORDER }>;
     fn runs<'m, 'c>()
     where

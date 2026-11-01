@@ -6,10 +6,10 @@
 //! - Its end runs the output projection, the post-attention norm, the attention residual, the
 //!   pre-feed-forward norm and the feed-forward; its update the post-feed-forward norm, the
 //!   feed-forward residual and the layer's tail.
-//! - Its leaves land nothing ahead, so its front and output projection's landing are `()`.
+//! - Its leaves land nothing ahead, so its front and output projection's landing are `()`; they
+//!   hold nothing in a call, so it takes `()` and runs each leaf with that leaf's empty slot.
 
 use super::{Cut, Output, Places, Pool, Staged, Stored, attend_stored};
-use crate::Module;
 use crate::models::decoder;
 use crate::modules::attention::{self, Attention, KeyValue, Positioned};
 use crate::modules::residual::Residual;
@@ -21,7 +21,7 @@ use crate::ops::normalization::{RmsNorm, RowMajor, Spread};
 use crate::tensor::axis::Single;
 use crate::tensor::live::Live;
 use crate::tensor::parallel::Chip;
-use crate::{Sequential, Then};
+use crate::{Module, Sequential, Slot, Then};
 use furiosa_opt_std::prelude::*;
 
 /// A call's context of `R` rows: their positions `P`, the slot each writes and the pages of
@@ -50,9 +50,8 @@ type AttendedHeads<A, R> = Attended<
 >;
 
 /// The sandwich-norm layer and its tail `L` in every form whose leaves take a whole envelope of
-/// `R` rows of `Hidden` features, attending in group `A` over pages of its cache. Its leaves run
-/// with the slots `QS` of its query/key/value stage, `PS` of its output projection and `MS` of
-/// its feed-forward.
+/// `R` rows of `Hidden` features, attending in group `A` over pages of its cache. Its query/key/
+/// value stage, output projection and feed-forward each run with their empty slot.
 impl<
     'c,
     A,
@@ -71,10 +70,7 @@ impl<
     FeedForward,
     Add,
     Tail,
-    QS,
-    PS,
-    MS,
-> Cut<A, &'c Context<P, R, Windows>, (QS, PS, MS)>
+> Cut<A, &'c Context<P, R, Windows>, ()>
     for Then<
         SandwichNorm<
             Attention<Positioned<Qkv, Position>, KeyValue<Write, ()>, Attend, Project>,
@@ -96,10 +92,11 @@ where
             &'x mut (),
             Output = Live<Spread<Hidden, R, Chip>, R>,
         >,
-    Positioned<Qkv, Position>: for<'r, 'x> Module<
+    Positioned<Qkv, Position>: Slot
+        + for<'r, 'x> Module<
             (&'r Live<Spread<Hidden, R, Chip>, R>, &'c P),
             (),
-            &'x mut QS,
+            &'x mut <Positioned<Qkv, Position> as Slot>::Empty,
             Output = (
                 Live<QueryHeads<A, R>, R>,
                 Live<KeyHeads<A, R>, R>,
@@ -126,10 +123,11 @@ where
             &'x mut (),
             Output = Live<AttendedHeads<A, R>, R>,
         >,
-    Project: for<'r, 'x> Module<
+    Project: Slot
+        + for<'r, 'x> Module<
             &'r Live<AttendedHeads<A, R>, R>,
             (),
-            &'x mut PS,
+            &'x mut <Project as Slot>::Empty,
             Output = Live<Spread<Hidden, R, Chip>, R>,
         >,
     Add: for<'r, 's, 'x> Module<
@@ -141,10 +139,11 @@ where
             &'x mut (),
             Output = Live<Spread<Hidden, R, Chip>, R>,
         >,
-    FeedForward: for<'r, 'x> Module<
+    FeedForward: Slot
+        + for<'r, 'x> Module<
             &'r Live<Spread<Hidden, R, Chip>, R>,
             (),
-            &'x mut MS,
+            &'x mut <FeedForward as Slot>::Empty,
             Output = Live<Spread<Hidden, R, Chip>, R>,
         >,
     Tail: for<'r, 'x> Module<
@@ -180,12 +179,13 @@ where
         call: &'c Context<P, R, Windows>,
         (): (),
         rows: Live<Self::Rows, R>,
-        (stored, slots): (&mut Stored<A, R>, &mut (QS, PS, MS)),
+        (stored, _): (&mut Stored<A, R>, &mut ()),
     ) -> Live<Self::Rows, R> {
         let Then(Sequential(Residual(norm, Then(attention, _), _), _), _) = self;
         let normalized = norm.forward(&mut *device, (), &mut (), &rows);
         let input = (&normalized, &call.positions);
-        let (query, key, value) = (attention.0.qkv).forward(&mut *device, (), &mut slots.0, input);
+        let slot = &mut Default::default();
+        let (query, key, value) = (attention.0.qkv).forward(&mut *device, (), slot, input);
         let Stored { queries, retained } = stored;
         let tdma = &mut device.tdma;
         query.value().view().to_hbm_view(tdma, queries.view_mut());
@@ -226,16 +226,17 @@ where
         device: &mut Device,
         (attended, ()): Output<'_, A, R, R, ()>,
         input: Live<Self::Rows, R>,
-        slots: &mut (QS, PS, MS),
+        _: &mut (),
     ) -> Self::Staged {
         let Then(Sequential(first, Residual(norm, Then(mlp, _), _)), _) = self;
         let Residual(_, Then(attention, post), add) = first;
         let heads = attended.with(attended.value().0.to_dm(&mut device.tdma));
-        let projected = (attention.0.output).forward(&mut *device, (), &mut slots.1, &heads);
+        let slot = &mut Default::default();
+        let projected = (attention.0.output).forward(&mut *device, (), slot, &heads);
         let branch = post.forward(&mut *device, (), &mut (), &projected);
         let residual = add.forward(&mut *device, (), &mut (), (&input, &branch));
         let normalized = norm.forward(&mut *device, (), &mut (), &residual);
-        let ready = mlp.forward(device, (), &mut slots.2, &normalized);
+        let ready = mlp.forward(device, (), &mut Default::default(), &normalized);
         Staged {
             ready,
             attended: residual,
@@ -246,7 +247,7 @@ where
         &self,
         device: &mut Device,
         Staged { ready, attended }: Self::Staged,
-        _: &mut (QS, PS, MS),
+        _: &mut (),
     ) -> Live<Self::Rows, R> {
         let Then(Sequential(_, Residual(_, Then(_, post), add)), tail) = self;
         let branch = post.forward(&mut *device, (), &mut (), &ready);
