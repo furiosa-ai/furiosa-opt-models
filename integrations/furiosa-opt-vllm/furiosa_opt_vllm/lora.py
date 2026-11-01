@@ -153,4 +153,7 @@ class Adapters:
         # vLLM's own refusals, such as a rank above --max-lora-rank.
         peft = PEFTHelper.from_dict(config | {"vllm_max_position_embeddings": self.positions})
         peft.validate_legal(self.config)
-        return engine.decoder.Adapter(self.spec, engine.Checkpoint(path, config))
+        host = engine.decoder.HostAdapter(self.spec, engine.Checkpoint(path, config))
+        adapter = engine.decoder.Adapter(self.spec)
+        adapter.load(host)
+        return adapter

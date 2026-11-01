@@ -1,4 +1,4 @@
-//! Host staging: a checkpoint's terms built on host as HBM lays them out, then uploaded.
+//! Host staging: a checkpoint's terms built on host as HBM lays them out, then loaded into HBM.
 
 use furiosa_opt_std::prelude::*;
 use safetensors::tensor::TensorView;
@@ -220,17 +220,11 @@ where
     }
 }
 
-/// The tree `T` of a PEFT LoRA checkpoint's terms in HBM of `device`, built as `H` in [`Staged`]
-/// memory first: the checkpoint is read once with its configuration applied, and the strict
-/// traversal builds every term on host and refuses a tensor no term reads
-/// ([`LoadError::Unexpected`]), all before the first upload.
-pub fn load<T, H>(checkpoint: &Checkpoint, device: &mut Device) -> Result<T, LoadError>
-where
-    H: for<'c> Load<&'c Checkpoint>,
-    T: for<'h> Load<&'h H>,
-{
-    let staged = H::load(&mut Context::new(None), &scaled(checkpoint)?)?;
-    T::load(&mut Context::new(device), &staged)
+/// The tree `H` of a PEFT LoRA checkpoint's terms in [`Staged`] memory, which a tree in HBM loads
+/// from: the checkpoint is read once with its configuration applied, and the strict traversal
+/// builds every term on host and refuses a tensor no term reads ([`LoadError::Unexpected`]).
+pub fn load<H: for<'c> Load<&'c Checkpoint>>(checkpoint: &Checkpoint) -> Result<H, LoadError> {
+    H::load(&mut Context::new(None), &scaled(checkpoint)?)
 }
 
 #[cfg(test)]

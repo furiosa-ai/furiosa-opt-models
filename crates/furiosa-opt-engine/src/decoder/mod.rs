@@ -25,7 +25,7 @@ pub use adapters::{Adapter, Binding, Loader, SLOTS};
 pub use batch::{Batch, Rows, Staged, Table};
 pub use cache::{Cache, CacheSpec, Group, Kind, Pool};
 
-use crate::{AsyncModule, Checkpoint, Load, LoadError, forward};
+use crate::{AsyncModule, Checkpoint, Load, forward};
 use furiosa_opt_models::Module;
 use furiosa_opt_models::models::decoder::attention::qwen3::{Depth, LmHead, fp8};
 use furiosa_opt_models::models::decoder::attention::{
@@ -179,13 +179,9 @@ pub trait Decoder: Send + Sync {
     /// Views of `storage`, the layers of a cache allocated for this decoder.
     fn layers(storage: &[HbmBuffer]) -> io::Result<Self::Layers>;
 
-    /// `checkpoint`, a PEFT LoRA checkpoint, loaded onto `device` as an adapter of this decoder;
-    /// refused for a decoder that runs none.
-    fn adapter(_: &Checkpoint, _: &mut Device) -> Result<Self::Adapter, LoadError> {
-        Err(LoadError::Unsupported {
-            name: "adapters".into(),
-            reason: "the decoder's projections take no adapter".into(),
-        })
+    /// How the decoder makes the adapters its calls run with; none for a decoder that runs none.
+    fn adapters() -> Option<Loader> {
+        None
     }
 
     /// Launches the call `batch` plans on `layers`, with the adapters it binds, its rows'
@@ -293,8 +289,7 @@ impl<D: Decoder> Served for Instance<D> {
     }
 
     fn adapters(&self) -> Option<Loader> {
-        let load: Loader = |checkpoint, device| Ok(Adapter::new(D::adapter(checkpoint, device)?));
-        (D::ADAPTERS > 0).then_some(load)
+        D::adapters()
     }
 
     fn forward<'a>(
@@ -425,8 +420,10 @@ pub trait Adapting<S: Geometry + Decode + 'static> {
     /// Adapters a call runs at most.
     const ADAPTERS: usize;
 
-    /// `checkpoint`, a PEFT LoRA checkpoint, loaded onto `device` as an adapter.
-    fn adapter(checkpoint: &Checkpoint, device: &mut Device) -> Result<Self::Adapter, LoadError>;
+    /// How a root makes its adapters; none for a root that runs none.
+    fn adapters() -> Option<Loader> {
+        None
+    }
 
     /// Layer `layer`'s states with the call's adapters `held` and their `selections`.
     fn states<'t>(
@@ -441,16 +438,20 @@ impl<S: Geometry + Decode + 'static> Adapting<S> for form::Affine
 where
     launch::Adapter<S, Hbm>:
         Send + Sync + 'static + for<'h> Load<&'h launch::Adapter<S, lora::Staged>>,
-    launch::Adapter<S, lora::Staged>: for<'c> Load<&'c Checkpoint>,
+    launch::Adapter<S, lora::Staged>: Send + Sync + 'static + for<'c> Load<&'c Checkpoint>,
+    for<'t, 'h> &'t mut launch::Adapter<S, Hbm>: Load<(
+        &'t mut launch::Adapter<S, Hbm>,
+        &'h launch::Adapter<S, lora::Staged>,
+    )>,
     <S as Geometry>::Layers<launch::Terms<S, Hbm>>: AsRef<[launch::Terms<S, Hbm>]>,
 {
     type Adapter = launch::Adapter<S, Hbm>;
     type States<'t> = launch::Adapted<'t, S, SLOTS>;
     const ADAPTERS: usize = SLOTS;
 
-    // A PEFT checkpoint's terms are built on host from the checkpoint read once, then uploaded.
-    fn adapter(checkpoint: &Checkpoint, device: &mut Device) -> Result<Self::Adapter, LoadError> {
-        lora::load::<launch::Adapter<S, Hbm>, launch::Adapter<S, lora::Staged>>(checkpoint, device)
+    // A PEFT checkpoint's terms are built on host from the checkpoint read once, then loaded.
+    fn adapters() -> Option<Loader> {
+        Some(Loader::of::<Self::Adapter, launch::Adapter<S, lora::Staged>>())
     }
 
     fn states<'t>(
@@ -468,10 +469,6 @@ impl<S: Geometry + Decode + 'static> Adapting<S> for form::ChannelScaled {
     type States<'t> = ();
     const ADAPTERS: usize = 0;
 
-    fn adapter(checkpoint: &Checkpoint, device: &mut Device) -> Result<Infallible, LoadError> {
-        <Infallible as Adapting<S>>::adapter(checkpoint, device)
-    }
-
     fn states<'t>(
         held: [&'t Infallible; SLOTS],
         _: usize,
@@ -481,18 +478,11 @@ impl<S: Geometry + Decode + 'static> Adapting<S> for form::ChannelScaled {
     }
 }
 
-/// A root that runs no adapter refuses a load of one; no call holds one.
+/// A root that runs no adapter makes none; no call holds one.
 impl<S: Geometry + Decode + 'static> Adapting<S> for Infallible {
     type Adapter = Infallible;
     type States<'t> = ();
     const ADAPTERS: usize = 0;
-
-    fn adapter(_: &Checkpoint, _: &mut Device) -> Result<Infallible, LoadError> {
-        Err(LoadError::Unsupported {
-            name: "adapters".into(),
-            reason: "the decoder's projections take no adapter".into(),
-        })
-    }
 
     fn states<'t>(
         held: [&'t Infallible; SLOTS],
@@ -598,8 +588,8 @@ where
             .collect()
     }
 
-    fn adapter(checkpoint: &Checkpoint, device: &mut Device) -> Result<Self::Adapter, LoadError> {
-        <R::Adapting as Adapting<R::Size>>::adapter(checkpoint, device)
+    fn adapters() -> Option<Loader> {
+        <R::Adapting as Adapting<R::Size>>::adapters()
     }
 
     // The root is captured and launched in place, never held across an await: that `Send` check
