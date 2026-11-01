@@ -133,8 +133,9 @@ pub type Operands<S> = key_value::Operands<
     <S as Decode>::Windows,
 >;
 
-/// The rotation of a launch's rows, gathered from the positions' table it loads from the config.
-type Position<S> = SplitHalf<Head, Table<Positions<S>, rotary::Row<Head>>>;
+/// The rotation of a launch's rows, gathered from the positions' table it loads from the config:
+/// the constants that prepare a launch's context from the [`Operands`] the host plans.
+pub type Position<S> = SplitHalf<Head, Table<Positions<S>, rotary::Row<Head>>>;
 
 /// The base model over the body `B`, with the rotary table its launches gather their rows'
 /// rotation from.
