@@ -174,6 +174,20 @@ impl<'h, T: Load<&'h U>, U> Load<&'h GateUp<U>> for GateUp<T> {
     }
 }
 
+/// A packed gate/up term built on host, written into `into`'s storage.
+impl<'t, 'h, T, U> Load<(&'t mut GateUp<T>, &'h GateUp<U>)> for &'t mut GateUp<T>
+where
+    for<'u> &'u mut T: Load<(&'u mut T, &'h U)>,
+{
+    fn load(
+        context: &mut Context<'_>,
+        (into, host): (&'t mut GateUp<T>, &'h GateUp<U>),
+    ) -> Result<Self, LoadError> {
+        <&mut T as Load<_>>::load(context, (&mut into.0, &host.0))?;
+        Ok(into)
+    }
+}
+
 /// A term built on host, in HBM of the context's device.
 impl<'h, A: Load<HA>, B: Load<HB>, HA: Clone, HB: Clone> Load<&'h Term<HA, HB>> for Term<A, B> {
     fn load(context: &mut Context<'_>, host: &'h Term<HA, HB>) -> Result<Self, LoadError> {
@@ -183,6 +197,26 @@ impl<'h, A: Load<HA>, B: Load<HB>, HA: Clone, HB: Clone> Load<&'h Term<HA, HB>> 
             lora_a: Affine::new(a, ()),
             lora_b: Affine::new(b, ()),
         })
+    }
+}
+
+/// A term built on host, written into `into`'s storage; the host term stays its owner's.
+impl<'t, 'h, A, B, HA, HB> Load<(&'t mut Term<A, B>, &'h Term<HA, HB>)> for &'t mut Term<A, B>
+where
+    for<'u> &'u mut A: Load<(&'u mut A, &'h HA)>,
+    for<'u> &'u mut B: Load<(&'u mut B, &'h HB)>,
+{
+    fn load(
+        context: &mut Context<'_>,
+        (into, host): (&'t mut Term<A, B>, &'h Term<HA, HB>),
+    ) -> Result<Self, LoadError> {
+        context.field("lora_a", "", |cx| {
+            <&mut A as Load<_>>::load(cx, (&mut into.lora_a.weight, &host.lora_a.weight))
+        })?;
+        context.field("lora_b", "", |cx| {
+            <&mut B as Load<_>>::load(cx, (&mut into.lora_b.weight, &host.lora_b.weight))
+        })?;
+        Ok(into)
     }
 }
 
@@ -201,22 +235,48 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::future::IntoFuture;
+
     use safetensors::Dtype;
     use serde_json::Value;
 
     use super::*;
     use crate::load::Named;
     use crate::modules::lora::Rank;
+    use crate::tensor::memory::Hbm;
+    use crate::tensor::parallel::Chip;
 
     axes![Inputs = 64, Outputs = 48];
 
     /// The rank columns of a term adapting one module.
     type One = Rank<1>;
 
+    /// The rank columns of the packed gate/up term.
+    type Two = Rank<2>;
+
     /// One adapted module, `layer.proj`, of 64 inputs and 48 outputs, as PEFT names it.
     type Tree = Named<
         "base_model",
         Named<"layer", Named<"proj", Term<Host<m![One, Inputs]>, Host<m![Outputs, One]>>>>,
+    >;
+
+    /// One layer's adapter in memory `X`, as PEFT names it: `layer.proj`, of 64 inputs and 48
+    /// outputs, and the packed `layer.gate_proj` and `layer.up_proj`, of 24 outputs each.
+    type Adapter<X> = Named<
+        "base_model",
+        Named<
+            "layer",
+            (
+                Named<"proj", Factors<One, Outputs, X>>,
+                GateUp<Factors<Two, Outputs, X>>,
+            ),
+        >,
+    >;
+
+    /// A term's `[K, Inputs]` and `[Out, K]` factors in memory `X`.
+    type Factors<K, Out, X> = Term<
+        <X as Memory>::Tensor<bf16, Chip, m![K, Inputs]>,
+        <X as Memory>::Tensor<bf16, Chip, m![Out, K]>,
     >;
 
     /// A checkpoint of `config` and of F32 `tensors` in a folder of its own.
@@ -326,6 +386,116 @@ mod tests {
                 Some(LoadError::InvalidData { name, .. }) => assert_eq!(name, tensor),
                 other => panic!("{tensor}: {other:?}"),
             }
+        }
+    }
+
+    /// An adapter written in place from a borrowed host adapter holds what an upload of that host
+    /// adapter holds, in the storage its load allocated: a lower rank's columns and a module it
+    /// leaves out read as zeros, and an earlier host adapter writes its own values back.
+    #[test]
+    fn writes_a_host_adapter_into_a_loaded_one() {
+        fn values<S: M + 'static>(
+            leaf: &HbmTensor<bf16, Chip, S>,
+            device: &mut Device,
+        ) -> Vec<bf16> {
+            let read = leaf.to_host::<m![{ Chip }, { S }]>(&mut device.pdma);
+            futures_executor::block_on(read.into_future())
+                .unwrap()
+                .into_vec()
+        }
+        let read = |adapter: &Adapter<Hbm>, device: &mut Device| {
+            let Named(Named((Named(proj), GateUp(gate_up)))) = adapter;
+            [
+                values(&proj.lora_a.weight, device),
+                values(&proj.lora_b.weight, device),
+                values(&gate_up.lora_a.weight, device),
+                values(&gate_up.lora_b.weight, device),
+            ]
+        };
+        let leaves = [
+            "proj.lora_a",
+            "proj.lora_b",
+            "gate_up.lora_a",
+            "gate_up.lora_b",
+        ];
+        let rows = Outputs::SIZE / 2;
+        let stage = |rank: usize, alpha: f32, modules: &[&str]| {
+            let config = serde_json::json!({"peft_type": "LORA", "r": rank, "lora_alpha": alpha});
+            let outputs = |module: &str| match module {
+                "proj" => Outputs::SIZE,
+                _ => rows,
+            };
+            let names: Vec<(String, [usize; 2])> = (modules.iter())
+                .flat_map(|module| {
+                    let name = |factor: &str| format!("base_model.layer.{module}.{factor}");
+                    [
+                        (name(FACTORS[0]), [rank, Inputs::SIZE]),
+                        (name(FACTORS[1]), [outputs(module), rank]),
+                    ]
+                })
+                .collect();
+            let tensors: Vec<(&str, Dtype, [usize; 2])> = (names.iter())
+                .map(|(name, shape)| (name.as_str(), Dtype::F32, *shape))
+                .collect();
+            let (_directory, checkpoint) = saved(config, &tensors);
+            Adapter::<Staged>::load(&mut Context::new(None), &scaled(&checkpoint).unwrap()).unwrap()
+        };
+        let first = stage(8, 32.0, &["proj", "gate_proj", "up_proj"]);
+        let second = stage(2, 1.0, &["gate_proj"]);
+
+        let _lease = crate::tests::DEVICE.blocking_lock();
+        let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+        let mut loaded = Adapter::<Hbm>::load(&mut Context::new(&mut device), &first).unwrap();
+        let uploaded = Adapter::<Hbm>::load(&mut Context::new(&mut device), &second).unwrap();
+        let (first_held, second_held) = (read(&loaded, &mut device), read(&uploaded, &mut device));
+        let zero = bf16::from_f32(0.0);
+        let stored = |at: usize| at as f32 / 64.0;
+        let gate_a = (0..Two::SIZE * Inputs::SIZE).map(|at| match at < 2 * Inputs::SIZE {
+            true => bf16::from_f32(stored(at)),
+            false => zero,
+        });
+        let gate_b = (0..Outputs::SIZE * Two::SIZE).map(|at| {
+            let (row, column) = (at / Two::SIZE, at % Two::SIZE);
+            match row < rows && column < 2 {
+                true => bf16::from_f32(0.5 * stored(row * 2 + column)),
+                false => zero,
+            }
+        });
+        let gate_only = [
+            vec![zero; One::SIZE * Inputs::SIZE],
+            vec![zero; Outputs::SIZE * One::SIZE],
+            gate_a.collect(),
+            gate_b.collect(),
+        ];
+        assert_eq!(
+            second_held, gate_only,
+            "the second adapter adapts gate_proj alone"
+        );
+        for (leaf, (a, b)) in leaves.iter().zip(first_held.iter().zip(&second_held)) {
+            assert_ne!(a, b, "{leaf}: both adapters hold the same values");
+        }
+
+        let free = device.memory().usage().available;
+        let writes = [
+            (&second, &second_held),
+            (&first, &first_held),
+            (&second, &second_held),
+        ];
+        for (from, expected) in writes {
+            <&mut Adapter<Hbm> as Load<_>>::load(
+                &mut Context::new(&mut device),
+                (&mut loaded, from),
+            )
+            .unwrap();
+            let now = read(&loaded, &mut device);
+            for (leaf, (held, expected)) in leaves.iter().zip(now.iter().zip(expected)) {
+                assert_eq!(held, expected, "{leaf}");
+            }
+            assert_eq!(
+                device.memory().usage().available,
+                free,
+                "a write allocates no HBM"
+            );
         }
     }
 }
