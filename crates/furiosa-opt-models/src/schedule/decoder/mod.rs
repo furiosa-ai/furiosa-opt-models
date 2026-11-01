@@ -5,9 +5,9 @@
 //!   token, so the work from one attention to the next runs tile by tile in one pass.
 //! - That work is a [`Tokenwise`] of the end of one part and the start of the next. It takes a
 //!   tile of the part's attention output and of the part's input rows, the residual's other term,
-//!   and gives the tile of the next part's input rows, having stored the tile's queries, keys and
-//!   values for the next attention, its state. A part is a layer after its attention, or the
-//!   embedding; the next part a layer up to its attention's store, or the head.
+//!   and stores the tile of the next part's input rows with its queries, keys and values for the
+//!   next attention, its state. A part is a layer after its attention, or the embedding; the next
+//!   part a layer up to its attention's store, or the head.
 //! - The cut of a layer at its attention is private to the impls here, written once for the
 //!   pre-norm layer of Qwen3, Llama and Mistral at every size and in every projection form. It is
 //!   generic in the layer's leaves, each of which takes the cut's steps its own way: the
@@ -134,8 +134,10 @@ type Landing<'r, G, Z> = (ToDm<G, QueryHeads<Z>>, (&'r Rotation<Z>, usize));
 /// landed.
 type Projecting<'o, 'r, Z, L> = (&'o mut L, Live<&'r QueryRows<Z>, Capacity<Z>>);
 
-/// What a layer's attention stores of a launch's tiles: their queries, keys and values.
+/// What a layer's start stores of a launch's tiles: their rows, which its end reads after the
+/// attention, and their queries, keys and values, which the attention reads.
 pub struct Stored<Z: Geometry + Decode> {
+    rows: Rows<Z>,
     queries: QueryRows<Z>,
     retained: (KeyRows<Z>, KeyRows<Z>),
 }
@@ -147,9 +149,8 @@ pub struct Attended<Z: Geometry + Decode>(QueryRows<Z>);
 /// `L` as its form lands it.
 type Output<'p, Z, L> = (Live<&'p Attended<Z>, Capacity<Z>>, &'p mut L);
 
-/// One layer's places of a launch: its input rows, what its attention stores and what it attends.
+/// One layer's places of a launch: what its start stores and what its attention attends.
 struct Places<Z: Geometry + Decode> {
-    input: Rows<Z>,
     stored: Stored<Z>,
     attended: Attended<Z>,
 }
@@ -157,8 +158,8 @@ struct Places<Z: Geometry + Decode> {
 impl<Z: Geometry + Decode> Places<Z> {
     fn new() -> Self {
         Self {
-            input: HbmTensor::new(),
             stored: Stored {
+                rows: HbmTensor::new(),
                 queries: HbmTensor::new(),
                 retained: (HbmTensor::new(), HbmTensor::new()),
             },
@@ -185,7 +186,7 @@ trait Cut<Z: Geometry + Decode + 'static, A: States> {
 
     /// A tile's input `rows` through it up to its attention's store, its `front` landed: the input
     /// norm, then every period's queries, keys and values, head-normed, rotated and stored in
-    /// `stored`; the rows, for the residual.
+    /// `stored`, and the rows stored there for the residual.
     fn start(
         &self,
         device: &mut Device,
@@ -193,7 +194,7 @@ trait Cut<Z: Geometry + Decode + 'static, A: States> {
         front: Self::Front,
         rows: RowTile<Z>,
         state: (&mut Stored<Z>, &mut A),
-    ) -> RowTile<Z>;
+    );
 
     /// A tile through it from its attention to its MLP's second step, given a tile `output` of its
     /// attention output and `input` of its input rows: the output projection, the attention
@@ -406,7 +407,7 @@ where
         front: Self::Front,
         rows: RowTile<Z>,
         (stored, adapters): (&mut Stored<Z>, &mut T),
-    ) -> RowTile<Z> {
+    ) {
         let Sequential(Residual(_, attention, _), _) = self;
         let Attention {
             qkv:
@@ -462,7 +463,13 @@ where
                 (stored, adapters),
             );
         }
-        for _ in 0..tile.count::<Tile>() % 2 {
+        // A tile's rows store under its last period's chain, where the DMA queue idles: behind the
+        // period's rows when it is a single tile, else after the pairs.
+        let single = tile.count::<Tile>() % 2;
+        for _ in 0..1 - single {
+            stored.rows.spill(&mut *device, rows.value(), tile);
+        }
+        for _ in 0..single {
             let start = tile.tile::<Tile>(2 * pairs).start();
             let landing = ToDm::<Tiles<1>, QueryHeads<Z>>(PhantomData);
             let next = launch.period::<Tiles<1>>(&home, pairs);
@@ -470,6 +477,7 @@ where
                 (landing, (rotation, start / Tile::SIZE)),
                 value.forward(&mut *device, tile, &mut (), next),
             );
+            stored.rows.spill(&mut *device, rows.value(), tile);
             period(
                 device,
                 positions,
@@ -480,7 +488,6 @@ where
                 (stored, adapters),
             );
         }
-        rows
     }
 
     fn end(
@@ -557,7 +564,9 @@ fn period<Z, G, P, V, K, Q, QN, KN, QH, KH, T: States>(
     QN: for<'x> Module<QH, Live<(), Capacity<Z>>, &'x mut (), Output = Queries<G, Z>>,
     KN: for<'x> Module<KH, Live<(), Capacity<Z>>, &'x mut (), Output = Pairs<G>>,
 {
-    let Stored { queries, retained } = stored;
+    let Stored {
+        queries, retained, ..
+    } = stored;
     let projected = query.forward(&mut *device, tile, adapters.query(), &rows);
     // Behind the period's rows, which the projection reads first.
     let coefficients = crate::Op::forward(&landing, &mut *device, index);
@@ -575,14 +584,14 @@ fn period<Z, G, P, V, K, Q, QN, KN, QH, KH, T: States>(
 }
 
 /// A tile of the embedded rows through the first layer up to its attention's store, its
-/// projections running with `adapters`; the tile's rows, the first layer's input.
+/// projections running with `adapters`, the tile's rows stored as the first layer's input.
 impl<'l, 'c, 'a, 's, Z: Geometry + Decode + 'static, T: States, X: Cut<Z, T>>
     Module<Live<(), Capacity<Z>>, Launched<'c, 'a, Z>, (&'s mut Stored<Z>, &'s mut T)>
     for Tokenwise<&'l Rows<Z>, &'l X>
 where
     Rows<Z>: Fill<Device, Live<(), Capacity<Z>>, Rows = Owned<Width<Z>, Span>>,
 {
-    type Output = RowTile<Z>;
+    type Output = ();
 
     fn forward(
         &self,
@@ -599,8 +608,8 @@ where
 }
 
 /// A tile through a layer from its attention and the next layer up to its attention's store, each
-/// layer's projections running with its adapters; the next layer's input rows. The next layer's
-/// front lands while this one's MLP projects.
+/// layer's projections running with its adapters, the next layer's input rows stored. The next
+/// layer's front lands while this one's MLP projects.
 impl<'l, 'c, 'a, 'p, 's, Z: Geometry + Decode + 'static, T: States, X: Cut<Z, T, Landed = L>, L>
     Module<
         (Output<'p, Z, L>, RowTile<Z>),
@@ -608,7 +617,7 @@ impl<'l, 'c, 'a, 'p, 's, Z: Geometry + Decode + 'static, T: States, X: Cut<Z, T,
         (&'s mut Stored<Z>, (&'s mut T, &'s mut T)),
     > for Tokenwise<&'l X, &'l X>
 {
-    type Output = RowTile<Z>;
+    type Output = ();
 
     fn forward(
         &self,
@@ -762,8 +771,7 @@ where
             let tile = live.tile::<Span>(span);
             let tokenwise = Tokenwise(&*embedded, &first);
             let state = (&mut places.stored, &mut adapters);
-            let rows = tokenwise.forward(&mut *device, call, state, tile);
-            places.input.spill(&mut *device, rows.value(), tile);
+            tokenwise.forward(&mut *device, call, state, tile);
         }
         for index in 0..DEPTH - 1 {
             let (layer, next) = (layers.layer(index), layers.layer(index + 1));
@@ -773,12 +781,11 @@ where
             // just before, and the attention has read every store.
             for span in 0..spans {
                 let tile = live.tile::<Span>(span);
-                let input = tile.with(places.input.fill(&mut *device, tile));
+                let input = tile.with(places.stored.rows.fill(&mut *device, tile));
                 let tokenwise = Tokenwise(&layer, &next);
                 let output = (tile.with(&places.attended), &mut projecting);
                 let state = (&mut places.stored, (&mut adapters, &mut following));
-                let rows = tokenwise.forward(&mut *device, call, state, (output, input));
-                places.input.spill(&mut *device, rows.value(), tile);
+                tokenwise.forward(&mut *device, call, state, (output, input));
             }
         }
         let last = layers.layer(DEPTH - 1);
@@ -787,7 +794,7 @@ where
         let mut head: Rows<Z> = HbmTensor::new();
         for span in 0..spans {
             let tile = live.tile::<Span>(span);
-            let input = tile.with(places.input.fill(&mut *device, tile));
+            let input = tile.with(places.stored.rows.fill(&mut *device, tile));
             let output = (tile.with(&places.attended), &mut projecting);
             let tokenwise = Tokenwise(&last, norm);
             let rows = tokenwise.forward(&mut *device, call, &mut adapters, (output, input));
