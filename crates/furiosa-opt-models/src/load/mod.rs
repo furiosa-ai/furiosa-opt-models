@@ -2,8 +2,8 @@
 //!
 //! - A tree is built from a [`Checkpoint`] into HBM, updated in place from one (an [`Update`]
 //!   gathers the chunks), borrowed for a call, or written in place from a value of its own type
-//!   or from a borrowed tree of another memory. Each direction is an impl of [`Load`]; `#[derive(Load)]` writes them field-wise, and every
-//!   one fails with [`LoadError`].
+//!   or from a borrowed tree of another memory. Each direction is an impl of [`Load`];
+//!   `#[derive(Load)]` writes them field-wise, and every one fails with [`LoadError`].
 //! - Names: a field's checkpoint segment is its name or `rename`; array elements and the layers of
 //!   a stack are "0".."N-1", a stack's leaves each filling one backing of every layer; a
 //!   tuple field or element adds no checkpoint segment; [`Named`] names a generic child; a child
