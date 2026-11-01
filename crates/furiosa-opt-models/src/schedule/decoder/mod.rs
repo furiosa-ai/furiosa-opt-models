@@ -101,6 +101,8 @@ type KeyRows<Z> = HbmTensor<bf16, Chip, m![{ Symbol<Reach<Z>> }, KvHeads, Head]>
 type Norm<Z> = <Z as Geometry>::Norm<Width<Z>, Hbm>;
 /// The final norm, where the head starts.
 type FinalNorm<Z> = Named<"norm", Norm<Z>>;
+/// A norm's gain staged for a tile's rows.
+type Gain<Z> = <Stage as crate::Op<&'static Norm<Z>>>::Output;
 /// A launch's call as its layers read it: the context its rotary table prepares and its token IDs.
 type Launched<'c, 'a, Z> = Call<
     'c,
@@ -174,15 +176,28 @@ impl<Z: Geometry + Decode> Places<Z> {
 /// that run its leaves, each over one row tile. The work's order is [`Tokenwise`]'s; a layer shape
 /// gives the steps.
 trait Cut<Z: Geometry + Decode + 'static, A: States> {
+    /// Its front begun for a tile's rows.
+    type Begun;
     /// Its front landed for a tile's rows.
     type Front;
     /// Its output projection as its form lands it at its attention's boundary.
     type Landed;
     /// A tile between its MLP's two steps.
     type Staged;
+    /// A tile whose down projection exchanges its row halves.
+    type Exchanging;
 
-    /// Its front landed for the rows of `tile`.
-    fn front(&self, device: &mut Device, tile: Live<(), Capacity<Z>>) -> Self::Front;
+    /// Its front begun for the rows of `tile`: all of it but what lands behind the exchange that
+    /// ends the previous layer's down projection.
+    fn front(&self, device: &mut Device, tile: Live<(), Capacity<Z>>) -> Self::Begun;
+
+    /// Its `front`, begun, landed for the rows of `tile`.
+    fn land(
+        &self,
+        device: &mut Device,
+        tile: Live<(), Capacity<Z>>,
+        front: Self::Begun,
+    ) -> Self::Front;
 
     /// A tile's input `rows` through it up to its attention's store, its `front` landed: the input
     /// norm, then every period's queries, keys and values, head-normed, rotated and stored in
@@ -207,9 +222,17 @@ trait Cut<Z: Geometry + Decode + 'static, A: States> {
         adapters: &mut A,
     ) -> Self::Staged;
 
-    /// A `staged` tile through its MLP's second step, the down projection, and the MLP residual;
-    /// the rows.
-    fn update(&self, device: &mut Device, staged: Self::Staged, adapters: &mut A) -> RowTile<Z>;
+    /// A `staged` tile through its MLP's second step, the down projection, up to the exchange of
+    /// its row halves.
+    fn exchange(&self, device: &mut Device, staged: Self::Staged) -> Self::Exchanging;
+
+    /// An `exchanging` tile's row halves summed, and the MLP residual; the rows.
+    fn update(
+        &self,
+        device: &mut Device,
+        exchanging: Self::Exchanging,
+        adapters: &mut A,
+    ) -> RowTile<Z>;
 }
 
 /// The forms a layer's input norm, projections and head norms take for a tile's rows, landed: the
@@ -223,8 +246,8 @@ struct Front<G, V, K, Q, QN, KN> {
     key_norm: KN,
 }
 
-/// A tile between its MLP's two steps: the down projection's inputs `R` landed, and the rows of the
-/// attention residual, which the MLP residual adds to.
+/// A tile between steps of its MLP: the down projection's state `R`, and the rows of the attention
+/// residual, which the MLP residual adds to.
 struct Staged<R, Z: Geometry + Decode> {
     ready: R,
     attended: RowTile<Z>,
@@ -237,7 +260,7 @@ struct Staged<R, Z: Geometry + Decode> {
 /// query form lands as `QS` first. The output projection lands as `OL`; the MLP's gate/up form
 /// `GB` begins as `GS` and gives `GO` and its gating `SO`, whose down projection lands a weight
 /// panel as `DP`, stages the product as `DS`, lands its inputs as `DL` and, with its last panel,
-/// as `DR`.
+/// as `DR`, and exchanges its row halves as `DX`.
 impl<
     Z,
     H,
@@ -275,6 +298,7 @@ impl<
     DS,
     DL,
     DR,
+    DX,
     T,
 > Cut<Z, T> for Layer<Z, Q, K, V, QN, KN, A, O, G, D>
 where
@@ -363,13 +387,16 @@ where
         + for<'x> Module<Begin<(Live<SO, Capacity<Z>>, DP)>, (), &'x mut (), Output = DS>
         + for<'x> Module<Live<(DS, DP), Capacity<Z>>, (), &'x mut (), Output = DL>
         + for<'x> Module<(DL, DP), (), &'x mut (), Output = DR>
-        + for<'x> Module<Live<DR, Capacity<Z>>, (), &'x mut T::Down, Output = Owned<Width<Z>, Span>>,
+        + for<'x> Module<Begin<Live<DR, Capacity<Z>>>, (), &'x mut (), Output = DX>
+        + for<'x> Module<Live<DX, Capacity<Z>>, (), &'x mut T::Down, Output = Owned<Width<Z>, Span>>,
 {
-    type Front = Front<<Stage as crate::Op<&'static Norm<Z>>>::Output, VB, KB, Begin<QS>, QNB, KNB>;
+    type Begun = Front<Gain<Z>, VB, KB, Begin<QS>, QNB, KNB>;
+    type Front = Front<Gain<Z>, VB, KB, QB, QNB, KNB>;
     type Landed = OL;
     type Staged = Staged<DR, Z>;
+    type Exchanging = Staged<DX, Z>;
 
-    fn front(&self, device: &mut Device, tile: Live<(), Capacity<Z>>) -> Self::Front {
+    fn front(&self, device: &mut Device, tile: Live<(), Capacity<Z>>) -> Self::Begun {
         let Sequential(Residual(norm, attention, _), _) = self;
         let Attention {
             qkv:
@@ -400,14 +427,12 @@ where
         }
     }
 
-    fn start(
+    fn land(
         &self,
         device: &mut Device,
-        call: Launched<'_, '_, Z>,
-        front: Self::Front,
-        rows: RowTile<Z>,
-        (stored, adapters): (&mut Stored<Z>, &mut T),
-    ) {
+        tile: Live<(), Capacity<Z>>,
+        front: Self::Begun,
+    ) -> Self::Front {
         let Sequential(Residual(_, attention, _), _) = self;
         let Attention {
             qkv:
@@ -417,7 +442,7 @@ where
                             projection: Projection { query, .. },
                             ..
                         },
-                    positions,
+                    ..
                 },
             ..
         } = &attention.0;
@@ -429,9 +454,38 @@ where
             query_norm,
             key_norm,
         } = front;
+        Front {
+            gain,
+            value,
+            key,
+            query: query.forward(device, tile, &mut (), begun),
+            query_norm,
+            key_norm,
+        }
+    }
+
+    fn start(
+        &self,
+        device: &mut Device,
+        call: Launched<'_, '_, Z>,
+        front: Self::Front,
+        rows: RowTile<Z>,
+        (stored, adapters): (&mut Stored<Z>, &mut T),
+    ) {
+        let Sequential(Residual(_, attention, _), _) = self;
+        let Attention {
+            qkv: Positioned { positions, .. },
+            ..
+        } = &attention.0;
+        let Front {
+            gain,
+            value,
+            key,
+            query,
+            query_norm,
+            key_norm,
+        } = front;
         let tile = rows.with(());
-        // The query's second half lands behind the down's exchange, which it would delay.
-        let query = query.forward(&mut *device, tile, &mut (), begun);
         let mut launch = value.forward(&mut *device, tile, &mut (), Begin(()));
         let normalized = gain.forward(&mut *device, (), &mut (), &rows);
         // The rows the periods read lie apart from the launch, which the period loops carry.
@@ -532,10 +586,24 @@ where
         Staged { ready, attended }
     }
 
-    fn update(&self, device: &mut Device, staged: Self::Staged, adapters: &mut T) -> RowTile<Z> {
-        let Sequential(_, Residual(_, mlp, sum)) = self;
+    fn exchange(&self, device: &mut Device, staged: Self::Staged) -> Self::Exchanging {
+        let Sequential(_, Residual(_, mlp, _)) = self;
         let (_, down) = mlp.0.parts();
         let Staged { ready, attended } = staged;
+        let tile = attended.with(());
+        let ready = down.forward(device, (), &mut (), Begin(tile.with(ready)));
+        Staged { ready, attended }
+    }
+
+    fn update(
+        &self,
+        device: &mut Device,
+        exchanging: Self::Exchanging,
+        adapters: &mut T,
+    ) -> RowTile<Z> {
+        let Sequential(_, Residual(_, mlp, sum)) = self;
+        let (_, down) = mlp.0.parts();
+        let Staged { ready, attended } = exchanging;
         let tile = attended.with(());
         let fed = tile.with(down.forward(&mut *device, (), adapters.down(), tile.with(ready)));
         sum.forward(device, (), &mut (), (&attended, &fed))
@@ -601,7 +669,8 @@ where
         tile: Live<(), Capacity<Z>>,
     ) -> Self::Output {
         let Self(embedded, layer) = *self;
-        let front = layer.front(device, tile);
+        let begun = layer.front(device, tile);
+        let front = layer.land(device, tile, begun);
         let rows = tile.with(embedded.fill(&mut *device, tile));
         layer.start(device, call, front, rows, (stored, adapters))
     }
@@ -609,7 +678,8 @@ where
 
 /// A tile through a layer from its attention and the next layer up to its attention's store, each
 /// layer's projections running with its adapters, the next layer's input rows stored. The next
-/// layer's front lands while this one's MLP projects.
+/// layer's front lands while this one's MLP projects, all of it but what would delay the exchange
+/// that ends the down projection, which lands behind it.
 impl<'l, 'c, 'a, 'p, 's, Z: Geometry + Decode + 'static, T: States, X: Cut<Z, T, Landed = L>, L>
     Module<
         (Output<'p, Z, L>, RowTile<Z>),
@@ -629,8 +699,10 @@ impl<'l, 'c, 'a, 'p, 's, Z: Geometry + Decode + 'static, T: States, X: Cut<Z, T,
         let Self(layer, next) = *self;
         let tile = input.with(());
         let staged = layer.end(device, output, input, adapters);
-        let front = next.front(device, tile);
-        let rows = layer.update(device, staged, adapters);
+        let begun = next.front(device, tile);
+        let exchanging = layer.exchange(device, staged);
+        let front = next.land(device, tile, begun);
+        let rows = layer.update(device, exchanging, adapters);
         next.start(device, call, front, rows, (stored, following))
     }
 }
@@ -654,7 +726,8 @@ where
     ) -> Self::Output {
         let Self(layer, norm) = *self;
         let staged = layer.end(device, output, input, adapters);
-        let rows = layer.update(device, staged, adapters);
+        let exchanging = layer.exchange(device, staged);
+        let rows = layer.update(device, exchanging, adapters);
         norm.forward(device, (), &mut (), &rows)
     }
 }
