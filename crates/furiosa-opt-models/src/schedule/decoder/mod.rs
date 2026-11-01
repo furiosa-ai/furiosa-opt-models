@@ -235,8 +235,8 @@ trait Cut<Z: Geometry + Decode + 'static, A: States> {
     ) -> RowTile<Z>;
 }
 
-/// The forms a layer's input norm, projections and head norms take for a tile's rows, landed: the
-/// norm's gain, the value and key forms, the query form begun, and the two head norms' forms.
+/// The forms a layer's input norm, projections and head norms take for a tile's rows: the norm's
+/// gain, the value and key forms, the query form, begun or landed, and the two head norms' forms.
 struct Front<G, V, K, Q, QN, KN> {
     gain: G,
     value: V,
