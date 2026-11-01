@@ -595,13 +595,7 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>
 
     /// The span's rows: each cluster's own row half of the sums added to the half the other sent.
     fn summed(self, context: &mut Device) -> Owned<Hidden, Rows> {
-        let mut result: DmTensor<
-            bf16,
-            Chip,
-            Cluster<Intermediate>,
-            m![Hidden / 16],
-            m![Rows % (Rows / 2), Hidden % 16],
-        > = DmTensor::new();
+        let mut result: Half<Hidden, Intermediate, Rows> = DmTensor::new();
         if self.rows <= 8 {
             let own = self.eight(context, &[0, 1]);
             Add::of::<m![Rows % (Rows / 2) = 8, Hidden % 16 / 8], m![1], m![Hidden % 8], Term, _, _, _, _>(&mut *context, (&own, &self.sent.0)).commit_prefix::<m![Rows % (Rows / 2) = 8], _, _>(result.view_mut().tile::<m![Rows % (Rows / 2)], 8,
