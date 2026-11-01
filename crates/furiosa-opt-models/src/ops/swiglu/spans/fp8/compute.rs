@@ -82,33 +82,53 @@ impl<'a, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>
     }
 }
 
-/// The gate and up projections of a span's live rows: its rows as E4M3 by their row scales, each
-/// pair of 1024-input weight panels contracted with them in turn, the next pair landing during the
-/// current one's contraction, and the channel scales applied to the summed panels. A pair's
-/// partial sums are added as soon as the next pair's are, so at most two of them are held.
+/// A span's gate and up projections contracted up to their last pair: the rows quantized as the
+/// contractions read them, the first three pairs' summed partial sums, the last pair landed, and
+/// the row and channel scales the sums take.
+pub struct Contracted<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName> {
+    quantized: Input<Hidden, Intermediate, Rows>,
+    lanes: Lanes<Hidden, Intermediate, Rows>,
+    sums: Both<Intermediate, Rows>,
+    last: (Panel<Hidden, Intermediate>, Panel<Hidden, Intermediate>),
+    scale: RowScale<Intermediate, Rows>,
+    channels: (Channels<Intermediate, Rows>, Channels<Intermediate, Rows>),
+    waves: (usize, usize),
+}
+
+/// The gate and up projections of a span's live rows begun: its rows as E4M3 by their row scales,
+/// each pair of 1024-input weight panels but the last contracted with them in turn, the next pair
+/// landing during the current one's contraction. The channel scales land first and the last pair
+/// right behind the third, so the next step lands nothing and what lands between the steps delays
+/// none of its inputs.
 impl<'t, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>
-    Op<(
-        GateUp<Hidden, Intermediate>,
-        Live<&'t Owned<Hidden, Rows>, Capacity>,
-    )> for GateUpWeights<Hidden, Intermediate>
+    Op<
+        Begin<(
+            GateUp<Hidden, Intermediate>,
+            Live<&'t Owned<Hidden, Rows>, Capacity>,
+        )>,
+    > for GateUpWeights<Hidden, Intermediate>
 {
-    type Output = (
-        Projection<Intermediate, Rows>,
-        Projection<Intermediate, Rows>,
-    );
+    type Output = Contracted<Hidden, Intermediate, Rows>;
 
     fn forward(
         &self,
         context: &mut Device,
-        (first, normalized): (
+        Begin((first, normalized)): Begin<(
             GateUp<Hidden, Intermediate>,
             Live<&'t Owned<Hidden, Rows>, Capacity>,
-        ),
+        )>,
     ) -> Self::Output {
         const { assert!(Hidden::SIZE / 1024 == 4, "written for four passes") };
         let waves = (normalized.count::<axis::Rows<128>>(), normalized.rows());
         let (live, rows) = waves;
         let normalized = *normalized.value();
+        let channels = |context: &mut Device, term: usize| -> Channels<Intermediate, Rows> {
+            self.1
+                .view()
+                .tile::<m![Term], 1, m![Term = 1 # 2, Intermediate]>(term)
+                .to_dm(&mut context.tdma)
+        };
+        let channels = (channels(context, 0), channels(context, 1));
         // The row scales' pass runs before the rows' store, which queues behind the first pair's
         // transfer.
         let scales = InputScales.forward(&mut *context, normalized);
@@ -151,14 +171,6 @@ impl<'t, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: Axi
                 (&input[wave], (&tiles[wave], wave), &mut quantized),
             );
         }
-        let channels = |context: &mut Device, term: usize| -> ChannelScale<Intermediate, Rows> {
-            let channels: Channels<Intermediate, Rows> = self
-                .1
-                .view()
-                .tile::<m![Term], 1, m![Term = 1 # 2, Intermediate]>(term)
-                .to_dm(&mut context.tdma);
-            FetchChannels.forward(&mut *context, &channels)
-        };
         let panel = |context: &mut Device, term: usize| -> Panel<Hidden, Intermediate> {
             self.0
                 .view()
@@ -194,24 +206,67 @@ impl<'t, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: Axi
         let third = pair(context, 2);
         let mut b1: Both<Intermediate, Rows> = DmTensor::new();
         let l = Sweep.forward(&mut *context, (&quantized, &second, &mut b1, (1, l), waves));
+        let last = (panel(context, 0), panel(context, 1));
         let sums = add(context, (&b0, &b1));
-        let (g3, u3) = (panel(context, 0), panel(context, 1));
         let mut b2: Both<Intermediate, Rows> = DmTensor::new();
-        let l = Sweep.forward(&mut *context, (&quantized, &third, &mut b2, (2, l), waves));
-        let sums = add(context, (&sums, &b2));
+        let lanes = Sweep.forward(&mut *context, (&quantized, &third, &mut b2, (2, l), waves));
+        Contracted {
+            sums: add(context, (&sums, &b2)),
+            quantized,
+            lanes,
+            last,
+            scale,
+            channels,
+            waves,
+        }
+    }
+}
+
+/// The begun projections' last pair contracted and each term's summed panels scaled by the row
+/// and channel scales.
+impl<'t, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>
+    Op<(
+        Contracted<Hidden, Intermediate, Rows>,
+        Live<&'t Owned<Hidden, Rows>, Capacity>,
+    )> for GateUpWeights<Hidden, Intermediate>
+{
+    type Output = (
+        Projection<Intermediate, Rows>,
+        Projection<Intermediate, Rows>,
+    );
+
+    fn forward(
+        &self,
+        context: &mut Device,
+        (contracted, _): (
+            Contracted<Hidden, Intermediate, Rows>,
+            Live<&'t Owned<Hidden, Rows>, Capacity>,
+        ),
+    ) -> Self::Output {
+        let Contracted {
+            quantized,
+            lanes,
+            sums,
+            last: (g3, u3),
+            scale,
+            channels,
+            waves,
+        } = contracted;
         let mut b3: Both<Intermediate, Rows> = DmTensor::new();
-        let l = Sweep.forward(
+        let lanes = Sweep.forward(
             &mut *context,
-            (&quantized, &g3, (&mut b3, 0), (3, l), waves),
+            (&quantized, &g3, (&mut b3, 0), (3, lanes), waves),
         );
-        let channel = channels(context, 0);
-        let gate = Combine.forward(&mut *context, ((&sums, &b3, 0), (&scale, &channel), rows));
+        let channel = FetchChannels.forward(&mut *context, &channels.0);
+        let terms = ((&sums, &b3, 0), (&scale, &channel), waves.1);
+        let gate = Combine.forward(&mut *context, terms);
         Sweep.forward(
             &mut *context,
-            (&quantized, &u3, (&mut b3, 1), (3, l), waves),
+            (&quantized, &u3, (&mut b3, 1), (3, lanes), waves),
         );
-        let channel = channels(context, 1);
-        let up = Combine.forward(&mut *context, ((&sums, &b3, 1), (&scale, &channel), rows));
+        let channel = FetchChannels.forward(&mut *context, &channels.1);
+        let terms = ((&sums, &b3, 1), (&scale, &channel), waves.1);
+        let up = Combine.forward(&mut *context, terms);
         (gate, up)
     }
 }

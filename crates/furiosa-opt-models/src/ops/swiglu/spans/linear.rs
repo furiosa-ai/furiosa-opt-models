@@ -30,6 +30,29 @@ where
     fn forward(&self, _: &mut Device, _: Env, _: &mut (), _: Begin<()>) {}
 }
 
+/// Nor anything before the projection's last step, which projects the rows alone.
+impl<'t, Hidden, Intermediate, Rows, Capacity, T, Env>
+    Module<Begin<((), Live<&'t Owned<Hidden, Rows>, Capacity>)>, Env, &mut ()>
+    for Linear<Hidden, GateUp<Intermediate>, Chip, T>
+where
+    Hidden: AxisName,
+    Intermediate: AxisName,
+    Rows: AxisName,
+    Capacity: AxisName,
+    T: Matrix<In = Hidden, Out = GateUp<Intermediate>>,
+{
+    type Output = ();
+
+    fn forward(
+        &self,
+        _: &mut Device,
+        _: Env,
+        _: &mut (),
+        _: Begin<((), Live<&'t Owned<Hidden, Rows>, Capacity>)>,
+    ) {
+    }
+}
+
 /// The packed gate/up projection of a span's live rows, which move to HBM for it.
 impl<'t, Hidden, Intermediate, Rows, Capacity, T, Env: Copy>
     Module<((), Live<&'t Owned<Hidden, Rows>, Capacity>), Env, &mut ()>
