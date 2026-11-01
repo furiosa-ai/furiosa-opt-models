@@ -403,7 +403,9 @@ impl<G: Geometry + Family, Model, Head, P: Forms> Implements for ForCausalLM<G, 
 
     fn scope(source: &Checkpoint) -> Result<&'static str, LoadError> {
         check::<G>(source.config())?;
-        P::REQUIREMENT.admits(source).map(|()| "")
+        P::REQUIREMENT
+            .admits(source, &layers::<G>(G::MODEL))
+            .map(|()| "")
     }
 }
 
@@ -418,21 +420,25 @@ impl<G: Geometry + Family, Body, Rotary, P: Forms> Implements for Model<G, Body,
 
     fn scope(source: &Checkpoint) -> Result<&'static str, LoadError> {
         check::<G>(source.config())?;
-        P::REQUIREMENT.admits(source)?;
         let names = source.names();
         let holds = |name: &str| names.iter().any(|stored| stored == name);
         let nested = format!("{}.weight", embedding::<G>());
-        match (holds("embed_tokens.weight"), holds(&nested)) {
-            (true, true) => Err(LoadError::InvalidData {
-                name: "embed_tokens.weight".into(),
-                reason: format!(
-                    "the checkpoint holds a base model at its root and under {}",
-                    G::MODEL
-                ),
-            }),
-            (false, true) => Ok(G::MODEL),
-            _ => Ok(""),
-        }
+        let scope = match (holds("embed_tokens.weight"), holds(&nested)) {
+            (true, true) => {
+                return Err(LoadError::InvalidData {
+                    name: "embed_tokens.weight".into(),
+                    reason: format!(
+                        "the checkpoint holds a base model at its root and under {}",
+                        G::MODEL
+                    ),
+                });
+            }
+            (false, true) => G::MODEL,
+            _ => "",
+        };
+        P::REQUIREMENT
+            .admits(source, &layers::<G>(scope))
+            .map(|()| scope)
     }
 }
 
@@ -448,7 +454,9 @@ impl<G: Geometry + Family, Model, Score, P: Forms> Implements
 
     fn scope(source: &Checkpoint) -> Result<&'static str, LoadError> {
         check::<G>(source.config())?;
-        P::REQUIREMENT.admits(source).map(|()| "")
+        P::REQUIREMENT
+            .admits(source, &layers::<G>(G::MODEL))
+            .map(|()| "")
     }
 }
 
@@ -2756,6 +2764,15 @@ fn class<G: Family, R>(
 
 fn embedding<G: Family>() -> String {
     format!("{}.embed_tokens", G::MODEL)
+}
+
+/// Where a checkpoint keeping size `G`'s base model at `model` keeps each of its layers.
+fn layers<G: Geometry>(model: &str) -> Vec<String> {
+    let path = |layer| match model {
+        "" => format!("layers.{layer}"),
+        model => format!("{model}.layers.{layer}"),
+    };
+    (0..G::LAYERS).map(path).collect()
 }
 
 /// A config parse's refusal as a load's: unsupported, or invalid data.

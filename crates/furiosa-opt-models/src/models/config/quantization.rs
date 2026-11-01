@@ -2,7 +2,8 @@
 //! block scales or per-channel scales, or E2M1 weights and inputs with E4M3 scales per 16 inputs
 //! under static FP32 tensor scales, and the modules a checkpoint leaves unquantized.
 //!
-//! - A mixed-precision checkpoint declares one scheme for each module group.
+//! - A declaration names the modules each scheme quantizes: every linear module, or those a
+//!   group's patterns name; a mixed-precision checkpoint declares one scheme a module group.
 
 use super::{
     Absent, Constant, Disabled, Enabled, Exclusion, Exclusions, Literal, UNSUPPORTED, flattened,
@@ -12,20 +13,141 @@ use crate::tensor::form::fp8::GROUP;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::fmt;
 
-/// The quantization a checkpoint's `quantization_config` declares: how its projections scale, the
-/// modules it leaves unquantized and whether its KV cache is quantized too.
+/// The quantization a checkpoint's `quantization_config` declares: the modules each scheme
+/// quantizes, the modules it leaves unquantized and whether its KV cache is quantized too.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(try_from = "Value")]
 pub struct Quantization {
-    /// The scheme of each module group, once, in `Scheme` order.
-    pub schemes: Vec<Scheme>,
+    /// Each target the declaration names, with the scheme of the modules it names.
+    pub targets: Vec<(Target, Scheme)>,
     /// The modules left unquantized: by name, by a name prefix, or by a part of their name.
     pub excluded: Exclusions,
     /// Whether the checkpoint declares an E4M3 KV cache. An NVFP4 cache is at unit scale, since
     /// the NVFP4 parameter check refuses cache scales; a BF16 cache keeps its values unrounded.
     pub kv_cache: bool,
 }
+
+impl Quantization {
+    /// Whether `target` quantizes linear module `module`: it names the module, which the
+    /// declaration does not exclude.
+    pub fn quantizes(&self, target: &Target, module: &str) -> bool {
+        target.names(module) && !self.excluded.excludes(module)
+    }
+
+    /// The schemes the declaration quantizes linear module `module` in, each once: none when it
+    /// leaves the module unquantized, several when groups of several schemes name it.
+    pub fn schemes(&self, module: &str) -> Vec<Scheme> {
+        let mut schemes: Vec<_> = (self.targets.iter())
+            .filter(|(target, _)| self.quantizes(target, module))
+            .map(|(_, scheme)| *scheme)
+            .collect();
+        schemes.sort_unstable();
+        schemes.dedup();
+        schemes
+    }
+}
+
+/// The linear modules a module group quantizes, named one supported way.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(try_from = "String")]
+pub enum Target {
+    /// Every linear module, by its class name `Linear`.
+    Linear,
+    /// The modules whose name holds each part in order and then ends with one of the endings: a
+    /// pattern `re:.*part.*ending$` of literal names, whose last may hold one choice `(a|b)`.
+    Pattern {
+        parts: Vec<String>,
+        endings: Vec<String>,
+    },
+}
+
+impl Target {
+    /// Whether the target names linear module `module`.
+    pub fn names(&self, module: &str) -> bool {
+        match self {
+            Self::Linear => true,
+            Self::Pattern { parts, endings } => endings.iter().any(|ending| {
+                module.strip_suffix(ending.as_str()).is_some_and(|head| {
+                    let rest = parts.iter().try_fold(head, |rest, part| {
+                        rest.find(part.as_str()).map(|at| &rest[at + part.len()..])
+                    });
+                    rest.is_some()
+                })
+            }),
+        }
+    }
+}
+
+impl TryFrom<String> for Target {
+    type Error = String;
+
+    fn try_from(found: String) -> Result<Self, Self::Error> {
+        let refused = || refuse(format_args!("{found:?}"), TARGETS);
+        if found == "Linear" {
+            return Ok(Self::Linear);
+        }
+        let body = (found.strip_prefix("re:.*"))
+            .and_then(|body| body.strip_suffix('$'))
+            .filter(|body| !body.contains(r"\.*"))
+            .ok_or_else(refused)?;
+        // A name of word characters and escaped dots, read as dots, besides `markers`.
+        let literal = |name: &str, markers: &str| {
+            let word = |c: char| c.is_ascii_alphanumeric() || c == '_' || markers.contains(c);
+            let words = name.replace(r"\.", "").chars().all(word);
+            (!name.is_empty() && words).then(|| name.replace(r"\.", "."))
+        };
+        let mut names: Vec<_> = body.split(".*").collect();
+        let last = (names.pop())
+            .and_then(|last| literal(last, "(|)"))
+            .ok_or_else(refused)?;
+        let parts = (names.into_iter())
+            .map(|part| literal(part, ""))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(refused)?;
+        let plain = |text: &str| !text.contains(['(', '|', ')']);
+        let endings = match last.split_once('(') {
+            None if plain(&last) => vec![last],
+            None => return Err(refused()),
+            Some((prefix, rest)) => {
+                let (choices, suffix) = rest.split_once(')').ok_or_else(refused)?;
+                let choices: Vec<_> = choices.split('|').collect();
+                let named = |choice: &&str| !choice.is_empty() && plain(choice);
+                if !(plain(prefix) && plain(suffix) && choices.iter().all(named)) {
+                    return Err(refused());
+                }
+                (choices.iter())
+                    .map(|choice| format!("{prefix}{choice}{suffix}"))
+                    .collect()
+            }
+        };
+        Ok(Self::Pattern { parts, endings })
+    }
+}
+
+/// The target as a declaration spells it, its endings one choice.
+impl fmt::Display for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let escaped = |name: &String| name.replace('.', r"\.");
+        match self {
+            Self::Linear => f.write_str("Linear"),
+            Self::Pattern { parts, endings } => {
+                let parts: String = parts.iter().map(|part| escaped(part) + ".*").collect();
+                match endings.as_slice() {
+                    [ending] => write!(f, "re:.*{parts}{}$", escaped(ending)),
+                    endings => {
+                        let endings: Vec<_> = endings.iter().map(escaped).collect();
+                        write!(f, "re:.*{parts}({})$", endings.join("|"))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The targets a group may name, which a refusal of others names.
+const TARGETS: &str = r#""Linear" or "re:.*name.*name(a|b)name$" patterns of literal names"#;
 
 /// How a checkpoint quantizes its projections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -224,7 +346,7 @@ struct BlockGroup {
     input_activations: GroupActivations,
     #[serde(default)]
     output_activations: Absent,
-    targets: Vec<String>,
+    targets: Vec<Target>,
 }
 #[derive(Clone, Debug, Deserialize)]
 struct BlockWeights {
@@ -265,9 +387,9 @@ struct GroupActivations {
 }
 
 impl BlockGroup {
-    /// Symmetric weights and activations, the activations scaled at run time, on every linear
-    /// module.
-    fn linear(&self) -> bool {
+    /// Whether the group quantizes some modules, its weights and activations symmetric and the
+    /// activations scaled at run time.
+    fn quantizes(&self) -> bool {
         let Self {
             weights:
                 BlockWeights {
@@ -298,7 +420,7 @@ impl BlockGroup {
             output_activations: Absent,
             targets,
         } = self;
-        *weights && *activations && *dynamic && targets == &["Linear"]
+        *weights && *activations && *dynamic && !targets.is_empty()
     }
 }
 
@@ -311,7 +433,7 @@ struct ChannelGroup {
     input_activations: Option<TokenActivations>,
     #[serde(default)]
     output_activations: Absent,
-    targets: Vec<String>,
+    targets: Vec<Target>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -403,7 +525,7 @@ struct PackedGroup {
     input_activations: Option<PackedInputs>,
     #[serde(default)]
     output_activations: Absent,
-    targets: Vec<String>,
+    targets: Vec<Target>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -484,9 +606,9 @@ impl PackedGroup {
 }
 
 impl Format {
-    /// The scheme of a module group of a checkpoint stored in this format; only a mixed-precision
-    /// checkpoint's groups name formats of their own.
-    fn scheme(self, group: &Value) -> Result<Scheme, String> {
+    /// The scheme of a module group of a checkpoint stored in this format, and the modules the
+    /// group targets; only a mixed-precision checkpoint's groups name formats of their own.
+    fn scheme(self, group: &Value) -> Result<(Scheme, Vec<Target>), String> {
         let read = |error: serde_json::Error| error.to_string();
         let unsupported = |message: &str| format!("{UNSUPPORTED}{message}");
         let own = (group.get("format").filter(|format| !format.is_null()))
@@ -503,23 +625,23 @@ impl Format {
             }
         };
         let strategy = &group["weights"]["strategy"];
-        let (quantizes, scheme, refusal) = match (packed, strategy.as_str()) {
+        let (quantizes, scheme, refusal, targets) = match (packed, strategy.as_str()) {
             (true, _) => {
                 let group = PackedGroup::deserialize(group).map_err(read)?;
-                (group.quantizes(), Scheme::Nvfp4, NVFP4)
+                (group.quantizes(), Scheme::Nvfp4, NVFP4, group.targets)
             }
             (false, Some("channel")) => {
                 let group = ChannelGroup::deserialize(group).map_err(read)?;
-                (group.quantizes(), Scheme::Channel, FP8)
+                (group.quantizes(), Scheme::Channel, FP8, group.targets)
             }
             (false, Some("block")) => {
                 let group = BlockGroup::deserialize(group).map_err(read)?;
-                (group.linear(), Scheme::Block, FP8)
+                (group.quantizes(), Scheme::Block, FP8, group.targets)
             }
             (false, _) => return Err(refuse(strategy, r#""block" or "channel""#)),
         };
         quantizes
-            .then_some(scheme)
+            .then_some((scheme, targets))
             .ok_or_else(|| unsupported(refusal))
     }
 }
@@ -571,7 +693,7 @@ impl TryFrom<Value> for Quantization {
                 })
                 .collect::<Result<Vec<_>, _>>()
         };
-        let (mut schemes, excluded, kv_cache) = match located::<_, Hf>(declared)? {
+        let (targets, excluded, kv_cache) = match located::<_, Hf>(declared)? {
             Hf::Fp8 {
                 activation_scheme,
                 weight_block_size,
@@ -588,7 +710,7 @@ impl TryFrom<Value> for Quantization {
                 };
                 let ignored = ignored_layers.into_iter().chain(modules_to_not_convert);
                 (
-                    vec![scheme],
+                    vec![(Target::Linear, scheme)],
                     patterns(ignored.flatten().collect())?,
                     symmetric(kv_cache_scheme),
                 )
@@ -603,7 +725,7 @@ impl TryFrom<Value> for Quantization {
                     return Err(fp8());
                 }
                 (
-                    vec![Scheme::Tensor],
+                    vec![(Target::Linear, Scheme::Tensor)],
                     patterns(ignore.unwrap_or_default())?,
                     symmetric(kv_cache_scheme),
                 )
@@ -625,7 +747,7 @@ impl TryFrom<Value> for Quantization {
                      }| (),
                 );
                 (
-                    vec![Scheme::Nvfp4],
+                    vec![(Target::Linear, Scheme::Nvfp4)],
                     prefixes(ignore.unwrap_or_default())?,
                     Some(cache.is_some()),
                 )
@@ -650,20 +772,21 @@ impl TryFrom<Value> for Quantization {
                 if !empty(sparsity_config) {
                     return Err(refuse("a value", "none"));
                 }
-                let schemes = (config_groups.values())
+                let groups = (config_groups.values())
                     .map(|group| format.scheme(group))
                     .collect::<Result<Vec<_>, _>>()?;
+                let targets = (groups.into_iter())
+                    .flat_map(|(scheme, targets)| targets.into_iter().map(move |t| (t, scheme)))
+                    .collect();
                 (
-                    schemes,
+                    targets,
                     patterns(ignore.unwrap_or_default())?,
                     symmetric(kv_cache_scheme),
                 )
             }
         };
-        schemes.sort_unstable();
-        schemes.dedup();
         Ok(Self {
-            schemes,
+            targets,
             excluded: Exclusions(excluded),
             kv_cache: kv_cache.ok_or_else(fp8)?,
         })
@@ -749,7 +872,7 @@ mod tests {
             .map(|(document, scheme)| (quantization(&document).unwrap(), scheme))
             .collect();
         for (config, scheme) in &parsed {
-            assert_eq!(config.schemes, [*scheme]);
+            assert_eq!(config.targets, [(Target::Linear, *scheme)]);
         }
         assert!(parsed[1].0.kv_cache && !parsed[0].0.kv_cache);
         let excludes = |at: usize, module| parsed[at].0.excluded.excludes(module);
@@ -786,6 +909,10 @@ mod tests {
             "activations scaled at run time per 128 inputs",
         );
         let patterns = "exclusions must be module names or `re:.*part.*` patterns";
+        let targets = concat!(
+            r#"found "Embedding", compiled "Linear" or "re:.*name.*name(a|b)name$" patterns of "#,
+            "literal names",
+        );
         let asymmetric =
             json!({"num_bits": 8, "type": "float", "dynamic": false, "symmetric": false});
         let cases = [
@@ -939,7 +1066,7 @@ mod tests {
                 &compressed,
                 &[group[0], group[1], "targets"][..],
                 json!(["Embedding"]),
-                scales,
+                targets,
             ),
             (
                 &compressed,
@@ -1049,7 +1176,7 @@ mod tests {
     #[test]
     fn parses_nvfp4_declarations() {
         let config = quantization(&nvfp4()).unwrap();
-        assert_eq!(config.schemes, [Scheme::Nvfp4]);
+        assert_eq!(config.targets, [(Target::Linear, Scheme::Nvfp4)]);
         assert_eq!(
             config.excluded.0,
             [
@@ -1114,13 +1241,32 @@ mod tests {
         );
     }
 
-    /// A mixed-precision declaration parses to the scheme of each module group, its exclusions and
-    /// its E4M3 cache; a group's other values or format, or a sparse checkpoint, are refused.
+    /// A mixed-precision declaration parses to the modules each group's targets name in its scheme,
+    /// its exclusions and its E4M3 cache; a group's other values or format, or a sparse checkpoint,
+    /// are refused.
     #[test]
     fn parses_mixed_precision_declarations() {
         use crate::models::decoder::attention::gemma4;
         let config = quantization(&gemma4::tests::quantization()).unwrap();
-        assert_eq!(config.schemes, [Scheme::Channel, Scheme::Nvfp4]);
+        let attention = Target::Pattern {
+            parts: Vec::new(),
+            endings: ["q", "k", "v", "o"]
+                .map(|head| format!("self_attn.{head}_proj"))
+                .into(),
+        };
+        let feedforward = Target::Pattern {
+            parts: vec!["language_model".into()],
+            endings: ["gate", "up", "down"]
+                .map(|part| format!(".mlp.{part}_proj"))
+                .into(),
+        };
+        assert_eq!(
+            config.targets,
+            [
+                (attention, Scheme::Channel),
+                (feedforward.clone(), Scheme::Nvfp4)
+            ]
+        );
         assert!(config.kv_cache);
         for module in ["lm_head", "model.embed_audio.embedding_projection"] {
             assert!(config.excluded.excludes(module), "{module}");
@@ -1189,6 +1335,7 @@ mod tests {
         let error = quantization(&nvfp4).unwrap_err();
         assert_eq!(error.to_string(), format);
         (nvfp4["config_groups"].as_object_mut().unwrap()).remove("group_0");
-        assert_eq!(quantization(&nvfp4).unwrap().schemes, [Scheme::Nvfp4]);
+        let packed = quantization(&nvfp4).unwrap().targets;
+        assert_eq!(packed, [(feedforward, Scheme::Nvfp4)]);
     }
 }

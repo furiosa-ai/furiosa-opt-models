@@ -5,7 +5,7 @@ use super::{QueryHeads, Size};
 use crate::load::{Checkpoint, Load, LoadError};
 use crate::models::config::decoder::Rotary;
 use crate::models::config::{
-    self, Exclusions, Quantization, Scheme, compiled, decoder, scaling::Spectrum,
+    self, Exclusions, Quantization, Scheme, Target, compiled, decoder, scaling::Spectrum,
 };
 use crate::models::decoder::attention::extra_large::QWidth;
 use crate::models::decoder::attention::{Geometry, Head};
@@ -31,8 +31,8 @@ impl TryFrom<&decoder::Config<Spectrum>> for Config {
     fn try_from(config: &decoder::Config<Spectrum>) -> io::Result<Self> {
         if !matches!(
             &config.quantization_config,
-            Some(Quantization { schemes, excluded: Exclusions(excluded), kv_cache: false })
-                if *schemes == [Scheme::Block] && excluded.is_empty()
+            Some(Quantization { targets, excluded: Exclusions(excluded), kv_cache: false })
+                if *targets == [(Target::Linear, Scheme::Block)] && excluded.is_empty()
         ) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,

@@ -8,7 +8,7 @@
 //!   `Unsupported` and any other malformed document as `InvalidData`.
 //! - Every flattened part reads the document through a JSON map, so two parts may read one field.
 
-pub use quantization::{Quantization, Scheme};
+pub use quantization::{Quantization, Scheme, Target};
 
 use furiosa_opt_std::prelude::AxisName;
 use serde::{Deserialize, Deserializer, de};

@@ -2,7 +2,7 @@
 //! every default is the served checkpoint, whose projections are independently scaled FP8.
 
 use crate::models::config::{
-    self, Absent, Constant, Disabled, Scheme, Size, compiled, flattened, scaling,
+    self, Absent, Constant, Disabled, Scheme, Size, Target, compiled, flattened, scaling,
 };
 use crate::models::decoder::attention::{Qwen2ForCausalLM, Qwen2Layer};
 use crate::models::decoder::{self, Attention, Declaration, Envelope, Forms, Query, Shape, form};
@@ -439,10 +439,11 @@ where
         let requirement = F::REQUIREMENT;
         match (requirement.declaration(), &quantization) {
             (Some(Declaration::Fp8(scheme)), Some(declared))
-                if declared.schemes == [scheme] && !declared.kv_cache => {}
+                if declared.targets == [(Target::Linear, scheme)] && !declared.kv_cache => {}
             // The NVFP4 parameters refuse cache scales: a declared E4M3 cache is at unit scale, and
             // a BF16 cache holds its values unrounded.
-            (Some(Declaration::Nvfp4), Some(declared)) if declared.schemes == [Scheme::Nvfp4] => {}
+            (Some(Declaration::Nvfp4), Some(declared))
+                if declared.targets == [(Target::Linear, Scheme::Nvfp4)] => {}
             (_, None) if !requirement.quantized() || requirement.online() => {}
             (_, None) => {
                 return Err(io::Error::new(
@@ -640,7 +641,7 @@ mod tests {
         Blocks::parse(&excluding).unwrap();
         let declared = Nvfp4::parse(&nvfp4()).unwrap().quantization;
         assert!(
-            matches!(declared, Some(nvfp4) if nvfp4.schemes == [crate::models::config::Scheme::Nvfp4]
+            matches!(declared, Some(nvfp4) if nvfp4.targets == [(Target::Linear, Scheme::Nvfp4)]
             && nvfp4.kv_cache && nvfp4.excluded.excludes("lm_head"))
         );
         let mut unquantized = nvfp4();

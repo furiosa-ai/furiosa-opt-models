@@ -433,32 +433,40 @@ pub type Projection<F, In, Out, D = bf16, Chips = Chip, X = Hbm> = <F as Form>::
     <X as Memory>::Tensor<<F as Form>::Stored, Chips, m![Out, In]>,
 >;
 
-/// What a checkpoint declares about the weights its projections store: the declarations its
-/// quantized projections read, and whether a load may quantize BF16 weights for them instead.
+/// What a checkpoint declares about the weights a decoder layer's projections store: the
+/// declaration each role's projection reads, and whether a load may quantize BF16 weights for
+/// them instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Requirement {
-    /// Each declaration a quantized projection reads, once, from the first slot on.
-    declarations: [Option<Declaration>; PROJECTIONS],
+    /// The declaration the projection of each role reads, in [`ROLES`] order; none for BF16.
+    declarations: [Option<Declaration>; ROLES.len()],
     /// Whether every quantized projection also takes the E4M3 weights a load quantizes from BF16.
     online: bool,
 }
 
-/// A decoder layer's projections: its forms read at most so many declarations.
-const PROJECTIONS: usize = 7;
+/// Where a decoder layer keeps the projection of each role, in [`Forms`] order, as Hugging Face
+/// names it.
+const ROLES: [&str; 7] = [
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+];
 
 impl Requirement {
     /// BF16 weights, which no quantization declares.
     pub const UNQUANTIZED: Self = Self {
-        declarations: [None; PROJECTIONS],
+        declarations: [None; ROLES.len()],
         online: false,
     };
 
     /// Quantized weights that the checkpoint's `quantization_config` declares as `declaration`.
     pub const fn declared(declaration: Declaration) -> Self {
-        let mut declarations = [None; PROJECTIONS];
-        declarations[0] = Some(declaration);
         Self {
-            declarations,
+            declarations: [Some(declaration); ROLES.len()],
             online: false,
         }
     }
@@ -472,35 +480,30 @@ impl Requirement {
         }
     }
 
-    /// What a checkpoint declares for projections of requirements `self` and `other`: every
-    /// declaration either reads, as a mixed-precision checkpoint declares one a module group.
-    pub const fn and(self, other: Self) -> Self {
-        let online = match (self.quantized(), other.quantized()) {
-            (false, _) => other.online,
-            (_, false) => self.online,
-            (true, true) => self.online && other.online,
-        };
-        let mut declarations = self.declarations;
-        let mut at = 0;
-        while at < PROJECTIONS {
-            if let Some(declaration) = other.declarations[at] {
-                let mut slot = 0;
-                while matches!(declarations[slot], Some(held) if !held.same(declaration)) {
-                    slot += 1;
-                }
-                declarations[slot] = Some(declaration);
+    /// What a checkpoint declares for a layer whose projection of each role is in the form whose
+    /// requirement `forms` holds at the role's place: that form's declaration, and the weights a
+    /// load quantizes when every quantized role's form takes them.
+    pub const fn roles(forms: [Self; ROLES.len()]) -> Self {
+        let mut declarations = [None; ROLES.len()];
+        let (mut quantized, mut online) = (false, true);
+        let mut role = 0;
+        while role < ROLES.len() {
+            declarations[role] = forms[role].declarations[role];
+            if declarations[role].is_some() {
+                quantized = true;
+                online &= forms[role].online;
             }
-            at += 1;
+            role += 1;
         }
         Self {
             declarations,
-            online,
+            online: quantized && online,
         }
     }
 
     /// Whether the weights are quantized.
-    pub const fn quantized(self) -> bool {
-        self.declarations[0].is_some()
+    pub fn quantized(self) -> bool {
+        self.declarations.iter().any(Option::is_some)
     }
 
     /// Whether a load may quantize the BF16 weights of every quantized projection.
@@ -510,16 +513,16 @@ impl Requirement {
 
     /// The declaration the projections read, when they read one alone.
     pub fn declaration(self) -> Option<Declaration> {
-        match self.declarations {
-            [only, None, ..] => only,
-            _ => None,
-        }
+        let mut read = self.declarations.into_iter().flatten();
+        let first = read.next()?;
+        read.all(|other| other == first).then_some(first)
     }
 
-    /// Refuses `source` unless it holds the weights these projections read: BF16 ones if it declares
-    /// no quantization, quantized ones only if a load quantizes them, else those of exactly the
-    /// schemes it declares.
-    pub fn admits(self, source: &Checkpoint) -> Result<(), LoadError> {
+    /// Refuses `source` unless it holds the weights these projections read in the decoder layers
+    /// it keeps at `layers`: BF16 ones if it declares no quantization, quantized ones only if a
+    /// load quantizes them, else each projection in the scheme of its form by the targets naming
+    /// it, every target naming one.
+    pub fn admits(self, source: &Checkpoint, layers: &[String]) -> Result<(), LoadError> {
         const DECLARED: &str = "config.json:quantization_config";
         let declared = (source.declaration())
             .map(config::parse::<config::Quantization>)
@@ -537,43 +540,69 @@ impl Requirement {
                 reason,
             })
         };
-        let listed = |items: Vec<String>| items.join(" and ");
-        let read = || self.declarations.iter().flatten();
-        let own = listed(
-            read()
-                .map(|declaration| format!("{declaration:?}"))
-                .collect(),
-        );
+        let own = (self.declarations.iter().flatten()).fold(Vec::new(), |mut read, declaration| {
+            let name = format!("{declaration:?}");
+            if !read.contains(&name) {
+                read.push(name);
+            }
+            read
+        });
+        let own = own.join(" and ");
         let held = match (self.quantized(), self.online) {
             (false, _) => "BF16 projections".to_owned(),
             (true, false) => format!("{own} projections"),
             (true, true) => format!("{own} projections, or ones a load quantizes from BF16"),
         };
-        let reads = |schemes: &[config::Scheme]| {
-            read().all(|declaration| schemes.contains(&declaration.scheme()))
-                && (schemes.iter()).all(|scheme| read().any(|own| own.scheme() == *scheme))
-        };
-        match (
-            declared.map(|declared| declared.schemes),
-            source.quantization(),
-        ) {
+        match (declared, source.quantization()) {
             (None, None) if !self.quantized() => Ok(()),
             (None, Some(_)) if self.online => Ok(()),
-            (Some(schemes), None) if reads(&schemes) => Ok(()),
             (None, None) if self.online => refused(
                 "quantization",
                 format!("the checkpoint is read as stored, the line holds {held}"),
             ),
             (None, None) => refused(DECLARED, format!("missing, the line holds {held}")),
-            (Some(schemes), _) => {
-                let found = listed(schemes.iter().map(|s| format!("{s:?}")).collect());
-                refused(DECLARED, format!("{found}, the line holds {held}"))
-            }
             (None, Some(_)) => refused(
                 "quantization",
                 format!("a load quantizes the checkpoint, the line holds {held}"),
             ),
+            // A declared checkpoint loads its own weights: no load quantizes it.
+            (Some(declared), _) => match self.mismatch(&declared, layers) {
+                None => Ok(()),
+                Some(reason) => refused(DECLARED, reason),
+            },
         }
+    }
+
+    /// How `declared` departs from these projections in the decoder layers at `layers`: the first
+    /// projection it quantizes otherwise than its form reads, else a target quantizing none.
+    fn mismatch(self, declared: &config::Quantization, layers: &[String]) -> Option<String> {
+        let modules: Vec<_> = (layers.iter())
+            .flat_map(|layer| {
+                let modules = ROLES.map(|role| format!("{layer}.{role}"));
+                modules.into_iter().zip(self.declarations)
+            })
+            .collect();
+        let named = |scheme: &config::Scheme| format!("{scheme:?}");
+        let projection = modules.iter().find_map(|(module, declaration)| {
+            let found = declared.schemes(module);
+            let own = declaration.map(Declaration::scheme);
+            (found != own.as_slice()).then(|| {
+                let found = match found.as_slice() {
+                    [] => "unquantized".to_owned(),
+                    found => found.iter().map(named).collect::<Vec<_>>().join(" and "),
+                };
+                let own = own.as_ref().map_or("BF16".to_owned(), named);
+                format!("{module}: {found}, the line reads {own}")
+            })
+        });
+        let idle = || {
+            let quantizes = |target| modules.iter().any(|(at, _)| declared.quantizes(target, at));
+            let (target, _) = (declared.targets.iter()).find(|(target, _)| !quantizes(target))?;
+            Some(format!(
+                "target {target} quantizes no projection the line holds"
+            ))
+        };
+        projection.or_else(idle)
     }
 }
 
@@ -588,14 +617,6 @@ pub enum Declaration {
 }
 
 impl Declaration {
-    const fn same(self, other: Self) -> bool {
-        match (self, other) {
-            (Self::Fp8(first), Self::Fp8(second)) => first as u8 == second as u8,
-            (Self::Nvfp4, Self::Nvfp4) => true,
-            _ => false,
-        }
-    }
-
     /// The scheme a checkpoint declares for the weights this declaration reads.
     const fn scheme(self) -> config::Scheme {
         match self {
@@ -840,15 +861,17 @@ pub trait Forms: 'static {
     type Up: Form;
     type Down: Form;
 
-    /// What the checkpoint declares about every projection's weights: each declaration one reads,
-    /// as a mixed-precision checkpoint declares one for each module group.
-    const REQUIREMENT: Requirement = <Self::Query as Form>::REQUIREMENT
-        .and(<Self::Key as Form>::REQUIREMENT)
-        .and(<Self::Value as Form>::REQUIREMENT)
-        .and(<Self::Output as Form>::REQUIREMENT)
-        .and(<Self::Gate as Form>::REQUIREMENT)
-        .and(<Self::Up as Form>::REQUIREMENT)
-        .and(<Self::Down as Form>::REQUIREMENT);
+    /// What the checkpoint declares about every projection's weights: the declaration of each
+    /// role's form, as a mixed-precision checkpoint declares one for each module group.
+    const REQUIREMENT: Requirement = Requirement::roles([
+        <Self::Query as Form>::REQUIREMENT,
+        <Self::Key as Form>::REQUIREMENT,
+        <Self::Value as Form>::REQUIREMENT,
+        <Self::Output as Form>::REQUIREMENT,
+        <Self::Gate as Form>::REQUIREMENT,
+        <Self::Up as Form>::REQUIREMENT,
+        <Self::Down as Form>::REQUIREMENT,
+    ]);
 }
 
 impl<Query: Form, Key: Form, Value: Form, Output: Form, Gate: Form, U: Form, Down: Form> Forms
@@ -993,63 +1016,53 @@ mod tests {
         );
     }
 
-    /// A layer requires every declaration its quantized projections read, and takes the weights a
-    /// load quantizes only when each quantized projection does; BF16 projections require none.
+    /// A layer reads the declaration of each role's form, one alone only when every quantized role
+    /// reads it, and takes the weights a load quantizes only when each quantized projection does;
+    /// BF16 projections require none, and one form of every role requires what the form does.
     #[test]
     fn requires_each_declaration_its_forms_read() {
         use crate::tensor::form::nvfp4::W4A16;
         use form::{Affine, BlockScaled, ChannelScaled, Nvfp4, Nvfp4BlockScaled};
-        let (channel, block) = (
-            Declaration::Fp8(config::Scheme::Channel),
-            Declaration::Fp8(config::Scheme::Block),
-        );
+        let channel = Declaration::Fp8(config::Scheme::Channel);
         let nvfp4 = Declaration::Nvfp4;
         type Mixed<F> = Projections<ChannelScaled, ChannelScaled, ChannelScaled, ChannelScaled, F>;
         type Mlp<F> = Projections<Affine, Affine, Affine, Affine, F>;
         type Blocks = Projections<ChannelScaled, BlockScaled, BlockScaled, Affine, Affine>;
+        let read = |found: Requirement| (found.quantized(), found.declaration(), found.online());
         for (found, expected) in [
-            (<Affine as Forms>::REQUIREMENT, Requirement::UNQUANTIZED),
-            (
-                <Projections<Affine> as Forms>::REQUIREMENT,
-                Requirement::UNQUANTIZED,
-            ),
+            (<Affine as Forms>::REQUIREMENT, (false, None, false)),
             (
                 <ChannelScaled as Forms>::REQUIREMENT,
-                Requirement::quantizable(channel),
+                (true, Some(channel), true),
             ),
             (
                 <Mixed<Affine> as Forms>::REQUIREMENT,
-                Requirement::quantizable(channel),
+                (true, Some(channel), true),
             ),
-            (
-                <Mixed<Nvfp4> as Forms>::REQUIREMENT,
-                Requirement::declared(channel).and(Requirement::declared(nvfp4)),
-            ),
+            (<Mixed<Nvfp4> as Forms>::REQUIREMENT, (true, None, false)),
             (
                 <Mlp<Nvfp4BlockScaled> as Forms>::REQUIREMENT,
-                Requirement::declared(nvfp4),
+                (true, Some(nvfp4), false),
             ),
             (
                 <Mlp<Nvfp4BlockScaled<W4A16>> as Forms>::REQUIREMENT,
-                Requirement::declared(nvfp4),
+                (true, Some(nvfp4), false),
             ),
             (
                 <Projections<Nvfp4BlockScaled, Nvfp4BlockScaled<W4A16>> as Forms>::REQUIREMENT,
-                Requirement::declared(nvfp4),
+                (true, Some(nvfp4), false),
             ),
-            (
-                <Blocks as Forms>::REQUIREMENT,
-                Requirement::declared(channel).and(Requirement::declared(block)),
-            ),
+            (<Blocks as Forms>::REQUIREMENT, (true, None, false)),
         ] {
-            assert_eq!(found, expected);
+            assert_eq!(read(found), expected);
         }
-        let mixed = <Mixed<Nvfp4> as Forms>::REQUIREMENT;
-        assert_eq!((mixed.declaration(), mixed.online()), (None, false));
-        let channels = <ChannelScaled as Forms>::REQUIREMENT;
         assert_eq!(
-            (channels.declaration(), channels.online()),
-            (Some(channel), true)
+            <Projections<Affine> as Forms>::REQUIREMENT,
+            Requirement::UNQUANTIZED
+        );
+        assert_eq!(
+            <ChannelScaled as Forms>::REQUIREMENT,
+            Requirement::quantizable(channel)
         );
     }
 
@@ -1075,12 +1088,13 @@ mod tests {
             Requirement::UNQUANTIZED,
             Requirement::quantizable(Declaration::Fp8(config::Scheme::Channel)),
         );
+        let layers = ["model.layers.0".to_owned()];
         for stored in [source(None), source(Some(serde_json::Value::Null))] {
             let quantized = stored.quantized(Granularity::Channel).unwrap();
-            assert!(bf16.admits(&stored).is_ok());
-            assert!(channels.admits(&quantized).is_ok());
-            assert_eq!(refused(bf16.admits(&quantized)), "quantization");
-            assert_eq!(refused(channels.admits(&stored)), "quantization");
+            assert!(bf16.admits(&stored, &layers).is_ok());
+            assert!(channels.admits(&quantized, &layers).is_ok());
+            assert_eq!(refused(bf16.admits(&quantized, &layers)), "quantization");
+            assert_eq!(refused(channels.admits(&stored, &layers)), "quantization");
         }
         let blocks = source(Some(json!({
             "quant_method": "fp8", "activation_scheme": "dynamic",
@@ -1088,61 +1102,27 @@ mod tests {
         })));
         let declared = "config.json:quantization_config";
         for requirement in [bf16, channels] {
-            assert_eq!(refused(requirement.admits(&blocks)), declared);
+            assert_eq!(refused(requirement.admits(&blocks, &layers)), declared);
         }
         let block = Requirement::declared(Declaration::Fp8(config::Scheme::Block));
-        assert!(block.admits(&blocks).is_ok());
+        assert!(block.admits(&blocks, &layers).is_ok());
         match blocks.quantized(Granularity::Channel).err() {
             Some(LoadError::InvalidData { name, .. }) => assert_eq!(name, declared),
             other => panic!("{other:?} is not `InvalidData`"),
         }
-        match bf16.admits(&source(Some(json!(5)))) {
+        match bf16.admits(&source(Some(json!(5))), &layers) {
             Err(LoadError::InvalidData { name, .. }) => assert_eq!(name, declared),
             other => panic!("{other:?} is not `InvalidData`"),
         }
     }
 
-    /// A mixed-precision declaration admits projections that read each of its schemes and no
-    /// other: those reading some of them, or a scheme it lacks, are refused by the declaration.
-    #[test]
-    fn admits_every_scheme_a_mixed_declaration_states() {
-        use crate::models::decoder::attention::gemma4;
-        let directory = tempfile::tempdir().unwrap();
-        let source = |declared: &serde_json::Value| {
-            let config = serde_json::json!({ "quantization_config": declared });
-            Checkpoint::new(directory.path(), Some(config)).unwrap()
-        };
-        let channel = Declaration::Fp8(config::Scheme::Channel);
-        let nvfp4 = Declaration::Nvfp4;
-        let mixed = Requirement::declared(channel).and(Requirement::declared(nvfp4));
-        let published = gemma4::tests::quantization();
-        let mut channels = published.clone();
-        (channels["config_groups"].as_object_mut().unwrap()).remove("group_1");
-        assert!(mixed.admits(&source(&published)).is_ok());
-        assert!(
-            Requirement::quantizable(channel)
-                .admits(&source(&channels))
-                .is_ok()
-        );
-        for (requirement, declared) in [
-            (Requirement::quantizable(channel), &published),
-            (Requirement::declared(nvfp4), &published),
-            (mixed, &channels),
-        ] {
-            match requirement.admits(&source(declared)) {
-                Err(LoadError::Unsupported { name, .. }) => {
-                    assert_eq!(name, "config.json:quantization_config");
-                }
-                other => panic!("{other:?} is not `Unsupported`"),
-            }
-        }
-    }
     /// An NVFP4 line refuses a checkpoint that declares no quantization, naming its scheme alone.
     #[test]
     fn refuses_an_undeclared_checkpoint_by_its_scheme() {
         let directory = tempfile::tempdir().unwrap();
         let source = Checkpoint::new(directory.path(), Some(serde_json::json!({}))).unwrap();
-        match Requirement::declared(Declaration::Nvfp4).admits(&source) {
+        let layers = ["model.layers.0".to_owned()];
+        match Requirement::declared(Declaration::Nvfp4).admits(&source, &layers) {
             Err(LoadError::Unsupported { name, reason }) => assert_eq!(
                 (name.as_str(), reason.as_str()),
                 (
