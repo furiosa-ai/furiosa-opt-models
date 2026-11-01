@@ -150,7 +150,7 @@ where
 }
 
 /// A span's rows on chip: the three stages, one after another.
-impl<'x, H, I, Rows, Capacity, F, D, A, G, P, C, Env>
+impl<'x, H, I, Rows, Capacity, F, D, A, B, G, P, C, Env>
     Module<&'x Live<Owned<H, Rows>, Capacity>, Env, &mut ()> for Mlp<H, I, F, D>
 where
     H: AxisName,
@@ -159,7 +159,8 @@ where
     Capacity: AxisName,
     Down<I>: AxisName,
     F: for<'s> Module<Begin<()>, (), &'s mut (), Output = A>,
-    F: for<'s> Module<(A, Live<&'x Owned<H, Rows>, Capacity>), (), &'s mut (), Output = G>,
+    F: for<'s> Module<Begin<(A, Live<&'x Owned<H, Rows>, Capacity>)>, (), &'s mut (), Output = B>,
+    F: for<'s> Module<(B, Live<&'x Owned<H, Rows>, Capacity>), (), &'s mut (), Output = G>,
     SwiGlu: for<'s> Module<Live<G, Capacity>, (), &'s mut (), Output = P>,
     D: for<'s> Module<Begin<Live<P, Capacity>>, (), &'s mut (), Output = C>,
     D: for<'s> Module<Live<C, Capacity>, (), &'s mut (), Output = Owned<H, Rows>>,
@@ -173,14 +174,14 @@ where
         _: &mut (),
         normalized: &'x Live<Owned<H, Rows>, Capacity>,
     ) -> Self::Output {
-        let tile = normalized.with(());
+        let (tile, rows) = (normalized.with(()), normalized.with(normalized.value()));
         let weights = self.gate_up.forward(&mut *device, (), &mut (), Begin(()));
-        let projected = self.gate_up.forward(
-            &mut *device,
-            (),
-            &mut (),
-            (weights, tile.with(normalized.value())),
-        );
+        let begun = self
+            .gate_up
+            .forward(&mut *device, (), &mut (), Begin((weights, rows)));
+        let projected = self
+            .gate_up
+            .forward(&mut *device, (), &mut (), (begun, rows));
         let product = Module::forward(&SwiGlu, &mut *device, (), &mut (), tile.with(projected));
         let staged = self
             .down
