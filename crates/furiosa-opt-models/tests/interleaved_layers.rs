@@ -1,7 +1,8 @@
 //! The Gemma 4 catalog's layers interleaved in two collections over a call of rows that attend a
 //! history in their layers' caches: sliding layers in both collections or sliding and full layers,
-//! one of each a period, and the catalog's own period of five sliding layers and a full one; and
-//! the full layers' attention leaf alone.
+//! one of each a period, and the catalog's own period of five sliding layers and a full one; the
+//! full layers' attention leaf alone; and the feed-forward's NVFP4 projection leaves, under the
+//! early and the summed contract.
 
 #![feature(register_tool)]
 #![register_tool(furiosa_opt)]
@@ -18,6 +19,8 @@ use furiosa_opt_models::schedule::Decoder;
 use furiosa_opt_models::schedule::decoder::Places;
 use furiosa_opt_models::tensor::axis::Lanes;
 use furiosa_opt_models::tensor::cache::{Block, Blocks, KeyValue};
+use furiosa_opt_models::tensor::form::BlockScaled;
+use furiosa_opt_models::tensor::form::nvfp4::{Early, Scale, Scales, Summed, W4A16};
 use furiosa_opt_models::tensor::live::Live;
 use furiosa_opt_models::tensor::memory::Hbm;
 use furiosa_opt_models::tensor::parallel::Chip;
@@ -1039,6 +1042,245 @@ async fn one_head_attends_each_live_row_as_the_host() {
             }
         }
     }
+}
+
+/// An NVFP4 projection of `I` inputs to `O` outputs under contract `C`.
+type Nvfp4<I, O, C> = BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, C>;
+
+/// The call's live rows through one NVFP4 projection, from and back to HBM rows.
+#[device(chip = 1)]
+fn projected<I: AxisName, O: AxisName, C>(
+    device: &mut Device,
+    linear: &Nvfp4<I, O, C>,
+    (input, live): (&HbmTensor<bf16, Chip, m![Rows, I]>, &Value),
+) -> HbmTensor<bf16, Chip, m![Rows, O]>
+where
+    Nvfp4<I, O, C>: DeviceSend
+        + for<'x> Op<
+            &'x Live<Spread<I, Rows, Chip>, Rows>,
+            Output = Live<Spread<O, Rows, Chip>, Rows>,
+        >,
+{
+    let live = Live::<(), Rows>::read(live);
+    let rows: Live<Spread<I, Rows, Chip>, Rows> = live.with(input.to_dm(&mut device.tdma));
+    let output = Op::forward(linear, &mut *device, &rows);
+    output.value().to_hbm(&mut device.tdma)
+}
+
+/// Uniform values in `[0, 1)` from a xorshift state.
+fn uniform(count: usize, mut state: u64) -> impl Iterator<Item = f64> {
+    (0..count).map(move |_| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    })
+}
+
+/// Random NVFP4 weights of `I` inputs and `O` outputs: codes over the sixteen E2M1 values, E4M3
+/// block scales from 8 to 448 and a tensor scale near 2^14, with each row of the call's inputs in
+/// `[-2, 2)`.
+struct Drawn {
+    codes: Vec<f4e2m1>,
+    scales: Vec<f8e4m3>,
+    global: f32,
+    inputs: Vec<bf16>,
+}
+
+impl Drawn {
+    fn new<I: AxisName, O: AxisName>(seed: u64) -> Self {
+        let (i, o) = (I::SIZE, O::SIZE);
+        Self {
+            codes: (uniform(o * i, seed).map(|u| f4e2m1::from_bits((u * 16.0) as u8))).collect(),
+            scales: (uniform(o * i / 16, seed + 1))
+                .map(|u| f8e4m3::from_f32((8.0 + 440.0 * u) as f32))
+                .collect(),
+            global: 2f32.powi(14) * 1.37,
+            inputs: (uniform(Rows::SIZE * i, seed + 2))
+                .map(|u| bf16::from_f32((4.0 * u - 2.0) as f32))
+                .collect(),
+        }
+    }
+
+    /// The weights on the device under the contract `contract` makes of the tensor scale.
+    async fn coded<I: AxisName, O: AxisName, C>(
+        &self,
+        device: &mut Device,
+        contract: impl FnOnce(Scale) -> C,
+    ) -> Nvfp4<I, O, C> {
+        let global = HostTensor::<f32, m![1 # 8]>::from_vec([
+            self.global,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ]);
+        BlockScaled {
+            weight: HostTensor::<f4e2m1, m![O, I]>::from_vec(self.codes.clone())
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap(),
+            weight_scale: HostTensor::<f8e4m3, Scales<I, O>>::from_vec(self.scales.clone())
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap(),
+            contract: contract(global.to_hbm(&mut device.pdma).await.unwrap()),
+            shape: core::marker::PhantomData,
+        }
+    }
+
+    /// Every row's outputs in FP64: `sum_k code_k scale_k x_k / global`.
+    fn exact<I: AxisName, O: AxisName>(&self) -> Vec<f64> {
+        let (i, o) = (I::SIZE, O::SIZE);
+        let inputs: Vec<f64> = (self.inputs.iter())
+            .map(|x| f64::from(x.to_f32()))
+            .collect();
+        let mut exact = vec![0.0; Rows::SIZE * o];
+        let mut weights = vec![0.0; i];
+        for output in 0..o {
+            for (k, weight) in weights.iter_mut().enumerate() {
+                let at = output * i + k;
+                *weight = f64::from(self.codes[at].to_f32())
+                    * f64::from(self.scales[at / 16].to_f32())
+                    / f64::from(self.global);
+            }
+            for (row, input) in inputs.chunks_exact(i).enumerate() {
+                exact[row * o + output] = weights.iter().zip(input).map(|(w, x)| w * x).sum();
+            }
+        }
+        exact
+    }
+
+    /// The call's rows, `live` of them live and every other row poison, and their count.
+    async fn rows<I: AxisName>(
+        &self,
+        device: &mut Device,
+        live: usize,
+    ) -> (HbmTensor<bf16, Chip, m![Rows, I]>, Value) {
+        let rows = (self.inputs.iter().enumerate()).map(|(at, &value)| match at / I::SIZE < live {
+            true => value,
+            false => bf16::from_bits(POISON),
+        });
+        let rows = HostTensor::<bf16, m![Rows, I]>::from_vec(rows.collect::<Vec<_>>());
+        let count = HostTensor::<i32, m![1]>::from_vec([live as i32]);
+        (
+            rows.to_hbm(&mut device.pdma).await.unwrap(),
+            count.to_hbm(&mut device.pdma).await.unwrap(),
+        )
+    }
+}
+
+/// The `live` rows of `linear`'s projection of `drawn`'s rows.
+async fn project<I: AxisName, O: AxisName, C>(
+    device: &mut Device,
+    linear: &Nvfp4<I, O, C>,
+    drawn: &Drawn,
+    live: usize,
+) -> Vec<bf16>
+where
+    Nvfp4<I, O, C>: DeviceSend
+        + for<'x> Op<
+            &'x Live<Spread<I, Rows, Chip>, Rows>,
+            Output = Live<Spread<O, Rows, Chip>, Rows>,
+        >,
+{
+    let (rows, count) = drawn.rows::<I>(device, live).await;
+    let output = launch(projected, (&mut *device, linear, (&rows, &count)))
+        .await
+        .unwrap();
+    let mut output = output
+        .to_host::<m![Rows, O]>(&mut device.pdma)
+        .await
+        .unwrap()
+        .into_vec();
+    output.truncate(live * O::SIZE);
+    output
+}
+
+/// How far `found`, the first rows of `exact`, is from it: the worst output's error over one BF16
+/// rounding of it plus `2^-9` of its row's RMS, and the RMS error over the RMS of the outputs.
+fn error(found: &[bf16], exact: &[f64], outputs: usize) -> (f64, f64) {
+    let (mut worst, mut squares, mut total) = (0.0f64, 0.0, 0.0);
+    for (found, exact) in found.chunks_exact(outputs).zip(exact.chunks_exact(outputs)) {
+        let rms = (exact.iter().map(|e| e * e).sum::<f64>() / outputs as f64).sqrt();
+        for (got, want) in found.iter().zip(exact) {
+            let got = f64::from(got.to_f32());
+            worst = worst.max((got - want).abs() / (want.abs() / 256.0 + rms / 512.0));
+            squares += (got - want) * (got - want);
+            total += want * want;
+        }
+    }
+    (worst, (squares / total).sqrt())
+}
+
+/// The summed contract's live rows, at one row, a lane group, one row past it and the whole
+/// envelope: each output within one BF16 rounding of the FP64 product plus `2^-9` of its row's RMS
+/// for the FP32 sums, and nearer the product than the early contract's.
+async fn sums_rows_nearer_than_early<I: AxisName, O: AxisName>(device: &mut Device, seed: u64)
+where
+    Nvfp4<I, O, Summed<W4A16>>: DeviceSend
+        + for<'x> Op<
+            &'x Live<Spread<I, Rows, Chip>, Rows>,
+            Output = Live<Spread<O, Rows, Chip>, Rows>,
+        >,
+    Nvfp4<I, O, Early<W4A16>>: DeviceSend
+        + for<'x> Op<
+            &'x Live<Spread<I, Rows, Chip>, Rows>,
+            Output = Live<Spread<O, Rows, Chip>, Rows>,
+        >,
+{
+    let drawn = Drawn::new::<I, O>(seed);
+    let exact = drawn.exact::<I, O>();
+    let summed = drawn
+        .coded::<I, O, Summed<W4A16>>(device, |global| Summed {
+            input: W4A16,
+            global,
+        })
+        .await;
+    let early = drawn
+        .coded::<I, O, Early<W4A16>>(device, |global| Early {
+            input: W4A16,
+            global,
+        })
+        .await;
+    for live in [1, 8, 9, Rows::SIZE] {
+        let shape = format!("{}x{}, {live} live", I::SIZE, O::SIZE);
+        let (worst, summed) = error(
+            &project(device, &summed, &drawn, live).await,
+            &exact,
+            O::SIZE,
+        );
+        let (_, early) = error(
+            &project(device, &early, &drawn, live).await,
+            &exact,
+            O::SIZE,
+        );
+        println!(
+            "{shape}: summed worst {worst:.3} of the bound, RMS error {summed:.3e}; early {early:.3e}"
+        );
+        assert!(
+            worst <= 1.0,
+            "{shape}: an output is {worst} of the bound away"
+        );
+        assert!(
+            summed < early,
+            "{shape}: summed {summed} against early {early}"
+        );
+    }
+}
+
+/// The feed-forward's projections of the call's live rows under the summed contract give each
+/// row's FP64 product within one rounding, nearer than the early contract: into the intermediate
+/// width, each slice a row's whole input, and back, each slice a quarter of it.
+#[tokio::test(flavor = "current_thread")]
+async fn sums_nvfp4_rows_nearer_than_early() {
+    let _lease = DEVICE.lock().await;
+    let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+    sums_rows_nearer_than_early::<Hidden, Intermediate>(&mut device, 1).await;
+    sums_rows_nearer_than_early::<Intermediate, Hidden>(&mut device, 4).await;
 }
 
 /// Every catalog root a registry row serves still runs by the decoder family's one loop: the

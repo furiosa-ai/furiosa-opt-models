@@ -658,8 +658,7 @@ pub mod form {
     pub struct Nvfp4;
 
     /// [`Nvfp4`]'s weights under the experimental summed contract: a row's FP32 sum divides by the
-    /// global scale, so no coefficient rounds to BF16. Opt in by naming it in place of [`Nvfp4`];
-    /// it projects one row at a time so far, the live rows of a launch a todo.
+    /// global scale, so no coefficient rounds to BF16. Opt in by naming it in place of [`Nvfp4`].
     pub struct Nvfp4Summed;
 
     /// FP4 weights with per-16 FP8 block scales under a late FP32 tensor scale, whose inputs enter
