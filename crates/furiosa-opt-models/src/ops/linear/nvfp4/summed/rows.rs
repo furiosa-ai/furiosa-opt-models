@@ -7,8 +7,8 @@
 //!   pass there; a pass covers the most rows whose FP32 block scales fit the vector registers.
 //! - The projected rows end where the contract places them: in the output's feature slices once
 //!   the last pass ends, or [`Kept`] where the passes summed them.
-//! - Rows another summed projection kept reach the feature slices this projection's stage reads
-//!   only after its weights started landing, so the landing overlaps the move.
+//! - Rows another summed projection kept move to the feature slices this projection's stage reads
+//!   after its block scales and before its codes, the order the stage and the passes need them.
 
 use crate::Op;
 use crate::ops::linear::kernel::Rounded;
@@ -88,6 +88,13 @@ type Lane<R> = m![{ Layout<R>::Lanes }];
 type Summing<I, O, R> =
     DmTensor<bf16, Chip, Cluster<O>, Reduced<I, O>, m![R, O % ({ Owner<I, O> })]>;
 
+/// A weight's tensor scale and FP32 block scales on the slices of its passes.
+struct Scaled<I: AxisName, O: AxisName> {
+    global: VrfTensor<f32, Chip, Cluster<O>, Owners<I, O>, m![1 # 8]>,
+    scales:
+        DmTensor<f32, Chip, Cluster<O>, Owners<I, O>, m![O % ({ Owner<I, O> }), { Part<I> } / 16]>,
+}
+
 /// A weight's tensor scale, FP32 block scales and codes on the slices of its passes.
 struct Landed<I: AxisName, O: AxisName> {
     global: VrfTensor<f32, Chip, Cluster<O>, Owners<I, O>, m![1 # 8]>,
@@ -96,9 +103,8 @@ struct Landed<I: AxisName, O: AxisName> {
     codes: DmTensor<f4e2m1, Chip, Cluster<O>, Owners<I, O>, m![O % ({ Owner<I, O> }), { Part<I> }]>,
 }
 
-impl<I: AxisName, O: AxisName> Landed<I, O> {
-    /// The weight's scales and codes, each landing as the DMA reaches it; the passes wait for
-    /// theirs.
+impl<I: AxisName, O: AxisName> Scaled<I, O> {
+    /// The weight's tensor scale and block scales, each landing as the DMA reaches it.
     fn land<Y: Memory, P, K, V>(
         device: &mut Device,
         weight: &BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P>, Chip, K, V>,
@@ -145,6 +151,16 @@ impl<I: AxisName, O: AxisName> Landed<I, O> {
             .collect::<m![O % ({ Owner<I, O> }), { Part<I> } / 128], m![I / 16 % 8]>()
             .commit_trim::<m![I / 16 % 8]>()
             .commit_view(scales.view_mut());
+        Self { global, scales }
+    }
+
+    /// The weight with its codes landing after its scales: a pass's codes land on their own, so
+    /// the first group's passes start as theirs arrive.
+    fn with_codes(
+        self,
+        device: &mut Device,
+        weight: &HbmTensor<f4e2m1, Chip, m![O, I]>,
+    ) -> Landed<I, O> {
         let mut codes: DmTensor<
             f4e2m1,
             Chip,
@@ -152,11 +168,9 @@ impl<I: AxisName, O: AxisName> Landed<I, O> {
             Owners<I, O>,
             m![O % ({ Owner<I, O> }), { Part<I> }],
         > = DmTensor::new();
-        // A pass's codes land on their own, so the first group's passes start as theirs arrive.
         #[unroll]
         for tile in 0..<Tiles<I, O> as M>::SIZE {
             weight
-                .codes()
                 .view()
                 .tile::<Tiles<I, O>, 1, m![
                     O / (O / 2), O % (O / 2) / ({ Owner<I, O> }), { Elements<I, O> } # ({ Owner<I, O> }), I
@@ -168,13 +182,15 @@ impl<I: AxisName, O: AxisName> Landed<I, O> {
                     ]>(tile),
                 );
         }
-        Self {
-            global,
-            scales,
+        Landed {
+            global: self.global,
+            scales: self.scales,
             codes,
         }
     }
+}
 
+impl<I: AxisName, O: AxisName> Landed<I, O> {
     /// Every live row's outputs `bf16(sum_b scale_b (sum_{k in b} code_k x_k) / global)`, a lane
     /// group at a time, each in the slices that sum it.
     fn project<R: AxisName>(
@@ -326,7 +342,7 @@ where
     type Output = Live<P::Rows, R>;
 
     fn forward(&self, device: &mut Device, input: &'x Live<Spread<I, R>, R>) -> Self::Output {
-        let landed = Landed::land(device, self);
+        let landed = Scaled::land(device, self).with_codes(device, self.codes());
         let projected = landed.project(device, input);
         input.with(P::place(device, projected))
     }
@@ -334,7 +350,7 @@ where
 
 /// The live rows a summed projection of `H` inputs kept where its passes summed them, through a
 /// weight under the summed contract, into where its placement `P` puts them; the rows reach the
-/// feature slices of this weight's stage once its codes are on their way.
+/// feature slices of this weight's stage between its scales and its codes.
 impl<'x, H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P>
     Op<&'x Live<Kept<Summing<H, I, R>>, R>>
     for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P>, Chip, K, V>
@@ -351,9 +367,13 @@ where
         device: &mut Device,
         input: &'x Live<Kept<Summing<H, I, R>>, R>,
     ) -> Self::Output {
-        let landed = Landed::land(device, self);
+        let scaled = Scaled::land(device, self);
+        // One DMA queue carries the scales, the rows and the codes in turn: the stage reads the
+        // rows before the passes read the codes, and the scales widen while the rows move.
         let rows = input.with(spread(device, &input.value().0));
-        let projected = landed.project(device, &rows);
+        let projected = scaled
+            .with_codes(device, self.codes())
+            .project(device, &rows);
         input.with(P::place(device, projected))
     }
 }
