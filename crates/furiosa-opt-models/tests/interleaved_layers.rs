@@ -1247,21 +1247,45 @@ projection!(small_key_rows, Grouped, SmallHidden, SmallKeys);
 projection!(middle_query_rows, Grouped, MiddleHidden, MiddleQueries);
 projection!(middle_key_rows, Grouped, MiddleHidden, MiddleKeys);
 
-/// A gated MLP's fused gate and up projection alone: the live rows a count names of `input`,
-/// spread over the slices as a norm leaves them, projected by `weight` into rows in order.
-#[device(chip = 1)]
-fn large_gate_up_rows(
-    device: &mut Device,
-    weight: &Coded<LargeHidden, LargeGateUp>,
-    rows: &Value,
-    input: &Ordered<LargeHidden>,
-) -> Ordered<LargeGateUp> {
-    let live = Live::<(), Rows>::read(rows);
-    let input: Live<Spread<LargeHidden, Rows, Chip>, Rows> =
-        live.with(input.to_dm(&mut device.tdma));
-    let output: Live<Spread<LargeGateUp, Rows, Chip>, Rows> =
-        Op::forward(weight, &mut *device, &input);
-    output.value().to_hbm(&mut device.tdma)
+/// A BF16 projection of `I` inputs into `O` outputs.
+type Dense<I, O> = furiosa_opt_models::ops::linear::Affine<HbmTensor<bf16, Chip, m![O, I]>, ()>;
+
+axes![LargeQueries = 4096, LargeGate = 14336];
+
+/// One projection alone from rows spread over the slices as a norm leaves them, the catalog's and
+/// the other decoders' path: the live rows a count names of `input`, projected by `weight`.
+macro_rules! spread {
+    ($name:ident, $weight:ident, $in:ty, $out:ty) => {
+        #[device(chip = 1)]
+        fn $name(
+            device: &mut Device,
+            weight: &$weight<$in, $out>,
+            rows: &Value,
+            input: &Ordered<$in>,
+        ) -> Ordered<$out> {
+            let live = Live::<(), Rows>::read(rows);
+            let input: Live<Spread<$in, Rows, Chip>, Rows> =
+                live.with(input.to_dm(&mut device.tdma));
+            let output: Live<Spread<$out, Rows, Chip>, Rows> =
+                Op::forward(weight, &mut *device, &input);
+            output.value().to_hbm(&mut device.tdma)
+        }
+    };
+}
+
+spread!(large_gate_up_rows, Coded, LargeHidden, LargeGateUp);
+spread!(spread_query_rows, Coded, Hidden, SlidingQueryWidth);
+spread!(spread_key_rows, Coded, Hidden, SlidingKeyWidth);
+spread!(dense_query_rows, Dense, LargeHidden, LargeQueries);
+spread!(dense_gate_rows, Dense, LargeHidden, LargeGate);
+
+/// A BF16 weight of the probe's values.
+async fn dense<I: AxisName, O: AxisName>(device: &mut Device, seed: u64) -> Dense<I, O> {
+    let weight = (HostTensor::<bf16, m![O, I]>::from_vec(values(O::SIZE * I::SIZE, seed, 0.125)))
+        .to_hbm(&mut device.pdma)
+        .await
+        .unwrap();
+    furiosa_opt_models::ops::linear::Affine::new(weight, ())
 }
 
 /// A channel-scaled weight of E4M3 eighths and the per-row scales of the catalog's checkpoints.
@@ -1321,6 +1345,8 @@ async fn projection_profile() {
     let middle_query = coded::<MiddleHidden, MiddleQueries>(&mut device, 0x18).await;
     let middle_key = coded::<MiddleHidden, MiddleKeys>(&mut device, 0x19).await;
     let large_gate_up = coded::<LargeHidden, LargeGateUp>(&mut device, 0x1a).await;
+    let dense_query = dense::<LargeHidden, LargeQueries>(&mut device, 0x1b).await;
+    let dense_gate = dense::<LargeHidden, LargeGate>(&mut device, 0x1c).await;
     macro_rules! profile {
         ($live:expr, $count:expr, $kernel:ident, $weight:expr, $input:expr, $out:ty) => {{
             let case = format!("{}-rows-{}", stringify!($kernel), $live);
@@ -1475,6 +1501,36 @@ async fn projection_profile() {
             &large,
             LargeGateUp
         );
+        let ordered: Ordered<Hidden> =
+            (HostTensor::<bf16, m![Rows, Hidden]>::from_vec(hidden(live)))
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+        profile!(
+            live,
+            count,
+            spread_query_rows,
+            &sliding_query,
+            &ordered,
+            SlidingQueryWidth
+        );
+        profile!(
+            live,
+            count,
+            spread_key_rows,
+            &sliding_key,
+            &ordered,
+            SlidingKeyWidth
+        );
+        profile!(
+            live,
+            count,
+            dense_query_rows,
+            &dense_query,
+            &large,
+            LargeQueries
+        );
+        profile!(live, count, dense_gate_rows, &dense_gate, &large, LargeGate);
     }
 }
 
