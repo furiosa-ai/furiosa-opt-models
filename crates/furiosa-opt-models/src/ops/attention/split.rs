@@ -439,7 +439,8 @@ impl<Width: AxisName, Heads: AxisName, Groups: AxisName, Head: AxisName, Rows: A
 }
 
 /// The rows a projection of one head kind leaves where its contraction computes them, as `Heads`
-/// heads of `Groups` query heads each, as from feature slices.
+/// heads of `Groups` query heads each, as from feature slices; the row groups live rows touch move
+/// one by one unless every group is live.
 impl<In, Width, Code, Heads, Groups, Head, Rows>
     Op<Live<linear::Projected<In, Width, Code, Rows>, Rows>> for Reshape<m![Heads, Groups, Head]>
 where
@@ -461,34 +462,37 @@ where
         const { assert!(Width::SIZE == Heads::SIZE * Groups::SIZE * Head::SIZE) };
         let mut rows: Staged<Width, Rows> = DmTensor::new();
         let (first, count) = input.groups::<crate::tensor::axis::Lanes<Rows>>();
-        if count == 1 && count < <linear::Groups<Rows> as M>::SIZE {
-            linear::Linear::<In, Width>::group(input.value(), first).to_dm_view(
-                &mut device.tdma,
-                Layout::<Rows>::selected_mut(rows.view_mut(), first),
-            );
+        if count < <linear::Groups<Rows> as M>::SIZE {
             let mut heads: super::Heads<Rows, Heads, Groups, Head> = DmTensor::new();
-            // SAFETY: as for every row group below.
-            unsafe {
-                rows.view().reshape::<
-                    Chip,
-                    m![1 # 2],
-                    Lane<Rows>,
-                    m![{ linear::Groups<Rows> }, Heads, Groups, Head],
-                >()
-            }
-            .tile::<
-                linear::Groups<Rows>,
-                1,
-                m![{ Layout<Rows>::Selected }, Heads, Groups, Head],
-            >(first)
-            .to_dm_view(
-                &mut device.tdma,
-                heads.view_mut().tile::<
+            for at in 0..count {
+                let group = first + at;
+                linear::Linear::<In, Width>::group(input.value(), group).to_dm_view(
+                    &mut device.tdma,
+                    Layout::<Rows>::selected_mut(rows.view_mut(), group),
+                );
+                // SAFETY: as for every row group below.
+                unsafe {
+                    rows.view().reshape::<
+                        Chip,
+                        m![1 # 2],
+                        Lane<Rows>,
+                        m![{ linear::Groups<Rows> }, Heads, Groups, Head],
+                    >()
+                }
+                .tile::<
                     linear::Groups<Rows>,
                     1,
-                    m![{ Layout<Rows>::SelectedMut }, Groups, Head],
-                >(first),
-            );
+                    m![{ Layout<Rows>::Selected }, Heads, Groups, Head],
+                >(group)
+                .to_dm_view(
+                    &mut device.tdma,
+                    heads.view_mut().tile::<
+                        linear::Groups<Rows>,
+                        1,
+                        m![{ Layout<Rows>::SelectedMut }, Groups, Head],
+                    >(group),
+                );
+            }
             return input.with(heads);
         }
         (input.value().view()).to_dm_view(&mut device.tdma, rows.view_mut());
