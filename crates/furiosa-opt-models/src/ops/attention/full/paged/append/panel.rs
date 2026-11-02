@@ -2,14 +2,14 @@ use super::*;
 use crate::Op;
 use furiosa_opt_std::prelude;
 
-/// Softmax over one row of `K` keys: the probabilities and the row's log-sum-exp.
+/// Softmax over one row of `K` F32 scores: the probabilities and the row's log-sum-exp.
 pub(crate) struct Normalize;
 
 impl<KvHeads: AxisName, Groups: AxisName, K: AxisName>
     Op<
         DmTensorView<
             '_,
-            bf16,
+            f32,
             Chip,
             Cluster<KvHeads>,
             Slice<KvHeads, Groups>,
@@ -27,7 +27,7 @@ impl<KvHeads: AxisName, Groups: AxisName, K: AxisName>
         context: &mut Device,
         scores: DmTensorView<
             '_,
-            bf16,
+            f32,
             Chip,
             Cluster<KvHeads>,
             Slice<KvHeads, Groups>,
@@ -46,8 +46,7 @@ impl<KvHeads: AxisName, Groups: AxisName, K: AxisName>
         > = context
             .main
             .begin(scores.clone())
-            .fetch::<m![Rows % 8, { Symbol<K> } / 16], m![{ Symbol<K> } % 16]>()
-            .fetch_cast::<f32>()
+            .fetch::<m![Rows % 8, { Symbol<K> } / 8], m![{ Symbol<K> } % 8]>()
             .collect::<m![Rows % 8, { Symbol<K> } / 8], m![{ Symbol<K> } % 8]>()
             .vector_init()
             .vector_intra_slice_tag(TagMode::Comparison([Cmp::Equal(f32::NEG_INFINITY); 4]))
@@ -96,7 +95,7 @@ impl<KvHeads: AxisName, Groups: AxisName, K: AxisName>
     }
 }
 
-/// Tile `t` of a group's `K`-key score rows with every key its mask marks nonzero set to −∞.
+/// Tile `t` of a group's `K`-key F32 score rows with every key its mask marks nonzero set to −∞.
 pub(crate) struct Mask;
 
 impl<KvHeads: AxisName, Groups: AxisName, K: AxisName, T: AxisName>
@@ -104,7 +103,7 @@ impl<KvHeads: AxisName, Groups: AxisName, K: AxisName, T: AxisName>
         (
             DmTensorView<
                 '_,
-                bf16,
+                f32,
                 Chip,
                 Cluster<KvHeads>,
                 Slice<KvHeads, Groups>,
@@ -120,7 +119,7 @@ impl<KvHeads: AxisName, Groups: AxisName, K: AxisName, T: AxisName>
             >,
         ),
         &mut DmTensor<
-            bf16,
+            f32,
             Chip,
             Cluster<KvHeads>,
             Slice<KvHeads, Groups>,
@@ -138,7 +137,7 @@ impl<KvHeads: AxisName, Groups: AxisName, K: AxisName, T: AxisName>
             (
                 DmTensorView<
                     '_,
-                    bf16,
+                    f32,
                     Chip,
                     Cluster<KvHeads>,
                     Slice<KvHeads, Groups>,
@@ -154,7 +153,7 @@ impl<KvHeads: AxisName, Groups: AxisName, K: AxisName, T: AxisName>
                 >,
             ),
             &mut DmTensor<
-                bf16,
+                f32,
                 Chip,
                 Cluster<KvHeads>,
                 Slice<KvHeads, Groups>,
@@ -189,8 +188,7 @@ impl<KvHeads: AxisName, Groups: AxisName, K: AxisName, T: AxisName>
             .begin(
                 scores.tile::<m![{ Symbol<T> }], 1, m![{ TileOf<T> }, Rows % 8, { Symbol<K> }]>(t),
             )
-            .fetch::<m![Rows % 8, { Symbol<K> } / 16], m![{ Symbol<K> } % 16]>()
-            .fetch_cast::<f32>()
+            .fetch::<m![Rows % 8, { Symbol<K> } / 8], m![{ Symbol<K> } % 8]>()
             .collect::<m![Rows % 8, { Symbol<K> } / 8], m![{ Symbol<K> } % 8]>()
             .vector_init()
             .vector_tagged(&visible)
@@ -203,7 +201,6 @@ impl<KvHeads: AxisName, Groups: AxisName, K: AxisName, T: AxisName>
                 Branched::imm(state::PRESENT, f32::NEG_INFINITY),
             )
             .vector_final()
-            .cast::<bf16, m![{ Symbol<K> } % 8 # 16]>()
             .commit_trim::<m![{ Symbol<K> } % 8]>()
             .commit_view(
                 output
@@ -213,24 +210,23 @@ impl<KvHeads: AxisName, Groups: AxisName, K: AxisName, T: AxisName>
     }
 }
 
-/// The maximum of each row of `K` scores.
+/// The maximum of each row of `K` F32 scores.
 pub(crate) struct Maximum<K>(pub(crate) PhantomData<K>);
 
 impl<KvHeads: AxisName, Groups: AxisName, K: AxisName, Q: M>
-    Op<DmTensorView<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Q>> for Maximum<K>
+    Op<DmTensorView<'_, f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Q>> for Maximum<K>
 {
     type Output = Scalar<KvHeads, Groups>;
 
     fn forward(
         &self,
         context: &mut Device,
-        scores: DmTensorView<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Q>,
+        scores: DmTensorView<'_, f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Q>,
     ) -> Self::Output {
         context
             .main
             .begin(scores)
-            .fetch::<m![Rows % 8, { Symbol<K> } / 16], m![{ Symbol<K> } % 16]>()
-            .fetch_cast::<f32>()
+            .fetch::<m![Rows % 8, { Symbol<K> } / 8], m![{ Symbol<K> } % 8]>()
             .collect::<m![Rows % 8, { Symbol<K> } / 8], m![{ Symbol<K> } % 8]>()
             .vector_init()
             .vector_intra_slice_tag(TagMode::Zero)
@@ -285,8 +281,9 @@ impl<KvHeads: AxisName, Groups: AxisName, K: AxisName, T: AxisName, Q: M>
     }
 }
 
-/// Unnormalized causal softmax of tile `t` over its first `K` (`KEYS`) unmasked keys: `exp(score −
-/// max)` into `exponent`, the total into `total`, the lse into `lse`, later keys unwritten.
+/// Unnormalized causal softmax of tile `t` over its first `K` (`KEYS`) unmasked F32 scores:
+/// `exp(score − max)` into `exponent`, the total into `total`, the lse into `lse`, later keys
+/// unwritten.
 pub(crate) struct CausalSoftmax<K, const KEYS: usize>(pub(crate) PhantomData<K>);
 
 impl<K: AxisName, const KEYS: usize> CausalSoftmax<K, KEYS> {
@@ -341,7 +338,7 @@ impl<
         (
             DmTensorView<
                 '_,
-                bf16,
+                f32,
                 Chip,
                 Cluster<KvHeads>,
                 Slice<KvHeads, Groups>,
@@ -379,7 +376,7 @@ impl<
             (
                 DmTensorView<
                     '_,
-                    bf16,
+                    f32,
                     Chip,
                     Cluster<KvHeads>,
                     Slice<KvHeads, Groups>,
@@ -432,8 +429,7 @@ impl<
         let top: Scalar<KvHeads, Groups> = context
             .main
             .begin(Self::prefix(scores.clone(), t))
-            .fetch::<m![Rows % 8, { Symbol<K> } / 16], m![{ Symbol<K> } % 16]>()
-            .fetch_cast::<f32>()
+            .fetch::<m![Rows % 8, { Symbol<K> } / 8], m![{ Symbol<K> } % 8]>()
             .collect::<m![Rows % 8, { Symbol<K> } / 8], m![{ Symbol<K> } % 8]>()
             .vector_init()
             .vector_tagged(&visible)
@@ -453,8 +449,7 @@ impl<
         context
             .main
             .begin(Self::prefix(scores, t))
-            .fetch::<m![Rows % 8, { Symbol<K> } / 16], m![{ Symbol<K> } % 16]>()
-            .fetch_cast::<f32>()
+            .fetch::<m![Rows % 8, { Symbol<K> } / 8], m![{ Symbol<K> } % 8]>()
             .collect::<m![Rows % 8, { Symbol<K> } / 8], m![{ Symbol<K> } % 8]>()
             .vector_init()
             .vector_tagged(&visible)
@@ -504,8 +499,9 @@ impl<
 const ADMITTED: TagGuard =
     TagGuard::matches([BitReq::One, BitReq::Ignore, BitReq::Ignore, BitReq::Ignore]);
 
-/// Unnormalized softmax of tile `t` against `top`, the row maximum or the running lse: `exp(score −
-/// top)` into `exponent` and the row's total, which divides the weighted values instead of the row.
+/// Unnormalized softmax of tile `t`'s F32 scores against `top`, the row maximum or the running lse:
+/// `exp(score − top)` into `exponent` and the row's total, which divides the weighted values
+/// instead of the row.
 pub(crate) struct Exponentiate;
 
 impl<KvHeads: AxisName, Groups: AxisName, K: AxisName, T: AxisName>
@@ -513,7 +509,7 @@ impl<KvHeads: AxisName, Groups: AxisName, K: AxisName, T: AxisName>
         (
             DmTensorView<
                 '_,
-                bf16,
+                f32,
                 Chip,
                 Cluster<KvHeads>,
                 Slice<KvHeads, Groups>,
@@ -543,7 +539,7 @@ impl<KvHeads: AxisName, Groups: AxisName, K: AxisName, T: AxisName>
             (
                 DmTensorView<
                     '_,
-                    bf16,
+                    f32,
                     Chip,
                     Cluster<KvHeads>,
                     Slice<KvHeads, Groups>,
@@ -565,7 +561,10 @@ impl<KvHeads: AxisName, Groups: AxisName, K: AxisName, T: AxisName>
         ),
     ) {
         let (exponent, total) = output;
-        Op::forward(&Exponents, &mut *context, (input, &mut *exponent, t));
+        let slot = exponent
+            .view_mut()
+            .tile::<m![{ Symbol<T> }], 1, m![{ TileSlot<T> }, Rows % 8, { Symbol<K> }]>(t);
+        Op::forward(&Exponents, &mut *context, (input, slot, t));
         Op::forward(
             &Total::<K>(PhantomData),
             context,
@@ -580,15 +579,16 @@ impl<KvHeads: AxisName, Groups: AxisName, K: AxisName, T: AxisName>
     }
 }
 
-/// Tile `t`'s `exp(score − top)` of a group's `K`-key score rows into `exponent`.
+/// Tile `t`'s `exp(score − top)` of a group's `K`-key F32 score rows into `exponent`, the tile's
+/// row slot of a BF16 owner.
 pub(crate) struct Exponents;
 
-impl<KvHeads: AxisName, Groups: AxisName, K: AxisName, T: AxisName>
+impl<KvHeads: AxisName, Groups: AxisName, K: AxisName, T: AxisName, O: M>
     Op<(
         (
             DmTensorView<
                 '_,
-                bf16,
+                f32,
                 Chip,
                 Cluster<KvHeads>,
                 Slice<KvHeads, Groups>,
@@ -596,13 +596,7 @@ impl<KvHeads: AxisName, Groups: AxisName, K: AxisName, T: AxisName>
             >,
             &Scalar<KvHeads, Groups>,
         ),
-        &mut DmTensor<
-            bf16,
-            Chip,
-            Cluster<KvHeads>,
-            Slice<KvHeads, Groups>,
-            m![{ Symbol<T> }, Rows % 8, { Symbol<K> }],
-        >,
+        DmTensorViewMut<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, O>,
         usize,
     )> for Exponents
 {
@@ -615,7 +609,7 @@ impl<KvHeads: AxisName, Groups: AxisName, K: AxisName, T: AxisName>
             (
                 DmTensorView<
                     '_,
-                    bf16,
+                    f32,
                     Chip,
                     Cluster<KvHeads>,
                     Slice<KvHeads, Groups>,
@@ -623,23 +617,15 @@ impl<KvHeads: AxisName, Groups: AxisName, K: AxisName, T: AxisName>
                 >,
                 &Scalar<KvHeads, Groups>,
             ),
-            &mut DmTensor<
-                bf16,
-                Chip,
-                Cluster<KvHeads>,
-                Slice<KvHeads, Groups>,
-                m![{ Symbol<T> }, Rows % 8, { Symbol<K> }],
-            >,
+            DmTensorViewMut<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, O>,
             usize,
         ),
     ) {
         type Row<T, K> = m![{ TileOf<T> }, Rows % 8, { Symbol<K> }];
-        type RowSlot<T, K> = m![{ TileSlot<T> }, Rows % 8, { Symbol<K> }];
         context
             .main
             .begin(scores.tile::<m![{ Symbol<T> }], 1, Row<T, K>>(t))
-            .fetch::<m![Rows % 8, { Symbol<K> } / 16], m![{ Symbol<K> } % 16]>()
-            .fetch_cast::<f32>()
+            .fetch::<m![Rows % 8, { Symbol<K> } / 8], m![{ Symbol<K> } % 8]>()
             .collect::<m![Rows % 8, { Symbol<K> } / 8], m![{ Symbol<K> } % 8]>()
             .vector_init()
             .vector_intra_slice_tag(TagMode::Comparison([Cmp::Equal(f32::NEG_INFINITY); 4]))
@@ -650,11 +636,7 @@ impl<KvHeads: AxisName, Groups: AxisName, K: AxisName, T: AxisName>
             .vector_final()
             .cast::<bf16, m![{ Symbol<K> } % 8 # 16]>()
             .commit_trim::<m![{ Symbol<K> } % 8]>()
-            .commit_view(
-                exponent
-                    .view_mut()
-                    .tile::<m![{ Symbol<T> }], 1, RowSlot<T, K>>(t),
-            );
+            .commit_view(exponent);
     }
 }
 

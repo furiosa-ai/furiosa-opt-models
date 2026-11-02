@@ -170,7 +170,8 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, E: M>
     }
 }
 
-/// Scaled scores of one 128-key panel, written into `output`, a panel or a tile of a wider row.
+/// Scaled scores of one 128-key panel in F32, written into `output`, a panel or a tile of a wider
+/// row: a softmax rounds only its probabilities.
 pub(crate) struct FreshScores;
 
 impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, Q: M, E: M>
@@ -178,7 +179,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, Q: M, E: M>
         &Attention<KvHeads, Groups, Head>,
         DmTensorView<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Q>,
         &Keys<KvHeads, Groups, Head>,
-        DmTensorViewMut<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, E>,
+        DmTensorViewMut<'_, f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, E>,
     )> for FreshScores
 {
     type Output = ();
@@ -190,7 +191,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, Q: M, E: M>
             &Attention<KvHeads, Groups, Head>,
             DmTensorView<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Q>,
             &Keys<KvHeads, Groups, Head>,
-            DmTensorViewMut<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, E>,
+            DmTensorViewMut<'_, f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, E>,
         ),
     ) {
         context.main.begin(projected)
@@ -222,7 +223,6 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, Q: M, E: M>
         >()
         .vector_final()
         .commit_trim::<m![Cache % 8]>()
-        .commit_cast::<bf16>()
         .commit_view(output);
     }
 }
