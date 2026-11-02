@@ -179,13 +179,13 @@ axes![
 ];
 
 /// FP8 per-channel attention projections and an NVFP4 feed-forward, as the published checkpoint
-/// stores them.
+/// stores them; the feed-forward's FP32 sums divide by its tensor scale, so no coefficient rounds.
 pub type Quantized = decoder::Projections<
     form::ChannelScaled,
     form::ChannelScaled,
     form::ChannelScaled,
     form::ChannelScaled,
-    form::Nvfp4,
+    form::Nvfp4Summed,
 >;
 
 /// Sliding attention geometry: 256-wide heads and three cache windows.
