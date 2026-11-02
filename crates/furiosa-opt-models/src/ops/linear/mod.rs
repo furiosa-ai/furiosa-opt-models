@@ -4,6 +4,7 @@ pub use affine::{Affine, Bias, output, query};
 pub(crate) use affine::{Coefficients, Inputs, Outputs};
 pub(crate) use decode::Matrix;
 pub use experts::Experts;
+pub(crate) use kernel::Slabs;
 pub(crate) use rows::Projection;
 
 use core::borrow::Borrow;
@@ -11,13 +12,13 @@ use core::marker::PhantomData;
 
 use furiosa_opt_std::prelude::*;
 
-use crate::Op;
 use crate::load::{self, Load, LoadError};
 use crate::ops::normalization::Spread;
 use crate::tensor::form::Weight;
 use crate::tensor::form::{BlockScaled, Part, Projections};
 use crate::tensor::mapping;
 use crate::tensor::{axis::Lanes, live::Live};
+use crate::{Begin, Op};
 
 pub mod affine;
 mod decode;
@@ -443,7 +444,7 @@ where
 impl<'x, In: AxisName, Out: AxisName, Rows: AxisName, Chips: M, S: M, F: M, W>
     Op<&'x Live<DmTensor<bf16, m![1], Chips, S, m![Rows, { F }]>, Rows>> for Affine<W, ()>
 where
-    W: Matrix<In = In, Out = Out>,
+    W: Slabs<In = In, Out = Out>,
 {
     type Output = Live<Spread<Out, Rows>, Rows>;
 
@@ -472,9 +473,56 @@ where
 #[derive(DeviceSend, Load)]
 pub struct Native<W>(pub W);
 
-/// The live row groups of a launch's rows projected by the dense contraction, where it leaves
-/// them; the projected rows keep the launch's live rows.
-impl<'x, In, Out, Code, Rows, Chips, S, F, W>
+/// A projection begun: its weight lands as its form lands it, before any rows arrive.
+impl<W: Op<Begin<()>>> Op<Begin<()>> for Native<W> {
+    type Output = W::Output;
+
+    fn forward(&self, device: &mut Device, begin: Begin<()>) -> Self::Output {
+        self.0.forward(device, begin)
+    }
+}
+
+/// The live row groups of a launch's rows projected by the dense contraction over the weight as
+/// it landed, where the contraction leaves them; the projected rows keep the launch's live rows.
+impl<'x, In, Out, Code, Rows, Chips, S, F, W, L>
+    Op<(
+        L,
+        &'x Live<DmTensor<bf16, m![1], Chips, S, m![Rows, { F }]>, Rows>,
+    )> for Native<W>
+where
+    In: AxisName,
+    Out: AxisName,
+    Code: Scalar,
+    Rows: AxisName,
+    Chips: M,
+    S: M,
+    F: M,
+    L: Slabs<In = In, Out = Out, Stored = Code>,
+{
+    type Output = Live<Projected<In, Out, Code, Rows>, Rows>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (landed, input): (
+            L,
+            &'x Live<DmTensor<bf16, m![1], Chips, S, m![Rows, { F }]>, Rows>,
+        ),
+    ) -> Self::Output {
+        let projected = Affine::new(landed, ()).forward(
+            device,
+            (
+                input.with(PhantomData::<Rows>),
+                input.value().view(),
+                |at| mapping::Rows::<Rows>::group(input.value().view(), at),
+            ),
+        );
+        input.with(projected)
+    }
+}
+
+/// The same rows through the weight begun here.
+impl<'x, In, Out, Code, Rows, Chips, S, F, W, L>
     Op<&'x Live<DmTensor<bf16, m![1], Chips, S, m![Rows, { F }]>, Rows>> for Native<W>
 where
     In: AxisName,
@@ -484,7 +532,8 @@ where
     Chips: M,
     S: M,
     F: M,
-    W: Matrix<In = In, Out = Out, Stored = Code>,
+    W: Op<Begin<()>, Output = L>,
+    L: Slabs<In = In, Out = Out, Stored = Code>,
 {
     type Output = Live<Projected<In, Out, Code, Rows>, Rows>;
 
@@ -493,15 +542,8 @@ where
         device: &mut Device,
         input: &'x Live<DmTensor<bf16, m![1], Chips, S, m![Rows, { F }]>, Rows>,
     ) -> Self::Output {
-        let projected = Affine::new(&self.0, ()).forward(
-            device,
-            (
-                input.with(PhantomData::<Rows>),
-                input.value().view(),
-                |at| mapping::Rows::<Rows>::group(input.value().view(), at),
-            ),
-        );
-        input.with(projected)
+        let landed = self.forward(&mut *device, Begin(()));
+        self.forward(device, (landed, input))
     }
 }
 

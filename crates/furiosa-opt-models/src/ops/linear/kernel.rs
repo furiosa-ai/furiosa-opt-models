@@ -219,7 +219,7 @@ type Table<D, In, Out, Code, Rows, X> = DmTensor<
     ],
 >;
 
-type Resident<In, Out, Code, X = m![1]> = DmTensor<
+pub(super) type Resident<In, Out, Code, X = m![1]> = DmTensor<
     bf16,
     X,
     Cluster<In, Out, Code>,
@@ -545,6 +545,33 @@ pub(crate) trait Tiling<In: AxisName, Out: AxisName>: 'static {
     ) -> DmTensor<D, X, Self::Cluster, Self::Slices, E>;
 }
 
+/// A weight the contraction reads one slab at a time as its BF16 tile: a [`Matrix`], each slab
+/// decoded where it is stored, or a weight landed in the contraction's tiling before its rows.
+pub(crate) trait Slabs<X: M = m![1]> {
+    type In: AxisName;
+    type Out: AxisName;
+    /// The scalar the weight stores its values in, which fixes the contraction's tiling.
+    type Stored: Scalar;
+
+    /// Slab `at` in BF16.
+    fn slab(
+        &self,
+        device: &mut Device,
+        at: usize,
+    ) -> Resident<Self::In, Self::Out, Self::Stored, X>;
+}
+
+/// A matrix's slab is its tile of the contraction's tiling.
+impl<X: M, W: Matrix<X>> Slabs<X> for W {
+    type In = W::In;
+    type Out = W::Out;
+    type Stored = W::Stored;
+
+    fn slab(&self, device: &mut Device, at: usize) -> Resident<W::In, W::Out, W::Stored, X> {
+        self.tile::<Contraction<W::In, W::Out, W::Stored>>(device, at)
+    }
+}
+
 impl<In, Out, Code, Rows, V, U, W, Group> Op<(Live<PhantomData<Rows>, Rows>, V, Group)>
     for Affine<W, ()>
 where
@@ -554,7 +581,7 @@ where
     Rows: AxisName,
     V: Source<Chips = m![1]>,
     U: Source<Chips = m![1]>,
-    W: Matrix<In = In, Out = Out, Stored = Code>,
+    W: Slabs<In = In, Out = Out, Stored = Code>,
     Group: Fn(usize) -> U,
 {
     type Output = Result<In, Out, Code, Rows>;
@@ -623,7 +650,7 @@ where
         let mut result = DmTensor::new();
         #[unroll]
         for slab in 0..<Passes<In, Out, Code> as M>::SIZE {
-            let weight = self.weight.tile::<Contraction<In, Out, Code>>(device, slab);
+            let weight = self.weight.slab(device, slab);
             for at in 0..count {
                 let group = first + at;
                 let lanes = rows.forward(&mut *device, (group, PhantomData::<axis::Lanes<Rows>>));
@@ -797,7 +824,7 @@ where
     Window: AxisName,
     S: Stored<Rows = Rows>,
     O: Stored<Rows = Window>,
-    W: Matrix<In = In, Out = Out>,
+    W: Slabs<In = In, Out = Out>,
 {
     type Output = ();
 
@@ -936,6 +963,47 @@ impl<In: AxisName, Out: AxisName, Code: Scalar> Tiling<In, Out> for Contraction<
                 { K }
             ]>(at)
             .to_dm(&mut device.tdma)
+    }
+}
+
+/// Every slab of a weight tensor on the contraction's slices, a slice keeping `E` of each slab,
+/// the slab outermost.
+pub(super) type Landing<D, In, Out, Code, E> = DmTensor<
+    D,
+    m![1],
+    Cluster<In, Out, Code>,
+    ProjectionSlices<In, Out, Code>,
+    m![{ SlabIndex<In, Out, Code> }, { E }],
+>;
+
+/// One slab of a [`Landing`], chosen from its slabs.
+pub(super) type Slab<In, Out, Code> =
+    m![{ SlabIndex<In, Out, Code> } = 1 # ({ SlabIndex<In, Out, Code> })];
+
+impl<In: AxisName, Out: AxisName, Code: Scalar> Contraction<In, Out, Code> {
+    /// Every slab of an `[Out, K]` tensor in one transfer, a slice keeping `E`, its rows' share of
+    /// `K`, of each.
+    pub(super) fn land<D: MaterializableScalar, K: M, E: M>(
+        device: &mut Device,
+        tensor: &HbmTensor<D, m![1], m![Out, { K }]>,
+    ) -> Landing<D, In, Out, Code, E> {
+        const { Self::TILED };
+        tensor.to_dm(&mut device.tdma)
+    }
+
+    /// Slab `at` of a tensor landed whole.
+    pub(super) fn landed<D: Scalar, E: M>(
+        landing: &Landing<D, In, Out, Code, E>,
+        at: usize,
+    ) -> DmTensorView<
+        '_,
+        D,
+        m![1],
+        Cluster<In, Out, Code>,
+        ProjectionSlices<In, Out, Code>,
+        m![{ Slab<In, Out, Code> }, { E }],
+    > {
+        landing.view().tile::<SlabIndex<In, Out, Code>, 1, _>(at)
     }
 }
 
@@ -1109,7 +1177,7 @@ impl<In: AxisName, Out: AxisName, Code: Scalar> Contraction<In, Out, Code> {
         mut offsets: impl FnMut(&mut Device, usize) -> F,
     ) -> Result<In, Out, Code, Rows, V::Chips>
     where
-        W: Matrix<V::Chips, In = In, Out = Out, Stored = Code>,
+        W: Slabs<V::Chips, In = In, Out = Out, Stored = Code>,
         F: Offset<V::Chips, Cluster<In, Out, Code>, ProjectionSlices<In, Out, Code>>,
     {
         let rows = Stage::<In, Out, Code, Rows, Batch<In, Out, Code, Rows>>(PhantomData)
@@ -1117,7 +1185,7 @@ impl<In: AxisName, Out: AxisName, Code: Scalar> Contraction<In, Out, Code> {
         let mut result = DmTensor::new();
         #[unroll]
         for slab in 0..<Passes<In, Out, Code> as M>::SIZE {
-            let weight = weight.tile::<Self>(device, slab);
+            let weight = weight.slab(device, slab);
             let offset = offsets(device, slab);
             Self::batches::<_, Batch<In, Out, Code, Rows>, _, bf16, _>(
                 device,
