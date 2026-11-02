@@ -1283,6 +1283,118 @@ async fn sums_nvfp4_rows_nearer_than_early() {
     sums_rows_nearer_than_early::<Intermediate, Hidden>(&mut device, 4).await;
 }
 
+/// The feed-forward's NVFP4 projections under the early and the summed contract, profiled at the
+/// level `FURIOSA_OPT_PROFILE` asks for: for each live row count `PERIOD_PROFILE_ROWS` lists, a
+/// warm-up and `PERIOD_PROFILE_STEPS` launches of each, every span written as [`Lines`] writes it.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "profiles launches on a device"]
+async fn feed_forward_profile() {
+    use std::future::IntoFuture;
+    use tracing::Instrument;
+    let list = |name: &str, default: &str| -> Vec<usize> {
+        let list = std::env::var(name).unwrap_or_else(|_| default.into());
+        list.split(',').map(|item| item.parse().unwrap()).collect()
+    };
+    let steps = list("PERIOD_PROFILE_STEPS", "10")[0];
+    // Installed before the functions load, so that they load with the profile.
+    let _spans = tracing::subscriber::set_default(Lines::new());
+    let _lease = DEVICE.lock().await;
+    let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+    let (up, down) = (
+        Drawn::new::<Hidden, Intermediate>(1),
+        Drawn::new::<Intermediate, Hidden>(4),
+    );
+    let gate = (
+        up.coded::<Hidden, Intermediate, Early<W4A16>>(&mut device, |global| Early {
+            input: W4A16,
+            global,
+        })
+        .await,
+        up.coded::<Hidden, Intermediate, Summed<W4A16>>(&mut device, |global| Summed {
+            input: W4A16,
+            global,
+        })
+        .await,
+    );
+    let down_proj = (
+        down.coded::<Intermediate, Hidden, Early<W4A16>>(&mut device, |global| Early {
+            input: W4A16,
+            global,
+        })
+        .await,
+        down.coded::<Intermediate, Hidden, Summed<W4A16>>(&mut device, |global| Summed {
+            input: W4A16,
+            global,
+        })
+        .await,
+    );
+    for live in list("PERIOD_PROFILE_ROWS", "1,8,9,64") {
+        let rows = (
+            up.rows::<Hidden>(&mut device, live).await,
+            down.rows::<Intermediate>(&mut device, live).await,
+        );
+        for kernel in ["gate-early", "gate-summed", "down-early", "down-summed"] {
+            let case = format!("{kernel}-rows-{live}");
+            for sample in 0..=steps {
+                let span = match sample {
+                    0 => tracing::info_span!("warmup", case = case.as_str()),
+                    step => tracing::info_span!("forward", case = case.as_str(), step),
+                };
+                let started = std::time::Instant::now();
+                async {
+                    let submit = tracing::info_span!("submit");
+                    let ((hidden, hidden_live), (intermediate, intermediate_live)) =
+                        (&rows.0, &rows.1);
+                    match kernel {
+                        "gate-early" => {
+                            let arguments = (&mut device, &gate.0, (hidden, hidden_live));
+                            let output = launch(projected, arguments)
+                                .into_future()
+                                .instrument(submit)
+                                .await;
+                            drop(output.unwrap());
+                        }
+                        "gate-summed" => {
+                            let arguments = (&mut device, &gate.1, (hidden, hidden_live));
+                            let output = launch(projected, arguments)
+                                .into_future()
+                                .instrument(submit)
+                                .await;
+                            drop(output.unwrap());
+                        }
+                        "down-early" => {
+                            let arguments =
+                                (&mut device, &down_proj.0, (intermediate, intermediate_live));
+                            let output = launch(projected, arguments)
+                                .into_future()
+                                .instrument(submit)
+                                .await;
+                            drop(output.unwrap());
+                        }
+                        _ => {
+                            let arguments =
+                                (&mut device, &down_proj.1, (intermediate, intermediate_live));
+                            let output = launch(projected, arguments)
+                                .into_future()
+                                .instrument(submit)
+                                .await;
+                            drop(output.unwrap());
+                        }
+                    }
+                    (device.synchronize())
+                        .instrument(tracing::info_span!("wait"))
+                        .await
+                        .unwrap();
+                }
+                .instrument(span)
+                .await;
+                let elapsed = started.elapsed().as_secs_f64() * 1e3;
+                println!("{case} step {sample}: {elapsed:.3} ms");
+            }
+        }
+    }
+}
+
 /// Every catalog root a registry row serves still runs by the decoder family's one loop: the
 /// causal models of each Qwen3 size and form, Llama and Mistral.
 #[test]
