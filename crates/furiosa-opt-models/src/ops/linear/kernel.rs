@@ -9,6 +9,7 @@ use furiosa_opt_std::prelude::*;
 
 use crate::ops::linear::Groups;
 use crate::ops::linear::{Affine, Linear, Matrix};
+use crate::ops::normalization::{self, FeatureSlices, Spread};
 use crate::tensor::axis;
 use crate::tensor::live::Live;
 use crate::tensor::mapping::Rows as Layout;
@@ -325,17 +326,29 @@ type ChunkRows<In, Out, Code, Rows, X = m![1]> = DmTensor<
     m![1, Rows, { Chunked<In, Out, Code> }],
 >;
 
-enum Staged<In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName, X: M = m![1]> {
+/// Rows in their feature slices under a contraction's names, which its ring reads where they lie.
+type Features<'r, In, Out, Code, Rows, X> = DmTensorView<
+    'r,
+    bf16,
+    X,
+    Cluster<In, Out, Code>,
+    FeatureSlices<In>,
+    m![1, Rows, { normalization::Offset<In> }],
+>;
+
+pub(crate) enum Staged<'r, In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName, X: M = m![1]>
+{
     Replicated(Replicated<In, Out, Code, Rows, X>),
     Transposed(Transposed<In, Out, Code, Rows, X>),
     Ring(Ring<In, Out, Code, Rows, X>),
+    Features(Features<'r, In, Out, Code, Rows, X>),
     Chunk(ChunkRows<In, Out, Code, Rows, X>),
 }
 
 /// The route a batch of `B` of the `Rows` takes. A transposed broadcast serves one lane group
 /// only, and a chunk fetch grows with the lanes, so either takes the ring past its reach.
 impl<In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName, X: M>
-    Staged<In, Out, Code, Rows, X>
+    Staged<'_, In, Out, Code, Rows, X>
 {
     const fn route<B: AxisName>() -> Routing {
         match Contraction::<In, Out, Code>::config().routing {
@@ -344,9 +357,32 @@ impl<In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName, X: M>
             routing => routing,
         }
     }
+
+    /// A batch of `B` rows in the ring layout as the lanes of every slice: the switch ring takes
+    /// each slice's sixteen inputs to the slices whose part holds them.
+    fn lanes<B: AxisName, S: M, E: M>(
+        device: &mut Device,
+        rows: DmTensorView<'_, bf16, X, Cluster<In, Out, Code>, S, E>,
+    ) -> Lanes<In, Out, Code, Rows, B, X> {
+        device
+            .sub
+            .begin(rows)
+            .fetch::<m![{ Layout<Rows>::Lanes }, { Count<Rows, B> }], m![In % 16]>()
+            .switch::<ProjectionSlices<In, Out, Code>, m![
+                { Layout<Rows>::Lanes },
+                { Count<Rows, B> },
+                { Chunked<In, Out, Code> } / 16
+            ]>(SwitchConfig::CustomBroadcast { ring_size: 256 })
+            .collect::<m![
+                { Layout<Rows>::Lanes },
+                { Count<Rows, B> },
+                { Chunked<In, Out, Code> } / 16
+            ], m![In % 16]>()
+            .to_trf()
+    }
 }
 
-/// A view of a contraction's input rows, on chip or in HBM, that a stage copies from.
+/// A contraction's input rows, on chip or in HBM, that a stage copies from.
 pub(crate) trait Source {
     type Chips: M;
 
@@ -356,6 +392,19 @@ pub(crate) trait Source {
         into: DmTensorViewMut<'a, bf16, Self::Chips, C, S, E>,
     ) where
         Self: 'a;
+
+    /// The rows as the ring route of a contraction of `In` inputs into `Out` outputs reads them:
+    /// copied by `fill` into a ring layout of their own, unless they already lie in one.
+    fn ring<'a, In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName>(
+        self,
+        device: &mut Device,
+        fill: impl FnOnce(&mut Device, Self) -> Ring<In, Out, Code, Rows, Self::Chips>,
+    ) -> Staged<'a, In, Out, Code, Rows, Self::Chips>
+    where
+        Self: Sized + 'a,
+    {
+        Staged::Ring(fill(device, self))
+    }
 }
 
 impl<'v, X: M, ViewCluster: M, ViewSlices: M, ViewElements: M> Source
@@ -388,12 +437,47 @@ impl<'v, X: M, ViewElements: M> Source for HbmTensorView<'v, bf16, X, ViewElemen
     }
 }
 
-struct Stage<In, Out, Code, Rows, B>(PhantomData<(In, Out, Code, Rows, B)>);
+/// Rows in their feature slices already lie in the ring layout: a ring carries sixteen inputs a
+/// slice, a feature slice's share of every width it carries.
+impl<'v, W: AxisName, R: AxisName, X: M> Source for &'v Spread<W, R, X> {
+    type Chips = X;
 
-impl<In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName, B: AxisName, V: Source> crate::Op<V>
-    for Stage<In, Out, Code, Rows, B>
+    fn copy<'a, C: M, S: M, E: M>(
+        self,
+        device: &mut Device,
+        into: DmTensorViewMut<'a, bf16, X, C, S, E>,
+    ) where
+        Self: 'a,
+    {
+        self.view().to_dm_view(&mut device.tdma, into);
+    }
+
+    fn ring<'a, In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName>(
+        self,
+        _: &mut Device,
+        _: impl FnOnce(&mut Device, Self) -> Ring<In, Out, Code, Rows, X>,
+    ) -> Staged<'a, In, Out, Code, Rows, X>
+    where
+        Self: 'a,
+    {
+        // SAFETY: the same cells under the contraction's names: both physical clusters hold every
+        // row, and the rows and their features keep their order.
+        Staged::Features(unsafe { self.view().reshape() })
+    }
+}
+
+struct Stage<'r, In, Out, Code, Rows, B>(PhantomData<(&'r (), In, Out, Code, Rows, B)>);
+
+impl<'r, In, Out, Code, Rows, B, V> crate::Op<V> for Stage<'r, In, Out, Code, Rows, B>
+where
+    In: AxisName,
+    Out: AxisName,
+    Code: Scalar,
+    Rows: AxisName,
+    B: AxisName,
+    V: Source + 'r,
 {
-    type Output = Staged<In, Out, Code, Rows, V::Chips>;
+    type Output = Staged<'r, In, Out, Code, Rows, V::Chips>;
 
     fn forward(&self, device: &mut Device, input: V) -> Self::Output {
         /// The rows of `input` copied whole into the layout their route reads.
@@ -408,14 +492,14 @@ impl<In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName, B: AxisName, V: 
         match const { Staged::<In, Out, Code, Rows, V::Chips>::route::<B>() } {
             Routing::Replicated => Staged::Replicated(copied(device, input)),
             Routing::Transposed => Staged::Transposed(copied(device, input)),
-            Routing::Ring => Staged::Ring(copied(device, input)),
+            Routing::Ring => input.ring(device, |device, input| copied(device, input)),
             Routing::Chunk => Staged::Chunk(copied(device, input)),
         }
     }
 }
 
 impl<In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName, X: M, B: AxisName>
-    Op<(usize, PhantomData<B>)> for Staged<In, Out, Code, Rows, X>
+    Op<(usize, PhantomData<B>)> for Staged<'_, In, Out, Code, Rows, X>
 {
     type Output = Lanes<In, Out, Code, Rows, B, X>;
 
@@ -470,26 +554,19 @@ impl<In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName, X: M, B: AxisNam
                 >()
                 .to_trf(),
 
-            Self::Ring(input) => device
-                .sub
-                .begin(input.view().tile::<m![Rows / B], 1, m![
+            Self::Ring(input) => Self::lanes(
+                device,
+                input.view().tile::<m![Rows / B], 1, m![
                     1, Rows / B = 1 # (Rows / B), Rows % B, In % 16
-                ]>(at))
-                .fetch::<m![{ Layout<Rows>::Lanes }, { Count<Rows, B> }], m![In % 16]>()
-                .switch::<ProjectionSlices<In, Out, Code>, m![
-                    { Layout<Rows>::Lanes },
-                    { Count<Rows, B> },
-                    { Chunked<In, Out, Code> } / 16
-                ]>(SwitchConfig::CustomBroadcast { ring_size: 256 })
-                .collect::<
-                    m![
-                        { Layout<Rows>::Lanes },
-                        { Count<Rows, B> },
-                        { Chunked<In, Out, Code> } / 16
-                    ],
-                    m![In % 16],
-                >()
-                .to_trf(),
+                ]>(at),
+            ),
+
+            Self::Features(input) => Self::lanes(
+                device,
+                input.tile::<m![Rows / B], 1, m![
+                    1, Rows / B = 1 # (Rows / B), Rows % B, { normalization::Offset<In> }
+                ]>(at),
+            ),
 
             Self::Chunk(input) => device
                 .sub
@@ -630,14 +707,16 @@ where
                     PhantomData::<m![1, { Layout<Rows>::SelectedMut }, In % ({ Packet<Rows> })]>,
                 ),
             )),
-            Routing::Ring => Staged::Ring(grouped(
-                device,
-                &live,
-                (
-                    &group,
-                    PhantomData::<m![1, { Layout<Rows>::GroupMut<m![In % 16]> }]>,
-                ),
-            )),
+            Routing::Ring => input.ring(device, |device, _| {
+                grouped(
+                    device,
+                    &live,
+                    (
+                        &group,
+                        PhantomData::<m![1, { Layout<Rows>::GroupMut<m![In % 16]> }]>,
+                    ),
+                )
+            }),
             Routing::Chunk => Staged::Chunk(grouped(
                 device,
                 &live,
@@ -1151,7 +1230,7 @@ impl<In: AxisName, Out: AxisName, Code: Scalar> Contraction<In, Out, Code> {
     /// `offset` stored as `D` in its cells of `result`.
     fn batches<Rows: AxisName, B: AxisName, X: M, D: Rounding, F>(
         device: &mut Device,
-        rows: &Staged<In, Out, Code, Rows, X>,
+        rows: &Staged<'_, In, Out, Code, Rows, X>,
         weight: &Resident<In, Out, Code, X>,
         offset: &F,
         result: &mut Table<D, In, Out, Code, Rows, X>,

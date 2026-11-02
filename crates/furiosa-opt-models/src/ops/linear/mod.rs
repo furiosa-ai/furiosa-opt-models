@@ -482,22 +482,16 @@ impl<W: Op<Begin<()>>, View> Op<Begin<()>> for Native<W, View> {
     }
 }
 
-/// The live row groups of a launch's rows projected by the dense contraction over the weight as
-/// it landed, split into heads where the contraction leaves them; the heads keep the launch's live
-/// rows.
-impl<'x, In, Out, Code, Rows, Chips, S, F, W, View, L>
-    Op<(
-        L,
-        &'x Live<DmTensor<bf16, m![1], Chips, S, m![Rows, { F }]>, Rows>,
-    )> for Native<W, View>
+/// The live row groups of a launch's rows in their feature slices, projected by the dense
+/// contraction over the weight as it landed, split into heads where the contraction leaves them;
+/// the heads keep the launch's live rows.
+impl<'x, In, Out, Code, Rows, W, View, L> Op<(L, &'x Live<Spread<In, Rows>, Rows>)>
+    for Native<W, View>
 where
     In: AxisName,
     Out: AxisName,
     Code: Scalar,
     Rows: AxisName,
-    Chips: M,
-    S: M,
-    F: M,
     L: Slabs<In = In, Out = Out, Stored = Code>,
     mapping::Reshape<View>: Op<Live<Projected<In, Out, Code, Rows>, Rows>>,
 {
@@ -507,34 +501,25 @@ where
     fn forward(
         &self,
         device: &mut Device,
-        (landed, input): (
-            L,
-            &'x Live<DmTensor<bf16, m![1], Chips, S, m![Rows, { F }]>, Rows>,
-        ),
+        (landed, input): (L, &'x Live<Spread<In, Rows>, Rows>),
     ) -> Self::Output {
         let projected = Affine::new(landed, ()).forward(
             &mut *device,
-            (
-                input.with(PhantomData::<Rows>),
-                input.value().view(),
-                |at| mapping::Rows::<Rows>::group(input.value().view(), at),
-            ),
+            (input.with(PhantomData::<Rows>), input.value(), |at| {
+                mapping::Rows::<Rows>::group(input.value().view(), at)
+            }),
         );
         mapping::Reshape::<View>::default().forward(device, input.with(projected))
     }
 }
 
 /// The same rows through the weight begun here.
-impl<'x, In, Out, Code, Rows, Chips, S, F, W, View, L>
-    Op<&'x Live<DmTensor<bf16, m![1], Chips, S, m![Rows, { F }]>, Rows>> for Native<W, View>
+impl<'x, In, Out, Code, Rows, W, View, L> Op<&'x Live<Spread<In, Rows>, Rows>> for Native<W, View>
 where
     In: AxisName,
     Out: AxisName,
     Code: Scalar,
     Rows: AxisName,
-    Chips: M,
-    S: M,
-    F: M,
     W: Op<Begin<()>, Output = L>,
     L: Slabs<In = In, Out = Out, Stored = Code>,
     mapping::Reshape<View>: Op<Live<Projected<In, Out, Code, Rows>, Rows>>,
@@ -545,7 +530,7 @@ where
     fn forward(
         &self,
         device: &mut Device,
-        input: &'x Live<DmTensor<bf16, m![1], Chips, S, m![Rows, { F }]>, Rows>,
+        input: &'x Live<Spread<In, Rows>, Rows>,
     ) -> Self::Output {
         let landed = self.forward(&mut *device, Begin(()));
         self.forward(device, (landed, input))
