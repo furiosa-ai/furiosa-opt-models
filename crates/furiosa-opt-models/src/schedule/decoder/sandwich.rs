@@ -6,13 +6,17 @@
 //! - Its end runs the output projection, the post-attention norm, the attention residual, the
 //!   pre-feed-forward norm and the feed-forward; its update the post-feed-forward norm, the
 //!   feed-forward residual and the layer's tail.
-//! - Its leaves land nothing ahead, so its front and output projection's landing are `()`; they
-//!   hold nothing in a call, so it takes `()` and runs each leaf with that leaf's empty slot.
+//! - Its feed-forward's projections land their weights one step ahead, under work that issues no
+//!   transfer: the up projection's under the gate's passes, the down projection's under the
+//!   activation and the up projection's passes. Its front and output projection's landing are
+//!   `()`; its leaves hold nothing in a call, so it takes `()` and runs each with its empty slot.
 
 use super::{Cut, Output, Places, Pool, Staged, Stored, attend_stored};
 use crate::models::decoder;
 use crate::modules::attention::{self, Attention, KeyValue, Positioned};
-use crate::modules::residual::Residual;
+use crate::modules::feedforward::glu::Glu;
+use crate::modules::parallel::RowParallel;
+use crate::modules::residual::{Residual, Sum};
 use crate::modules::transformer::SandwichNorm;
 use crate::ops::attention::Heads;
 use crate::ops::attention::gqa::{Attended, Pages};
@@ -20,8 +24,8 @@ use crate::ops::index::scatter::Store;
 use crate::ops::normalization::{RmsNorm, RowMajor, Spread};
 use crate::tensor::axis::Single;
 use crate::tensor::live::Live;
-use crate::tensor::parallel::Chip;
-use crate::{Module, Sequential, Slot, Then};
+use crate::tensor::parallel::{Chip, Parallelism};
+use crate::{Begin, Fork, Module, Sequential, Slot, Then};
 use furiosa_opt_std::prelude::*;
 
 /// A call's context of `R` rows: their positions `P`, the slot each writes and the pages of
@@ -51,7 +55,9 @@ type AttendedHeads<A, R> = Attended<
 
 /// The sandwich-norm layer and its tail `L` in every form whose leaves take a whole envelope of
 /// `R` rows of `Hidden` features, attending in group `A` over pages of its cache. Its query/key/
-/// value stage, output projection and feed-forward each run with their empty slot.
+/// value stage and output projection run with their empty slot. Its gated feed-forward's gate,
+/// up and down projections land as `GL`, `UL`, `DL` and give `GO`, `UO` and the rows; the
+/// activation gives `AO` of the gate's, the product `MO`.
 impl<
     'c,
     A,
@@ -67,14 +73,26 @@ impl<
     Write,
     Attend,
     Project,
-    FeedForward,
+    Gate,
+    Activation,
+    Up,
+    Multiply,
+    Down,
+    Placement,
+    GL,
+    GO,
+    AO,
+    UL,
+    UO,
+    MO,
+    DL,
     Add,
     Tail,
 > Cut<A, &'c Context<P, R, Windows>, ()>
     for Then<
         SandwichNorm<
             Attention<Positioned<Qkv, Position>, KeyValue<Write, ()>, Attend, Project>,
-            FeedForward,
+            Glu<Gate, Activation, Up, Multiply, RowParallel<Down, Placement>>,
             RmsNorm<Hidden, EPSILON, NC, NP>,
             Add,
         >,
@@ -139,13 +157,16 @@ where
             &'x mut (),
             Output = Live<Spread<Hidden, R, Chip>, R>,
         >,
-    FeedForward: Slot
-        + for<'r, 'x> Module<
-            &'r Live<Spread<Hidden, R, Chip>, R>,
-            (),
-            &'x mut <FeedForward as Slot>::Empty,
-            Output = Live<Spread<Hidden, R, Chip>, R>,
-        >,
+    Placement: Parallelism,
+    Gate: for<'x> Module<Begin<()>, (), &'x mut (), Output = GL>
+        + for<'r, 'x> Module<(GL, &'r Live<Spread<Hidden, R, Chip>, R>), (), &'x mut (), Output = GO>,
+    Activation: for<'r, 'x> Module<&'r GO, (), &'x mut (), Output = AO>,
+    Up: for<'x> Module<Begin<()>, (), &'x mut (), Output = UL>
+        + for<'r, 'x> Module<(UL, &'r Live<Spread<Hidden, R, Chip>, R>), (), &'x mut (), Output = UO>,
+    Multiply: for<'g, 'u, 'x> Module<(&'g AO, &'u UO), (), &'x mut (), Output = MO>,
+    Down: for<'x> Module<Begin<()>, (), &'x mut (), Output = DL>,
+    RowParallel<Down, Placement>:
+        for<'r, 'x> Module<(DL, &'r MO), (), &'x mut (), Output = Live<Spread<Hidden, R, Chip>, R>>,
     Tail: for<'r, 'x> Module<
             &'r Live<Spread<Hidden, R, Chip>, R>,
             (),
@@ -230,13 +251,21 @@ where
     ) -> Self::Staged {
         let Then(Sequential(first, Residual(norm, Then(mlp, _), _)), _) = self;
         let Residual(_, Then(attention, post), add) = first;
+        let Sum(Fork((Then(gate, activation), up)), Then(multiply, down)) = &mlp.0;
         let heads = attended.with(attended.value().0.to_dm(&mut device.tdma));
         let slot = &mut Default::default();
         let projected = (attention.0.output).forward(&mut *device, (), slot, &heads);
         let branch = post.forward(&mut *device, (), &mut (), &projected);
         let residual = add.forward(&mut *device, (), &mut (), (&input, &branch));
         let normalized = norm.forward(&mut *device, (), &mut (), &residual);
-        let ready = mlp.forward(device, (), &mut Default::default(), &normalized);
+        let gate_landed = gate.forward(&mut *device, (), &mut (), Begin(()));
+        let up_landed = up.forward(&mut *device, (), &mut (), Begin(()));
+        let gated = gate.forward(&mut *device, (), &mut (), (gate_landed, &normalized));
+        let down_landed = (down.0.operation).forward(&mut *device, (), &mut (), Begin(()));
+        let activated = activation.forward(&mut *device, (), &mut (), &gated);
+        let upped = up.forward(&mut *device, (), &mut (), (up_landed, &normalized));
+        let product = multiply.forward(&mut *device, (), &mut (), (&activated, &upped));
+        let ready = down.forward(device, (), &mut (), (down_landed, &product));
         Staged {
             ready,
             attended: residual,
