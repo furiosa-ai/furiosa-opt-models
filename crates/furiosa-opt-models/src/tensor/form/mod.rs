@@ -436,7 +436,7 @@ impl<'a, In: AxisName, Out: AxisName, A, X: Memory, W, T> Load<&'a Checkpoint>
     for Nvfp4<In, Out, nvfp4::Summed<A, X>, W, T>
 where
     W: Load<HostTensor<f4e2m1, m![{ Chip }, { m![Out, In] }]>>,
-    T: Load<&'a Checkpoint>,
+    T: Load<nvfp4::BlockScales<In, Out>>,
     nvfp4::Summed<A, X>: Load<&'a Checkpoint>,
 {
     fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
@@ -451,7 +451,7 @@ impl<'t, 's, In: AxisName, Out: AxisName, A, X: Memory, W, T>
     )> for &'t mut Nvfp4<In, Out, nvfp4::Summed<A, X>, W, T>
 where
     for<'u> &'u mut W: Load<(&'u mut W, Codes<In, Out>)>,
-    for<'u> &'u mut T: Load<(&'u mut T, &'s Checkpoint)>,
+    for<'u> &'u mut T: Load<(&'u mut T, nvfp4::BlockScales<In, Out>)>,
     for<'u> &'u mut nvfp4::Summed<A, X>: Load<(&'u mut nvfp4::Summed<A, X>, &'s Checkpoint)>,
 {
     fn load(
