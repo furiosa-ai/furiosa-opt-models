@@ -215,7 +215,9 @@ impl LoadOptions {
         };
         let class = match config.part() {
             Part::Encoder => None,
-            Part::Whole => Some(Decoder::class(config.class()).ok_or_else(unbound)?),
+            Part::Whole | Part::Layers(_) => {
+                Some(Decoder::class(config.class()).ok_or_else(unbound)?)
+            }
         };
         let model = py.detach(|| {
             let mut context = device.0.lock().unwrap_or_else(PoisonError::into_inner);

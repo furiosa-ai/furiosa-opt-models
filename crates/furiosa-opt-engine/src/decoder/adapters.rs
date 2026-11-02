@@ -1,8 +1,10 @@
 //! The LoRA adapters a decoder's calls run their requests with.
 //!
-//! - An adapter is a PEFT checkpoint loaded into HBM as the decoder's adapter tree
-//!   (`Decoder::Adapter`). Nothing changes it, so a call reads it where it lies: a framework makes
-//!   an adapter active by putting it in a slot of the list it calls with, without a copy.
+//! - An adapter is a PEFT checkpoint built on host as the decoder's adapter tree, then loaded into
+//!   the storage of one in HBM (`Decoder::Adapter`); a call reads it where it lies, so a framework
+//!   makes an adapter active by putting it in a slot of the list it calls with, without a copy.
+//! - A framework may load another host adapter into an adapter between calls: a call reads what
+//!   was loaded before it was submitted.
 //! - A call holds at most [`SLOTS`] adapters, and each slot's update runs on every row: a slot no
 //!   request names reads another slot's adapter, its selection zero on every row.
 //! - A slot's selection of the call's rows, one on the rows of the requests that name the slot and
@@ -10,7 +12,9 @@
 //! - A `Served` decoder loads and reads its adapters as an [`Adapter`], the tree's type erased:
 //!   an adapter belongs to the decoder's type on a device, not to one load of it.
 
-use crate::{Checkpoint, LoadError};
+use crate::{Checkpoint, Load, LoadError};
+use furiosa_opt_models::load::Context;
+use furiosa_opt_models::modules::lora;
 use furiosa_opt_models::tensor::memory::alias;
 use furiosa_opt_std::prelude::*;
 use std::any::Any;
@@ -20,26 +24,81 @@ use std::io;
 /// every row whether a row names it or not.
 pub const SLOTS: usize = 2;
 
-/// An adapter a served decoder loaded, its tree's type erased: a call of a decoder of another type
-/// refuses it.
+/// An adapter tree of a served decoder, on host or in HBM, its type erased: a call or a load that
+/// expects a tree of another decoder type or memory refuses it.
 pub struct Adapter(Box<dyn Any + Send + Sync>);
 
-/// Loads a PEFT LoRA checkpoint onto a device as an adapter of one decoder type.
-pub type Loader = fn(&Checkpoint, &mut Device) -> Result<Adapter, LoadError>;
-
 impl Adapter {
-    pub(super) fn new<A: Send + Sync + 'static>(tree: A) -> Self {
+    fn new<A: Send + Sync + 'static>(tree: A) -> Self {
         Self(Box::new(tree))
     }
 
-    /// The tree of a decoder whose adapters are `A`s; refused as an adapter of another model.
+    /// The tree of a decoder whose adapters are `A`s; refused as one of another model or memory.
     pub(super) fn of<A: 'static>(&self) -> io::Result<&A> {
-        self.0.downcast_ref::<A>().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "an adapter was loaded for another model",
-            )
-        })
+        self.0.downcast_ref::<A>().ok_or_else(Self::foreign)
+    }
+
+    /// The same tree, to write into.
+    fn of_mut<A: 'static>(&mut self) -> io::Result<&mut A> {
+        self.0.downcast_mut::<A>().ok_or_else(Self::foreign)
+    }
+
+    fn foreign() -> io::Error {
+        let reason = "an adapter is of another model or memory";
+        io::Error::new(io::ErrorKind::InvalidInput, reason)
+    }
+}
+
+/// How a decoder makes its adapters, each a `Load` of its trees with their type erased: on host
+/// from a PEFT checkpoint, in HBM for its calls, and from one into the other.
+#[derive(Clone, Copy)]
+pub struct Loader {
+    host: fn(&Checkpoint) -> Result<Adapter, LoadError>,
+    adapter: fn(&mut Device) -> Result<Adapter, LoadError>,
+    load: fn(&mut Adapter, &Adapter, &mut Device) -> io::Result<()>,
+}
+
+impl Loader {
+    /// The loader of a decoder whose adapters are `A`s in HBM, built from `H`s on host.
+    pub(super) const fn of<A, H>() -> Self
+    where
+        A: Send + Sync + 'static + for<'h> Load<&'h H>,
+        H: Send + Sync + 'static + for<'c> Load<&'c Checkpoint>,
+        for<'t, 'h> &'t mut A: Load<(&'t mut A, &'h H)>,
+    {
+        Self {
+            host: |checkpoint| Ok(Adapter::new(lora::load::<H>(checkpoint)?)),
+            // The host tree of a checkpoint that adapts no module: every term zero.
+            adapter: |device| {
+                let empty = H::load(&mut Context::new(None), &Checkpoint::default())?;
+                Ok(Adapter::new(A::load(&mut Context::new(device), &empty)?))
+            },
+            load: |into, host, device| {
+                let host = host.of::<H>()?;
+                let into = into.of_mut::<A>()?;
+                <&mut A as Load<_>>::load(&mut Context::new(device), (into, host))
+                    .map_err(io::Error::other)?;
+                Ok(())
+            },
+        }
+    }
+
+    /// `checkpoint`, a PEFT LoRA checkpoint, built on host as an adapter; no device is touched.
+    pub fn host(&self, checkpoint: &Checkpoint) -> Result<Adapter, LoadError> {
+        (self.host)(checkpoint)
+    }
+
+    /// An adapter in new HBM of `device` that updates no row: every term zero.
+    pub fn adapter(&self, device: &mut Device) -> Result<Adapter, LoadError> {
+        (self.adapter)(device)
+    }
+
+    /// `host`, an adapter [`Loader::host`] built, written into the storage of `into`, every term,
+    /// each write ended on return. A tree of another model or memory is refused as `InvalidInput`
+    /// before any transfer; a device failure, which may leave `into` partly written, is the
+    /// `LoadError::Device` source of an `Other` error.
+    pub fn load(&self, into: &mut Adapter, host: &Adapter, device: &mut Device) -> io::Result<()> {
+        (self.load)(into, host, device)
     }
 }
 

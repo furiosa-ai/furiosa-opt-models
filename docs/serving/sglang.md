@@ -15,7 +15,7 @@ The platform accepts these values:
 | `--device` | Unset or `cpu` (framework tensors stay on the host; the model runs on RNGD) |
 | `--attention-backend`, `--prefill-attention-backend`, `--decode-attention-backend` | Unset or `torch_native` (the engine runs attention) |
 | `startup_weight_load_mode` | `serial` |
-| `disaggregation_mode` | `null` |
+| `disaggregation_mode` | `null`, or `prefill` and `decode` with `--disaggregation-transfer-backend mooncake_tcp` ([Disaggregate prefill and decode](index.md#disaggregate-prefill-and-decode)) |
 | Attention data, expert, context parallelism (`attn_dp_size`, `ep_size`, `dcp_size`, `attn_cp_size`) and `nnodes` | 1 |
 | `--tp-size` | A chip count the model is compiled for; one scheduler drives every chip, so `/server_info` reports `tp_size` 1 |
 | `--dp-size` | Any, or 1 with speculative decoding; replica `i` runs on the `--tp-size` chips from position `i` × `--tp-size` of `FURIOSA_VISIBLE_CHIPS`, or of every installed chip when it is unset |
@@ -25,19 +25,27 @@ The platform accepts these values:
 | `--mem-fraction-static` | Unset defaults to 0.9, leaving the headroom a model split over chips needs |
 | `--enable-deterministic-inference` | Off, or on to load the model [batch invariant](index.md#keep-outputs-independent-of-the-batch) with the radix cache on |
 | `--enable-hierarchical-cache` | A model without recurrent state, with the host tier sized by `--hicache-ratio` or `--hicache-size` and kept in memory: `--hicache-host-memory-mode cache`, `--hicache-io-backend kernel`, `--hicache-mem-layout page_first`, no `--hicache-storage-backend` and no memory saver |
+| `--quantization` | Unset, or `fp8` to [quantize a BF16 checkpoint at load](index.md#quantize-a-bf16-checkpoint-at-load) |
+| `--speculative-draft-model-quantization` | Unset, which takes the target's, `unquant`, or `fp8` |
+| `--max-lora-rank` | Unset or at most 32, the rank the engine's adapter terms hold ([Serve LoRA adapters](index.md#serve-lora-adapters)) |
+| `--lora-target-modules` | Unset, `all`, or attention and MLP projections: `q_proj`, `k_proj`, `v_proj`, `qkv_proj`, `o_proj`, `gate_proj`, `up_proj`, `gate_up_proj`, `down_proj` |
+| `--max-loras-per-batch` | Any: the entries of SGLang's adapter pool, each an adapter on the device taken before the KV cache sizes; a batch still runs at most two adapters, the adapters one engine call runs |
+| `--lora-backend`, `--max-lora-chunk-size`, `--lora-strict-loading` | Any, without effect: the engine computes the updates and refuses an adapter tensor no update reads |
 
 These features are not supported yet, and the plugin refuses them at startup rather than ignore them:
 
-- LoRA and speculative algorithms other than NGRAM and STANDALONE.
+- Speculative algorithms other than NGRAM and STANDALONE.
+- LoRA on a model whose load runs no adapter, such as the block-scaled FP8 Qwen3 8B, with overlapped adapter loading (`--enable-lora-overlap-loading`) or on experts (`--experts-shared-outer-loras`, `--lora-use-virtual-experts`); an adapter that adds tokens to the vocabulary or holds no `adapter_model.safetensors` is refused when it loads.
 - Speculative decoding with more than one candidate a position, adaptive speculation or an external n-gram corpus.
 - Watermarking (`--enable-watermark`) and strict thinking (`--enable-strict-thinking`), which change the scores of each step.
-- Quantization and quantization parameter files.
+- Quantization methods other than `fp8`, of the target or of a STANDALONE draft model, and quantization parameter files.
 - Hierarchical cache storage backends, HiSparse, unified memory, LMCache, FlexKV and the unified cache external linker.
 - The memory saver (`--enable-memory-saver`) with speculative decoding, whose worker and draft model keep device memory a release does not reach yet, and with the hierarchical cache, whose host tier copies the cache storage a release frees.
 - Per-layer embedding offload (`ple_offload_embedding`).
 - Returning hidden states, routed experts or indexer top-k.
 - Diffusion LM algorithms (`dllm_algorithm`) and `prefill_only_disable_kv_cache`.
 - Encoder disaggregation (`--encoder-only`, `--language-only`).
+- With prefill-decode disaggregation: a transfer backend other than `mooncake_tcp` (`nixl` and `mori` register the token pool as device memory, and `fake` moves no KV), a model split over chips (an image page holds each chip's part in turn, which a server split otherwise reads differently), host receive (`--disaggregation-decode-host-receive-threshold` below 1: SGLang receives into a host pool only beside a token pool of separate key and value buffers), decode-side cache offload, which needs a storage backend, KV checksums, which SGLang computes with a CUDA kernel, a `host_pool` retraction backup, which SGLang backs up only from an MHA token pool, and NGRAM speculative decoding, whose decode server cannot read the first token SGLang hands a received request.
 
 The platform disables CUDA graphs and piecewise CUDA graphs, and sets the scheduling options by model kind:
 

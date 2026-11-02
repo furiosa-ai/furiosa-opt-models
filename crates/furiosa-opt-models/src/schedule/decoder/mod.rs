@@ -30,7 +30,6 @@ use crate::models::decoder::attention::qwen3::{self, LmHead, QueryHeads, fp8};
 use crate::models::decoder::attention::{
     ForCausalLM, ForSequenceClassification, Geometry, Head, KvHeads, Qwen2Layer,
 };
-use crate::models::decoder::form::BlockScaled;
 use crate::models::decoder::launch;
 use crate::modules::attention::{Attention, NormalizedQkv, Positioned, Projection};
 use crate::modules::generic::collection::View;
@@ -66,11 +65,11 @@ pub struct Decoder<M>(pub M);
 
 /// The catalog's layer of the size `Z` whose projections hold form `P`: a [`Layer`] of the
 /// form's leaves.
-type Catalog<P, Z> = qwen3::Layer<Z, P, bf16, Hbm>;
+type Catalog<P, Z, X = Hbm> = qwen3::Layer<Z, P, bf16, X>;
 /// A pre-norm layer of the size `Z` over the leaves its form chooses: the query, key and value
 /// projections `Q`, `K`, `V`, their head norms `QN`, `KN`, the attention `A`, the output projection
 /// `O` and the MLP's gate/up and down projections `G`, `D`; the catalog's layer in every form.
-type Layer<Z, Q, K, V, QN, KN, A, O, G, D> = Qwen2Layer<
+type Layer<Z, Q, K, V, QN, KN, A, O, G, D, N = Norm<Z>> = Qwen2Layer<
     NormalizedQkv<Projection<Q, K, V>, QN, KN>,
     Rotary<Head>,
     Scatter,
@@ -78,11 +77,11 @@ type Layer<Z, Q, K, V, QN, KN, A, O, G, D> = Qwen2Layer<
     A,
     O,
     Mlp<Width<Z>, Intermediate<Z>, G, D>,
-    Norm<Z>,
+    N,
     Add,
 >;
 /// The catalog layer's output projection in form `P`.
-type OutputProjection<P, Z> = <P as Form>::Output<<Z as Geometry>::Queries, Width<Z>, Hbm>;
+type OutputProjection<P, Z, X = Hbm> = <P as Form>::Output<<Z as Geometry>::Queries, Width<Z>, X>;
 type Capacity<Z> = launch::Capacity<Z>;
 type Reach<Z> = <Z as Decode>::Reach;
 type Width<Z> = <Z as Geometry>::Hidden;
@@ -95,9 +94,9 @@ type QueryRows<Z> =
     HbmTensor<bf16, Chip, m![{ Symbol<Reach<Z>> }, KvHeads, { Symbol<Groups<Z>> }, Head]>;
 /// A launch's rows of each KV head: its keys or its values.
 type KeyRows<Z> = HbmTensor<bf16, Chip, m![{ Symbol<Reach<Z>> }, KvHeads, Head]>;
-type Norm<Z> = <Z as Geometry>::Norm<Width<Z>, Hbm>;
+type Norm<Z, X = Hbm> = <Z as Geometry>::Norm<Width<Z>, X>;
 /// The final norm, where the head starts.
-type FinalNorm<Z> = Named<"norm", Norm<Z>>;
+type FinalNorm<Z, X = Hbm> = Named<"norm", Norm<Z, X>>;
 /// A launch's call as its layers read it: the context its rotary table prepares and its token IDs.
 type Launched<'c, 'a, Z> = Call<
     'c,
@@ -270,13 +269,15 @@ impl<
     DS,
     DR,
     T,
-> Cut<Z, T> for Layer<Z, Q, K, V, QN, KN, A, O, G, D>
+    Parameter,
+> Cut<Z, T> for Layer<Z, Q, K, V, QN, KN, A, O, G, D, RmsNorm<H, E, Chip, Parameter>>
 where
     T: States,
     Z: Geometry<KvHeads = KvHeads, Head = Head, Hidden = H, Norm<H, Hbm> = RmsNorm<H, E, Chip>>
         + Decode
         + 'static,
     H: Tiled<Capacity = axis::Rows<C>, Last = axis::Rows<L>>,
+    Parameter: core::borrow::Borrow<HbmTensor<bf16, Chip, m![H]>>,
     swiglu::Down<Intermediate<Z>>: AxisName,
     V: for<'x> Module<Begin<()>, Live<(), Capacity<Z>>, &'x mut (), Output = VB>,
     VB: for<'x> Module<
@@ -353,7 +354,7 @@ where
         + for<'x> Module<Live<DR, Capacity<Z>>, (), &'x mut T::Down, Output = Owned<Width<Z>, Span>>,
 {
     type Front = Front<
-        <Stage as crate::Op<&'static Norm<Z>>>::Output,
+        RmsNorm<H, E, Chip, crate::ops::normalization::span::Scale<H, Span>>,
         VB,
         Launch<Width<Z>, F, Capacity<Z>>,
         KB,
@@ -615,11 +616,11 @@ impl<'l, 'c, 'a, 'p, 's, Z: Geometry + Decode + 'static, T: States, X: Cut<Z, T,
 
 /// A tile through the last layer from its attention, its projections running with `adapters`, and
 /// the final norm; the head's rows.
-impl<'l, 'c, 'a, 'p, 's, Z: Geometry + Decode + 'static, T: States, X: Cut<Z, T, Landed = L>, L>
+impl<'l, 'c, 'a, 'p, 's, Z: Geometry + Decode + 'static, T: States, X: Cut<Z, T, Landed = L>, L, N>
     Module<(Output<'p, Z, L>, RowTile<Z>), Launched<'c, 'a, Z>, &'s mut T>
-    for Tokenwise<&'l X, &'l FinalNorm<Z>>
+    for Tokenwise<&'l X, &'l Named<"norm", N>>
 where
-    FinalNorm<Z>: for<'r, 'x> Module<&'r RowTile<Z>, (), &'x mut (), Output = RowTile<Z>>,
+    Named<"norm", N>: for<'r, 'x> Module<&'r RowTile<Z>, (), &'x mut (), Output = RowTile<Z>>,
 {
     type Output = RowTile<Z>;
 
@@ -649,6 +650,7 @@ impl<
     'a,
     's,
     'b,
+    'w,
     Z,
     P,
     T,
@@ -659,8 +661,19 @@ impl<
     const L: usize,
     OL,
     Env,
+    F,
 > Module<&'i mut launch::Input<'a, Z>, Env, launch::Body<'s, Z, [launch::Layer<'b, T>; DEPTH]>>
-    for Decoder<&'m launch::Base<Z, P>>
+    for Decoder<
+        &'m launch::Base<
+            Z,
+            P,
+            &'w Hbm,
+            crate::modules::generic::collection::Stack<
+                crate::modules::generic::collection::Interval<crate::tensor::scalar::Value>,
+            >,
+            F,
+        >,
+    >
 where
     Z: Geometry<
             KvHeads = KvHeads,
@@ -675,8 +688,25 @@ where
     P: Form,
     T: States,
     swiglu::Down<Intermediate<Z>>: AxisName,
-    Catalog<P, Z>: View<DEPTH, Layer = Catalog<P, Z>> + Cut<Z, T, Landed = OL>,
-    OutputProjection<P, Z>: for<'x> Module<Begin<()>, (), &'x mut (), Output = OL>
+    Catalog<P, Z, &'w Hbm>: View<DEPTH, Layer<'m> = Catalog<P, Z, &'m Hbm>>,
+    Catalog<P, Z, &'m Hbm>: Cut<Z, T, Landed = OL>,
+    SplitHalf<Head, F>: for<'v> Module<
+            (Live<(), Capacity<Z>>, &'v mut &'a launch::Operands<Z>),
+            (),
+            &'v mut (),
+            Output = launch::Context<
+                'a,
+                Capacity<Z>,
+                Reach<Z>,
+                <Z as Decode>::Sequences,
+                <Z as Decode>::Slots,
+                Groups<Z>,
+                launch::Waves<Z>,
+                <Z as Decode>::Windows,
+            >,
+        >,
+    FinalNorm<Z, &'w Hbm>: for<'r, 'x> Module<&'r RowTile<Z>, (), &'x mut (), Output = RowTile<Z>>,
+    OutputProjection<P, Z, &'m Hbm>: for<'x> Module<Begin<()>, (), &'x mut (), Output = OL>
         + for<'d, 'g> Module<&'g mut OL, (), &'d mut (), Output = ()>,
 {
     type Output = (Rows<Z>, &'a Selected<Capacity<Z>>);
@@ -708,7 +738,7 @@ where
         // A layer's attention once every tile stored its rows: the rows attended as items written
         // to the cache before, the deferred rows after.
         let attend = |device: &mut Device,
-                      layer: &Catalog<P, Z>,
+                      layer: &Catalog<P, Z, &'m Hbm>,
                       slot: &mut launch::Layer<'b, T>,
                       places: &mut Places<Z>| {
             let Sequential(Residual(_, attention, _), _) = layer;
@@ -789,12 +819,31 @@ type Loops<'a, Z> = (Rows<Z>, &'a Selected<Capacity<Z>>);
 
 /// A launch of the catalog's causal model: its base model's loops, then the selected rows' greedy
 /// tokens.
-impl<'i, 'a, 's, Z: Geometry + Decode + 'static, B, P: Form, L, Env>
+impl<'i, 'a, 's, Z: Geometry + Decode + 'static, B, P: Form, L, Env, W, Bias, I, F>
     Module<&'i mut launch::Input<'a, Z>, Env, launch::State<'s, Z, L>>
-    for ForCausalLM<Z, launch::Over<Z, B, P>, LmHead<Z, Hbm>, P>
+    for ForCausalLM<
+        Z,
+        launch::Over<Z, B, P, F>,
+        crate::modules::language::Greedy<
+            Width<Z>,
+            <Z as Geometry>::Vocabulary,
+            crate::ops::linear::Affine<W, Bias>,
+            crate::ops::reduction::Argmax<<Z as Geometry>::Vocabulary, Chip, I>,
+        >,
+        P,
+    >
 where
-    for<'m> Decoder<&'m launch::Over<Z, B, P>>:
+    for<'m> Decoder<&'m launch::Over<Z, B, P, F>>:
         Module<&'i mut launch::Input<'a, Z>, Env, launch::Body<'s, Z, L>, Output = Loops<'a, Z>>,
+    W: core::borrow::Borrow<
+            HbmTensor<
+                bf16,
+                Chip,
+                m![{ Symbol<<Z as Geometry>::Vocabulary> }, { Symbol<Width<Z>> }],
+            >,
+        >,
+    Bias: core::borrow::Borrow<HbmTensor<f32, Chip, m![{ Symbol<<Z as Geometry>::Vocabulary> }]>>,
+    I: core::borrow::Borrow<HbmTensor<i32, Chip, m![{ Symbol<<Z as Geometry>::Vocabulary> }]>>,
 {
     type Output = ();
 
@@ -812,9 +861,9 @@ where
 }
 
 /// A launch of the catalog's base model: its loops, then the selected rows' hidden values.
-impl<'i, 'a, 's, Z: Geometry + Decode + 'static, B, P: Form, L, Env>
+impl<'i, 'a, 's, Z: Geometry + Decode + 'static, B, P: Form, L, Env, F>
     Module<&'i mut launch::Input<'a, Z>, Env, launch::State<'s, Z, L, launch::Values<Z>>>
-    for launch::Over<Z, B, P>
+    for launch::Over<Z, B, P, F>
 where
     for<'m> Decoder<&'m Self>:
         Module<&'i mut launch::Input<'a, Z>, Env, launch::Body<'s, Z, L>, Output = Loops<'a, Z>>,
@@ -836,12 +885,14 @@ where
 
 /// A launch of the catalog's sequence classifier: its base model's loops, then the selected rows'
 /// scores.
-impl<'i, 'a, 's, Z: Geometry + Decode + 'static, B, P: Form, L, Env>
+impl<'i, 'a, 's, Z: Geometry + Decode + 'static, B, P: Form, L, Env, F, W, Bias>
     Module<&'i mut launch::Input<'a, Z>, Env, launch::State<'s, Z, L, launch::Scores<Z>>>
-    for ForSequenceClassification<Z, launch::Over<Z, B, P>, Classifier<Width<Z>>, P>
+    for ForSequenceClassification<Z, launch::Over<Z, B, P, F>, Classifier<Width<Z>, W, Bias>, P>
 where
-    for<'m> Decoder<&'m launch::Over<Z, B, P>>:
+    for<'m> Decoder<&'m launch::Over<Z, B, P, F>>:
         Module<&'i mut launch::Input<'a, Z>, Env, launch::Body<'s, Z, L>, Output = Loops<'a, Z>>,
+    W: core::borrow::Borrow<crate::ops::linear::affine::Weights<Width<Z>>>,
+    Bias: core::borrow::Borrow<crate::ops::linear::affine::Bias>,
 {
     type Output = ();
 
@@ -859,14 +910,14 @@ where
 }
 
 /// Block-scaled FP8 Qwen3-8B's launch runs its catalog model.
-impl<'i, 'a, 's, L, Env>
+impl<'i, 'a, 's, L, Env, M>
     Module<
         &'i mut launch::Input<'a, qwen3::Size<"8B">>,
         Env,
         launch::State<'s, qwen3::Size<"8B">, L>,
-    > for fp8::ForCausalLM
+    > for fp8::ForCausalLM<M>
 where
-    launch::Model<qwen3::Size<"8B">, BlockScaled>: Module<
+    M: Module<
             &'i mut launch::Input<'a, qwen3::Size<"8B">>,
             Env,
             launch::State<'s, qwen3::Size<"8B">, L>,
@@ -890,11 +941,27 @@ where
 mod tests {
     use super::*;
     use crate::models::decoder::attention::llama;
-    use crate::models::decoder::form::{Affine, ChannelScaled};
+    use crate::models::decoder::form::{Affine, BlockScaled, ChannelScaled};
+    use crate::modules::generic::collection::{Interval, Stack};
+    use crate::ops::linear::affine::{Bias, Weights};
+    use crate::ops::rotary::group::Table;
+    use crate::tensor::scalar::Value;
 
-    /// Each catalog root, of every size and projection form a registry row serves, runs by the
-    /// decoder family's one loop on its launch's input and the state ending in the place its head
-    /// writes: the causal model's tokens, the base model's hidden values, the classifier's scores.
+    /// The launch trees a root's launch binds: its leaves, interval and rotary table borrowed.
+    type Rotation<'w, S> = &'w Table<launch::Positions<S>, crate::ops::rotary::Row<Head>>;
+    type Model<'w, S, P> = launch::Model<S, P, &'w Hbm, Stack<Interval<Value>>, Rotation<'w, S>>;
+    type Base<'w, S, P> = launch::Base<S, P, &'w Hbm, Stack<Interval<Value>>, Rotation<'w, S>>;
+    type Scored<'w, S, P> = ForSequenceClassification<
+        S,
+        Base<'w, S, P>,
+        Classifier<Width<S>, &'w Weights<Width<S>>, &'w Bias>,
+        P,
+    >;
+
+    /// Each catalog root's launch tree, of every size and projection form a registry row serves,
+    /// runs by the decoder family's one loop on its launch's input and the state ending in the
+    /// place its head writes: the causal model's tokens, the base model's hidden values, the
+    /// classifier's scores.
     #[test]
     fn every_root_runs_by_the_loop() {
         fn runs<R, Z: Geometry + Decode, O>()
@@ -906,26 +973,30 @@ mod tests {
                 >,
         {
         }
-        type Q<const N: &'static str> = qwen3::Size<N>;
-        runs::<launch::Model<Q<"0.6B">, Affine>, Q<"0.6B">, launch::Tokens<Q<"0.6B">>>();
-        runs::<launch::Base<Q<"0.6B">, Affine>, Q<"0.6B">, launch::Values<Q<"0.6B">>>();
-        runs::<launch::Classifier<Q<"0.6B">, Affine>, Q<"0.6B">, launch::Scores<Q<"0.6B">>>();
-        runs::<launch::Model<Q<"1.7B">, Affine>, Q<"1.7B">, launch::Tokens<Q<"1.7B">>>();
-        runs::<launch::Base<Q<"1.7B">, Affine>, Q<"1.7B">, launch::Values<Q<"1.7B">>>();
-        runs::<launch::Classifier<Q<"1.7B">, Affine>, Q<"1.7B">, launch::Scores<Q<"1.7B">>>();
-        runs::<launch::Model<Q<"4B">, Affine>, Q<"4B">, launch::Tokens<Q<"4B">>>();
-        runs::<launch::Base<Q<"4B">, Affine>, Q<"4B">, launch::Values<Q<"4B">>>();
-        runs::<launch::Classifier<Q<"4B">, Affine>, Q<"4B">, launch::Scores<Q<"4B">>>();
-        runs::<launch::Model<Q<"8B">, Affine>, Q<"8B">, launch::Tokens<Q<"8B">>>();
-        runs::<launch::Base<Q<"8B">, Affine>, Q<"8B">, launch::Values<Q<"8B">>>();
-        runs::<launch::Classifier<Q<"8B">, Affine>, Q<"8B">, launch::Scores<Q<"8B">>>();
-        runs::<launch::Model<Q<"0.6B">, ChannelScaled>, Q<"0.6B">, launch::Tokens<Q<"0.6B">>>();
-        runs::<launch::Model<Q<"1.7B">, ChannelScaled>, Q<"1.7B">, launch::Tokens<Q<"1.7B">>>();
-        runs::<launch::Model<Q<"4B">, ChannelScaled>, Q<"4B">, launch::Tokens<Q<"4B">>>();
-        runs::<fp8::ForCausalLM, Q<"8B">, launch::Tokens<Q<"8B">>>();
-        type Llama = llama::Size<"8B">;
-        runs::<launch::Model<Llama, Affine>, Llama, launch::Tokens<Llama>>();
-        type Mistral = llama::Size<"Mistral-7B">;
-        runs::<launch::Model<Mistral, Affine>, Mistral, launch::Tokens<Mistral>>();
+        fn launches<'w>() {
+            type Q<const N: &'static str> = qwen3::Size<N>;
+            runs::<Model<'w, Q<"0.6B">, Affine>, Q<"0.6B">, launch::Tokens<Q<"0.6B">>>();
+            runs::<Base<'w, Q<"0.6B">, Affine>, Q<"0.6B">, launch::Values<Q<"0.6B">>>();
+            runs::<Scored<'w, Q<"0.6B">, Affine>, Q<"0.6B">, launch::Scores<Q<"0.6B">>>();
+            runs::<Model<'w, Q<"1.7B">, Affine>, Q<"1.7B">, launch::Tokens<Q<"1.7B">>>();
+            runs::<Base<'w, Q<"1.7B">, Affine>, Q<"1.7B">, launch::Values<Q<"1.7B">>>();
+            runs::<Scored<'w, Q<"1.7B">, Affine>, Q<"1.7B">, launch::Scores<Q<"1.7B">>>();
+            runs::<Model<'w, Q<"4B">, Affine>, Q<"4B">, launch::Tokens<Q<"4B">>>();
+            runs::<Base<'w, Q<"4B">, Affine>, Q<"4B">, launch::Values<Q<"4B">>>();
+            runs::<Scored<'w, Q<"4B">, Affine>, Q<"4B">, launch::Scores<Q<"4B">>>();
+            runs::<Model<'w, Q<"8B">, Affine>, Q<"8B">, launch::Tokens<Q<"8B">>>();
+            runs::<Base<'w, Q<"8B">, Affine>, Q<"8B">, launch::Values<Q<"8B">>>();
+            runs::<Scored<'w, Q<"8B">, Affine>, Q<"8B">, launch::Scores<Q<"8B">>>();
+            runs::<Model<'w, Q<"0.6B">, ChannelScaled>, Q<"0.6B">, launch::Tokens<Q<"0.6B">>>();
+            runs::<Model<'w, Q<"1.7B">, ChannelScaled>, Q<"1.7B">, launch::Tokens<Q<"1.7B">>>();
+            runs::<Model<'w, Q<"4B">, ChannelScaled>, Q<"4B">, launch::Tokens<Q<"4B">>>();
+            type Fp8<'w> = fp8::ForCausalLM<Model<'w, Q<"8B">, BlockScaled>>;
+            runs::<Fp8<'w>, Q<"8B">, launch::Tokens<Q<"8B">>>();
+            type Llama = llama::Size<"8B">;
+            runs::<Model<'w, Llama, Affine>, Llama, launch::Tokens<Llama>>();
+            type Mistral = llama::Size<"Mistral-7B">;
+            runs::<Model<'w, Mistral, Affine>, Mistral, launch::Tokens<Mistral>>();
+        }
+        launches();
     }
 }

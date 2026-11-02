@@ -3,8 +3,8 @@ platform makes `--kv-offloading-size` select.
 
 - Its scheduler side is vLLM's offloading scheduler over vLLM's CPU offloading spec: which blocks to
   store and load, their eviction, and the host tier's size.
-- Its worker side, `worker.Worker`, follows vLLM's offloading worker on the engine cache that
-  `register` gives it.
+- Its worker side is vLLM's offloading worker, which decides when copies start and end and reports
+  them; `register` gives it `worker.Host`, which copies the blocks of the runner's engine cache.
 """
 
 from __future__ import annotations
@@ -29,9 +29,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
+    OffloadingConnectorWorker,
+)
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 
-from furiosa_opt_vllm.offload.worker import Host, Worker
+from furiosa_opt_vllm.offload.worker import Host
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -53,13 +56,14 @@ if TYPE_CHECKING:
     from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 
-    import furiosa_opt_engine as engine
+    from furiosa_opt_vllm.runner import Runner
 
 
 @final
 class RNGDOffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     """vLLM's offloading of the engine cache to host memory: vLLM's offloading scheduler chooses the
-    blocks to store and load, and the worker side moves them once `register` gives it the cache."""
+    blocks to store and load, and vLLM's offloading worker moves them once `register` gives it the
+    cache."""
 
     def __init__(
         self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig
@@ -71,15 +75,19 @@ class RNGDOffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             if role == KVConnectorRole.SCHEDULER
             else None
         )
-        self._worker: Worker | None = None
+        self._worker = (
+            OffloadingConnectorWorker(self._spec, vllm_config, kv_cache_config)
+            if role == KVConnectorRole.WORKER
+            else None
+        )
 
-    def register(self, cache: engine.decoder.Cache, chips: int) -> None:
-        """Move the blocks of `cache`, whose layers span `chips` chips, from now on: vLLM registers
-        caches as torch tensors, which the engine's cache layers are not."""
+    def register(self, runner: Runner, chips: int) -> None:
+        """Move the blocks of the cache `runner` holds, whose layers span `chips` chips, from now
+        on: vLLM registers caches as torch tensors, which the engine's cache layers are not."""
         chunks = self._spec.num_chunks
         if chunks == 0:
             raise ValueError("kv_offloading_size must hold at least one chunk of cache blocks")
-        self._worker = Worker(Host(cache, chips, chunks, self._spec.blocks_per_chunk))
+        self.worker.worker = Host(runner, chips, chunks, self._spec.blocks_per_chunk)
 
     @property
     def scheduler(self) -> OffloadingConnectorScheduler:
@@ -87,8 +95,8 @@ class RNGDOffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         return self._scheduler
 
     @property
-    def worker(self) -> Worker:
-        assert self._worker is not None, "the runner registers the cache before the first step"
+    def worker(self) -> OffloadingConnectorWorker:
+        assert self._worker is not None
         return self._worker
 
     # The worker side.
@@ -96,13 +104,13 @@ class RNGDOffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     @override
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata) -> None:
         assert isinstance(kv_connector_metadata, OffloadingConnectorMetadata)
-        self.worker.flush(kv_connector_metadata)
+        self.worker.handle_preemptions(kv_connector_metadata)
 
     @override
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: object) -> None:
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, OffloadingConnectorMetadata)
-        self.worker.start(metadata)
+        self.worker.start_kv_transfers(metadata)
 
     @override
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -124,16 +132,15 @@ class RNGDOffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     def wait_for_save(self) -> None:
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, OffloadingConnectorMetadata)
-        self.worker.defer(metadata)
+        self.worker.prepare_store_kv(metadata)
 
     @override
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
-        # Stores report through the worker metadata, which fences their blocks' reuse.
-        return set(), self.worker.finished()
+        return self.worker.get_finished(finished_req_ids)
 
     @override
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
-        return None if self._worker is None else self._worker.report()
+        return None if self._worker is None else self._worker.build_connector_worker_meta()
 
     @override
     def shutdown(self) -> None:

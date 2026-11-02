@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
+    from furiosa_opt_sglang.lora import Binding
     from furiosa_opt_sglang.runner import Runner
 
     # Each call's hidden rows or greedy tokens, with the (request, row) pairs they hold.
@@ -31,16 +32,20 @@ def forward(
     batch: ScheduleBatch,
     snapshot: Batch,
     *,
+    adapters: Binding,
     every: bool,
     feed: Mapping[int, engine.HbmTensor],
 ) -> Rows:
     """Each call's rows with the request rows they hold: hidden rows, or a causal decoder's greedy
-    token of each kept row; a request in `feed` takes its one row's token on the device."""
+    token of each kept row; a request in `feed` takes its one row's token on the device, and each
+    request's rows run with its LoRA adapter of `adapters`."""
     model = runner.model.loaded
     pool = runner.req_to_token_pool
     if pool is None:
         raise RuntimeError("cache initialization must precede scheduled generation")
-    yield from paged(model, model.core, pool, batch, snapshot, every=every, feed=feed)
+    yield from paged(
+        model, model.core, pool, batch, snapshot, adapters=adapters, every=every, feed=feed
+    )
 
 
 def paged(
@@ -50,6 +55,7 @@ def paged(
     batch: ScheduleBatch,
     snapshot: Batch,
     *,
+    adapters: Binding,
     every: bool,
     feed: Mapping[int, engine.HbmTensor],
 ) -> Rows:
@@ -100,8 +106,9 @@ def paged(
                     request.cached,
                     tokens,
                     engine.decoder.Keep.ALL if every else last,
+                    adapter=adapters.slot(batch.reqs[i].lora_id),
                 )
             )
-        output = loaded.forward(requests, storage)
+        output = loaded.forward(requests, storage, list(adapters.adapters) or None)
         # --8<-- [end:forward]
         yield [rows[row] for row in call.kept], output

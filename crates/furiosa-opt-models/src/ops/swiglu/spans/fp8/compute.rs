@@ -86,11 +86,14 @@ impl<'a, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>
 /// pair of 1024-input weight panels contracted with them in turn, the next pair landing during the
 /// current one's contraction, and the channel scales applied to the summed panels. A pair's
 /// partial sums are added as soon as the next pair's are, so at most two of them are held.
-impl<'t, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>
+impl<'t, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName, W, S>
     Op<(
         GateUp<Hidden, Intermediate>,
         Live<&'t Owned<Hidden, Rows>, Capacity>,
-    )> for GateUpWeights<Hidden, Intermediate>
+    )> for fp8::Rows<m![Hidden], m![Term, Intermediate], W, S>
+where
+    W: Borrow<HbmTensor<f8e4m3, Chip, Blocked<Hidden, Intermediate>>>,
+    S: Borrow<HbmTensor<f32, Chip, m![Term, Intermediate]>>,
 {
     type Output = (
         Projection<Intermediate, Rows>,
@@ -152,6 +155,7 @@ impl<'t, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: Axi
         let channels = |context: &mut Device, term: usize| -> ChannelScale<Intermediate, Rows> {
             let channels: Channels<Intermediate, Rows> = self
                 .1
+                .borrow()
                 .view()
                 .tile::<m![Term], 1, m![Term = 1 # 2, Intermediate]>(term)
                 .to_dm(&mut context.tdma);
@@ -159,6 +163,7 @@ impl<'t, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: Axi
         };
         let panel = |context: &mut Device, term: usize| -> Panel<Hidden, Intermediate> {
             self.0
+                .borrow()
                 .view()
                 .tile::<m![Term], 1, m![Term = 1 # 2, Hidden / 1024,
                     Intermediate / (Intermediate / 64), Hidden % 1024 / 128,

@@ -5,20 +5,21 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, final
 
-from pydantic import BaseModel
+from pydantic import BaseModel, JsonValue, TypeAdapter
 from sglang.srt.runtime_context import get_model, get_serving
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 import furiosa_opt_engine as engine
+from furiosa_opt_sglang.admission import Refused
 from furiosa_opt_sglang.batch import operand
 from furiosa_opt_sglang.checkpoint import checkout
 from furiosa_opt_sglang.decoder import RELEASED, Decoder, Location
-from furiosa_opt_sglang.platform import Refused
+from furiosa_opt_sglang.load import quantization
 
 if TYPE_CHECKING:
     from collections.abc import Set
 
-    from furiosa_opt_sglang.platform import Standalone
+    from furiosa_opt_sglang.admission import Standalone
     from furiosa_opt_sglang.speculative import Decoding
 
 
@@ -55,12 +56,19 @@ class Draft:
                 "speculative_draft_model_path requires the target's token-to-id mapping",
             )
         directory = checkout(path, revision)
-        config = Config.model_validate_json((Path(directory) / "config.json").read_bytes())
+        stored = TypeAdapter(dict[str, JsonValue]).validate_json(
+            (Path(directory) / "config.json").read_bytes()
+        )
+        config = Config.model_validate(stored)
         checkpoint = Location(directory, None)
         if target.model is None:
             raise RuntimeError(RELEASED)
         try:
             loads = engine.LoadOptions().chips(target.model.parallel)
+            if (
+                name := quantization(options.speculative_draft_model_quantization, stored)
+            ) is not None:
+                loads = loads.quantization(name)
             loads.parse(checkpoint.mapped())
         except (NotImplementedError, ValueError) as error:
             raise Refused("speculative_draft_model_path", str(error)) from None

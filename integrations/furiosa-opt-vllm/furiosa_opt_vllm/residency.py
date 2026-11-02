@@ -8,7 +8,7 @@ loads or allocates it again.
 - Waking restores one tag after another, each awake once restored, so a retry after a failure
   restores only what still sleeps.
 - `reload` loads the awake weights again from the checkpoint's files, into the device memory the
-  served ones free first.
+  served ones free first, and unloads every LoRA adapter.
 """
 
 from __future__ import annotations
@@ -40,6 +40,13 @@ def decoder(runner: Runner) -> Decoder:
             raise RuntimeError("load_model must precede sleep mode")
         case _:
             raise NotImplementedError("sleep mode moves the memory of a decoder only")
+
+
+def cache(runner: Runner) -> engine.decoder.Cache:
+    """The KV cache the runner holds now, which sleep mode releases and waking allocates anew."""
+    if runner.cache is None:
+        raise RuntimeError("wake_up must restore the KV cache before its blocks move")
+    return runner.cache
 
 
 def sleep(runner: Runner, level: int) -> None:
@@ -102,3 +109,6 @@ def reload(runner: Runner) -> None:
     runner.model = released = replace(served, model=None)
     del served
     runner.model = replace(released, copy=copy).loaded(mapped if copy is None else copy)
+    if runner.adapters is not None:
+        # As vLLM's workers end a reload, with no adapter loaded.
+        runner.adapters.remove_all()

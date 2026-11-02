@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, NoReturn, TypeAlias, assert_never, final
+from typing import TYPE_CHECKING, Literal, NoReturn, TypeAlias, assert_never, cast, final
 
 import torch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -10,21 +10,26 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
     resolve_attention_backend_strs,
 )
-from sglang.srt.runtime_context import get_server_args, get_spec
+from sglang.srt.runtime_context import get_lora, get_server_args, get_spec
 from typing_extensions import override
 
 import furiosa_opt_engine as engine
 from furiosa_opt_sglang import load
+from furiosa_opt_sglang.admission import Ngram, Refused, Speculations, Standalone
 from furiosa_opt_sglang.cache import Attention
 from furiosa_opt_sglang.decoder import Decoder
 from furiosa_opt_sglang.generation.model import Model
-from furiosa_opt_sglang.platform import Ngram, Refused, Speculations, Standalone
+from furiosa_opt_sglang.lora import UNADAPTED, Adapters, Binding
+from furiosa_opt_sglang.lora.options import Lora
 from furiosa_opt_sglang.speculative import Speculative
 from furiosa_opt_sglang.speculative.ngram import Corpus
 from furiosa_opt_sglang.speculative.standalone import Draft
 
 if TYPE_CHECKING:
     from sglang.srt.kv_canary.runner.canary_manager import CanaryManager
+    from sglang.srt.lora.lora_manager import LoRAManager
+    from sglang.srt.lora.lora_registry import LoRARef
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
     from sglang.srt.model_executor.runner.base_runner import BaseRunner
@@ -81,6 +86,8 @@ class Runner(ModelRunner):
     canary_manager: CanaryManager | None = None
     prefill_aware_swa = False
     speculative: Speculative | None = None
+    # The LoRA adapters when SGLang enables LoRA.
+    adapters: Adapters | None = None
 
     @property
     @override
@@ -102,6 +109,20 @@ class Runner(ModelRunner):
 
         self.selected, self.issued = {}, deque()
         loaded = load.bind(self.model_config, self.gpu_id)
+        lora = get_lora()
+        if cast("bool | None", lora.enable_lora):
+            # The pool's entries take their device memory before the cache sizes.
+            config = self.model_config.hf_text_config
+            adapters = Adapters(loaded.core, Lora.parse(lora), config)
+            # SGLang reaches its manager's methods by name, which `Adapters` implements.
+            self.lora_manager = cast("LoRAManager", cast("object", adapters))
+            self.adapters = adapters
+            # A `--lora-paths` adapter that fails to load stops the server, as SGLang's does.
+            for ref in cast("list[LoRARef]", lora.lora_paths or []):
+                if not (result := adapters.load_lora_adapter(ref)).success:
+                    raise RuntimeError(
+                        f"Failed to load LoRA adapter {ref.lora_name}: {result.error_message}"
+                    )
         options = Speculations.parse(get_server_args())
         if options is not None:
             # Verification selects each draft position's token on the device, which only a causal
@@ -136,6 +157,12 @@ class Runner(ModelRunner):
         self.init_attention_backends()
         self.init_cuda_graphs()
         self.init_ngram_embedding_manager()
+
+    def bound(self, batch: ScheduleBatch) -> Binding:
+        """The adapters the target's calls of `batch` take: each request's own."""
+        if self.adapters is None:
+            return UNADAPTED
+        return self.adapters.bind(request.lora_id for request in batch.reqs)
 
     @override
     def alloc_memory_pool(self, memory_pool_config: MemoryPoolConfig | None = None) -> None:

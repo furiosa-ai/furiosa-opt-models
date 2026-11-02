@@ -1,17 +1,23 @@
 //! Qwen3 in BF16 with LoRA adapters through the engine's Rust API: PEFT checkpoints loaded as
 //! adapters and run beside rows without one, against the base model with each adapter merged into
-//! its weights; and a load for adapters of a line that runs none, refused from its config.
+//! its weights; rows appended after a history and all kept, as speculative decoding verifies
+//! drafts, against the same rows fed one a call; an adapter's storage loaded with another adapter
+//! between calls, as a framework serves it; and a load for adapters of a line that runs none,
+//! refused from its config.
 
 #![feature(adt_const_params, unsized_const_params)]
 
+use std::io::ErrorKind;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use furiosa_opt_engine::decoder::{Cache, Decoder, Instance, Keep, Request, Rows};
+use furiosa_opt_engine::decoder::{self, Cache, Decoder, Instance, Keep, Request, Rows};
 use furiosa_opt_engine::{AsyncModule, Checkpoint, Hbm, Load, LoadError, LoadOptions, Tiling};
 use furiosa_opt_models::load::Context;
 use furiosa_opt_models::models::decoder::attention::qwen3;
 use furiosa_opt_models::models::decoder::{form, launch};
+use furiosa_opt_models::modules::lora;
 use furiosa_opt_std::prelude::{Device, HostBufferSlice, M, Topology, bf16};
 use safetensors::Dtype;
 use safetensors::tensor::TensorView;
@@ -24,6 +30,9 @@ const BLOCK_SCALED: &str = "6124ba90c39c8e2299ddd57f4b4f0df5845480c8";
 /// Qwen3-0.6B's adapter tree.
 type Adapter = launch::Adapter<qwen3::Size<"0.6B">, Hbm>;
 
+/// The same tree on host, which an adapter tree loads from.
+type Host = launch::Adapter<qwen3::Size<"0.6B">, lora::Staged>;
+
 /// Qwen3-0.6B's base model, which returns the kept rows' hidden values.
 type Base = launch::Base<qwen3::Size<"0.6B">, form::Affine>;
 
@@ -35,7 +44,7 @@ const HIDDEN: usize = 1024;
 /// The layers the test adapters update: the last four. BF16 rounding of the merged weights and
 /// of the update differ, and 28 layers amplify that at a prompt's first position to the size of
 /// the update itself; four layers keep it small, and other layers hold zero terms.
-const ADAPTED: std::ops::Range<usize> = 24..28;
+const ADAPTED: Range<usize> = 24..28;
 
 /// Each module an adapter may update, by its path in a layer, with its outputs and inputs: the
 /// query, key, value and output projections and the feed-forward's gate, up and down projections.
@@ -195,6 +204,15 @@ impl Peft {
     }
 }
 
+/// Two adapters: one of every projection, and one of three of another rank, scaled by rsLoRA.
+fn pefts() -> [Peft; 2] {
+    let every = MODULES.map(|(path, ..)| path.split_once('.').unwrap().1);
+    [
+        Peft::new(11, 16, 32.0, false, &every),
+        Peft::new(23, 8, 16.0, true, &["q_proj", "v_proj", "up_proj"]),
+    ]
+}
+
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -250,6 +268,39 @@ fn distance(left: &[f32], right: &[f32]) -> f32 {
         .sqrt()
 }
 
+/// Prompt 1 through `served` with `adapter` in the only slot of its call, returned with the cache
+/// it appends to once the device accepted the call; nothing reads the rows.
+fn call(
+    runtime: &tokio::runtime::Runtime,
+    served: &dyn decoder::Served,
+    device: &mut Device,
+    adapter: &decoder::Adapter,
+) -> (Cache, decoder::HbmTensor) {
+    let cache = Cache::new(device, &served.limits().cache, 4).unwrap();
+    let rows = runtime.block_on(async {
+        let request = request(device, 1, Some(0)).await;
+        let slots = [Some(adapter)];
+        (served.forward(device, &cache, &[request], &slots).await).unwrap()
+    });
+    (cache, rows)
+}
+
+/// The bytes of a call's rows, read once the call completed.
+fn bytes(
+    runtime: &tokio::runtime::Runtime,
+    device: &mut Device,
+    rows: decoder::HbmTensor,
+) -> Vec<u8> {
+    let mut host = vec![0; rows.buffer.size()];
+    runtime.block_on(async {
+        (rows.buffer.to_host(&mut device.pdma))
+            .output(&mut host[..])
+            .await
+            .unwrap();
+    });
+    host
+}
+
 /// One call of three prompts, the first without an adapter and the others with one each of two
 /// adapters, one of every projection and one of three, returns for each prompt, wherever the call
 /// lays out its rows, the rows it returns alone with its adapter, bit for bit, and for the prompt
@@ -262,16 +313,12 @@ fn adapted_rows_match_merged_weights() {
     let directory = snapshot("Qwen/Qwen3-0.6B", REVISION, &["*.json", "*.safetensors"]);
     let checkpoint = Checkpoint::new(directory, None).unwrap();
     let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
-    let every = MODULES.map(|(path, ..)| path.split_once('.').unwrap().1);
-    let pefts = [
-        Peft::new(11, 16, 32.0, false, &every),
-        Peft::new(23, 8, 16.0, true, &["q_proj", "v_proj", "up_proj"]),
-    ];
+    let pefts = pefts();
     let directories = [(); 4].map(|()| tempfile::tempdir().unwrap());
     let adapters: Vec<Adapter> = (pefts.iter().zip(&directories))
         .map(|(peft, directory)| {
-            let saved = peft.save(directory.path());
-            Base::adapter(&saved, &mut device).unwrap()
+            let host: Host = lora::load(&peft.save(directory.path())).unwrap();
+            <Adapter as Load<_>>::load(&mut Context::new(&mut device), &host).unwrap()
         })
         .collect();
     let model = base(&checkpoint, &mut device);
@@ -326,6 +373,177 @@ fn adapted_rows_match_merged_weights() {
             }
         }
     });
+}
+
+/// A call of rows appended after a cached position, all kept, as speculative decoding verifies
+/// drafts, runs each request with its adapter: of one request without an adapter, one with an
+/// adapter of every projection and one with an adapter of the query and output projections, each
+/// returns the rows its tokens give fed one a call, bit for bit under a batch-invariant load, and
+/// otherwise at most a quarter as far from them as its adapter moves those from the base model's.
+#[test]
+#[ignore = "opens a device"]
+fn rows_after_a_history_run_with_their_adapter() {
+    let directory = snapshot("Qwen/Qwen3-0.6B", REVISION, &["*.json", "*.safetensors"]);
+    let checkpoint = Checkpoint::new(directory, None).unwrap();
+    let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+    let [every, _] = pefts();
+    let pefts = [every, Peft::new(31, 4, 32.0, false, &["q_proj", "o_proj"])];
+    let directories = [(); 2].map(|()| tempfile::tempdir().unwrap());
+    let adapters: Vec<Adapter> = (pefts.iter().zip(&directories))
+        .map(|(peft, directory)| {
+            let host: Host = lora::load(&peft.save(directory.path())).unwrap();
+            <Adapter as Load<_>>::load(&mut Context::new(&mut device), &host).unwrap()
+        })
+        .collect();
+    let slots = [Some(&adapters[0]), Some(&adapters[1])];
+    // Each request's adapter: none, then each slot's; four rows verified after one cached.
+    let lines = [None, Some(0), Some(1)];
+    let (cached, end) = (1, PROMPTS[1].len());
+    for tiling in [Tiling::Fixed, Tiling::Adaptive] {
+        let causal: Causal = Load::load(&mut Context::new(&mut device), &checkpoint).unwrap();
+        let model = Instance::new(causal.model, tiling);
+        let limits = model.decoder().limits(tiling);
+        runtime().block_on(async {
+            // One call of prompt 1's positions `span` for each line, on a block of its own.
+            let call =
+                async |device: &mut Device, cache: &Cache, (span, keep): (Range<usize>, Keep)| {
+                    let mut requests = Vec::new();
+                    for (block, adapter) in (1..).zip(lines) {
+                        let prompt = request(device, 1, adapter).await;
+                        let tokens = Rows::new(prompt.tokens.buffer(), span.clone()).unwrap();
+                        requests.push(Request {
+                            rows: vec![vec![block]],
+                            cached: span.start,
+                            tokens,
+                            keep,
+                            ..prompt
+                        });
+                    }
+                    let rows = model
+                        .forward(device, (), (cache, &slots[..]), &requests[..])
+                        .await
+                        .unwrap();
+                    hidden(device, rows).await
+                };
+            let cache = Cache::new(&mut device, &limits.cache, 4).unwrap();
+            let mut fed = Vec::new();
+            for position in 0..end {
+                fed.push(call(&mut device, &cache, (position..position + 1, Keep::Last)).await);
+            }
+            let cache = Cache::new(&mut device, &limits.cache, 4).unwrap();
+            call(&mut device, &cache, (0..cached, Keep::Last)).await;
+            let verified = call(&mut device, &cache, (cached..end, Keep::All)).await;
+            let fed = |line: usize, position: usize| &fed[position][line * HIDDEN..][..HIDDEN];
+            let verified = |line: usize, position: usize| {
+                &verified[(line * (end - cached) + position - cached) * HIDDEN..][..HIDDEN]
+            };
+            for position in cached..end {
+                // Unless the load is batch invariant, the call shapes differ in the order of sums.
+                let apart = distance(verified(0, position), fed(0, position));
+                for line in [1, 2] {
+                    let far = distance(fed(line, position), fed(0, position));
+                    assert!(
+                        4.0 * apart < far,
+                        "{tiling:?} position {position}: line {line}'s adapter moves the rows \
+                         {far}, no further than the call shapes part the base model's, {apart}"
+                    );
+                    let near = distance(verified(line, position), fed(line, position));
+                    assert!(
+                        4.0 * near <= far,
+                        "{tiling:?} position {position}: line {line}'s verified row lies {near} \
+                         from the row fed one a call, which lies {far} from the base model's"
+                    );
+                }
+                if tiling == Tiling::Fixed {
+                    for line in 0..lines.len() {
+                        assert!(
+                            verified(line, position) == fed(line, position),
+                            "position {position}: line {line}'s verified row keeps the bits of \
+                             the row fed one a call under a batch-invariant load"
+                        );
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// A call reads the adapter its storage held when the call was submitted: a load into the storage
+/// after the device accepted the call changes the next call's rows only, and storage loaded again
+/// serves an adapter's rows as new storage loaded once with it does, bit for bit.
+#[test]
+#[ignore = "opens a device"]
+fn a_call_reads_the_adapter_loaded_before_it() {
+    let directory = snapshot("Qwen/Qwen3-0.6B", REVISION, &["*.json", "*.safetensors"]);
+    let checkpoint = Checkpoint::new(directory, None).unwrap();
+    let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+    let model = base(&checkpoint, &mut device);
+    let served: &dyn decoder::Served = &model;
+    let loader = served.adapters().unwrap();
+    let directories = [(); 2].map(|()| tempfile::tempdir().unwrap());
+    let hosts = (pefts().iter().zip(&directories))
+        .map(|(peft, directory)| loader.host(&peft.save(directory.path())).unwrap())
+        .collect::<Vec<_>>();
+    let mut reused = loader.adapter(&mut device).unwrap();
+    let mut fresh = [(); 2].map(|()| loader.adapter(&mut device).unwrap());
+    for (adapter, host) in fresh.iter_mut().zip(&hosts) {
+        loader.load(adapter, host, &mut device).unwrap();
+    }
+    let runtime = runtime();
+
+    loader.load(&mut reused, &hosts[0], &mut device).unwrap();
+    let before = call(&runtime, served, &mut device, &reused);
+    loader.load(&mut reused, &hosts[1], &mut device).unwrap();
+    let after = call(&runtime, served, &mut device, &reused);
+
+    let [first, second] = fresh
+        .each_ref()
+        .map(|adapter| call(&runtime, served, &mut device, adapter));
+    let [before, after, first, second] =
+        [before, after, first, second].map(|(_cache, rows)| bytes(&runtime, &mut device, rows));
+    assert!(
+        before == first,
+        "the call submitted before the second load reads the first adapter"
+    );
+    assert!(
+        after == second,
+        "the call after it reads the second adapter"
+    );
+    assert!(
+        first != second,
+        "the adapters' rows differ, so a call that read the other one fails"
+    );
+}
+
+/// A load into an adapter's storage refuses, before any transfer, an adapter that is not a host
+/// tree of the decoder's type, here one in HBM, and the storage keeps the adapter it held.
+#[test]
+#[ignore = "opens a device"]
+fn refuses_an_adapter_of_another_model_or_memory() {
+    let directory = snapshot("Qwen/Qwen3-0.6B", REVISION, &["*.json", "*.safetensors"]);
+    let checkpoint = Checkpoint::new(directory, None).unwrap();
+    let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+    let model = base(&checkpoint, &mut device);
+    let served: &dyn decoder::Served = &model;
+    let loader = served.adapters().unwrap();
+    let saved = tempfile::tempdir().unwrap();
+    let [peft, _] = pefts();
+    let host = loader.host(&peft.save(saved.path())).unwrap();
+    let mut held = loader.adapter(&mut device).unwrap();
+    let other = loader.adapter(&mut device).unwrap();
+    loader.load(&mut held, &host, &mut device).unwrap();
+    let runtime = runtime();
+    let before = call(&runtime, served, &mut device, &held);
+
+    let error = loader.load(&mut held, &other, &mut device).unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::InvalidInput, "{error}");
+    let after = call(&runtime, served, &mut device, &held);
+    let [before, after] = [before, after].map(|(_cache, rows)| bytes(&runtime, &mut device, rows));
+    assert!(
+        before == after,
+        "the refused load leaves the adapter the storage held"
+    );
 }
 
 /// A load for calls that run adapters parses a line whose projections take them, and refuses

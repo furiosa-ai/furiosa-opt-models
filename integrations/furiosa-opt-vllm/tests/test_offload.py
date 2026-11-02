@@ -4,36 +4,60 @@ them as with its blocks in the device cache.
 - The jobs that copy blocks report each ended job once and raise a failed copy once every copy
   submitted before it ended, here over stand-in transfers; blocks whose host rows follow each other
   share one copy.
+- The connector, driven as vLLM's runner drives it, starts a step's stores in the next step, ends
+  the stores a step flushes before its calls, and reports each load's request and each job once
+  its copies ended, here over a host tier of stand-in transfers.
 - On RNGD, `vllm serve --kv-offloading-size` answers an evicted prompt as a server without
-  offloading answers it from its device cache. Under batch invariance a prompt reloaded from
-  chunks, or resumed after preemption, answers as it does with no block cached.
+  offloading answers it from its device cache, as each data-parallel replica does. Under batch
+  invariance a prompt reloaded from chunks, resumed after preemption, or reloaded after sleep mode
+  freed the cache, answers as it does with no block cached.
 """
 
 from __future__ import annotations
 
+import asyncio
 import urllib.request
+from itertools import count
 from typing import TYPE_CHECKING, Final, final
 
 import pytest
+import test_sleep
 import torch
 from conftest import post, serve
 from test_preemption import CHECKPOINT, CONTEXT, PREEMPTED, counter, greedy
+from typing_extensions import override
 from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
+from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    OffloadingConnectorMetadata,
+    OffloadingWorkerMetadata,
+    TransferJob,
+)
+from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
+from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.inputs import TokensPrompt
+from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
+from vllm.v1.kv_offload.base import (
+    GPULoadStoreSpec,
+    LoadStoreSpec,
+    OffloadingWorker,
+    TransferResult,
+)
+from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 
-from furiosa_opt_vllm import cache
+from furiosa_opt_vllm import cache, offload
 from furiosa_opt_vllm.offload import worker
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from http.client import HTTPResponse
+    from pathlib import Path
 
     from transformers import PreTrainedTokenizerBase
     from vllm import RequestOutput
-    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
-        OffloadingConnectorMetadata,
-    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
     from vllm.entrypoints.openai.completion.protocol import CompletionResponse
 
 ANSWER: Final = 32
@@ -179,6 +203,185 @@ def test_shutdown_ends_every_job_then_raises() -> None:
         running.shutdown()
     assert all(transfer.waited for transfer in copies)
     assert running.finished() == []
+
+
+@final
+class Tier(OffloadingWorker):
+    """A host tier over `worker.Jobs` whose copies, one a block, end or fail when the test says."""
+
+    def __init__(self, failure: RuntimeError | None = None) -> None:
+        self.jobs = worker.Jobs()
+        self.copies: dict[int, list[Copies]] = {}
+        self.failure = failure
+
+    @override
+    def submit_store(
+        self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
+    ) -> bool:
+        self.submit(job_id, len(src_spec.block_ids))
+        return True
+
+    @override
+    def submit_load(self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec) -> bool:
+        self.submit(job_id, len(dst_spec.block_ids))
+        return True
+
+    def submit(self, job_id: int, blocks: int) -> None:
+        self.copies[job_id] = [Copies(self.failure) for _ in range(blocks)]
+        self.jobs.submit(job_id, self.copies[job_id], 64 * blocks)
+
+    def end(self, job_id: int) -> None:
+        for transfer in self.copies[job_id]:
+            transfer.ended = True
+
+    @override
+    def get_finished(self) -> list[TransferResult]:
+        return self.jobs.finished()
+
+    @override
+    def wait(self, job_ids: set[int]) -> None:
+        self.jobs.wait(job_ids)
+
+    @override
+    def shutdown(self) -> None:
+        self.jobs.shutdown()
+
+
+def store(request: str, blocks: list[int]) -> TransferJob:
+    """A job of `request` that stores `blocks` of the device cache to host chunks 0, 1, ..."""
+    device = GPULoadStoreSpec(blocks, [len(blocks)], [0])
+    return TransferJob(request, device, CPULoadStoreSpec(list(range(len(blocks)))))
+
+
+def load(request: str, blocks: list[int]) -> TransferJob:
+    """A job of `request` that loads host chunks 0, 1, ... into `blocks` of the device cache."""
+    job = store(request, blocks)
+    return TransferJob(request, job.dst_spec, job.src_spec)
+
+
+def plan(
+    loads: dict[int, TransferJob] | None = None,
+    stores: dict[int, TransferJob] | None = None,
+    flush: set[int] | None = None,
+) -> OffloadingConnectorMetadata:
+    """A step's jobs as vLLM's offloading scheduler sends them."""
+    return OffloadingConnectorMetadata(loads or {}, stores or {}, flush)
+
+
+@final
+class Steps:
+    """The plugin's connector on the worker side over `tier`, driven as vLLM's runner drives a
+    connector around each step."""
+
+    def __init__(self, served: Path, tier: Tier) -> None:
+        self.config = EngineArgs(
+            model=str(served), dtype="bfloat16", skip_tokenizer_init=True, kv_offloading_size=1
+        ).create_engine_config()
+        page = FullAttentionSpec(
+            block_size=BLOCK, num_kv_heads=8, head_size=128, dtype=torch.bfloat16
+        )
+        cache = KVCacheConfig(8, [], [KVCacheGroupSpec(["layers.0"], page)])
+        self.connector = offload.RNGDOffloadingConnector(self.config, KVConnectorRole.WORKER, cache)
+        self.connector.worker.worker = tier
+
+    def run(
+        self, metadata: OffloadingConnectorMetadata
+    ) -> tuple[set[str], OffloadingWorkerMetadata | None]:
+        """One step of `metadata`: the requests whose loads it reports, and the jobs it reports
+        ended."""
+        connector = self.connector
+        connector.handle_preemptions(metadata)
+        connector.bind_connector_metadata(metadata)
+        with set_forward_context(None, self.config):
+            connector.start_load_kv(get_forward_context())
+        connector.wait_for_save()
+        sending, received = connector.get_finished(set())
+        assert sending == set()
+        report = connector.build_connector_worker_meta()
+        connector.clear_connector_metadata()
+        return received, report
+
+
+@pytest.mark.usefixtures("platform_env")
+def test_starts_a_steps_stores_in_the_next_step(served: Path) -> None:
+    """A step's stores start once the next step begins, after the step's own calls."""
+    tier = Tier()
+    steps = Steps(served, tier)
+    _ = steps.run(plan(stores={5: store("a", [1, 2])}))
+    assert tier.copies == {}
+    _ = steps.run(plan())
+    assert list(tier.copies) == [5]
+
+
+@pytest.mark.usefixtures("platform_env")
+@pytest.mark.parametrize("deferred", [True, False], ids=["earlier-step", "same-step"])
+def test_ends_flushed_stores_before_the_step(served: Path, *, deferred: bool) -> None:
+    """A step that hands a stored block to another request ends that block's store before the
+    step's calls, whether an earlier step or this one scheduled the store."""
+    tier = Tier()
+    steps = Steps(served, tier)
+    stores = {5: store("a", [1, 2])}
+    if deferred:
+        _ = steps.run(plan(stores=stores))
+    steps.connector.handle_preemptions(plan(stores={} if deferred else stores, flush={5}))
+    assert [copy.waited for copy in tier.copies[5]] == [True, True]
+
+
+@pytest.mark.usefixtures("platform_env")
+def test_reports_a_load_once_its_copies_end(served: Path) -> None:
+    """A load reports its request, and its job ended, once every copy ended and only once."""
+    tier = Tier()
+    steps = Steps(served, tier)
+    assert steps.run(plan(loads={3: load("a", [1, 2])})) == (set(), None)
+    tier.copies[3][0].ended = True
+    assert steps.run(plan()) == (set(), None)
+    tier.copies[3][1].ended = True
+    received, report = steps.run(plan())
+    assert received == {"a"}
+    assert report is not None
+    assert report.completed_jobs == {3: 1}
+    assert report.transfer_stats.load.bytes == 128
+    assert steps.run(plan()) == (set(), None)
+
+
+@pytest.mark.usefixtures("platform_env")
+def test_reports_a_store_once_its_copies_end(served: Path) -> None:
+    """A store reports no request, and its job ended once, after its copies ended."""
+    tier = Tier()
+    steps = Steps(served, tier)
+    _ = steps.run(plan(stores={5: store("a", [1, 2])}))
+    assert steps.run(plan()) == (set(), None)
+    tier.end(5)
+    received, report = steps.run(plan())
+    assert received == set()
+    assert report is not None
+    assert report.completed_jobs == {5: 1}
+    assert report.transfer_stats.store.bytes == 128
+    assert steps.run(plan()) == (set(), None)
+
+
+@pytest.mark.usefixtures("platform_env")
+def test_raises_a_failed_copy_instead_of_reporting_it(served: Path) -> None:
+    """A step that finds a failed copy raises it, and neither the load's request nor its job is
+    reported."""
+    tier = Tier(RuntimeError("copy failed"))
+    steps = Steps(served, tier)
+    with pytest.raises(RuntimeError, match="copy failed"):
+        _ = steps.run(plan(loads={3: load("a", [1])}))
+    assert steps.connector.build_connector_worker_meta() is None
+
+
+@pytest.mark.usefixtures("platform_env")
+def test_shutdown_ends_submitted_jobs(served: Path) -> None:
+    """Shutdown waits for every submitted copy, then raises the first that failed."""
+    tier = Tier(RuntimeError("copy failed"))
+    steps = Steps(served, tier)
+    steps.connector.bind_connector_metadata(plan(loads={3: load("a", [1, 2])}))
+    with set_forward_context(None, steps.config):
+        steps.connector.start_load_kv(get_forward_context())
+    with pytest.raises(RuntimeError, match="copy failed"):
+        steps.connector.shutdown()
+    assert [copy.waited for copy in tier.copies[3]] == [True, True]
 
 
 @pytest.mark.parametrize(
@@ -367,16 +570,26 @@ def test_reuses_blocks_once_their_store_ends(
         oracle.llm_engine.engine_core.shutdown()
     # The engine core runs in this process, so the test sees the stores each step's fence covers.
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    submitted: set[int] = set()
     pending: list[int] = []
-    flush = worker.Worker.flush
+    submit = worker.Host.submit_store
+    flush = offload.RNGDOffloadingConnector.handle_preemptions
 
-    def spy(self: worker.Worker, metadata: OffloadingConnectorMetadata) -> None:
-        # The flushed stores that no earlier step submitted.
-        unsubmitted = {job_id for job_id, _ in self.deferred}.union(metadata.store_jobs)
-        pending.append(len((metadata.jobs_to_flush or set()) & unsubmitted))
+    def record(
+        self: worker.Host, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
+    ) -> bool:
+        submitted.add(job_id)
+        return submit(self, job_id, src_spec, dst_spec)
+
+    def spy(self: offload.RNGDOffloadingConnector, metadata: KVConnectorMetadata) -> None:
+        assert isinstance(metadata, OffloadingConnectorMetadata)
+        earlier = set(submitted)
         flush(self, metadata)
+        # The flushed stores that no earlier step submitted.
+        pending.append(len((metadata.jobs_to_flush or set()) & (submitted - earlier)))
 
-    monkeypatch.setattr(worker.Worker, "flush", spy)
+    monkeypatch.setattr(worker.Host, "submit_store", record)
+    monkeypatch.setattr(offload.RNGDOffloadingConnector, "handle_preemptions", spy)
     llm = sequential(1)
     try:
         # The first request ends at its first token, in the step whose prefill fills its ninth
@@ -442,3 +655,103 @@ def test_keeps_preempted_requests(
         assert counter(llm, LOADED) > 0
     finally:
         llm.llm_engine.engine_core.shutdown()
+
+
+def evicting(offloading: float | None = None, *, sleep: bool = False) -> LLM:
+    """An engine of `SERVED`'s device cache, which one request and its answer mostly fill, with
+    `offloading` GiB of host memory if set, and sleep mode if `sleep`."""
+    return LLM(
+        CHECKPOINT,
+        dtype="bfloat16",
+        generation_config="vllm",
+        max_model_len=128,
+        num_gpu_blocks_override=9,
+        disable_log_stats=False,
+        kv_offloading_size=offloading,
+        enable_sleep_mode=sleep,
+    )
+
+
+@pytest.mark.feature("KV cache offloading")
+def test_offloads_the_cache_waking_allocates(
+    tokenizer: PreTrainedTokenizerBase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sleep frees the whole device cache, of which the host tier keeps nothing, and after waking
+    the host tier moves the blocks of the cache waking allocated: an evicted prompt reloads them
+    and answers as it did before any of its blocks was cached."""
+    # A batch-invariant load computes a row alike whatever calls wrote the blocks it reads.
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    # The test reads the worker's free device memory through a function of its own.
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    first, *others = (ask(tokenizer, people) for people in NOTES)
+    llm = evicting(1, sleep=True)
+    try:
+        # The blocks sleep frees hold another prompt's rows, which a copy of them would reload.
+        _ = generate(llm, others[-1])
+        awake, kv = test_sleep.available(llm), test_sleep.cache(llm)
+        llm.sleep(level=1)
+        freed = test_sleep.available(llm) - awake
+        llm.wake_up()
+        computed = generate(llm, first)
+        for prompt in others:
+            _ = generate(llm, prompt)
+        before = counter(llm, LOADED)
+        reloaded = generate(llm, first)
+        assert counter(llm, LOADED) > before
+    finally:
+        llm.llm_engine.engine_core.shutdown()
+    assert freed >= test_sleep.weights() + kv
+    assert reloaded.num_cached_tokens == len(first) // BLOCK * BLOCK
+    assert reloaded.outputs[0].token_ids == computed.outputs[0].token_ids
+
+
+@pytest.mark.feature("KV cache offloading")
+def test_offloads_in_each_data_parallel_replica(tokenizer: PreTrainedTokenizerBase) -> None:
+    """Each data-parallel replica keeps the blocks it evicts in its own host tier: a prompt evicted
+    on either replica reloads them there and answers as one engine without offloading answers it
+    from its device cache."""
+    first, *others = (ask(tokenizer, people) for people in NOTES)
+    oracle = evicting()
+    try:
+        _ = generate(oracle, first)
+        resident = generate(oracle, first)
+    finally:
+        oracle.llm_engine.engine_core.shutdown()
+    params = SamplingParams(temperature=0, max_tokens=ANSWER, ignore_eos=True)
+
+    async def replay() -> list[RequestOutput]:
+        engine = AsyncLLM.from_engine_args(
+            AsyncEngineArgs(
+                CHECKPOINT,
+                dtype="bfloat16",
+                generation_config="vllm",
+                max_model_len=128,
+                num_gpu_blocks_override=9,
+                kv_offloading_size=1,
+                data_parallel_size=2,
+            )
+        )
+        ids = count()
+
+        async def answer(prompt: list[int], rank: int) -> RequestOutput:
+            outputs = engine.generate(
+                TokensPrompt(prompt_token_ids=prompt),
+                params,
+                str(next(ids)),
+                data_parallel_rank=rank,
+            )
+            return [output async for output in outputs][-1]
+
+        try:
+            reloaded: list[RequestOutput] = []
+            for rank in (0, 1):
+                for prompt in (first, *others):
+                    _ = await answer(prompt, rank)
+                reloaded.append(await answer(first, rank))
+            return reloaded
+        finally:
+            engine.shutdown()
+
+    for output in asyncio.run(replay()):
+        assert output.num_cached_tokens == resident.num_cached_tokens == len(first) // BLOCK * BLOCK
+        assert output.outputs[0].token_ids == resident.outputs[0].token_ids

@@ -76,7 +76,7 @@ def available(runner: Runner) -> int:
     match model:
         case Decoder():
             blocks = min(max(0, memory) // block_bytes, max_blocks)
-            return runner.selection.capacity(blocks) * block_bytes
+            return runner.selection.capacity(blocks, block_bytes) * block_bytes
         case Media():
             return max(0, min(memory, max_blocks * block_bytes))
         case _:

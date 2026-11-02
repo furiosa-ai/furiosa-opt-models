@@ -2,6 +2,8 @@ use super::*;
 use crate::Op;
 use crate::ops::linear::affine::output;
 
+mod phase;
+
 /// A launch's attended rows in HBM: `Groups` query heads of `Head` features for each of `KvHeads`.
 type Attended<Reach, KvHeads, Groups, Head> =
     HbmTensor<bf16, Chip, m![Reach, KvHeads, Groups, Head]>;
@@ -37,149 +39,19 @@ pub struct Landed<Hidden: AxisName, QWidth: AxisName, Rows: AxisName> {
     second: Option<Second<Hidden, QWidth, Rows>>,
 }
 
-/// The projection begun before any attended row arrives: the place its weights and their channel
-/// scales land in, which they do when the landed projection is given back, e.g. while an
-/// attention's last history is in flight.
-impl<Hidden: AxisName, QWidth: AxisName> Op<Begin<()>> for Stored<Hidden, QWidth> {
-    type Output = Landed<Hidden, QWidth, Span>;
-
-    fn forward(&self, _: &mut Device, _: Begin<()>) -> Self::Output {
-        Landed {
-            staged: Affine::new((Weight::new(), Channels::new()), ()),
-            step: 0,
-            first: None,
-            second: None,
-        }
-    }
-}
-
-/// The weights and their channel scales written in the staged form the projection reads.
-impl<Hidden: AxisName, QWidth: AxisName> Op<&mut Landed<Hidden, QWidth, Span>>
-    for Stored<Hidden, QWidth>
-{
-    type Output = ();
-
-    fn forward(&self, context: &mut Device, landed: &mut Landed<Hidden, QWidth, Span>) {
-        let (weight, channels) = &mut landed.staged.weight;
-        self.weight
-            .0
-            .view()
-            .to_dm_view(&mut context.tdma, weight.view_mut());
-        self.weight
-            .1
-            .view()
-            .to_dm_view(&mut context.tdma, channels.view_mut());
-    }
-}
-
 /// Span tile `attended` of the attended rows as the steps take it, with what the projection landed.
 type Tile<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head> = (
     &'l mut Landed<Hidden, QWidth, Span>,
     Live<&'a Attended<Reach, KvHeads, Groups, Head>, Capacity>,
 );
 
-/// A tile begun: its rows landed and the first block's first pass; given back, it takes its second
-/// step.
-impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head>
-    Op<Begin<Begin<Tile<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head>>>>
-    for Stored<Hidden, QWidth>
-where
-    Hidden: AxisName,
-    QWidth: AxisName,
-    Capacity: AxisName,
-    Reach: AxisName,
-    KvHeads: AxisName,
-    Groups: AxisName,
-    Head: AxisName,
-{
-    type Output = Begin<Tile<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head>>;
-
-    fn forward(
-        &self,
-        context: &mut Device,
-        Begin(Begin((landed, attended))): Begin<
-            Begin<Tile<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head>>,
-        >,
-    ) -> Self::Output {
-        let _ = Op::forward(
-            self,
-            context,
-            (&mut *landed, attended.into_value(), attended.with(())),
-        );
-        Begin((landed, attended))
-    }
-}
-
-/// A tile's second step: the other passes and the exchange of one half of the clusters' partial
-/// sums; given back, it takes its last.
-impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head>
-    Op<Begin<Tile<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head>>>
-    for Stored<Hidden, QWidth>
-where
-    Hidden: AxisName,
-    QWidth: AxisName,
-    Capacity: AxisName,
-    Reach: AxisName,
-    KvHeads: AxisName,
-    Groups: AxisName,
-    Head: AxisName,
-{
-    type Output = Tile<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head>;
-
-    fn forward(
-        &self,
-        context: &mut Device,
-        Begin((landed, attended)): Begin<
-            Tile<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head>,
-        >,
-    ) -> Self::Output {
-        let _ = Op::forward(
-            self,
-            context,
-            (&mut *landed, attended.into_value(), attended.with(())),
-        );
-        (landed, attended)
-    }
-}
-
-/// A tile's last step, the sum: its rows.
-impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head>
-    Op<Tile<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head>>
-    for Stored<Hidden, QWidth>
-where
-    Hidden: AxisName,
-    QWidth: AxisName,
-    Capacity: AxisName,
-    Reach: AxisName,
-    KvHeads: AxisName,
-    Groups: AxisName,
-    Head: AxisName,
-{
-    type Output = Owned<Hidden, Span>;
-
-    fn forward(
-        &self,
-        context: &mut Device,
-        (landed, attended): Tile<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head>,
-    ) -> Self::Output {
-        match Op::forward(
-            self,
-            context,
-            (landed, attended.into_value(), attended.with(())),
-        ) {
-            Poll::Ready(rows) => rows,
-            Poll::Pending => Owned::new(),
-        }
-    }
-}
-
 /// One step of span tile `tile` of the attended rows; the sum once the third step gives it.
-impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head>
+impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head, W, S>
     Op<(
         &'l mut Landed<Hidden, QWidth, Span>,
         &'a Attended<Reach, KvHeads, Groups, Head>,
         Live<(), Capacity>,
-    )> for Stored<Hidden, QWidth>
+    )> for Affine<Rows<m![QWidth], m![Hidden], W, S>, ()>
 where
     Hidden: AxisName,
     QWidth: AxisName,

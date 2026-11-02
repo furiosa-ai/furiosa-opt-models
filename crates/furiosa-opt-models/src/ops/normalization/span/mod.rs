@@ -35,23 +35,29 @@ pub(crate) trait Tiled: AxisName {
 /// A norm with its retained gain written once in DM, where its forward on a span's rows reads it.
 pub(crate) struct Stage;
 
-impl<Width: AxisName, const EPSILON: usize> Op<&super::RmsNorm<Width, EPSILON, Chip>> for Stage {
+impl<Width: AxisName, const EPSILON: usize, T> Op<&super::RmsNorm<Width, EPSILON, Chip, T>>
+    for Stage
+where
+    T: core::borrow::Borrow<HbmTensor<bf16, Chip, m![Width]>>,
+{
     type Output = super::RmsNorm<Width, EPSILON, Chip, Scale<Width, Span>>;
 
     fn forward(
         &self,
         device: &mut Device,
-        norm: &super::RmsNorm<Width, EPSILON, Chip>,
+        norm: &super::RmsNorm<Width, EPSILON, Chip, T>,
     ) -> Self::Output {
-        super::RmsNorm::new(norm.weight().tensor().to_dm(&mut device.tdma))
+        super::RmsNorm::new(core::borrow::Borrow::borrow(norm.weight()).to_dm(&mut device.tdma))
     }
 }
 
 /// A norm whose gain is in HBM writes it to DM for each span it normalizes.
-impl<Width, R: AxisName, const EPSILON: usize, const CAPACITY: usize, const LAST: usize>
-    Op<&Live<Owned<Width, Span>, R>> for super::RmsNorm<Width, EPSILON, Chip>
+impl<Width, R: AxisName, const EPSILON: usize, const CAPACITY: usize, const LAST: usize, T>
+    Op<&Live<Owned<Width, Span>, R>>
+    for super::RmsNorm<Width, EPSILON, Chip, crate::tensor::form::Weight<m![Width], Chip, T>>
 where
     Width: Tiled<Capacity = Rows<CAPACITY>, Last = Rows<LAST>>,
+    T: core::borrow::Borrow<HbmTensor<bf16, Chip, m![Width]>>,
 {
     type Output = Live<Owned<Width, Span>, R>;
 

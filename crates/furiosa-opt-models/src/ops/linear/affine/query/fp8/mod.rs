@@ -5,6 +5,7 @@ pub(crate) use super::{
 };
 use crate::ops::linear::query::group::Group;
 use crate::ops::normalization::Scaled;
+use crate::tensor::memory::{Hbm, Memory};
 use crate::tensor::parallel::Chip;
 use crate::{Op, ops::linear::Affine};
 pub(crate) use activation::{Fill, Quantize, RowScales};
@@ -43,16 +44,17 @@ pub type Layout<Hidden, Heads, Head> = m![
     Head % 64,
     Hidden % 64
 ];
-pub type Stored<Hidden, Heads, Head> = HbmTensor<f8e4m3, Chip, Layout<Hidden, Heads, Head>>;
+pub type Stored<Hidden, Heads, Head, X = Hbm> =
+    <X as Memory>::Tensor<f8e4m3, Chip, Layout<Hidden, Heads, Head>>;
 /// A head projection's stored weight: its codes, with `S` the row scales it keeps, if any.
-pub type Weights<Hidden, Heads, Head, S = ()> =
-    crate::tensor::form::fp8::Rows<m![Hidden], m![Heads, Head], Stored<Hidden, Heads, Head>, S>;
+pub type Weights<Hidden, Heads, Head, S = (), X = Hbm> =
+    crate::tensor::form::fp8::Rows<m![Hidden], m![Heads, Head], Stored<Hidden, Heads, Head, X>, S>;
 /// The value projection's row scales, its heads' scales.
-pub type HeadScales<Heads, Head> = HbmTensor<f32, Chip, m![Heads, Head]>;
+pub type HeadScales<Heads, Head, X = Hbm> = <X as Memory>::Tensor<f32, Chip, m![Heads, Head]>;
 /// A query or key projection's row scales: each head's square, for each row of a tile.
-pub type HeadSquares<Heads> = crate::tensor::form::fp8::Squares<Squared<Heads>>;
+pub type HeadSquares<Heads, X = Hbm> = crate::tensor::form::fp8::Squares<Squared<Heads, X>>;
 /// Each head's squared scale, for each row of a tile.
-pub type Squared<Heads> = HbmTensor<f32, Chip, m![Heads, Tile]>;
+pub type Squared<Heads, X = Hbm> = <X as Memory>::Tensor<f32, Chip, m![Heads, Tile]>;
 pub(crate) type Input<Hidden, G> =
     DmTensor<f8e4m3, Chip, m![2], m![4, Hidden / 64], m![G, Tile, Hidden % 64]>;
 pub(crate) type Lanes<Hidden, G, Heads> = TrfTensor<

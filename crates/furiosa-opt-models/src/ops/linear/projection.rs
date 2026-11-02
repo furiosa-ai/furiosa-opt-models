@@ -91,11 +91,10 @@ impl<I: AxisName, O: AxisName> Tiling<I, O> for OneRow<I, O> {
 
     fn to_dm<D: MaterializableScalar, X: M, K: M, E: M>(
         device: &mut Device,
-        tensor: &HbmTensor<D, X, m![O, { K }]>,
+        tensor: HbmTensorView<'_, D, X, m![O, { K }]>,
         at: usize,
     ) -> DmTensor<D, X, Cluster, Slices<I, O>, E> {
         tensor
-            .view()
             .tile::<
                 m![O % ({ Block<O> })],
                 4,

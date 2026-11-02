@@ -74,3 +74,19 @@ where
         Ok(into)
     }
 }
+
+impl<'t, 'h, const NAME: &'static str, T, U> Load<(&'t mut Named<NAME, T>, &'h Named<NAME, U>)>
+    for &'t mut Named<NAME, T>
+where
+    for<'u> &'u mut T: Load<(&'u mut T, &'h U)>,
+{
+    fn load(
+        context: &mut Context<'_>,
+        (into, from): (&'t mut Named<NAME, T>, &'h Named<NAME, U>),
+    ) -> Result<Self, LoadError> {
+        context.field(NAME, NAME, |cx| {
+            <&mut T as Load<_>>::load(cx, (&mut into.0, &from.0))
+        })?;
+        Ok(into)
+    }
+}

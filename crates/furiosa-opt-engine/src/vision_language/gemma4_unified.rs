@@ -10,6 +10,7 @@ use furiosa_opt_models::load::{Context, Load, LoadError, Part};
 use furiosa_opt_models::models::vision_language::gemma4_unified::{
     self, Frames, Offsets, Patch, Patches, Positions, Samples, Text, offset,
 };
+use furiosa_opt_models::modules::generic::collection::Interval;
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
 use furiosa_opt_models::ops::index::copy;
 use furiosa_opt_models::tensor::memory::{Hbm, alias};
@@ -22,12 +23,16 @@ axes![Short = 512, Long = 2304];
 /// The media encoder reads a load of the encoder part alone, and serves media; its rows are
 /// computed alone, so no tiling applies to them.
 impl Listed for gemma4_unified::Encoder<Hbm> {
-    fn reads(part: Part) -> Result<(), LoadError> {
+    fn reads(part: &Part<Interval<usize>>) -> Result<(), LoadError> {
         match part {
             Part::Encoder => Ok(()),
             Part::Whole => Err(LoadError::Unsupported {
                 name: "encoder".into(),
                 reason: "a media encoder loads alone, so choose the encoder".into(),
+            }),
+            Part::Layers(_) => Err(LoadError::Unsupported {
+                name: "layers".into(),
+                reason: "a media encoder does not load decoder layers".into(),
             }),
         }
     }

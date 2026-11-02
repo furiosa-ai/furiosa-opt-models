@@ -1,14 +1,15 @@
-"""A separately placed model drafter preserves target decoding."""
+"""A model drafter loaded beside its target preserves target decoding."""
 
 from __future__ import annotations
 
+import gc
 from collections.abc import Callable, Generator
 from dataclasses import replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
-from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 from vllm import LLM, SamplingParams
 from vllm.config import VllmConfig
@@ -19,9 +20,14 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 import furiosa_opt_engine as engine
 from furiosa_opt_vllm.additional import Section
 from furiosa_opt_vllm.admission import Draft, Refused, speculative
+from furiosa_opt_vllm.decoder import Decoder
 from furiosa_opt_vllm.drafting import Drafter, Drafting
 from furiosa_opt_vllm.runner import Runner
 
+if TYPE_CHECKING:
+    from conftest import Greedy
+
+TARGET = "Qwen/Qwen3-1.7B"
 TEXT = "The quick brown fox jumps over the lazy dog. " * 8
 PROMPT = f"Copy the following text exactly, without any explanation:\n{TEXT}"
 DRAFTED = "vllm:spec_decode_num_draft_tokens"
@@ -40,7 +46,8 @@ def refusal(load: Callable[[], Drafter]) -> str:
 
 @pytest.mark.usefixtures("platform_env")
 def test_refuses_tokenless(served: Path) -> None:
-    """A draft model drafts only for a target whose attention cache takes token IDs."""
+    """A draft model drafts only beside a decoder that takes token IDs, which an encoder-only
+    instance does not load."""
     config = EngineArgs(
         model=str(served),
         dtype="bfloat16",
@@ -58,7 +65,7 @@ def test_refuses_tokenless(served: Path) -> None:
 
 @pytest.fixture(scope="module")
 def config() -> VllmConfig:
-    """A Qwen3-0.6B target that Qwen3-0.6B drafts for from the chips the target leaves free."""
+    """A Qwen3-0.6B target that Qwen3-0.6B drafts for on the target's chip."""
     return EngineArgs(
         model="Qwen/Qwen3-0.6B",
         dtype="bfloat16",
@@ -79,18 +86,23 @@ def draft(config: VllmConfig) -> Draft:
 
 
 @pytest.fixture
-def standalone() -> engine.relation.CausalLM[engine.Sequence]:
-    """The draft model loaded alone, on the first free chips, as a target loads."""
-    parser: type[engine.Model[engine.relation.CausalLM[engine.Sequence]]] = engine.Model
-    return engine.LoadOptions().load(parser.from_pretrained(snapshot_download("Qwen/Qwen3-0.6B")))
+def target(config: VllmConfig) -> Decoder:
+    """The target loaded as the runner loads it, released after each test before another load
+    takes the chip."""
+    # A failed earlier test's models sit in its traceback's reference cycle until a collection,
+    # and they hold the chip this load opens.
+    _ = gc.collect()
+    return Decoder.load(config)
 
 
-def test_matches_standalone(
-    config: VllmConfig, draft: Draft, standalone: engine.relation.CausalLM[engine.Sequence]
+def test_proposes_greedy_drafts(
+    config: VllmConfig, draft: Draft, target: Decoder, greedy: Greedy
 ) -> None:
-    """Drafts proposed together match each request's standalone continuation after rejected and
-    accepted suffixes, also when its known tokens take more than one call's rows."""
-    body = standalone.scores.body
+    """Drafts proposed together are each request's greedy drafts of its known tokens after rejected
+    and accepted suffixes, also when its known tokens take more than one call's rows."""
+    model = target.model
+    assert isinstance(model, engine.qwen3.ForCausalLM)
+    block = model.cache.pools[0].block
     # The runner's requests and batch, which a proposal reads and its sampled tokens extend.
     runner = Runner(config)
     runner.input_batch = InputBatch(
@@ -99,11 +111,12 @@ def test_matches_standalone(
         max_num_batched_tokens=32,
         device=torch.device("cpu"),
         vocab_size=151936,
-        block_sizes=[body.cache.block.tokens],
-        kernel_block_sizes=[body.cache.block.tokens],
+        block_sizes=[block],
+        kernel_block_sizes=[block],
         max_num_blocks_per_req=[128],
     )
-    drafting = Drafting(Drafter.load(draft, body.cache), 256, runner.requests)
+    drafter = Drafter.load(draft, target)
+    drafting = Drafting(drafter, 256, runner.requests)
     match AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B"):
         case PreTrainedTokenizerBase() as tokenizer:
             text = tokenizer.encode(
@@ -111,10 +124,8 @@ def test_matches_standalone(
             )
         case _:
             raise TypeError("tokenizer loading must return a pretrained tokenizer")
-    prompts = {
-        "short": text,
-        "long": (text * (body.cache.rows // len(text) + 2))[: body.cache.rows + 3],
-    }
+    rows = drafter.model.rows
+    prompts = {"short": text, "long": (text * (rows // len(text) + 2))[: rows + 3]}
     tables = {"short": list(range(128)), "long": list(range(128, 256))}
     for req_id, prompt in prompts.items():
         runner.requests[req_id] = CachedRequestState(
@@ -128,25 +139,6 @@ def test_matches_standalone(
             output_token_ids=[],
         )
         _ = runner.input_batch.add_request(runner.requests[req_id])
-
-    def continuation(prefix: list[int]) -> list[int]:
-        cache = engine.Cache(body.cache, 128)
-        blocks = list(range(128))
-        output: engine.HbmTensor | None = None
-        for position, token in enumerate(prefix):
-            output = standalone.forward(
-                [engine.Request(blocks, position, engine.HostTensor((token,)).to_hbm(body.device))],
-                cache,
-            )
-        assert output is not None, "a reference prefix holds a token"
-        tokens: list[int] = []
-        for offset in range(3):
-            tokens.append(int(output.to_host().numpy()[0]))
-            if offset < 2:
-                output = standalone.forward(
-                    [engine.Request(blocks, len(prefix) + offset, output)], cache
-                )
-        return tokens
 
     proposed: dict[str, list[int]] = {req_id: [] for req_id in prompts}
     # A step's tokens reject a request's first draft, or accept all of its drafts and add one.
@@ -163,66 +155,40 @@ def test_matches_standalone(
         proposed = dict(zip(prompts, drafts, strict=True))
         for req_id, prompt in prompts.items():
             known = [*prompt, *runner.requests[req_id].output_token_ids]
-            assert proposed[req_id] == continuation(known), (rejected, req_id)
+            assert len(proposed[req_id]) == 3, (req_id, proposed[req_id])
+            greedy.drafts("Qwen/Qwen3-0.6B", known, proposed[req_id])
 
 
-def test_refuses_shorter_window(
-    draft: Draft, standalone: engine.relation.CausalLM[engine.Sequence]
-) -> None:
+def test_refuses_shorter_window(draft: Draft, target: Decoder) -> None:
     """A draft model must hold as long a context as the target serves."""
-    cache = standalone.scores.body.cache
-    shorter = replace(draft, max_model_len=cache.window + 1)
-    assert refusal(lambda: Drafter.load(shorter, cache)) == "speculative_config.model"
+    assert target.model is not None
+    shorter = replace(draft, max_model_len=target.model.window + 1)
+    assert refusal(lambda: Drafter.load(shorter, target)) == "speculative_config.model"
 
 
-def test_loads_its_cache_dtype(
-    draft: Draft, standalone: engine.relation.CausalLM[engine.Sequence]
-) -> None:
-    """A draft model loads with its admitted cache dtype: the engine compiles Qwen3-0.6B without an
-    FP8 cache and refuses one before it reads any weights."""
+def test_loads_its_cache_dtype(draft: Draft, target: Decoder) -> None:
+    """A draft model loads with its admitted cache dtype: the engine caches Qwen3-0.6B in BF16
+    only and refuses an FP8 cache before it reads any weights."""
     fp8 = replace(draft, cache_dtype="float8_e4m3fn")
-    with pytest.raises(NotImplementedError, match="cache dtype"):
-        _ = Drafter.load(fp8, standalone.scores.body.cache)
+    with pytest.raises(NotImplementedError, match="kv_cache"):
+        _ = Drafter.load(fp8, target)
 
 
-def test_refuses_another_vocabulary(draft: Draft) -> None:
+def test_refuses_another_vocabulary(draft: Draft, target: Decoder) -> None:
     """A draft model must take the target's token IDs: Qwen3-Embedding-0.6B's 151669-token
     vocabulary is not Qwen3-0.6B's."""
-    parser: type[engine.Model[engine.Sequence]] = engine.Model
-    target = (
-        engine.LoadOptions()
-        .drop("head")
-        .load(parser.from_pretrained(snapshot_download("Qwen/Qwen3-Embedding-0.6B")))
+    assert refusal(lambda: Drafter.load(draft, replace(target, vocabulary=151669))) == (
+        "speculative_config.model"
     )
-    assert refusal(lambda: Drafter.load(draft, target.cache)) == "speculative_config.model"
-
-
-@pytest.fixture(scope="module", name="_baseline")
-def baseline() -> list[int]:
-    """The target's greedy tokens without drafts, from an engine that shuts down before `llm`'s
-    starts on the same chips."""
-    llm = LLM(
-        model="Qwen/Qwen3-1.7B",
-        dtype="bfloat16",
-        max_model_len=2048,
-        max_num_seqs=2,
-        max_num_batched_tokens=32,
-        generation_config="vllm",
-    )
-    try:
-        return list(
-            llm.generate(PROMPT, SamplingParams(temperature=0, max_tokens=64))[0]
-            .outputs[0]
-            .token_ids
-        )
-    finally:
-        llm.llm_engine.engine_core.shutdown()
 
 
 @pytest.fixture(scope="module")
-def llm(_baseline: list[int]) -> Generator[LLM]:
+def llm() -> Generator[LLM]:
+    # The models this module's earlier tests load sit in reference cycles until a collection, and
+    # they hold the chip the engine core opens.
+    _ = gc.collect()
     llm = LLM(
-        model="Qwen/Qwen3-1.7B",
+        model=TARGET,
         dtype="bfloat16",
         max_model_len=2048,
         max_num_seqs=2,
@@ -249,11 +215,13 @@ def counter(llm: LLM, name: str) -> float:
 
 
 @pytest.mark.feature("Speculative decoding (ngram, suffix, draft model)")
-def test_keeps_greedy(llm: LLM, _baseline: list[int]) -> None:
+def test_keeps_greedy(llm: LLM, greedy: Greedy) -> None:
     """Drafts keep the target's greedy tokens, and on copied text the target accepts most."""
     drafted, accepted = counter(llm, DRAFTED), counter(llm, ACCEPTED)
     result = llm.generate(PROMPT, SamplingParams(temperature=0, max_tokens=64))[0]
-    assert list(result.outputs[0].token_ids) == _baseline
+    assert result.prompt_token_ids is not None
+    tokens = list(result.outputs[0].token_ids)
+    greedy.continuation(TARGET, list(result.prompt_token_ids), tokens, 64)
     drafted, accepted = counter(llm, DRAFTED) - drafted, counter(llm, ACCEPTED) - accepted
     # Both models copy the same text with one tokenizer, so their greedy tokens mostly agree; a
     # drafter that lost the accepted prefix agrees with the target almost never.

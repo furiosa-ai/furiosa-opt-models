@@ -96,11 +96,10 @@ impl<I: AxisName, O: AxisName, R: AxisName> Tiling<I, O> for Chunked<I, O, R> {
 
     fn to_dm<D: MaterializableScalar, X: M, K: M, E: M>(
         device: &mut Device,
-        tensor: &HbmTensor<D, X, m![O, { K }]>,
+        tensor: HbmTensorView<'_, D, X, m![O, { K }]>,
         at: usize,
     ) -> DmTensor<D, X, Cluster<R>, Slices<I, O, R>, E> {
         tensor
-            .view()
             .tile::<m![O / ({ Np<I, O, R> })], 1, m![O % ({ Np<I, O, R> }) # O, { K }]>(at)
             .to_dm(&mut device.tdma)
     }

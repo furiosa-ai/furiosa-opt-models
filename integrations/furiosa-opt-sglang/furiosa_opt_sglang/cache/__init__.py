@@ -1,10 +1,10 @@
-"""Own runner-lifetime engine storage and expose SGLang's cache transport."""
+"""Own runner-lifetime engine storage and expose SGLang's cache transport; a transfer backend
+reaches the cache through the pool's host image (`image.Image`)."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Self, cast, final
+from typing import TYPE_CHECKING, cast, final
 
 import torch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -13,39 +13,12 @@ from sglang.srt.mem_cache.memory_pool import KVCache
 from typing_extensions import override
 
 import furiosa_opt_engine as engine
+from furiosa_opt_sglang.cache.image import Image
+from furiosa_opt_sglang.cache.pages import Pages
 from furiosa_opt_sglang.decoder import RELEASED
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
-
-    from furiosa_opt_sglang.decoder import Decoder
-
-
-@dataclass(frozen=True, slots=True)
-class Pages:
-    """A decoder's paged keys and values as the token pool keeps them: blocks of `pool`'s format for
-    each of `layers`, a part of each block on every one of `chips` chips, where a token's row holds
-    `heads` keys, then as many values, of `width` elements of `dtype` each, which the engine does
-    not report."""
-
-    pool: engine.decoder.Pool
-    layers: range
-    chips: int
-    dtype: torch.dtype
-    heads: int
-    width: int
-
-    @classmethod
-    def parse(cls, decoder: Decoder, heads: int, width: int) -> Self:
-        """Refuse a row format whose blocks the engine sizes otherwise."""
-        if decoder.model is None:
-            raise RuntimeError(RELEASED)
-        # PyTorch exposes its named dtypes through an untyped module lookup.
-        dtype = cast("torch.dtype", getattr(torch, decoder.model.kv_cache))
-        size = decoder.pool.block * 2 * heads * width * dtype.itemsize
-        if size != decoder.pool.bytes:
-            raise ValueError(f"the engine pages {decoder.pool.bytes} bytes a block, SGLang {size}")
-        return cls(decoder.pool, decoder.layers, decoder.model.parallel, dtype, heads, width)
 
 
 @final
@@ -70,6 +43,7 @@ class Cache(KVCache):
         self.storage: engine.decoder.Cache | None = engine.decoder.Cache(
             spec, (size + 2 * block - 1) // block
         )
+        self.image = Image(self)
 
     @override
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
@@ -90,6 +64,14 @@ class Cache(KVCache):
         _ = copy(
             self, layer.layer_id - self.start_layer, loc, torch.stack((cache_k, cache_v), dim=1)
         )
+
+    @property
+    def head_num(self) -> int:
+        """The key-value heads of an image page, every chip's."""
+        return self.pages.heads * self.pages.chips
+
+    def get_contiguous_buf_infos(self) -> tuple[list[int], list[int], list[int]]:
+        return self.image.infos()
 
     def get_kv_size_bytes(self) -> tuple[int, int]:
         if self.storage is None:

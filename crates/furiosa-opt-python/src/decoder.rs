@@ -4,8 +4,9 @@
 //!   a slot of the blocks its `rows` name and attends to every position up to its own.
 //! - A loaded decoder describes its cache as a `CacheSpec` on its device; `Cache(spec, blocks)`
 //!   allocates `blocks` blocks of every layer there, which the framework assigns to sequences.
-//! - A decoder whose projections take LoRA adapters describes them as an `AdapterSpec`;
-//!   `Adapter(spec, checkpoint)` loads a PEFT checkpoint onto its device as one.
+//! - A decoder whose projections take LoRA adapters describes them as an `AdapterSpec`:
+//!   `HostAdapter(spec, checkpoint)` builds a PEFT checkpoint on host as one, `Adapter(spec)`
+//!   allocates one on its device, and `Adapter.load(host)` writes a host adapter into its storage.
 //! - A decoder's `forward(requests, cache, adapters)` takes a list of requests, the cache they
 //!   append to and the adapters they run with, which a request names by index, and returns the
 //!   rows they keep as its `Output` names them.
@@ -36,6 +37,7 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Kind>()?;
     module.add_class::<Cache>()?;
     module.add_class::<AdapterSpec>()?;
+    module.add_class::<HostAdapter>()?;
     module.add_class::<Adapter>()?;
     Ok(())
 }
@@ -446,8 +448,8 @@ impl Cache {
 }
 
 /// The LoRA adapters a loaded decoder's calls run their requests with: `RANK`, the rank every
-/// update holds, and `SLOTS`, the adapters one call runs with. `Adapter(spec, checkpoint)` loads
-/// one onto the decoder's device.
+/// update holds, and `SLOTS`, the adapters one call runs with. `HostAdapter(spec, checkpoint)`
+/// builds one on host and `Adapter(spec)` allocates one on the decoder's device.
 #[gen_stub_pyclass]
 #[pyclass(frozen, module = "engine.decoder")]
 pub(super) struct AdapterSpec {
@@ -477,45 +479,81 @@ impl AdapterSpec {
     const SLOTS: usize = decoder::SLOTS;
 }
 
-/// A PEFT LoRA checkpoint loaded onto a decoder's device as its adapter tree: each adapted
-/// module's `lora_A` and `lora_B`, the scale folded in. Nothing changes it, so a call reads it in
-/// place; a framework makes it active by putting it in a slot of the list a call takes.
+/// A PEFT LoRA checkpoint built on host as a decoder's adapter tree: each adapted module's
+/// `lora_A` and `lora_B`, the scale folded in, the rank zero-padded. It holds no device.
 #[gen_stub_pyclass]
 #[pyclass(frozen, module = "engine.decoder")]
-pub(super) struct Adapter {
-    inner: decoder::Adapter,
-    context: Shared,
-}
+pub(super) struct HostAdapter(decoder::Adapter);
 
 #[gen_stub_pymethods]
 #[pymethods]
-impl Adapter {
-    /// Load `checkpoint`, a PEFT LoRA checkpoint opened with its `adapter_config.json` as its
-    /// config, as an adapter of the decoder `spec` describes.
+impl HostAdapter {
+    /// Build `checkpoint`, a PEFT LoRA checkpoint opened with its `adapter_config.json` as its
+    /// config, as an adapter of the decoder `spec` describes; no device is touched.
     ///
     /// Raises:
     ///     ValueError: A factor is missing, malformed or of another shape, or the checkpoint
     ///         holds a tensor no adapted module reads.
     ///     NotImplementedError: The configuration asks for an update a term does not hold, such as
     ///         DoRA, a bias or a rank past `AdapterSpec.RANK`.
-    ///     RuntimeError: The device fails.
     #[new]
     fn new(py: Python<'_>, spec: &AdapterSpec, checkpoint: &Checkpoint) -> Result<Self, Error> {
+        Ok(Self(py.detach(|| spec.load.host(&checkpoint.0))?))
+    }
+}
+
+/// A decoder's adapter tree in HBM, which a call lists: `Adapter(spec)` allocates it with every
+/// term zero, and `load` writes a host adapter into its storage. A call reads it where it lies, so
+/// a framework makes it active by putting it in a slot of the list a call takes.
+#[gen_stub_pyclass]
+#[pyclass(module = "engine.decoder")]
+pub(super) struct Adapter {
+    inner: decoder::Adapter,
+    spec: Py<AdapterSpec>,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl Adapter {
+    /// Allocate an adapter of the decoder `spec` describes on its device, which updates no row.
+    ///
+    /// Raises:
+    ///     RuntimeError: The device fails or has no room for it.
+    #[new]
+    fn new(py: Python<'_>, spec: Bound<'_, AdapterSpec>) -> Result<Self, Error> {
+        let AdapterSpec { load, context } = spec.get();
         let inner = py.detach(|| {
-            let mut context = spec.context.lock().unwrap_or_else(PoisonError::into_inner);
-            (spec.load)(&checkpoint.0, &mut context.device)
+            let mut context = context.lock().unwrap_or_else(PoisonError::into_inner);
+            load.adapter(&mut context.device)
         })?;
         Ok(Self {
             inner,
-            context: spec.context.clone(),
+            spec: spec.unbind(),
         })
+    }
+
+    /// Write `host` into this adapter's storage, every term, holding the device while it writes:
+    /// a call submitted before reads the adapter it held, and one submitted after reads `host`.
+    ///
+    /// Raises:
+    ///     ValueError: `host` was built for another model, before anything is written.
+    ///     RuntimeError: The device fails; the adapter may hold part of `host`, so a framework
+    ///         stops serving it.
+    fn load(&mut self, py: Python<'_>, host: &HostAdapter) -> Result<(), Error> {
+        let Self { inner, spec } = self;
+        let AdapterSpec { load, context } = spec.get();
+        py.detach(|| {
+            let mut context = context.lock().unwrap_or_else(PoisonError::into_inner);
+            load.load(inner, &host.0, &mut context.device)
+        })?;
+        Ok(())
     }
 }
 
 impl Adapter {
     /// This adapter as a call on the device of `context` reads it; refuses one on another device.
     fn on(&self, context: &Shared) -> Result<&decoder::Adapter, Error> {
-        if !Arc::ptr_eq(&self.context, context) {
+        if !Arc::ptr_eq(&self.spec.get().context, context) {
             return Err(PyValueError::new_err("an adapter lies on another device").into());
         }
         Ok(&self.inner)
