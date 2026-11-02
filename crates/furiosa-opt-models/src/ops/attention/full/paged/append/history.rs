@@ -19,7 +19,7 @@ pub(crate) struct LastPanel;
 impl<KvHeads: AxisName, Head: AxisName>
     Op<(
         (
-            (&Gather, &Blocks<KvHeads, Head>),
+            (&Gather, Layer<&Blocks<KvHeads, Head>>),
             &HbmTensor<i32, Chip, m![Cache / Block]>,
             &Value,
         ),
@@ -33,7 +33,7 @@ impl<KvHeads: AxisName, Head: AxisName>
         context: &mut Device,
         (input, at): (
             (
-                (&Gather, &Blocks<KvHeads, Head>),
+                (&Gather, Layer<&Blocks<KvHeads, Head>>),
                 &HbmTensor<i32, Chip, m![Cache / Block]>,
                 &Value,
             ),
@@ -128,14 +128,14 @@ pub(crate) struct Gathered<P>(pub(crate) PhantomData<P>);
 /// Whole history block `at` of width `P`, every row of it committed history: read whole, so no
 /// length is staged for it.
 impl<KvHeads: AxisName, Head: AxisName, P: Panel, W: AxisName>
-    Op<((&Table<W>, (&Gather, &Blocks<KvHeads, Head>)), usize)> for Gathered<P>
+    Op<((&Table<W>, (&Gather, Layer<&Blocks<KvHeads, Head>>)), usize)> for Gathered<P>
 {
     type Output = InDm<KvHeads, Head, P>;
 
     fn forward(
         &self,
         context: &mut Device,
-        ((table, pool), at): ((&Table<W>, (&Gather, &Blocks<KvHeads, Head>)), usize),
+        ((table, pool), at): ((&Table<W>, (&Gather, Layer<&Blocks<KvHeads, Head>>)), usize),
     ) -> Self::Output {
         // SAFETY: a whole block lies below h, so every gathered row is committed history.
         Op::forward(
@@ -153,7 +153,7 @@ impl<KvHeads: AxisName, Head: AxisName, P: Panel, W: AxisName>
 /// History block `at` of width `P` up to the history's `length`: the rows past it are unspecified.
 impl<KvHeads: AxisName, Head: AxisName, P: Panel, W: AxisName>
     Op<(
-        (&Table<W>, (&Gather, &Blocks<KvHeads, Head>), &Value),
+        (&Table<W>, (&Gather, Layer<&Blocks<KvHeads, Head>>), &Value),
         usize,
     )> for Gathered<P>
 {
@@ -163,7 +163,7 @@ impl<KvHeads: AxisName, Head: AxisName, P: Panel, W: AxisName>
         &self,
         context: &mut Device,
         ((table, pool, length), at): (
-            (&Table<W>, (&Gather, &Blocks<KvHeads, Head>), &Value),
+            (&Table<W>, (&Gather, Layer<&Blocks<KvHeads, Head>>), &Value),
             usize,
         ),
     ) -> Self::Output {
@@ -376,7 +376,7 @@ pub(crate) struct FoldBlock<P>(pub(crate) PhantomData<P>);
 impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName, W: AxisName>
     Op<(
         &Attention<KvHeads, Groups, Head>,
-        (&Table<W>, (&Gather, &Blocks<KvHeads, Head>)),
+        (&Table<W>, (&Gather, Layer<&Blocks<KvHeads, Head>>)),
         usize,
         &Group<KvHeads, Groups, Head, T>,
         (
@@ -392,7 +392,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName,
         context: &mut Device,
         (attention, input, at, query, state): (
             &Attention<KvHeads, Groups, Head>,
-            (&Table<W>, (&Gather, &Blocks<KvHeads, Head>)),
+            (&Table<W>, (&Gather, Layer<&Blocks<KvHeads, Head>>)),
             usize,
             &Group<KvHeads, Groups, Head, T>,
             (
