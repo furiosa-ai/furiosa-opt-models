@@ -486,7 +486,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> Group<KvHeads, Groups,
             context,
             (
                 attention,
-                (first, |context: &mut Device, s| source.key(context, s)),
+                (first, |context: &mut Device, s| source.key(context, s), 0),
                 queries,
                 &mut scores,
             ),
@@ -514,7 +514,13 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> Group<KvHeads, Groups,
                     m![{ Symbol<Self> }, Rows % 8, { Keys<Narrow> }]>(),
             )
         };
-        let mut masked = history::Keyed::<KvHeads, Groups, Narrow, Self>::new();
+        let mut masked = DmTensor::<
+            f32,
+            Chip,
+            Cluster<KvHeads>,
+            Slice<KvHeads, Groups>,
+            m![{ Symbol<Self> }, Rows % 8, { Keys<Narrow> }],
+        >::new();
         let mut probabilities = history::Keyed::<KvHeads, Groups, Narrow, Self>::new();
         let mut total = state::Running::<KvHeads, Groups, Self>::new();
         #[unroll]
@@ -626,35 +632,41 @@ axes![
 ];
 
 /// A history block width: `Span` 128-key panels normalized as one `Keys`-wide row, of which
-/// the table of `W` windows of history holds `Count<W>`.
-pub(crate) trait Panel {
+/// the table of `W` windows of history holds `Count<W>`; its F32 scores are held a `Window`-wide
+/// block at a time, at most 512 keys.
+pub(crate) trait Panel: 'static {
     type Span: AxisName;
     type Keys: AxisName;
     type Count<W: AxisName>: AxisName;
+    type Window: Panel;
 }
 pub(crate) struct Half;
 impl Panel for Half {
     type Span = Span512;
     type Keys = Keys512;
     type Count<W: AxisName> = Whole<W, 512>;
+    type Window = Half;
 }
 pub(crate) struct Wide;
 impl Panel for Wide {
     type Span = Span1024;
     type Keys = Keys1024;
     type Count<W: AxisName> = Whole<W, 1024>;
+    type Window = Half;
 }
 pub(crate) struct Narrow;
 impl Panel for Narrow {
     type Span = Span128;
     type Keys = Cache;
     type Count<W: AxisName> = Chunks<W>;
+    type Window = Narrow;
 }
 pub(crate) struct Double;
 impl Panel for Double {
     type Span = Span2048;
     type Keys = Keys2048;
     type Count<W: AxisName> = Whole<W, 2048>;
+    type Window = Half;
 }
 const _: () = assert!(
     Keys2048::SIZE == Span2048::SIZE * Cache::SIZE
@@ -693,8 +705,9 @@ type Scalar<KvHeads, Groups> =
     VrfTensor<f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, m![Rows % 8, 1 # 8]>;
 type Local<KvHeads, Groups> =
     DmTensor<f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, m![Rows % 8, 1 # 8]>;
+/// One tile's scaled scores over a 128-key panel, in F32 until their exponents.
 type Scores<KvHeads, Groups> =
-    DmTensor<bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, m![Rows % 8, Cache]>;
+    DmTensor<f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, m![Rows % 8, Cache]>;
 type Partial<KvHeads, Groups, Head> =
     DmTensor<f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, m![Rows % 8, Head]>;
 pub(crate) type Table<W> = HbmTensor<i32, Chip, m![{ Symbol<Chunks<W>> }, Cache / Block]>;
@@ -1613,7 +1626,7 @@ impl<
             &mut *context,
             (
                 attention,
-                (key, |context: &mut Device, s| source.key(context, s)),
+                (key, |context: &mut Device, s| source.key(context, s), 0),
                 queries,
                 &mut scores,
             ),
@@ -1785,7 +1798,8 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel> Source<KvHea
 }
 
 /// The scaled scores of a block's `P::Span` panels for every tile of the group, into `scores`:
-/// one fill, the first already made, and one contraction per panel.
+/// one fill of the source's panels from `first`, the first already made, and one contraction per
+/// panel.
 struct ScoreBlock<P>(PhantomData<P>);
 
 impl<
@@ -1799,7 +1813,7 @@ impl<
 >
     Op<(
         &Attention<KvHeads, Groups, Head>,
-        (fresh::Keys<KvHeads, Groups, Head>, F),
+        (fresh::Keys<KvHeads, Groups, Head>, F, usize),
         &Q,
         &mut history::PanelScores<KvHeads, Groups, P, T>,
     )> for ScoreBlock<P>
@@ -1809,17 +1823,16 @@ impl<
     fn forward(
         &self,
         context: &mut Device,
-        (attention, (first, mut fill), queries, scores): (
+        (attention, (mut key, mut fill, first), queries, scores): (
             &Attention<KvHeads, Groups, Head>,
-            (fresh::Keys<KvHeads, Groups, Head>, F),
+            (fresh::Keys<KvHeads, Groups, Head>, F, usize),
             &Q,
             &mut history::PanelScores<KvHeads, Groups, P, T>,
         ),
     ) {
-        let mut key = first;
         #[unroll]
         for s in 1..P::Span::SIZE {
-            let next = fill(context, s);
+            let next = fill(context, first + s);
             Op::forward(
                 &history::Score::<P>(PhantomData),
                 &mut *context,
@@ -1974,12 +1987,13 @@ mod tests {
         ((j + head * 3 + group * 5) % 15) as f32 / 32.0 - 0.21875
     }
 
-    /// The attended rows of a chunk of `q` rows of `G` query groups a KV head over `h` keys of a
-    /// poisoned, shuffled pool; scratch rows past the chunk's hold `past`, or else a NaN query and
-    /// the next key's key and value, and live row `nan` holds a NaN value.
+    /// The attended rows of a chunk of `q` rows of `G` query groups a KV head, each query `gain`
+    /// times `query_value`, over `h` keys of a poisoned, shuffled pool; scratch rows past the
+    /// chunk's hold `past`, or else a NaN query and the next key's key and value, and live row
+    /// `nan` holds a NaN value.
     async fn attend<G: AxisName>(
         context: &mut Device,
-        (q, h): (usize, usize),
+        (q, h, gain): (usize, usize, f32),
         (past, nan): (Option<f32>, Option<usize>),
     ) -> Vec<bf16> {
         let scratch = |row: usize, own: f32, next: f32| {
@@ -2026,7 +2040,7 @@ mod tests {
         let query: Queries<G> = HostTensor::<bf16, m![Query, KvHeads, G, Head]>::from_vec(
             (0..1024 * 8 * groups * 128).map(|at| {
                 let j = at / (8 * groups * 128);
-                let own = query_value(j, at / (groups * 128) % 8, at / 128 % groups);
+                let own = gain * query_value(j, at / (groups * 128) % 8, at / 128 % groups);
                 scratch(j, own, f32::NAN)
             }),
         )
@@ -2136,14 +2150,14 @@ mod tests {
         ];
         let row = 8 * G::SIZE * 128;
         for (q, h) in cases {
-            let zeroed = attend::<G>(&mut *context, (q, h), (Some(0.0), None)).await;
+            let zeroed = attend::<G>(&mut *context, (q, h, 1.0), (Some(0.0), None)).await;
             let runs = [
                 (f32::NAN, None),
                 (f32::INFINITY, None),
                 (f32::NAN, Some(q - 1)),
             ];
             for (past, nan) in runs {
-                let got = attend::<G>(&mut *context, (q, h), (Some(past), nan)).await;
+                let got = attend::<G>(&mut *context, (q, h, 1.0), (Some(past), nan)).await;
                 let clean = nan.unwrap_or(q) * row;
                 for (at, (got, zeroed)) in got[..clean].iter().zip(&zeroed[..clean]).enumerate() {
                     let (got, zeroed) = (got.to_f32(), zeroed.to_f32());
@@ -2171,12 +2185,35 @@ mod tests {
     async fn attends_causally_with_poisoned_padding() {
         let _lease = DEVICE.lock().await;
         let mut context = Device::new(attend_chunk.topology()).unwrap();
-        attends_causally::<Groups>(&mut context).await;
-        attends_causally::<Pairs>(&mut context).await;
+        attends_causally::<Groups>(&mut context, 1.0).await;
+        attends_causally::<Pairs>(&mut context, 1.0).await;
     }
 
-    /// The causal check at `G` query groups a KV head.
-    async fn attends_causally<G: AxisName>(context: &mut Device) {
+    /// The same chunks attend as precisely at the scores a trained model's heads reach, tens
+    /// rather than the fixture's fractions: queries 32 times larger, scores up to 35.
+    #[tokio::test(flavor = "current_thread")]
+    async fn attends_causally_at_trained_scores() {
+        let _lease = DEVICE.lock().await;
+        let mut context = Device::new(attend_chunk.topology()).unwrap();
+        attends_causally::<Groups>(&mut context, 32.0).await;
+        attends_causally::<Pairs>(&mut context, 32.0).await;
+    }
+
+    /// Row `j`'s attended value of `head` and `group` before its channel's scale, its query
+    /// `gain` times `query_value`, over `keys` keys, with a stable F32 softmax.
+    fn reference(gain: f32, (j, head, group): (usize, usize, usize), keys: usize) -> f32 {
+        let score = |k| gain * query_value(j, head, group) * kv(k, head) * 128.0 / 128.0f32.sqrt();
+        let max = (0..keys).fold(f32::NEG_INFINITY, |max, k| max.max(score(k)));
+        let (sum, weighted) = (0..keys).fold((0.0f32, 0.0f32), |(sum, weighted), k| {
+            let weight = (score(k) - max).exp();
+            (sum + weight, weighted + weight * value(k, head))
+        });
+        weighted / sum
+    }
+
+    /// The causal check at `G` query groups a KV head, each query `gain` times `query_value`,
+    /// against the stable softmax of those F32 scores. Each case prints its largest output error.
+    async fn attends_causally<G: AxisName>(context: &mut Device, gain: f32) {
         let cases = [
             (128, 0),
             (256, 0),
@@ -2195,46 +2232,42 @@ mod tests {
             (897, 128),
             (1023, 2049),
         ];
+        let mut failures = Vec::new();
         for (q, h) in cases {
-            let got = attend::<G>(&mut *context, (q, h), (None, None)).await;
+            let got = attend::<G>(&mut *context, (q, h, gain), (None, None)).await;
             let mut max_error = 0.0f32;
             for j in 0..q {
                 for head in 0..8 {
                     for group in 0..G::SIZE {
-                        let scores: Vec<f32> = (0..=h + j)
-                            .map(|k| {
-                                query_value(j, head, group) * kv(k, head) * 128.0 / 128.0f32.sqrt()
-                            })
-                            .collect();
-                        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                        let mut sum = 0.0f32;
-                        let mut weighted = 0.0f32;
-                        for (k, score) in scores.into_iter().enumerate() {
-                            let weight = (score - max).exp();
-                            sum += weight;
-                            weighted += weight * value(k, head);
-                        }
+                        let attended = reference(gain, (j, head, group), h + j + 1);
                         for channel in 0..128 {
-                            let expected = weighted / sum * scale(channel);
+                            let expected = attended * scale(channel);
                             let at = ((j * 8 + head) * G::SIZE + group) * 128 + channel;
                             let actual = got[at].to_f32();
                             assert!(
                                 actual.is_finite(),
-                                "{} groups q={q} h={h} row={j} head={head} group={group}",
+                                "{} groups q={q} h={h} row={j} head={head} group={group} channel={channel}",
                                 G::SIZE
                             );
                             let error = (actual - expected).abs();
                             max_error = max_error.max(error);
-                            assert!(
-                                error <= 0.004,
-                                "{} groups q={q} h={h} row={j}: {actual} != {expected}",
-                                G::SIZE
-                            );
+                            if error > 0.004 && failures.len() < 8 {
+                                failures.push(format!(
+                                    "{} groups gain={gain} q={q} h={h} row={j} \
+                                     head={head} group={group} channel={channel}: \
+                                     actual={actual} f32_reference={expected}",
+                                    G::SIZE,
+                                ));
+                            }
                         }
                     }
                 }
             }
-            println!("{} groups q={q} h={h} max_error={max_error}", G::SIZE);
+            println!(
+                "{} groups gain={gain} q={q} h={h} max_error={max_error}",
+                G::SIZE
+            );
         }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }
