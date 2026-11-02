@@ -814,7 +814,7 @@ mod tests {
         let _lease = DEVICE.lock().await;
         let mut device = Device::new(checked.topology()).unwrap();
         let bytes = 2048 * <Blocks>::BLOCK_STRIDE as usize;
-        let mut layer = Blocks::from_buffer(HbmBuffer::alloc(&device, bytes).unwrap()).unwrap();
+        let mut layer = Blocks::from_buffers([HbmBuffer::alloc(&device, bytes).unwrap()]).unwrap();
         let blocks = layer.tokens.len();
         assert!(blocks > Eight::SIZE * BlockIndex::SIZE + Eight::SIZE);
         let base = |row: usize, head: usize, channel: usize| {

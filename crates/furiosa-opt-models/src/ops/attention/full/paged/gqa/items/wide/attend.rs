@@ -22,7 +22,7 @@ impl<
             (
                 &Wide<KvHeads, Head, Waves>,
                 Shape,
-                (&Gather, &Blocks<KvHeads, Head>),
+                (&Gather, Layer<&Blocks<KvHeads, Head>>),
             ),
             ((&H, &mut S), usize),
         ),
@@ -47,7 +47,7 @@ where
             (
                 &Wide<KvHeads, Head, Waves>,
                 Shape,
-                (&Gather, &Blocks<KvHeads, Head>),
+                (&Gather, Layer<&Blocks<KvHeads, Head>>),
             ),
             ((&H, &mut S), usize),
         ),

@@ -1,5 +1,5 @@
-//! The KV cache layout: blocks of token rows, each token's key and value stored together, and the
-//! bytes they span.
+//! The KV cache layout: blocks of token rows, each token's key and value stored together, the
+//! bytes they span, and one layer's range of a cache that holds several.
 
 use super::parallel::Chip;
 use crate::tensor::memory::blocks;
@@ -17,10 +17,11 @@ axes![
 /// A cache that stores each key and value in BF16.
 pub type Bf16 = bf16;
 
-/// One layer's runtime-sized cache, with each token's key and value stored together.
+/// A runtime-sized cache of one layer or of several, each layer's blocks an equal range after the
+/// previous layer's, with each token's key and value stored together.
 #[derive(DeviceSend)]
 pub struct Blocks<Heads: AxisName, Dimension: AxisName, D: Scalar = bf16, Chips: M = Chip> {
-    /// Interleaved key/value blocks in physical allocation order.
+    /// Interleaved key/value blocks in physical allocation order, layer by layer.
     pub tokens: Slice<HbmTensor<D, Chips, m![Block, KeyValue, Heads, Dimension]>>,
 }
 
@@ -35,19 +36,44 @@ impl<Heads: AxisName, Dimension: AxisName, D: Scalar, Chips: M> Blocks<Heads, Di
     /// Maximum block count whose byte offsets fit the device's signed index range.
     pub const MAX_BLOCKS: usize = (i32::MAX as usize + 1) / Self::BLOCK_STRIDE as usize;
 
-    /// One layer's storage split into blocks; refuse a partial or unaligned block, or more blocks
-    /// than signed byte offsets reach.
-    pub fn from_buffer(buffer: Buffer) -> io::Result<Self> {
-        let tokens = blocks(buffer, Self::BLOCK_STRIDE as usize)?;
-        if tokens.len() > Self::MAX_BLOCKS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cache blocks exceed signed byte offsets",
-            ));
+    /// The layers' storages split into blocks, one layer's after another; refuse a partial or
+    /// unaligned block, layers of unequal blocks, or more blocks a layer than signed byte offsets
+    /// reach.
+    pub fn from_buffers(layers: impl IntoIterator<Item = Buffer>) -> io::Result<Self> {
+        let layers = (layers.into_iter())
+            .map(|layer| blocks(layer, Self::BLOCK_STRIDE as usize))
+            .collect::<io::Result<Vec<Vec<_>>>>()?;
+        let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+        let entries = layers.first().map_or(0, Vec::len);
+        if layers.iter().any(|layer| layer.len() != entries) {
+            return Err(invalid("cache layers hold unequal blocks"));
+        }
+        if entries > Self::MAX_BLOCKS {
+            return Err(invalid("cache blocks exceed signed byte offsets"));
         }
         Ok(Self {
-            tokens: tokens.into(),
+            tokens: layers.into_iter().flatten().collect(),
         })
+    }
+}
+
+/// One layer's range of a cache's blocks: the blocks, borrowed as `B`, and the range's first
+/// entry, which a write or read through it addresses its byte offsets from.
+#[derive(Clone, Copy, Debug)]
+pub struct Layer<B> {
+    pub blocks: B,
+    pub entry: usize,
+}
+
+impl<Heads: AxisName, Dimension: AxisName, D: Scalar, Chips: M>
+    Layer<&mut Blocks<Heads, Dimension, D, Chips>>
+{
+    /// The same range, to read.
+    pub fn read(&self) -> Layer<&Blocks<Heads, Dimension, D, Chips>> {
+        Layer {
+            blocks: &*self.blocks,
+            entry: self.entry,
+        }
     }
 }
 
@@ -94,7 +120,7 @@ impl<Heads: AxisName, Dimension: AxisName> Blocks<Heads, Dimension> {
         let width = Self::BLOCK_STRIDE as usize / size_of::<bf16>();
         assert!(values.len().is_multiple_of(width));
         let mut blocks =
-            Self::from_buffer(Buffer::alloc(device, values.len() * size_of::<bf16>()).unwrap())
+            Self::from_buffers([Buffer::alloc(device, values.len() * size_of::<bf16>()).unwrap()])
                 .unwrap();
         blocks
             .write(device, 0..values.len() / width, values)
