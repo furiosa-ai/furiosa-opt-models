@@ -1448,7 +1448,8 @@ fn schedules_the_catalog_order() {
 
 /// The catalog's period and the mixed layers by the schedule, profiled at the level
 /// `FURIOSA_OPT_PROFILE` asks for: for each live row count `PERIOD_PROFILE_ROWS` lists, a warm-up
-/// and `PERIOD_PROFILE_STEPS` launches of each, every span written as [`Lines`] writes it.
+/// and `PERIOD_PROFILE_STEPS` launches of each, every span written as [`Lines`] writes it, then the
+/// hash of its last launch's live rows.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "profiles launches on a device"]
 async fn period_profile() {
@@ -1499,13 +1500,14 @@ async fn period_profile() {
         let (contexts, rows) = ((&contexts.0, &contexts.1), (&input, &count));
         for kernel in ["period", "mixed"] {
             let case = format!("{kernel}-rows-{live}");
+            let mut last = None;
             for sample in 0..=steps {
                 let span = match sample {
                     0 => tracing::info_span!("warmup", case = case.as_str()),
                     step => tracing::info_span!("forward", case = case.as_str(), step),
                 };
                 let started = std::time::Instant::now();
-                async {
+                let output = async {
                     let submit = tracing::info_span!("submit");
                     let output = match kernel {
                         "period" => {
@@ -1523,17 +1525,21 @@ async fn period_profile() {
                                 .await
                         }
                     };
-                    output.unwrap();
+                    let output = output.unwrap();
                     (device.synchronize())
                         .instrument(tracing::info_span!("wait"))
                         .await
                         .unwrap();
+                    output
                 }
                 .instrument(span)
                 .await;
                 let elapsed = started.elapsed().as_secs_f64() * 1e3;
                 println!("{case} step {sample}: {elapsed:.3} ms");
+                last = Some(output);
             }
+            let hash = fingerprint(&crate::rows(&mut device, &last.unwrap(), live).await);
+            println!("hash {case} {hash:016x}");
         }
     }
 }
