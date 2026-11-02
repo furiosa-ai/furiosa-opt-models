@@ -261,40 +261,11 @@ where
                 );
             }
         }
-        // Only the live rows move to the feature slices: all at once, else each whole lane group,
-        // then each other row alone.
-        type Feature<O> = Symbol<normalization::Chunk<O>>;
-        input.cover::<Lanes<R>, _>(
-            &mut (device, &mut output),
-            (
-                |(device, output)| {
-                    projected
-                        .view()
-                        .to_dm_view(&mut device.tdma, output.view_mut());
-                },
-                |(device, output), group| {
-                    Layout::<R>::group(projected.view(), group).to_dm_view(
-                        &mut device.tdma,
-                        output.view_mut().tile::<
-                            Layout<R>::Groups,
-                            1,
-                            Layout<R>::GroupMut<m![O % ({ Feature<O> })]>,
-                        >(group),
-                    );
-                },
-                |(device, output), row| {
-                    projected
-                        .view()
-                        .tile::<m![R], 1, m![R = 1 # R, O % ({ Owner<I, O> })]>(row)
-                        .to_dm_view(
-                            &mut device.tdma,
-                            output
-                                .view_mut()
-                                .tile::<m![R], 1, m![R = 1 #{!} R, O % ({ Feature<O> })]>(row),
-                        );
-                },
-            ),
-        );
+        // Every row moves to the feature slices at once: a transfer costs about the same for one
+        // row as for the envelope.
+        projected
+            .view()
+            .to_dm_view(&mut device.tdma, output.view_mut());
         input.with(output)
     }
 }
