@@ -186,7 +186,6 @@ where
             let group = first + at;
             let lanes =
                 stage::<I, O, R, _>(device, Layout::<R>::group(input.value().view(), group));
-            #[unroll]
             for tile in 0..<Tiles<I, O> as M>::SIZE {
                 let scale: VrfTensor<
                     f32,
