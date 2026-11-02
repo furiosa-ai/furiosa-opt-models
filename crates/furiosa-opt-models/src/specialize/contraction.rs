@@ -35,6 +35,9 @@ const SCALED: usize = 16 * 8;
 /// [`tiling`] restores, its staged copy fits a slice's data memory if any pass count [`holds`] it.
 pub(crate) const BAND: usize = 64;
 
+/// Inputs a ring of the slices carries: a row's sixteen-input packets, one a slice.
+const RING: usize = 16 * super::SLICES;
+
 /// Data memory a derived tiling's working set takes at most: fifteen pages, since the allocator
 /// leaves part of a page between them unused (measured: 469 KiB of them fit, 484 KiB do not).
 const WORKING: usize = 15 * PAGE;
@@ -758,7 +761,8 @@ const ROW_TILES: [RowTile; 22] = [
 
 /// The `(chunk, block, passes, routing)` of `(input, output)` of `bits`-bit coefficients: a listed
 /// shape's entry, else the widest legal replicated tiling of fewest passes, preferring parts of
-/// whole E2M1 scale blocks, over the fewest passes that hold a slab restored from codes, if any.
+/// whole E2M1 scale blocks, over the fewest passes that hold a slab restored from codes, if any; a
+/// slab restored from codes takes its rows over the ring where the ring carries all their inputs.
 pub(crate) const fn tiling(
     input: usize,
     output: usize,
@@ -782,12 +786,13 @@ pub(crate) const fn tiling(
         let mut passes = 1;
         while passes <= output / 8 {
             if let Some((chunk, block, passes, routing)) = widest(input, output, passes, unit) {
-                // A BF16 slab is staged as stored; one restored from narrower codes must hold.
-                let (block, passes) = if bits < 8 * BF16 {
-                    held(input, output, (chunk, block, passes))
-                } else {
-                    (block, passes)
-                };
+                // A BF16 slab is staged as stored, beside the replicated rows the listed tilings
+                // were timed against; one restored from codes must hold, beside rows on the ring.
+                if bits >= 8 * BF16 {
+                    return (chunk, block, passes, routing);
+                }
+                let (block, passes) = held(input, output, (chunk, block, passes));
+                let routing = if input <= RING { Ring } else { routing };
                 return (chunk, block, passes, routing);
             }
             passes += 1;
