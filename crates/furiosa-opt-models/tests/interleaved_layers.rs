@@ -1091,3 +1091,240 @@ fn schedules_the_catalog_order() {
     }
     runs();
 }
+
+/// The catalog's period and the mixed layers by the schedule, profiled at the level
+/// `FURIOSA_OPT_PROFILE` asks for: for each live row count `PERIOD_PROFILE_ROWS` lists, a warm-up
+/// and `PERIOD_PROFILE_STEPS` launches of each, every span written as [`Lines`] writes it.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "profiles launches on a device"]
+async fn period_profile() {
+    use std::future::IntoFuture;
+    use tracing::Instrument;
+    let list = |name: &str, default: &str| -> Vec<usize> {
+        let list = std::env::var(name).unwrap_or_else(|_| default.into());
+        list.split(',').map(|item| item.parse().unwrap()).collect()
+    };
+    let steps = list("PERIOD_PROFILE_STEPS", "10")[0];
+    // Installed before the functions load, so that they load with the profile.
+    let _spans = tracing::subscriber::set_default(Lines::new());
+    let _lease = DEVICE.lock().await;
+    let mut device = Device::new(scheduled_period.topology()).unwrap();
+    let sliding = [0, 1, 2, 3, 4].map(|at| checkpoint::<Group>(at).load(&mut device).unwrap());
+    let full = [checkpoint::<full::Group>(5).load(&mut device).unwrap()];
+    let period: Period = Interleave {
+        layers: (sliding, full),
+    };
+    let (mixed, norm) = model::<full::Group>(&mut device);
+    let (held, mixes) = (period_caches(), caches::<full::Group>());
+    for live in list("PERIOD_PROFILE_ROWS", "1,8,9,32,64") {
+        let contexts = (
+            context::<Group>(&mut device, live).await,
+            context::<full::Group>(&mut device, live).await,
+        );
+        let mut periods = (
+            [
+                pool::<Group>(&mut device, &held[0]).await,
+                pool::<Group>(&mut device, &held[1]).await,
+                pool::<Group>(&mut device, &held[2]).await,
+                pool::<Group>(&mut device, &held[3]).await,
+                pool::<Group>(&mut device, &held[4]).await,
+            ],
+            [pool::<full::Group>(&mut device, &held[5]).await],
+        );
+        let mut pools = (
+            [
+                pool::<Group>(&mut device, &mixes[0]).await,
+                pool::<Group>(&mut device, &mixes[2]).await,
+            ],
+            [
+                pool::<full::Group>(&mut device, &mixes[1]).await,
+                pool::<full::Group>(&mut device, &mixes[3]).await,
+            ],
+        );
+        let (input, count) = input(&mut device, live).await;
+        let (contexts, rows) = ((&contexts.0, &contexts.1), (&input, &count));
+        for kernel in ["period", "mixed"] {
+            let case = format!("{kernel}-rows-{live}");
+            for sample in 0..=steps {
+                let span = match sample {
+                    0 => tracing::info_span!("warmup", case = case.as_str()),
+                    step => tracing::info_span!("forward", case = case.as_str(), step),
+                };
+                let started = std::time::Instant::now();
+                async {
+                    let submit = tracing::info_span!("submit");
+                    let output = match kernel {
+                        "period" => {
+                            let model = (&period, &norm);
+                            let arguments = (&mut device, model, contexts, &mut periods, rows);
+                            (launch(scheduled_period, arguments).into_future())
+                                .instrument(submit)
+                                .await
+                        }
+                        _ => {
+                            let model = (&mixed, &norm);
+                            let arguments = (&mut device, model, contexts, &mut pools, rows);
+                            (launch(scheduled_mixed, arguments).into_future())
+                                .instrument(submit)
+                                .await
+                        }
+                    };
+                    output.unwrap();
+                    (device.synchronize())
+                        .instrument(tracing::info_span!("wait"))
+                        .await
+                        .unwrap();
+                }
+                .instrument(span)
+                .await;
+                let elapsed = started.elapsed().as_secs_f64() * 1e3;
+                println!("{case} step {sample}: {elapsed:.3} ms");
+            }
+        }
+    }
+}
+
+/// Records every span to `PERIOD_PROFILE_OUT` (default `npu.tsv`), a line each: `S id parent name
+/// ns fields` as it opens (an NPU span's fields carry its cycles) and `C id ns` as it closes; a
+/// kernel's name, written once on a `K label bytes name` line, is its label in the spans.
+struct Lines {
+    out: std::sync::Mutex<std::io::BufWriter<std::fs::File>>,
+    base: std::time::Instant,
+    spans: std::sync::Mutex<Spans>,
+}
+
+/// The spans [`Lines`] tracks: the last id, each open span's handles, the spans each thread is
+/// in, and the labels of the kernels named so far.
+#[derive(Default)]
+struct Spans {
+    last: u64,
+    handles: std::collections::HashMap<u64, usize>,
+    entered: std::collections::HashMap<std::thread::ThreadId, Vec<u64>>,
+    kernels: std::collections::HashSet<String>,
+}
+
+impl Lines {
+    fn new() -> Self {
+        let path = std::env::var("PERIOD_PROFILE_OUT").unwrap_or_else(|_| "npu.tsv".into());
+        let out = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+        Self {
+            out: std::sync::Mutex::new(out),
+            base: std::time::Instant::now(),
+            spans: std::sync::Mutex::default(),
+        }
+    }
+
+    fn write(&self, line: &str) {
+        use std::io::Write;
+        self.out.lock().unwrap().write_all(line.as_bytes()).unwrap();
+    }
+}
+
+impl tracing::Subscriber for Lines {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        let mut spans = self.spans.lock().unwrap();
+        spans.last += 1;
+        let id = spans.last;
+        spans.handles.insert(id, 1);
+        let thread = std::thread::current().id();
+        let parent = match attributes.parent() {
+            Some(parent) => parent.into_u64(),
+            None if attributes.is_contextual() => (spans.entered.get(&thread))
+                .and_then(|stack| stack.last().copied())
+                .unwrap_or(0),
+            None => 0,
+        };
+        let mut fields = Fields {
+            text: String::new(),
+            kernels: &mut spans.kernels,
+            named: String::new(),
+        };
+        attributes.record(&mut fields);
+        let line = format!(
+            "{}S\t{id}\t{parent}\t{}\t{}{}\n",
+            fields.named,
+            attributes.metadata().name(),
+            self.base.elapsed().as_nanos(),
+            fields.text
+        );
+        drop(spans);
+        self.write(&line);
+        tracing::span::Id::from_u64(id)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {}
+
+    fn enter(&self, span: &tracing::span::Id) {
+        let mut spans = self.spans.lock().unwrap();
+        let stack = spans.entered.entry(std::thread::current().id());
+        stack.or_default().push(span.into_u64());
+    }
+
+    fn exit(&self, span: &tracing::span::Id) {
+        let mut spans = self.spans.lock().unwrap();
+        if let Some(stack) = spans.entered.get_mut(&std::thread::current().id())
+            && let Some(at) = stack.iter().rposition(|&id| id == span.into_u64())
+        {
+            stack.remove(at);
+        }
+    }
+
+    fn clone_span(&self, span: &tracing::span::Id) -> tracing::span::Id {
+        let mut spans = self.spans.lock().unwrap();
+        *spans.handles.entry(span.into_u64()).or_default() += 1;
+        span.clone()
+    }
+
+    fn try_close(&self, span: tracing::span::Id) -> bool {
+        let id = span.into_u64();
+        let mut spans = self.spans.lock().unwrap();
+        let Some(handles) = spans.handles.get_mut(&id) else {
+            return false;
+        };
+        *handles -= 1;
+        if *handles > 0 {
+            return false;
+        }
+        spans.handles.remove(&id);
+        drop(spans);
+        self.write(&format!("C\t{id}\t{}\n", self.base.elapsed().as_nanos()));
+        true
+    }
+}
+
+/// A span's fields as `\tname=value` text, a kernel's name replaced by its label (the last path
+/// segment before any generic argument), and the `K` line of a kernel it names first.
+struct Fields<'a> {
+    text: String,
+    kernels: &'a mut std::collections::HashSet<String>,
+    named: String,
+}
+
+impl tracing::field::Visit for Fields<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() != "kernel" {
+            self.text.push_str(&format!("\t{}={value}", field.name()));
+            return;
+        }
+        let path = value.split('<').next().unwrap_or(value);
+        let label = path.rsplit("::").next().unwrap_or(path).to_owned();
+        if self.kernels.insert(label.clone()) {
+            let name: String = value.chars().take(400).collect();
+            self.named = format!("K\t{label}\t{}\t{name}\n", value.len());
+        }
+        self.text.push_str(&format!("\tkernel={label}"));
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let text = format!("{value:?}");
+        self.record_str(field, text.trim_matches('"'));
+    }
+}
