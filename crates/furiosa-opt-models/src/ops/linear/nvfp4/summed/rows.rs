@@ -9,7 +9,9 @@
 //!   pass there; a pass covers the most rows whose FP32 block scales fit the vector registers.
 //! - The projected rows end where the contract places them: in the output's feature slices once
 //!   the last pass ends, or [`Kept`] where the passes summed them.
-//! - Rows another summed projection kept move to the feature slices this projection's stage reads.
+//! - Rows another summed projection kept land in both clusters as they lie, an owner's run of
+//!   features a slice, and its lane groups stage from there; rows whose runs cannot tile both
+//!   clusters' slices that way move to the feature slices first.
 
 use crate::ops::linear::kernel::Rounded;
 use crate::ops::normalization::{self, FeatureSlices, Spread};
@@ -89,6 +91,37 @@ type Lane<R> = m![{ Layout<R>::Lanes }];
 type Summing<I, O, R> =
     DmTensor<bf16, Chip, Cluster<O>, Reduced<I, O>, m![R, O % ({ Owner<I, O> })]>;
 
+/// The rows a projection of `H` inputs into `I` outputs summed, in both clusters: each half of the
+/// outputs on half of the slices, an owner's run on a slice of its own, as the passes left them.
+type Both<H, I, R> =
+    DmTensor<bf16, Chip, normalization::Cluster, Runs<H, I>, m![R, I % ({ Owner<H, I> })]>;
+type Runs<H, I> = m![I / (I / 2), I % (I / 2) / ({ Owner<H, I> })];
+
+/// Whether [`Both`] holds the rows a projection of `H` inputs into `I` outputs summed: the runs of
+/// both halves fit a cluster's slices and a part of `I` inputs is whole runs.
+const fn fits_both<H: AxisName, I: AxisName>() -> bool {
+    H::SIZE / Chunk::<H>::SIZE >= 2
+        && I::SIZE / Chunk::<I>::SIZE >= 2
+        && Chunk::<I>::SIZE.is_multiple_of(Owned::<H, I>::SIZE)
+}
+
+/// Inputs a switch packet takes from one owner's run of `H`-input rows: the most, at most a flit,
+/// that divide the run, so a packet never spans two owners.
+#[derive(Clone, Debug)]
+struct Piece<H, I>(PhantomData<(H, I)>);
+
+impl<H: AxisName, I: AxisName> AxisName for Piece<H, I> {
+    const NAME: Ident = Ident::new("Piece");
+    const SIZE: usize = {
+        let run = Owned::<H, I>::SIZE;
+        let mut piece = 16;
+        while !run.is_multiple_of(piece) {
+            piece -= 4;
+        }
+        piece
+    };
+}
+
 /// A weight's tensor scale, E4M3 block scales and codes on the slices of its passes: the weight
 /// begun.
 pub struct Landed<I: AxisName, O: AxisName> {
@@ -136,10 +169,10 @@ impl<I: AxisName, O: AxisName> Landed<I, O> {
 
     /// Every live row's outputs `bf16(sum_b scale_b (sum_{k in b} code_k x_k) / global)`, a lane
     /// group at a time, each in the slices that sum it.
-    fn project<R: AxisName>(
+    fn project<R: AxisName, X: Stage<I, O, R>>(
         &self,
         device: &mut Device,
-        input: &Live<Spread<I, R>, R>,
+        input: &Live<X, R>,
     ) -> Summing<I, O, R> {
         let global = scalar::register(device, &self.global);
         // The block scales widen to FP32 once, so each pass of every group loads its rows' as is.
@@ -162,8 +195,7 @@ impl<I: AxisName, O: AxisName> Landed<I, O> {
         let (first, count) = input.groups::<Lanes<R>>();
         for at in 0..count {
             let group = first + at;
-            let lanes =
-                stage::<I, O, R, _>(device, Layout::<R>::group(input.value().view(), group));
+            let lanes = input.value().stage(device, group);
             for tile in 0..<Tiles<I, O> as M>::SIZE {
                 let scale: VrfTensor<
                     f32,
@@ -362,8 +394,8 @@ where
     }
 }
 
-/// The same rows through the weight as it landed: they move to the feature slices this weight's
-/// stage reads, then project.
+/// The same rows through the weight as it landed: one transfer lands them in both clusters as they
+/// lie, or in the feature slices where they cannot lie so, then they project.
 impl<'x, H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P>
     Op<(Landed<I, O>, &'x Live<Kept<Summing<H, I, R>>, R>)>
     for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P>, Chip, K, V>
@@ -377,8 +409,15 @@ where
         device: &mut Device,
         (landed, input): (Landed<I, O>, &'x Live<Kept<Summing<H, I, R>>, R>),
     ) -> Self::Output {
-        let rows = input.with(spread(device, &input.value().0));
-        let projected = landed.project(device, &rows);
+        let rows = &input.value().0;
+        let projected = if const { fits_both::<H, I>() } {
+            let mut both = Both::<H, I, R>::new();
+            rows.view().to_dm_view(&mut device.tdma, both.view_mut());
+            landed.project(device, &input.with(both))
+        } else {
+            let spread = input.with(spread(device, rows));
+            landed.project(device, &spread)
+        };
         input.with(P::place(device, projected))
     }
 }
@@ -394,32 +433,95 @@ fn spread<I: AxisName, O: AxisName, R: AxisName>(
     spread
 }
 
-/// One lane group of the rows as the tensor-register lanes of every slice, each slice the group's
-/// inputs in its part: the switch ring takes each feature slice's inputs to the slices that hold
-/// them.
-fn stage<'i, I: AxisName, O: AxisName, R: AxisName, E: M>(
-    device: &mut Device,
-    input: DmTensorView<'i, bf16, Chip, normalization::Cluster, FeatureSlices<I>, E>,
-) -> TrfTensor<bf16, Chip, Cluster<O>, Owners<I, O>, Lane<R>, m![1, { Part<I> }]> {
-    type Feature<I> = Symbol<normalization::Chunk<I>>;
-    if const { I::SIZE <= 16 * 256 } {
-        // SAFETY: both physical clusters hold every row, sixteen inputs a slice; only the logical
-        // cluster axis changes.
-        let input = unsafe { input.reshape::<Chip, Cluster<O>, m![I / 16 # 256], E>() };
-        device
-            .sub
-            .begin(input)
-            .fetch::<Lane<R>, m![I % 16]>()
-            .switch::<Owners<I, O>, m![{ Lane<R> }, { Part<I> } / 16]>(
-                SwitchConfig::CustomBroadcast { ring_size: 256 },
-            )
-            .collect::<m![{ Lane<R> }, { Part<I> } / 16], m![I % 16]>()
-            .to_trf()
-    } else {
-        // A slice holds several switch packets, delivered with other slices' inputs innermost, so
-        // the parts are written in DM before the lanes fill in input order.
-        // SAFETY: as above, only the logical cluster axis changes.
-        let input = unsafe { input.reshape::<Chip, Cluster<O>, FeatureSlices<I>, E>() };
+/// Rows a projection of `I` inputs into `O` outputs reads a lane group of as the tensor-register
+/// lanes of every slice, each slice the group's inputs in its part.
+trait Stage<I: AxisName, O: AxisName, R: AxisName> {
+    fn stage(
+        &self,
+        device: &mut Device,
+        group: usize,
+    ) -> TrfTensor<bf16, Chip, Cluster<O>, Owners<I, O>, Lane<R>, m![1, { Part<I> }]>;
+}
+
+/// Rows in their feature slices: the switch ring takes each feature slice's inputs to the slices
+/// that hold them.
+impl<I: AxisName, O: AxisName, R: AxisName> Stage<I, O, R> for Spread<I, R> {
+    fn stage(
+        &self,
+        device: &mut Device,
+        group: usize,
+    ) -> TrfTensor<bf16, Chip, Cluster<O>, Owners<I, O>, Lane<R>, m![1, { Part<I> }]> {
+        type Feature<I> = Symbol<normalization::Chunk<I>>;
+        type Group<I, R> = Layout<R>::Elements<m![I % ({ Feature<I> })]>;
+        let input = Layout::<R>::group(self.view(), group);
+        if const { I::SIZE <= 16 * 256 } {
+            // SAFETY: both physical clusters hold every row, sixteen inputs a slice; only the
+            // logical cluster axis changes.
+            let input =
+                unsafe { input.reshape::<Chip, Cluster<O>, m![I / 16 # 256], Group<I, R>>() };
+            device
+                .sub
+                .begin(input)
+                .fetch::<Lane<R>, m![I % 16]>()
+                .switch::<Owners<I, O>, m![{ Lane<R> }, { Part<I> } / 16]>(
+                    SwitchConfig::CustomBroadcast { ring_size: 256 },
+                )
+                .collect::<m![{ Lane<R> }, { Part<I> } / 16], m![I % 16]>()
+                .to_trf()
+        } else {
+            // A slice holds several switch packets, delivered with other slices' inputs
+            // innermost, so the parts are written in DM before the lanes fill in input order.
+            // SAFETY: as above, only the logical cluster axis changes.
+            let input =
+                unsafe { input.reshape::<Chip, Cluster<O>, FeatureSlices<I>, Group<I, R>>() };
+            let mut staged: DmTensor<
+                bf16,
+                Chip,
+                Cluster<O>,
+                Owners<I, O>,
+                m![{ Lane<R> }, { Part<I> }],
+            > = DmTensor::new();
+            device
+                .sub
+                .begin(input)
+                .fetch::<m![{ Lane<R> }, I % ({ Feature<I> }) / 16], m![I % 16]>()
+                .switch::<Owners<I, O>, m![
+                    { Lane<R> },
+                    I % ({ Feature<I> }) / 16,
+                    I % ({ Width<I> }) / ({ Feature<I> })
+                ]>(SwitchConfig::CustomBroadcast { ring_size: 256 })
+                .collect::<m![
+                    { Lane<R> },
+                    I % ({ Feature<I> }) / 16,
+                    I % ({ Width<I> }) / ({ Feature<I> })
+                ], m![I % 16]>()
+                .commit_trim::<m![I % 16]>()
+                .commit_view(staged.view_mut());
+            device
+                .sub
+                .begin(staged.view())
+                .fetch::<m![{ Lane<R> }, { Part<I> } / 16], m![I % 16]>()
+                .collect::<m![{ Lane<R> }, { Part<I> } / 16], m![I % 16]>()
+                .to_trf()
+        }
+    }
+}
+
+/// Rows a summed projection of `H` inputs kept, in both clusters: the switch ring takes each
+/// owner's run, a piece at a time, to the slices whose part holds it, and the parts are written in
+/// DM before the lanes fill in input order.
+impl<H: AxisName, I: AxisName, O: AxisName, R: AxisName> Stage<I, O, R> for Both<H, I, R> {
+    fn stage(
+        &self,
+        device: &mut Device,
+        group: usize,
+    ) -> TrfTensor<bf16, Chip, Cluster<O>, Owners<I, O>, Lane<R>, m![1, { Part<I> }]> {
+        type Run<H, I> = Symbol<Piece<H, I>>;
+        type Group<H, I, R> = Layout<R>::Elements<m![I % ({ Owner<H, I> })]>;
+        const { assert!(fits_both::<H, I>()) };
+        let input = Layout::<R>::group(self.view(), group);
+        // SAFETY: both physical clusters hold every row; only the logical cluster axis changes.
+        let input = unsafe { input.reshape::<Chip, Cluster<O>, Runs<H, I>, Group<H, I, R>>() };
         let mut staged: DmTensor<
             bf16,
             Chip,
@@ -430,18 +532,20 @@ fn stage<'i, I: AxisName, O: AxisName, R: AxisName, E: M>(
         device
             .sub
             .begin(input)
-            .fetch::<m![{ Lane<R> }, I % ({ Feature<I> }) / 16], m![I % 16]>()
+            .fetch::<m![{ Lane<R> }, I % ({ Owner<H, I> }) / ({ Run<H, I> })], m![
+                I % ({ Run<H, I> })
+            ]>()
             .switch::<Owners<I, O>, m![
                 { Lane<R> },
-                I % ({ Feature<I> }) / 16,
-                I % ({ Width<I> }) / ({ Feature<I> })
+                I % ({ Owner<H, I> }) / ({ Run<H, I> }),
+                I % ({ Width<I> }) / ({ Owner<H, I> })
             ]>(SwitchConfig::CustomBroadcast { ring_size: 256 })
             .collect::<m![
                 { Lane<R> },
-                I % ({ Feature<I> }) / 16,
-                I % ({ Width<I> }) / ({ Feature<I> })
-            ], m![I % 16]>()
-            .commit_trim::<m![I % 16]>()
+                I % ({ Owner<H, I> }) / ({ Run<H, I> }),
+                I % ({ Width<I> }) / ({ Owner<H, I> })
+            ], m![I % ({ Run<H, I> }) # 16]>()
+            .commit_trim::<m![I % ({ Run<H, I> })]>()
             .commit_view(staged.view_mut());
         device
             .sub
