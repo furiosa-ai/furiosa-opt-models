@@ -13,7 +13,7 @@ env:
 jobs:
   run:
     if: github.event_name == 'pull_request'
-    runs-on: arc-runner-benchmark-rngd4
+    runs-on: furiosa-opt-models-rngd4-runner
     timeout-minutes: 10
     steps:
       # The inventory and actions come from the tree the test binaries were built from.
