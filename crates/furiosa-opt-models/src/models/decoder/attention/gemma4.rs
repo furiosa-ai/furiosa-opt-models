@@ -23,7 +23,7 @@ use crate::modules::{multimodal, transformer};
 use crate::ops::attention::gqa::Cache;
 use crate::ops::embedding::Embedding;
 use crate::ops::index::scatter::Scatter;
-use crate::ops::linear::Affine;
+use crate::ops::linear::{Affine, Native};
 use crate::ops::normalization::{RmsNorm, UnitRmsNorm};
 use crate::ops::pointwise::activation::{NewGelu, Softcap};
 use crate::ops::pointwise::{add, multiply};
@@ -31,6 +31,7 @@ use crate::ops::reduction::Argmax;
 use crate::tensor::axis;
 use crate::tensor::cache;
 use crate::tensor::form::Weight;
+use crate::tensor::mapping::Reshape;
 use crate::tensor::memory::{Hbm, Memory};
 use crate::tensor::parallel::{Chip, Parallel};
 use crate::{Branch, Op, Sequential, Then};
@@ -130,8 +131,10 @@ type Values<A, P, X> = Heads<<P as Forms>::Value, <A as Attention>::KvWidth, KvV
 /// Group `A`'s key/value heads.
 type KvView<A> = decoder::HeadView<<A as Attention>::Heads, <A as Attention>::Head>;
 
-/// Heads read as `View`, projected from a row in form `F` to `Width` features.
-type Heads<F, Width, View, X> = decoder::Heads<F, Hidden, Width, View, bf16, Parallel<1>, X>;
+/// Heads read as `View`, projected from a row in form `F` to `Width` features, which the head
+/// split takes where the contraction leaves them.
+type Heads<F, Width, View, X> =
+    Sequential<Native<decoder::Projection<F, Hidden, Width, bf16, Chip, X>>, Reshape<View>>;
 
 /// Group `A`'s attended heads projected back to rows.
 type Output<A, P, X> = Named<"o_proj", decoder::Output<P, Hidden, A, Parallel<1>, X>>;

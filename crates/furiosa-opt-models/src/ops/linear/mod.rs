@@ -467,6 +467,44 @@ where
     }
 }
 
+/// A projection whose live rows stay in its contraction's native mapping, for a consumer that
+/// moves them where it reads them: a weight form `W` read as itself.
+#[derive(DeviceSend, Load)]
+pub struct Native<W>(pub W);
+
+/// The live row groups of a launch's rows projected by the dense contraction, where it leaves
+/// them; the projected rows keep the launch's live rows.
+impl<'x, In, Out, Code, Rows, Chips, S, F, W>
+    Op<&'x Live<DmTensor<bf16, m![1], Chips, S, m![Rows, { F }]>, Rows>> for Native<W>
+where
+    In: AxisName,
+    Out: AxisName,
+    Code: Scalar,
+    Rows: AxisName,
+    Chips: M,
+    S: M,
+    F: M,
+    W: Matrix<In = In, Out = Out, Stored = Code>,
+{
+    type Output = Live<Projected<In, Out, Code, Rows>, Rows>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        input: &'x Live<DmTensor<bf16, m![1], Chips, S, m![Rows, { F }]>, Rows>,
+    ) -> Self::Output {
+        let projected = Affine::new(&self.0, ()).forward(
+            device,
+            (
+                input.with(PhantomData::<Rows>),
+                input.value().view(),
+                |at| mapping::Rows::<Rows>::group(input.value().view(), at),
+            ),
+        );
+        input.with(projected)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use furiosa_opt_std::prelude::*;

@@ -438,6 +438,75 @@ impl<Width: AxisName, Heads: AxisName, Groups: AxisName, Head: AxisName, Rows: A
     }
 }
 
+/// The rows a projection of one head kind leaves where its contraction computes them, as `Heads`
+/// heads of `Groups` query heads each, as from feature slices.
+impl<In, Width, Code, Heads, Groups, Head, Rows>
+    Op<Live<linear::Projected<In, Width, Code, Rows>, Rows>> for Reshape<m![Heads, Groups, Head]>
+where
+    In: AxisName,
+    Width: AxisName,
+    Code: Scalar,
+    Heads: AxisName,
+    Groups: AxisName,
+    Head: AxisName,
+    Rows: AxisName,
+{
+    type Output = Live<super::Heads<Rows, Heads, Groups, Head>, Rows>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        input: Live<linear::Projected<In, Width, Code, Rows>, Rows>,
+    ) -> Self::Output {
+        const { assert!(Width::SIZE == Heads::SIZE * Groups::SIZE * Head::SIZE) };
+        let mut rows: Staged<Width, Rows> = DmTensor::new();
+        let (first, count) = input.groups::<crate::tensor::axis::Lanes<Rows>>();
+        if count == 1 && count < <linear::Groups<Rows> as M>::SIZE {
+            linear::Linear::<In, Width>::group(input.value(), first).to_dm_view(
+                &mut device.tdma,
+                Layout::<Rows>::selected_mut(rows.view_mut(), first),
+            );
+            let mut heads: super::Heads<Rows, Heads, Groups, Head> = DmTensor::new();
+            // SAFETY: as for every row group below.
+            unsafe {
+                rows.view().reshape::<
+                    Chip,
+                    m![1 # 2],
+                    Lane<Rows>,
+                    m![{ linear::Groups<Rows> }, Heads, Groups, Head],
+                >()
+            }
+            .tile::<
+                linear::Groups<Rows>,
+                1,
+                m![{ Layout<Rows>::Selected }, Heads, Groups, Head],
+            >(first)
+            .to_dm_view(
+                &mut device.tdma,
+                heads.view_mut().tile::<
+                    linear::Groups<Rows>,
+                    1,
+                    m![{ Layout<Rows>::SelectedMut }, Groups, Head],
+                >(first),
+            );
+            return input.with(heads);
+        }
+        (input.value().view()).to_dm_view(&mut device.tdma, rows.view_mut());
+        let mut heads: super::Heads<Rows, Heads, Groups, Head> = DmTensor::new();
+        // SAFETY: the features are head-major within every row. Relabeling preserves cells.
+        unsafe {
+            rows.view().reshape::<
+                Chip,
+                m![1 # 2],
+                Lane<Rows>,
+                m![{ linear::Groups<Rows> }, Heads, Groups, Head],
+            >()
+        }
+        .to_dm_view(&mut device.tdma, heads.view_mut());
+        input.with(heads)
+    }
+}
+
 /// The rows a key or value projection leaves in feature slices, as `Heads` heads: the view above
 /// with one head in each group.
 impl<Width: AxisName, Heads: AxisName, Head: AxisName, Rows: AxisName>
@@ -446,6 +515,29 @@ impl<Width: AxisName, Heads: AxisName, Head: AxisName, Rows: AxisName>
     type Output = Live<super::Heads<Rows, Heads, Single, Head>, Rows>;
 
     fn forward(&self, device: &mut Device, input: Live<Spread<Width, Rows>, Rows>) -> Self::Output {
+        Reshape::<m![Heads, Single, Head]>::default().forward(device, input)
+    }
+}
+
+/// The rows a key or value projection leaves where its contraction computes them, as `Heads`
+/// heads: the view above with one head in each group.
+impl<In, Width, Code, Heads, Head, Rows> Op<Live<linear::Projected<In, Width, Code, Rows>, Rows>>
+    for Reshape<m![Heads, Head]>
+where
+    In: AxisName,
+    Width: AxisName,
+    Code: Scalar,
+    Heads: AxisName,
+    Head: AxisName,
+    Rows: AxisName,
+{
+    type Output = Live<super::Heads<Rows, Heads, Single, Head>, Rows>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        input: Live<linear::Projected<In, Width, Code, Rows>, Rows>,
+    ) -> Self::Output {
         Reshape::<m![Heads, Single, Head]>::default().forward(device, input)
     }
 }
