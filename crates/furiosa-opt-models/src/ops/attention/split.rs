@@ -379,7 +379,8 @@ impl<Width: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName, Rows:
 }
 
 /// The rows a projection of one head kind leaves in feature slices, as `Heads` heads of
-/// `Groups` query heads each; each row keeps its lane and its heads their order.
+/// `Groups` query heads each; each row keeps its lane and its heads their order, and live rows
+/// that lie in one row group move alone.
 impl<Width: AxisName, Heads: AxisName, Groups: AxisName, Head: AxisName, Rows: AxisName>
     Op<Live<Spread<Width, Rows>, Rows>> for Reshape<m![Heads, Groups, Head]>
 {
@@ -388,11 +389,41 @@ impl<Width: AxisName, Heads: AxisName, Groups: AxisName, Head: AxisName, Rows: A
     fn forward(&self, device: &mut Device, input: Live<Spread<Width, Rows>, Rows>) -> Self::Output {
         const { assert!(Width::SIZE == Heads::SIZE * Groups::SIZE * Head::SIZE) };
         let mut rows: Staged<Width, Rows> = DmTensor::new();
+        let mut heads: super::Heads<Rows, Heads, Groups, Head> = DmTensor::new();
+        let (first, count) = input.groups::<crate::tensor::axis::Lanes<Rows>>();
+        if count == 1 && count < <linear::Groups<Rows> as M>::SIZE {
+            Layout::<Rows>::group(input.value().view(), first).to_dm_view(
+                &mut device.tdma,
+                Layout::<Rows>::selected_mut(rows.view_mut(), first),
+            );
+            // SAFETY: as for every row group below.
+            unsafe {
+                rows.view().reshape::<
+                    Chip,
+                    m![1 # 2],
+                    Lane<Rows>,
+                    m![{ linear::Groups<Rows> }, Heads, Groups, Head],
+                >()
+            }
+            .tile::<
+                linear::Groups<Rows>,
+                1,
+                m![{ Layout<Rows>::Selected }, Heads, Groups, Head],
+            >(first)
+            .to_dm_view(
+                &mut device.tdma,
+                heads.view_mut().tile::<
+                    linear::Groups<Rows>,
+                    1,
+                    m![{ Layout<Rows>::SelectedMut }, Groups, Head],
+                >(first),
+            );
+            return input.with(heads);
+        }
         input
             .value()
             .view()
             .to_dm_view(&mut device.tdma, rows.view_mut());
-        let mut heads: super::Heads<Rows, Heads, Groups, Head> = DmTensor::new();
         // SAFETY: the features are head-major within every row. Relabeling preserves cells.
         unsafe {
             rows.view().reshape::<
