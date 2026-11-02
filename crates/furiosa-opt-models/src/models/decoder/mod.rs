@@ -635,7 +635,7 @@ pub mod form {
     use crate::tensor;
     use crate::tensor::form::fp8::Block;
     use crate::tensor::form::fp8::Scales;
-    use crate::tensor::form::nvfp4::{self, Early, Late, Summed, W4A4, W4A16};
+    use crate::tensor::form::nvfp4::{self, Early, Features, Late, Summed, W4A4, W4A16};
     use crate::tensor::parallel::Chip;
     use furiosa_opt_std::prelude::*;
 
@@ -659,7 +659,8 @@ pub mod form {
 
     /// [`Nvfp4`]'s weights under the experimental summed contract: a row's FP32 sum divides by the
     /// global scale, so no coefficient rounds to BF16. Opt in by naming it in place of [`Nvfp4`].
-    pub struct Nvfp4Summed;
+    /// A launch's projected rows end where `P` places them, as [`Summed`] reads it.
+    pub struct Nvfp4Summed<P = Features>(PhantomData<P>);
 
     /// FP4 weights with per-16 FP8 block scales under a late FP32 tensor scale, whose inputs enter
     /// in form `A`: quantized at run time as the weights are, or as the BF16 they are.
@@ -799,7 +800,7 @@ pub mod form {
         type Caches = (bf16,);
     }
 
-    impl Form for Nvfp4Summed {
+    impl<P: 'static> Form for Nvfp4Summed<P> {
         type Stored = f4e2m1;
 
         type Of<In: AxisName, Out: AxisName, D: Scalar, Chips: M + 'static, X: Memory, V> =
@@ -809,7 +810,7 @@ pub mod form {
                 f4e2m1,
                 f8e4m3,
                 nvfp4::Scales<In, Out>,
-                Summed<W4A16, X>,
+                Summed<W4A16, X, P>,
                 Chip,
                 V,
                 X::Tensor<f8e4m3, Chip, nvfp4::Scales<In, Out>>,

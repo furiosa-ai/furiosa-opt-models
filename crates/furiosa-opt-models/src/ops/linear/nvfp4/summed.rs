@@ -244,6 +244,7 @@ mod tests {
                     .to_hbm(&mut device.pdma)
                     .await
                     .unwrap(),
+                place: PhantomData,
             },
             shape: PhantomData,
         };

@@ -1,13 +1,13 @@
 //! Activation functions: each one function of one element.
 
 use super::{
-    Factors, Float, Registers, Rows, Segment, SpreadPacket, SpreadPairs, SpreadTime, Width, Window,
+    Cell, Cells, Chunks, Factors, Float, Kept, Registers, Rows, Segment, Walk, Width, Window,
 };
 use crate::Op;
 use crate::load::{Checkpoint, Context, Load, LoadError};
 use crate::ops::index::packed::Timestep;
 use crate::ops::linear::{Groups, stream};
-use crate::ops::normalization::{Chunk, Cluster, Element, FeatureSlices, Spread};
+use crate::ops::normalization::Spread;
 use crate::ops::vector::Silu as _;
 use crate::tensor::{live::Live, mapping::Rows as Layout, parallel::Chip, scalar};
 use furiosa_opt_std::prelude::*;
@@ -217,69 +217,98 @@ impl<'x, W: AxisName, R: AxisName, Chips: M + 'static> Op<&'x Live<Spread<W, R, 
         device: &mut Device,
         input: &'x Live<Spread<W, R, Chips>, R>,
     ) -> Self::Output {
-        type Wide<W, R, Chips> = DmTensor<f32, Chips, Cluster, FeatureSlices<W>, Element<W, R>>;
-        type Narrow<W, R> = m![R, W % ({ Symbol<Chunk<W>> }) / 4];
-        let x: Wide<W, R, Chips> = device
-            .main
-            .begin(input.value().view())
-            .fetch::<SpreadTime<W, R>, SpreadPacket<W>>()
-            .fetch_cast::<f32>()
-            .collect::<SpreadTime<W, R>, SpreadPacket<W>>()
-            .commit_trim::<SpreadPacket<W>>()
-            .commit();
-        let inner: Wide<W, R, Chips> = device
-            .main
-            .begin(input.value().view())
-            .fetch::<SpreadTime<W, R>, SpreadPacket<W>>()
-            .fetch_cast::<f32>()
-            .collect::<SpreadTime<W, R>, SpreadPacket<W>>()
-            .vector_init()
-            .vector_intra_slice_tag(TagMode::Zero)
-            .vector_narrow_split::<Narrow<W, R>, m![W % 4]>()
-            .vector_fp_binary_with_mode(
-                FpBinaryOp::MulF(FpMulAlu::Mul0),
-                BinaryArgMode::Mode00,
-                0.0f32,
-            )
-            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), CUBIC)
-            .vector_fp_binary(FpBinaryOp::AddF, 1_f32)
-            .vector_widen_concat::<SpreadTime<W, R>, SpreadPacket<W>>()
-            .vector_final()
-            .commit_trim::<SpreadPacket<W>>()
-            .commit();
-        let tanh: Wide<W, R, Chips> = device
-            .main
-            .begin_interleaved::<Factors, _, _, _, _, _>(inner.view(), x.view())
-            .fetch::<SpreadPairs<W, R>, SpreadPacket<W>>()
-            .collect::<SpreadPairs<W, R>, SpreadPacket<W>>()
-            .vector_init()
-            .vector_intra_slice_unzip::<Factors, SpreadTime<W, R>>()
-            .vector_narrow_split::<Narrow<W, R>, m![W % 4]>()
-            .vector_fp_zip(FpBinaryOp::MulF(FpMulAlu::Mul0))
-            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), ROOT)
-            .vector_fp_unary(FpUnaryOp::Tanh)
-            .vector_widen_concat::<SpreadTime<W, R>, SpreadPacket<W>>()
-            .vector_final()
-            .commit_trim::<SpreadPacket<W>>()
-            .commit();
-        let value = device
-            .main
-            .begin_interleaved::<Factors, _, _, _, _, _>(tanh.view(), x.view())
-            .fetch::<SpreadPairs<W, R>, SpreadPacket<W>>()
-            .collect::<SpreadPairs<W, R>, SpreadPacket<W>>()
-            .vector_init()
-            .vector_intra_slice_unzip::<Factors, SpreadTime<W, R>>()
-            .vector_narrow_split::<Narrow<W, R>, m![W % 4]>()
-            .vector_fp_binary(FpBinaryOp::AddF, 1_f32, ())
-            .vector_fp_zip(FpBinaryOp::MulF(FpMulAlu::Mul0))
-            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), 0.5_f32)
-            .vector_widen_concat::<SpreadTime<W, R>, SpreadPacket<W>>()
-            .vector_final()
-            .cast::<bf16, m![W % 8 # 16]>()
-            .commit_trim::<m![W % 8]>()
-            .commit();
-        input.with(value)
+        input.with(new_gelu::<Chunks<W, R>, _, _, _, _>(
+            device,
+            input.value().view(),
+        ))
     }
+}
+
+/// The tanh GELU of a launch's rows where their producer kept them, cell by cell as in feature
+/// slices; the result keeps their layout and live rows.
+impl<'x, R: AxisName, Chips: M + 'static, C: M, S: M, E: M + 'static>
+    Op<&'x Live<Kept<DmTensor<bf16, Chips, C, S, E>>, R>> for NewGelu
+{
+    type Output = Live<Kept<DmTensor<bf16, Chips, C, S, E>>, R>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        input: &'x Live<Kept<DmTensor<bf16, Chips, C, S, E>>, R>,
+    ) -> Self::Output {
+        // SAFETY: the cells keep their order; only their names merge into one axis.
+        let cells = unsafe { input.value().0.view().reshape::<Chips, C, S, Cell<E>>() };
+        let value = new_gelu::<Cells<E>, _, _, _, _>(device, cells);
+        // SAFETY: as above, back.
+        input.with(Kept(unsafe { value.reshape::<Chips, C, S, E>() }))
+    }
+}
+
+/// `x / 2 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 x³)))` of each BF16 cell walked as `K` says, in
+/// FP32 over three DM round trips, rounded once to BF16.
+fn new_gelu<K: Walk, Chips: M + 'static, C: M, S: M, E: M>(
+    device: &mut Device,
+    input: DmTensorView<'_, bf16, Chips, C, S, E>,
+) -> DmTensor<bf16, Chips, C, S, E> {
+    let x: DmTensor<f32, Chips, C, S, E> = device
+        .main
+        .begin(input.clone())
+        .fetch::<K::Time, K::Packet>()
+        .fetch_cast::<f32>()
+        .collect::<K::Time, K::Packet>()
+        .commit_trim::<K::Packet>()
+        .commit();
+    let inner: DmTensor<f32, Chips, C, S, E> = device
+        .main
+        .begin(input)
+        .fetch::<K::Time, K::Packet>()
+        .fetch_cast::<f32>()
+        .collect::<K::Time, K::Packet>()
+        .vector_init()
+        .vector_intra_slice_tag(TagMode::Zero)
+        .vector_narrow_split::<K::Narrow, K::Half>()
+        .vector_fp_binary_with_mode(
+            FpBinaryOp::MulF(FpMulAlu::Mul0),
+            BinaryArgMode::Mode00,
+            0.0f32,
+        )
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), CUBIC)
+        .vector_fp_binary(FpBinaryOp::AddF, 1_f32)
+        .vector_widen_concat::<K::Time, K::Packet>()
+        .vector_final()
+        .commit_trim::<K::Packet>()
+        .commit();
+    let tanh: DmTensor<f32, Chips, C, S, E> = device
+        .main
+        .begin_interleaved::<Factors, _, _, _, _, _>(inner.view(), x.view())
+        .fetch::<K::Pairs, K::Packet>()
+        .collect::<K::Pairs, K::Packet>()
+        .vector_init()
+        .vector_intra_slice_unzip::<Factors, K::Time>()
+        .vector_narrow_split::<K::Narrow, K::Half>()
+        .vector_fp_zip(FpBinaryOp::MulF(FpMulAlu::Mul0))
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), ROOT)
+        .vector_fp_unary(FpUnaryOp::Tanh)
+        .vector_widen_concat::<K::Time, K::Packet>()
+        .vector_final()
+        .commit_trim::<K::Packet>()
+        .commit();
+    device
+        .main
+        .begin_interleaved::<Factors, _, _, _, _, _>(tanh.view(), x.view())
+        .fetch::<K::Pairs, K::Packet>()
+        .collect::<K::Pairs, K::Packet>()
+        .vector_init()
+        .vector_intra_slice_unzip::<Factors, K::Time>()
+        .vector_narrow_split::<K::Narrow, K::Half>()
+        .vector_fp_binary(FpBinaryOp::AddF, 1_f32, ())
+        .vector_fp_zip(FpBinaryOp::MulF(FpMulAlu::Mul0))
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), 0.5_f32)
+        .vector_widen_concat::<K::Time, K::Packet>()
+        .vector_final()
+        .cast::<bf16, K::Padded>()
+        .commit_trim::<K::Packet>()
+        .commit()
 }
 
 /// x * sigmoid(x), preserving any input chip mapping.
@@ -468,23 +497,53 @@ impl<'x, W: AxisName, R: AxisName, Chips: M + 'static> Op<&'x Live<Spread<W, R, 
         device: &mut Device,
         input: &'x Live<Spread<W, R, Chips>, R>,
     ) -> Self::Output {
-        let value = device
-            .main
-            .begin(input.value().view())
-            .fetch::<SpreadTime<W, R>, SpreadPacket<W>>()
-            .fetch_cast::<f32>()
-            .collect::<SpreadTime<W, R>, SpreadPacket<W>>()
-            .vector_init()
-            .vector_intra_slice_tag(TagMode::Zero)
-            .vector_narrow_split::<m![R, W % ({ Symbol<Chunk<W>> }) / 4], m![W % 4]>()
-            .vector_silu()
-            .vector_widen_concat::<SpreadTime<W, R>, SpreadPacket<W>>()
-            .vector_final()
-            .cast::<bf16, m![W % 8 # 16]>()
-            .commit_trim::<m![W % 8]>()
-            .commit();
-        input.with(value)
+        input.with(silu::<Chunks<W, R>, _, _, _, _>(
+            device,
+            input.value().view(),
+        ))
     }
+}
+
+/// `x * sigmoid(x)` of a launch's rows where their producer kept them, cell by cell as in feature
+/// slices; the result keeps their layout and live rows.
+impl<'x, R: AxisName, Chips: M + 'static, C: M, S: M, E: M + 'static>
+    Op<&'x Live<Kept<DmTensor<bf16, Chips, C, S, E>>, R>> for Silu
+{
+    type Output = Live<Kept<DmTensor<bf16, Chips, C, S, E>>, R>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        input: &'x Live<Kept<DmTensor<bf16, Chips, C, S, E>>, R>,
+    ) -> Self::Output {
+        // SAFETY: the cells keep their order; only their names merge into one axis.
+        let cells = unsafe { input.value().0.view().reshape::<Chips, C, S, Cell<E>>() };
+        let value = silu::<Cells<E>, _, _, _, _>(device, cells);
+        // SAFETY: as above, back.
+        input.with(Kept(unsafe { value.reshape::<Chips, C, S, E>() }))
+    }
+}
+
+/// `x * sigmoid(x)` of each BF16 cell walked as `K` says, in FP32, rounded once to BF16.
+fn silu<K: Walk, Chips: M + 'static, C: M, S: M, E: M>(
+    device: &mut Device,
+    input: DmTensorView<'_, bf16, Chips, C, S, E>,
+) -> DmTensor<bf16, Chips, C, S, E> {
+    device
+        .main
+        .begin(input)
+        .fetch::<K::Time, K::Packet>()
+        .fetch_cast::<f32>()
+        .collect::<K::Time, K::Packet>()
+        .vector_init()
+        .vector_intra_slice_tag(TagMode::Zero)
+        .vector_narrow_split::<K::Narrow, K::Half>()
+        .vector_silu()
+        .vector_widen_concat::<K::Time, K::Packet>()
+        .vector_final()
+        .cast::<bf16, K::Padded>()
+        .commit_trim::<K::Packet>()
+        .commit()
 }
 
 /// `bf16(silu(t))` of each timestep's time embedding, FP32 inside and rounded once.

@@ -1238,6 +1238,7 @@ where
         .coded::<I, O, Summed<W4A16>>(device, |global| Summed {
             input: W4A16,
             global,
+            place: core::marker::PhantomData,
         })
         .await;
     let early = drawn
@@ -1313,6 +1314,7 @@ async fn feed_forward_profile() {
         up.coded::<Hidden, Intermediate, Summed<W4A16>>(&mut device, |global| Summed {
             input: W4A16,
             global,
+            place: core::marker::PhantomData,
         })
         .await,
     );
@@ -1325,6 +1327,7 @@ async fn feed_forward_profile() {
         down.coded::<Intermediate, Hidden, Summed<W4A16>>(&mut device, |global| Summed {
             input: W4A16,
             global,
+            place: core::marker::PhantomData,
         })
         .await,
     );

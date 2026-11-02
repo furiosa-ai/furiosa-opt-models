@@ -11,6 +11,7 @@
 //!
 //! Source: <https://github.com/vllm-project/vllm/blob/ee0da84ab9e04ac7610e28580af62c365e898389/vllm/model_executor/layers/quantization/utils/nvfp4_emulation_utils.py>.
 
+use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
 use furiosa_opt_std::runtime::HostBuffer;
 use safetensors::Dtype;
@@ -45,9 +46,11 @@ pub struct Early<A, X: Memory = Hbm> {
 
 /// The reduced FP32 sum divided by the tensor scale once, inputs in form `A`: an early checkpoint's
 /// `weight_global_scale` under the late contract's arithmetic. Experimental: a row projected this
-/// way differs from [`Early`]'s in the rounding of each coefficient, which it leaves out.
+/// way differs from [`Early`]'s in the rounding of each coefficient, which it leaves out. A launch's
+/// projected rows end where `P` places them: in the feature slices ([`Features`]), or kept where
+/// their passes summed them for elementwise steps and a next summed projection to read there.
 #[derive(DeviceSend, Load)]
-pub struct Summed<A, X: Memory = Hbm> {
+pub struct Summed<A, X: Memory = Hbm, P = Features> {
     /// The form inputs enter the contraction in.
     #[load(rename = "")]
     pub input: A,
@@ -55,7 +58,12 @@ pub struct Summed<A, X: Memory = Hbm> {
     /// global`.
     #[load(rename = "weight_global_scale")]
     pub global: Held<X>,
+    /// Where a launch's projected rows end.
+    pub place: PhantomData<P>,
 }
+
+/// A launch's projected rows in the output's feature slices, where every reader takes them.
+pub struct Features;
 
 /// The reduced FP32 sum times the tensor scales once, inputs in form `A`.
 #[derive(DeviceSend, Load)]

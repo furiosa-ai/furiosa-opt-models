@@ -26,7 +26,7 @@ use crate::ops::index::scatter::Scatter;
 use crate::ops::linear::{Affine, Native};
 use crate::ops::normalization::{RmsNorm, UnitRmsNorm};
 use crate::ops::pointwise::activation::{NewGelu, Softcap};
-use crate::ops::pointwise::{add, multiply};
+use crate::ops::pointwise::{Kept, add, multiply};
 use crate::ops::reduction::Argmax;
 use crate::tensor::axis;
 use crate::tensor::cache;
@@ -183,11 +183,15 @@ axes![
 
 /// FP8 per-channel attention projections and an NVFP4 feed-forward, as the published checkpoint
 /// stores them; the feed-forward's FP32 sums divide by its tensor scale, so no coefficient rounds.
+/// The gate and up rows stay where their passes summed them, for the activation, the product and
+/// the down projection to read there.
 pub type Quantized = decoder::Projections<
     form::ChannelScaled,
     form::ChannelScaled,
     form::ChannelScaled,
     form::ChannelScaled,
+    form::Nvfp4Summed<Kept>,
+    form::Nvfp4Summed<Kept>,
     form::Nvfp4Summed,
 >;
 
