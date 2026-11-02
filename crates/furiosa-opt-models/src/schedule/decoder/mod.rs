@@ -213,13 +213,13 @@ trait Cut<Z: Geometry + Decode + 'static, A: States> {
     );
 
     /// A tile through it from its attention to its MLP's second step, given a tile `output` of its
-    /// attention output and `input` of its input rows: the output projection, the attention
+    /// attention output and `input` of its input rows in HBM: the output projection, the attention
     /// residual and the MLP's first step on its norm.
     fn end(
         &self,
         device: &mut Device,
         output: Output<'_, Z, Self::Landed>,
-        input: RowTile<Z>,
+        input: Live<&Rows<Z>, Capacity<Z>>,
         adapters: &mut A,
     ) -> Self::Staged;
 
@@ -553,7 +553,7 @@ where
         &self,
         device: &mut Device,
         (attended, landed): Output<'_, Z, OL>,
-        input: RowTile<Z>,
+        input: Live<&Rows<Z>, Capacity<Z>>,
         adapters: &mut T,
     ) -> Self::Staged {
         let Sequential(Residual(_, attention, sum), Residual(norm, mlp, _)) = self;
@@ -570,6 +570,9 @@ where
             &mut (),
             Begin(Begin((&mut *landed, rows))),
         );
+        // The input rows land behind the output projection's rows: the residual reads them only
+        // after the projection, and the cross-cluster sync of their store then waits here.
+        let input = tile.with(input.value().fill(&mut *device, tile));
         let first = down.forward(&mut *device, (), &mut (), Begin(0usize));
         let begun = output.forward(&mut *device, (), &mut (), begun);
         let ahead = gate_up.forward(&mut *device, (), &mut (), Begin(()));
@@ -679,16 +682,14 @@ where
     }
 }
 
-/// A tile through a layer from its attention and the next layer up to its attention's store, each
-/// layer's projections running with its adapters, the next layer's input rows stored. The next
-/// layer's front lands while this one's MLP projects, all of it but what would delay the exchange
-/// that ends the down projection, which lands behind it.
+/// A tile through a layer from its attention, its input rows read where they are stored, and the
+/// next layer up to its attention's store, each layer's projections running with its adapters, the
+/// next layer's input rows stored in their place. The next layer's front lands while this one's
+/// MLP projects, all of it but what would delay the exchange that ends the down projection, which
+/// lands behind it.
 impl<'l, 'c, 'a, 'p, 's, Z: Geometry + Decode + 'static, T: States, X: Cut<Z, T, Landed = L>, L>
-    Module<
-        (Output<'p, Z, L>, RowTile<Z>),
-        Launched<'c, 'a, Z>,
-        (&'s mut Stored<Z>, (&'s mut T, &'s mut T)),
-    > for Tokenwise<&'l X, &'l X>
+    Module<Output<'p, Z, L>, Launched<'c, 'a, Z>, (&'s mut Stored<Z>, (&'s mut T, &'s mut T))>
+    for Tokenwise<&'l X, &'l X>
 {
     type Output = ();
 
@@ -697,11 +698,11 @@ impl<'l, 'c, 'a, 'p, 's, Z: Geometry + Decode + 'static, T: States, X: Cut<Z, T,
         device: &mut Device,
         call: Launched<'c, 'a, Z>,
         (stored, (adapters, following)): (&'s mut Stored<Z>, (&'s mut T, &'s mut T)),
-        (output, input): (Output<'p, Z, L>, RowTile<Z>),
+        output: Output<'p, Z, L>,
     ) -> Self::Output {
         let Self(layer, next) = *self;
-        let tile = input.with(());
-        let staged = layer.end(device, output, input, adapters);
+        let tile = output.0.with(());
+        let staged = layer.end(device, output, tile.with(&stored.rows), adapters);
         let begun = next.front(device, tile);
         let exchanging = layer.exchange(device, staged);
         let front = next.land(device, tile, begun);
@@ -710,10 +711,10 @@ impl<'l, 'c, 'a, 'p, 's, Z: Geometry + Decode + 'static, T: States, X: Cut<Z, T,
     }
 }
 
-/// A tile through the last layer from its attention, its projections running with `adapters`, and
-/// the final norm; the head's rows.
-impl<'l, 'c, 'a, 'p, 's, Z: Geometry + Decode + 'static, T: States, X: Cut<Z, T, Landed = L>, L>
-    Module<(Output<'p, Z, L>, RowTile<Z>), Launched<'c, 'a, Z>, &'s mut T>
+/// A tile through the last layer from its attention, its input rows read where they are stored, its
+/// projections running with `adapters`, and the final norm; the head's rows.
+impl<'l, 'c, 'a, 'p, 'i, 's, Z: Geometry + Decode + 'static, T: States, X: Cut<Z, T, Landed = L>, L>
+    Module<(Output<'p, Z, L>, Live<&'i Rows<Z>, Capacity<Z>>), Launched<'c, 'a, Z>, &'s mut T>
     for Tokenwise<&'l X, &'l FinalNorm<Z>>
 where
     FinalNorm<Z>: for<'r, 'x> Module<&'r RowTile<Z>, (), &'x mut (), Output = RowTile<Z>>,
@@ -725,7 +726,7 @@ where
         device: &mut Device,
         _: Launched<'c, 'a, Z>,
         adapters: &'s mut T,
-        (output, input): (Output<'p, Z, L>, RowTile<Z>),
+        (output, input): (Output<'p, Z, L>, Live<&'i Rows<Z>, Capacity<Z>>),
     ) -> Self::Output {
         let Self(layer, norm) = *self;
         let staged = layer.end(device, output, input, adapters);
@@ -866,11 +867,10 @@ where
             // just before, and the attention has read every store.
             for span in 0..spans {
                 let tile = live.tile::<Span>(span);
-                let input = tile.with(places.stored.rows.fill(&mut *device, tile));
                 let tokenwise = Tokenwise(&layer, &next);
                 let output = (tile.with(&places.attended), &mut projecting);
                 let state = (&mut places.stored, (&mut adapters, &mut following));
-                tokenwise.forward(&mut *device, call, state, (output, input));
+                tokenwise.forward(&mut *device, call, state, output);
             }
         }
         let last = layers.layer(DEPTH - 1);
@@ -883,7 +883,7 @@ where
         let mut head: Rows<Z> = HbmTensor::new();
         for span in 0..spans {
             let tile = live.tile::<Span>(span);
-            let input = tile.with(places.stored.rows.fill(&mut *device, tile));
+            let input = tile.with(&places.stored.rows);
             let output = (tile.with(&places.attended), &mut projecting);
             let tokenwise = Tokenwise(&last, norm);
             let rows = tokenwise.forward(&mut *device, call, &mut adapters, (output, input));
