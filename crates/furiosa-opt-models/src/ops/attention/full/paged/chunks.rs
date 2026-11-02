@@ -3,7 +3,7 @@ use super::append::{self, Keys512, Keys1024, Keys2048, SingleTile, TileGroup, Ti
 use crate::Module;
 use crate::ops::index::gather::Gather;
 use crate::tensor::cache::Block;
-use crate::tensor::cache::Blocks;
+use crate::tensor::cache::{Blocks, Layer};
 use crate::tensor::parallel::Chip;
 use crate::tensor::scalar::Value;
 pub(crate) use append::Causal;
@@ -638,7 +638,7 @@ impl<
                 &HbmTensor<bf16, Chip, m![All, KvHeads, Head]>,
             ),
             (&Invocation<Sequences, W>, usize),
-            (&Gather, &Blocks<KvHeads, Head>),
+            (&Gather, Layer<&Blocks<KvHeads, Head>>),
             &mut append::Output<KvHeads, Groups, Head, All>,
             ((&H, &mut S), usize),
         ),
@@ -662,7 +662,7 @@ where
                 &HbmTensor<bf16, Chip, m![All, KvHeads, Head]>,
             ),
             (&Invocation<Sequences, W>, usize),
-            (&Gather, &Blocks<KvHeads, Head>),
+            (&Gather, Layer<&Blocks<KvHeads, Head>>),
             &mut append::Output<KvHeads, Groups, Head, All>,
             ((&H, &mut S), usize),
         ),

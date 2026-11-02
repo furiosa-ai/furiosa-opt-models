@@ -3,8 +3,8 @@
 //!
 //! - The model's rotary table prepares a launch's [`Context`] from its [`Operands`] once (the
 //!   work's counts read, the rows' rotation gathered); the body and head then run over spans of
-//!   the live rows, each layer on its own cache blocks, and the head reads the selected rows'
-//!   tokens out tile by tile.
+//!   the live rows, each layer on its range of the launch's cache, and the head reads the selected
+//!   rows' tokens out tile by tile.
 //! - The envelope a launch is compiled for is the size's [`Decode`]: its rows, and the context its
 //!   rotary table, prompt chunks and work items cover, its windows' [`Positions`].
 
@@ -138,13 +138,17 @@ pub type Classifier<S, P> =
 /// The slots of an attention's front: its projections', then its norms'; none holds anything.
 type Front = (((), (), ()), (), ());
 
-/// A layer's state slot: its attention's (its front's, its cache blocks, which it writes and
-/// reads, and its output projection's), then what its projections run with in the call, `A`:
-/// their adapters, none by default.
-pub type Layer<'b, A = ()> = ((Front, &'b mut Blocks<KvHeads, Head>, ()), A);
+/// A layer's state slot: its attention's (its front's, its cache stage's, which writes and reads
+/// the layer's range of the [`Stack`]'s cache, and its output projection's), then what its
+/// projections run with in the call, `A`: their adapters, none by default.
+pub type Layer<A = ()> = ((Front, (), ()), A);
 
-/// A launch's body's state: the hidden rows the embedding writes and the layers' slots `L`, a
-/// [`Layer`] each, then the final norm's, which holds none.
+/// The state of a launch's layers: the cache, whose blocks hold each layer's as an equal range in
+/// layer order, so a layer selects its range by an entry, then the layers' slots `L`.
+pub type Stack<'b, L> = (&'b mut Blocks<KvHeads, Head>, L);
+
+/// A launch's body's state: the hidden rows the embedding writes and the layers' state `L`, a
+/// [`Stack`], then the final norm's, which holds none.
 pub type Body<'s, S, L> = &'s mut (
     (HbmTensor<bf16, Chip, Blocked<Hidden<S>, Capacity<S>>>, L),
     (),

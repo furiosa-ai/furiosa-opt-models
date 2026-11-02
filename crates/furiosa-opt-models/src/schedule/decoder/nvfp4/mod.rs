@@ -14,6 +14,7 @@ use crate::ops::normalization::{
     span::{self, Span, Stage},
 };
 use crate::ops::pointwise::add::Add;
+use crate::tensor::cache;
 use crate::tensor::live::{Fill, Live, Spill};
 use crate::tensor::parallel::Chip;
 use crate::{Module, Op, Sequential, Then};
@@ -28,7 +29,7 @@ impl<'i, 'a, 's, 'b, Env>
     Module<
         &'i mut launch::Input<'a, Size>,
         Env,
-        launch::State<'s, Size, [launch::Layer<'b>; DEPTH]>,
+        launch::State<'s, Size, launch::Stack<'b, [launch::Layer; DEPTH]>>,
     > for ForCausalLM
 {
     type Output = ();
@@ -36,7 +37,7 @@ impl<'i, 'a, 's, 'b, Env>
         &self,
         device: &mut Device,
         _: Env,
-        state: launch::State<'s, Size, [launch::Layer<'b>; DEPTH]>,
+        state: launch::State<'s, Size, launch::Stack<'b, [launch::Layer; DEPTH]>>,
         input: &'i mut launch::Input<'a, Size>,
     ) {
         let causal = &self.model;
@@ -46,7 +47,8 @@ impl<'i, 'a, 's, 'b, Env>
             &mut *device,
             (live, &mut input.cache),
         );
-        let (((hidden, slots), ()), tokens) = state;
+        let (((hidden, (blocks, _)), ()), tokens) = state;
+        let range = blocks.tokens.len() / DEPTH;
         let Then(Backbone { embedding, body }, norm) = &causal.model.body;
         Op::forward(
             &embedding.0,
@@ -100,14 +102,17 @@ impl<'i, 'a, 's, 'b, Env>
             let Sequential(Residual(_, attention, _), Residual(ff_norm, feedforward, _)) = &layer;
             let Sequential(Residual(next_norm, next_attention, _), _) = &next;
             let attention = &attention.0;
-            let pool = &mut slots[index].0.1;
+            let mut pool = cache::Layer {
+                blocks: &mut **blocks,
+                entry: index * range,
+            };
             // Match Qwen FP8: item rows enter this layer's cache before attention;
             // prefill rows remain in scratch until attention has consumed them.
             let deferred = Module::forward(
                 &attention.cache,
                 &mut *device,
                 (),
-                &mut *pool,
+                &mut pool,
                 (&retained, (&context.write, &context.read), live),
             );
             // SAFETY: QWidth is exactly KvHeads * Groups * Head; only contiguous axes change.
@@ -117,7 +122,7 @@ impl<'i, 'a, 's, 'b, Env>
                     .alias::<Chip, m![Reach, KvHeads, Groups, Head]>()
             };
             let history = Retained {
-                pool: &**pool,
+                pool: pool.read(),
                 key: &retained.0,
                 value: &retained.1,
                 read: &attention.cache.read,
@@ -142,7 +147,7 @@ impl<'i, 'a, 's, 'b, Env>
                 &attention.cache,
                 &mut *device,
                 (),
-                &mut *pool,
+                &mut pool,
                 (deferred, &retained, &context.write),
             );
             // SAFETY: collapse the same head/group coordinates back into projection features.

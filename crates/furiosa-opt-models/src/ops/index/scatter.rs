@@ -10,7 +10,7 @@ use crate::ops::normalization::{RowMajor, Spread};
 use crate::ops::reduction::Selected;
 use crate::specialize::index::store;
 use crate::tensor::cache::Blocks;
-use crate::tensor::cache::{Block, KeyValue};
+use crate::tensor::cache::{Block, KeyValue, Layer};
 use crate::tensor::{
     axis::{self, Lanes, Single, Tile},
     live::Live,
@@ -730,7 +730,7 @@ impl<W: AxisName, Q: AxisName, D: MaterializableScalar, Chips: M + 'static>
 }
 
 /// The keys and values of a launch's rows in HBM, the slot each row names, its live rows and the
-/// layer they write.
+/// layer's range of the cache they write.
 pub(crate) struct Rows<
     'a,
     Reach: AxisName,
@@ -745,7 +745,7 @@ pub(crate) struct Rows<
     ),
     pub slot: &'a HbmTensor<i32, Chips, m![Reach]>,
     pub rows: Live<(), R>,
-    pub pool: &'a mut Blocks<Heads, Head, bf16, Chips>,
+    pub pool: Layer<&'a mut Blocks<Heads, Head, bf16, Chips>>,
 }
 
 /// A store's `T` rows in DM, `P` a slice: each cluster copies and scatters its own four heads, so
@@ -803,8 +803,10 @@ impl<'a, Reach: AxisName, Heads: AxisName, Head: AxisName, R: AxisName, Chips: M
         // layer and exclude committed history.
         unsafe {
             self.pool
+                .blocks
                 .tokens
                 .scatter::<m![Block], m![KeyValue, Heads, Head]>()
+                .entry(self.pool.entry)
                 .by_byte_offsets(destination.view())
                 .unchecked()
                 .from_dm_view(&mut device.tdma, token.view())
@@ -1255,7 +1257,7 @@ mod tests {
                 pair: (key, value),
                 slot,
                 rows,
-                pool: blocks,
+                pool: Layer { blocks, entry: 0 },
             },
         );
     }
