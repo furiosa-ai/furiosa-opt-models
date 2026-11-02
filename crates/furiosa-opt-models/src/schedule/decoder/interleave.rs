@@ -6,6 +6,8 @@
 //!   last layer, each tile's rows back in the home.
 //! - A period's last edge leads to the next period's first layer; the last period, peeled, ends in
 //!   the final norm instead.
+//! - A run of a period's edges that each lead to the next layer of the same collection rolls too:
+//!   one device loop over the run's layers, as those edges differ only in their layers' indices.
 //! - Each group's layers share its places: a layer stores into them once the group's previous
 //!   attention read them.
 //! - A causal model over such collections launches once a call: each group's context prepared from
@@ -101,13 +103,14 @@ where
     ) {
         let (interleave, norm) = self.0;
         let (first, second) = &interleave.layers;
-        let (positions, period, groups, counts) = const {
+        let (positions, period, groups, counts, runs) = const {
             let order = Order::<FIRST, SECOND>::new(ORDER);
             (
                 order.positions.0,
                 order.period,
                 ORDER.len() / order.period,
                 order.counts,
+                runs::<FIRST, SECOND>(ORDER, order.period),
             )
         };
         // Whether a period starts with a layer of the first collection.
@@ -136,12 +139,28 @@ where
                 }
             }};
         }
+        // `$body` for each edge of a run of `$run`, `$step` its place in the run: a device loop
+        // over a run of two or more.
+        macro_rules! roll {
+            ($run:expr, $step:ident, $body:block) => {
+                match $run > 1 {
+                    true => {
+                        for $step in 0..$run $body
+                    }
+                    false => {
+                        let $step = 0;
+                        $body
+                    }
+                }
+            };
+        }
         match leads {
             true => starts!(&first[0], cx, pa, sa[0].1),
             false => starts!(&second[0], cy, pb, sb[0].1),
         }
         let mut period_of = |group: usize, last: bool| {
-            let (mut a, mut b) = (0, 0);
+            // The end of the last run, whose device loop ran the edges before it.
+            let (mut a, mut b, mut end) = (0, 0, 0);
             #[unroll]
             for offset in 0..period {
                 let current = a < counts[0] && positions[a] == offset;
@@ -158,71 +177,83 @@ where
                     true => ((group + 1) * counts[0], (group + 1) * counts[1]),
                     false => (group * counts[0] + na, group * counts[1] + nb),
                 };
-                match current {
-                    true => {
-                        let index = group * counts[0] + a;
-                        let layer = &first[index];
-                        let attend = (&mut sa[index].0, live);
-                        let mut landed = layer.attend(&mut *device, cx, attend, pa);
-                        let mut slot = sa[index].1;
-                        if wraps && last {
-                            edge!(layer, pa, landed, Tokenwise(layer, norm), cx, &mut slot);
-                        } else if next {
-                            let mut following = sa[ja].1;
-                            let work = Tokenwise(layer, &first[ja]);
-                            edge!(
-                                layer,
-                                pa,
-                                landed,
-                                work,
-                                (cx, cx),
-                                (&mut pa.stored, (&mut slot, &mut following))
-                            );
-                        } else {
-                            let mut following = sb[jb].1;
-                            let work = Tokenwise(layer, &second[jb]);
-                            edge!(
-                                layer,
-                                pa,
-                                landed,
-                                work,
-                                (cx, cy),
-                                (&mut pb.stored, (&mut slot, &mut following))
-                            );
-                        }
+                let run = match current {
+                    true => runs.0[a],
+                    false => runs.1[b],
+                };
+                // The last period's last edge leads to the final norm, outside any run.
+                let run = match last && offset + run == period {
+                    true => run - 1,
+                    false => run,
+                };
+                if offset >= end {
+                    match current {
+                        true => roll!(run, step, {
+                            let index = group * counts[0] + a + step;
+                            let layer = &first[index];
+                            let attend = (&mut sa[index].0, live);
+                            let mut landed = layer.attend(&mut *device, cx, attend, pa);
+                            let mut slot = sa[index].1;
+                            if wraps && last {
+                                edge!(layer, pa, landed, Tokenwise(layer, norm), cx, &mut slot);
+                            } else if next {
+                                let mut following = sa[index + 1].1;
+                                let work = Tokenwise(layer, &first[index + 1]);
+                                edge!(
+                                    layer,
+                                    pa,
+                                    landed,
+                                    work,
+                                    (cx, cx),
+                                    (&mut pa.stored, (&mut slot, &mut following))
+                                );
+                            } else {
+                                let mut following = sb[jb].1;
+                                let work = Tokenwise(layer, &second[jb]);
+                                edge!(
+                                    layer,
+                                    pa,
+                                    landed,
+                                    work,
+                                    (cx, cy),
+                                    (&mut pb.stored, (&mut slot, &mut following))
+                                );
+                            }
+                        }),
+                        false => roll!(run, step, {
+                            let index = group * counts[1] + b + step;
+                            let layer = &second[index];
+                            let attend = (&mut sb[index].0, live);
+                            let mut landed = layer.attend(&mut *device, cy, attend, pb);
+                            let mut slot = sb[index].1;
+                            if wraps && last {
+                                edge!(layer, pb, landed, Tokenwise(layer, norm), cy, &mut slot);
+                            } else if next {
+                                let mut following = sa[ja].1;
+                                let work = Tokenwise(layer, &first[ja]);
+                                edge!(
+                                    layer,
+                                    pb,
+                                    landed,
+                                    work,
+                                    (cy, cx),
+                                    (&mut pa.stored, (&mut slot, &mut following))
+                                );
+                            } else {
+                                let mut following = sb[index + 1].1;
+                                let work = Tokenwise(layer, &second[index + 1]);
+                                edge!(
+                                    layer,
+                                    pb,
+                                    landed,
+                                    work,
+                                    (cy, cy),
+                                    (&mut pb.stored, (&mut slot, &mut following))
+                                );
+                            }
+                        }),
                     }
-                    false => {
-                        let index = group * counts[1] + b;
-                        let layer = &second[index];
-                        let attend = (&mut sb[index].0, live);
-                        let mut landed = layer.attend(&mut *device, cy, attend, pb);
-                        let mut slot = sb[index].1;
-                        if wraps && last {
-                            edge!(layer, pb, landed, Tokenwise(layer, norm), cy, &mut slot);
-                        } else if next {
-                            let mut following = sa[ja].1;
-                            let work = Tokenwise(layer, &first[ja]);
-                            edge!(
-                                layer,
-                                pb,
-                                landed,
-                                work,
-                                (cy, cx),
-                                (&mut pa.stored, (&mut slot, &mut following))
-                            );
-                        } else {
-                            let mut following = sb[jb].1;
-                            let work = Tokenwise(layer, &second[jb]);
-                            edge!(
-                                layer,
-                                pb,
-                                landed,
-                                work,
-                                (cy, cy),
-                                (&mut pb.stored, (&mut slot, &mut following))
-                            );
-                        }
-                    }
+                    end = offset + run;
                 }
                 (a, b) = (na, nb);
             }
@@ -232,6 +263,37 @@ where
         }
         period_of(groups - 1, true);
     }
+}
+
+/// Each layer's run in a period of `order`, the first collection's layers and then the second's,
+/// each in storage order: how many edges from the layer on each lead to the next layer of the same
+/// collection, the period's last edge to the next period's first layer.
+const fn runs<const FIRST: usize, const SECOND: usize>(
+    order: &[Branch],
+    period: usize,
+) -> ([usize; FIRST], [usize; SECOND]) {
+    let mut runs = ([0; FIRST], [0; SECOND]);
+    let (mut offset, mut a, mut b) = (0, 0, 0);
+    while offset < period {
+        let mut run = 0;
+        while offset + run < period
+            && order[offset + run] as usize == order[(offset + run + 1) % period] as usize
+        {
+            run += 1;
+        }
+        match order[offset] {
+            Branch::First => {
+                runs.0[a] = run;
+                a += 1;
+            }
+            _ => {
+                runs.1[b] = run;
+                b += 1;
+            }
+        }
+        offset += 1;
+    }
+    runs
 }
 
 /// A call's context of `R` rows in group `A`: their rotation, write slots and pages.
