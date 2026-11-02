@@ -1279,6 +1279,54 @@ spread!(spread_key_rows, Coded, Hidden, SlidingKeyWidth);
 spread!(dense_query_rows, Dense, LargeHidden, LargeQueries);
 spread!(dense_gate_rows, Dense, LargeHidden, LargeGate);
 
+type SlidingHeads = <Group as Attention>::Heads;
+type SlidingGroups = <Group as Attention>::Groups;
+type SlidingHead = <Group as Attention>::Head;
+
+axes![
+    LargeHeads = 8,
+    LargeGroups = 4,
+    LargeHead = 128,
+    LargeKeys = 1024
+];
+
+/// One projection's rows alone split into the heads a decoder's query, key or value view reads:
+/// the live rows a count names of `input`, `Heads` heads of `Groups` query heads each.
+macro_rules! heads {
+    ($name:ident, $width:ty, $heads:ty, $groups:ty, $head:ty) => {
+        #[device(chip = 1)]
+        fn $name(
+            device: &mut Device,
+            rows: &Value,
+            input: &Ordered<$width>,
+        ) -> HbmTensor<bf16, Chip, m![Rows, $heads, $groups, $head]> {
+            let live = Live::<(), Rows>::read(rows);
+            let input: Live<Spread<$width, Rows, Chip>, Rows> =
+                live.with(input.to_dm(&mut device.tdma));
+            let split =
+                furiosa_opt_models::tensor::mapping::Reshape::<m![$heads, $groups, $head]>::default(
+                );
+            let heads = Op::forward(&split, &mut *device, input);
+            heads.value().to_hbm(&mut device.tdma)
+        }
+    };
+}
+
+heads!(
+    sliding_query_heads,
+    SlidingQueryWidth,
+    SlidingHeads,
+    SlidingGroups,
+    SlidingHead
+);
+heads!(
+    large_query_heads,
+    LargeQueries,
+    LargeHeads,
+    LargeGroups,
+    LargeHead
+);
+
 /// A BF16 weight of the probe's values.
 async fn dense<I: AxisName, O: AxisName>(device: &mut Device, seed: u64) -> Dense<I, O> {
     let weight = (HostTensor::<bf16, m![O, I]>::from_vec(values(O::SIZE * I::SIZE, seed, 0.125)))
@@ -1378,6 +1426,37 @@ async fn projection_profile() {
                 .await;
             let output = output.unwrap().into_vec();
             let hash = fingerprint(&output[..$live * <$out>::SIZE]);
+            println!("hash {case} {hash:016x}");
+        }};
+    }
+    macro_rules! profile_heads {
+        ($live:expr, $count:expr, $kernel:ident, $input:expr, $out:ty, $width:expr) => {{
+            let case = format!("{}-rows-{}", stringify!($kernel), $live);
+            let mut last = None;
+            for sample in 0..=steps {
+                let span = match sample {
+                    0 => tracing::info_span!("warmup", case = case.as_str()),
+                    step => tracing::info_span!("forward", case = case.as_str(), step),
+                };
+                let output = async {
+                    let arguments = (&mut device, $count, $input);
+                    let output = (launch($kernel, arguments).into_future())
+                        .instrument(tracing::info_span!("submit"))
+                        .await
+                        .unwrap();
+                    (device.synchronize())
+                        .instrument(tracing::info_span!("wait"))
+                        .await
+                        .unwrap();
+                    output
+                }
+                .instrument(span)
+                .await;
+                last = Some(output);
+            }
+            let output = last.unwrap().to_host::<$out>(&mut device.pdma).await;
+            let output = output.unwrap().into_vec();
+            let hash = fingerprint(&output[..$live * $width]);
             println!("hash {case} {hash:016x}");
         }};
     }
@@ -1531,6 +1610,27 @@ async fn projection_profile() {
             LargeQueries
         );
         profile!(live, count, dense_gate_rows, &dense_gate, &large, LargeGate);
+        let queries: Ordered<SlidingQueryWidth> =
+            (HostTensor::<bf16, m![Rows, SlidingQueryWidth]>::from_vec(rows(4096, 0x24)))
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+        let wide: Ordered<LargeQueries> =
+            (HostTensor::<bf16, m![Rows, LargeQueries]>::from_vec(rows(4096, 0x25)))
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+        type SlidingRows = m![Rows, SlidingHeads, SlidingGroups, SlidingHead];
+        type LargeRows = m![Rows, LargeHeads, LargeGroups, LargeHead];
+        profile_heads!(
+            live,
+            count,
+            sliding_query_heads,
+            &queries,
+            SlidingRows,
+            4096
+        );
+        profile_heads!(live, count, large_query_heads, &wide, LargeRows, 4096);
     }
 }
 
