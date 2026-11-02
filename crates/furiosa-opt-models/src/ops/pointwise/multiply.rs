@@ -4,13 +4,14 @@ use super::{
     Batch, BatchMut, Cell, Cells, Chunks, Extent, Factors, Float, Kept, Rows, Segment, Slices,
     SpreadPacket, SpreadTime, Walk, Width, Window,
 };
-use crate::Op;
 use crate::load::Load;
 use crate::ops::normalization::{Chunk, Cluster, FeatureSlices, Spread};
 use crate::ops::vector::Zip;
 use crate::tensor::{axis::Single, live::Live, scalar};
+use crate::{Begin, Op};
 use furiosa_opt_std::prelude::*;
 use std::borrow::Borrow;
+use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 
 /// Multiply a single-chip tensor by an FP32 scalar; the kernel requires eight padded cells.
@@ -163,6 +164,29 @@ impl<F: M, Chips: M + 'static> Scale<HbmTensor<f32, Chips, F>> {
     }
 }
 
+/// A scale's factor written in the feature slices of rows of `W` features.
+pub struct Landed<W: AxisName, Chips: M>(
+    DmTensor<f32, Chips, Cluster, FeatureSlices<W>, m![1 # 8]>,
+);
+
+/// A scale begun for rows in feature slices: its factor written in their slices before they
+/// arrive.
+impl<W: AxisName, R: AxisName, Chips: M + 'static, F> Op<Begin<PhantomData<Spread<W, R, Chips>>>>
+    for Scale<F>
+where
+    F: Borrow<HbmTensor<f32, Chips, m![1 # 8]>>,
+{
+    type Output = Scale<Landed<W, Chips>>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        _: Begin<PhantomData<Spread<W, R, Chips>>>,
+    ) -> Self::Output {
+        Scale(Landed(self.0.borrow().to_dm(&mut device.tdma)))
+    }
+}
+
 /// Every row of one launch in feature slices times the FP32 scalar in the first cell of the factor,
 /// rounded once to BF16; the result keeps their live rows.
 impl<'x, W: AxisName, R: AxisName, Chips: M + 'static, F> Op<&'x Live<Spread<W, R, Chips>, R>>
@@ -177,9 +201,23 @@ where
         device: &mut Device,
         input: &'x Live<Spread<W, R, Chips>, R>,
     ) -> Self::Output {
-        let factor: DmTensor<f32, Chips, Cluster, FeatureSlices<W>, m![1 # 8]> =
-            self.0.borrow().to_dm(&mut device.tdma);
-        let factor = scalar::register(device, &factor);
+        let begun = self.forward(&mut *device, Begin(PhantomData::<Spread<W, R, Chips>>));
+        begun.forward(device, input)
+    }
+}
+
+/// The same rows times the factor as it landed.
+impl<'x, W: AxisName, R: AxisName, Chips: M + 'static> Op<&'x Live<Spread<W, R, Chips>, R>>
+    for Scale<Landed<W, Chips>>
+{
+    type Output = Live<Spread<W, R, Chips>, R>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        input: &'x Live<Spread<W, R, Chips>, R>,
+    ) -> Self::Output {
+        let factor = scalar::register(device, &self.0.0);
         let value = device
             .main
             .begin(input.value().view())
