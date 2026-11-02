@@ -84,12 +84,16 @@ jobs:
         run: cargo furiosa-opt test -p furiosa-opt-engine --release --doc
       # Pull requests build the reference too, so one that breaks it fails before it merges.
       - if: matrix.package == 'engine'
+        run: cargo furiosa-opt doc -p furiosa-opt-models --no-deps
+      # rustdoc takes RUSTDOCFLAGS, so it runs the old trait solver; on the next one its auto-trait
+      # synthesis aborts until https://github.com/rust-lang/rust/pull/149019. The old solver cannot
+      # prove the bounds of the models' BF16 launch impls the engine's reference reaches and then
+      # runs on, so this reference does not gate a pull request until the solver is fixed.
+      - if: matrix.package == 'engine'
+        continue-on-error: true
+        timeout-minutes: 10
         # The engine's interface is its Python module, so its Rust reference documents internal items.
-        run: |
-          cargo furiosa-opt doc -p furiosa-opt-models --no-deps
-          # rustdoc takes RUSTDOCFLAGS, so it runs the old trait solver; on the next one its
-          # auto-trait synthesis aborts until https://github.com/rust-lang/rust/pull/149019.
-          RUSTDOCFLAGS=--document-private-items cargo furiosa-opt doc -p furiosa-opt-engine --no-deps
+        run: RUSTDOCFLAGS=--document-private-items cargo furiosa-opt doc -p furiosa-opt-engine --no-deps
       - if: matrix.package == 'engine' && github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
