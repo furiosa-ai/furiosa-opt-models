@@ -1582,16 +1582,21 @@ projection!(sliding_key_rows, Grouped, Hidden, SlidingKeyWidth);
 projection!(full_query_rows, Grouped, Hidden, FullQueryWidth);
 projection!(full_key_rows, Grouped, Hidden, FullKeyWidth);
 projection!(sliding_output_rows, Ordered, SlidingQueryWidth, Hidden);
+projection!(full_output_rows, Ordered, FullQueryWidth, Hidden);
 
 // The other channel-scaled decoders' widths whose projections take the same contraction: hidden
-// 1024 and 2560 with their query and key widths, and a 4096-hidden MLP's fused gate and up.
+// 1024 and 2560 with their query, key, output, fused gate and up, and down widths, and a
+// 4096-hidden MLP's fused gate and up.
 axes![
     SmallHidden = 1024,
     SmallQueries = 2048,
     SmallKeys = 1024,
+    SmallGateUp = 6144,
     MiddleHidden = 2560,
     MiddleQueries = 4096,
     MiddleKeys = 1024,
+    MiddleGateUp = 19456,
+    MiddleIntermediate = 9728,
     LargeHidden = 4096,
     LargeGateUp = 28672
 ];
@@ -1600,6 +1605,7 @@ projection!(small_query_rows, Grouped, SmallHidden, SmallQueries);
 projection!(small_key_rows, Grouped, SmallHidden, SmallKeys);
 projection!(middle_query_rows, Grouped, MiddleHidden, MiddleQueries);
 projection!(middle_key_rows, Grouped, MiddleHidden, MiddleKeys);
+projection!(middle_output_rows, Ordered, MiddleQueries, MiddleHidden);
 
 /// A BF16 projection of `I` inputs into `O` outputs.
 type Dense<I, O> = furiosa_opt_models::ops::linear::Affine<HbmTensor<bf16, Chip, m![O, I]>, ()>;
@@ -1628,6 +1634,9 @@ macro_rules! spread {
 }
 
 spread!(large_gate_up_rows, Coded, LargeHidden, LargeGateUp);
+spread!(small_gate_up_rows, Coded, SmallHidden, SmallGateUp);
+spread!(middle_gate_up_rows, Coded, MiddleHidden, MiddleGateUp);
+spread!(middle_down_rows, Coded, MiddleIntermediate, MiddleHidden);
 spread!(spread_query_rows, Coded, Hidden, SlidingQueryWidth);
 spread!(spread_key_rows, Coded, Hidden, SlidingKeyWidth);
 spread!(dense_query_rows, Dense, LargeHidden, LargeQueries);
@@ -1749,6 +1758,11 @@ async fn projection_profile() {
     let large_gate_up = coded::<LargeHidden, LargeGateUp>(&mut device, 0x1a).await;
     let dense_query = dense::<LargeHidden, LargeQueries>(&mut device, 0x1b).await;
     let dense_gate = dense::<LargeHidden, LargeGate>(&mut device, 0x1c).await;
+    let full_output = coded::<FullQueryWidth, Hidden>(&mut device, 0x1d).await;
+    let middle_output = coded::<MiddleQueries, MiddleHidden>(&mut device, 0x1e).await;
+    let small_gate_up = coded::<SmallHidden, SmallGateUp>(&mut device, 0x1f).await;
+    let middle_gate_up = coded::<MiddleHidden, MiddleGateUp>(&mut device, 0x2b).await;
+    let middle_down = coded::<MiddleIntermediate, MiddleHidden>(&mut device, 0x2c).await;
     macro_rules! profile {
         ($live:expr, $count:expr, $kernel:ident, $weight:expr, $input:expr, $out:ty) => {{
             let case = format!("{}-rows-{}", stringify!($kernel), $live);
@@ -1985,6 +1999,71 @@ async fn projection_profile() {
             4096
         );
         profile_heads!(live, count, large_query_heads, &wide, LargeRows, 4096);
+        let full_attended: Ordered<FullQueryWidth> =
+            (HostTensor::<bf16, m![Rows, FullQueryWidth]>::from_vec(rows(8192, 0x26)))
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+        profile!(
+            live,
+            count,
+            full_output_rows,
+            &full_output,
+            &full_attended,
+            Hidden
+        );
+        let middle_attended: Ordered<MiddleQueries> =
+            (HostTensor::<bf16, m![Rows, MiddleQueries]>::from_vec(rows(4096, 0x27)))
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+        profile!(
+            live,
+            count,
+            middle_output_rows,
+            &middle_output,
+            &middle_attended,
+            MiddleHidden
+        );
+        let small_ordered: Ordered<SmallHidden> =
+            (HostTensor::<bf16, m![Rows, SmallHidden]>::from_vec(rows(1024, 0x28)))
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+        profile!(
+            live,
+            count,
+            small_gate_up_rows,
+            &small_gate_up,
+            &small_ordered,
+            SmallGateUp
+        );
+        let middle_ordered: Ordered<MiddleHidden> =
+            (HostTensor::<bf16, m![Rows, MiddleHidden]>::from_vec(rows(2560, 0x29)))
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+        profile!(
+            live,
+            count,
+            middle_gate_up_rows,
+            &middle_gate_up,
+            &middle_ordered,
+            MiddleGateUp
+        );
+        let product: Ordered<MiddleIntermediate> =
+            (HostTensor::<bf16, m![Rows, MiddleIntermediate]>::from_vec(rows(9728, 0x2a)))
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+        profile!(
+            live,
+            count,
+            middle_down_rows,
+            &middle_down,
+            &product,
+            MiddleHidden
+        );
     }
 }
 
