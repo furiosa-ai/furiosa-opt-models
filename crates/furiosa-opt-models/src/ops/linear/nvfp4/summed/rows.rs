@@ -11,7 +11,8 @@
 //!   the last pass ends, or [`Kept`] where the passes summed them.
 //! - Rows another summed projection kept land in both clusters as they lie, an owner's run of
 //!   features a slice, and its lane groups stage from there; rows whose runs cannot tile both
-//!   clusters' slices that way move to the feature slices first.
+//!   clusters' slices that way move to the feature slices first. A projection begun with such
+//!   rows issues their landing alone, so a schedule can issue later transfers behind it.
 
 use crate::ops::linear::kernel::Rounded;
 use crate::ops::normalization::{self, FeatureSlices, Spread};
@@ -394,8 +395,8 @@ where
     }
 }
 
-/// The same rows through the weight as it landed: one transfer lands them in both clusters as they
-/// lie, or in the feature slices where they cannot lie so, then they project.
+/// The same rows through the weight as it landed: they land in both clusters as they lie, or in
+/// the feature slices where they cannot lie so, then they project.
 impl<'x, H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P>
     Op<(Landed<I, O>, &'x Live<Kept<Summing<H, I, R>>, R>)>
     for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P>, Chip, K, V>
@@ -409,16 +410,52 @@ where
         device: &mut Device,
         (landed, input): (Landed<I, O>, &'x Live<Kept<Summing<H, I, R>>, R>),
     ) -> Self::Output {
-        let rows = &input.value().0;
-        let projected = if const { fits_both::<H, I>() } {
-            let mut both = Both::<H, I, R>::new();
-            rows.view().to_dm_view(&mut device.tdma, both.view_mut());
-            landed.project(device, &input.with(both))
+        if const { fits_both::<H, I>() } {
+            let begun = self.forward(&mut *device, Begin((landed, input)));
+            self.forward(device, begun)
         } else {
-            let spread = input.with(spread(device, rows));
-            landed.project(device, &spread)
-        };
-        input.with(P::place(device, projected))
+            let spread = input.with(spread(device, &input.value().0));
+            self.forward(device, (landed, &spread))
+        }
+    }
+}
+
+/// The same rows begun with the weight as it landed: one transfer lands them in both clusters as
+/// they lie, so a schedule can issue it ahead of other transfers; given back, they project.
+impl<'x, H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P>
+    Op<Begin<(Landed<I, O>, &'x Live<Kept<Summing<H, I, R>>, R>)>>
+    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P>, Chip, K, V>
+{
+    type Output = (Landed<I, O>, Live<Both<H, I, R>, R>);
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        Begin((landed, input)): Begin<(Landed<I, O>, &'x Live<Kept<Summing<H, I, R>>, R>)>,
+    ) -> Self::Output {
+        const { assert!(fits_both::<H, I>()) };
+        let mut both = Both::<H, I, R>::new();
+        (input.value().0.view()).to_dm_view(&mut device.tdma, both.view_mut());
+        (landed, input.with(both))
+    }
+}
+
+/// Rows landed in both clusters through the weight as it landed.
+impl<H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P>
+    Op<(Landed<I, O>, Live<Both<H, I, R>, R>)>
+    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P>, Chip, K, V>
+where
+    P: Place<I, O, R>,
+{
+    type Output = Live<P::Rows, R>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (landed, rows): (Landed<I, O>, Live<Both<H, I, R>, R>),
+    ) -> Self::Output {
+        let projected = landed.project(device, &rows);
+        rows.with(P::place(device, projected))
     }
 }
 

@@ -5,9 +5,10 @@
 //! - Its front lands the query, key and value projections' weights; its start runs the input norm
 //!   and the positioned query/key/value stage over them, and stores the heads.
 //! - Its end runs the output projection, the post-attention norm, the attention residual, the
-//!   pre-feed-forward norm and the feed-forward up to the down projection's input; its update the
-//!   down projection, the post-feed-forward norm, the feed-forward residual and the layer's tail.
-//!   The next layer's front lands between them, under the down projection's passes.
+//!   pre-feed-forward norm and the feed-forward up to the down projection begun with its input,
+//!   whose landing it issues; its update the down projection, the post-feed-forward norm, the
+//!   feed-forward residual and the layer's tail. The next layer's front lands between them,
+//!   behind the down projection's input and under its passes.
 //! - Its feed-forward's projections land their weights one step ahead, under work that issues no
 //!   transfer: the gate projection's under the post-attention and pre-feed-forward norms, whose
 //!   gains land first, the up projection's under the gate's passes, the down projection's under
@@ -62,7 +63,7 @@ type AttendedHeads<A, R> = Attended<
 /// the head norms leave as `NQ`, `NK`; its output projection runs with its empty slot. Its norms
 /// land their gains as `NB`. Its gated feed-forward's gate, up and down projections land as `GL`,
 /// `UL`, `DL` and give `GO`, `UO` and the rows; the activation gives `AO` of the gate's, the
-/// product `MO`.
+/// product `MO`, with which the down projection begins as `DR`.
 impl<
     'c,
     A,
@@ -104,6 +105,7 @@ impl<
     UO,
     MO,
     DL,
+    DR,
     Add,
     Tail,
 > Cut<A, &'c Context<P, R, Windows>, ()>
@@ -208,9 +210,10 @@ where
     Up: for<'x> Module<Begin<()>, (), &'x mut (), Output = UL>
         + for<'r, 'x> Module<(UL, &'r Live<Spread<Hidden, R, Chip>, R>), (), &'x mut (), Output = UO>,
     Multiply: for<'g, 'u, 'x> Module<(&'g AO, &'u UO), (), &'x mut (), Output = MO>,
-    Down: for<'x> Module<Begin<()>, (), &'x mut (), Output = DL>,
+    Down: for<'x> Module<Begin<()>, (), &'x mut (), Output = DL>
+        + for<'r, 'x> Module<Begin<(DL, &'r MO)>, (), &'x mut (), Output = DR>,
     RowParallel<Down, Placement>:
-        for<'r, 'x> Module<(DL, &'r MO), (), &'x mut (), Output = Live<Spread<Hidden, R, Chip>, R>>,
+        for<'x> Module<DR, (), &'x mut (), Output = Live<Spread<Hidden, R, Chip>, R>>,
     Tail: for<'r, 'x> Module<
             &'r Live<Spread<Hidden, R, Chip>, R>,
             (),
@@ -225,7 +228,7 @@ where
     type Home = HbmTensor<bf16, Chip, RowMajor<Hidden, R>>;
     type Front = (QL, KL, VL);
     type Landed = ();
-    type Staged = Staged<(DL, MO), Live<Self::Rows, R>>;
+    type Staged = Staged<DR, Live<Self::Rows, R>>;
 
     fn fill(&self, device: &mut Device, home: &Self::Home, _: Live<(), R>) -> Self::Rows {
         home.to_dm(&mut device.tdma)
@@ -338,8 +341,9 @@ where
         let activated = activation.forward(&mut *device, (), &mut (), &gated);
         let upped = up.forward(&mut *device, (), &mut (), (up_landed, &normalized));
         let product = multiply.forward(&mut *device, (), &mut (), (&activated, &upped));
+        let begun = Begin((down_landed, &product));
         Staged {
-            ready: (down_landed, product),
+            ready: (down.0.operation).forward(&mut *device, (), &mut (), begun),
             attended: residual,
         }
     }
@@ -352,8 +356,7 @@ where
     ) -> Live<Self::Rows, R> {
         let Then(Sequential(_, Residual(_, Then(mlp, post), add)), tail) = self;
         let Sum(_, Then(_, down)) = &mlp.0;
-        let (landed, product) = ready;
-        let ready = down.forward(&mut *device, (), &mut (), (landed, &product));
+        let ready = down.forward(&mut *device, (), &mut (), ready);
         let branch = post.forward(&mut *device, (), &mut (), &ready);
         let rows = add.forward(&mut *device, (), &mut (), (&attended, &branch));
         tail.forward(device, (), &mut (), &rows)
