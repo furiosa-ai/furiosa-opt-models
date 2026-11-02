@@ -7,8 +7,9 @@
 //!   pre-feed-forward norm and the feed-forward; its update the post-feed-forward norm, the
 //!   feed-forward residual and the layer's tail.
 //! - Its feed-forward's projections land their weights one step ahead, under work that issues no
-//!   transfer: the up projection's under the gate's passes, the down projection's under the
-//!   activation and the up projection's passes. Its front and output projection's landing are
+//!   transfer: the gate projection's under the post-attention and pre-feed-forward norms, whose
+//!   gains land first, the up projection's under the gate's passes, the down projection's under
+//!   the activation and the up projection's passes. Its front and output projection's landing are
 //!   `()`; its leaves hold nothing in a call, so it takes `()` and runs each with its empty slot.
 
 use super::{Cut, Output, Places, Pool, Staged, Stored, attend_stored};
@@ -55,9 +56,9 @@ type AttendedHeads<A, R> = Attended<
 
 /// The sandwich-norm layer and its tail `L` in every form whose leaves take a whole envelope of
 /// `R` rows of `Hidden` features, attending in group `A` over pages of its cache. Its query/key/
-/// value stage and output projection run with their empty slot. Its gated feed-forward's gate,
-/// up and down projections land as `GL`, `UL`, `DL` and give `GO`, `UO` and the rows; the
-/// activation gives `AO` of the gate's, the product `MO`.
+/// value stage and output projection run with their empty slot. Its norms land their gains as
+/// `NB`. Its gated feed-forward's gate, up and down projections land as `GL`, `UL`, `DL` and give
+/// `GO`, `UO` and the rows; the activation gives `AO` of the gate's, the product `MO`.
 impl<
     'c,
     A,
@@ -68,6 +69,7 @@ impl<
     const EPSILON: usize,
     NC,
     NP,
+    NB,
     Qkv,
     Position,
     Write,
@@ -105,6 +107,12 @@ where
     Hidden: AxisName,
     NC: M,
     RmsNorm<Hidden, EPSILON, NC, NP>: for<'r, 'x> Module<
+            &'r Live<Spread<Hidden, R, Chip>, R>,
+            (),
+            &'x mut (),
+            Output = Live<Spread<Hidden, R, Chip>, R>,
+        > + for<'x> Module<Begin<()>, (), &'x mut (), Output = NB>,
+    NB: for<'r, 'x> Module<
             &'r Live<Spread<Hidden, R, Chip>, R>,
             (),
             &'x mut (),
@@ -255,10 +263,12 @@ where
         let heads = attended.with(attended.value().0.to_dm(&mut device.tdma));
         let slot = &mut Default::default();
         let projected = (attention.0.output).forward(&mut *device, (), slot, &heads);
+        let post = post.forward(&mut *device, (), &mut (), Begin(()));
+        let norm = norm.forward(&mut *device, (), &mut (), Begin(()));
+        let gate_landed = gate.forward(&mut *device, (), &mut (), Begin(()));
         let branch = post.forward(&mut *device, (), &mut (), &projected);
         let residual = add.forward(&mut *device, (), &mut (), (&input, &branch));
         let normalized = norm.forward(&mut *device, (), &mut (), &residual);
-        let gate_landed = gate.forward(&mut *device, (), &mut (), Begin(()));
         let up_landed = up.forward(&mut *device, (), &mut (), Begin(()));
         let gated = gate.forward(&mut *device, (), &mut (), (gate_landed, &normalized));
         let down_landed = (down.0.operation).forward(&mut *device, (), &mut (), Begin(()));

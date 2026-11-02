@@ -1,10 +1,10 @@
 //! `x * w / sqrt(mean(x²) + epsilon)` per row, with FP32 statistics and one rounding.
 
 use super::{Chunk, Cluster, FeatureSlices, Lines, Spread, Tile, TilePart, TileParts, TileRows};
-use crate::Op;
 use crate::load::{Checkpoint, Context, Load, LoadError};
 use crate::tensor::form::Weight;
 use crate::tensor::{axis::Single, live::Live, scalar};
+use crate::{Begin, Op};
 use core::borrow::Borrow;
 use core::marker::PhantomData;
 use furiosa_opt_std::prelude::stage::{Standalone, VeOrder::IntraFirst, Way::Way4};
@@ -136,6 +136,20 @@ where
     fn lanes(&self, device: &mut Device) -> Features<Width, Chips> {
         let in_dm: InDm<Width, Chips> = self.tensor().to_dm(&mut device.tdma);
         in_dm.lanes(device)
+    }
+}
+
+/// A norm begun: its gain written in the feature slices of the rows it scales, before they
+/// arrive.
+impl<Width: AxisName, const EPSILON: usize, Chips: M, T> Op<Begin<()>>
+    for RmsNorm<Width, EPSILON, Chips, Weight<m![Width], Chips, T>>
+where
+    T: Borrow<HbmTensor<bf16, Chips, m![Width]>>,
+{
+    type Output = RmsNorm<Width, EPSILON, Chips, InDm<Width, Chips>>;
+
+    fn forward(&self, device: &mut Device, _: Begin<()>) -> Self::Output {
+        RmsNorm::new(self.weight.tensor().to_dm(&mut device.tdma))
     }
 }
 
