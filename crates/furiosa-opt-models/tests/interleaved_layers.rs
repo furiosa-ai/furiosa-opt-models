@@ -96,12 +96,12 @@ type PeriodPools = ([Pool<Group>; 5], [Pool<full::Group>; 1]);
 type HiddenRows = HbmTensor<bf16, Chip, m![Rows, Hidden]>;
 
 /// A layer's state: its attention's slots, its cache blocks, its MLP's slots.
-type Qkv = ((((), ()), ((), ()), (((), ()), ())), (), ());
+type Qkv = (((), (), ((), ())), (), ());
 type Units = ((((), ()), ()), ((), ()));
 type State<'b, A> = ((((Qkv, &'b mut Pool<A>, ()), ()), (Units, ())), ());
 
 fn state<A: Attention>(pool: &mut Pool<A>) -> State<'_, A> {
-    let qkv = ((((), ()), ((), ()), (((), ()), ())), (), ());
+    let qkv = (((), (), ((), ())), (), ());
     let units = ((((), ()), ()), ((), ()));
     ((((qkv, pool, ()), ()), (units, ())), ())
 }

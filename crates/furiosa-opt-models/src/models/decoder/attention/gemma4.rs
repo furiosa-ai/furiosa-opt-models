@@ -31,7 +31,6 @@ use crate::ops::reduction::Argmax;
 use crate::tensor::axis;
 use crate::tensor::cache;
 use crate::tensor::form::Weight;
-use crate::tensor::mapping::Reshape;
 use crate::tensor::memory::{Hbm, Memory};
 use crate::tensor::parallel::{Chip, Parallel};
 use crate::{Branch, Op, Sequential, Then};
@@ -133,8 +132,7 @@ type KvView<A> = decoder::HeadView<<A as Attention>::Heads, <A as Attention>::He
 
 /// Heads read as `View`, projected from a row in form `F` to `Width` features, which the head
 /// split takes where the contraction leaves them.
-type Heads<F, Width, View, X> =
-    Sequential<Native<decoder::Projection<F, Hidden, Width, bf16, Chip, X>>, Reshape<View>>;
+type Heads<F, Width, View, X> = Native<decoder::Projection<F, Hidden, Width, bf16, Chip, X>, View>;
 
 /// Group `A`'s attended heads projected back to rows.
 type Output<A, P, X> = Named<"o_proj", decoder::Output<P, Hidden, A, Parallel<1>, X>>;

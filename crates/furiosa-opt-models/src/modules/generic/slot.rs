@@ -77,7 +77,7 @@ impl<Matrix, Offset> Slot for Affine<Matrix, Offset> {
     type Empty = ();
 }
 
-impl<W> Slot for Native<W> {
+impl<W, View> Slot for Native<W, View> {
     type Empty = ();
 }
 

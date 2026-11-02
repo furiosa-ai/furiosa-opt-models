@@ -468,13 +468,13 @@ where
     }
 }
 
-/// A projection whose live rows stay in its contraction's native mapping, for a consumer that
-/// moves them where it reads them: a weight form `W` read as itself.
+/// A projection whose live rows its head view `View` takes where the contraction leaves them: a
+/// weight form `W` read as itself, each row split into `View`'s heads.
 #[derive(DeviceSend, Load)]
-pub struct Native<W>(pub W);
+pub struct Native<W, View>(pub W, pub PhantomData<View>);
 
 /// A projection begun: its weight lands as its form lands it, before any rows arrive.
-impl<W: Op<Begin<()>>> Op<Begin<()>> for Native<W> {
+impl<W: Op<Begin<()>>, View> Op<Begin<()>> for Native<W, View> {
     type Output = W::Output;
 
     fn forward(&self, device: &mut Device, begin: Begin<()>) -> Self::Output {
@@ -483,12 +483,13 @@ impl<W: Op<Begin<()>>> Op<Begin<()>> for Native<W> {
 }
 
 /// The live row groups of a launch's rows projected by the dense contraction over the weight as
-/// it landed, where the contraction leaves them; the projected rows keep the launch's live rows.
-impl<'x, In, Out, Code, Rows, Chips, S, F, W, L>
+/// it landed, split into heads where the contraction leaves them; the heads keep the launch's live
+/// rows.
+impl<'x, In, Out, Code, Rows, Chips, S, F, W, View, L>
     Op<(
         L,
         &'x Live<DmTensor<bf16, m![1], Chips, S, m![Rows, { F }]>, Rows>,
-    )> for Native<W>
+    )> for Native<W, View>
 where
     In: AxisName,
     Out: AxisName,
@@ -498,8 +499,10 @@ where
     S: M,
     F: M,
     L: Slabs<In = In, Out = Out, Stored = Code>,
+    mapping::Reshape<View>: Op<Live<Projected<In, Out, Code, Rows>, Rows>>,
 {
-    type Output = Live<Projected<In, Out, Code, Rows>, Rows>;
+    type Output =
+        <mapping::Reshape<View> as Op<Live<Projected<In, Out, Code, Rows>, Rows>>>::Output;
 
     fn forward(
         &self,
@@ -510,20 +513,20 @@ where
         ),
     ) -> Self::Output {
         let projected = Affine::new(landed, ()).forward(
-            device,
+            &mut *device,
             (
                 input.with(PhantomData::<Rows>),
                 input.value().view(),
                 |at| mapping::Rows::<Rows>::group(input.value().view(), at),
             ),
         );
-        input.with(projected)
+        mapping::Reshape::<View>::default().forward(device, input.with(projected))
     }
 }
 
 /// The same rows through the weight begun here.
-impl<'x, In, Out, Code, Rows, Chips, S, F, W, L>
-    Op<&'x Live<DmTensor<bf16, m![1], Chips, S, m![Rows, { F }]>, Rows>> for Native<W>
+impl<'x, In, Out, Code, Rows, Chips, S, F, W, View, L>
+    Op<&'x Live<DmTensor<bf16, m![1], Chips, S, m![Rows, { F }]>, Rows>> for Native<W, View>
 where
     In: AxisName,
     Out: AxisName,
@@ -534,8 +537,10 @@ where
     F: M,
     W: Op<Begin<()>, Output = L>,
     L: Slabs<In = In, Out = Out, Stored = Code>,
+    mapping::Reshape<View>: Op<Live<Projected<In, Out, Code, Rows>, Rows>>,
 {
-    type Output = Live<Projected<In, Out, Code, Rows>, Rows>;
+    type Output =
+        <mapping::Reshape<View> as Op<Live<Projected<In, Out, Code, Rows>, Rows>>>::Output;
 
     fn forward(
         &self,

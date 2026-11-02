@@ -121,8 +121,8 @@ fn from_hidden(
         Live::<(), Rows>::all().subrange(start.extent::<m![Rows]>(), rows.extent::<m![Rows]>());
     let hidden: Live<Spread<Hidden, Rows, Chip>, Rows> = live.with(hidden.to_dm(&mut device.tdma));
     let projection = &stage.0.projection;
-    let query = Module::forward(&projection.query, &mut *device, (), &mut ((), ()), &hidden);
-    let key = Module::forward(&projection.key, &mut *device, (), &mut ((), ()), &hidden);
+    let query = Module::forward(&projection.query, &mut *device, (), &mut (), &hidden);
+    let key = Module::forward(&projection.key, &mut *device, (), &mut (), &hidden);
     position(device, stage, (query, key), rotation)
 }
 
