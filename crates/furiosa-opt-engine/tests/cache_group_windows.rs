@@ -502,3 +502,189 @@ fn continues_a_prompt_over_both_groups_as_the_reference() {
         assert_eq!(continued, [CONTINUATION; 2], "two sequences a call");
     });
 }
+
+/// Calls of Gemma 4's decoder by shape, profiled at the level `FURIOSA_OPT_PROFILE` asks for: the
+/// published checkpoint loaded as the reference test loads it, then each case `GEMMA_PROFILE_CASES`
+/// names (all by default), a warm-up and `GEMMA_PROFILE_STEPS` timed calls each.
+#[test]
+#[ignore = "reads the published checkpoint from the local hub cache"]
+fn gemma_profile() {
+    use std::time::Instant;
+    use tracing::Instrument;
+    // Blocks of the history every sequence of a case shares; a decode row writes its position to
+    // a block of its own after them.
+    const SHARED: usize = 160;
+    // Name, sequences, tokens a sequence, cached positions.
+    const CASES: [(&str, usize, usize, usize); 8] = [
+        ("decode-1-at-27", 1, 1, 27),
+        ("decode-1-at-1024", 1, 1, 1024),
+        ("decode-1-at-2187", 1, 1, 2187),
+        ("decode-8-at-1024", 8, 1, 1024),
+        ("decode-32-at-1024", 32, 1, 1024),
+        ("decode-64-at-1024", 64, 1, 1024),
+        ("chunk-64-at-0", 1, 64, 0),
+        ("chunk-64-at-512", 1, 64, 512),
+    ];
+    let steps: usize =
+        std::env::var("GEMMA_PROFILE_STEPS").map_or(20, |steps| steps.parse().unwrap());
+    let wanted = std::env::var("GEMMA_PROFILE_CASES").unwrap_or_default();
+    let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+    // Installed before the functions load, so that they load with the profile.
+    let _spans = lines();
+    let source = Checkpoint::new(snapshot(GEMMA4, &["*.json", "*.safetensors"]), None).unwrap();
+    let loading = Instant::now();
+    let root: gemma4::ForCausalLM = source.load(&mut device).unwrap();
+    println!("loaded in {:.1} s", loading.elapsed().as_secs_f64());
+    let instance = Instance::new(root, Tiling::Adaptive);
+    let model: &dyn Served = &instance;
+    let limits = model.limits();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let cache = Cache::new(&device, &limits.cache, SHARED + gemma4::Rows::SIZE).unwrap();
+        let bytes: usize = cache.layers().iter().map(HbmBuffer::size).sum();
+        println!("cache of {} blocks, {bytes} B", cache.blocks());
+        let ids = |end: usize| (0..end).map(|id| id as u32);
+        for (case, sequences, tokens, cached) in CASES {
+            if !wanted.is_empty() && !wanted.split(',').any(|name| name == case) {
+                continue;
+            }
+            let mut requests = Vec::with_capacity(sequences);
+            for sequence in 0..sequences {
+                let blocks: Vec<u32> = match tokens {
+                    1 => (ids(cached / Block::SIZE).chain([(SHARED + sequence) as u32])).collect(),
+                    _ => ids((cached + tokens).div_ceil(Block::SIZE)).collect(),
+                };
+                requests.push(request(&mut device, (&blocks, cached), &vec![0; tokens]).await);
+            }
+            for sample in 0..=steps {
+                let span = match sample {
+                    0 => tracing::info_span!("warmup", case),
+                    step => tracing::info_span!("forward", case, step),
+                };
+                let started = Instant::now();
+                let tokens = async {
+                    let output = (model.forward(&mut device, &cache, &requests, &[]))
+                        .instrument(tracing::info_span!("submit"))
+                        .await
+                        .unwrap();
+                    (device.synchronize())
+                        .instrument(tracing::info_span!("wait"))
+                        .await
+                        .unwrap();
+                    (words(&mut device, &output.buffer))
+                        .instrument(tracing::info_span!("readback"))
+                        .await
+                        .unwrap()
+                }
+                .instrument(span)
+                .await;
+                println!(
+                    "{case} step {sample}: {:.3} ms, first token {}",
+                    started.elapsed().as_secs_f64() * 1e3,
+                    tokens[0],
+                );
+            }
+        }
+    });
+}
+
+/// Records every span to `GEMMA_PROFILE_OUT` (default `npu.tsv`), a line each: `S id parent name
+/// ns fields` as it opens (an NPU span's fields carry its cycles) and `C id ns` as it closes; a
+/// kernel's name, written once on a `K label bytes name` line, is its label in the spans.
+fn lines() -> tracing::subscriber::DefaultGuard {
+    use tracing_subscriber::prelude::*;
+    let path = std::env::var("GEMMA_PROFILE_OUT").unwrap_or_else(|_| "npu.tsv".into());
+    let out = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+    let layer = Lines {
+        out: std::sync::Mutex::new(out),
+        base: std::time::Instant::now(),
+        kernels: std::sync::Mutex::default(),
+    };
+    tracing::subscriber::set_default(tracing_subscriber::registry().with(layer))
+}
+
+struct Lines {
+    out: std::sync::Mutex<std::io::BufWriter<std::fs::File>>,
+    base: std::time::Instant,
+    kernels: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+/// A span's fields as `\tname=value` text, and the `K` line of a kernel it names first.
+struct Fields<'a> {
+    text: String,
+    kernels: &'a std::sync::Mutex<std::collections::HashSet<String>>,
+    named: String,
+}
+
+impl tracing::field::Visit for Fields<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        use std::hash::{Hash, Hasher};
+        let label = match field.name() {
+            "kernel" if value.contains("copy::__furiosa_opt_place") => "place".into(),
+            "kernel" if value.contains("gemma4") => "root48".into(),
+            "kernel" => {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                value.hash(&mut hasher);
+                format!("kernel-{:016x}", hasher.finish())
+            }
+            _ => {
+                self.text.push_str(&format!("\t{}={value}", field.name()));
+                return;
+            }
+        };
+        if self.kernels.lock().unwrap().insert(label.clone()) {
+            let name: String = value.chars().take(400).collect();
+            self.named = format!("K\t{label}\t{}\t{name}\n", value.len());
+        }
+        self.text.push_str(&format!("\tkernel={label}"));
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let text = format!("{value:?}");
+        self.record_str(field, text.trim_matches('"'));
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for Lines
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attributes: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        use std::io::Write;
+        let parent = match attributes.parent() {
+            Some(parent) => Some(parent.clone()),
+            None if attributes.is_contextual() => context.current_span().id().cloned(),
+            None => None,
+        };
+        let mut fields = Fields {
+            text: String::new(),
+            kernels: &self.kernels,
+            named: String::new(),
+        };
+        attributes.record(&mut fields);
+        let line = format!(
+            "{}S\t{}\t{}\t{}\t{}{}\n",
+            fields.named,
+            id.into_u64(),
+            parent.map_or(0, |parent| parent.into_u64()),
+            attributes.metadata().name(),
+            self.base.elapsed().as_nanos(),
+            fields.text
+        );
+        self.out.lock().unwrap().write_all(line.as_bytes()).unwrap();
+    }
+
+    fn on_close(&self, id: tracing::span::Id, _: tracing_subscriber::layer::Context<'_, S>) {
+        use std::io::Write;
+        let line = format!("C\t{}\t{}\n", id.into_u64(), self.base.elapsed().as_nanos());
+        self.out.lock().unwrap().write_all(line.as_bytes()).unwrap();
+    }
+}
