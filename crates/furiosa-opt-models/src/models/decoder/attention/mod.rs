@@ -3261,8 +3261,8 @@ mod tests {
         assert_eq!(scope(published(), &[root]).unwrap(), "");
         assert_eq!(scope(published(), &[nested]).unwrap(), "model");
         let both = "the checkpoint holds a base model at its root and under model";
-        let mut rescaled = published();
-        rescaled["rope_scaling"] = serde_json::json!({"rope_type": "linear", "factor": 2.0});
+        let mut windowed = published();
+        windowed["use_sliding_window"] = serde_json::json!(true);
         let mut wide = published();
         wide["hidden_size"] = serde_json::json!(1000);
         for (refused, expected) in [
@@ -3271,8 +3271,9 @@ mod tests {
                 format!("invalid {root}: {both}"),
             ),
             (
-                scope(rescaled, &[]),
-                "unsupported config.json: rope_scaling: Qwen3 rotates without scaling".into(),
+                scope(windowed, &[]),
+                "unsupported config.json: use_sliding_window: Qwen3 attends the whole history"
+                    .into(),
             ),
             (
                 scope(wide, &[]),

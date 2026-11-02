@@ -26,7 +26,7 @@ jobs:
   # Building needs no RNGD, so every job here runs on a CPU runner and leaves the chips to the tests.
   compiler:
     if: inputs.build
-    runs-on: aks-kr-xlarge-m
+    runs-on: furiosa-opt-models-runner
     timeout-minutes: 30
     permissions: {actions: read, contents: write}
     env:
@@ -51,7 +51,7 @@ jobs:
           - {package: models, cache: kernels, packages: -p furiosa-opt-models}
           # The engine's job also builds its binding's tests, which reach the kernels it serves.
           - {package: engine, cache: serving, packages: -p furiosa-opt-engine -p furiosa-opt-python}
-    runs-on: aks-kr-xlarge-m
+    runs-on: furiosa-opt-models-runner
     # A new compiler revision compiles every kernel once; later runs compile only changed kernels.
     timeout-minutes: 90
     steps:
@@ -84,12 +84,16 @@ jobs:
         run: cargo furiosa-opt test -p furiosa-opt-engine --release --doc
       # Pull requests build the reference too, so one that breaks it fails before it merges.
       - if: matrix.package == 'engine'
+        run: cargo furiosa-opt doc -p furiosa-opt-models --no-deps
+      # rustdoc takes RUSTDOCFLAGS, so it runs the old trait solver; on the next one its auto-trait
+      # synthesis aborts until https://github.com/rust-lang/rust/pull/149019. The old solver cannot
+      # prove the bounds of the models' BF16 launch impls the engine's reference reaches and then
+      # runs on, so this reference does not gate a pull request until the solver is fixed.
+      - if: matrix.package == 'engine'
+        continue-on-error: true
+        timeout-minutes: 10
         # The engine's interface is its Python module, so its Rust reference documents internal items.
-        run: |
-          cargo furiosa-opt doc -p furiosa-opt-models --no-deps
-          # rustdoc takes RUSTDOCFLAGS, so it runs the old trait solver; on the next one its
-          # auto-trait synthesis aborts until https://github.com/rust-lang/rust/pull/149019.
-          RUSTDOCFLAGS=--document-private-items cargo furiosa-opt doc -p furiosa-opt-engine --no-deps
+        run: RUSTDOCFLAGS=--document-private-items cargo furiosa-opt doc -p furiosa-opt-engine --no-deps
       - if: matrix.package == 'engine' && github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
@@ -116,7 +120,7 @@ jobs:
     if: inputs.build && inputs.wheel
     needs: compiler
     permissions: {contents: read}
-    runs-on: aks-kr-xlarge-m
+    runs-on: furiosa-opt-models-runner
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -163,7 +167,7 @@ jobs:
   # findings not fixed yet.
   clippy:
     needs: compiler
-    runs-on: aks-kr-xlarge-m
+    runs-on: furiosa-opt-models-runner
     timeout-minutes: 30
     env:
       # cargo-furiosa-opt names the backend for its builds; a plain cargo build names it here.
