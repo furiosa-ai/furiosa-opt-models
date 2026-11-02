@@ -83,22 +83,6 @@ where
             T::to_dm(device, self.scales(), at);
         let mut restored = DmTensor::new();
         for part in 0..<T::Restorations as M>::SIZE {
-            let decoded: DmTensor<
-                bf16,
-                m![1],
-                T::Cluster,
-                T::Slices,
-                m![{ T::Restored }, { T::Inputs }],
-            > = device
-                .main
-                .begin(coded.view().tile::<T::Restorations, 1, m![
-                    { Selected<T::Restorations> }, { T::Restored }, { T::Inputs }
-                ]>(part))
-                .fetch::<m![{ T::Restored }, { T::Inputs } / 16], m![In % 16]>()
-                .fetch_table_lookup::<bf16>()
-                .collect::<m![{ T::Restored }, { T::Inputs } / 16], m![In % 16]>()
-                .commit_trim::<m![In % 16]>()
-                .commit();
             let scale: VrfTensor<f32, m![1], T::Cluster, T::Slices, m![{ T::Restored }, 1 # 8]> =
                 device
                     .sub
@@ -110,7 +94,9 @@ where
                     .to_vrf();
             device
                 .main
-                .begin(decoded.view())
+                .begin(coded.view().tile::<T::Restorations, 1, m![
+                    { Selected<T::Restorations> }, { T::Restored }, { T::Inputs }
+                ]>(part))
                 .fetch::<m![{ T::Restored }, { T::Inputs } / 16], m![In % 16]>()
                 .fetch_cast::<f32>()
                 .collect::<m![{ T::Restored }, { T::Inputs } / 8], m![In % 8]>()
