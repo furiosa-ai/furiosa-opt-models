@@ -937,12 +937,12 @@ pub(crate) const fn batch(rows: usize, inputs: usize, lanes: usize) -> usize {
     batch
 }
 
-/// Output rows of a block of `block` rows one restoration scales: a power of two dividing the
-/// block, at most 64, so their FP32 scales take at most 2 KiB of the VRF.
+/// Output rows of a block of `block` rows one restoration scales: the most dividing the block, at
+/// most 64, so their FP32 scales take at most 2 KiB of the VRF.
 pub(crate) const fn restored(block: usize) -> usize {
     let mut rows = 64;
     while !block.is_multiple_of(rows) {
-        rows /= 2;
+        rows -= 1;
     }
     rows
 }

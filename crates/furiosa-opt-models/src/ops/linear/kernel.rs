@@ -939,8 +939,8 @@ impl<In: AxisName, Out: AxisName, Code: Scalar> Tiling<In, Out> for Contraction<
     }
 }
 
-/// Output rows of a block one restoration scales: a power of two dividing the block, at most 64,
-/// so their FP32 scales take at most 2 KiB of the VRF.
+/// Output rows of a block one restoration scales: the most dividing the block, at most 64, so
+/// their FP32 scales take at most 2 KiB of the VRF.
 #[derive(Clone, Debug)]
 pub(crate) struct RestoredRows<In, Out, Code>(PhantomData<(In, Out, Code)>);
 
