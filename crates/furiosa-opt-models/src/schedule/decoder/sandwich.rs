@@ -15,6 +15,8 @@
 //!   the activation and the up projection's passes; its output projection's inside its
 //!   attention, once the attention's first history is in flight. Its leaves hold nothing in a
 //!   call, so it takes `()`.
+//! - Its tile is its envelope, so its attention hands its end the attended heads where they are,
+//!   with the landed output projection, and writes no HBM place.
 
 use super::{Cut, Output, Places, Pool, Staged, Stored, attend_stored};
 use crate::load::Named;
@@ -239,7 +241,7 @@ where
     type Reach = R;
     type Home = HbmTensor<bf16, Chip, RowMajor<Hidden, R>>;
     type Front = (QL, KL, VL);
-    type Landed = OL;
+    type Landed = (OL, Live<AttendedHeads<A, R>, R>);
     type Staged = Staged<DR, Live<Self::Rows, R>>;
 
     fn fill(&self, device: &mut Device, home: &Self::Home, _: Live<(), R>) -> Self::Rows {
@@ -310,7 +312,7 @@ where
         call: &'c Context<P, R, Windows>,
         (pool, live): (&mut &mut Pool<A>, Live<(), R>),
         places: &mut Places<A, R>,
-    ) -> OL {
+    ) -> Self::Landed {
         let Then(Sequential(Residual(_, Then(attention, _), _), _), _) = self;
         let Attention {
             cache,
@@ -318,7 +320,7 @@ where
             output,
             ..
         } = &attention.0;
-        let Places { stored, attended } = places;
+        let Places { stored, .. } = places;
         let write = &call.write;
         let operands = (&write, &call.read);
         attend_stored(
@@ -331,8 +333,7 @@ where
                 let boundary = (&output.0.operation, &mut landed);
                 let input = (&query, pool, &call.read, boundary);
                 let rows = attend.forward(&mut *device, (), &mut (), input);
-                (rows.value().view()).to_hbm_view(&mut device.tdma, attended.0.view_mut());
-                landed
+                (landed, rows)
             },
         )
     }
@@ -340,16 +341,15 @@ where
     fn end(
         &self,
         device: &mut Device,
-        (attended, landed): Output<'_, A, R, R, OL>,
+        (_, landed): Output<'_, A, R, R, Self::Landed>,
         input: Live<Self::Rows, R>,
         _: &mut (),
     ) -> Self::Staged {
         let Then(Sequential(first, Residual(norm, Then(mlp, _), _)), _) = self;
         let Residual(_, Then(attention, post), add) = first;
         let Sum(Fork((Then(gate, activation), up)), Then(multiply, down)) = &mlp.0;
-        let heads = attended.with(attended.value().0.to_dm(&mut device.tdma));
-        let landed = (&*landed, &heads);
-        let projected = (attention.0.output).forward(&mut *device, (), &mut (), landed);
+        let (landed, heads) = &*landed;
+        let projected = (attention.0.output).forward(&mut *device, (), &mut (), (landed, heads));
         let post = post.forward(&mut *device, (), &mut (), Begin(()));
         let norm = norm.forward(&mut *device, (), &mut (), Begin(()));
         let gate_landed = gate.forward(&mut *device, (), &mut (), Begin(()));

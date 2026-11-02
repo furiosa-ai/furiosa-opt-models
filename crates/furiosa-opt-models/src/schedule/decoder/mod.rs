@@ -225,7 +225,8 @@ trait Cut<A: decoder::Attention, C, T> {
     type Home;
     /// Its front landed for a tile's rows.
     type Front;
-    /// Its output projection as its form lands it at its attention's boundary.
+    /// What its attention hands its end beside the attended place: its output projection as its
+    /// form lands it at the attention's boundary, and the attended rows if the end reads them there.
     type Landed;
     /// A tile between its MLP's two steps.
     type Staged;
