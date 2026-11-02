@@ -502,21 +502,25 @@ impl<R: AxisName, W: AxisName> AxisName for Tables<R, W> {
 }
 
 /// A catalog root as a decoder: a call plans its rows' positions, cache slots, attention work and
-/// selected rows on the host, then launches the root once over every layer's own blocks, which
-/// writes the selected rows' outputs in kept order; a call that runs adapters passes each layer's
-/// projections their terms and selections of the rows. Under a fixed tiling every row is a work
-/// item, so a launch holds the size's call rows.
+/// selected rows on the host, then launches the root once over one view of every layer's blocks,
+/// each layer's an equal range in layer order, which writes the selected rows' outputs in kept
+/// order; a call that runs adapters passes each layer's projections their terms and selections of
+/// the rows. Under a fixed tiling every row is a work item, so a launch holds the size's call rows.
 impl<R> Decoder for R
 where
     R: Root + DeviceSend + Send + Sync,
-    for<'b, 't> <R::Size as Geometry>::Layers<launch::Layer<'b, Held<'t, R>>>:
-        TryFrom<Vec<launch::Layer<'b, Held<'t, R>>>> + DeviceSend,
-    for<'b> <R::Size as Geometry>::Layers<launch::Layer<'b>>:
-        TryFrom<Vec<launch::Layer<'b>>> + DeviceSend,
+    for<'t> <R::Size as Geometry>::Layers<launch::Layer<Held<'t, R>>>:
+        TryFrom<Vec<launch::Layer<Held<'t, R>>>> + DeviceSend,
+    <R::Size as Geometry>::Layers<launch::Layer>: TryFrom<Vec<launch::Layer>> + DeviceSend,
     for<'i, 'a, 's, 'b> R: Module<
             &'i mut launch::Input<'a, R::Size>,
             (),
-            launch::State<'s, R::Size, <R::Size as Geometry>::Layers<launch::Layer<'b>>, R::Place>,
+            launch::State<
+                's,
+                R::Size,
+                launch::Stack<'b, <R::Size as Geometry>::Layers<launch::Layer>>,
+                R::Place,
+            >,
             Output = (),
         >,
     for<'i, 'a, 's, 'b, 't> R: Module<
@@ -525,7 +529,7 @@ where
             launch::State<
                 's,
                 R::Size,
-                <R::Size as Geometry>::Layers<launch::Layer<'b, Held<'t, R>>>,
+                launch::Stack<'b, <R::Size as Geometry>::Layers<launch::Layer<Held<'t, R>>>>,
                 R::Place,
             >,
             Output = (),
@@ -534,7 +538,7 @@ where
     const OUTPUT: Output = <R::Place as Place>::OUTPUT;
     const ADAPTERS: usize = <R::Adapting as Adapting<R::Size>>::ADAPTERS;
     type Output = Rows<<R::Place as Place>::Scalar, R::Row>;
-    type Layers = Vec<Blocks<KvHeads, Head>>;
+    type Layers = Blocks<KvHeads, Head>;
     type Adapter = <R::Adapting as Adapting<R::Size>>::Adapter;
 
     fn limits(&self, tiling: Tiling) -> Limits {
@@ -542,9 +546,10 @@ where
     }
 
     fn layers(storage: &[HbmBuffer]) -> io::Result<Self::Layers> {
-        (storage.iter())
-            .map(|layer| Blocks::from_buffer(layer.alias(..).map_err(io::Error::other)?))
-            .collect()
+        let layers = (storage.iter())
+            .map(|layer| layer.alias(..).map_err(io::Error::other))
+            .collect::<io::Result<Vec<_>>>()?;
+        Blocks::from_buffers(layers)
     }
 
     fn adapter(checkpoint: &Checkpoint, device: &mut Device) -> Result<Self::Adapter, LoadError> {
@@ -607,10 +612,10 @@ where
             let place = DeviceOutput::alloc(device).map_err(io::Error::other)?;
             let place = match batch.adapters() {
                 None => {
-                    let slots = (layers.iter_mut())
-                        .map(|blocks| ((Default::default(), blocks, ()), ()))
+                    let slots = (0..<R::Size as Geometry>::LAYERS)
+                        .map(|_| <launch::Layer>::default())
                         .collect();
-                    submit(device, root, &mut input, slots, place)?
+                    submit(device, root, &mut input, (layers, slots), place)?
                 }
                 Some(binding) => {
                     let selections = (
@@ -618,14 +623,14 @@ where
                         adapters::selected::<launch::Capacity<R::Size>, Rank<2>>(&mut next)?,
                     );
                     let held = binding.held();
-                    let slots = (layers.iter_mut().enumerate())
-                        .map(|(at, blocks)| {
+                    let slots = (0..<R::Size as Geometry>::LAYERS)
+                        .map(|at| -> launch::Layer<Held<'_, R>> {
                             let states =
                                 <R::Adapting as Adapting<R::Size>>::states(held, at, &selections);
-                            ((Default::default(), blocks, ()), states)
+                            (Default::default(), states)
                         })
                         .collect();
-                    submit(device, root, &mut input, slots, place)?
+                    submit(device, root, &mut input, (layers, slots), place)?
                 }
             };
             Rows::new(&place.into_buffer(), 0..batch.kept().len())
@@ -664,13 +669,14 @@ fn limits<S: Geometry + Decode + 'static>(adapters: usize, tiling: Tiling) -> Li
     }
 }
 
-/// One launch of `root` over a call's `input` and its layers' `slots`, writing the selected rows'
-/// outputs into `place`, which it returns once the device accepted the launch.
-fn submit<'i, 'a, R, L>(
+/// One launch of `root` over a call's `input`, its layers' cache `blocks` and their `slots`,
+/// writing the selected rows' outputs into `place`, which it returns once the device accepted the
+/// launch.
+fn submit<'i, 'a, 'b, R, L>(
     device: &mut Device,
     root: &R,
     input: &'i mut launch::Input<'a, R::Size>,
-    slots: Vec<L>,
+    (blocks, slots): (&'b mut Blocks<KvHeads, Head>, Vec<L>),
     place: R::Place,
 ) -> io::Result<R::Place>
 where
@@ -679,14 +685,19 @@ where
     for<'s> R: Module<
             &'i mut launch::Input<'a, R::Size>,
             (),
-            launch::State<'s, R::Size, <R::Size as Geometry>::Layers<L>, R::Place>,
+            launch::State<
+                's,
+                R::Size,
+                launch::Stack<'b, <R::Size as Geometry>::Layers<L>>,
+                R::Place,
+            >,
             Output = (),
         >,
 {
-    let slots: <R::Size as Geometry>::Layers<L> = (slots.try_into())
-        .unwrap_or_else(|_| unreachable!("a cache of the decoder's spec holds each layer"));
+    let slots: <R::Size as Geometry>::Layers<L> =
+        (slots.try_into()).unwrap_or_else(|_| unreachable!("a launch holds a slot for each layer"));
     let hidden = DeviceOutput::alloc(device).map_err(io::Error::other)?;
-    let mut places = (((hidden, slots), ()), place);
+    let mut places = (((hidden, (blocks, slots)), ()), place);
     let state: launch::State<'_, R::Size, _, R::Place> = &mut places;
     launch(forward, (&mut *device, root, (), state, input))
         .output(&mut ())

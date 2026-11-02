@@ -162,7 +162,7 @@ impl<
             (
                 &Items<KvHeads, Groups, Head, Waves>,
                 Shape,
-                (&Gather, &Blocks<KvHeads, Head>),
+                (&Gather, Layer<&Blocks<KvHeads, Head>>),
             ),
             &mut HeadRows<Rows, KvHeads, Q, Head>,
             (&H, &mut S),
@@ -185,7 +185,7 @@ where
             (
                 &Items<KvHeads, Groups, Head, Waves>,
                 Shape,
-                (&Gather, &Blocks<KvHeads, Head>),
+                (&Gather, Layer<&Blocks<KvHeads, Head>>),
             ),
             &mut HeadRows<Rows, KvHeads, Q, Head>,
             (&H, &mut S),
@@ -300,7 +300,11 @@ pub(crate) mod tests {
         };
         let shape = items.shape();
         for _ in 0..layers.extent::<m![Layers]>() {
-            let input = (items, shape, (&Gather, &*pool));
+            let layer = Layer {
+                blocks: &*pool,
+                entry: 0,
+            };
+            let input = (items, shape, (&Gather, layer));
             Module::forward(
                 &attention,
                 &mut *device,

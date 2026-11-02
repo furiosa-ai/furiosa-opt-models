@@ -54,6 +54,7 @@ use crate::ops::rotary::{Rotary, Row, SplitHalf};
 use crate::ops::swiglu::{self, Mlp};
 use crate::specialize::attention::Decode;
 use crate::tensor::axis;
+use crate::tensor::cache::{self, Blocks};
 use crate::tensor::live::{Fill, Live, Spill};
 use crate::tensor::memory::Hbm;
 use crate::tensor::parallel::Chip;
@@ -754,8 +755,12 @@ impl<
     const L: usize,
     OL,
     Env,
-> Module<&'i mut launch::Input<'a, Z>, Env, launch::Body<'s, Z, [launch::Layer<'b, T>; DEPTH]>>
-    for Decoder<&'m launch::Base<Z, P>>
+>
+    Module<
+        &'i mut launch::Input<'a, Z>,
+        Env,
+        launch::Body<'s, Z, launch::Stack<'b, [launch::Layer<T>; DEPTH]>>,
+    > for Decoder<&'m launch::Base<Z, P>>
 where
     Z: Geometry<
             KvHeads = KvHeads,
@@ -780,7 +785,7 @@ where
         &self,
         device: &mut Device,
         _: Env,
-        body: launch::Body<'s, Z, [launch::Layer<'b, T>; DEPTH]>,
+        body: launch::Body<'s, Z, launch::Stack<'b, [launch::Layer<T>; DEPTH]>>,
         input: &'i mut launch::Input<'a, Z>,
     ) -> Self::Output {
         let model = self.0;
@@ -791,7 +796,8 @@ where
             context: &context,
             tokens: &input.tokens,
         };
-        let ((embedded, slots), ()) = body;
+        let ((embedded, (blocks, slots)), ()) = body;
+        let range = blocks.tokens.len() / DEPTH;
         let Then(Backbone { embedding, body }, norm) = &model.body;
         let launch = embedding::Launch {
             ids: call.tokens,
@@ -801,10 +807,10 @@ where
         crate::Op::forward(&embedding.0, &mut *device, launch);
         let (layers, spans) = (&body.layers.0, live.count::<Span>());
         // A layer's attention once every tile stored its rows: the rows attended as items written
-        // to the cache before, the deferred rows after.
+        // to its range of the cache before, the deferred rows after.
         let attend = |device: &mut Device,
                       layer: &Catalog<P, Z>,
-                      slot: &mut launch::Layer<'b, T>,
+                      mut pool: cache::Layer<&mut Blocks<KvHeads, Head>>,
                       places: &mut Places<Z>| {
             let Sequential(Residual(_, attention, _), _) = layer;
             let Attention {
@@ -813,16 +819,16 @@ where
                 output,
                 ..
             } = &attention.0;
-            let (context, pool) = (&call.context.0, &mut slot.0.1);
+            let context = &call.context.0;
             let operands = (&context.write, &context.read);
             let deferred = stage.forward(
                 &mut *device,
                 (),
-                &mut *pool,
+                &mut pool,
                 (&places.stored.retained, operands, live),
             );
             let history = Retained {
-                pool: &**pool,
+                pool: pool.read(),
                 key: &places.stored.retained.0,
                 value: &places.stored.retained.1,
                 read: &stage.read,
@@ -834,7 +840,7 @@ where
             let rows = (rows.0, rows.1, rows.2, boundary, &mut places.attended.0);
             attend.forward(&mut *device, (), &mut (), rows);
             let rows = (deferred, &places.stored.retained, &context.write);
-            stage.forward(device, (), &mut *pool, rows);
+            stage.forward(device, (), &mut pool, rows);
             projecting
         };
         let mut places = Places::new();
@@ -848,7 +854,11 @@ where
         }
         for index in 0..DEPTH - 1 {
             let (layer, next) = (layers.layer(index), layers.layer(index + 1));
-            let mut projecting = attend(&mut *device, &layer, &mut slots[index], &mut places);
+            let pool = cache::Layer {
+                blocks: &mut **blocks,
+                entry: index * range,
+            };
+            let mut projecting = attend(&mut *device, &layer, pool, &mut places);
             let (mut adapters, mut following) = (slots[index].1, slots[index + 1].1);
             // In place, so the loop carries one state: a tile overwrites only its own rows, read
             // just before, and the attention has read every store.
@@ -862,7 +872,11 @@ where
             }
         }
         let last = layers.layer(DEPTH - 1);
-        let mut projecting = attend(&mut *device, &last, &mut slots[DEPTH - 1], &mut places);
+        let pool = cache::Layer {
+            blocks: &mut **blocks,
+            entry: (DEPTH - 1) * range,
+        };
+        let mut projecting = attend(&mut *device, &last, pool, &mut places);
         let mut adapters = slots[DEPTH - 1].1;
         let mut head: Rows<Z> = HbmTensor::new();
         for span in 0..spans {
@@ -995,7 +1009,12 @@ mod tests {
             for<'i, 'a, 's, 'b> R: Module<
                     &'i mut launch::Input<'a, Z>,
                     (),
-                    launch::State<'s, Z, <Z as Geometry>::Layers<launch::Layer<'b>>, O>,
+                    launch::State<
+                        's,
+                        Z,
+                        launch::Stack<'b, <Z as Geometry>::Layers<launch::Layer>>,
+                        O,
+                    >,
                 >,
         {
         }
