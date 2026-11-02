@@ -93,14 +93,23 @@ pub(crate) trait Partition: Sized {
     /// The immediate the logits are divided by; its reciprocal is exactly the score scale.
     const DIVISOR: f32;
 
-    fn windows(
+    /// Every window of a history merged: `land` issues window `at`'s history, `attend` attends
+    /// what it landed, and `boundary` runs once the first window's history is in flight.
+    fn windows<H>(
         device: &mut Device,
         rest: usize,
-        mut window: impl FnMut(&mut Device, usize) -> (Partial<Self>, Local<Self>),
+        (mut land, mut attend): (
+            impl FnMut(&mut Device, usize) -> H,
+            impl FnMut(&mut Device, H) -> (Partial<Self>, Local<Self>),
+        ),
+        boundary: impl FnOnce(&mut Device),
     ) -> Attended<Self> {
-        let (mut carry, mut running) = window(device, 0);
+        let first = land(device, 0);
+        boundary(device);
+        let (mut carry, mut running) = attend(device, first);
         for at in 0..rest {
-            let (partial, lse) = window(device, at + 1);
+            let window = land(device, at + 1);
+            let (partial, lse) = attend(device, window);
             (carry, running) = Self::fold(device, &carry, &running, &partial, &lse);
         }
         // Each of a head's shard slices adds its part of the epsilon, so it is added once.

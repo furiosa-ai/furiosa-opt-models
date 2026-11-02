@@ -981,14 +981,17 @@ pub(super) type Slab<In, Out, Code> =
     m![{ SlabIndex<In, Out, Code> } = 1 # ({ SlabIndex<In, Out, Code> })];
 
 impl<In: AxisName, Out: AxisName, Code: Scalar> Contraction<In, Out, Code> {
-    /// Every slab of an `[Out, K]` tensor in one transfer, a slice keeping `E`, its rows' share of
-    /// `K`, of each.
+    /// Every slab of an `[Out, K]` tensor into `landing` in one transfer, a slice keeping `E`, its
+    /// rows' share of `K`, of each.
     pub(super) fn land<D: MaterializableScalar, K: M, E: M>(
         device: &mut Device,
         tensor: &HbmTensor<D, m![1], m![Out, { K }]>,
-    ) -> Landing<D, In, Out, Code, E> {
+        landing: &mut Landing<D, In, Out, Code, E>,
+    ) {
         const { Self::TILED };
-        tensor.to_dm(&mut device.tdma)
+        tensor
+            .view()
+            .to_dm_view(&mut device.tdma, landing.view_mut());
     }
 
     /// Slab `at` of a tensor landed whole.

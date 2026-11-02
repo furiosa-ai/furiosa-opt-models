@@ -12,10 +12,12 @@
 //! - Its feed-forward's projections land their weights one step ahead, under work that issues no
 //!   transfer: the gate projection's under the post-attention and pre-feed-forward norms, whose
 //!   gains land first, the up projection's under the gate's passes, the down projection's under
-//!   the activation and the up projection's passes. Its output projection's landing is `()`; its
-//!   leaves hold nothing in a call, so it takes `()` and runs each with its empty slot.
+//!   the activation and the up projection's passes; its output projection's inside its
+//!   attention, once the attention's first history is in flight. Its leaves hold nothing in a
+//!   call, so it takes `()`.
 
 use super::{Cut, Output, Places, Pool, Staged, Stored, attend_stored};
+use crate::load::Named;
 use crate::models::decoder;
 use crate::modules::attention::{self, Attention, KeyValue, NormalizedQkv, Positioned, Projection};
 use crate::modules::feedforward::glu::Glu;
@@ -29,7 +31,7 @@ use crate::ops::normalization::{RmsNorm, RowMajor, Spread};
 use crate::tensor::axis::Single;
 use crate::tensor::live::Live;
 use crate::tensor::parallel::{Chip, Parallelism};
-use crate::{Begin, Fork, Module, Sequential, Slot, Then};
+use crate::{Begin, Fork, Module, Sequential, Then};
 use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
 
@@ -61,9 +63,9 @@ type AttendedHeads<A, R> = Attended<
 /// The sandwich-norm layer and its tail `L` in every form whose leaves take a whole envelope of
 /// `R` rows of `Hidden` features, attending in group `A` over pages of its cache. Its query, key
 /// and value projections land as `QL`, `KL`, `VL` and give `QO`, `KO` and the value heads, which
-/// the head norms leave as `NQ`, `NK`; its output projection runs with its empty slot. Its norms
-/// land their gains as `NB`. Its gated feed-forward's gate, up and down projections land as `GL`,
-/// `UL`, `DL` and give `GO`, `UO` and the rows; the activation gives `AO` of the gate's, the
+/// the head norms leave as `NQ`, `NK`; its output projection lands as `OL` in its attention. Its
+/// norms land their gains as `NB`. Its gated feed-forward's gate, up and down projections land as
+/// `GL`, `UL`, `DL` and give `GO`, `UO` and the rows; the activation gives `AO` of the gate's, the
 /// product `MO`, with which the down projection begins as `DR`. Its tail lands its factor as `TB`.
 impl<
     'c,
@@ -92,7 +94,10 @@ impl<
     NK,
     Write,
     Attend,
-    Project,
+    const OUTPUT: &'static str,
+    O,
+    OP,
+    OL,
     Gate,
     Activation,
     Up,
@@ -124,7 +129,7 @@ impl<
                 >,
                 KeyValue<Write, ()>,
                 Attend,
-                Project,
+                Named<OUTPUT, RowParallel<O, OP>>,
             >,
             Glu<Gate, Activation, Up, Multiply, RowParallel<Down, Placement>>,
             RmsNorm<Hidden, EPSILON, NC, NP>,
@@ -179,21 +184,25 @@ where
             &'d mut (),
             Output = (),
         >,
-    Attend: for<'q, 'b, 'h, 'x> Module<
+    Attend: for<'q, 'b, 'h, 'o, 'l, 'x> Module<
             (
                 &'q Live<QueryHeads<A, R>, R>,
                 &'b Pool<A>,
                 &'h Pages<R, Windows, Chip>,
+                (&'o O, &'l mut OL),
             ),
             (),
             &'x mut (),
             Output = Live<AttendedHeads<A, R>, R>,
         >,
-    Project: Slot
-        + for<'r, 'x> Module<
-            &'r Live<AttendedHeads<A, R>, R>,
+    O: for<'x> Module<Begin<()>, (), &'x mut (), Output = OL>
+        + for<'l, 'x> Module<&'l mut OL, (), &'x mut (), Output = ()>,
+    OL: Default,
+    OP: Parallelism,
+    Named<OUTPUT, RowParallel<O, OP>>: for<'l, 'r, 'x> Module<
+            (&'l OL, &'r Live<AttendedHeads<A, R>, R>),
             (),
-            &'x mut <Project as Slot>::Empty,
+            &'x mut (),
             Output = Live<Spread<Hidden, R, Chip>, R>,
         >,
     Add: for<'r, 's, 'x> Module<
@@ -230,7 +239,7 @@ where
     type Reach = R;
     type Home = HbmTensor<bf16, Chip, RowMajor<Hidden, R>>;
     type Front = (QL, KL, VL);
-    type Landed = ();
+    type Landed = OL;
     type Staged = Staged<DR, Live<Self::Rows, R>>;
 
     fn fill(&self, device: &mut Device, home: &Self::Home, _: Live<(), R>) -> Self::Rows {
@@ -301,9 +310,14 @@ where
         call: &'c Context<P, R, Windows>,
         (pool, live): (&mut &mut Pool<A>, Live<(), R>),
         places: &mut Places<A, R>,
-    ) {
+    ) -> OL {
         let Then(Sequential(Residual(_, Then(attention, _), _), _), _) = self;
-        let Attention { cache, attend, .. } = &attention.0;
+        let Attention {
+            cache,
+            attend,
+            output,
+            ..
+        } = &attention.0;
         let Places { stored, attended } = places;
         let write = &call.write;
         let operands = (&write, &call.read);
@@ -313,8 +327,12 @@ where
             (pool, &*stored, live),
             |device, pool| {
                 let query = live.with(stored.queries.to_dm(&mut device.tdma));
-                let rows = attend.forward(&mut *device, (), &mut (), (&query, pool, &call.read));
+                let mut landed = OL::default();
+                let boundary = (&output.0.operation, &mut landed);
+                let input = (&query, pool, &call.read, boundary);
+                let rows = attend.forward(&mut *device, (), &mut (), input);
                 (rows.value().view()).to_hbm_view(&mut device.tdma, attended.0.view_mut());
+                landed
             },
         )
     }
@@ -322,7 +340,7 @@ where
     fn end(
         &self,
         device: &mut Device,
-        (attended, ()): Output<'_, A, R, R, ()>,
+        (attended, landed): Output<'_, A, R, R, OL>,
         input: Live<Self::Rows, R>,
         _: &mut (),
     ) -> Self::Staged {
@@ -330,8 +348,8 @@ where
         let Residual(_, Then(attention, post), add) = first;
         let Sum(Fork((Then(gate, activation), up)), Then(multiply, down)) = &mlp.0;
         let heads = attended.with(attended.value().0.to_dm(&mut device.tdma));
-        let slot = &mut Default::default();
-        let projected = (attention.0.output).forward(&mut *device, (), slot, &heads);
+        let landed = (&*landed, &heads);
+        let projected = (attention.0.output).forward(&mut *device, (), &mut (), landed);
         let post = post.forward(&mut *device, (), &mut (), Begin(()));
         let norm = norm.forward(&mut *device, (), &mut (), Begin(()));
         let gate_landed = gate.forward(&mut *device, (), &mut (), Begin(()));

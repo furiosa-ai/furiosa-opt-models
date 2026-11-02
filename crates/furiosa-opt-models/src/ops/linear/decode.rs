@@ -157,8 +157,32 @@ pub struct Landed<In: AxisName, Out: AxisName> {
     scales: Landing<f32, In, Out, f8e4m3, m![{ Rows<In, Out> }, 1 # 8]>,
 }
 
-/// The weight's codes, then its scales, one transfer each: a transfer into part of a slice's
-/// codes would hold every later command until the part before it lands.
+/// The place a weight lands in, before it lands.
+impl<In: AxisName, Out: AxisName> Default for Landed<In, Out> {
+    fn default() -> Self {
+        Self {
+            codes: DmTensor::new(),
+            scales: DmTensor::new(),
+        }
+    }
+}
+
+/// The weight's codes, then its scales, one transfer each, into a place made before: a transfer
+/// into part of a slice's codes would hold every later command until the part before it lands.
+impl<In: AxisName, Out: AxisName, K, V> Op<&mut Landed<In, Out>> for ChannelScaled<In, Out, K, V>
+where
+    K: Borrow<HbmTensor<f8e4m3, Chip, m![Out, In]>>,
+    V: Borrow<HbmTensor<f32, Chip, m![Out, 1 # 8]>>,
+{
+    type Output = ();
+
+    fn forward(&self, device: &mut Device, landed: &mut Landed<In, Out>) {
+        Tiled::<In, Out>::land(device, self.codes(), &mut landed.codes);
+        Tiled::<In, Out>::land(device, self.scales(), &mut landed.scales);
+    }
+}
+
+/// The weight begun: it lands in a place of its own.
 impl<In: AxisName, Out: AxisName, K, V> Op<Begin<()>> for ChannelScaled<In, Out, K, V>
 where
     K: Borrow<HbmTensor<f8e4m3, Chip, m![Out, In]>>,
@@ -167,10 +191,9 @@ where
     type Output = Landed<In, Out>;
 
     fn forward(&self, device: &mut Device, _: Begin<()>) -> Landed<In, Out> {
-        Landed {
-            codes: Tiled::<In, Out>::land(device, self.codes()),
-            scales: Tiled::<In, Out>::land(device, self.scales()),
-        }
+        let mut landed = Landed::default();
+        self.forward(device, &mut landed);
+        landed
     }
 }
 
@@ -205,6 +228,17 @@ impl<In: AxisName, Out: AxisName> Slabs for Landed<In, Out> {
                 ]>(part)
             },
         )
+    }
+}
+
+/// A borrowed landed weight restores as the weight it borrows.
+impl<In: AxisName, Out: AxisName> Slabs for &Landed<In, Out> {
+    type In = In;
+    type Out = Out;
+    type Stored = f8e4m3;
+
+    fn slab(&self, device: &mut Device, at: usize) -> Resident<In, Out, f8e4m3> {
+        (**self).slab(device, at)
     }
 }
 

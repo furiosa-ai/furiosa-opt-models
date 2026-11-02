@@ -111,47 +111,52 @@ where
         let attended = <Partition<Heads, Groups, Head, SCALE, Chip> as shard::Partition>::windows(
             device,
             read.rest.extent::<m![Windows]>(),
-            |device, at| {
-                let mut blocks: HbmTensor<i32, Chip, m![BlockIndex]> = HbmTensor::new();
-                read.blocks
-                    .view()
-                    .tile::<m![Windows], 1, m![Windows = 1 # Windows, BlockIndex]>(at)
-                    .to_hbm_view(&mut device.tdma, blocks.view_mut());
-                let mut lengths: HbmTensor<i32, Chip, m![1]> = HbmTensor::new();
-                read.lengths
-                    .view()
-                    .tile::<m![Windows], 1, m![Windows = 1 # Windows, 1]>(at)
-                    .to_hbm_view(&mut device.tdma, lengths.view_mut());
-                let in_dm: CacheTile<Heads, Head, D, Chip> = cache
-                    .tokens
-                    .gather::<m![1], m![Block, KeyValue, Heads, Head]>()
-                    .by_byte_offsets(&blocks)
-                    .prefix::<m![BlockIndex], _>(&lengths, 0)
-                    .to_dm(&mut device.tdma);
-                let in_dm = Convert::<bf16>::default().forward(device, in_dm);
-                // Two consecutive blocks fill each shard's 32 token slots.
-                let in_dm: DmTensor<
-                    bf16,
-                    Chip,
-                    Cluster,
-                    Slices<Heads>,
-                    m![1, KeyValue, Cache % 32, Head],
-                > = unsafe { in_dm.reshape() };
-                let mut bias: DmTensor<
-                    f32,
-                    Chip,
-                    Cluster,
-                    Slices<Heads>,
-                    m![1, Groups, Cache % 32],
-                > = DmTensor::new();
-                read.bias
-                    .view()
-                    .tile::<m![Windows], 1, m![Windows = 1 # Windows, Cache]>(at)
-                    .to_dm_view(&mut device.tdma, bias.view_mut());
-                let mut partial =
-                    shard::Partial::<Partition<Heads, Groups, Head, SCALE, Chip>>::new();
-                let mut lse = shard::Local::<Partition<Heads, Groups, Head, SCALE, Chip>>::new();
-                <Partition<Heads, Groups, Head, SCALE, Chip> as shard::Partition>::attend_precise::<
+            (
+                |device: &mut Device, at| {
+                    let mut blocks: HbmTensor<i32, Chip, m![BlockIndex]> = HbmTensor::new();
+                    read.blocks
+                        .view()
+                        .tile::<m![Windows], 1, m![Windows = 1 # Windows, BlockIndex]>(at)
+                        .to_hbm_view(&mut device.tdma, blocks.view_mut());
+                    let mut lengths: HbmTensor<i32, Chip, m![1]> = HbmTensor::new();
+                    read.lengths
+                        .view()
+                        .tile::<m![Windows], 1, m![Windows = 1 # Windows, 1]>(at)
+                        .to_hbm_view(&mut device.tdma, lengths.view_mut());
+                    let in_dm: CacheTile<Heads, Head, D, Chip> = cache
+                        .tokens
+                        .gather::<m![1], m![Block, KeyValue, Heads, Head]>()
+                        .by_byte_offsets(&blocks)
+                        .prefix::<m![BlockIndex], _>(&lengths, 0)
+                        .to_dm(&mut device.tdma);
+                    let in_dm = Convert::<bf16>::default().forward(device, in_dm);
+                    // Two consecutive blocks fill each shard's 32 token slots.
+                    let in_dm: DmTensor<
+                        bf16,
+                        Chip,
+                        Cluster,
+                        Slices<Heads>,
+                        m![1, KeyValue, Cache % 32, Head],
+                    > = unsafe { in_dm.reshape() };
+                    let mut bias: DmTensor<
+                        f32,
+                        Chip,
+                        Cluster,
+                        Slices<Heads>,
+                        m![1, Groups, Cache % 32],
+                    > = DmTensor::new();
+                    read.bias
+                        .view()
+                        .tile::<m![Windows], 1, m![Windows = 1 # Windows, Cache]>(at)
+                        .to_dm_view(&mut device.tdma, bias.view_mut());
+                    (in_dm, bias)
+                },
+                |device: &mut Device, (in_dm, bias)| {
+                    let mut partial =
+                        shard::Partial::<Partition<Heads, Groups, Head, SCALE, Chip>>::new();
+                    let mut lse =
+                        shard::Local::<Partition<Heads, Groups, Head, SCALE, Chip>>::new();
+                    <Partition<Heads, Groups, Head, SCALE, Chip> as shard::Partition>::attend_precise::<
                     m![1],
                     _,
                     _,
@@ -171,8 +176,10 @@ where
                     partial.view_mut(),
                     lse.view_mut(),
                 );
-                (partial, lse)
-            },
+                    (partial, lse)
+                },
+            ),
+            |_| (),
         );
         let output: HbmTensor<bf16, Chip, m![Heads, Groups, Head]> =
             attended.to_hbm(&mut device.tdma);
@@ -381,6 +388,43 @@ impl<
             &Pages<Rows, Windows>,
         ),
     ) -> Self::Output {
+        self.forward(device, (query, blocks, read, (&(), &mut ())))
+    }
+}
+
+/// The same queries attending, `boundary` running on its state once their first history is in
+/// flight.
+impl<
+    Heads: AxisName,
+    Groups: AxisName,
+    Head: AxisName,
+    Windows: AxisName,
+    Rows: AxisName,
+    H,
+    G,
+    const SCALE: usize,
+>
+    Op<(
+        &Live<super::super::Heads<Rows, Heads, Groups, Head>, Rows>,
+        &Blocks<Heads, Head>,
+        &Pages<Rows, Windows>,
+        (&H, &mut G),
+    )> for Windowed<Heads, Groups, Head, SCALE>
+where
+    H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()>,
+{
+    type Output = Live<Attended<Rows, Heads, Groups, Head>, Rows>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (query, blocks, read, boundary): (
+            &Live<super::super::Heads<Rows, Heads, Groups, Head>, Rows>,
+            &Blocks<Heads, Head>,
+            &Pages<Rows, Windows>,
+            (&H, &mut G),
+        ),
+    ) -> Self::Output {
         let mut heads = DmTensor::new();
         query
             .value()
@@ -391,9 +435,7 @@ impl<
             table: &read.table,
             lengths: &read.lengths,
         };
-        query.with(self.forward(
-            device,
-            (&heads, &history, &read.bias, &read.rest, query.with(())),
-        ))
+        let history = (&heads, &history, &read.bias, &read.rest, query.with(()));
+        query.with(self.forward(device, (history, boundary)))
     }
 }
