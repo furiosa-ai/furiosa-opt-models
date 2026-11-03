@@ -438,9 +438,22 @@ impl<Width: AxisName, Heads: AxisName, Groups: AxisName, Head: AxisName, Rows: A
     }
 }
 
+type HeadFeatures<Width, Heads> = m![Width % (Width / ({ Symbol<Heads> }))];
+
+/// Head slices holding a head-major row's `Width` features before they are named as heads: each
+/// KV head is the features' top digit.
+type Unsplit<'h, Rows, Width, Heads> = DmTensorViewMut<
+    'h,
+    bf16,
+    Chip,
+    m![1 # 2],
+    m![{ Layout<Rows>::Lanes } # 8, Width / (Width / ({ Symbol<Heads> })) # 8, 1 # 4],
+    m![{ linear::Groups<Rows> }, { HeadFeatures<Width, Heads> }],
+>;
+
 /// The rows a projection of one head kind leaves where its contraction computes them, as `Heads`
-/// heads of `Groups` query heads each, as from feature slices; the row groups live rows touch move
-/// one by one unless every group is live.
+/// heads of `Groups` query heads each, moved straight into the head slices: the row groups live
+/// rows touch one by one unless every group is live.
 impl<In, Width, Code, Heads, Groups, Head, Rows>
     Op<Live<linear::Projected<In, Width, Code, Rows>, Rows>> for Reshape<m![Heads, Groups, Head]>
 where
@@ -460,53 +473,28 @@ where
         input: Live<linear::Projected<In, Width, Code, Rows>, Rows>,
     ) -> Self::Output {
         const { assert!(Width::SIZE == Heads::SIZE * Groups::SIZE * Head::SIZE) };
-        let mut rows: Staged<Width, Rows> = DmTensor::new();
+        let mut heads: super::Heads<Rows, Heads, Groups, Head> = DmTensor::new();
         let (first, count) = input.groups::<crate::tensor::axis::Lanes<Rows>>();
         if count < <linear::Groups<Rows> as M>::SIZE {
-            let mut heads: super::Heads<Rows, Heads, Groups, Head> = DmTensor::new();
             for at in 0..count {
                 let group = first + at;
+                // SAFETY: as for every row group below.
+                let unsplit: Unsplit<'_, Rows, Width, Heads> =
+                    unsafe { heads.view_mut().reshape() };
                 linear::Linear::<In, Width>::group(input.value(), group).to_dm_view(
                     &mut device.tdma,
-                    Layout::<Rows>::selected_mut(rows.view_mut(), group),
-                );
-                // SAFETY: as for every row group below.
-                unsafe {
-                    rows.view().reshape::<
-                        Chip,
-                        m![1 # 2],
-                        Lane<Rows>,
-                        m![{ linear::Groups<Rows> }, Heads, Groups, Head],
-                    >()
-                }
-                .tile::<
-                    linear::Groups<Rows>,
-                    1,
-                    m![{ Layout<Rows>::Selected }, Heads, Groups, Head],
-                >(group)
-                .to_dm_view(
-                    &mut device.tdma,
-                    heads.view_mut().tile::<
+                    unsplit.tile::<
                         linear::Groups<Rows>,
                         1,
-                        m![{ Layout<Rows>::SelectedMut }, Groups, Head],
+                        m![{ Layout<Rows>::SelectedMut }, { HeadFeatures<Width, Heads> }],
                     >(group),
                 );
             }
             return input.with(heads);
         }
-        (input.value().view()).to_dm_view(&mut device.tdma, rows.view_mut());
-        let mut heads: super::Heads<Rows, Heads, Groups, Head> = DmTensor::new();
         // SAFETY: the features are head-major within every row. Relabeling preserves cells.
-        unsafe {
-            rows.view().reshape::<
-                Chip,
-                m![1 # 2],
-                Lane<Rows>,
-                m![{ linear::Groups<Rows> }, Heads, Groups, Head],
-            >()
-        }
-        .to_dm_view(&mut device.tdma, heads.view_mut());
+        let unsplit: Unsplit<'_, Rows, Width, Heads> = unsafe { heads.view_mut().reshape() };
+        (input.value().view()).to_dm_view(&mut device.tdma, unsplit);
         input.with(heads)
     }
 }
