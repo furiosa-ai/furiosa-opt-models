@@ -713,13 +713,24 @@ fn weighted_sum<G: Partition, Count: M, K: M, P: M>(
         G::Slices,
         m![{ Count }, { G::Head }, { G::Keys }],
     > =
+        // In runs of sixteen keys: the fetch reads each key at a row's stride, on one bank group,
+        // and a longer run holds that group past a DMA's NoC timeout.
         device
             .main
             .begin(chunk)
-            .fetch::<m![{ Count }, { G::Head } / 8, { G::Keys }], m![{ G::Head } % 8 # 16]>()
-            .collect::<m![{ Count }, { G::Head } / 8, { G::Keys }], m![{ G::Head } % 8 # 16]>()
+            .fetch::<
+                m![{ Count }, { G::Keys } / 16, { G::Head } / 8, { G::Keys } % 16],
+                m![{ G::Head } % 8 # 16],
+            >()
+            .collect::<
+                m![{ Count }, { G::Keys } / 16, { G::Head } / 8, { G::Keys } % 16],
+                m![{ G::Head } % 8 # 16],
+            >()
             .transpose::<
-                m![{ Count }, { G::Head } / 8, { G::Keys } / 4, { G::Head } % 8],
+                m![
+                    { Count }, { G::Keys } / 16, { G::Head } / 8, { G::Keys } % 16 / 4,
+                    { G::Head } % 8
+                ],
                 m![{ G::Keys } % 4 # 16],
             >()
             .commit_trim::<m![{ G::Keys } % 4]>()
