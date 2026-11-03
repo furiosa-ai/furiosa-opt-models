@@ -25,49 +25,76 @@ use crate::tensor::memory::dtype;
 pub(crate) fn laid_out<D: MaterializableScalar, E: M, To: M>(
     host: &HostTensor<D, E>,
 ) -> Option<HostTensor<D, To>> {
-    let (from, to) = (E::to_value(), To::to_value());
-    if from.normalize() == to.normalize() {
-        return None;
-    }
-    let (live, block, padded) = unpadded(to);
-    if live.size() != from.size() {
-        return None;
-    }
-    let walk = sequence(&[&from], &[&live], SequencerMode::Read)
-        .ok()?
-        .remove(0);
-    let bytes = |cells: usize| {
-        (cells * D::BITS)
-            .is_multiple_of(8)
-            .then_some(cells * D::BITS / 8)
-    };
-    // Innermost first: the run, then each outer step and its stride in the source; a run spanning
-    // several blocks of `To`'s innermost factor goes a block at a time.
-    let mut wheels = walk
-        .0
-        .iter()
-        .map(|(_, entry)| (entry.mapping.size(), entry.memory_stride));
-    let mut steps = match wheels.next()? {
-        (cells, 1) if block.is_multiple_of(cells) => vec![(1, cells)],
-        (cells, 1) if cells.is_multiple_of(block) => vec![(cells / block, block), (1, block)],
-        _ => return None,
-    };
-    let run = steps.pop()?.1;
-    steps.extend(wheels);
-    let steps: Vec<(usize, usize)> = (steps.into_iter())
-        .map(|(size, stride)| Some((size, bytes(stride).filter(|&stride| stride > 0)?)))
-        .collect::<Option<_>>()?;
-    let (run, block, padded) = (bytes(run)?, bytes(block)?, bytes(padded)?);
+    let runs = Runs::new(&E::to_value(), &To::to_value(), D::BITS)?;
     let source: Vec<u8> = host.clone().into_buffer().into();
-    let mut image = vec![0; bytes(To::SIZE)?];
-    for at in 0..bytes(live.size())? / run {
-        let (offset, _) = (steps.iter()).fold((0, at), |(offset, rest), &(size, stride)| {
-            (offset + rest % size * stride, rest / size)
-        });
-        let cell = at * run / block * padded + at * run % block;
-        image[cell..cell + run].copy_from_slice(&source[offset..offset + run]);
+    HostTensor::try_from(HostBuffer::from_vec(runs.copy(&source))).ok()
+}
+
+/// One layout's bytes as another's a run at a time: a run's source offset sums `steps` (size, byte
+/// stride, innermost first), and runs fill `block` bytes of each `padded` of the image.
+struct Runs {
+    steps: Vec<(usize, usize)>,
+    run: usize,
+    block: usize,
+    padded: usize,
+    live: usize,
+    image: usize,
+}
+
+impl Runs {
+    /// The runs that lay cells of `bits` bits out from `from` to `to`, or none when the layouts are
+    /// one or no walk of whole-byte runs reads each cell once.
+    fn new(from: &Mapping, to: &Mapping, bits: usize) -> Option<Self> {
+        if from.normalize() == to.normalize() {
+            return None;
+        }
+        let (live, block, padded) = unpadded(to.clone());
+        if live.size() != from.size() {
+            return None;
+        }
+        let walk = sequence(&[from], &[&live], SequencerMode::Read)
+            .ok()?
+            .remove(0);
+        let bytes = |cells: usize| (cells * bits).is_multiple_of(8).then_some(cells * bits / 8);
+        // Innermost first: the run, then each outer step and its stride in the source; a run
+        // spanning several blocks of `to`'s innermost factor goes a block at a time.
+        let mut wheels = walk
+            .0
+            .iter()
+            .map(|(_, entry)| (entry.mapping.size(), entry.memory_stride));
+        let mut steps = match wheels.next()? {
+            (cells, 1) if block.is_multiple_of(cells) => vec![(1, cells)],
+            (cells, 1) if cells.is_multiple_of(block) => vec![(cells / block, block), (1, block)],
+            _ => return None,
+        };
+        let run = steps.pop()?.1;
+        steps.extend(wheels);
+        let steps = (steps.into_iter())
+            .map(|(size, stride)| Some((size, bytes(stride).filter(|&stride| stride > 0)?)))
+            .collect::<Option<_>>()?;
+        Some(Self {
+            steps,
+            run: bytes(run)?,
+            block: bytes(block)?,
+            padded: bytes(padded)?,
+            live: bytes(live.size())?,
+            image: bytes(to.size())?,
+        })
     }
-    HostTensor::try_from(HostBuffer::from_vec(image)).ok()
+
+    /// The image of `source`'s bytes.
+    fn copy(&self, source: &[u8]) -> Vec<u8> {
+        let mut image = vec![0; self.image];
+        for at in 0..self.live / self.run {
+            let (offset, _) = (self.steps.iter())
+                .fold((0, at), |(offset, rest), &(size, stride)| {
+                    (offset + rest % size * stride, rest / size)
+                });
+            let cell = at * self.run / self.block * self.padded + at * self.run % self.block;
+            image[cell..cell + self.run].copy_from_slice(&source[offset..offset + self.run]);
+        }
+        image
+    }
 }
 
 /// `mapping` without the padding of its innermost factor, with that factor's live and padded
@@ -249,14 +276,18 @@ impl Checkpoint {
         let ordered = Mapping::from_terms(stored.iter().map(|axis| axis.to_term()));
         let image = match layout.normalize() == ordered.normalize() {
             true => data,
-            false => {
-                let mut image = vec![0; layout.size() * width];
-                let cells = layout.iter(&stored, &Index::new(), true).enumerate();
-                for (cell, at) in cells.filter_map(|(cell, at)| Some((cell, at?))) {
-                    image[cell * width..][..width].copy_from_slice(&data[at * width..][..width]);
+            false => match Runs::new(&ordered, &layout, 8 * width) {
+                Some(runs) => runs.copy(&data),
+                None => {
+                    let mut image = vec![0; layout.size() * width];
+                    let cells = layout.iter(&stored, &Index::new(), true).enumerate();
+                    for (cell, at) in cells.filter_map(|(cell, at)| Some((cell, at?))) {
+                        image[cell * width..][..width]
+                            .copy_from_slice(&data[at * width..][..width]);
+                    }
+                    image
                 }
-                image
-            }
+            },
         };
         HostTensor::try_from(HostBuffer::from_vec(image)).map_err(|error| LoadError::InvalidData {
             name: name.into(),
