@@ -6,6 +6,8 @@
 //!   tensor registers; back from feature-slice rows, a group switched whole into DM first; and
 //!   back from the rows the first projection kept, a group's parts switched under the passes of
 //!   the group before.
+//! - At Gemma 4's widths and at a SwiGLU decoder's, whose owners and passes divide differently, so
+//!   its kept rows stage a group at a time.
 
 #![feature(register_tool)]
 #![register_tool(furiosa_opt)]
@@ -29,6 +31,13 @@ static DEVICE: Mutex<()> = Mutex::const_new(());
 type Rows = gemma4::Rows;
 type Hidden = gemma4::Hidden;
 type Intermediate = gemma4::Intermediate;
+
+/// A SwiGLU decoder's widths, as Llama 3 8B's.
+mod swiglu {
+    use furiosa_opt_std::prelude::*;
+
+    axes![Hidden = 4096, Intermediate = 14336];
+}
 
 /// An NVFP4 projection of `I` inputs to `O` outputs, its rows ending where `P` places them.
 type Nvfp4<I, O, P> = BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Hbm, P>>;
@@ -54,19 +63,21 @@ where
     output.value().to_hbm(&mut device.tdma)
 }
 
-/// The live rows through `gate`, kept where its passes summed them, then through `down`.
+/// The live rows through `gate`, kept as `K` where its passes summed them, then through `down`.
 #[device(chip = 1)]
-fn chained(
+fn chained<H: AxisName, I: AxisName, K>(
     device: &mut Device,
-    (gate, down): (
-        &Nvfp4<Hidden, Intermediate, Kept>,
-        &Nvfp4<Intermediate, Hidden, Features>,
-    ),
-    (input, (start, rows)): (&HbmTensor<bf16, Chip, m![Rows, Hidden]>, (&Value, &Value)),
-) -> HbmTensor<bf16, Chip, m![Rows, Hidden]> {
+    (gate, down): (&Nvfp4<H, I, Kept>, &Nvfp4<I, H, Features>),
+    (input, (start, rows)): (&HbmTensor<bf16, Chip, m![Rows, H]>, (&Value, &Value)),
+) -> HbmTensor<bf16, Chip, m![Rows, H]>
+where
+    Nvfp4<H, I, Kept>: DeviceSend + for<'x> Op<&'x Live<Spread<H, Rows, Chip>, Rows>, Output = K>,
+    Nvfp4<I, H, Features>:
+        DeviceSend + for<'k> Op<&'k K, Output = Live<Spread<H, Rows, Chip>, Rows>>,
+{
     let live =
         Live::<(), Rows>::all().subrange(start.extent::<m![Rows]>(), rows.extent::<m![Rows]>());
-    let rows: Live<Spread<Hidden, Rows, Chip>, Rows> = live.with(input.to_dm(&mut device.tdma));
+    let rows: Live<Spread<H, Rows, Chip>, Rows> = live.with(input.to_dm(&mut device.tdma));
     let kept = Op::forward(gate, &mut *device, &rows);
     let output = Op::forward(down, &mut *device, &kept);
     output.value().to_hbm(&mut device.tdma)
@@ -154,79 +165,100 @@ const CASES: &[(usize, usize)] = &[
     (3, 61),
 ];
 
+/// Each live row of every case at widths `$hidden` and `$intermediate` gives the outputs the whole
+/// envelope gives it, in each of the three ways a projection stages its rows.
+macro_rules! envelope {
+    ($device:expr, $hidden:ident, $intermediate:ident) => {{
+        let device: &mut Device = $device;
+        let up = weight::<$hidden, $intermediate, Features>(device, 1).await;
+        let gate = weight::<$hidden, $intermediate, Kept>(device, 1).await;
+        let down = weight::<$intermediate, $hidden, Features>(device, 4).await;
+        let mut envelope: [Vec<bf16>; 3] = Default::default();
+        for (start, live) in [(0, Rows::SIZE)].iter().chain(CASES) {
+            let (start, live) = (*start, *live);
+            let first = count(start).to_hbm(&mut device.pdma).await.unwrap();
+            let counted = count(live).to_hbm(&mut device.pdma).await.unwrap();
+            let narrow = rows::<$hidden>(3, start..start + live);
+            let narrow = (HostTensor::<bf16, m![Rows, $hidden]>::from_vec(narrow))
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+            let wide = rows::<$intermediate>(5, start..start + live);
+            let wide = (HostTensor::<bf16, m![Rows, $intermediate]>::from_vec(wide))
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+            let forms: [(Vec<bf16>, usize); 3] = [
+                (
+                    launch(
+                        projected,
+                        (&mut *device, &up, (&narrow, (&first, &counted))),
+                    )
+                    .await
+                    .unwrap()
+                    .to_host::<m![Rows, $intermediate]>(&mut device.pdma)
+                    .await
+                    .unwrap()
+                    .into_vec(),
+                    $intermediate::SIZE,
+                ),
+                (
+                    launch(
+                        projected,
+                        (&mut *device, &down, (&wide, (&first, &counted))),
+                    )
+                    .await
+                    .unwrap()
+                    .to_host::<m![Rows, $hidden]>(&mut device.pdma)
+                    .await
+                    .unwrap()
+                    .into_vec(),
+                    $hidden::SIZE,
+                ),
+                (
+                    launch(
+                        chained,
+                        (&mut *device, (&gate, &down), (&narrow, (&first, &counted))),
+                    )
+                    .await
+                    .unwrap()
+                    .to_host::<m![Rows, $hidden]>(&mut device.pdma)
+                    .await
+                    .unwrap()
+                    .into_vec(),
+                    $hidden::SIZE,
+                ),
+            ];
+            for (form, (found, width)) in forms.into_iter().enumerate() {
+                if live == Rows::SIZE {
+                    envelope[form] = found;
+                    continue;
+                }
+                let rows = start * width..(start + live) * width;
+                for at in rows.clone() {
+                    assert_eq!(
+                        found[at].to_bits(),
+                        envelope[form][at].to_bits(),
+                        "{}x{} form {form}, rows {start}+{live}: output {at}",
+                        $hidden::SIZE,
+                        $intermediate::SIZE,
+                    );
+                }
+            }
+        }
+    }};
+}
+
 /// Each live row of every case gives the outputs the whole envelope gives it, in each of the three
-/// ways a projection stages its rows.
+/// ways a projection stages its rows, at Gemma 4's widths and at a SwiGLU decoder's.
 #[tokio::test(flavor = "current_thread")]
 async fn projects_each_live_row_as_the_envelope() {
     let _lease = DEVICE.lock().await;
     let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
-    let up = weight::<Hidden, Intermediate, Features>(&mut device, 1).await;
-    let gate = weight::<Hidden, Intermediate, Kept>(&mut device, 1).await;
-    let down = weight::<Intermediate, Hidden, Features>(&mut device, 4).await;
-    let mut envelope: [Vec<bf16>; 3] = Default::default();
-    for (start, live) in [(0, Rows::SIZE)].iter().chain(CASES) {
-        let (start, live) = (*start, *live);
-        let first = count(start).to_hbm(&mut device.pdma).await.unwrap();
-        let counted = count(live).to_hbm(&mut device.pdma).await.unwrap();
-        let narrow = rows::<Hidden>(3, start..start + live);
-        let narrow = (HostTensor::<bf16, m![Rows, Hidden]>::from_vec(narrow))
-            .to_hbm(&mut device.pdma)
-            .await
-            .unwrap();
-        let wide = rows::<Intermediate>(5, start..start + live);
-        let wide = (HostTensor::<bf16, m![Rows, Intermediate]>::from_vec(wide))
-            .to_hbm(&mut device.pdma)
-            .await
-            .unwrap();
-        let forms: [(Vec<bf16>, usize); 3] = [
-            (
-                launch(projected, (&mut device, &up, (&narrow, (&first, &counted))))
-                    .await
-                    .unwrap()
-                    .to_host::<m![Rows, Intermediate]>(&mut device.pdma)
-                    .await
-                    .unwrap()
-                    .into_vec(),
-                Intermediate::SIZE,
-            ),
-            (
-                launch(projected, (&mut device, &down, (&wide, (&first, &counted))))
-                    .await
-                    .unwrap()
-                    .to_host::<m![Rows, Hidden]>(&mut device.pdma)
-                    .await
-                    .unwrap()
-                    .into_vec(),
-                Hidden::SIZE,
-            ),
-            (
-                launch(
-                    chained,
-                    (&mut device, (&gate, &down), (&narrow, (&first, &counted))),
-                )
-                .await
-                .unwrap()
-                .to_host::<m![Rows, Hidden]>(&mut device.pdma)
-                .await
-                .unwrap()
-                .into_vec(),
-                Hidden::SIZE,
-            ),
-        ];
-        for (form, (found, width)) in forms.into_iter().enumerate() {
-            if live == Rows::SIZE {
-                envelope[form] = found;
-                continue;
-            }
-            let rows = start * width..(start + live) * width;
-            for at in rows.clone() {
-                assert_eq!(
-                    found[at].to_bits(),
-                    envelope[form][at].to_bits(),
-                    "form {form}, rows {start}+{live}: output {at}"
-                );
-            }
-        }
+    envelope!(&mut device, Hidden, Intermediate);
+    {
+        use swiglu::{Hidden, Intermediate};
+        envelope!(&mut device, Hidden, Intermediate);
     }
 }
 
@@ -307,7 +339,7 @@ async fn rows_profile() {
             .await
             .unwrap();
         macro_rules! profile {
-            ($form:literal, $kernel:ident, $weights:expr, $rows:expr) => {{
+            ($form:literal, $kernel:expr, $weights:expr, $rows:expr) => {{
                 let mut tasks = vec![];
                 for step in 0..=steps {
                     spans.0.lock().unwrap().clear();
