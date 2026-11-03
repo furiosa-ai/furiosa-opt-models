@@ -671,7 +671,7 @@ pub mod form {
 
     /// How HBM holds [`Nvfp4Summed`]'s codes and block scales.
     pub mod summed {
-        pub use crate::ops::linear::nvfp4::summed::rows::{Blocks, Codes};
+        pub use crate::ops::linear::nvfp4::summed::rows::{Blocks, Codes, Ownership};
     }
 
     /// FP4 weights with per-16 FP8 block scales under a late FP32 tensor scale, whose inputs enter
@@ -817,7 +817,7 @@ pub mod form {
         type Caches = (bf16,);
     }
 
-    impl<P: 'static> Form for Nvfp4Summed<P> {
+    impl<P: summed::Ownership + 'static> Form for Nvfp4Summed<P> {
         type Stored = f4e2m1;
 
         type Of<In: AxisName, Out: AxisName, D: Scalar, Chips: M + 'static, X: Memory, V> =
@@ -829,8 +829,8 @@ pub mod form {
                 nvfp4::Scales<In, Out>,
                 Summed<W4A16, X, P>,
                 Chip,
-                X::Tensor<f4e2m1, Chip, summed::Codes<In, Out>>,
-                X::Tensor<f8e4m3, Chip, summed::Blocks<In, Out>>,
+                X::Tensor<f4e2m1, Chip, summed::Codes<In, Out, P>>,
+                X::Tensor<f8e4m3, Chip, summed::Blocks<In, Out, P>>,
             >;
 
         const REQUIREMENT: Requirement = Requirement::declared(Declaration::Nvfp4);

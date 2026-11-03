@@ -251,6 +251,7 @@ pub(super) type SpreadPairs<W, R> = m![R, Factors, W % ({ Symbol<Chunk<W>> }) / 
 /// A launch's rows left in the DM layout `T` their producer computed them in: elementwise steps
 /// run on them there and keep the layout, and a reader that knows it takes them as they lie.
 /// `Kept` alone names that choice, as a projection's contract states where its rows end.
+#[derive(Clone, Debug)]
 pub struct Kept<T = ()>(pub T);
 
 /// How an elementwise step walks each slice's cells: `Time` steps of an eight-cell `Packet`, the

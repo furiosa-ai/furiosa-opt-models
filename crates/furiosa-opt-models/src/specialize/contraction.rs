@@ -913,7 +913,7 @@ const fn carved(
                 if whole(carved, feature)
                     && legal(input, output, (chunk, carved, passes))
                     && filled == slices
-                    && 16 * active >= 15 * slices
+                    && full(active, slices)
                     && active > best.0
                     && (bits >= 8 * BF16 || holds(chunk, carved, passes))
                 {
@@ -927,9 +927,32 @@ const fn carved(
     best.1
 }
 
+/// Output rows each owner of a summed projection holds when a cluster's half of `output` outputs
+/// splits over the owners of `parts` input parts: the even share, or where that is no whole number
+/// of `grain` outputs nor a divisor of one, the next that is, if at most one owner in sixteen idles.
+pub(crate) const fn owned(output: usize, parts: usize, grain: usize) -> usize {
+    let half = output / 2;
+    let seats = super::SLICES / parts;
+    let even = half / seats;
+    let mut rows = even;
+    while !whole(rows, grain) || !half.is_multiple_of(rows) {
+        rows += 4;
+        if !full(half / rows, seats) {
+            return even;
+        }
+    }
+    rows
+}
+
 /// Whether `block` outputs are a whole number of feature chunks of `feature` outputs or divide one.
 const fn whole(block: usize, feature: usize) -> bool {
     block.is_multiple_of(feature) || feature.is_multiple_of(block)
+}
+
+/// Whether `active` of `slices` slices leave at most one in sixteen idle, the price a carving into
+/// whole feature chunks may pay.
+const fn full(active: usize, slices: usize) -> bool {
+    16 * active >= 15 * slices
 }
 
 /// The slices `(chunk, block, passes)` takes, its top digit padded, and the active ones.

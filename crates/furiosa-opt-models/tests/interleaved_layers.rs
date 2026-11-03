@@ -21,7 +21,7 @@ use furiosa_opt_models::schedule::decoder::Places;
 use furiosa_opt_models::tensor::axis::Lanes;
 use furiosa_opt_models::tensor::cache::{Block, Blocks, KeyValue};
 use furiosa_opt_models::tensor::form::BlockScaled;
-use furiosa_opt_models::tensor::form::nvfp4::{Early, Scale, Scales, Summed, W4A16};
+use furiosa_opt_models::tensor::form::nvfp4::{Early, Features, Scale, Scales, Summed, W4A16};
 use furiosa_opt_models::tensor::live::Live;
 use furiosa_opt_models::tensor::memory::Hbm;
 use furiosa_opt_models::tensor::parallel::Chip;
@@ -1066,7 +1066,8 @@ type Nvfp4<I, O, C, K = m![O, I], V = Scales<I, O>> = BlockScaled<
 >;
 
 /// An NVFP4 projection under the summed contract, held as the catalog's summed form holds it.
-type Summing<I, O> = Nvfp4<I, O, Summed<W4A16>, summed::Codes<I, O>, summed::Blocks<I, O>>;
+type Summing<I, O> =
+    Nvfp4<I, O, Summed<W4A16>, summed::Codes<I, O, Features>, summed::Blocks<I, O, Features>>;
 
 /// The call's live rows through one NVFP4 projection, from and back to HBM rows.
 #[device(chip = 1)]

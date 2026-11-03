@@ -14,7 +14,7 @@
 
 use furiosa_opt_models::Op;
 use furiosa_opt_models::models::decoder::attention::gemma4;
-use furiosa_opt_models::models::decoder::form::summed::{Blocks, Codes};
+use furiosa_opt_models::models::decoder::form::summed::{Blocks, Codes, Ownership};
 use furiosa_opt_models::ops::normalization::Spread;
 use furiosa_opt_models::ops::pointwise::Kept;
 use furiosa_opt_models::tensor::form::BlockScaled;
@@ -50,8 +50,8 @@ type Nvfp4<I, O, P> = BlockScaled<
     Scales<I, O>,
     Summed<W4A16, Hbm, P>,
     Chip,
-    HbmTensor<f4e2m1, Chip, Codes<I, O>>,
-    HbmTensor<f8e4m3, Chip, Blocks<I, O>>,
+    HbmTensor<f4e2m1, Chip, Codes<I, O, P>>,
+    HbmTensor<f8e4m3, Chip, Blocks<I, O, P>>,
 >;
 
 /// The live rows `start` and `rows` name, through `linear`, from and back to HBM rows.
@@ -112,7 +112,10 @@ fn uniform(count: usize, state: u64) -> impl Iterator<Item = f64> {
 
 /// Random NVFP4 weights of `I` inputs and `O` outputs on the device: codes over the sixteen E2M1
 /// values, E4M3 block scales from 8 to 448 and a tensor scale near 2^14.
-async fn weight<I: AxisName, O: AxisName, P>(device: &mut Device, seed: u64) -> Nvfp4<I, O, P> {
+async fn weight<I: AxisName, O: AxisName, P: Ownership>(
+    device: &mut Device,
+    seed: u64,
+) -> Nvfp4<I, O, P> {
     let codes: Vec<u8> = (words(O::SIZE * I::SIZE / 2, seed))
         .map(|word| (word >> 56) as u8)
         .collect();

@@ -63,6 +63,7 @@ pub struct Summed<A, X: Memory = Hbm, P = Features> {
 }
 
 /// A launch's projected rows in the output's feature slices, where every reader takes them.
+#[derive(Clone, Debug)]
 pub struct Features;
 
 /// The reduced FP32 sum times the tensor scales once, inputs in form `A`.
