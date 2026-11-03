@@ -15,7 +15,7 @@ use crate::modules::attention::Projection;
 use crate::modules::generic::collection::Stack;
 use crate::ops::attention::full;
 use crate::ops::index::{gather::Gather, scatter::Scatter};
-use crate::ops::linear::nvfp4::tiled::{mlp::Mlp, output::Output, panels::Panels};
+use crate::ops::linear::nvfp4::tiled::{mlp::Mlp, output::Output, qkv::QkvProjection};
 use crate::ops::rotary::Rotary;
 use crate::ops::{embedding::Embedding, normalization::RmsNorm, pointwise::add::Add};
 use crate::specialize::attention::Decode;
@@ -59,9 +59,9 @@ pub type Catalog = attention::Qwen2ForCausalLM<
 >;
 pub type Body = Catalog::Body;
 pub type Qkv = Projection<
-    Named<"q_proj", Panels<Hidden, QWidth>>,
-    Named<"k_proj", Panels<Hidden, KvWidth>>,
-    Named<"v_proj", Panels<Hidden, KvWidth>>,
+    Named<"q_proj", QkvProjection<Hidden, QWidth>>,
+    Named<"k_proj", QkvProjection<Hidden, KvWidth>>,
+    Named<"v_proj", QkvProjection<Hidden, KvWidth>>,
 >;
 pub type Norm = RmsNorm<Hidden, EPSILON, Chip>;
 
@@ -191,3 +191,8 @@ fn calibration(from: &Checkpoint, cx: &mut Context<'_>) -> Result<Calibration, L
     }
     Ok(Calibration)
 }
+
+#[cfg(feature = "kernel-diagnostics")]
+pub use crate::ops::linear::nvfp4::tiled::heads::inspect_qkv_heads;
+#[cfg(feature = "kernel-diagnostics")]
+pub use crate::schedule::decoder::nvfp4::inspect_transition;

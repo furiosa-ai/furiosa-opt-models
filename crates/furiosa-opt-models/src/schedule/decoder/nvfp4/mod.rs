@@ -8,7 +8,7 @@ use crate::modules::language::Backbone;
 use crate::modules::residual::Residual;
 use crate::ops::attention::full::paged::Retained;
 use crate::ops::embedding;
-use crate::ops::linear::nvfp4::tiled::{heads, mlp, panels::Panels};
+use crate::ops::linear::nvfp4::tiled::{heads, mlp};
 use crate::ops::normalization::{
     RmsNorm,
     span::{self, Span, Stage},
@@ -204,4 +204,50 @@ impl<'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, Size>, Env, launch::S
             .lm_head
             .read_normalized(device, hidden, selected, tokens, &norm.0);
     }
+}
+
+/// Exercise the production MLP-to-next-layer prefetch before normalizing and projecting.
+#[cfg(feature = "kernel-diagnostics")]
+pub fn inspect_transition(
+    device: &mut Device,
+    mlp: &mlp::Mlp<Hidden, Intermediate>,
+    norm: &Norm,
+    qkv: &Qkv,
+    input: &span::Owned<Hidden, Span>,
+    rows: usize,
+) -> (
+    crate::ops::linear::nvfp4::tiled::qkv::Output<QWidth, Span>,
+    crate::ops::linear::nvfp4::tiled::qkv::Output<KvWidth, Span>,
+    crate::ops::linear::nvfp4::tiled::qkv::Output<KvWidth, Span>,
+) {
+    use crate::ops::linear::nvfp4::tiled::qkv as kernel;
+    let (output, (gain, prepared)) = mlp::forward_with_next(
+        device,
+        &mlp.gate_proj,
+        &mlp.up_proj,
+        &mlp.down_proj,
+        input,
+        rows,
+        prefetch::Head {
+            norm,
+            qkv,
+            enabled: true,
+        },
+    );
+    let live = Live::<(), Span>::all().subrange(0, rows);
+    let normalized = Op::forward(&gain, &mut *device, &live.with(output));
+    let (mut q, mut k, mut v) = (HbmTensor::new(), HbmTensor::new(), HbmTensor::new());
+    kernel::consume(
+        device,
+        (&qkv.query.0, &qkv.key.0, &qkv.value.0),
+        (&prepared.query, &prepared.key, &prepared.value),
+        normalized.value(),
+        rows,
+        |device, qo, ko, vo, wave| {
+            kernel::store_wave(device, &qo, &mut q, wave);
+            kernel::store_wave(device, &ko, &mut k, wave);
+            kernel::store_wave(device, &vo, &mut v, wave);
+        },
+    );
+    (q, k, v)
 }

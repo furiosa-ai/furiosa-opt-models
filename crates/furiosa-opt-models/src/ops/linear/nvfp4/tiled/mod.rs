@@ -12,6 +12,7 @@ pub mod mlp;
 pub mod output;
 pub mod panels;
 pub(crate) mod prefetch;
+pub mod qkv;
 
 /// Only the weight tensor scale participates in W4A16 arithmetic. Input calibration is
 /// validated when loading and discarded; activations and cached keys/values remain BF16.

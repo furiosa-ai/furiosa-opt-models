@@ -6,8 +6,8 @@ mod fixtures;
 
 type Rows = furiosa_opt_models::tensor::axis::Rows<512>;
 use furiosa_opt_models::{
-    models::decoder::attention::llama::nvfp4::{Hidden, Intermediate},
-    ops::linear::nvfp4::tiled::{mlp, panels::Panels},
+    models::decoder::attention::llama::nvfp4::{Hidden, Intermediate, QWidth},
+    ops::linear::nvfp4::tiled::{mlp, panels::Panels, qkv::QkvProjection},
     tensor::scalar::Value as Count,
 };
 use furiosa_opt_std::{prelude::*, runtime::launch};
@@ -158,5 +158,98 @@ async fn fused_mlp_matches_scalar_w4a16_with_poisoned_padding() {
             );
         }
         eprintln!("fused MLP oracle rows={rows}: max absolute error {max_error}");
+    }
+    #[cfg(feature = "kernel-diagnostics")]
+    {
+        use furiosa_opt_models::{
+            models::decoder::attention::llama::nvfp4::{Norm, QWidth, Qkv},
+            tensor::form::Weight,
+        };
+        let qkv = Qkv {
+            query: furiosa_opt_models::load::Named(projection(&mut device).await),
+            key: furiosa_opt_models::load::Named(projection(&mut device).await),
+            value: furiosa_opt_models::load::Named(projection(&mut device).await),
+        };
+        let norm = Norm::new(Weight::new(
+            HostTensor::<bf16, m![Hidden]>::from_vec(vec![bf16::from_f32(1.0); 4096])
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap(),
+        ));
+        for rows in [
+            1, 4, 8, 9, 16, 17, 32, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512,
+        ] {
+            let input = HostTensor::<bf16, m![Rows, Hidden]>::from_vec((0..512 * 4096).map(|at| {
+                bf16::from_f32(if at / 4096 < rows {
+                    input(at / 4096, at % 4096)
+                } else {
+                    f32::NAN
+                })
+            }))
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap();
+            let count = fixtures::count(&mut device, rows).await;
+            let output = launch(transition, (&mut device, &mlp, &norm, &qkv, &count, &input))
+                .await
+                .unwrap()
+                .to_host::<m![Rows, QWidth]>(&mut device.pdma)
+                .await
+                .unwrap()
+                .into_vec();
+            for row in 0..rows {
+                let scale = (expected[row].iter().map(|x| x * x).sum::<f32>() / 4096.0 + 1e-5)
+                    .sqrt()
+                    .recip();
+                for out in 0..4096 {
+                    let feature = out * 97 % 4096;
+                    let normalized = bf16::from_f32(expected[row][feature] * scale).to_f32();
+                    let want =
+                        bf16::from_f32(normalized * scalar_weight(out, feature) * 0.5).to_f32();
+                    let got = output[row * 4096 + out].to_f32();
+                    assert!(
+                        got.is_finite() && (got - want).abs() <= 0.02_f32.max(want.abs() * 0.015),
+                        "prefetched MLP rows={rows} row={row} feature={out} got={got} want={want}"
+                    );
+                }
+            }
+            eprintln!("MLP -> prefetched norm/QKV oracle rows={rows}: passed");
+        }
+    }
+}
+/// Exercise the real next-layer prefetch while the down projection is still live.
+#[cfg(feature = "kernel-diagnostics")]
+#[device(chip = 1)]
+fn transition(
+    device: &mut Device,
+    mlp: &mlp::Mlp<Hidden, Intermediate>,
+    norm: &furiosa_opt_models::models::decoder::attention::llama::nvfp4::Norm,
+    qkv: &furiosa_opt_models::models::decoder::attention::llama::nvfp4::Qkv,
+    count: &Count,
+    input: &HbmTensor<bf16, m![1], m![Rows, Hidden]>,
+) -> HbmTensor<bf16, m![1], m![Rows, QWidth]> {
+    use furiosa_opt_models::models::decoder::attention::llama::nvfp4::{
+        QWidth, inspect_transition,
+    };
+    let rows = furiosa_opt_models::tensor::live::Live::<(), Rows>::read(count).rows();
+    let input = input.to_dm(&mut device.tdma);
+    let (q, _, _) = inspect_transition(device, mlp, norm, qkv, &input, rows);
+    let mut output = HbmTensor::<bf16, m![1], m![Rows, QWidth]>::new();
+    q.view().to_hbm_view(&mut device.tdma, output.view_mut());
+    output
+}
+
+#[cfg(feature = "kernel-diagnostics")]
+async fn projection<O: AxisName>(device: &mut Device) -> QkvProjection<Hidden, O> {
+    let (weight, weight_scale, scales) = fixtures::weights::<Hidden, O, _, _>(
+        device,
+        QkvProjection::<Hidden, O>::reorder::<1, _>,
+        QkvProjection::<Hidden, O>::reorder::<16, _>,
+    )
+    .await;
+    QkvProjection {
+        weight,
+        weight_scale,
+        scales,
     }
 }

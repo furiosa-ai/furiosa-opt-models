@@ -1,14 +1,14 @@
 //! Complete restored QKV operands and norm gain, hosted by the preceding MLP's down panels.
 use super::*;
-use crate::ops::linear::nvfp4::tiled::panels::Prepared;
 use crate::ops::linear::nvfp4::tiled::prefetch::{Issued, Points};
+use crate::ops::linear::nvfp4::tiled::qkv::{self, Weight};
 
 pub(super) type Norm = RmsNorm<Hidden, EPSILON, Chip, span::Scale<Hidden, Span>>;
 
 pub(super) struct Projection {
-    pub query: Prepared<Hidden, QWidth>,
-    pub key: Prepared<Hidden, KvWidth>,
-    pub value: Prepared<Hidden, KvWidth>,
+    pub query: Weight<Hidden, QWidth>,
+    pub key: Weight<Hidden, KvWidth>,
+    pub value: Weight<Hidden, KvWidth>,
 }
 
 pub(super) struct Head<'a> {
@@ -21,7 +21,7 @@ pub(super) struct First<'a> {
     qkv: &'a Qkv,
     enabled: bool,
     norm: Norm,
-    value: Prepared<Hidden, KvWidth>,
+    value: Weight<Hidden, KvWidth>,
 }
 
 impl Head<'_> {
@@ -38,7 +38,7 @@ impl<'a> Points<Device> for Head<'a> {
         // No speculative loads on the final layer. Empty buffers are never consumed there.
         let (value, norm) = if self.enabled {
             (
-                self.qkv.value.0.prepare(device),
+                qkv::prepare(device, &self.qkv.value.0),
                 crate::Op::forward(&crate::ops::normalization::span::Stage, device, self.norm),
             )
         } else {
@@ -65,9 +65,9 @@ impl Points<Device> for First<'_> {
         let (key, query) = if self.enabled {
             // Queue both complete packed operands before either restoration stream.
             // Their storage stays at this boundary, rather than spanning all down panels.
-            let key = self.qkv.key.0.stage(device);
-            let query = self.qkv.query.0.stage(device);
-            (Panels::restore(device, key), Panels::restore(device, query))
+            let key = qkv::stage(device, &self.qkv.key.0);
+            let query = qkv::stage(device, &self.qkv.query.0);
+            (qkv::restore(device, key), qkv::restore(device, query))
         } else {
             (DmTensor::new(), DmTensor::new())
         };

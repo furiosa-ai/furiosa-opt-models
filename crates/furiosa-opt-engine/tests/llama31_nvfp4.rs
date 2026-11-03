@@ -221,3 +221,158 @@ fn matches_w4a16_references_across_prefill_boundaries() {
         }
     });
 }
+
+/// Persistent writes must preserve a poisoned guard and keep genuine BF16 precision.
+#[test]
+#[ignore = "opens a device and loads the pinned checkpoint"]
+fn bf16_cache_mixed_launches_preserve_guards_and_precision() {
+    let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+    let model = Instance::new(
+        checkpoint().load::<ForCausalLM>(&mut device).unwrap(),
+        Tiling::Adaptive,
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        for (items, prompt, history) in [
+            (1, 129, 0),
+            (4, 509, 127),
+            (16, 1008, 128),
+            (1, 1023, 128),
+            (8, 121, 2048),
+        ] {
+            let first = cache_case(&model, &mut device, items, prompt, history).await;
+            let second = cache_case(&model, &mut device, items, prompt, history).await;
+            assert_eq!(first, second, "repeated cache contents/tokens changed");
+            eprintln!("BF16 cache guards/precision/repeat passed: {items}/{prompt}/{history}");
+        }
+    });
+}
+
+async fn cache_case(
+    model: &Instance<ForCausalLM>,
+    device: &mut Device,
+    items: usize,
+    prompt: usize,
+    history: usize,
+) -> (Vec<Vec<i32>>, Vec<u64>, usize) {
+    use std::hash::Hasher;
+    let mut seed = 42u64;
+    let mut random = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut lengths = vec![128usize; items];
+    lengths.push(history);
+    let counts: Vec<_> = lengths
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| (n + if i == items { prompt + 3 } else { 4 }).div_ceil(16))
+        .collect();
+    let count: usize = counts.iter().sum();
+    let mut order: Vec<u32> = (1..=count as u32).collect();
+    for i in (1..order.len()).rev() {
+        let j = random() as usize % (i + 1);
+        order.swap(i, j);
+    }
+    let mut at = 0;
+    let tables: Vec<Vec<u32>> = counts
+        .iter()
+        .map(|&n| {
+            let table = order[at..at + n].to_vec();
+            at += n;
+            table
+        })
+        .collect();
+    let cache = Cache::new(device, &model.limits().cache, count + 1).unwrap();
+    assert_eq!(model.limits().cache.pools[0].bytes, 65536);
+    for layer in cache.layers() {
+        let poison: Vec<u8> = (0..layer.size() / 2)
+            .flat_map(|_| 0x7fc1u16.to_le_bytes())
+            .collect();
+        let mut target = layer.alias(..).unwrap();
+        HostBufferSlice::from(&poison[..])
+            .to_hbm(&mut device.pdma)
+            .output(&mut target)
+            .await
+            .unwrap();
+    }
+    for (i, &length) in lengths.iter().enumerate() {
+        let ids: Vec<i32> = (0..length).map(|_| (random() % 128256) as i32).collect();
+        for (chunk, tokens) in ids.chunks(1024).enumerate() {
+            let mut r = request(device, tokens, chunk * 1024, &tables[i]).await;
+            r.keep = Keep::None;
+            model.forward(device, &cache, &[r], &[]).await.unwrap();
+        }
+    }
+    let mut requests = Vec::new();
+    let ids: Vec<i32> = (0..prompt).map(|_| (random() % 128256) as i32).collect();
+    requests.push(request(device, &ids, history, &tables[items]).await);
+    for i in 0..items {
+        requests.push(request(device, &[(random() % 128256) as i32], 128, &tables[i]).await);
+    }
+    let output = model.forward(device, &cache, &requests, &[]).await.unwrap();
+    let mut generated = vec![tokens(device, output).await];
+    for n in &mut lengths[..items] {
+        *n += 1;
+    }
+    lengths[items] += prompt;
+    for _ in 0..3 {
+        let mut requests = Vec::new();
+        for i in 0..lengths.len() {
+            requests.push(
+                request(
+                    device,
+                    &[(random() % 128256) as i32],
+                    lengths[i],
+                    &tables[i],
+                )
+                .await,
+            );
+        }
+        let output = model.forward(device, &cache, &requests, &[]).await.unwrap();
+        generated.push(tokens(device, output).await);
+        for n in &mut lengths {
+            *n += 1;
+        }
+    }
+    let mut hashes = Vec::new();
+    let mut precise = 0;
+    for layer in cache.layers() {
+        let mut bytes = vec![0u8; layer.size()];
+        layer
+            .to_host(&mut device.pdma)
+            .output(&mut bytes[..])
+            .await
+            .unwrap();
+        assert!(
+            bytes[..65536]
+                .chunks_exact(2)
+                .all(|x| u16::from_le_bytes([x[0], x[1]]) == 0x7fc1),
+            "guard block overwritten"
+        );
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        for (i, &length) in lengths.iter().enumerate() {
+            for row in 0..length {
+                let start = tables[i][row / 16] as usize * 65536 + row % 16 * 4096;
+                let live = &bytes[start..start + 4096];
+                hash.write(live);
+                for pair in live.chunks_exact(2) {
+                    let bits = u16::from_le_bytes([pair[0], pair[1]]);
+                    let value = f32::from_bits((bits as u32) << 16);
+                    assert!(value.is_finite(), "live KV is uninitialized/nonfinite");
+                    if value.abs() >= 1.0 / 64.0 && value.abs() < 256.0 && bits & 15 != 0 {
+                        precise += 1;
+                    }
+                }
+            }
+        }
+        hashes.push(hash.finish());
+    }
+    assert!(precise > 0, "cache appears rounded through FP8");
+    (generated, hashes, precise)
+}

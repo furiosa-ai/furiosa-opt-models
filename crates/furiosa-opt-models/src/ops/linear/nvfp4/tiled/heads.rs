@@ -1,6 +1,6 @@
 //! Resident Q/K/V outputs stay in DM through rotation, then land in retained scratch.
 //! The current layer writes its live K/V rows through the native cache stage.
-use super::panels::{Panels, Prepared, resident as qkv_resident};
+use super::qkv::{self as qkv_resident, QkvProjection, Weight};
 use crate::Op;
 use crate::ops::normalization::span::{Owned, Span};
 use crate::ops::rotary::{
@@ -17,24 +17,14 @@ type Sl<H> = m![H % (H / 2) # 16, Wave / 8];
 type Heads<H, Head> = DmTensor<bf16, Chip, Cl<H>, Sl<H>, m![Wave % 8, Head]>;
 
 fn landed<H: AxisName, W: AxisName, R: AxisName, Head: AxisName>(
-    device: &mut Device,
+    _device: &mut Device,
     rows: qkv_resident::WaveOutput<W, R>,
 ) -> Heads<H, Head> {
     const {
-        assert!(W::SIZE == H::SIZE * Head::SIZE);
+        assert!(W::SIZE == H::SIZE * Head::SIZE && Head::SIZE == 128);
     }
-    // SAFETY: the 64 projection owners split into heads and head fragments;
-    // each cluster retains the same half of the heads. Only axis names change.
-    let rows = unsafe {
-        rows.reshape::<Chip, Cl<H>,
-        m![H % (H / 2), Head / (W / 64), Wave % 64 / 8],
-        m![Wave / 64, Wave % 8, Head % (W / 64)]>()
-    };
-    // Redistribute head fragments and row ownership directly between DM slices.
-    // K/V use four of the sixteen padded head slots per cluster, as RoPE expects.
-    let mut output = Heads::new();
-    rows.view().to_dm_view(&mut device.tdma, output.view_mut());
-    output
+    // SAFETY: QKV already landed in the head owners; only axis names change.
+    unsafe { rows.reshape() }
 }
 
 fn rotate<H: AxisName, Head: AxisName, Slots: AxisName>(
@@ -87,8 +77,12 @@ pub(crate) fn project<
     Slots: AxisName,
 >(
     device: &mut Device,
-    qkv: (&Panels<H, Q>, &Panels<H, K>, &Panels<H, K>),
-    prepared: (&Prepared<H, Q>, &Prepared<H, K>, &Prepared<H, K>),
+    qkv: (
+        &QkvProjection<H, Q>,
+        &QkvProjection<H, K>,
+        &QkvProjection<H, K>,
+    ),
+    prepared: (&Weight<H, Q>, &Weight<H, K>, &Weight<H, K>),
     input: &Owned<H, Span>,
     rotations: &Rotations<Head, Slots>,
     query: &mut HbmTensor<bf16, Chip, m![Reach, Q]>,
@@ -100,7 +94,7 @@ pub(crate) fn project<
     let query_target = query;
     let key_target = key;
     let value_target = value;
-    qkv_resident::consume_normalized(
+    qkv_resident::consume(
         device,
         qkv,
         prepared,
@@ -129,4 +123,75 @@ pub(crate) fn project<
             place(device, &value, value_target, at);
         },
     );
+}
+
+#[cfg(feature = "kernel-diagnostics")]
+use crate::models::decoder::attention::{Head, KvHeads, llama::nvfp4::QueryHeads};
+/// Exercise the production raw-QKV DM redistribution without RoPE or cache casts.
+#[cfg(feature = "kernel-diagnostics")]
+pub fn inspect_qkv_heads<H: AxisName, Q: AxisName, K: AxisName, R: AxisName>(
+    device: &mut Device,
+    projections: (
+        &QkvProjection<H, Q>,
+        &QkvProjection<H, K>,
+        &QkvProjection<H, K>,
+    ),
+    input: &Owned<H, R>,
+    rows: usize,
+) -> (
+    HbmTensor<bf16, Chip, m![R, Q]>,
+    HbmTensor<bf16, Chip, m![R, K]>,
+    HbmTensor<bf16, Chip, m![R, K]>,
+) {
+    let (mut qo, mut ko, mut vo) = (HbmTensor::new(), HbmTensor::new(), HbmTensor::new());
+    let mut store = |device: &mut Device,
+                     q: Heads<QueryHeads, Head>,
+                     k: Heads<KvHeads, Head>,
+                     v: Heads<KvHeads, Head>,
+                     wave: usize| {
+        // SAFETY: head and channel axes concatenate to each projection width.
+        unsafe {
+            q.view()
+                .reshape::<Chip, Cl<QueryHeads>, Sl<QueryHeads>, m![Wave % 8, Head]>()
+                .to_hbm_view(
+                    &mut device.tdma,
+                    qo.view_mut()
+                        .tile::<m![R], 128, m![R = 128 #{!} R, Q]>(wave * 128)
+                        .reshape::<Chip, m![Wave #{!} R, QueryHeads, Head]>(),
+                );
+            k.view().to_hbm_view(
+                &mut device.tdma,
+                ko.view_mut()
+                    .tile::<m![R], 128, m![R = 128 #{!} R, K]>(wave * 128)
+                    .reshape::<Chip, m![Wave #{!} R, KvHeads, Head]>(),
+            );
+            v.view().to_hbm_view(
+                &mut device.tdma,
+                vo.view_mut()
+                    .tile::<m![R], 128, m![R = 128 #{!} R, K]>(wave * 128)
+                    .reshape::<Chip, m![Wave #{!} R, KvHeads, Head]>(),
+            );
+        }
+    };
+    {
+        let (q, k, v) = (
+            qkv_resident::prepare(device, projections.0),
+            qkv_resident::prepare(device, projections.1),
+            qkv_resident::prepare(device, projections.2),
+        );
+        qkv_resident::consume(
+            device,
+            projections,
+            (&q, &k, &v),
+            input,
+            rows,
+            |device, q, k, v, wave| {
+                let q = landed::<QueryHeads, Q, R, Head>(device, q);
+                let k = landed::<KvHeads, K, R, Head>(device, k);
+                let v = landed::<KvHeads, K, R, Head>(device, v);
+                store(device, q, k, v, wave);
+            },
+        );
+    }
+    (qo, ko, vo)
 }
