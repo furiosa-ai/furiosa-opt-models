@@ -6,7 +6,8 @@
 //!   rows arrive, so a schedule can land it under earlier work; its projection widens the block
 //!   scales to FP32 once, then runs every lane group.
 //! - A lane group fills half of the tensor registers through the switch ring once and meets every
-//!   pass there; a pass covers the most rows whose FP32 block scales fit the vector registers.
+//!   pass there; a pass covers the most rows whose FP32 block scales fit the vector registers. The
+//!   next group fills the other half under the passes when its switch takes one part a pass.
 //! - The projected rows end where the contract places them: in the output's feature slices once
 //!   the last pass ends, or [`Kept`] where the passes summed them.
 //! - Rows another summed projection kept land in both clusters as they lie, an owner's run of
@@ -91,6 +92,19 @@ type Lane<R> = m![{ Layout<R>::Lanes }];
 /// cluster half of the outputs, each owner slice its consecutive outputs of every row.
 type Summing<I, O, R> =
     DmTensor<bf16, Chip, Cluster<O>, Reduced<I, O>, m![R, O % ({ Owner<I, O> })]>;
+
+/// A lane group's rows in the tensor registers of every slice of a projection of `I` inputs into
+/// `O` outputs, each slice the group's inputs in its part.
+type Registers<I, O, R> =
+    TrfTensor<bf16, Chip, Cluster<O>, Owners<I, O>, Lane<R>, m![1, { Part<I> }]>;
+
+/// The FP32 block scales of one pass's rows, in the vector registers.
+type Scaling<I, O> =
+    VrfTensor<f32, Chip, Cluster<O>, Owners<I, O>, m![{ Elements<I, O> }, { Part<I> } / 16]>;
+
+/// A lane group's rows in each slice's part, in input order, as the switch leaves them in DM.
+type Staging<I, O, R> =
+    DmTensor<bf16, Chip, Cluster<O>, Owners<I, O>, m![{ Lane<R> }, { Part<I> }]>;
 
 /// The rows a projection of `H` inputs into `I` outputs summed, in both clusters: each half of the
 /// outputs on half of the slices, an owner's run on a slice of its own, as the passes left them.
@@ -193,25 +207,20 @@ impl<I: AxisName, O: AxisName> Landed<I, O> {
             .commit_trim::<m![I / 16 % 8]>()
             .commit_view(scales.view_mut());
         let mut projected = Summing::<I, O, R>::new();
-        let (first, count) = input.groups::<Lanes<R>>();
-        for at in 0..count {
-            let group = first + at;
-            let lanes = input.value().stage(device, group);
-            for tile in 0..<Tiles<I, O> as M>::SIZE {
-                let scale: VrfTensor<
-                    f32,
-                    Chip,
-                    Cluster<O>,
-                    Owners<I, O>,
-                    m![{ Elements<I, O> }, { Part<I> } / 16],
-                > = device
-                    .sub
-                    .begin(scales.view().tile::<Tiles<I, O>, 1, m![
-                        { Elements<I, O> } # ({ Owner<I, O> }), { Part<I> } / 16
-                    ]>(tile))
-                    .fetch::<m![{ Elements<I, O> }, { Part<I> } / 128], m![I / 16 % 8]>()
-                    .collect::<m![{ Elements<I, O> }, { Part<I> } / 128], m![I / 16 % 8]>()
-                    .to_vrf();
+        let load = |device: &mut Device, tile: usize| -> Scaling<I, O> {
+            device
+                .sub
+                .begin(scales.view().tile::<Tiles<I, O>, 1, m![
+                    { Elements<I, O> } # ({ Owner<I, O> }), { Part<I> } / 16
+                ]>(tile))
+                .fetch::<m![{ Elements<I, O> }, { Part<I> } / 128], m![I / 16 % 8]>()
+                .collect::<m![{ Elements<I, O> }, { Part<I> } / 128], m![I / 16 % 8]>()
+                .to_vrf()
+        };
+        let mut pass =
+            |device: &mut Device,
+             (group, tile): (usize, usize),
+             (lanes, scale): (&Registers<I, O, R>, &Scaling<I, O>)| {
                 // Each lane's block sums meet their row's block scales, the same for every lane.
                 let sums = device
                     .main
@@ -222,7 +231,7 @@ impl<I: AxisName, O: AxisName> Landed<I, O> {
                     .fetch_table_lookup::<bf16>()
                     .collect::<m![{ Elements<I, O> }, { Part<I> } / 16], m![I % 16]>()
                     .contract_outer::<m![{ Elements<I, O> }, { Part<I> } / 16, 1], m![I % 16], _, _, _>(
-                        &lanes,
+                        lanes,
                     )
                     .contract_packet::<m![1]>()
                     .contract_time::<m![{ Elements<I, O> }, { Part<I> } / 16, 1]>()
@@ -235,7 +244,7 @@ impl<I: AxisName, O: AxisName> Landed<I, O> {
                         m![{ Elements<I, O> }, { Part<I> } / 16, 1, { Lane<R> } # 8 / 4],
                         m![{ Lane<R> } # 8 % 4],
                     >()
-                    .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &scale)
+                    .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), scale)
                     .vector_intra_slice_reduce::<
                         I,
                         m![{ Elements<I, O> }, 1, { Lane<R> } # 8 / 4],
@@ -270,6 +279,42 @@ impl<I: AxisName, O: AxisName> Landed<I, O> {
                             { Elements<I, O> } #{!} ({ Owner<I, O> })
                         ]>(tile),
                 );
+            };
+        let (first, count) = input.groups::<Lanes<R>>();
+        let rows = input.value();
+        if const { X::PARTS == 0 || X::PARTS == <Tiles<I, O> as M>::SIZE } {
+            // Each pass of a group before the last switches one part of the next group after its
+            // own loads, beside its contraction; the next group's lanes fill the other half of the
+            // TRF under the last pass. The last group's passes run alone.
+            let mut staged = X::staged();
+            rows.switch(device, first, &mut staged);
+            let mut lanes = rows.fill(device, first, &staged);
+            for next in 1..count {
+                for tile in 0..<Tiles<I, O> as M>::SIZE {
+                    let scale = load(device, tile);
+                    pass(device, (first + next - 1, tile), (&lanes, &scale));
+                    if const { X::PARTS > 0 } {
+                        rows.part(device, (first + next, tile), &mut staged);
+                    }
+                }
+                lanes = rows.fill(device, first + next, &staged);
+            }
+            for _ in 0..count.min(1) {
+                for tile in 0..<Tiles<I, O> as M>::SIZE {
+                    let scale = load(device, tile);
+                    pass(device, (first + count - 1, tile), (&lanes, &scale));
+                }
+            }
+        } else {
+            for at in 0..count {
+                let group = first + at;
+                let mut staged = X::staged();
+                rows.switch(device, group, &mut staged);
+                let lanes = rows.fill(device, group, &staged);
+                for tile in 0..<Tiles<I, O> as M>::SIZE {
+                    let scale = load(device, tile);
+                    pass(device, (group, tile), (&lanes, &scale));
+                }
             }
         }
         projected
@@ -471,53 +516,43 @@ fn spread<I: AxisName, O: AxisName, R: AxisName>(
 }
 
 /// Rows a projection of `I` inputs into `O` outputs reads a lane group of as the tensor-register
-/// lanes of every slice, each slice the group's inputs in its part.
+/// lanes of every slice, each slice the group's inputs in its part: the switch ring writes a group
+/// into its staging DM, whole or in `PARTS` parts, and the group fills the TRF from there.
 trait Stage<I: AxisName, O: AxisName, R: AxisName> {
-    fn stage(
+    /// The parts the switch can write a group in, none when it fills the TRF itself.
+    const PARTS: usize;
+
+    fn staged() -> Staging<I, O, R>;
+    fn switch(&self, device: &mut Device, group: usize, staged: &mut Staging<I, O, R>);
+    fn part(&self, device: &mut Device, at: (usize, usize), staged: &mut Staging<I, O, R>);
+    fn fill(
         &self,
         device: &mut Device,
         group: usize,
-    ) -> TrfTensor<bf16, Chip, Cluster<O>, Owners<I, O>, Lane<R>, m![1, { Part<I> }]>;
+        staged: &Staging<I, O, R>,
+    ) -> Registers<I, O, R>;
 }
 
 /// Rows in their feature slices: the switch ring takes each feature slice's inputs to the slices
-/// that hold them.
+/// that hold them, straight into the TRF where a slice holds one packet of a row.
 impl<I: AxisName, O: AxisName, R: AxisName> Stage<I, O, R> for Spread<I, R> {
-    fn stage(
-        &self,
-        device: &mut Device,
-        group: usize,
-    ) -> TrfTensor<bf16, Chip, Cluster<O>, Owners<I, O>, Lane<R>, m![1, { Part<I> }]> {
+    const PARTS: usize = if I::SIZE <= 16 * 256 { 0 } else { 1 };
+
+    fn staged() -> Staging<I, O, R> {
+        DmTensor::new()
+    }
+
+    fn switch(&self, device: &mut Device, group: usize, staged: &mut Staging<I, O, R>) {
         type Feature<I> = Symbol<normalization::Chunk<I>>;
         type Group<I, R> = Layout<R>::Elements<m![I % ({ Feature<I> })]>;
-        let input = Layout::<R>::group(self.view(), group);
-        if const { I::SIZE <= 16 * 256 } {
-            // SAFETY: both physical clusters hold every row, sixteen inputs a slice; only the
-            // logical cluster axis changes.
-            let input =
-                unsafe { input.reshape::<Chip, Cluster<O>, m![I / 16 # 256], Group<I, R>>() };
-            device
-                .sub
-                .begin(input)
-                .fetch::<Lane<R>, m![I % 16]>()
-                .switch::<Owners<I, O>, m![{ Lane<R> }, { Part<I> } / 16]>(
-                    SwitchConfig::CustomBroadcast { ring_size: 256 },
-                )
-                .collect::<m![{ Lane<R> }, { Part<I> } / 16], m![I % 16]>()
-                .to_trf()
-        } else {
+        if const { I::SIZE > 16 * 256 } {
             // A slice holds several switch packets, delivered with other slices' inputs
             // innermost, so the parts are written in DM before the lanes fill in input order.
-            // SAFETY: as above, only the logical cluster axis changes.
-            let input =
-                unsafe { input.reshape::<Chip, Cluster<O>, FeatureSlices<I>, Group<I, R>>() };
-            let mut staged: DmTensor<
-                bf16,
-                Chip,
-                Cluster<O>,
-                Owners<I, O>,
-                m![{ Lane<R> }, { Part<I> }],
-            > = DmTensor::new();
+            // SAFETY: both physical clusters hold every row; only the logical cluster axis changes.
+            let input = unsafe {
+                Layout::<R>::group(self.view(), group)
+                    .reshape::<Chip, Cluster<O>, FeatureSlices<I>, Group<I, R>>()
+            };
             device
                 .sub
                 .begin(input)
@@ -534,38 +569,62 @@ impl<I: AxisName, O: AxisName, R: AxisName> Stage<I, O, R> for Spread<I, R> {
                 ], m![I % 16]>()
                 .commit_trim::<m![I % 16]>()
                 .commit_view(staged.view_mut());
+        }
+    }
+
+    fn part(&self, device: &mut Device, (group, _): (usize, usize), staged: &mut Staging<I, O, R>) {
+        self.switch(device, group, staged);
+    }
+
+    fn fill(
+        &self,
+        device: &mut Device,
+        group: usize,
+        staged: &Staging<I, O, R>,
+    ) -> Registers<I, O, R> {
+        type Feature<I> = Symbol<normalization::Chunk<I>>;
+        type Group<I, R> = Layout<R>::Elements<m![I % ({ Feature<I> })]>;
+        if const { I::SIZE <= 16 * 256 } {
+            // SAFETY: both physical clusters hold every row, sixteen inputs a slice; only the
+            // logical cluster axis changes.
+            let input = unsafe {
+                Layout::<R>::group(self.view(), group)
+                    .reshape::<Chip, Cluster<O>, m![I / 16 # 256], Group<I, R>>()
+            };
             device
                 .sub
-                .begin(staged.view())
-                .fetch::<m![{ Lane<R> }, { Part<I> } / 16], m![I % 16]>()
+                .begin(input)
+                .fetch::<Lane<R>, m![I % 16]>()
+                .switch::<Owners<I, O>, m![{ Lane<R> }, { Part<I> } / 16]>(
+                    SwitchConfig::CustomBroadcast { ring_size: 256 },
+                )
                 .collect::<m![{ Lane<R> }, { Part<I> } / 16], m![I % 16]>()
                 .to_trf()
+        } else {
+            filled(device, staged)
         }
     }
 }
 
 /// Rows a summed projection of `H` inputs kept, in both clusters: the switch ring takes each
-/// owner's run, a piece at a time, to the slices whose part holds it, and the parts are written in
-/// DM before the lanes fill in input order.
+/// owner's run, a piece at a time, to the slices whose part holds it, all pieces at once or one a
+/// part, and the parts are written in DM before the lanes fill in input order.
 impl<H: AxisName, I: AxisName, O: AxisName, R: AxisName> Stage<I, O, R> for Both<H, I, R> {
-    fn stage(
-        &self,
-        device: &mut Device,
-        group: usize,
-    ) -> TrfTensor<bf16, Chip, Cluster<O>, Owners<I, O>, Lane<R>, m![1, { Part<I> }]> {
+    const PARTS: usize = Owned::<H, I>::SIZE / Piece::<H, I>::SIZE;
+
+    fn staged() -> Staging<I, O, R> {
+        DmTensor::new()
+    }
+
+    fn switch(&self, device: &mut Device, group: usize, staged: &mut Staging<I, O, R>) {
         type Run<H, I> = Symbol<Piece<H, I>>;
         type Group<H, I, R> = Layout<R>::Elements<m![I % ({ Owner<H, I> })]>;
         const { assert!(fits_both::<H, I>()) };
-        let input = Layout::<R>::group(self.view(), group);
         // SAFETY: both physical clusters hold every row; only the logical cluster axis changes.
-        let input = unsafe { input.reshape::<Chip, Cluster<O>, Runs<H, I>, Group<H, I, R>>() };
-        let mut staged: DmTensor<
-            bf16,
-            Chip,
-            Cluster<O>,
-            Owners<I, O>,
-            m![{ Lane<R> }, { Part<I> }],
-        > = DmTensor::new();
+        let input = unsafe {
+            Layout::<R>::group(self.view(), group)
+                .reshape::<Chip, Cluster<O>, Runs<H, I>, Group<H, I, R>>()
+        };
         device
             .sub
             .begin(input)
@@ -584,11 +643,59 @@ impl<H: AxisName, I: AxisName, O: AxisName, R: AxisName> Stage<I, O, R> for Both
             ], m![I % ({ Run<H, I> }) # 16]>()
             .commit_trim::<m![I % ({ Run<H, I> })]>()
             .commit_view(staged.view_mut());
+    }
+
+    fn part(
+        &self,
+        device: &mut Device,
+        (group, piece): (usize, usize),
+        staged: &mut Staging<I, O, R>,
+    ) {
+        type Run<H, I> = Symbol<Piece<H, I>>;
+        type Pieces<H, I> = m![I % ({ Owner<H, I> }) / ({ Run<H, I> })];
+        type Group<H, I, R> = Layout<R>::Elements<m![I % ({ Owner<H, I> })]>;
+        const { assert!(fits_both::<H, I>()) };
+        // SAFETY: as above, only the logical cluster axis changes.
+        let input = unsafe {
+            Layout::<R>::group(self.view(), group)
+                .reshape::<Chip, Cluster<O>, Runs<H, I>, Group<H, I, R>>()
+        };
         device
             .sub
-            .begin(staged.view())
-            .fetch::<m![{ Lane<R> }, { Part<I> } / 16], m![I % 16]>()
-            .collect::<m![{ Lane<R> }, { Part<I> } / 16], m![I % 16]>()
-            .to_trf()
+            .begin(input.tile::<Pieces<H, I>, 1, m![
+                { Layout<R>::Selected },
+                { Lane<R> },
+                I % ({ Run<H, I> }) # ({ Owner<H, I> })
+            ]>(piece))
+            .fetch::<Lane<R>, m![I % ({ Run<H, I> })]>()
+            .switch::<Owners<I, O>, m![{ Lane<R> }, I % ({ Width<I> }) / ({ Owner<H, I> })]>(
+                SwitchConfig::CustomBroadcast { ring_size: 256 },
+            )
+            .collect::<m![{ Lane<R> }, I % ({ Width<I> }) / ({ Owner<H, I> })], m![
+                I % ({ Run<H, I> }) # 16
+            ]>()
+            .commit_trim::<m![I % ({ Run<H, I> })]>()
+            .commit_view(staged.view_mut().tile::<Pieces<H, I>, 1, m![
+                { Lane<R> },
+                I % ({ Width<I> }) / ({ Owner<H, I> }),
+                I % ({ Run<H, I> }) #{!} ({ Owner<H, I> })
+            ]>(piece));
     }
+
+    fn fill(&self, device: &mut Device, _: usize, staged: &Staging<I, O, R>) -> Registers<I, O, R> {
+        filled(device, staged)
+    }
+}
+
+/// A lane group's staged rows into the TRF, in input order.
+fn filled<I: AxisName, O: AxisName, R: AxisName>(
+    device: &mut Device,
+    staged: &Staging<I, O, R>,
+) -> Registers<I, O, R> {
+    device
+        .sub
+        .begin(staged.view())
+        .fetch::<m![{ Lane<R> }, { Part<I> } / 16], m![I % 16]>()
+        .collect::<m![{ Lane<R> }, { Part<I> } / 16], m![I % 16]>()
+        .to_trf()
 }
