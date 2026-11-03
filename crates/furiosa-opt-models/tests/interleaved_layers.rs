@@ -329,11 +329,16 @@ fn scheduled_period(
     home
 }
 
-/// Tokens of history before the call's first row, past a block boundary.
-const HISTORY: usize = 100;
+/// Tokens of history before the call's first row: `PERIOD_PROFILE_HISTORY`, or 100, past a block
+/// boundary.
+fn history() -> usize {
+    std::env::var("PERIOD_PROFILE_HISTORY").map_or(100, |tokens| tokens.parse().unwrap())
+}
 
 /// Physical blocks of each layer's cache: the history and every row of the call.
-const BLOCKS: usize = (HISTORY + Rows::SIZE).div_ceil(Block::SIZE) + 1;
+fn blocks() -> usize {
+    (history() + Rows::SIZE).div_ceil(Block::SIZE) + 1
+}
 
 /// A value nothing reads: a NaN with a payload of its own.
 const POISON: u16 = 0xff81;
@@ -481,7 +486,7 @@ fn hidden(live: usize) -> Vec<bf16> {
 
 /// The keys a row of the call sees: the history and every row up to its own.
 fn visible(row: usize, live: usize) -> usize {
-    if row < live { HISTORY + row + 1 } else { 0 }
+    if row < live { history() + row + 1 } else { 0 }
 }
 
 /// Pages of `Windows` windows: row `row` sees its first `visible(row)` keys, its table's entry `e`
@@ -549,7 +554,7 @@ async fn context<A: Kind>(device: &mut Device, live: usize) -> Context<A> {
             .unwrap();
     let (mut low, mut high) = (Vec::new(), Vec::new());
     for row in 0..Rows::SIZE {
-        let position = (HISTORY + row) as f32;
+        let position = (history() + row) as f32;
         for at in 0..rotated {
             let (sin, cos) = f64::from(position * frequencies.pairs()[at % pairs]).sin_cos();
             let (l, h) = match at < pairs {
@@ -568,7 +573,7 @@ async fn context<A: Kind>(device: &mut Device, live: usize) -> Context<A> {
         high: table(high).to_hbm(&mut device.pdma).await.unwrap(),
     };
     let slots = (0..Rows::SIZE).map(|row| match row < live {
-        true => ((HISTORY + row) as i32) * Pool::<A>::ROW_STRIDE,
+        true => ((history() + row) as i32) * Pool::<A>::ROW_STRIDE,
         false => 0,
     });
     let write = HostTensor::<i32, m![Rows]>::from_vec(slots.collect::<Vec<_>>());
@@ -593,12 +598,12 @@ fn width<A: Attention>() -> usize {
 /// Layer `layer`'s cache: the history's keys and values, every later slot poison.
 fn cache<A: Attention>(layer: usize) -> Vec<bf16> {
     let history = values(
-        HISTORY * width::<A>(),
+        history() * width::<A>(),
         0x2545_f491 ^ (layer as u64) << 32,
         0.25,
     );
     let poison = bf16::from_bits(POISON);
-    (0..BLOCKS * Block::SIZE * width::<A>())
+    (0..blocks() * Block::SIZE * width::<A>())
         .map(|at| history.get(at).copied().unwrap_or(poison))
         .collect()
 }
@@ -611,11 +616,11 @@ type Tokens<A> = m![
     { Symbol<<A as Attention>::Head> }
 ];
 
-/// `values` in a new cache of [`BLOCKS`] blocks.
+/// `values` in a new cache of [`blocks`] blocks.
 async fn pool<A: Attention>(device: &mut Device, values: &[bf16]) -> Pool<A> {
-    let bytes = BLOCKS * Pool::<A>::BLOCK_STRIDE as usize;
+    let bytes = blocks() * Pool::<A>::BLOCK_STRIDE as usize;
     let mut pool = Pool::<A>::from_buffer(HbmBuffer::alloc(device, bytes).unwrap()).unwrap();
-    for (block, values) in values.chunks_exact(values.len() / BLOCKS).enumerate() {
+    for (block, values) in values.chunks_exact(values.len() / blocks()).enumerate() {
         HostTensor::<bf16, Tokens<A>>::from_vec(values.to_vec())
             .to_hbm(&mut device.pdma)
             .output(&mut pool.tokens[block])
@@ -628,7 +633,7 @@ async fn pool<A: Attention>(device: &mut Device, values: &[bf16]) -> Pool<A> {
 /// Every value of `pool`, block by block.
 async fn read<A: Attention>(device: &mut Device, pool: &Pool<A>) -> Vec<bf16> {
     let mut values = Vec::new();
-    for block in 0..BLOCKS {
+    for block in 0..blocks() {
         let tokens = pool.tokens[block]
             .to_host::<Tokens<A>>(&mut device.pdma)
             .await;
@@ -796,11 +801,12 @@ fn written(
         let value = value.to_f32();
         assert!(value.is_finite(), "{live} rows: element {at} is {value}");
     }
+    let rows = history()..history() + live;
     for (layer, ((found, before), &width)) in found.iter().zip(before).zip(widths).enumerate() {
         for (at, (found, before)) in found.iter().zip(before).enumerate() {
             let token = at / width;
             let place = format!("layer {layer}, {live} rows: token {token}");
-            match (HISTORY..HISTORY + live).contains(&token) {
+            match rows.contains(&token) {
                 true => assert!(found.to_f32().is_finite(), "{place}"),
                 false => assert_eq!(found.to_bits(), before.to_bits(), "{place}"),
             }
