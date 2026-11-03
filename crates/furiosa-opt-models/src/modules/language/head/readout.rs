@@ -6,7 +6,7 @@ use crate::modules::generic::schedule::{Fill, Spill};
 use crate::modules::generic::schedule::{IntoStream, Stream};
 use crate::ops::index::scatter::Store;
 use crate::ops::normalization::span::{Selection, Span, Tile};
-use crate::ops::normalization::{Blocked, Spread};
+use crate::ops::normalization::{Blocked, RmsNorm, Spread};
 use crate::ops::reduction;
 use crate::tensor::live::{Live, OnTile};
 use crate::tensor::scalar::Value;
@@ -115,6 +115,30 @@ where
         selected: &Selected<Capacity>,
         tokens: &mut HbmTensor<i32, Chip, m![Capacity]>,
     ) {
+        self.read_with(context, hidden, selected, tokens, ());
+    }
+
+    /// Gather only the requested rows, normalizing each 8/64/128-row head tile. Limiting
+    /// the norm to a tile also keeps its row inverses within the vector register file.
+    pub(crate) fn read_normalized<Capacity: AxisName, const EPSILON: usize>(
+        &self,
+        context: &mut Device,
+        hidden: &HbmTensor<bf16, Chip, Blocked<Width, Capacity>>,
+        selected: &Selected<Capacity>,
+        tokens: &mut HbmTensor<i32, Chip, m![Capacity]>,
+        norm: &RmsNorm<Width, EPSILON, Chip>,
+    ) {
+        self.read_with(context, hidden, selected, tokens, norm);
+    }
+
+    fn read_with<Capacity: AxisName, P: Prepare<Width>>(
+        &self,
+        context: &mut Device,
+        hidden: &HbmTensor<bf16, Chip, Blocked<Width, Capacity>>,
+        selected: &Selected<Capacity>,
+        tokens: &mut HbmTensor<i32, Chip, m![Capacity]>,
+        prepare: P,
+    ) {
         // Read after the rows: waiting for the read drains the DMA queue, retiring at once every
         // transfer the rows left pending, whose completion ids and memory the head reuses.
         let chosen = Live::<(), Capacity>::read(&selected.live);
@@ -130,6 +154,7 @@ where
                 &mut *context,
                 &mut Tiles {
                     rows: &rows,
+                    prepare: &prepare,
                     head: &head,
                     tokens: &mut *tokens,
                     tile,
@@ -139,22 +164,39 @@ where
     }
 }
 
+/// A tile's optional final normalization, specialized at compile time.
+trait Prepare<Width: AxisName> {
+    fn apply<R: AxisName>(&self, device: &mut Device, rows: Spread<Width, R>) -> Spread<Width, R>;
+}
+impl<Width: AxisName> Prepare<Width> for () {
+    fn apply<R: AxisName>(&self, _: &mut Device, rows: Spread<Width, R>) -> Spread<Width, R> {
+        rows
+    }
+}
+impl<Width: AxisName, const EPSILON: usize> Prepare<Width> for &RmsNorm<Width, EPSILON, Chip> {
+    fn apply<R: AxisName>(&self, device: &mut Device, rows: Spread<Width, R>) -> Spread<Width, R> {
+        crate::Op::forward(*self, device, &rows)
+    }
+}
+
 /// One span's tiles: each read by the head, and its tokens stored where its rows sit among the
 /// launch's.
-struct Tiles<'a, Width: AxisName, V: AxisName, Capacity: AxisName> {
+struct Tiles<'a, Width: AxisName, V: AxisName, Capacity: AxisName, P> {
     rows: &'a Spread<Width, Span>,
+    prepare: &'a P,
     head: &'a InDm<'a, Width, V>,
     tokens: &'a mut HbmTensor<i32, Chip, m![Capacity]>,
     tile: Live<(), Capacity>,
 }
 
-impl<R: AxisName, Width: AxisName, V: AxisName, Capacity: AxisName> OnTile<Device, R>
-    for Tiles<'_, Width, V, Capacity>
+impl<R: AxisName, Width: AxisName, V: AxisName, Capacity: AxisName, P: Prepare<Width>>
+    OnTile<Device, R> for Tiles<'_, Width, V, Capacity, P>
 {
     fn run(&mut self, device: &mut Device, index: usize) {
         let mut rows: Spread<Width, R> = DmTensor::new();
         let wave = Tile::<Width, m![Span % R]>::of(self.rows, index, &mut rows);
         wave.input.to_dm_view(&mut device.tdma, wave.output);
+        let rows = self.prepare.apply(device, rows);
         let selected = self.head.forward(&mut *device, (), &mut (), &rows);
         self.tokens.spill(device, &selected, (self.tile, index));
     }

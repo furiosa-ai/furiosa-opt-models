@@ -236,15 +236,22 @@ impl LoadOptions {
             architecture,
             implementation,
             part: checkpoint.part(),
-            // An implementation serving a quantization holds E4M3 projections: the block-FP8 one
-            // serves a checkpoint declaring one, the channel-scaled ones a checkpoint a load
-            // quantizes. A media encoder holds BF16 ones whatever its language model's.
+            // Packed NVFP4 codes occupy U8 containers (two E2M1 values a byte); this
+            // safetensors version has no FP4 dtype. Other quantized lines hold E4M3.
             precision: match (
                 checkpoint.part(),
                 checkpoint.declaration(),
                 checkpoint.quantization(),
             ) {
                 (Part::Encoder, ..) | (Part::Whole, None, None) => Dtype::BF16,
+                (_, Some(declared), _)
+                    if declared
+                        .get("quant_algo")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("NVFP4") =>
+                {
+                    Dtype::U8
+                }
                 _ => Dtype::F8_E4M3,
             },
             kv_cache: Dtype::BF16,

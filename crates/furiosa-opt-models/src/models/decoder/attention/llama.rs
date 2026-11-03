@@ -7,6 +7,8 @@
 //! - The vocabulary compiles as 131072 rows, `vocab_size` 128256 padded; the head's bias lowers the
 //!   padded rows.
 
+pub mod nvfp4;
+
 use std::io;
 
 use serde::Deserialize;

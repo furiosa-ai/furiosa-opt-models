@@ -146,6 +146,7 @@ nav:
               - models/qwen3-8b.md
           - Llama:
               - models/llama3-8b.md
+              - models/llama3.1-8b-nvfp4.md
           - Mistral:
               - models/mistral-7b.md
               - models/mistral-nemo.md
