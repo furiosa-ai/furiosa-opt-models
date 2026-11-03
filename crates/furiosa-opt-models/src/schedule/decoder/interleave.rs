@@ -23,6 +23,7 @@ use crate::modules::language::{Backbone, Cap, Greedy, Normalized};
 use crate::ops::attention::gqa::Pages;
 use crate::ops::embedding::Ids;
 use crate::ops::index::gather::Gather;
+use crate::ops::index::scatter::Store;
 use crate::ops::linear::{self, Affine};
 use crate::ops::normalization::{RowMajor, Spread};
 use crate::ops::reduction::Argmax;
@@ -412,8 +413,7 @@ where
         );
         let Then(Backbone { embedding, body }, norm) = &self.model.body;
         let embedded = embedding.forward(&mut *device, (), &mut ((), ()), (&input.tokens, live));
-        let mut home: Home<Hidden, R> = HbmTensor::new();
-        (embedded.value().view()).to_hbm_view(&mut device.tdma, home.view_mut());
+        let mut home: Home<Hidden, R> = crate::Op::forward(&Store, &mut *device, &embedded);
         let mut places = (
             (Places::<A, R>::new(), first),
             (Places::<B, R>::new(), second),
