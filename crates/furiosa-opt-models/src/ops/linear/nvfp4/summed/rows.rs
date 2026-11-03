@@ -481,22 +481,25 @@ impl<I: AxisName, O: AxisName, R: AxisName> Fold<I, O, R> for Trim {
 /// projected from `I` inputs into `O` outputs.
 pub trait Place<I: AxisName, O: AxisName, R: AxisName> {
     type Rows;
-    fn place(device: &mut Device, rows: Summing<I, O, R>) -> Self::Rows;
+    fn place(device: &mut Device, rows: Live<Summing<I, O, R>, R>) -> Live<Self::Rows, R>;
 }
 
 impl<I: AxisName, O: AxisName, R: AxisName> Place<I, O, R> for Features {
     type Rows = Spread<O, R>;
 
-    fn place(device: &mut Device, rows: Summing<I, O, R>) -> Self::Rows {
-        spread(device, &rows)
+    fn place(device: &mut Device, rows: Live<Summing<I, O, R>, R>) -> Live<Self::Rows, R> {
+        let mut spread = Spread::<O, R>::new();
+        transfer(device, rows.with(rows.value()), &mut spread);
+        rows.with(spread)
     }
 }
 
 impl<I: AxisName, O: AxisName, R: AxisName> Place<I, O, R> for Kept {
     type Rows = Kept<Summing<I, O, R>>;
 
-    fn place(_: &mut Device, rows: Summing<I, O, R>) -> Self::Rows {
-        Kept(rows)
+    fn place(_: &mut Device, rows: Live<Summing<I, O, R>, R>) -> Live<Self::Rows, R> {
+        let live = rows.with(());
+        live.with(Kept(rows.into_value()))
     }
 }
 
@@ -569,7 +572,7 @@ impl<'x, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P: Place<I, O, 
         (landed, input): (Landed<I, O>, &'x Live<Spread<I, R>, R>),
     ) -> Self::Output {
         let projected = landed.project(device, input);
-        input.with(P::place(device, projected))
+        P::place(device, input.with(projected))
     }
 }
 
@@ -615,8 +618,9 @@ where
             let begun = self.forward(&mut *device, Begin((landed, input)));
             self.forward(device, begun)
         } else {
-            let spread = input.with(spread(device, &input.value().0));
-            self.forward(device, (landed, &spread))
+            let mut spread = Spread::<I, R>::new();
+            transfer(device, input.with(&input.value().0), &mut spread);
+            self.forward(device, (landed, &input.with(spread)))
         }
     }
 }
@@ -636,7 +640,7 @@ impl<'x, H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P>
     ) -> Self::Output {
         const { assert!(fits_both::<H, I>()) };
         let mut both = Both::<H, I, R>::new();
-        (input.value().0.view()).to_dm_view(&mut device.tdma, both.view_mut());
+        transfer(device, input.with(&input.value().0), &mut both);
         (landed, input.with(both))
     }
 }
@@ -656,19 +660,28 @@ where
         (landed, rows): (Landed<I, O>, Live<Both<H, I, R>, R>),
     ) -> Self::Output {
         let projected = landed.project(device, &rows);
-        rows.with(P::place(device, projected))
+        P::place(device, rows.with(projected))
     }
 }
 
-/// Every row a projection's passes summed, in the output's feature slices: one transfer, as a
-/// transfer costs about the same for one row as for the envelope.
-fn spread<I: AxisName, O: AxisName, R: AxisName>(
+/// The live rows of `rows` into `into`'s mapping in one transfer: the lane group holding them, or
+/// the envelope when they span groups, as a transfer's setup costs about as much as all its rows.
+fn transfer<R: AxisName, C: M, S: M, X: M, D: M, T: M, Y: M>(
     device: &mut Device,
-    rows: &Summing<I, O, R>,
-) -> Spread<O, R> {
-    let mut spread = Spread::<O, R>::new();
-    rows.view().to_dm_view(&mut device.tdma, spread.view_mut());
-    spread
+    rows: Live<&DmTensor<bf16, Chip, C, S, m![R, { X }]>, R>,
+    into: &mut DmTensor<bf16, Chip, D, T, m![R, { Y }]>,
+) {
+    let (first, count) = rows.groups::<Lanes<R>>();
+    if count > 1 {
+        rows.value()
+            .view()
+            .to_dm_view(&mut device.tdma, into.view_mut());
+    } else {
+        Layout::<R>::group(rows.value().view(), first).to_dm_view(
+            &mut device.tdma,
+            (into.view_mut()).tile::<Layout<R>::Groups, 1, Layout<R>::GroupMut<Y>>(first),
+        );
+    }
 }
 
 /// Rows a projection of `I` inputs into `O` outputs reads a lane group of as the tensor-register
