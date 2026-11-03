@@ -14,6 +14,7 @@
 
 use furiosa_opt_models::Op;
 use furiosa_opt_models::models::decoder::attention::gemma4;
+use furiosa_opt_models::models::decoder::form::summed::{Blocks, Codes};
 use furiosa_opt_models::ops::normalization::Spread;
 use furiosa_opt_models::ops::pointwise::Kept;
 use furiosa_opt_models::tensor::form::BlockScaled;
@@ -39,8 +40,19 @@ mod swiglu {
     axes![Hidden = 4096, Intermediate = 14336];
 }
 
-/// An NVFP4 projection of `I` inputs to `O` outputs, its rows ending where `P` places them.
-type Nvfp4<I, O, P> = BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Hbm, P>>;
+/// An NVFP4 projection of `I` inputs to `O` outputs, held as the catalog's summed form holds it,
+/// its rows ending where `P` places them.
+type Nvfp4<I, O, P> = BlockScaled<
+    I,
+    O,
+    f4e2m1,
+    f8e4m3,
+    Scales<I, O>,
+    Summed<W4A16, Hbm, P>,
+    Chip,
+    HbmTensor<f4e2m1, Chip, Codes<I, O>>,
+    HbmTensor<f8e4m3, Chip, Blocks<I, O>>,
+>;
 
 /// The live rows `start` and `rows` name, through `linear`, from and back to HBM rows.
 #[device(chip = 1)]

@@ -13,7 +13,7 @@ use crate::tensor::{parallel::Chip, scalar};
 use core::borrow::Borrow;
 use furiosa_opt_std::prelude::*;
 
-mod rows;
+pub(crate) mod rows;
 
 /// Ways a row's inputs split over slices: the fewest, a power of two, that keep a slice's part
 /// within 4096 inputs, so its four rows' FP32 block scales take at most 4 KiB of the VRF.

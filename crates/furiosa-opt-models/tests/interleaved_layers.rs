@@ -9,6 +9,7 @@
 
 use furiosa_opt_models::load::{Checkpoint, Load, Named};
 use furiosa_opt_models::models::decoder::attention::gemma4::{self, full, sliding};
+use furiosa_opt_models::models::decoder::form::summed;
 use furiosa_opt_models::models::decoder::{self, Attention};
 use furiosa_opt_models::modules::{attention, language};
 use furiosa_opt_models::ops::attention::gqa::{Attended, Cache, Pages};
@@ -1050,18 +1051,32 @@ async fn one_head_attends_each_live_row_as_the_host() {
     }
 }
 
-/// An NVFP4 projection of `I` inputs to `O` outputs under contract `C`.
-type Nvfp4<I, O, C> = BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, C>;
+/// An NVFP4 projection of `I` inputs to `O` outputs under contract `C`, its codes and block scales
+/// laid out in HBM as `K` and `V`.
+type Nvfp4<I, O, C, K = m![O, I], V = Scales<I, O>> = BlockScaled<
+    I,
+    O,
+    f4e2m1,
+    f8e4m3,
+    Scales<I, O>,
+    C,
+    Chip,
+    HbmTensor<f4e2m1, Chip, K>,
+    HbmTensor<f8e4m3, Chip, V>,
+>;
+
+/// An NVFP4 projection under the summed contract, held as the catalog's summed form holds it.
+type Summing<I, O> = Nvfp4<I, O, Summed<W4A16>, summed::Codes<I, O>, summed::Blocks<I, O>>;
 
 /// The call's live rows through one NVFP4 projection, from and back to HBM rows.
 #[device(chip = 1)]
-fn projected<I: AxisName, O: AxisName, C>(
+fn projected<I: AxisName, O: AxisName, C, K: M, V: M>(
     device: &mut Device,
-    linear: &Nvfp4<I, O, C>,
+    linear: &Nvfp4<I, O, C, K, V>,
     (input, live): (&HbmTensor<bf16, Chip, m![Rows, I]>, &Value),
 ) -> HbmTensor<bf16, Chip, m![Rows, O]>
 where
-    Nvfp4<I, O, C>: DeviceSend
+    Nvfp4<I, O, C, K, V>: DeviceSend
         + for<'x> Op<
             &'x Live<Spread<I, Rows, Chip>, Rows>,
             Output = Live<Spread<O, Rows, Chip>, Rows>,
@@ -1109,11 +1124,11 @@ impl Drawn {
     }
 
     /// The weights on the device under the contract `contract` makes of the tensor scale.
-    async fn coded<I: AxisName, O: AxisName, C>(
+    async fn coded<I: AxisName, O: AxisName, C, K: M, V: M>(
         &self,
         device: &mut Device,
         contract: impl FnOnce(Scale) -> C,
-    ) -> Nvfp4<I, O, C> {
+    ) -> Nvfp4<I, O, C, K, V> {
         let global = HostTensor::<f32, m![1 # 8]>::from_vec([
             self.global,
             0.0,
@@ -1180,14 +1195,14 @@ impl Drawn {
 }
 
 /// The `live` rows of `linear`'s projection of `drawn`'s rows.
-async fn project<I: AxisName, O: AxisName, C>(
+async fn project<I: AxisName, O: AxisName, C, K: M, V: M>(
     device: &mut Device,
-    linear: &Nvfp4<I, O, C>,
+    linear: &Nvfp4<I, O, C, K, V>,
     drawn: &Drawn,
     live: usize,
 ) -> Vec<bf16>
 where
-    Nvfp4<I, O, C>: DeviceSend
+    Nvfp4<I, O, C, K, V>: DeviceSend
         + for<'x> Op<
             &'x Live<Spread<I, Rows, Chip>, Rows>,
             Output = Live<Spread<O, Rows, Chip>, Rows>,
@@ -1227,7 +1242,7 @@ fn error(found: &[bf16], exact: &[f64], outputs: usize) -> (f64, f64) {
 /// for the FP32 sums, and nearer the product than the early contract's.
 async fn sums_rows_nearer_than_early<I: AxisName, O: AxisName>(device: &mut Device, seed: u64)
 where
-    Nvfp4<I, O, Summed<W4A16>>: DeviceSend
+    Summing<I, O>: DeviceSend
         + for<'x> Op<
             &'x Live<Spread<I, Rows, Chip>, Rows>,
             Output = Live<Spread<O, Rows, Chip>, Rows>,
@@ -1240,15 +1255,15 @@ where
 {
     let drawn = Drawn::new::<I, O>(seed);
     let exact = drawn.exact::<I, O>();
-    let summed = drawn
-        .coded::<I, O, Summed<W4A16>>(device, |global| Summed {
+    let summed: Summing<I, O> = drawn
+        .coded(device, |global| Summed {
             input: W4A16,
             global,
             place: core::marker::PhantomData,
         })
         .await;
-    let early = drawn
-        .coded::<I, O, Early<W4A16>>(device, |global| Early {
+    let early: Nvfp4<I, O, Early<W4A16>> = drawn
+        .coded(device, |global| Early {
             input: W4A16,
             global,
         })
@@ -1311,26 +1326,32 @@ async fn feed_forward_profile() {
         Drawn::new::<Hidden, Intermediate>(1),
         Drawn::new::<Intermediate, Hidden>(4),
     );
-    let gate = (
-        up.coded::<Hidden, Intermediate, Early<W4A16>>(&mut device, |global| Early {
+    let gate: (
+        Nvfp4<Hidden, Intermediate, Early<W4A16>>,
+        Summing<Hidden, Intermediate>,
+    ) = (
+        up.coded(&mut device, |global| Early {
             input: W4A16,
             global,
         })
         .await,
-        up.coded::<Hidden, Intermediate, Summed<W4A16>>(&mut device, |global| Summed {
+        up.coded(&mut device, |global| Summed {
             input: W4A16,
             global,
             place: core::marker::PhantomData,
         })
         .await,
     );
-    let down_proj = (
-        down.coded::<Intermediate, Hidden, Early<W4A16>>(&mut device, |global| Early {
+    let down_proj: (
+        Nvfp4<Intermediate, Hidden, Early<W4A16>>,
+        Summing<Intermediate, Hidden>,
+    ) = (
+        down.coded(&mut device, |global| Early {
             input: W4A16,
             global,
         })
         .await,
-        down.coded::<Intermediate, Hidden, Summed<W4A16>>(&mut device, |global| Summed {
+        down.coded(&mut device, |global| Summed {
             input: W4A16,
             global,
             place: core::marker::PhantomData,

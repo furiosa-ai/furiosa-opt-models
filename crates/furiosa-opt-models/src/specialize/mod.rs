@@ -23,6 +23,10 @@ pub(crate) const TRF: usize = 65_536;
 /// Bytes of the data memory a slice holds.
 pub(crate) const DM: usize = 524_288;
 
+/// Bytes of the HBM access a transfer's packets stream at full rate in: a run that is a whole
+/// number of them lands in them, any other run in packets that each cost an access more.
+pub(crate) const PACKET: usize = 256;
+
 /// The plan of a pairwise all-reduce: one round for each bit of a chip's index, each adding a
 /// chip's partial sum to the partial of the chip whose index differs in that bit.
 pub(crate) mod collective {

@@ -659,8 +659,14 @@ pub mod form {
 
     /// [`Nvfp4`]'s weights under the experimental summed contract: a row's FP32 sum divides by the
     /// global scale, so no coefficient rounds to BF16. Opt in by naming it in place of [`Nvfp4`].
-    /// A launch's projected rows end where `P` places them, as [`Summed`] reads it.
+    /// A launch's projected rows end where `P` places them, as [`Summed`] reads it. HBM holds the
+    /// codes and block scales as the slices that sum them hold them, a load lays them out so.
     pub struct Nvfp4Summed<P = Features>(PhantomData<P>);
+
+    /// How HBM holds [`Nvfp4Summed`]'s codes and block scales.
+    pub mod summed {
+        pub use crate::ops::linear::nvfp4::summed::rows::{Blocks, Codes};
+    }
 
     /// FP4 weights with per-16 FP8 block scales under a late FP32 tensor scale, whose inputs enter
     /// in form `A`: quantized at run time as the weights are, or as the BF16 they are.
@@ -812,8 +818,8 @@ pub mod form {
                 nvfp4::Scales<In, Out>,
                 Summed<W4A16, X, P>,
                 Chip,
-                V,
-                X::Tensor<f8e4m3, Chip, nvfp4::Scales<In, Out>>,
+                X::Tensor<f4e2m1, Chip, summed::Codes<In, Out>>,
+                X::Tensor<f8e4m3, Chip, summed::Blocks<In, Out>>,
             >;
 
         const REQUIREMENT: Requirement = Requirement::declared(Declaration::Nvfp4);

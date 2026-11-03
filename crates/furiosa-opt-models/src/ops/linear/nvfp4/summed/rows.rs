@@ -21,7 +21,7 @@
 use crate::ops::linear::kernel::Rounded;
 use crate::ops::normalization::{self, FeatureSlices, Spread};
 use crate::ops::pointwise::Kept;
-use crate::specialize::{TRF, VRF};
+use crate::specialize::{PACKET, TRF, VRF};
 use crate::tensor::form::BlockScaled;
 use crate::tensor::form::nvfp4::{Features, Held, Scale, Scales, Summed, W4A16};
 use crate::tensor::memory::Memory;
@@ -85,6 +85,33 @@ type Owners<I, O> = m![O % (O / 2) / ({ Owner<I, O> }), I / ({ Width<I> })];
 type Reduced<I, O> = m![O % (O / 2) / ({ Owner<I, O> }), 1 # (I / ({ Width<I> }))];
 /// A slice's part of a row's inputs.
 type Part<I> = m![I % ({ Width<I> })];
+/// A slice's block scales: one for each 16 inputs of each row it owns.
+type Scaled<I, O> = m![O % ({ Owner<I, O> }), { Part<I> } / 16];
+
+/// Bytes of a slice's E4M3 block scales in whole packets, an odd number of them, so that the
+/// slices' runs start alternately in the HBM's two stacks.
+#[derive(Clone, Debug)]
+pub struct Bursts<I, O>(PhantomData<(I, O)>);
+
+impl<I: AxisName, O: AxisName> AxisName for Bursts<I, O> {
+    const NAME: Ident = Ident::new("Bursts");
+    const SIZE: usize = {
+        let packets = (Owned::<I, O>::SIZE * Chunk::<I>::SIZE / 16).div_ceil(PACKET);
+        (packets | 1) * PACKET
+    };
+}
+
+/// [`Scaled`] padded to [`Bursts`].
+type Padded<I, O> = m![{ Scaled<I, O> } # ({ Symbol<Bursts<I, O>> })];
+
+/// A weight's codes in HBM as the slices that sum them hold them, a slice's rows after the slice
+/// before: a slice's run lands whole, in whole packets.
+pub type Codes<I, O> = m![{ Cluster<O> }, { Owners<I, O> }, O % ({ Owner<I, O> }), { Part<I> }];
+
+/// A weight's E4M3 block scales in HBM as the slices that sum them hold them, a slice's run padded
+/// to whole packets.
+pub type Blocks<I, O> = m![{ Cluster<O> }, { Owners<I, O> }, { Padded<I, O> }];
+
 /// A slice's passes over its rows, and the rows of one pass.
 type Tiles<I, O> = m![O % ({ Owner<I, O> }) / ({ Tall<I, O> })];
 type Elements<I, O> = m![O % ({ Tall<I, O> })];
@@ -152,13 +179,7 @@ impl<H: AxisName, I: AxisName> AxisName for Piece<H, I> {
 /// begun.
 pub struct Landed<I: AxisName, O: AxisName> {
     global: DmTensor<f32, Chip, Cluster<O>, Owners<I, O>, m![1 # 8]>,
-    blocks: DmTensor<
-        f8e4m3,
-        Chip,
-        Cluster<O>,
-        Owners<I, O>,
-        m![O % ({ Owner<I, O> }), { Part<I> } / 16],
-    >,
+    blocks: DmTensor<f8e4m3, Chip, Cluster<O>, Owners<I, O>, Padded<I, O>>,
     codes: DmTensor<f4e2m1, Chip, Cluster<O>, Owners<I, O>, m![O % ({ Owner<I, O> }), { Part<I> }]>,
 }
 
@@ -171,8 +192,8 @@ impl<I: AxisName, O: AxisName> Landed<I, O> {
         weight: &BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P>, Chip, K, V>,
     ) -> Self
     where
-        K: Borrow<HbmTensor<f4e2m1, Chip, m![O, I]>>,
-        V: Borrow<HbmTensor<f8e4m3, Chip, Scales<I, O>>>,
+        K: Borrow<HbmTensor<f4e2m1, Chip, Codes<I, O>>>,
+        V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O>>>,
         Held<Y>: Borrow<Scale>,
     {
         const {
@@ -188,8 +209,8 @@ impl<I: AxisName, O: AxisName> Landed<I, O> {
         let global: &Scale = weight.contract.global.borrow();
         Self {
             global: global.to_dm(&mut device.tdma),
-            blocks: weight.scales().to_dm(&mut device.tdma),
-            codes: weight.codes().to_dm(&mut device.tdma),
+            blocks: weight.weight_scale.borrow().to_dm(&mut device.tdma),
+            codes: weight.weight.borrow().to_dm(&mut device.tdma),
         }
     }
 
@@ -205,7 +226,7 @@ impl<I: AxisName, O: AxisName> Landed<I, O> {
         let mut scales = Widened::<I, O>::new();
         device
             .sub
-            .begin(self.blocks.view())
+            .begin(self.blocks.view().unpad::<Scaled<I, O>>())
             .fetch::<m![O % ({ Owner<I, O> })], m![{ Part<I> } / 16]>()
             .fetch_cast::<f32>()
             .collect::<m![O % ({ Owner<I, O> }), { Part<I> } / 128], m![I / 16 % 8]>()
@@ -516,8 +537,8 @@ impl<I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory>
     Op<(Live<(), R>, &HbmTensor<bf16, Chip, m![R, I]>)>
     for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y>, Chip, K, V>
 where
-    K: Borrow<HbmTensor<f4e2m1, Chip, m![O, I]>>,
-    V: Borrow<HbmTensor<f8e4m3, Chip, Scales<I, O>>>,
+    K: Borrow<HbmTensor<f4e2m1, Chip, Codes<I, O>>>,
+    V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O>>>,
     Held<Y>: Borrow<Scale>,
 {
     type Output = HbmTensor<bf16, Chip, m![R, O]>;
@@ -538,8 +559,8 @@ where
 impl<I: AxisName, O: AxisName, K, V, Y: Memory, P> Op<Begin<()>>
     for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P>, Chip, K, V>
 where
-    K: Borrow<HbmTensor<f4e2m1, Chip, m![O, I]>>,
-    V: Borrow<HbmTensor<f8e4m3, Chip, Scales<I, O>>>,
+    K: Borrow<HbmTensor<f4e2m1, Chip, Codes<I, O>>>,
+    V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O>>>,
     Held<Y>: Borrow<Scale>,
 {
     type Output = Landed<I, O>;
@@ -555,8 +576,8 @@ impl<'x, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P: Place<I, O, 
     Op<&'x Live<Spread<I, R>, R>>
     for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P>, Chip, K, V>
 where
-    K: Borrow<HbmTensor<f4e2m1, Chip, m![O, I]>>,
-    V: Borrow<HbmTensor<f8e4m3, Chip, Scales<I, O>>>,
+    K: Borrow<HbmTensor<f4e2m1, Chip, Codes<I, O>>>,
+    V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O>>>,
     Held<Y>: Borrow<Scale>,
 {
     type Output = Live<P::Rows, R>;
@@ -590,8 +611,8 @@ impl<'x, H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P>
     Op<&'x Live<Kept<Summing<H, I, R>>, R>>
     for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P>, Chip, K, V>
 where
-    K: Borrow<HbmTensor<f4e2m1, Chip, m![O, I]>>,
-    V: Borrow<HbmTensor<f8e4m3, Chip, Scales<I, O>>>,
+    K: Borrow<HbmTensor<f4e2m1, Chip, Codes<I, O>>>,
+    V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O>>>,
     Held<Y>: Borrow<Scale>,
     P: Place<I, O, R>,
 {

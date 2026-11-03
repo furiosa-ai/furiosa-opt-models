@@ -17,7 +17,7 @@ use crate::tensor::memory::Memory;
 use core::borrow::Borrow;
 
 mod rows;
-mod summed;
+pub(crate) mod summed;
 
 /// One contiguous feature vector.
 pub(crate) type Vector<W> = HbmTensor<bf16, Chip, m![W]>;
