@@ -23,7 +23,7 @@ use crate::modules::{multimodal, transformer};
 use crate::ops::attention::gqa::Cache;
 use crate::ops::embedding::Embedding;
 use crate::ops::index::scatter::Scatter;
-use crate::ops::linear::{Affine, Native};
+use crate::ops::linear::{Affine, Native, Parted};
 use crate::ops::normalization::{RmsNorm, UnitRmsNorm};
 use crate::ops::pointwise::activation::{NewGelu, Softcap};
 use crate::ops::pointwise::{Kept, add, multiply};
@@ -84,21 +84,17 @@ pub type Catalog<P, C, X> = Gemma4ForCausalLM<
 pub type LmHead<X = Hbm> = Greedy<
     Hidden,
     Vocabulary,
-    Affine<
-        <X as Memory>::Tensor<bf16, Chip, m![Vocabulary, Hidden]>,
-        <X as Memory>::Tensor<f32, Chip, m![Vocabulary]>,
-    >,
+    Affine<Tied<X>, <X as Memory>::Tensor<f32, Chip, m![Vocabulary]>>,
     Argmax<Vocabulary, Chip, <X as Memory>::Tensor<i32, Chip, m![Vocabulary]>>,
     Softcap<<X as Memory>::Tensor<f32, Chip, m![1 # 8]>>,
 >;
 
 /// The token table.
-type Table<X> = Embedding<
-    Vocabulary,
-    Hidden,
-    Chip,
-    Weight<m![Vocabulary, Hidden], Chip, <X as Memory>::Tensor<bf16, Chip, m![Vocabulary, Hidden]>>,
->;
+type Table<X> = Embedding<Vocabulary, Hidden, Chip, Weight<m![Vocabulary, Hidden], Chip, Tied<X>>>;
+
+/// The table the embedding and the head share, by parts as the head's passes land it: each pass
+/// reads one run a slice, and a token's row is read from every part.
+type Tied<X> = <X as Memory>::Tensor<bf16, Chip, Parted<Hidden, Vocabulary>>;
 
 /// Group `A`'s query, key and value heads: queries and keys normalized by learned gains, and the
 /// heads of value projection `V` by unit gain.
