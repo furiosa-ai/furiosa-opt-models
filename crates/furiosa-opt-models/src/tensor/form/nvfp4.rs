@@ -255,7 +255,7 @@ pub(crate) fn codes<C: M + 'static, S: M + 'static>(
 }
 
 /// The tensor scales `leaves` beside the context's name, absent ones reported together.
-fn scales<const N: usize>(
+pub(crate) fn scales<const N: usize>(
     from: &Checkpoint,
     context: &mut Context<'_>,
     leaves: [&str; N],

@@ -46,6 +46,7 @@ use core::task::Poll;
 use furiosa_opt_std::prelude::*;
 
 mod affine;
+mod nvfp4;
 
 /// The work between two attentions on one row tile: the end of `A`, then the start of `B`.
 pub struct Tokenwise<A, B>(pub A, pub B);

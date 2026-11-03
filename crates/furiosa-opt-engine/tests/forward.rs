@@ -38,6 +38,7 @@ forward! {
     qwen3_1_7b_forward: ("Qwen/Qwen3-1.7B", "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e");
     qwen3_4b_forward: ("Qwen/Qwen3-4B", "1cfa9a7208912126459214e8b04321603b3df60c");
     qwen3_8b_forward: ("Qwen/Qwen3-8B", "b968826d9c46dd6066d109eabc6255188de91218");
+    llama31_8b_nvfp4_forward: ("nvidia/Llama-3.1-8B-Instruct-NVFP4", "bdb54e24298451af785c0ac63c1b485e9b7400a2");
     llama3_8b_forward: ("NousResearch/Meta-Llama-3-8B", "315b20096dc791d381d514deb5f8bd9c8d6d3061");
     mistral_7b_v0_3_forward:
         ("mistralai/Mistral-7B-v0.3", "caa1feb0e54d415e2df31207e5f4e273e33509b1");
