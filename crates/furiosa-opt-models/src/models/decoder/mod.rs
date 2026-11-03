@@ -643,8 +643,14 @@ pub mod form {
     pub struct Affine;
 
     /// FP8 weights with one FP32 scale per output channel, as a load quantizes BF16 ones or a
-    /// checkpoint declares them; inputs stay BF16.
+    /// checkpoint declares them; inputs stay BF16. HBM holds the codes as the contraction's slices
+    /// hold them, a load lays them out so.
     pub struct ChannelScaled;
+
+    /// How HBM holds [`ChannelScaled`]'s codes.
+    pub mod channel {
+        pub use crate::ops::linear::fp8::Codes;
+    }
 
     /// FP8 weights and activations with static per-tensor scales.
     pub struct TensorScaled;
@@ -700,7 +706,12 @@ pub mod form {
         type Stored = f8e4m3;
 
         type Of<In: AxisName, Out: AxisName, D: Scalar, Chips: M + 'static, X: Memory, V> =
-            fp8::ChannelScaled<In, Out, V, X::Tensor<f32, Chip, m![Out, 1 # 8]>>;
+            fp8::ChannelScaled<
+                In,
+                Out,
+                X::Tensor<f8e4m3, Chip, channel::Codes<In, Out>>,
+                X::Tensor<f32, Chip, m![Out, 1 # 8]>,
+            >;
 
         type Query<Hidden: AxisName, Heads: AxisName, Head: AxisName, X: Memory> =
             query::matrix::ChannelScaled<Hidden, Heads, Head, X>;

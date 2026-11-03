@@ -21,7 +21,7 @@ pub type ChannelScaled<QWidth, Hidden, X = Hbm> = Weight<
     fp8::ChannelScaled<
         QWidth,
         Hidden,
-        <X as Memory>::Tensor<f8e4m3, Chip, m![Hidden, QWidth]>,
+        <X as Memory>::Tensor<f8e4m3, Chip, fp8::Codes<QWidth, Hidden>>,
         <X as Memory>::Tensor<f32, Chip, m![Hidden, 1 # 8]>,
     >,
 >;

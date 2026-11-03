@@ -125,14 +125,15 @@ fn held<Out: AxisName, In: AxisName, W, T>(
     >,
 ) -> (Vec<u8>, Vec<u8>)
 where
-    W: core::borrow::Borrow<HbmTensor<f8e4m3, m![1], m![Out, In]>>,
+    W: core::borrow::Borrow<HbmTensor<f8e4m3, m![1], form::channel::Codes<In, Out>>>,
     T: core::borrow::Borrow<HbmTensor<f32, m![1], m![Out, 1 # 8]>>,
 {
     let runtime = runtime();
     let codes = runtime
         .block_on(
             projection
-                .codes()
+                .weight
+                .borrow()
                 .to_host::<m![Out, In]>(&mut device.pdma)
                 .into_future(),
         )

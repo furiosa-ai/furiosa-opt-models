@@ -97,7 +97,8 @@ impl<const N: usize> Projections<'_, N> {
 
 /// Another handle to the same codes and scales, so a module's copy can outlive the borrow of the
 /// tree.
-impl<In, Out, E, S, B, C, Chips> Clone for BlockScaled<In, Out, E, S, B, C, Chips>
+impl<In, Out, E, S, B, C, Chips, K> Clone
+    for BlockScaled<In, Out, E, S, B, C, Chips, HbmTensor<E, Chips, K>>
 where
     In: AxisName,
     Out: AxisName,
@@ -106,6 +107,7 @@ where
     B: M,
     C: Copy,
     Chips: M,
+    K: M,
 {
     fn clone(&self) -> Self {
         // SAFETY: parameters are read-only; each alias names the same cells in the same order.

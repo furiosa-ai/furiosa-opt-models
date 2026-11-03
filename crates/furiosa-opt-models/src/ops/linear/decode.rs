@@ -11,8 +11,8 @@ use core::borrow::Borrow;
 use core::{fmt, marker::PhantomData};
 use furiosa_opt_std::prelude::*;
 
-use super::fp8::ChannelScaled;
-use super::kernel::{self, Contraction, Landing, Resident, Slabs, Tiling};
+use super::fp8::{ChannelScaled, Codes};
+use super::kernel::{self, Contraction, Landing, Resident, Run, Slabs, Tiling};
 use crate::{Begin, Op};
 
 /// A weight form a contraction reads as BF16 tiles: BF16 as stored, E4M3 restored by its row's FP32
@@ -29,6 +29,16 @@ pub(crate) trait Matrix<X: M = m![1]> {
         device: &mut Device,
         at: usize,
     ) -> DmTensor<bf16, X, T::Cluster, T::Slices, m![{ T::Rows }, { T::Inputs }]>;
+
+    /// Slab `at` of the contraction's tiling, in BF16: its tile, unless the weight holds its values
+    /// as the contraction's slices do.
+    fn slab(
+        &self,
+        device: &mut Device,
+        at: usize,
+    ) -> Resident<Self::In, Self::Out, Self::Stored, X> {
+        self.tile::<Contraction<Self::In, Self::Out, Self::Stored>>(device, at)
+    }
 }
 
 /// A borrowed weight form reads as the form it borrows.
@@ -43,6 +53,14 @@ impl<X: M, T: Matrix<X>> Matrix<X> for &T {
         at: usize,
     ) -> DmTensor<bf16, X, S::Cluster, S::Slices, m![{ S::Rows }, { S::Inputs }]> {
         (**self).tile::<S>(device, at)
+    }
+
+    fn slab(
+        &self,
+        device: &mut Device,
+        at: usize,
+    ) -> Resident<Self::In, Self::Out, Self::Stored, X> {
+        (**self).slab(device, at)
     }
 }
 
@@ -64,40 +82,64 @@ impl<In: AxisName, Out: AxisName, X: M> Matrix<X> for HbmTensor<bf16, X, m![Out,
 type Selected<R> = m![{ R } = 1 # ({ R })];
 type SelectedMut<R> = m![{ R } = 1 #{!} ({ R })];
 
-/// E4M3 coefficients in [output, input] order with one FP32 scale per output row.
+/// E4M3 codes held as the contraction's slices hold them, with one FP32 scale per output row.
 impl<In: AxisName, Out: AxisName, K, V> Matrix for ChannelScaled<In, Out, K, V>
 where
-    K: Borrow<HbmTensor<f8e4m3, Chip, m![Out, In]>>,
+    K: Borrow<HbmTensor<f8e4m3, Chip, Codes<In, Out>>>,
     V: Borrow<HbmTensor<f32, Chip, m![Out, 1 # 8]>>,
 {
     type In = In;
     type Out = Out;
     type Stored = f8e4m3;
 
-    /// `bf16(coefficient * scale)` with the FP32 scale of the coefficient's output row.
+    /// `bf16(coefficient * scale)` with the FP32 scale of the coefficient's output row; a tiling
+    /// other than the contraction's reads only codes held as a checkpoint stores them.
     fn tile<T: Tiling<In, Out>>(
         &self,
         device: &mut Device,
         at: usize,
     ) -> DmTensor<bf16, m![1], T::Cluster, T::Slices, m![{ T::Rows }, { T::Inputs }]> {
-        let coded: DmTensor<f8e4m3, m![1], T::Cluster, T::Slices, m![{ T::Rows }, { T::Inputs }]> =
-            T::to_dm(device, self.codes(), at);
-        let scales: DmTensor<f32, m![1], T::Cluster, T::Slices, m![{ T::Rows }, 1 # 8]> =
-            T::to_dm(device, self.scales(), at);
-        restore_rows::<T, In, Out, _, _>(
-            device,
-            |part| {
-                coded.view().tile::<T::Restorations, 1, m![
-                    { Selected<T::Restorations> }, { T::Restored }, { T::Inputs }
-                ]>(part)
-            },
-            |part| {
-                scales.view().tile::<T::Restorations, 1, m![
-                    { Selected<T::Restorations> }, { T::Restored }, 1 # 8
-                ]>(part)
-            },
-        )
+        const {
+            assert!(
+                <Run<In, Out, f8e4m3> as AxisName>::SIZE == In::SIZE,
+                "codes held as the contraction's tiles are read by its slabs alone"
+            )
+        };
+        // SAFETY: codes whose rows stay whole are held in the checkpoint's order.
+        let codes: HbmTensor<f8e4m3, Chip, m![Out, In]> =
+            unsafe { self.weight.borrow().view().alias() };
+        let coded = T::to_dm(device, &codes, at);
+        let scales = T::to_dm(device, self.scales(), at);
+        restored::<T, In, Out>(device, &coded, &scales)
     }
+
+    fn slab(&self, device: &mut Device, at: usize) -> Resident<In, Out, f8e4m3> {
+        let coded = Tiled::<In, Out>::slab(device, self.weight.borrow(), at);
+        let scales = Tiled::<In, Out>::to_dm(device, self.scales(), at);
+        restored::<Tiled<In, Out>, In, Out>(device, &coded, &scales)
+    }
+}
+
+/// A tile of tiling `T` as `bf16(code * scale)`, from its `coded` E4M3 codes and its rows' FP32
+/// `scales`.
+fn restored<T: Tiling<In, Out>, In: AxisName, Out: AxisName>(
+    device: &mut Device,
+    coded: &DmTensor<f8e4m3, m![1], T::Cluster, T::Slices, m![{ T::Rows }, { T::Inputs }]>,
+    scales: &DmTensor<f32, m![1], T::Cluster, T::Slices, m![{ T::Rows }, 1 # 8]>,
+) -> DmTensor<bf16, m![1], T::Cluster, T::Slices, m![{ T::Rows }, { T::Inputs }]> {
+    restore_rows::<T, In, Out, _, _>(
+        device,
+        |part| {
+            coded.view().tile::<T::Restorations, 1, m![
+                { Selected<T::Restorations> }, { T::Restored }, { T::Inputs }
+            ]>(part)
+        },
+        |part| {
+            scales.view().tile::<T::Restorations, 1, m![
+                { Selected<T::Restorations> }, { T::Restored }, 1 # 8
+            ]>(part)
+        },
+    )
 }
 
 /// A tile of tiling `T` as `bf16(code * scale)` with the FP32 scale of the code's output row, a
@@ -171,13 +213,13 @@ impl<In: AxisName, Out: AxisName> Default for Landed<In, Out> {
 /// into part of a slice's codes would hold every later command until the part before it lands.
 impl<In: AxisName, Out: AxisName, K, V> Op<&mut Landed<In, Out>> for ChannelScaled<In, Out, K, V>
 where
-    K: Borrow<HbmTensor<f8e4m3, Chip, m![Out, In]>>,
+    K: Borrow<HbmTensor<f8e4m3, Chip, Codes<In, Out>>>,
     V: Borrow<HbmTensor<f32, Chip, m![Out, 1 # 8]>>,
 {
     type Output = ();
 
     fn forward(&self, device: &mut Device, landed: &mut Landed<In, Out>) {
-        Tiled::<In, Out>::land(device, self.codes(), &mut landed.codes);
+        Tiled::<In, Out>::land(device, self.weight.borrow(), &mut landed.codes);
         Tiled::<In, Out>::land(device, self.scales(), &mut landed.scales);
     }
 }
@@ -185,7 +227,7 @@ where
 /// The weight begun: it lands in a place of its own.
 impl<In: AxisName, Out: AxisName, K, V> Op<Begin<()>> for ChannelScaled<In, Out, K, V>
 where
-    K: Borrow<HbmTensor<f8e4m3, Chip, m![Out, In]>>,
+    K: Borrow<HbmTensor<f8e4m3, Chip, Codes<In, Out>>>,
     V: Borrow<HbmTensor<f32, Chip, m![Out, 1 # 8]>>,
 {
     type Output = Landed<In, Out>;

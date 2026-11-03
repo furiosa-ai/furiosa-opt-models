@@ -1575,9 +1575,18 @@ async fn period_profile() {
 }
 
 /// A channel-scaled projection of `I` inputs into `O` outputs, the form of the catalog's
-/// attention projections.
+/// attention projections, its codes held as the form holds them.
 type Coded<I, O> = furiosa_opt_models::ops::linear::Affine<
-    furiosa_opt_models::tensor::form::BlockScaled<I, O, f8e4m3, f32, m![O, 1 # 8], (), Chip>,
+    furiosa_opt_models::tensor::form::BlockScaled<
+        I,
+        O,
+        f8e4m3,
+        f32,
+        m![O, 1 # 8],
+        (),
+        Chip,
+        HbmTensor<f8e4m3, Chip, furiosa_opt_models::models::decoder::form::channel::Codes<I, O>>,
+    >,
     (),
 >;
 

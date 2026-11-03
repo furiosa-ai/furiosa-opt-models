@@ -32,9 +32,12 @@ type Tile<I, O, const ROWS: usize, Chips> =
 pub(crate) type ChannelScaled<
     In,
     Out,
-    W = HbmTensor<f8e4m3, Chip, m![Out, In]>,
+    W = HbmTensor<f8e4m3, Chip, Codes<In, Out>>,
     T = HbmTensor<f32, Chip, m![Out, 1 # 8]>,
 > = BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], (), Chip, W, T>;
+
+/// How HBM holds a channel-scaled weight's codes: as the contraction's slices hold them.
+pub type Codes<In, Out> = super::kernel::Tiles<In, Out, f8e4m3>;
 
 /// Static per-tensor activation and weight scales: its checkpoint's `weight`, `weight_scale` and
 /// `input_scale`, the coefficients held as `W` and the scales as `S`, owned or borrowed.

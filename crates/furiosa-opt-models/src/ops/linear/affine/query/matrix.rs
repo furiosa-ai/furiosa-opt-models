@@ -41,7 +41,7 @@ pub type ChannelScaled<Hidden, Heads, Head, X = Hbm> = Weight<
         Hidden,
         Heads,
         Head,
-        <X as Memory>::Tensor<f8e4m3, Chip, m![{ Symbol<Width<Heads, Head>> }, Hidden]>,
+        <X as Memory>::Tensor<f8e4m3, Chip, fp8::Codes<Hidden, Width<Heads, Head>>>,
         <X as Memory>::Tensor<f32, Chip, m![{ Symbol<Width<Heads, Head>> }, 1 # 8]>,
     >,
 >;
@@ -52,7 +52,7 @@ type Coded<
     Hidden,
     Heads,
     Head,
-    W = HbmTensor<f8e4m3, Chip, m![{ Symbol<Width<Heads, Head>> }, Hidden]>,
+    W = HbmTensor<f8e4m3, Chip, fp8::Codes<Hidden, Width<Heads, Head>>>,
     T = HbmTensor<f32, Chip, m![{ Symbol<Width<Heads, Head>> }, 1 # 8]>,
 > = fp8::ChannelScaled<Hidden, Width<Heads, Head>, W, T>;
 

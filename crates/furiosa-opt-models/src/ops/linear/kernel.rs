@@ -3,6 +3,7 @@ use core::borrow::Borrow;
 use core::marker::PhantomData;
 
 use crate::Op;
+use crate::specialize::PACKET;
 use crate::specialize::contraction::{self, BAND, Routing};
 use furiosa_opt_std::prelude;
 use furiosa_opt_std::prelude::*;
@@ -638,14 +639,14 @@ pub(crate) trait Slabs<X: M = m![1]> {
     ) -> Resident<Self::In, Self::Out, Self::Stored, X>;
 }
 
-/// A matrix's slab is its tile of the contraction's tiling.
+/// A matrix's slab is its slab of the contraction's tiling.
 impl<X: M, W: Matrix<X>> Slabs<X> for W {
     type In = W::In;
     type Out = W::Out;
     type Stored = W::Stored;
 
     fn slab(&self, device: &mut Device, at: usize) -> Resident<W::In, W::Out, W::Stored, X> {
-        self.tile::<Contraction<W::In, W::Out, W::Stored>>(device, at)
+        Matrix::slab(self, device, at)
     }
 }
 
@@ -1045,6 +1046,33 @@ impl<In: AxisName, Out: AxisName, Code: Scalar> Tiling<In, Out> for Contraction<
     }
 }
 
+/// Inputs of a row a slice's tile holds together in HBM: a part's, unless a part is a whole number
+/// of packets, when the rows stay whole as a checkpoint stores them.
+#[derive(Clone, Debug)]
+pub struct Run<In, Out, Code>(PhantomData<(In, Out, Code)>);
+
+impl<In: AxisName, Out: AxisName, Code: Scalar> AxisName for Run<In, Out, Code> {
+    const NAME: Ident = Ident::new("Run");
+
+    const SIZE: usize = {
+        let c = Contraction::<In, Out, Code>::config();
+        if (c.chunk * Code::BITS / 8).is_multiple_of(PACKET) {
+            In::SIZE
+        } else {
+            c.chunk
+        }
+    };
+}
+
+/// A weight in HBM as the contraction's slices hold it, each slice's tile of a slab after the one
+/// before, so a transfer cuts it into whole packets; [`Run`] keeps whole rows that already are.
+pub(crate) type Tiles<In, Out, Code> = m![
+    Out / ({ Block<In, Out, Code> }),
+    In / ({ Symbol<Run<In, Out, Code>> }),
+    Out % ({ Block<In, Out, Code> }),
+    In % ({ Symbol<Run<In, Out, Code>> })
+];
+
 /// Every slab of a weight tensor on the contraction's slices, a slice keeping `E` of each slab,
 /// the slab outermost.
 pub(super) type Landing<D, In, Out, Code, E> = DmTensor<
@@ -1060,17 +1088,36 @@ pub(super) type Slab<In, Out, Code> =
     m![{ SlabIndex<In, Out, Code> } = 1 # ({ SlabIndex<In, Out, Code> })];
 
 impl<In: AxisName, Out: AxisName, Code: Scalar> Contraction<In, Out, Code> {
-    /// Every slab of an `[Out, K]` tensor into `landing` in one transfer, a slice keeping `E`, its
-    /// rows' share of `K`, of each.
-    pub(super) fn land<D: MaterializableScalar, K: M, E: M>(
+    /// Every slab of a tensor laid out as `S`, `[Out, K]` or [`Tiles`], into `landing` in one
+    /// transfer, a slice keeping `E`, its rows' share of `K`, of each.
+    pub(super) fn land<D: MaterializableScalar, S: M, E: M>(
         device: &mut Device,
-        tensor: &HbmTensor<D, m![1], m![Out, { K }]>,
+        tensor: &HbmTensor<D, m![1], S>,
         landing: &mut Landing<D, In, Out, Code, E>,
     ) {
         const { Self::TILED };
         tensor
             .view()
             .to_dm_view(&mut device.tdma, landing.view_mut());
+    }
+
+    /// Slab `at` of a tensor held as [`Tiles`], a slice keeping `E` of it.
+    pub(super) fn slab<D: MaterializableScalar, X: M, E: M>(
+        device: &mut Device,
+        tensor: &HbmTensor<D, X, Tiles<In, Out, Code>>,
+        at: usize,
+    ) -> DmTensor<D, X, Cluster<In, Out, Code>, ProjectionSlices<In, Out, Code>, E> {
+        const { Self::TILED };
+        tensor
+            .view()
+            .tile::<SlabIndex<In, Out, Code>, 1, m![
+                Out % (Out / ({ Passes<In, Out, Code> })) / ({ Block<In, Out, Code> })
+                    # (Out / ({ Block<In, Out, Code> })),
+                In / ({ Symbol<Run<In, Out, Code>> }),
+                Out % ({ Block<In, Out, Code> }),
+                In % ({ Symbol<Run<In, Out, Code>> })
+            ]>(at)
+            .to_dm(&mut device.tdma)
     }
 
     /// Slab `at` of a tensor landed whole.
