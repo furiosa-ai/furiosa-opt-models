@@ -6,6 +6,7 @@ use std::future::IntoFuture;
 use furiosa_opt_std::prelude::{HbmTensor, HostTensor, M, MaterializableScalar, Pair, m};
 use tokio::task;
 
+use super::tensor::laid_out;
 use super::{Checkpoint, Context, Load, LoadError};
 
 /// The leaf at the current name, in HBM; a leaf of a tie target is split into two owners of its
@@ -118,12 +119,17 @@ impl<'t, D: MaterializableScalar, C: M + 'static, S: M + 'static, E: M>
         context: &mut Context<'_>,
         (into, host): (&'t mut HbmTensor<D, C, S>, HostTensor<D, E>),
     ) -> Result<Self, LoadError> {
-        let path = context.path();
-        let device = context.device();
-        let write = host.to_hbm::<C, S>(&mut device.pdma).output(&mut *into);
-        futures_executor::block_on(task::unconstrained(write.into_future()))
-            .map_err(|source| LoadError::Device { path, source })?;
-        Ok(into)
+        match laid_out::<D, E, m![{ C }, { S }]>(&host) {
+            Some(host) => <&mut HbmTensor<D, C, S> as Load<_>>::load(context, (into, host)),
+            None => {
+                let path = context.path();
+                let device = context.device();
+                let write = host.to_hbm::<C, S>(&mut device.pdma).output(&mut *into);
+                futures_executor::block_on(task::unconstrained(write.into_future()))
+                    .map_err(|source| LoadError::Device { path, source })?;
+                Ok(into)
+            }
+        }
     }
 }
 

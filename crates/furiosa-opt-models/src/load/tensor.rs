@@ -8,7 +8,8 @@
 //!   `m![W % 1024, In]`); one naming none holds every value on every chip, read as one copy.
 
 use furiosa_opt_std::prelude::{
-    AxisTerm, HostTensor, Index, M, Mapping, MappingExt, MaterializableScalar,
+    AxisTerm, HostTensor, Index, M, Mapping, MappingExt, MaterializableScalar, SequencerMode,
+    sequence,
 };
 use furiosa_opt_std::runtime::HostBuffer;
 use std::borrow::Cow;
@@ -18,6 +19,76 @@ use safetensors::tensor::TensorView;
 
 use super::{Checkpoint, Context, LoadError};
 use crate::tensor::memory::dtype;
+
+/// `host` laid out as `To` a contiguous run at a time, or none when its layout is `To`'s or no walk
+/// of whole-byte runs reads each cell once (a broadcast, inner padding): the upload lays those out.
+pub(crate) fn laid_out<D: MaterializableScalar, E: M, To: M>(
+    host: &HostTensor<D, E>,
+) -> Option<HostTensor<D, To>> {
+    let (from, to) = (E::to_value(), To::to_value());
+    if from.normalize() == to.normalize() {
+        return None;
+    }
+    let (live, block, padded) = unpadded(to);
+    if live.size() != from.size() {
+        return None;
+    }
+    let walk = sequence(&[&from], &[&live], SequencerMode::Read)
+        .ok()?
+        .remove(0);
+    let bytes = |cells: usize| {
+        (cells * D::BITS)
+            .is_multiple_of(8)
+            .then_some(cells * D::BITS / 8)
+    };
+    // Innermost first: the run, then each outer step and its stride in the source; a run spanning
+    // several blocks of `To`'s innermost factor goes a block at a time.
+    let mut wheels = walk
+        .0
+        .iter()
+        .map(|(_, entry)| (entry.mapping.size(), entry.memory_stride));
+    let mut steps = match wheels.next()? {
+        (cells, 1) if block.is_multiple_of(cells) => vec![(1, cells)],
+        (cells, 1) if cells.is_multiple_of(block) => vec![(cells / block, block), (1, block)],
+        _ => return None,
+    };
+    let run = steps.pop()?.1;
+    steps.extend(wheels);
+    let steps: Vec<(usize, usize)> = (steps.into_iter())
+        .map(|(size, stride)| Some((size, bytes(stride).filter(|&stride| stride > 0)?)))
+        .collect::<Option<_>>()?;
+    let (run, block, padded) = (bytes(run)?, bytes(block)?, bytes(padded)?);
+    let source: Vec<u8> = host.clone().into_buffer().into();
+    let mut image = vec![0; bytes(To::SIZE)?];
+    for at in 0..bytes(live.size())? / run {
+        let (offset, _) = (steps.iter()).fold((0, at), |(offset, rest), &(size, stride)| {
+            (offset + rest % size * stride, rest / size)
+        });
+        let cell = at * run / block * padded + at * run % block;
+        image[cell..cell + run].copy_from_slice(&source[offset..offset + run]);
+    }
+    HostTensor::try_from(HostBuffer::from_vec(image)).ok()
+}
+
+/// `mapping` without the padding of its innermost factor, with that factor's live and padded
+/// cells: equal when it is not padded.
+fn unpadded(mapping: Mapping) -> (Mapping, usize, usize) {
+    match mapping {
+        Mapping::Pair { left, right } => {
+            let (right, live, padded) = unpadded((*right).clone());
+            ((*left).clone().pair(right), live, padded)
+        }
+        Mapping::Padding { inner, padding, .. } => {
+            let inner = (*inner).clone();
+            let live = inner.size();
+            (inner, live, padding)
+        }
+        other => {
+            let size = other.size();
+            (other, size, size)
+        }
+    }
+}
 
 impl Checkpoint {
     /// The bytes of the float tensor `view` of `name` as BF16: its own, or its FP32 values rounded
@@ -277,6 +348,47 @@ mod tests {
             matches!(&part, Some(LoadError::Unsupported { name, reason })
                 if name == "w" && reason == "the leaf holds part of the axis I"),
             "{part:?}"
+        );
+    }
+
+    /// A layout whose cells a walk of whole-byte runs reads gets each cell where it places it, for
+    /// FP32, E2M1 codes two a byte and a padded innermost factor; runs splitting a byte and inner
+    /// padding are declined.
+    #[test]
+    fn lays_out_whole_runs_or_declines() {
+        type Grouped = m![O / 2, I / 2, O % 2, I % 2];
+        let at = |o: usize, i: usize| ((o / 2 * 2 + i / 2) * 2 + o % 2) * 2 + i % 2;
+        let values: Vec<f32> = (0..8).map(|value| value as f32).collect();
+        let grouped = laid_out::<f32, m![O, I], Grouped>(&HostTensor::from_vec(values.clone()));
+        let mut expected = vec![0.0; 8];
+        for (o, i) in (0..2).flat_map(|o| (0..4).map(move |i| (o, i))) {
+            expected[at(o, i)] = values[o * 4 + i];
+        }
+        assert_eq!(grouped.unwrap().into_vec(), expected);
+        let codes: Vec<f4e2m1> = (0..8).map(|code| f4e2m1::from_bits(code as u8)).collect();
+        let grouped = laid_out::<f4e2m1, m![O, I], Grouped>(&HostTensor::from_vec(codes.clone()));
+        let found: Vec<u8> = grouped
+            .unwrap()
+            .into_vec()
+            .iter()
+            .map(|code| code.to_bits())
+            .collect();
+        let mut expected = vec![0; 8];
+        for (o, i) in (0..2).flat_map(|o| (0..4).map(move |i| (o, i))) {
+            expected[at(o, i)] = codes[o * 4 + i].to_bits();
+        }
+        assert_eq!(found, expected);
+        let split = laid_out::<f4e2m1, m![O, I], m![I, O]>(&HostTensor::from_vec(codes));
+        assert!(split.is_none(), "a run of one code splits a byte");
+        let padded = laid_out::<f32, m![O, I], m![O, I # 8]>(&HostTensor::from_vec(values.clone()));
+        let rows = values
+            .chunks(4)
+            .flat_map(|row| row.iter().copied().chain([0.0; 4]));
+        assert_eq!(padded.unwrap().into_vec(), rows.collect::<Vec<_>>());
+        let inner = laid_out::<f32, m![O, I], m![O # 4, I]>(&HostTensor::from_vec(values));
+        assert!(
+            inner.is_none(),
+            "padding outside the innermost factor is the upload's"
         );
     }
 
