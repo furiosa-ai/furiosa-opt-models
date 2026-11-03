@@ -789,10 +789,12 @@ pub(crate) const fn tiling(
                 // A BF16 slab is staged as stored, beside the replicated rows the listed tilings
                 // were timed against; one restored from codes must hold, beside rows on the ring.
                 if bits >= 8 * BF16 {
+                    let block = carved(input, output, (chunk, block, passes), bits);
                     return (chunk, block, passes, routing);
                 }
                 let (block, passes) = held(input, output, (chunk, block, passes));
                 let routing = if input <= RING { Ring } else { routing };
+                let block = carved(input, output, (chunk, block, passes), bits);
                 return (chunk, block, passes, routing);
             }
             passes += 1;
@@ -883,6 +885,62 @@ const fn held(
     // No pass count holds a band beside a restoration, so the budget cannot choose one; fewer
     // staged rows may still fit the derived tiling.
     (block, passes)
+}
+
+/// The block of the derived `(chunk, block, passes)`, the outputs' odd factor carved as the top
+/// digit where that leaves whole feature chunks over the same slices, at most one in sixteen idle,
+/// and a slab of `bits`-bit codes still restores beside its rows: its sums reach the slices whole.
+const fn carved(
+    input: usize,
+    output: usize,
+    (chunk, block, passes): (usize, usize, usize),
+    bits: usize,
+) -> usize {
+    let feature = super::normalization::chunk(output);
+    if whole(block, feature) {
+        return block;
+    }
+    let (slices, _) = occupancy(input, output, (chunk, block, passes));
+    let half = output / (2 * passes);
+    let mut best = (0, block);
+    let mut blocks = 1;
+    while blocks <= super::SLICES {
+        let mut top = 1;
+        while top <= if passes == 1 { super::SLICES - 1 } else { 1 } {
+            if half.is_multiple_of(blocks * top) {
+                let carved = half / (blocks * top);
+                let (filled, active) = occupancy(input, output, (chunk, carved, passes));
+                if whole(carved, feature)
+                    && legal(input, output, (chunk, carved, passes))
+                    && filled == slices
+                    && 16 * active >= 15 * slices
+                    && active > best.0
+                    && (bits >= 8 * BF16 || holds(chunk, carved, passes))
+                {
+                    best = (active, carved);
+                }
+            }
+            top += 2;
+        }
+        blocks *= 2;
+    }
+    best.1
+}
+
+/// Whether `block` outputs are a whole number of feature chunks of `feature` outputs or divide one.
+const fn whole(block: usize, feature: usize) -> bool {
+    block.is_multiple_of(feature) || feature.is_multiple_of(block)
+}
+
+/// The slices `(chunk, block, passes)` takes, its top digit padded, and the active ones.
+const fn occupancy(
+    input: usize,
+    output: usize,
+    (chunk, block, passes): (usize, usize, usize),
+) -> (usize, usize) {
+    let top = odd(output / (2 * passes * block));
+    let blocks = output / (2 * passes * block * top) * (input / chunk);
+    (blocks * top.next_power_of_two(), blocks * top)
 }
 
 /// Whether a slice holds `(chunk, block, passes)` while it restores a slab beside a band of staged
