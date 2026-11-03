@@ -642,7 +642,7 @@ where
                 &mut *device,
                 env,
                 &mut (),
-                (frequencies, &positions),
+                (frequencies, &positions, tiles),
             ),
             write: table::writes::<Rows, _>(
                 device,
