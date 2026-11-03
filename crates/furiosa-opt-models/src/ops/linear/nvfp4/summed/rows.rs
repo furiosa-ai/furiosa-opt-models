@@ -9,7 +9,8 @@
 //!   pass there; a pass covers the most rows whose FP32 block scales fit the vector registers. The
 //!   next group fills the other half under the passes when its switch takes one part a pass.
 //! - A pass's vector engine takes each block's sums four lanes a step, so the last group, when its
-//!   live rows lie in its first four lanes, fills and folds those four alone: one step a block.
+//!   live rows lie in its first four lanes, switches, fills and folds those four alone: one step a
+//!   block.
 //! - The projected rows end where the contract places them: in the output's feature slices once
 //!   the last pass ends, or [`Kept`] where the passes summed them.
 //! - Rows another summed projection kept land in both clusters as they lie, an owner's run of
@@ -228,8 +229,8 @@ impl<I: AxisName, O: AxisName> Landed<I, O> {
             // own loads, beside its contraction; the next group's lanes fill the other half of the
             // TRF under the last pass. The last group's passes run alone.
             let mut staged = X::staged();
-            rows.switch(device, first, &mut staged);
             for _ in 0..whole.min(1) {
+                rows.switch(device, first, &mut staged);
                 let mut lanes = rows.fill(device, first, &staged);
                 for next in 1..whole {
                     for tile in 0..<Tiles<I, O> as M>::SIZE {
@@ -260,6 +261,13 @@ impl<I: AxisName, O: AxisName> Landed<I, O> {
                 }
             }
             for _ in 0..front {
+                // Behind whole groups its parts came under their passes; alone, it switches its
+                // four lanes.
+                if const { X::PARTS > 0 } {
+                    for _ in 0..1 - whole.min(1) {
+                        rows.switch_front(device, last, &mut staged);
+                    }
+                }
                 let lanes = rows.front(device, last, &staged);
                 for tile in 0..<Tiles<I, O> as M>::SIZE {
                     self.pass::<R, Trim>(device, (&lanes, operands), (last, tile), &mut projected);
@@ -282,7 +290,7 @@ impl<I: AxisName, O: AxisName> Landed<I, O> {
             }
             for _ in 0..front {
                 let mut staged = X::staged();
-                rows.switch(device, last, &mut staged);
+                rows.switch_front(device, last, &mut staged);
                 let lanes = rows.front(device, last, &staged);
                 for tile in 0..<Tiles<I, O> as M>::SIZE {
                     self.pass::<R, Trim>(device, (&lanes, operands), (last, tile), &mut projected);
@@ -693,6 +701,8 @@ trait Stage<I: AxisName, O: AxisName, R: AxisName> {
 
     fn staged() -> Staging<I, O, R>;
     fn switch(&self, device: &mut Device, group: usize, staged: &mut Staging<I, O, R>);
+    /// The first four lanes of `group` alone, as `switch` switches every lane.
+    fn switch_front(&self, device: &mut Device, group: usize, staged: &mut Staging<I, O, R>);
     fn part(&self, device: &mut Device, at: (usize, usize), staged: &mut Staging<I, O, R>);
     fn fill(
         &self,
@@ -745,6 +755,38 @@ impl<I: AxisName, O: AxisName, R: AxisName> Stage<I, O, R> for Spread<I, R> {
                 ], m![I % 16]>()
                 .commit_trim::<m![I % 16]>()
                 .commit_view(staged.view_mut());
+        }
+    }
+
+    fn switch_front(&self, device: &mut Device, group: usize, staged: &mut Staging<I, O, R>) {
+        type Feature<I> = Symbol<normalization::Chunk<I>>;
+        type Group<I, R> = Layout<R>::Elements<m![I % ({ Feature<I> })]>;
+        if const { I::SIZE > 16 * 256 } {
+            // SAFETY: as in `switch`.
+            let input = unsafe {
+                Layout::<R>::group(self.view(), group)
+                    .reshape::<Chip, Cluster<O>, FeatureSlices<I>, Group<I, R>>()
+            };
+            device
+                .sub
+                .begin(input.tile::<m![{ Lane<R> } / 4], 1, m![
+                    { Layout<R>::Selected },
+                    { Lane<R> } % 4 # ({ Symbol<Lanes<R>> }),
+                    I % ({ Feature<I> })
+                ]>(0))
+                .fetch::<m![{ Front<R> }, I % ({ Feature<I> }) / 16], m![I % 16]>()
+                .switch::<Owners<I, O>, m![
+                    { Front<R> },
+                    I % ({ Feature<I> }) / 16,
+                    I % ({ Width<I> }) / ({ Feature<I> })
+                ]>(SwitchConfig::CustomBroadcast { ring_size: 256 })
+                .collect::<m![
+                    { Front<R> },
+                    I % ({ Feature<I> }) / 16,
+                    I % ({ Width<I> }) / ({ Feature<I> })
+                ], m![I % 16]>()
+                .commit_trim::<m![I % 16]>()
+                .commit_view(staged_front(staged));
         }
     }
 
@@ -853,6 +895,39 @@ impl<H: AxisName, I: AxisName, O: AxisName, R: AxisName> Stage<I, O, R> for Both
             .commit_view(staged.view_mut());
     }
 
+    fn switch_front(&self, device: &mut Device, group: usize, staged: &mut Staging<I, O, R>) {
+        type Run<H, I> = Symbol<Piece<H, I>>;
+        type Group<H, I, R> = Layout<R>::Elements<m![I % ({ Owner<H, I> })]>;
+        const { assert!(fits_both::<H, I>()) };
+        // SAFETY: as in `switch`.
+        let input = unsafe {
+            Layout::<R>::group(self.view(), group)
+                .reshape::<Chip, Cluster<O>, Runs<H, I>, Group<H, I, R>>()
+        };
+        device
+            .sub
+            .begin(input.tile::<m![{ Lane<R> } / 4], 1, m![
+                { Layout<R>::Selected },
+                { Lane<R> } % 4 # ({ Symbol<Lanes<R>> }),
+                I % ({ Owner<H, I> })
+            ]>(0))
+            .fetch::<m![{ Front<R> }, I % ({ Owner<H, I> }) / ({ Run<H, I> })], m![
+                I % ({ Run<H, I> })
+            ]>()
+            .switch::<Owners<I, O>, m![
+                { Front<R> },
+                I % ({ Owner<H, I> }) / ({ Run<H, I> }),
+                I % ({ Width<I> }) / ({ Owner<H, I> })
+            ]>(SwitchConfig::CustomBroadcast { ring_size: 256 })
+            .collect::<m![
+                { Front<R> },
+                I % ({ Owner<H, I> }) / ({ Run<H, I> }),
+                I % ({ Width<I> }) / ({ Owner<H, I> })
+            ], m![I % ({ Run<H, I> }) # 16]>()
+            .commit_trim::<m![I % ({ Run<H, I> })]>()
+            .commit_view(staged_front(staged));
+    }
+
     fn part(
         &self,
         device: &mut Device,
@@ -920,6 +995,20 @@ fn filled<I: AxisName, O: AxisName, R: AxisName>(
         .fetch::<m![{ Lane<R> }, { Part<I> } / 16], m![I % 16]>()
         .collect::<m![{ Lane<R> }, { Part<I> } / 16], m![I % 16]>()
         .to_trf()
+}
+
+/// The first four lanes of a lane group's staging, where its front switches and fills.
+fn staged_front<I: AxisName, O: AxisName, R: AxisName>(
+    staged: &mut Staging<I, O, R>,
+) -> DmTensorViewMut<
+    '_,
+    bf16,
+    Chip,
+    Cluster<O>,
+    Owners<I, O>,
+    m![{ Lane<R> } % 4 #{!} ({ Symbol<Lanes<R>> }), { Part<I> }],
+> {
+    staged.view_mut().tile::<m![{ Lane<R> } / 4], 1, _>(0)
 }
 
 /// A lane group's first four staged rows into the TRF, in input order.
