@@ -7,7 +7,8 @@
 //!   scales to FP32 once, then runs every lane group.
 //! - A lane group fills half of the tensor registers through the switch ring once and meets every
 //!   pass there; a pass covers the most rows whose FP32 block scales fit the vector registers. The
-//!   next group fills the other half under the passes when its switch takes one part a pass.
+//!   next group fills the other half under the passes when its switch takes at least one part a
+//!   pass, the parts past the passes after the last.
 //! - A pass's vector engine takes each block's sums four lanes a step, so the last group, when its
 //!   live rows lie in its first four lanes, switches, fills and folds those four alone: one step a
 //!   block.
@@ -251,16 +252,17 @@ impl<I: AxisName, O: AxisName> Landed<I, O> {
         let whole = count - front;
         let last = first + count.max(1) - 1;
         let operands = (&scales, &global);
-        if const { X::PARTS == 0 || X::PARTS == <Tiles<I, O> as M>::SIZE } {
-            // Each pass of a group before the last switches one part of the next group after its
-            // own loads, beside its contraction; the next group's lanes fill the other half of the
-            // TRF under the last pass. The last group's passes run alone.
+        let tiles = <Tiles<I, O> as M>::SIZE;
+        if const { X::PARTS == 0 || X::PARTS >= <Tiles<I, O> as M>::SIZE } {
+            // Each pass of a group before the last switches a part of the next group beside its
+            // contraction, the parts past the passes after the last; the next group's lanes then
+            // fill the other half of the TRF. The last group's passes run alone.
             let mut staged = X::staged();
             for _ in 0..whole.min(1) {
                 rows.switch(device, first, &mut staged);
                 let mut lanes = rows.fill(device, first, &staged);
                 for next in 1..whole {
-                    for tile in 0..<Tiles<I, O> as M>::SIZE {
+                    for tile in 0..tiles {
                         self.pass::<R, Split>(
                             device,
                             (&lanes, operands),
@@ -271,9 +273,14 @@ impl<I: AxisName, O: AxisName> Landed<I, O> {
                             rows.part(device, (first + next, tile), &mut staged);
                         }
                     }
+                    if const { X::PARTS > <Tiles<I, O> as M>::SIZE } {
+                        for part in 0..X::PARTS - tiles {
+                            rows.part(device, (first + next, tiles + part), &mut staged);
+                        }
+                    }
                     lanes = rows.fill(device, first + next, &staged);
                 }
-                for tile in 0..<Tiles<I, O> as M>::SIZE {
+                for tile in 0..tiles {
                     self.pass::<R, Split>(
                         device,
                         (&lanes, operands),
@@ -283,6 +290,13 @@ impl<I: AxisName, O: AxisName> Landed<I, O> {
                     if const { X::PARTS > 0 } {
                         for _ in 0..front {
                             rows.part(device, (last, tile), &mut staged);
+                        }
+                    }
+                }
+                if const { X::PARTS > <Tiles<I, O> as M>::SIZE } {
+                    for _ in 0..front {
+                        for part in 0..X::PARTS - tiles {
+                            rows.part(device, (last, tiles + part), &mut staged);
                         }
                     }
                 }
@@ -296,7 +310,7 @@ impl<I: AxisName, O: AxisName> Landed<I, O> {
                     }
                 }
                 let lanes = rows.front(device, last, &staged);
-                for tile in 0..<Tiles<I, O> as M>::SIZE {
+                for tile in 0..tiles {
                     self.pass::<R, Trim>(device, (&lanes, operands), (last, tile), &mut projected);
                 }
             }
@@ -306,7 +320,7 @@ impl<I: AxisName, O: AxisName> Landed<I, O> {
                 let mut staged = X::staged();
                 rows.switch(device, group, &mut staged);
                 let lanes = rows.fill(device, group, &staged);
-                for tile in 0..<Tiles<I, O> as M>::SIZE {
+                for tile in 0..tiles {
                     self.pass::<R, Split>(
                         device,
                         (&lanes, operands),
@@ -319,7 +333,7 @@ impl<I: AxisName, O: AxisName> Landed<I, O> {
                 let mut staged = X::staged();
                 rows.switch_front(device, last, &mut staged);
                 let lanes = rows.front(device, last, &staged);
-                for tile in 0..<Tiles<I, O> as M>::SIZE {
+                for tile in 0..tiles {
                     self.pass::<R, Trim>(device, (&lanes, operands), (last, tile), &mut projected);
                 }
             }
