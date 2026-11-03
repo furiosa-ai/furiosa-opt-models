@@ -29,9 +29,10 @@ use crate::modules::transformer::SandwichNorm;
 use crate::ops::attention::Heads;
 use crate::ops::attention::gqa::{Attended, Pages};
 use crate::ops::index::scatter::Store;
-use crate::ops::normalization::{RmsNorm, RowMajor, Spread};
-use crate::tensor::axis::Single;
+use crate::ops::normalization::{self, RmsNorm, RowMajor, Spread};
+use crate::tensor::axis::{Lanes, Single};
 use crate::tensor::live::Live;
+use crate::tensor::mapping::Rows as Layout;
 use crate::tensor::parallel::{Chip, Parallelism};
 use crate::{Begin, Fork, Module, Sequential, Then};
 use core::marker::PhantomData;
@@ -244,8 +245,25 @@ where
     type Landed = (OL, Live<AttendedHeads<A, R>, R>);
     type Staged = Staged<DR, Live<Self::Rows, R>>;
 
-    fn fill(&self, device: &mut Device, home: &Self::Home, _: Live<(), R>) -> Self::Rows {
-        home.to_dm(&mut device.tdma)
+    fn fill(&self, device: &mut Device, home: &Self::Home, tile: Live<(), R>) -> Self::Rows {
+        type Feature<W> = Symbol<normalization::Chunk<W>>;
+        let mut rows = Self::Rows::new();
+        // One transfer, as its setup costs about as much as all its rows: the live rows' lane group,
+        // or the envelope when they span groups.
+        let (first, count) = tile.groups::<Lanes<R>>();
+        if count > 1 {
+            home.view().to_dm_view(&mut device.tdma, rows.view_mut());
+        } else {
+            (home.view())
+                .tile::<Layout<R>::Groups, 1, Layout<R>::Elements<m![Hidden]>>(first)
+                .to_dm_view(
+                    &mut device.tdma,
+                    (rows.view_mut()).tile::<Layout<R>::Groups, 1, Layout<R>::GroupMut<
+                        m![Hidden % ({ Feature<Hidden> })],
+                    >>(first),
+                );
+        }
+        rows
     }
 
     fn spill(&self, device: &mut Device, home: &mut Self::Home, rows: Live<&Self::Rows, R>) {
