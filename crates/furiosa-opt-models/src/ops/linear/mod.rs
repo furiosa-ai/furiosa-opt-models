@@ -6,6 +6,7 @@ pub(crate) use decode::Matrix;
 pub use experts::Experts;
 pub(crate) use kernel::Slabs;
 pub(crate) use rows::Projection;
+pub use stream::{Contraction, Pass, Table};
 
 use core::borrow::Borrow;
 use core::marker::PhantomData;

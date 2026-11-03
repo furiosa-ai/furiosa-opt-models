@@ -23,7 +23,7 @@ use crate::modules::language::{Backbone, Cap, Greedy, Normalized};
 use crate::ops::attention::gqa::Pages;
 use crate::ops::embedding::Ids;
 use crate::ops::index::gather::Gather;
-use crate::ops::linear::Affine;
+use crate::ops::linear::{self, Affine};
 use crate::ops::normalization::{RowMajor, Spread};
 use crate::ops::reduction::Argmax;
 use crate::ops::rotary::Rotation;
@@ -359,7 +359,7 @@ where
     B: decoder::Attention<Rotated: AxisName>,
     R: AxisName,
     V: AxisName,
-    W: Borrow<HbmTensor<bf16, Chip, m![V, Hidden]>>,
+    W: linear::Table<Chip, Hidden = Hidden, Vocabulary = V>,
     Bias: Borrow<HbmTensor<f32, Chip, m![V]>>,
     I: Borrow<HbmTensor<i32, Chip, m![V]>>,
     C: Cap<Hidden, V>,
