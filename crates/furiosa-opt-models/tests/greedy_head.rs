@@ -8,7 +8,7 @@ use furiosa_opt_models::Module;
 use furiosa_opt_models::load::{Checkpoint, Context, Load};
 use furiosa_opt_models::modules::language::Greedy;
 use furiosa_opt_models::ops::index::gather;
-use furiosa_opt_models::ops::linear::{Affine, Biased};
+use furiosa_opt_models::ops::linear::{Affine, Biased, Parted};
 use furiosa_opt_models::ops::pointwise::activation::Softcap;
 use furiosa_opt_models::ops::reduction::Argmax;
 use furiosa_opt_models::tensor::axis::{Eight, Rows};
@@ -43,6 +43,26 @@ fn selected<V: AxisName, R: AxisName, C>(
 where
     C: DeviceSend,
     Greedy<Hidden, V, Biased<Hidden, V>, Argmax<V>, C>: Selects<R>,
+{
+    head.forward(device, (), &mut (), input)
+}
+
+/// A greedy head over a table that lies by parts, as the head's passes land it.
+type ByParts<V> = Greedy<
+    Hidden,
+    V,
+    Affine<HbmTensor<bf16, Chip, Parted<Hidden, V>>, HbmTensor<f32, Chip, m![V]>>,
+    Argmax<V>,
+>;
+
+#[device(chip = 1)]
+fn selected_by_parts<V: AxisName, R: AxisName>(
+    device: &mut Device,
+    head: &ByParts<V>,
+    input: &mut gather::Rows<'_, bf16, Hidden, R>,
+) -> HbmTensor<i32, Chip, m![R]>
+where
+    ByParts<V>: Selects<R>,
 {
     head.forward(device, (), &mut (), input)
 }
@@ -94,15 +114,8 @@ async fn greedy<V: AxisName, C>(
     Greedy::new(Affine::new(weight, mask), argmax.unwrap(), cap)
 }
 
-async fn tokens<V: AxisName, R: AxisName, C>(
-    device: &mut Device,
-    head: &Greedy<Hidden, V, Biased<Hidden, V>, Argmax<V>, C>,
-    input: Vec<bf16>,
-) -> Vec<usize>
-where
-    C: DeviceSend,
-    Greedy<Hidden, V, Biased<Hidden, V>, Argmax<V>, C>: Selects<R>,
-{
+/// Each input row in HBM of its own.
+async fn storage(device: &mut Device, input: Vec<bf16>) -> gather::RowStorage<Hidden, bf16> {
     let mut rows = Vec::new();
     for row in input.chunks_exact(Hidden::SIZE) {
         let row = HostTensor::<bf16, m![Hidden]>::from_vec(row.to_vec());
@@ -112,7 +125,19 @@ where
                 .unwrap(),
         );
     }
-    let source: gather::RowStorage<Hidden, bf16> = Slice::from(rows);
+    Slice::from(rows)
+}
+
+async fn tokens<V: AxisName, R: AxisName, C>(
+    device: &mut Device,
+    head: &Greedy<Hidden, V, Biased<Hidden, V>, Argmax<V>, C>,
+    input: Vec<bf16>,
+) -> Vec<usize>
+where
+    C: DeviceSend,
+    Greedy<Hidden, V, Biased<Hidden, V>, Argmax<V>, C>: Selects<R>,
+{
+    let source = storage(device, input).await;
     let mut input = gather::Rows::<bf16, Hidden, R>::new(device, &source)
         .await
         .unwrap();
@@ -137,34 +162,78 @@ async fn selects_first_maximum() {
     selects_first_maximum_of::<Compiled, Rows<16>>(128_256).await;
 }
 
+/// The logits of each case's tokens and the token it selects, of `live` checkpoint tokens
+/// compiled on `V`: ties within and across passes and clusters, padded rows above the live ones.
+fn cases<V: AxisName>(live: usize) -> [(Vec<(usize, f32)>, usize); 9] {
+    [
+        (vec![(42, 5.0)], 42),
+        (vec![(7, 5.0), (V::SIZE / 3 + 19, 5.0)], 7),
+        (
+            vec![(live - 1, 5.0), (live, 10.0), (V::SIZE - 1, 10.0)],
+            live - 1,
+        ),
+        (vec![(0, 5.0f32.next_down()), (live - 1, 5.0)], live - 1),
+        (vec![(2 * V::SIZE / 3 + 5, 3.0)], 2 * V::SIZE / 3 + 5),
+        (vec![(1234, -0.5), (1233, -0.5)], 1233),
+        (
+            vec![(V::SIZE / 3 - 1, 2.0), (V::SIZE / 3, 2.0)],
+            V::SIZE / 3 - 1,
+        ),
+        (vec![(99_999, 7.0)], 99_999),
+        (vec![(live - 1, 3.0), (live, 3.0)], live - 1),
+    ]
+}
+
 /// Row `r` runs case `r % 9` on its own pair of input columns, of `live` checkpoint tokens
 /// compiled on `V`.
 async fn selects_first_maximum_of<V: AxisName, R: AxisName>(live: usize) {
-    let cases: [(&[(usize, f32)], usize); 9] = [
-        (&[(42, 5.0)], 42),
-        (&[(7, 5.0), (V::SIZE / 3 + 19, 5.0)], 7),
-        (
-            &[(live - 1, 5.0), (live, 10.0), (V::SIZE - 1, 10.0)],
-            live - 1,
-        ),
-        (&[(0, 5.0f32.next_down()), (live - 1, 5.0)], live - 1),
-        (&[(2 * V::SIZE / 3 + 5, 3.0)], 2 * V::SIZE / 3 + 5),
-        (&[(1234, -0.5), (1233, -0.5)], 1233),
-        (
-            &[(V::SIZE / 3 - 1, 2.0), (V::SIZE / 3, 2.0)],
-            V::SIZE / 3 - 1,
-        ),
-        (&[(99_999, 7.0)], 99_999),
-        (&[(live - 1, 3.0), (live, 3.0)], live - 1),
-    ];
-    let case = |row: usize| cases[row % cases.len()];
-    let (weight, input) = projection::<V, R>(|row| case(row).0);
+    let cases = cases::<V>(live);
+    let case = |row: usize| &cases[row % cases.len()];
+    let (weight, input) = projection::<V, R>(|row| &case(row).0);
     let _lease = DEVICE.lock().await;
     let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
     let head = greedy::<V, ()>(&mut device, weight, live, ()).await;
     let tokens = tokens::<V, R, ()>(&mut device, &head, input).await;
     for (row, &token) in tokens.iter().enumerate() {
         assert_eq!(token, case(row).1, "row {row}");
+    }
+}
+
+/// A head over a table that lies by parts, as its passes land it, selects each row's first
+/// maximum as the row-major table's head does, across ties and pass boundaries, never a padded
+/// row.
+#[tokio::test(flavor = "current_thread")]
+async fn selects_first_maximum_over_a_parted_table() {
+    type V = Padded;
+    type R = Rows<32>;
+    let cases = cases::<V>(LIVE);
+    let case = |row: usize| &cases[row % cases.len()];
+    let (weight, input) = projection::<V, R>(|row| &case(row).0);
+    let _lease = DEVICE.lock().await;
+    let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+    let rows = greedy::<V, ()>(&mut device, weight, LIVE, ()).await;
+    let Affine { weight, bias } = rows.head;
+    let parted = weight
+        .to_host::<m![V, Hidden]>(&mut device.pdma)
+        .await
+        .unwrap()
+        .to_hbm::<Chip, Parted<Hidden, V>>(&mut device.pdma)
+        .await
+        .unwrap();
+    let head: ByParts<V> = Greedy::new(Affine::new(parted, bias), rows.argmax, ());
+    let source = storage(&mut device, input).await;
+    let mut input = gather::Rows::<bf16, Hidden, R>::new(&mut device, &source)
+        .await
+        .unwrap();
+    let tokens = launch(selected_by_parts, (&mut device, &head, &mut input))
+        .await
+        .unwrap()
+        .to_host::<m![R]>(&mut device.pdma)
+        .await
+        .unwrap()
+        .into_vec();
+    for (row, &token) in tokens.iter().enumerate() {
+        assert_eq!(token as usize, case(row).1, "row {row}");
     }
 }
 

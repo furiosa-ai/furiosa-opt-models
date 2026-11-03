@@ -3,6 +3,7 @@
 use crate::Op;
 use crate::load::Load;
 use crate::ops::index::table::{self, Access, Offsets};
+use crate::ops::linear::{Contraction, Parted};
 use crate::tensor::cache::Blocks;
 use crate::tensor::cache::{Block, KeyValue};
 use crate::tensor::{
@@ -119,6 +120,48 @@ impl<W: AxisName, R: M, D: MaterializableScalar, C: AxisName, Chips: M + 'static
             }
             output
         }
+    }
+}
+
+/// Rows of a table that lies by parts, a lane group of at most eight rows a transfer: each row is
+/// read from every part at its offset in the part.
+impl<W: AxisName, V: AxisName, C: AxisName, Chips: M + 'static>
+    Op<(
+        &HbmTensor<bf16, Chips, Parted<W, V>>,
+        &HbmTensor<i32, Chips, m![C]>,
+    )> for Gather
+{
+    type Output = HbmTensor<bf16, Chips, m![C, W]>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (input, offsets): (
+            &HbmTensor<bf16, Chips, Parted<W, V>>,
+            &HbmTensor<i32, Chips, m![C]>,
+        ),
+    ) -> Self::Output {
+        type Part<W> = Symbol<Contraction<W>>;
+        type Parts<W> = m![W / ({ Part<W> }), W % ({ Part<W> })];
+        type Rows<Chips, W, C> =
+            DmTensor<bf16, Chips, m![1 # 2], m![{ Layout<C>::Lanes } # 256], Parts<W>>;
+        let mut output = HbmTensor::new();
+        for group in 0..<Groups<C> as M>::SIZE {
+            let mut index: Indices<Chips, C> = HbmTensor::new();
+            offsets
+                .view()
+                .tile::<Groups<C>, 1, m![{ Layout<C>::Selected }, { Layout<C>::Lanes }]>(group)
+                .to_hbm_view(&mut device.tdma, index.view_mut());
+            let selected: Rows<Chips, W, C> = input
+                .gather::<m![V], Parts<W>>()
+                .by_byte_offsets(&index)
+                .to_dm(&mut device.tdma);
+            selected.view().to_hbm_view(
+                &mut device.tdma,
+                output.view_mut().tile::<Groups<C>, 1, Write<W, C>>(group),
+            );
+        }
+        output
     }
 }
 

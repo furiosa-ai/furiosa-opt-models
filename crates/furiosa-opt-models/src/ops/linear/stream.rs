@@ -8,11 +8,14 @@
 //!   once a call; scores stage a 32-row tile's lanes each pass, the most a transposition takes.
 
 use crate::Op;
-use crate::ops::index::gather;
+use crate::ops::index::gather::{self, Gather};
+use crate::ops::index::table::ByteOffset;
 use crate::ops::linear::kernel::{self, Unrounded};
 use crate::ops::linear::{Affine, Groups};
 use crate::ops::normalization::{self, FeatureSlices, Spread};
 use crate::specialize::vocabulary;
+use crate::tensor::form::Weight;
+use crate::tensor::mapping::Packets;
 use crate::tensor::{axis::Tile, mapping::Rows as Layout, parallel::Chip};
 use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
@@ -96,8 +99,13 @@ type Weights<Chips, Hidden, V> = DmTensor<
     ],
 >;
 
-/// A vocabulary table in HBM, by the order its rows lie in: the rows a pass lands on every slice's
-/// block.
+/// A vocabulary table in HBM by its parts, as a stream's passes land it: part `p`'s chunk of
+/// every row in row order, so what a slice lands in a pass, the next rows of its block in its
+/// part, is one run.
+pub type Parted<Hidden, V> = m![{ Parts<Hidden> }, V, Hidden % ({ Chunk<Hidden> })];
+
+/// A vocabulary table in HBM, row-major `[V, Hidden]` or [`Parted`], as its readers read it: the
+/// rows a head's pass lands on every slice's block, and the rows of a launch's tokens.
 pub trait Table<Chips: M + 'static> {
     /// Features of a row.
     type Hidden: AxisName;
@@ -108,6 +116,13 @@ pub trait Table<Chips: M + 'static> {
 
     /// Pass `at`'s rows.
     fn pass(&self, at: usize) -> HbmTensorView<'_, bf16, Chips, Self::Pass>;
+
+    /// The rows of the tokens `ids`, in order.
+    fn rows<R: AxisName>(
+        &self,
+        device: &mut Device,
+        ids: &HbmTensor<i32, Chips, Packets<R>>,
+    ) -> HbmTensor<bf16, Chips, m![R, { Symbol<Self::Hidden> }]>;
 }
 
 type PassIndex<Hidden, V> = m![V % ({ Block<Hidden, V> }) / ({ PassRows<Hidden, V> })];
@@ -126,6 +141,44 @@ impl<Hidden: AxisName, V: AxisName, Chips: M + 'static> Table<Chips>
     fn pass(&self, at: usize) -> HbmTensorView<'_, bf16, Chips, Self::Pass> {
         self.view().tile::<PassIndex<Hidden, V>, 1, Self::Pass>(at)
     }
+
+    fn rows<R: AxisName>(
+        &self,
+        device: &mut Device,
+        ids: &HbmTensor<i32, Chips, Packets<R>>,
+    ) -> HbmTensor<bf16, Chips, m![R, Hidden]> {
+        let row = ByteOffset::<bf16, m![Hidden], m![R]>::default();
+        let offsets = Op::forward(&row, &mut *device, ids);
+        Op::forward(&Gather, device, (self, &offsets))
+    }
+}
+
+impl<Hidden: AxisName, V: AxisName, Chips: M + 'static> Table<Chips>
+    for HbmTensor<bf16, Chips, Parted<Hidden, V>>
+{
+    type Hidden = Hidden;
+    type Vocabulary = V;
+    type Pass = m![
+        { Parts<Hidden> },
+        V / ({ Block<Hidden, V> }),
+        V % ({ PassRows<Hidden, V> }) # ({ Block<Hidden, V> }),
+        Hidden % ({ Chunk<Hidden> })
+    ];
+
+    fn pass(&self, at: usize) -> HbmTensorView<'_, bf16, Chips, Self::Pass> {
+        self.view().tile::<PassIndex<Hidden, V>, 1, Self::Pass>(at)
+    }
+
+    /// A row's offset steps over its chunk, the part's row length.
+    fn rows<R: AxisName>(
+        &self,
+        device: &mut Device,
+        ids: &HbmTensor<i32, Chips, Packets<R>>,
+    ) -> HbmTensor<bf16, Chips, m![R, Hidden]> {
+        let row = ByteOffset::<bf16, m![Hidden % ({ Chunk<Hidden> })], m![R]>::default();
+        let offsets = Op::forward(&row, &mut *device, ids);
+        Op::forward(&Gather, device, (self, &offsets))
+    }
 }
 
 /// A borrowed table reads as the table.
@@ -136,6 +189,33 @@ impl<T: Table<Chips>, Chips: M + 'static> Table<Chips> for &T {
 
     fn pass(&self, at: usize) -> HbmTensorView<'_, bf16, Chips, Self::Pass> {
         (**self).pass(at)
+    }
+
+    fn rows<R: AxisName>(
+        &self,
+        device: &mut Device,
+        ids: &HbmTensor<i32, Chips, Packets<R>>,
+    ) -> HbmTensor<bf16, Chips, m![R, { Symbol<Self::Hidden> }]> {
+        (**self).rows(device, ids)
+    }
+}
+
+/// A parameter reads as the table it holds.
+impl<S: M, T: Table<Chips>, Chips: M + 'static> Table<Chips> for Weight<S, Chips, T> {
+    type Hidden = T::Hidden;
+    type Vocabulary = T::Vocabulary;
+    type Pass = T::Pass;
+
+    fn pass(&self, at: usize) -> HbmTensorView<'_, bf16, Chips, Self::Pass> {
+        self.held().pass(at)
+    }
+
+    fn rows<R: AxisName>(
+        &self,
+        device: &mut Device,
+        ids: &HbmTensor<i32, Chips, Packets<R>>,
+    ) -> HbmTensor<bf16, Chips, m![R, { Symbol<Self::Hidden> }]> {
+        self.held().rows(device, ids)
     }
 }
 
