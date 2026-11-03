@@ -109,6 +109,20 @@ pub(crate) const fn pass(head: usize, groups: usize, keys: usize) -> usize {
     rows
 }
 
+/// Whether a pass of `rows` rows over an `envelope` lands a window while the one before it is
+/// attended: when two landings, a fold and the envelope's rows leave a quarter of DM to the layer.
+pub(crate) const fn overlaps(
+    head: usize,
+    groups: usize,
+    keys: usize,
+    (rows, envelope): (usize, usize),
+) -> bool {
+    let landings = 2 * (rows / LANES) * KeyValue::SIZE * keys * head * size_of::<bf16>();
+    let folds = 4 * (rows / LANES) * groups * head * size_of::<f32>();
+    let envelope = 2 * envelope.div_ceil(LANES) * groups * head * size_of::<bf16>();
+    landings + folds + envelope <= 3 * super::DM / 4
+}
+
 /// Shards a window of `keys` keys splits into, one a slice: as many as a cluster's slices hold
 /// for each of `heads` heads and each of its row lanes, each shard at least one `block` of keys.
 pub(crate) const fn shards(heads: usize, keys: usize, block: usize) -> usize {

@@ -42,6 +42,17 @@ type Statistics<G, Count = <G as Partition>::Rows> = VrfTensor<
     m![{Count}, {<G as Partition>::Groups}, 1 # 8],
 >;
 
+/// A window's values transposed for the weighted sum's register fill, `Count` row groups of them.
+pub(crate) type Transposed<G, Count = <G as Partition>::Rows> = DmTensor<
+    bf16,
+    Chip<G>,
+    <G as Partition>::Cluster,
+    <G as Partition>::Slices,
+    m![{ Count }, { <G as Partition>::Head }, {
+        <G as Partition>::Keys
+    }],
+>;
+
 pub(crate) type Partial<G, Count = <G as Partition>::Rows> = DmTensor<
     f32,
     Chip<G>,
@@ -112,6 +123,65 @@ pub(crate) trait Partition: Sized {
             let (partial, lse) = attend(device, window);
             (carry, running) = Self::fold(device, &carry, &running, &partial, &lse);
         }
+        Self::merged(device, (&carry, &running))
+    }
+
+    /// [`Self::windows`] landing windows alternately in two places, `rest` (at most `Rest`) after
+    /// the first; `prepare` runs before the next lands: its page mapping waits for every transfer.
+    fn overlapped<P, V, Rest: AxisName>(
+        device: &mut Device,
+        rest: usize,
+        (even, odd, values): (&mut P, &mut P, &mut V),
+        (mut land, mut prepare, mut attend): (
+            impl FnMut(&mut Device, usize, &mut P),
+            impl FnMut(&mut Device, &P, &mut V),
+            impl FnMut(&mut Device, &P, &V) -> (Partial<Self>, Local<Self>),
+        ),
+        boundary: impl FnOnce(&mut Device),
+    ) -> Attended<Self> {
+        land(device, 0, even);
+        boundary(device);
+        prepare(device, even, values);
+        // A device loop whose bound folds to zero is refused, so fewer windows skip its loops.
+        if const { Rest::SIZE > 0 } {
+            for _ in 0..rest.min(1) {
+                land(device, 1, odd);
+            }
+        }
+        let (mut carry, mut running) = attend(device, even, values);
+        // Pair `p` attends windows `2p + 1` and `2p + 2`, each while the next one lands.
+        if const { Rest::SIZE > 0 } {
+            for pair in 0..(rest + 1) / 2 {
+                let after = rest - 2 * pair;
+                prepare(device, odd, values);
+                if const { Rest::SIZE > 1 } {
+                    for _ in 0..(after / 2).min(1) {
+                        land(device, 2 * pair + 2, even);
+                    }
+                }
+                let (partial, lse) = attend(device, odd, values);
+                (carry, running) = Self::fold(device, &carry, &running, &partial, &lse);
+                if const { Rest::SIZE > 1 } {
+                    for _ in 0..(after / 2).min(1) {
+                        prepare(device, even, values);
+                        if const { Rest::SIZE > 2 } {
+                            for _ in 0..((after - 1) / 2).min(1) {
+                                land(device, 2 * pair + 3, odd);
+                            }
+                        }
+                        let (partial, lse) = attend(device, even, values);
+                        (carry, running) = Self::fold(device, &carry, &running, &partial, &lse);
+                    }
+                }
+            }
+        }
+        Self::merged(device, (&carry, &running))
+    }
+
+    fn merged(
+        device: &mut Device,
+        (carry, running): (&Partial<Self>, &Local<Self>),
+    ) -> Attended<Self> {
         // Each of a head's shard slices adds its part of the epsilon, so it is added once.
         merge::<
             Self::Key,
@@ -133,14 +203,53 @@ pub(crate) trait Partition: Sized {
         )
     }
 
-    fn attend<Count: M, Q: M, K: M, B: M, P: M, L: M>(
+    /// A window's `value` rows transposed into `values`, as the shard's attention reads them, in
+    /// runs of sixteen keys: a longer run holds one bank group past a DMA's NoC timeout.
+    fn transpose<Count: M, K: M, V: M>(
+        device: &mut Device,
+        value: DmTensorView<'_, bf16, Chip<Self>, Self::Cluster, Self::Slices, K>,
+        values: DmTensorViewMut<'_, bf16, Chip<Self>, Self::Cluster, Self::Slices, V>,
+    ) {
+        device
+            .main
+            .begin(value)
+            .fetch::<m![
+                { Count },
+                { Self::Keys } / 16,
+                { Self::Head } / 8,
+                { Self::Keys } % 16
+            ], m![{ Self::Head } % 8 # 16]>()
+            .collect::<m![
+                { Count },
+                { Self::Keys } / 16,
+                { Self::Head } / 8,
+                { Self::Keys } % 16
+            ], m![{ Self::Head } % 8 # 16]>()
+            .transpose::<m![
+                { Count },
+                { Self::Keys } / 16,
+                { Self::Head } / 8,
+                { Self::Keys } % 16 / 4,
+                { Self::Head } % 8
+            ], m![{ Self::Keys } % 4 # 16]>()
+            .commit_trim::<m![{ Self::Keys } % 4]>()
+            .commit_view(values);
+    }
+
+    /// The shard's attention of `query` over one window's `key` rows and its values transposed in
+    /// `values`: `partial` and `lse`.
+    fn attend<Count: M, Q: M, K: M, V: M, B: M, P: M, L: M>(
         device: &mut Device,
         query: DmTensorView<'_, bf16, Chip<Self>, Self::Cluster, Self::Slices, Q>,
-        key: DmTensorView<'_, bf16, Chip<Self>, Self::Cluster, Self::Slices, K>,
-        value: DmTensorView<'_, bf16, Chip<Self>, Self::Cluster, Self::Slices, K>,
+        (key, values): (
+            DmTensorView<'_, bf16, Chip<Self>, Self::Cluster, Self::Slices, K>,
+            DmTensorView<'_, bf16, Chip<Self>, Self::Cluster, Self::Slices, V>,
+        ),
         bias: DmTensorView<'_, f32, Chip<Self>, Self::Cluster, Self::Slices, B>,
-        partial: DmTensorViewMut<'_, f32, Chip<Self>, Self::Cluster, Self::Slices, P>,
-        lse: DmTensorViewMut<'_, f32, Chip<Self>, Self::Cluster, Self::Slices, L>,
+        (partial, lse): (
+            DmTensorViewMut<'_, f32, Chip<Self>, Self::Cluster, Self::Slices, P>,
+            DmTensorViewMut<'_, f32, Chip<Self>, Self::Cluster, Self::Slices, L>,
+        ),
     ) {
         let logits: Slots<Self, Count> =
             qk_logits::<Self, Count, _, _, _>(device, query, key, bias)
@@ -243,7 +352,7 @@ pub(crate) trait Partition: Sized {
             .vector_final()
             .commit_trim::<m![1 # 8]>()
             .commit_view(lse);
-        weighted_sum::<Self, Count, _, _>(device, &weight, &total, value, partial);
+        weighted_sum::<Self, Count, _, _>(device, (&weight, &total), values, partial);
     }
 
     fn attend_precise<Count: M, Q: M, K: M, B: M, P: M, L: M>(
@@ -387,8 +496,17 @@ pub(crate) trait Partition: Sized {
             .commit();
         let mut a = Partial::<Self, Count>::new();
         let mut b = Partial::<Self, Count>::new();
-        weighted_sum::<Self, Count, _, _>(device, &high, &total, value.clone(), a.view_mut());
-        weighted_sum::<Self, Count, _, _>(device, &low, &total, value, b.view_mut());
+        let mut high_values = Transposed::<Self, Count>::new();
+        Self::transpose::<Count, _, _>(device, value.clone(), high_values.view_mut());
+        weighted_sum::<Self, Count, _, _>(
+            device,
+            (&high, &total),
+            high_values.view(),
+            a.view_mut(),
+        );
+        let mut low_values = Transposed::<Self, Count>::new();
+        Self::transpose::<Count, _, _>(device, value, low_values.view_mut());
+        weighted_sum::<Self, Count, _, _>(device, (&low, &total), low_values.view(), b.view_mut());
         device
             .main
             .begin_interleaved::<Summand, _, _, _, _, _>(a.view(), b.view())
@@ -699,42 +817,12 @@ fn qk_logits<'a, G: Partition, Count: M, Q: M, K: M, B: M>(
         .vector_final()
 }
 
-fn weighted_sum<G: Partition, Count: M, K: M, P: M>(
+fn weighted_sum<G: Partition, Count: M, V: M, P: M>(
     device: &mut Device,
-    weight: &Slots<G, Count>,
-    total: &Statistics<G, Count>,
-    chunk: DmTensorView<'_, bf16, Chip<G>, G::Cluster, G::Slices, K>,
+    (weight, total): (&Slots<G, Count>, &Statistics<G, Count>),
+    values: DmTensorView<'_, bf16, Chip<G>, G::Cluster, G::Slices, V>,
     output: DmTensorViewMut<'_, f32, Chip<G>, G::Cluster, G::Slices, P>,
 ) {
-    let value: DmTensor<
-        bf16,
-        Chip<G>,
-        G::Cluster,
-        G::Slices,
-        m![{ Count }, { G::Head }, { G::Keys }],
-    > =
-        // In runs of sixteen keys: the fetch reads each key at a row's stride, on one bank group,
-        // and a longer run holds that group past a DMA's NoC timeout.
-        device
-            .main
-            .begin(chunk)
-            .fetch::<
-                m![{ Count }, { G::Keys } / 16, { G::Head } / 8, { G::Keys } % 16],
-                m![{ G::Head } % 8 # 16],
-            >()
-            .collect::<
-                m![{ Count }, { G::Keys } / 16, { G::Head } / 8, { G::Keys } % 16],
-                m![{ G::Head } % 8 # 16],
-            >()
-            .transpose::<
-                m![
-                    { Count }, { G::Keys } / 16, { G::Head } / 8, { G::Keys } % 16 / 4,
-                    { G::Head } % 8
-                ],
-                m![{ G::Keys } % 4 # 16],
-            >()
-            .commit_trim::<m![{ G::Keys } % 4]>()
-            .commit();
     let value: TrfTensor<
         bf16,
         Chip<G>,
@@ -744,7 +832,7 @@ fn weighted_sum<G: Partition, Count: M, K: M, P: M>(
         m![{ Count }, { G::Head } / 8, { G::Keys }],
     > = device
         .sub
-        .begin(value.view())
+        .begin(values)
         .fetch::<m![
             { G::Head } % 8,
             { Count },
