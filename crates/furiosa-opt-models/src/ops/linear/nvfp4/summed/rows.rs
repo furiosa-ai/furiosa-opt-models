@@ -56,7 +56,7 @@ impl<I: AxisName, O: AxisName> AxisName for Owned<I, O> {
 }
 
 /// Output rows a pass covers: the most, a multiple of four dividing the owned rows, whose FP32 block
-/// scales over the slice's chunk take at most three quarters of its vector registers.
+/// scales over the slice's chunk fit its vector registers beside the tensor scale's eight lanes.
 #[derive(Clone, Debug)]
 struct Height<I, O>(PhantomData<(I, O)>);
 
@@ -66,7 +66,7 @@ impl<I: AxisName, O: AxisName> AxisName for Height<I, O> {
         let owned = Owned::<I, O>::SIZE;
         let mut rows = owned - owned % 4;
         while rows > 4
-            && !(owned.is_multiple_of(rows) && rows * Chunk::<I>::SIZE / 16 * 4 <= VRF * 3 / 4)
+            && !(owned.is_multiple_of(rows) && rows * Chunk::<I>::SIZE / 16 * 4 + 8 * 4 <= VRF)
         {
             rows -= 4;
         }
