@@ -88,25 +88,31 @@ type Part<I> = m![I % ({ Width<I> })];
 /// A slice's block scales: one for each 16 inputs of each row it owns.
 type Scaled<I, O> = m![O % ({ Owner<I, O> }), { Part<I> } / 16];
 
-/// Bytes of a slice's E4M3 block scales in whole packets, an odd number of them, so that the
-/// slices' runs start alternately in the HBM's two stacks.
-#[derive(Clone, Debug)]
-pub struct Bursts<I, O>(PhantomData<(I, O)>);
+/// A slice's codes: its rows over its part of the inputs.
+type Coded<I, O> = m![O % ({ Owner<I, O> }), { Part<I> }];
 
-impl<I: AxisName, O: AxisName> AxisName for Bursts<I, O> {
+/// Values of a slice's run of `R` values of `D` in whole packets, an odd number of them, so that
+/// the slices' runs start alternately in the HBM's two stacks.
+#[derive(Clone, Debug)]
+pub struct Bursts<R, D>(PhantomData<(R, D)>);
+
+impl<R: M + 'static, D: Scalar> AxisName for Bursts<R, D> {
     const NAME: Ident = Ident::new("Bursts");
     const SIZE: usize = {
-        let packets = (Owned::<I, O>::SIZE * Chunk::<I>::SIZE / 16).div_ceil(PACKET);
-        (packets | 1) * PACKET
+        let packets = (R::SIZE * D::BITS / 8).div_ceil(PACKET);
+        (packets | 1) * PACKET * 8 / D::BITS
     };
 }
 
 /// [`Scaled`] padded to [`Bursts`].
-type Padded<I, O> = m![{ Scaled<I, O> } # ({ Symbol<Bursts<I, O>> })];
+type Padded<I, O> = m![{ Scaled<I, O> } # ({ Symbol<Bursts<Scaled<I, O>, f8e4m3>> })];
+
+/// [`Coded`] padded to [`Bursts`].
+type Packed<I, O> = m![{ Coded<I, O> } # ({ Symbol<Bursts<Coded<I, O>, f4e2m1>> })];
 
 /// A weight's codes in HBM as the slices that sum them hold them, a slice's rows after the slice
 /// before: a slice's run lands whole, in whole packets.
-pub type Codes<I, O> = m![{ Cluster<O> }, { Owners<I, O> }, O % ({ Owner<I, O> }), { Part<I> }];
+pub type Codes<I, O> = m![{ Cluster<O> }, { Owners<I, O> }, { Packed<I, O> }];
 
 /// A weight's E4M3 block scales in HBM as the slices that sum them hold them, a slice's run padded
 /// to whole packets.
@@ -180,7 +186,7 @@ impl<H: AxisName, I: AxisName> AxisName for Piece<H, I> {
 pub struct Landed<I: AxisName, O: AxisName> {
     global: DmTensor<f32, Chip, Cluster<O>, Owners<I, O>, m![1 # 8]>,
     blocks: DmTensor<f8e4m3, Chip, Cluster<O>, Owners<I, O>, Padded<I, O>>,
-    codes: DmTensor<f4e2m1, Chip, Cluster<O>, Owners<I, O>, m![O % ({ Owner<I, O> }), { Part<I> }]>,
+    codes: DmTensor<f4e2m1, Chip, Cluster<O>, Owners<I, O>, Packed<I, O>>,
 }
 
 impl<I: AxisName, O: AxisName> Landed<I, O> {
@@ -340,9 +346,14 @@ impl<I: AxisName, O: AxisName> Landed<I, O> {
             .to_vrf();
         let sums = device
             .main
-            .begin(self.codes.view().tile::<Tiles<I, O>, 1, m![
-                { Elements<I, O> } # ({ Owner<I, O> }), { Part<I> }
-            ]>(tile))
+            .begin(
+                self.codes
+                    .view()
+                    .unpad::<Coded<I, O>>()
+                    .tile::<Tiles<I, O>, 1, m![
+                        { Elements<I, O> } # ({ Owner<I, O> }), { Part<I> }
+                    ]>(tile),
+            )
             .fetch::<m![{ Elements<I, O> }, { Part<I> } / 64], m![I % 64]>()
             .fetch_table_lookup::<bf16>()
             .collect::<m![{ Elements<I, O> }, { Part<I> } / 16], m![I % 16]>()
