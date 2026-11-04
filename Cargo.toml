@@ -11,7 +11,11 @@ members = [
 # branch `next`. CI and the install guide install the tip with `cargo binstall --git`, which takes no
 # revision, so a snapshot cut to `next` and the bump of this pin land together.
 [workspace.dependencies]
-furiosa-opt-std = { git = "https://github.com/furiosa-ai/furiosa-opt-preview", rev = "0dc3ceab827a859882860c32eae51d02aa2e2634" }
+# LOCAL: until a preview snapshot carries npu-tools #21298's f4e2m1 -> bf16 table lookup, the std
+# is this rev's snapshot (npu-tools cc921070feb) plus that one commit, exported beside this checkout
+# the way the snapshot is cut; the compiler on PATH is built from the same tree.
+# Was rev 0dc3ceab827a859882860c32eae51d02aa2e2634.
+furiosa-opt-std = { path = "../furiosa-opt-export-cc921070-21298/furiosa-opt-std" }
 
 # The engine's monomorphized debug info overflows the linker's 4 GiB debug sections.
 [profile.dev.package.furiosa-opt-engine]
