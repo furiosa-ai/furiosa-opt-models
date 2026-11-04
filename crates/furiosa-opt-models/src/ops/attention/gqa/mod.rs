@@ -617,7 +617,10 @@ where
                     (|device| once(device, 1), |_, _, _| ()),
                 );
             }
-            return <Partition<Rows, KvHeads, Groups, Head, SCALE> as shard::Partition>::windows(
+            return <Partition<Rows, KvHeads, Groups, Head, SCALE> as shard::Partition>::windows::<
+                _,
+                Rest<Windows>,
+            >(
                 device,
                 rest,
                 (
@@ -905,7 +908,10 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
             for tile in 0..count {
                 let pass = Pass::<N>::of(first + tile, live);
                 let projected = projects(device, pass);
-                let merged = <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::windows(
+                let merged = <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::windows::<
+                    _,
+                    Rest<Windows>,
+                >(
                     device,
                     rest,
                     (
@@ -1055,7 +1061,7 @@ mod tests {
     use std::f32::consts::FRAC_1_SQRT_2;
     use std::iter::repeat_n;
 
-    axes![Groups = 2];
+    axes![Groups = 2, Windows = 3];
 
     type PrefixGroups = QueryGroups<4>;
 
@@ -1459,13 +1465,13 @@ mod tests {
     }
 
     #[device(chip = 1)]
-    fn attend_prefix<Count: AxisName>(
+    fn attend_prefix<Count: AxisName, Depth: AxisName>(
         device: &mut Device,
         query: &PrefixQuery<Count>,
         blocks: &Blocks,
-        table: &HbmTensor<i32, Chip, m![Count, Chunks, BlockIndex]>,
-        lengths: &BlockCounts<Count, Chunks>,
-        bias: &Bias<Count>,
+        table: &HbmTensor<i32, Chip, m![Count, Depth, BlockIndex]>,
+        lengths: &BlockCounts<Count, Depth>,
+        bias: &Bias<Count, Depth>,
         (rest, live): (&Value, &Value),
         output: &mut PrefixOutput<Count>,
     ) {
@@ -1484,9 +1490,10 @@ mod tests {
             .to_hbm_view(&mut device.tdma, output.view_mut());
     }
 
-    /// Rows `0..live` of `Count` attend over the prefix of the bank each names, through a
-    /// scratch poisoned past every prefix; later rows are not live and write nothing checked.
-    async fn prefix<Count: AxisName>(rows: &[usize], live: usize) {
+    /// Rows `0..live` of `Count` attend over the prefix of the bank each names in a history of
+    /// `Depth` windows, through a scratch poisoned past every prefix; later rows are not live and
+    /// write nothing checked.
+    async fn prefix<Count: AxisName, Depth: AxisName>(rows: &[usize], live: usize) {
         const LENGTHS: [usize; 8] = [0, 1, 63, 64, 65, 511, 512, 513];
         const SHORTER: [usize; 8] = [0, 0, 1, 63, 64, 65, 511, 512];
         assert_eq!(rows.len(), Count::SIZE);
@@ -1533,9 +1540,9 @@ mod tests {
                 .collect(),
         )
         .await;
-        let table = HostTensor::<i32, m![Count, Chunks, BlockIndex]>::from_vec(
+        let table = HostTensor::<i32, m![Count, Depth, BlockIndex]>::from_vec(
             rows.iter().flat_map(|&row| {
-                (0..Chunks::SIZE * Cache::SIZE / Block::SIZE).map(move |at| {
+                (0..Depth::SIZE * Cache::SIZE / Block::SIZE).map(move |at| {
                     (((row % 8) * 1024 / Block::SIZE + at % (1024 / Block::SIZE)) as i32)
                         * <Blocks>::BLOCK_STRIDE
                 })
@@ -1568,8 +1575,8 @@ mod tests {
                 .collect::<Vec<_>>();
             // The first launch fills scratch with poisoned tails; later launches reuse it
             // while the gather writes only the shorter readable prefix.
-            let lengths_hbm: BlockCounts<Count, Chunks> =
-                block_counts::<Count, Chunks>(lengths.iter().map(|&length| {
+            let lengths_hbm: BlockCounts<Count, Depth> =
+                block_counts::<Count, Depth>(lengths.iter().map(|&length| {
                     if phase == 0 {
                         TEST_TOKENS as i32
                     } else {
@@ -1579,9 +1586,9 @@ mod tests {
                 .to_hbm(&mut device.pdma)
                 .await
                 .unwrap();
-            let bias = HostTensor::<f32, m![Count, Chunks, Cache]>::from_vec(
+            let bias = HostTensor::<f32, m![Count, Depth, Cache]>::from_vec(
                 lengths.iter().flat_map(|&length| {
-                    (0..Chunks::SIZE * Cache::SIZE)
+                    (0..Depth::SIZE * Cache::SIZE)
                         .map(move |token| if token < length { 0.0 } else { PADDING_BIAS })
                 }),
             )
@@ -1664,7 +1671,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn wide_rows_preserve_prefix() {
-        prefix::<Rows<64>>(
+        prefix::<Rows<64>, Chunks>(
             &(0..64)
                 .map(|row| (row * 3 + row / 8) % 8)
                 .collect::<Vec<_>>(),
@@ -1677,7 +1684,7 @@ mod tests {
     /// a partial sixth, every prefix length among them, attend as when every row is live.
     #[tokio::test(flavor = "current_thread")]
     async fn live_groups_attend_alone() {
-        prefix::<Rows<64>>(
+        prefix::<Rows<64>, Chunks>(
             &(0..64)
                 .map(|row| (row * 3 + row / 8) % 8)
                 .collect::<Vec<_>>(),
@@ -1689,12 +1696,31 @@ mod tests {
     /// One live row of a wide envelope attends alone.
     #[tokio::test(flavor = "current_thread")]
     async fn one_live_row_attends_alone() {
-        prefix::<Rows<64>>(&(0..64).map(|row| (row + 7) % 8).collect::<Vec<_>>(), 1).await;
+        prefix::<Rows<64>, Chunks>(&(0..64).map(|row| (row + 7) % 8).collect::<Vec<_>>(), 1).await;
+    }
+
+    /// A history of a few windows holds each window's terms until one merge: five whole groups and
+    /// a partial sixth, every prefix length among them, attend as the host does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_groups_hold_their_windows() {
+        prefix::<Rows<64>, Windows>(
+            &(0..64)
+                .map(|row| (row * 3 + row / 8) % 8)
+                .collect::<Vec<_>>(),
+            41,
+        )
+        .await;
+    }
+
+    /// One live row holds its windows' terms alone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_live_row_holds_its_windows() {
+        prefix::<Rows<64>, Windows>(&(0..64).map(|row| (row + 7) % 8).collect::<Vec<_>>(), 1).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn wide_partial_rows_zero() {
-        prefix::<Rows<64>>(
+        prefix::<Rows<64>, Chunks>(
             &(0..64)
                 .map(|row| if row < 47 { (row * 5 + row / 8) % 8 } else { 8 })
                 .collect::<Vec<_>>(),
@@ -1706,7 +1732,7 @@ mod tests {
     /// Four row groups fill one pass: the batch attends in a single trip.
     #[tokio::test(flavor = "current_thread")]
     async fn full_pass_rows_preserve_prefix() {
-        prefix::<Rows<32>>(
+        prefix::<Rows<32>, Chunks>(
             &(0..32)
                 .map(|row| (row * 3 + row / 8) % 8)
                 .collect::<Vec<_>>(),
@@ -1718,7 +1744,7 @@ mod tests {
     /// A pass whose rows all read empty histories writes zeros beside a pass that attends.
     #[tokio::test(flavor = "current_thread")]
     async fn empty_pass_rows_zero() {
-        prefix::<Rows<64>>(
+        prefix::<Rows<64>, Chunks>(
             &(0..64)
                 .map(|row| if row < 32 { (row * 5 + row / 8) % 8 } else { 8 })
                 .collect::<Vec<_>>(),
@@ -1729,17 +1755,18 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn tail_preserves_prefix() {
-        prefix::<Eight>(&[0, 1, 2, 3, 4, 5, 6, 7], 8).await;
+        prefix::<Eight, Chunks>(&[0, 1, 2, 3, 4, 5, 6, 7], 8).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn rows_remain_independent() {
-        prefix::<Sixteen>(&[7, 6, 5, 4, 3, 2, 1, 0, 8, 9, 10, 11, 12, 13, 14, 15], 16).await;
+        prefix::<Sixteen, Chunks>(&[7, 6, 5, 4, 3, 2, 1, 0, 8, 9, 10, 11, 12, 13, 14, 15], 16)
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn empty_history_zero() {
-        prefix::<Single>(&[0], 1).await;
+        prefix::<Single, Chunks>(&[0], 1).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1824,7 +1851,10 @@ mod tests {
         > = source.to_dm(&mut device.tdma);
         let query: super::Query<Eight, KvHeads, Groups, Head> = query.to_dm(&mut device.tdma);
         let bias: super::Bias<Eight, KvHeads, Groups> = bias.to_dm(&mut device.tdma);
-        <super::Partition<Eight, KvHeads, Groups, Head, INVERSE_ROOT> as Partition>::windows(
+        <super::Partition<Eight, KvHeads, Groups, Head, INVERSE_ROOT> as Partition>::windows::<
+            _,
+            super::Rest<Single>,
+        >(
             device,
             0,
             (

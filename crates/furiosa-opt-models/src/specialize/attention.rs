@@ -109,6 +109,14 @@ pub(crate) const fn pass(head: usize, groups: usize, keys: usize) -> usize {
     rows
 }
 
+/// Whether a history of `windows` windows holds every window's softmax terms until one merge
+/// combines them, rather than folding each into a running attention: when it has a fold to save and
+/// the FP32 terms of `count` row groups of `groups` query groups, each window's, fit one data memory
+/// page.
+pub(crate) const fn holds(head: usize, groups: usize, count: usize, windows: usize) -> bool {
+    windows > 1 && windows * count * groups * (head + LANES) * size_of::<f32>() <= super::DM / 16
+}
+
 /// Whether a pass of `rows` rows over an `envelope` lands a window while the one before it is
 /// attended: when two landings, a fold and the envelope's rows leave a quarter of DM to the layer.
 pub(crate) const fn overlaps(

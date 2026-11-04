@@ -108,7 +108,10 @@ where
         // The broadcast copies become the shards that consume the same query.
         let query: DmTensor<bf16, Chip, Cluster, Slices<Heads>, m![1, Groups, Head]> =
             unsafe { query.reshape() };
-        let attended = <Partition<Heads, Groups, Head, SCALE, Chip> as shard::Partition>::windows(
+        let attended = <Partition<Heads, Groups, Head, SCALE, Chip> as shard::Partition>::windows::<
+            _,
+            super::Rest<Windows>,
+        >(
             device,
             read.rest.extent::<m![Windows]>(),
             (

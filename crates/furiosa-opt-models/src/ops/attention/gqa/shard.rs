@@ -1,6 +1,8 @@
 use crate::ops::attention::softmax::merge::merge;
 use crate::ops::vector::Zip;
+use crate::specialize::attention;
 use furiosa_opt_std::prelude::*;
+use std::marker::PhantomData;
 
 type Chip<G> = <G as Partition>::Chip;
 
@@ -63,7 +65,7 @@ pub(crate) type Partial<G, Count = <G as Partition>::Rows> = DmTensor<
     }],
 >;
 
-type Terms<G> = DmTensor<
+type Summands<G> = DmTensor<
     f32,
     Chip<G>,
     <G as Partition>::Cluster,
@@ -102,6 +104,124 @@ pub(crate) struct Registers<G: Partition, Count: M> {
     bias: Mask<G, Count>,
 }
 
+/// One window of a history that spans at most `Rest` windows after the first.
+#[derive(Clone, Debug)]
+pub(crate) struct Window<Rest>(PhantomData<Rest>);
+
+impl<Rest: AxisName> AxisName for Window<Rest> {
+    const NAME: Ident = Ident::new("Window");
+    const SIZE: usize = Rest::SIZE + 1;
+}
+
+/// How the windows of a history combine into its attention: each window's terms, its shard
+/// partial and log-sum-exp, join the windows before it, and the joined windows merge over the
+/// shards.
+pub(crate) trait Terms<G: Partition>: Sized {
+    /// The terms of a history's first window.
+    fn first(device: &mut Device, terms: (Partial<G>, Local<G>)) -> Self;
+    /// Window `at`'s terms, past the first, joined to the windows before it.
+    fn join(&mut self, device: &mut Device, at: usize, terms: (Partial<G>, Local<G>));
+    /// The attention over every window joined.
+    fn merged(self, device: &mut Device) -> Attended<G>;
+}
+
+/// The windows folded into a running attention, each as it is attended.
+pub(crate) struct Folded<G: Partition> {
+    carry: Partial<G>,
+    running: Local<G>,
+}
+
+impl<G: Partition> Terms<G> for Folded<G> {
+    fn first(_: &mut Device, (carry, running): (Partial<G>, Local<G>)) -> Self {
+        Self { carry, running }
+    }
+
+    fn join(&mut self, device: &mut Device, _: usize, (partial, lse): (Partial<G>, Local<G>)) {
+        let (carry, running) = G::fold(device, &self.carry, &self.running, &partial, &lse);
+        (self.carry, self.running) = (carry, running);
+    }
+
+    fn merged(self, device: &mut Device) -> Attended<G> {
+        G::merged(device, (&self.carry, &self.running))
+    }
+}
+
+/// Every window's terms, a slot a window, until one merge combines them over the windows and the
+/// shards together.
+pub(crate) struct Held<G: Partition, Rest: AxisName> {
+    partials: DmTensor<
+        f32,
+        Chip<G>,
+        G::Cluster,
+        G::Slices,
+        m![{ Symbol<Window<Rest>> }, { G::Rows }, { G::Groups }, { G::Head }],
+    >,
+    lses: DmTensor<
+        f32,
+        Chip<G>,
+        G::Cluster,
+        G::Slices,
+        m![{ Symbol<Window<Rest>> }, { G::Rows }, { G::Groups }, 1 # 8],
+    >,
+}
+
+impl<G: Partition, Rest: AxisName> Terms<G> for Held<G, Rest> {
+    fn first(device: &mut Device, terms: (Partial<G>, Local<G>)) -> Self {
+        // A slot past the history's windows keeps a log-sum-exp of negative infinity: no share.
+        let mut lses = DmTensor::new();
+        lses.view_mut().memset(f32::NEG_INFINITY, &mut device.sub);
+        let mut held = Self {
+            partials: DmTensor::new(),
+            lses,
+        };
+        held.join(device, 0, terms);
+        held
+    }
+
+    fn join(&mut self, device: &mut Device, at: usize, (partial, lse): (Partial<G>, Local<G>)) {
+        device
+            .main
+            .begin(partial.view())
+            .fetch::<m![{ G::Rows }, { G::Groups }, { G::Head } / 8], m![{ G::Head } % 8]>()
+            .collect::<m![{ G::Rows }, { G::Groups }, { G::Head } / 8], m![{ G::Head } % 8]>()
+            .commit_trim::<m![{ G::Head } % 8]>()
+            .commit_view(self.partials.view_mut().tile::<m![{ Symbol<Window<Rest>> }], 1, m![
+                { Symbol<Window<Rest>> } = 1 #{!} ({ Symbol<Window<Rest>> }), { G::Rows }, { G::Groups }, { G::Head }
+            ]>(at));
+        device
+            .main
+            .begin(lse.view())
+            .fetch::<m![{ G::Rows }, { G::Groups }], m![1 # 8]>()
+            .collect::<m![{ G::Rows }, { G::Groups }], m![1 # 8]>()
+            .commit_trim::<m![1 # 8]>()
+            .commit_view(self.lses.view_mut().tile::<m![{ Symbol<Window<Rest>> }], 1, m![
+                { Symbol<Window<Rest>> } = 1 #{!} ({ Symbol<Window<Rest>> }), { G::Rows }, { G::Groups }, 1 # 8
+            ]>(at));
+    }
+
+    fn merged(self, device: &mut Device) -> Attended<G> {
+        // Each of a head's shard slices adds its part of the epsilon, so it is added once.
+        merge::<
+            Window<Rest>,
+            m![{ Symbol<Window<Rest>> }],
+            m![{ G::Rows }, { G::Groups }],
+            G::Head,
+            G::Agreed,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        >(
+            device,
+            (self.partials.view(), self.lses.view()),
+            const { 1e-6f32 / G::SHARDS as f32 },
+        )
+    }
+}
+
 /// Geometry and score scaling shared by shard-local attention and its softmax reduction.
 pub(crate) trait Partition: Sized {
     type Chip: M;
@@ -120,25 +240,23 @@ pub(crate) trait Partition: Sized {
     const DIVISOR: f32;
 
     /// Every window of a history merged: `land` issues window `at`'s history, `attend` attends
-    /// what it landed, and `boundary` runs once the first window's history is in flight.
-    fn windows<H>(
+    /// what it landed into the slot it is given, and `boundary` runs once the first window's
+    /// history is in flight. A history of at most `Rest` windows after the first holds every
+    /// window's terms for one merge where they fit, else folds each into a running attention.
+    fn windows<H, Rest: AxisName>(
         device: &mut Device,
         rest: usize,
-        (mut land, mut attend): (
+        steps: (
             impl FnMut(&mut Device, usize) -> H,
             impl FnMut(&mut Device, H) -> (Partial<Self>, Local<Self>),
         ),
         boundary: impl FnOnce(&mut Device),
     ) -> Attended<Self> {
-        let first = land(device, 0);
-        boundary(device);
-        let (mut carry, mut running) = attend(device, first);
-        for at in 0..rest {
-            let window = land(device, at + 1);
-            let (partial, lse) = attend(device, window);
-            (carry, running) = Self::fold(device, &carry, &running, &partial, &lse);
+        if const { holds::<Self, Rest>() } {
+            Self::serial::<_, Held<Self, Rest>>(device, rest, steps, boundary)
+        } else {
+            Self::serial::<_, Folded<Self>>(device, rest, steps, boundary)
         }
-        Self::merged(device, (&carry, &running))
     }
 
     /// [`Self::windows`] landing windows alternately in two places, `rest` (at most `Rest`) after
@@ -149,6 +267,52 @@ pub(crate) trait Partition: Sized {
     /// it, once the last window is prepared: `attend` must then read only what `prepare` returned.
     /// A history of two windows or more lands what follows exactly once, one of a window never.
     fn overlapped<P, V, F, Rest: AxisName, const FOLLOW: bool>(
+        device: &mut Device,
+        rest: usize,
+        places: (&mut P, &mut P, &mut V),
+        steps: (
+            impl FnMut(&mut Device, usize, &mut P),
+            impl FnMut(&mut Device, &P, &mut V) -> F,
+            impl FnMut(&mut Device, (&P, F), &V) -> (Partial<Self>, Local<Self>),
+        ),
+        hooks: (
+            impl FnOnce(&mut Device),
+            impl FnMut(&mut Device, usize, &mut P),
+        ),
+    ) -> Attended<Self> {
+        if const { holds::<Self, Rest>() } {
+            Self::paired::<_, _, _, Held<Self, Rest>, Rest, FOLLOW>(
+                device, rest, places, steps, hooks,
+            )
+        } else {
+            Self::paired::<_, _, _, Folded<Self>, Rest, FOLLOW>(device, rest, places, steps, hooks)
+        }
+    }
+
+    /// [`Self::windows`] with one place, each window landed after the one before is attended.
+    fn serial<H, T: Terms<Self>>(
+        device: &mut Device,
+        rest: usize,
+        (mut land, mut attend): (
+            impl FnMut(&mut Device, usize) -> H,
+            impl FnMut(&mut Device, H) -> (Partial<Self>, Local<Self>),
+        ),
+        boundary: impl FnOnce(&mut Device),
+    ) -> Attended<Self> {
+        let first = land(device, 0);
+        boundary(device);
+        let terms = attend(device, first);
+        let mut terms = T::first(device, terms);
+        for at in 0..rest {
+            let window = land(device, at + 1);
+            let window = attend(device, window);
+            terms.join(device, at + 1, window);
+        }
+        terms.merged(device)
+    }
+
+    /// [`Self::overlapped`] with the windows' terms joined as `T` joins them.
+    fn paired<P, V, F, T: Terms<Self>, Rest: AxisName, const FOLLOW: bool>(
         device: &mut Device,
         rest: usize,
         (even, odd, values): (&mut P, &mut P, &mut V),
@@ -170,7 +334,8 @@ pub(crate) trait Partition: Sized {
                 land(device, 1, odd);
             }
         }
-        let (mut carry, mut running) = attend(device, (even, window), values);
+        let terms = attend(device, (even, window), values);
+        let mut terms = T::first(device, terms);
         // Pair `p` attends windows `2p + 1` and `2p + 2`, each while the next one lands.
         if const { Rest::SIZE > 0 } {
             for pair in 0..(rest + 1) / 2 {
@@ -183,8 +348,8 @@ pub(crate) trait Partition: Sized {
                         land(device, 2 * pair + 2, even);
                     }
                 }
-                let (partial, lse) = attend(device, (odd, window), values);
-                (carry, running) = Self::fold(device, &carry, &running, &partial, &lse);
+                let window = attend(device, (odd, window), values);
+                terms.join(device, 2 * pair + 1, window);
                 if const { Rest::SIZE > 1 } {
                     for _ in 0..(after / 2).min(1) {
                         let window = prepare(device, even, values);
@@ -198,13 +363,13 @@ pub(crate) trait Partition: Sized {
                                 follow(device, rest + 1, even);
                             }
                         }
-                        let (partial, lse) = attend(device, (even, window), values);
-                        (carry, running) = Self::fold(device, &carry, &running, &partial, &lse);
+                        let window = attend(device, (even, window), values);
+                        terms.join(device, 2 * pair + 2, window);
                     }
                 }
             }
         }
-        Self::merged(device, (&carry, &running))
+        terms.merged(device)
     }
 
     fn merged(
@@ -678,7 +843,7 @@ pub(crate) trait Partition: Sized {
         let scaled = |device: &mut Device,
                       term: &Partial<Self>,
                       share: &Statistics<Self>,
-                      terms: &mut Terms<Self>,
+                      terms: &mut Summands<Self>,
                       at: usize| {
             device
                     .main
@@ -748,7 +913,7 @@ pub(crate) trait Partition: Sized {
             .commit_trim::<m![1 # 8]>()
             .commit();
         let divisor: Statistics<Self> = operand::<Self, _>(device, &total);
-        let mut terms = Terms::<Self>::new();
+        let mut terms = Summands::<Self>::new();
         let old_share = share(device, &old, &divisor);
         scaled(device, carry, &old_share, &mut terms, 0);
         let new_share = share(device, &new, &divisor);
@@ -806,6 +971,16 @@ pub(crate) trait Partition: Sized {
             .commit();
         (folded, statistic)
     }
+}
+
+/// Whether a history of at most `Rest` windows after the first holds every window's terms.
+const fn holds<G: Partition, Rest: AxisName>() -> bool {
+    attention::holds(
+        <G::Head as M>::SIZE,
+        <G::Groups as M>::SIZE,
+        <G::Rows as M>::SIZE,
+        Rest::SIZE + 1,
+    )
 }
 
 const PRESENT: TagGuard =
