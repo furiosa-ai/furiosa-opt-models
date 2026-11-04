@@ -9,12 +9,13 @@
 //!   whose landing it issues; its update the down projection, the post-feed-forward norm, the
 //!   feed-forward residual and the layer's tail, whose factor it lands first. The next layer's
 //!   front lands between them, behind the down projection's input and under its passes.
-//! - Its feed-forward's projections land their weights one step ahead, under work that issues no
-//!   transfer: the gate projection's under the post-attention and pre-feed-forward norms, whose
-//!   gains land first, the up projection's under the gate's passes, the down projection's under
-//!   the activation and the up projection's passes; its output projection's inside its
-//!   attention, once the attention's first history is in flight. Its leaves hold nothing in a
-//!   call, so it takes `()`.
+//! - Its feed-forward's projections land their weights ahead, under work that issues no transfer:
+//!   the gate projection's codes in its start, behind the input norm's gain and before the
+//!   queries are handed on, into the place the decoder holds across its attention for its end,
+//!   and its scales under the post-attention and pre-feed-forward norms, whose gains land first;
+//!   the up projection's under those norms and the gate's passes; the down projection's under the activation and the up projection's
+//!   passes; its output projection's inside its attention, once the attention's first history is
+//!   in flight. Its leaves hold nothing in a call, so it takes `()`.
 //! - Its tile is its envelope, so its attention hands its end the attended heads where they are,
 //!   with the landed output projection, and writes no HBM place.
 
@@ -110,6 +111,7 @@ impl<
     Down,
     Placement,
     GL,
+    GS,
     GO,
     AO,
     UL,
@@ -236,7 +238,15 @@ where
         >,
     Placement: Parallelism,
     Gate: for<'x> Module<Begin<()>, (), &'x mut (), Output = GL>
-        + for<'r, 'x> Module<(GL, &'r Live<Spread<Hidden, R, Chip>, R>), (), &'x mut (), Output = GO>,
+        + for<'l, 'x> Module<&'l mut GL, (), &'x mut (), Output = ()>
+        + for<'l, 'x> Module<Begin<&'l GL>, (), &'x mut (), Output = GS>
+        + for<'l, 'r, 'x> Module<
+            ((GS, &'l GL), &'r Live<Spread<Hidden, R, Chip>, R>),
+            (),
+            &'x mut (),
+            Output = GO,
+        >,
+    GL: Default,
     Activation: for<'r, 'x> Module<&'r GO, (), &'x mut (), Output = AO>,
     Up: for<'x> Module<Begin<()>, (), &'x mut (), Output = UL>
         + for<'r, 'x> Module<(UL, &'r Live<Spread<Hidden, R, Chip>, R>), (), &'x mut (), Output = UO>,
@@ -260,6 +270,7 @@ where
     type Home = HbmTensor<bf16, Chip, RowMajor<Hidden, R>>;
     type Front = (QL, KL, VL);
     type Landed = (OL, Live<AttendedHeads<A, R>, R>);
+    type Ahead = GL;
     type Staged = Staged<DR, Live<Self::Rows, R>>;
 
     fn fill(&self, device: &mut Device, home: &Self::Home, tile: Live<(), R>) -> Self::Rows {
@@ -309,9 +320,13 @@ where
         call: &'c Context<P, R, Windows>,
         (query, key, value): Self::Front,
         rows: Live<Self::Rows, R>,
-        (stored, _): (&mut Stored<A, R>, &mut ()),
+        (stored, gate_landed, _): (&mut Stored<A, R>, &mut GL, &mut ()),
     ) -> Live<Self::Rows, R> {
-        let Then(Sequential(Residual(norm, Then(attention, _), _), _), _) = self;
+        let Then(
+            Sequential(Residual(norm, Then(attention, _), _), Residual(_, Then(mlp, _), _)),
+            _,
+        ) = self;
+        let Sum(Fork((Then(gate, _), _)), _) = &mlp.0;
         let Positioned {
             projection:
                 NormalizedQkv {
@@ -322,6 +337,9 @@ where
             positions,
         } = &attention.0.qkv;
         let normalized = norm.forward(&mut *device, (), &mut (), &rows);
+        // The gate's codes land for the end behind the norm's gain, where the transfers idle until
+        // the query projection hands its rows on; its scales land in the end.
+        gate.forward(&mut *device, (), &mut (), gate_landed);
         let input = &normalized;
         // Where every row group is live, the query projection keeps the rows it filled into the
         // tensor registers for the key and value projections; else each fills its live groups.
@@ -391,7 +409,7 @@ where
     fn end(
         &self,
         device: &mut Device,
-        (_, landed): Output<'_, A, R, R, Self::Landed>,
+        ((_, landed), gate_landed): (Output<'_, A, R, R, Self::Landed>, &GL),
         input: Live<Self::Rows, R>,
         _: &mut (),
     ) -> Self::Staged {
@@ -402,12 +420,13 @@ where
         let projected = (attention.0.output).forward(&mut *device, (), &mut (), (landed, heads));
         let post = post.forward(&mut *device, (), &mut (), Begin(()));
         let norm = norm.forward(&mut *device, (), &mut (), Begin(()));
-        let gate_landed = gate.forward(&mut *device, (), &mut (), Begin(()));
+        let gate_scales = gate.forward(&mut *device, (), &mut (), Begin(gate_landed));
         let branch = post.forward(&mut *device, (), &mut (), &projected);
         let residual = add.forward(&mut *device, (), &mut (), (&input, &branch));
         let normalized = norm.forward(&mut *device, (), &mut (), &residual);
         let up_landed = up.forward(&mut *device, (), &mut (), Begin(()));
-        let gated = gate.forward(&mut *device, (), &mut (), (gate_landed, &normalized));
+        let begun = (gate_scales, gate_landed);
+        let gated = gate.forward(&mut *device, (), &mut (), (begun, &normalized));
         let down_landed = (down.0.operation).forward(&mut *device, (), &mut (), Begin(()));
         let activated = activation.forward(&mut *device, (), &mut (), &gated);
         let upped = up.forward(&mut *device, (), &mut (), (up_landed, &normalized));

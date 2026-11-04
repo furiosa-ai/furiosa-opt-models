@@ -59,6 +59,7 @@ impl<
     H,
     LX,
     LY,
+    K,
     const FIRST: usize,
     const SECOND: usize,
     const ORDER: &'static [Branch],
@@ -84,10 +85,33 @@ where
     RB: AxisName,
     CX: Copy,
     CY: Copy,
+    K: Default,
     T: Copy,
     U: Copy,
-    X: Cut<A, CX, T, Rows = W, Envelope = E, Tile = Tl, Reach = RA, Home = H, Landed = LX>,
-    Y: Cut<B, CY, U, Rows = W, Envelope = E, Tile = Tl, Reach = RB, Home = H, Landed = LY>,
+    X: Cut<
+            A,
+            CX,
+            T,
+            Rows = W,
+            Envelope = E,
+            Tile = Tl,
+            Reach = RA,
+            Home = H,
+            Landed = LX,
+            Ahead = K,
+        >,
+    Y: Cut<
+            B,
+            CY,
+            U,
+            Rows = W,
+            Envelope = E,
+            Tile = Tl,
+            Reach = RB,
+            Home = H,
+            Landed = LY,
+            Ahead = K,
+        >,
     Named<"norm", F>: for<'r, 'x> Module<&'r Live<W, E>, (), &'x mut (), Output = Live<W, E>>,
 {
     type Output = ();
@@ -116,13 +140,14 @@ where
         };
         // Whether a period starts with a layer of the first collection.
         let leads = counts[0] > 0 && positions[0] == 0;
+        let mut ahead = K::default();
         // The first layer's start over every tile.
         macro_rules! starts {
             ($layer:expr, $call:expr, $places:expr, $slot:expr) => {{
                 let mut slot = $slot;
                 for at in 0..live.count::<Tl>() {
                     let tile = live.tile::<Tl>(at);
-                    let state = (&mut $places.stored, &mut slot);
+                    let state = (&mut $places.stored, &mut ahead, &mut slot);
                     let rows = Tokenwise(&*home, $layer).forward(&mut *device, $call, state, tile);
                     $layer.spill(&mut *device, home, rows.with(rows.value()));
                 }
@@ -196,7 +221,8 @@ where
                             let mut landed = layer.attend(&mut *device, cx, attend, pa);
                             let mut slot = sa[index].1;
                             if wraps && last {
-                                edge!(layer, pa, landed, Tokenwise(layer, norm), cx, &mut slot);
+                                let work = Tokenwise(layer, norm);
+                                edge!(layer, pa, landed, work, cx, (&ahead, &mut slot));
                             } else if next {
                                 let mut following = sa[index + 1].1;
                                 let work = Tokenwise(layer, &first[index + 1]);
@@ -206,7 +232,7 @@ where
                                     landed,
                                     work,
                                     (cx, cx),
-                                    (&mut pa.stored, (&mut slot, &mut following))
+                                    (&mut pa.stored, &mut ahead, (&mut slot, &mut following))
                                 );
                             } else {
                                 let mut following = sb[jb].1;
@@ -217,7 +243,7 @@ where
                                     landed,
                                     work,
                                     (cx, cy),
-                                    (&mut pb.stored, (&mut slot, &mut following))
+                                    (&mut pb.stored, &mut ahead, (&mut slot, &mut following))
                                 );
                             }
                         }),
@@ -228,7 +254,8 @@ where
                             let mut landed = layer.attend(&mut *device, cy, attend, pb);
                             let mut slot = sb[index].1;
                             if wraps && last {
-                                edge!(layer, pb, landed, Tokenwise(layer, norm), cy, &mut slot);
+                                let work = Tokenwise(layer, norm);
+                                edge!(layer, pb, landed, work, cy, (&ahead, &mut slot));
                             } else if next {
                                 let mut following = sa[ja].1;
                                 let work = Tokenwise(layer, &first[ja]);
@@ -238,7 +265,7 @@ where
                                     landed,
                                     work,
                                     (cy, cx),
-                                    (&mut pa.stored, (&mut slot, &mut following))
+                                    (&mut pa.stored, &mut ahead, (&mut slot, &mut following))
                                 );
                             } else {
                                 let mut following = sb[index + 1].1;
@@ -249,7 +276,7 @@ where
                                     landed,
                                     work,
                                     (cy, cy),
-                                    (&mut pb.stored, (&mut slot, &mut following))
+                                    (&mut pb.stored, &mut ahead, (&mut slot, &mut following))
                                 );
                             }
                         }),
