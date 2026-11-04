@@ -760,9 +760,9 @@ const ROW_TILES: [RowTile; 22] = [
 ];
 
 /// The `(chunk, block, passes, routing)` of `(input, output)` of `bits`-bit coefficients: a listed
-/// shape's entry, else the widest legal replicated tiling of fewest passes, preferring parts of
-/// whole E2M1 scale blocks, over the fewest passes that hold a slab restored from codes, if any; a
-/// slab restored from codes takes its rows over the ring where the ring carries all their inputs.
+/// shape's entry, else the [`parted`] tiling; a slab restored from E4M3 codes takes parts a band of
+/// rows fits the tensor registers beside where any is legal, so each half of the band fills one
+/// register bank while the other contracts.
 pub(crate) const fn tiling(
     input: usize,
     output: usize,
@@ -781,39 +781,62 @@ pub(crate) const fn tiling(
         }
         at += 1;
     }
+    if bits == 8
+        && let Some(tiling) = parted(input, output, bits, super::TRF / (BAND * BF16))
+    {
+        return tiling;
+    }
+    match parted(input, output, bits, input) {
+        Some(tiling) => tiling,
+        None => panic!("no contraction tiling fits these projection widths"),
+    }
+}
+
+/// The widest legal replicated tiling of fewest passes whose parts hold at most `most` inputs,
+/// preferring parts of whole E2M1 scale blocks, over the fewest passes that hold a slab restored
+/// from codes, if any; a slab restored from codes takes its rows over the ring where the ring
+/// carries all their inputs.
+const fn parted(
+    input: usize,
+    output: usize,
+    bits: usize,
+    most: usize,
+) -> Option<(usize, usize, usize, Routing)> {
     let mut unit = SCALED;
     loop {
         let mut passes = 1;
         while passes <= output / 8 {
-            if let Some((chunk, block, passes, routing)) = widest(input, output, passes, unit) {
+            if let Some((chunk, block, passes, routing)) =
+                widest(input, output, passes, (unit, most))
+            {
                 // A BF16 slab is staged as stored, beside the replicated rows the listed tilings
                 // were timed against; one restored from codes must hold, beside rows on the ring.
                 if bits >= 8 * BF16 {
                     let block = carved(input, output, (chunk, block, passes), bits);
-                    return (chunk, block, passes, routing);
+                    return Some((chunk, block, passes, routing));
                 }
                 let (block, passes) = held(input, output, (chunk, block, passes));
                 let routing = if input <= RING { Ring } else { routing };
                 let block = carved(input, output, (chunk, block, passes), bits);
-                return (chunk, block, passes, routing);
+                return Some((chunk, block, passes, routing));
             }
             passes += 1;
         }
-        assert!(
-            unit != 1,
-            "no contraction tiling fits these projection widths"
-        );
+        if unit == 1 {
+            return None;
+        }
         unit = 1;
     }
 }
 
-/// The legal replicated tiling of `passes` slabs, parts a multiple of `unit` inputs, with the most
-/// active slices, then cheap row staging, then fewest parts; none if no tiling is legal.
+/// The legal replicated tiling of `passes` slabs, parts a multiple of `unit` and at most `most`
+/// inputs, with the most active slices, then cheap row staging, then fewest parts; none if no
+/// tiling is legal.
 const fn widest(
     input: usize,
     output: usize,
     passes: usize,
-    unit: usize,
+    (unit, most): (usize, usize),
 ) -> Option<(usize, usize, usize, Routing)> {
     if !output.is_multiple_of(2 * passes) {
         return None;
@@ -834,6 +857,7 @@ const fn widest(
                     let cheap = cheap(chunk, block);
                     if (active > rank.0 || (active == rank.0 && cheap && !rank.1))
                         && chunk.is_multiple_of(unit)
+                        && chunk <= most
                         && legal(input, output, (chunk, block, passes))
                     {
                         rank = (active, cheap);
