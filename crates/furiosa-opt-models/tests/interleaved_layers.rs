@@ -1244,9 +1244,9 @@ fn error(found: &[bf16], exact: &[f64], outputs: usize) -> (f64, f64) {
     (worst, (squares / total).sqrt())
 }
 
-/// The summed contract's live rows, at one row, a lane group, one row past it and the whole
-/// envelope: each output within one BF16 rounding of the FP64 product plus `2^-9` of its row's RMS
-/// for the FP32 sums, and nearer the product than the early contract's.
+/// The summed contract's live rows, at one row, a lane group, one row past it, one row past two
+/// and the whole envelope: each output within one BF16 rounding of the FP64 product plus `2^-9` of
+/// its row's RMS for the FP32 sums, and nearer the product than the early contract's.
 async fn sums_rows_nearer_than_early<I: AxisName, O: AxisName>(device: &mut Device, seed: u64)
 where
     Summing<I, O>: DeviceSend
@@ -1275,7 +1275,7 @@ where
             global,
         })
         .await;
-    for live in [1, 8, 9, Rows::SIZE] {
+    for live in [1, 8, 9, 17, Rows::SIZE] {
         let shape = format!("{}x{}, {live} live", I::SIZE, O::SIZE);
         let (worst, summed) = error(
             &project(device, &summed, &drawn, live).await,
