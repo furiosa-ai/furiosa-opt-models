@@ -29,6 +29,7 @@ use crate::modules::transformer::SandwichNorm;
 use crate::ops::attention::Heads;
 use crate::ops::attention::gqa::{Attended, Pages};
 use crate::ops::index::scatter::Store;
+use crate::ops::linear::Grouped;
 use crate::ops::normalization::{self, RmsNorm, RowMajor, Spread};
 use crate::tensor::axis::{Lanes, Single};
 use crate::tensor::live::Live;
@@ -91,6 +92,7 @@ impl<
     QL,
     KL,
     VL,
+    KB,
     QO,
     KO,
     NQ,
@@ -159,16 +161,31 @@ where
             Output = Live<Spread<Hidden, R, Chip>, R>,
         >,
     Query: for<'x> Module<Begin<()>, (), &'x mut (), Output = QL>
-        + for<'r, 'x> Module<(QL, &'r Live<Spread<Hidden, R, Chip>, R>), (), &'x mut (), Output = QO>,
+        + for<'r, 'x> Module<
+            (QL, Grouped<&'r Live<Spread<Hidden, R, Chip>, R>>),
+            (),
+            &'x mut (),
+            Output = QO,
+        > + for<'r, 'x> Module<
+            (QL, Begin<&'r Live<Spread<Hidden, R, Chip>, R>>),
+            (),
+            &'x mut (),
+            Output = (QO, KB),
+        >,
     Key: for<'x> Module<Begin<()>, (), &'x mut (), Output = KL>
-        + for<'r, 'x> Module<(KL, &'r Live<Spread<Hidden, R, Chip>, R>), (), &'x mut (), Output = KO>,
+        + for<'r, 'x> Module<
+            (KL, Grouped<&'r Live<Spread<Hidden, R, Chip>, R>>),
+            (),
+            &'x mut (),
+            Output = KO,
+        > + for<'b, 'x> Module<(KL, &'b KB), (), &'x mut (), Output = KO>,
     Value: for<'x> Module<Begin<()>, (), &'x mut (), Output = VL>,
     Then<Value, ValueNorm>: for<'r, 'x> Module<
-            (VL, &'r Live<Spread<Hidden, R, Chip>, R>),
+            (VL, Grouped<&'r Live<Spread<Hidden, R, Chip>, R>>),
             (),
             &'x mut ((), ()),
             Output = Live<KeyHeads<A, R>, R>,
-        >,
+        > + for<'b, 'x> Module<(VL, &'b KB), (), &'x mut ((), ()), Output = Live<KeyHeads<A, R>, R>>,
     QueryNorm: for<'r, 'x> Module<&'r QO, (), &'x mut (), Output = NQ>,
     KeyNorm: for<'r, 'x> Module<&'r KO, (), &'x mut (), Output = NK>,
     Position: for<'x> Module<
@@ -306,9 +323,25 @@ where
         } = &attention.0.qkv;
         let normalized = norm.forward(&mut *device, (), &mut (), &rows);
         let input = &normalized;
-        let query = (projections.query).forward(&mut *device, (), &mut (), (query, input));
-        let key = (projections.key).forward(&mut *device, (), &mut (), (key, input));
-        let value = (projections.value).forward(&mut *device, (), &mut ((), ()), (value, input));
+        // Where every row group is live, the query projection keeps the rows it filled into the
+        // tensor registers for the key and value projections; else each fills its live groups.
+        let projected = |device: &mut Device| {
+            if input.groups::<Lanes<R>>().1 == <Layout<R>::Groups as M>::SIZE {
+                let begun = (query, Begin(input));
+                let (query, banks) = (projections.query).forward(&mut *device, (), &mut (), begun);
+                return (
+                    query,
+                    (projections.key).forward(&mut *device, (), &mut (), (key, &banks)),
+                    (projections.value).forward(device, (), &mut ((), ()), (value, &banks)),
+                );
+            }
+            (
+                (projections.query).forward(&mut *device, (), &mut (), (query, Grouped(input))),
+                (projections.key).forward(&mut *device, (), &mut (), (key, Grouped(input))),
+                (projections.value).forward(device, (), &mut ((), ()), (value, Grouped(input))),
+            )
+        };
+        let (query, key, value) = projected(&mut *device);
         let query = query_norm.forward(&mut *device, (), &mut (), &query);
         let key = key_norm.forward(&mut *device, (), &mut (), &key);
         let positioned = ((query, key), &call.positions);

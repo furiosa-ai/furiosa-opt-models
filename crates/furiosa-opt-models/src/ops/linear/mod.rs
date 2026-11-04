@@ -514,6 +514,97 @@ where
     }
 }
 
+/// The rows of a launch in their feature slices, every row group of them live, begun: projected
+/// over the weight as it landed and split into heads, and kept in both register banks as its
+/// contraction read them, for every congruent projection of the same rows; both keep the rows.
+impl<'x, In, Out, Code, Rows, W, View, L> Op<(L, Begin<&'x Live<Spread<In, Rows>, Rows>>)>
+    for Native<W, View>
+where
+    In: AxisName,
+    Out: AxisName,
+    Code: Scalar,
+    Rows: AxisName,
+    L: Slabs<In = In, Out = Out, Stored = Code>,
+    mapping::Reshape<View>: Op<Live<Projected<In, Out, Code, Rows>, Rows>>,
+{
+    type Output = (
+        <mapping::Reshape<View> as Op<Live<Projected<In, Out, Code, Rows>, Rows>>>::Output,
+        Live<kernel::Banks<In, Out, Code, Rows>, Rows>,
+    );
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (landed, Begin(input)): (L, Begin<&'x Live<Spread<In, Rows>, Rows>>),
+    ) -> Self::Output {
+        let (projected, banks) =
+            kernel::Contraction::<In, Out, Code>::kept(&mut *device, &landed, input.value());
+        let heads = mapping::Reshape::<View>::default().forward(device, input.with(projected));
+        (heads, input.with(banks))
+    }
+}
+
+/// The rows another projection filled into both register banks, projected over the weight as it
+/// landed and split into heads where the contraction leaves them; the heads keep the live rows.
+impl<'x, In, Out, Code, Rows, W, View, L, F>
+    Op<(L, &'x Live<kernel::Banks<In, F, Code, Rows>, Rows>)> for Native<W, View>
+where
+    In: AxisName,
+    Out: AxisName,
+    Code: Scalar,
+    Rows: AxisName,
+    F: AxisName,
+    L: Slabs<In = In, Out = Out, Stored = Code>,
+    mapping::Reshape<View>: Op<Live<Projected<In, Out, Code, Rows>, Rows>>,
+{
+    type Output =
+        <mapping::Reshape<View> as Op<Live<Projected<In, Out, Code, Rows>, Rows>>>::Output;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (landed, banks): (L, &'x Live<kernel::Banks<In, F, Code, Rows>, Rows>),
+    ) -> Self::Output {
+        let projected =
+            kernel::Contraction::<In, Out, Code>::banked(device, &landed, banks.value());
+        mapping::Reshape::<View>::default().forward(device, banks.with(projected))
+    }
+}
+
+/// Rows of which fewer than every row group are live: a projection contracts each live lane group
+/// alone, as no register bank holds the envelope.
+pub struct Grouped<T>(pub T);
+
+/// The live lane groups of a launch's rows in their feature slices, fewer than all, projected over
+/// the weight as it landed and split into heads where the contraction leaves them.
+impl<'x, In, Out, Code, Rows, W, View, L> Op<(L, Grouped<&'x Live<Spread<In, Rows>, Rows>>)>
+    for Native<W, View>
+where
+    In: AxisName,
+    Out: AxisName,
+    Code: Scalar,
+    Rows: AxisName,
+    L: Slabs<In = In, Out = Out, Stored = Code>,
+    mapping::Reshape<View>: Op<Live<Projected<In, Out, Code, Rows>, Rows>>,
+{
+    type Output =
+        <mapping::Reshape<View> as Op<Live<Projected<In, Out, Code, Rows>, Rows>>>::Output;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (landed, Grouped(input)): (L, Grouped<&'x Live<Spread<In, Rows>, Rows>>),
+    ) -> Self::Output {
+        let projected = Affine::new(landed, ()).grouped(
+            &mut *device,
+            (input.with(PhantomData::<Rows>), input.value(), |at| {
+                mapping::Rows::<Rows>::group(input.value().view(), at)
+            }),
+        );
+        mapping::Reshape::<View>::default().forward(device, input.with(projected))
+    }
+}
+
 /// The same rows through the weight begun here.
 impl<'x, In, Out, Code, Rows, W, View, L> Op<&'x Live<Spread<In, Rows>, Rows>> for Native<W, View>
 where
