@@ -780,7 +780,8 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 .commit_trim::<m![Head % 16]>()
                 .commit()
         };
-        // Everything a window's attention reads of its place, so the place is free once prepared.
+        // Everything a window's attention reads of its place, so the place is free once prepared;
+        // the registers fill first, so the key fill runs beside the values' transpose.
         let prepares = |device: &mut Device,
                         landing: &Place<Rows, KvHeads, Groups, Head, N>,
                         values: &mut Transposed<Rows, KvHeads, Groups, Head, SCALE, N>|
@@ -790,16 +791,18 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     .chunk()
                     .tile::<m![KeyValue], 1, Half<TileRows<Rows, N>, KvHeads, Head>>(at)
             };
+            let registers =
+                <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::fill::<
+                    TileRows<Rows, N>,
+                    _,
+                    _,
+                >(device, half(0), landing.bias.view());
             <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::transpose::<
                 TileRows<Rows, N>,
                 _,
                 _,
             >(device, half(1), values.view_mut());
-            <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::fill::<
-                TileRows<Rows, N>,
-                _,
-                _,
-            >(device, half(0), landing.bias.view())
+            registers
         };
         let attends =
             |device: &mut Device,
