@@ -602,17 +602,19 @@ where
                     Landing::new(),
                     Transposed::<Rows, KvHeads, Groups, Head, SCALE>::new(),
                 );
+                lands(device, 0, &mut landings.0);
                 return <Partition<Rows, KvHeads, Groups, Head, SCALE> as shard::Partition>::overlapped::<
                     _,
                     _,
                     _,
                     Rest<Windows>,
+                    false,
                 >(
                     device,
                     rest,
                     (&mut landings.0, &mut landings.1, &mut landings.2),
                     (&mut lands, prepares, attends),
-                    |device| once(device, 1),
+                    (|device| once(device, 1), |_, _, _| ()),
                 );
             }
             return <Partition<Rows, KvHeads, Groups, Head, SCALE> as shard::Partition>::windows(
@@ -645,41 +647,46 @@ where
         );
         if const { Self::ROWS == 32 } {
             let (wides, halves) = (groups / wide, groups % wide / half);
-            for tile in 0..groups / wide {
-                let (pass, first) = (Pass::<32>::of(tile, live), |device: &mut Device| {
-                    once(device, 1 - tile.min(1))
-                });
-                self.pass(device, inputs, (pass, first), &mut attended);
-            }
-            for tile in 0..groups % wide / half {
-                let pass = Pass::<16>::of(groups / wide * (wide / half) + tile, live);
-                let first = |device: &mut Device| once(device, 1 - wides.min(1));
-                self.pass(device, inputs, (pass, first), &mut attended);
-            }
-            for tile in 0..groups % half {
-                let pass = Pass::<8>::of(groups / half * half + tile, live);
-                let first = |device: &mut Device| once(device, (1 - wides.min(1)) * (1 - halves));
-                self.pass(device, inputs, (pass, first), &mut attended);
-            }
+            self.passes::<_, _, _, 32>(
+                device,
+                inputs,
+                (0, wides, live),
+                (&mut once, 1),
+                &mut attended,
+            );
+            let first = wides * (wide / half);
+            let times = 1 - wides.min(1);
+            self.passes::<_, _, _, 16>(
+                device,
+                inputs,
+                (first, halves, live),
+                (&mut once, times),
+                &mut attended,
+            );
+            let first = groups / half * half;
+            let times = (1 - wides.min(1)) * (1 - halves);
+            let pass = (first, groups % half, live);
+            self.passes::<_, _, _, 8>(device, inputs, pass, (&mut once, times), &mut attended);
         } else if const { Self::ROWS == 16 } {
-            for tile in 0..groups / half {
-                let (pass, first) = (Pass::<16>::of(tile, live), |device: &mut Device| {
-                    once(device, 1 - tile.min(1))
-                });
-                self.pass(device, inputs, (pass, first), &mut attended);
-            }
-            for tile in 0..groups % half {
-                let pass = Pass::<8>::of(groups / half * half + tile, live);
-                let first = |device: &mut Device| once(device, 1 - (groups / half).min(1));
-                self.pass(device, inputs, (pass, first), &mut attended);
-            }
+            let halves = groups / half;
+            self.passes::<_, _, _, 16>(
+                device,
+                inputs,
+                (0, halves, live),
+                (&mut once, 1),
+                &mut attended,
+            );
+            let pass = (halves * half, groups % half, live);
+            let times = 1 - halves.min(1);
+            self.passes::<_, _, _, 8>(device, inputs, pass, (&mut once, times), &mut attended);
         } else {
-            for tile in 0..groups {
-                let (pass, first) = (Pass::<8>::of(tile, live), |device: &mut Device| {
-                    once(device, 1 - tile.min(1))
-                });
-                self.pass(device, inputs, (pass, first), &mut attended);
-            }
+            self.passes::<_, _, _, 8>(
+                device,
+                inputs,
+                (0, groups, live),
+                (&mut once, 1),
+                &mut attended,
+            );
         }
         // Without a live row no pass runs, so the boundary runs alone.
         once(device, 1 - groups.min(1));
@@ -705,9 +712,16 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
         )
     }
 
-    /// Attends the row groups of `pass` over their histories and writes their rows in `attended`;
-    /// `boundary` runs once the pass's first history is in flight.
-    fn pass<Rows: AxisName, Windows: AxisName, Source, const N: usize>(
+    /// Whether a pass of `N` rows over the envelope `Rows` lands the next pass's first window: only
+    /// the widest passes repeat, and only in an envelope that holds two of them.
+    const fn follows<Rows: AxisName, const N: usize>() -> bool {
+        N == Self::ROWS && <RowGroups<Rows> as M>::SIZE > <TileGroups<Rows, N> as AxisName>::SIZE
+    }
+
+    /// Attends the row groups of `count` passes over the `N`-row tiles from tile `first` and writes
+    /// their rows in `attended`; `boundary` runs `times` times once the first pass's first history
+    /// is in flight. Overlapping passes share two places: each lands the next one's first window.
+    fn passes<Rows: AxisName, Windows: AxisName, Source, const N: usize>(
         &self,
         device: &mut Device,
         (query, history, bias, rest): (
@@ -716,7 +730,8 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
             &HbmTensor<f32, Chip, m![Rows, Windows, Cache]>,
             usize,
         ),
-        (pass, boundary): (Pass<N>, impl FnOnce(&mut Device)),
+        (first, count, live): (usize, usize, Live<(), Rows>),
+        (boundary, times): (&mut impl FnMut(&mut Device, usize), usize),
         attended: &mut Attended<Rows, KvHeads, Groups, Head>,
     ) where
         Source: for<'c> crate::Module<
@@ -725,40 +740,46 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 &'c mut InDm<Rows, KvHeads, Head, TileRows<Rows, N>>,
             >,
     {
-        let projected: Query<Rows, KvHeads, Groups, Head, TileRows<Rows, N>> = device
-            .sub
-            .begin(query.view().tile::<Tiles<Rows, N>, 1, m![
-                { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), { TileRows<Rows, N> }, Groups, Head
-            ]>(pass.tile))
-            .fetch::<m![{ TileRows<Rows, N> }, Groups, Head / 16], m![Head % 16]>()
-            .switch::<CacheSlices<Rows, KvHeads>, m![{ TileRows<Rows, N> }, Groups, Head / 16]>(
-                SwitchConfig::CustomBroadcast {
-                    ring_size: Shards::<KvHeads>::SIZE,
-                },
-            )
-            .collect::<m![{ TileRows<Rows, N> }, Groups, Head / 16], m![Head % 16]>()
-            .commit_trim::<m![Head % 16]>()
-            .commit();
+        type Place<Rows, KvHeads, Groups, Head, const N: usize> =
+            Landing<Rows, KvHeads, Groups, Head, TileRows<Rows, N>>;
         type Transposed<Rows, KvHeads, Groups, Head, const SCALE: usize, const N: usize> =
             shard::Transposed<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>, TileRows<Rows, N>>;
-        let mut lands =
-            |device: &mut Device,
-             at: usize,
-             landing: &mut Landing<Rows, KvHeads, Groups, Head, TileRows<Rows, N>>| {
-                crate::Module::forward(history, &mut *device, (), &mut landing.cells, (at, pass));
-                bias.view()
-                    .tile::<m![Windows], 1, m![Rows, Windows = 1 # Windows, Cache]>(at)
-                    .tile::<Tiles<Rows, N>, 1, m![
-                        { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), { TileRows<Rows, N> },
-                        { Layout<Rows>::Lanes }, Windows = 1 # Windows, Cache
-                    ]>(pass.tile)
-                    .to_dm_view(&mut device.tdma, landing.bias.view_mut());
-            };
         type Registers<Rows, KvHeads, Groups, Head, const SCALE: usize, const N: usize> =
             shard::Registers<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>, TileRows<Rows, N>>;
+        // The bias goes first: a transfer issued after the gather may wait for it to finish.
+        let lands = |device: &mut Device,
+                     (at, pass): (usize, Pass<N>),
+                     landing: &mut Place<Rows, KvHeads, Groups, Head, N>| {
+            bias.view()
+                .tile::<m![Windows], 1, m![Rows, Windows = 1 # Windows, Cache]>(at)
+                .tile::<Tiles<Rows, N>, 1, m![
+                    { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), { TileRows<Rows, N> },
+                    { Layout<Rows>::Lanes }, Windows = 1 # Windows, Cache
+                ]>(pass.tile)
+                .to_dm_view(&mut device.tdma, landing.bias.view_mut());
+            crate::Module::forward(history, &mut *device, (), &mut landing.cells, (at, pass));
+        };
+        let projects = |device: &mut Device,
+                        pass: Pass<N>|
+         -> Query<Rows, KvHeads, Groups, Head, TileRows<Rows, N>> {
+            device
+                .sub
+                .begin(query.view().tile::<Tiles<Rows, N>, 1, m![
+                    { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), { TileRows<Rows, N> }, Groups, Head
+                ]>(pass.tile))
+                .fetch::<m![{ TileRows<Rows, N> }, Groups, Head / 16], m![Head % 16]>()
+                .switch::<CacheSlices<Rows, KvHeads>, m![{ TileRows<Rows, N> }, Groups, Head / 16]>(
+                    SwitchConfig::CustomBroadcast {
+                        ring_size: Shards::<KvHeads>::SIZE,
+                    },
+                )
+                .collect::<m![{ TileRows<Rows, N> }, Groups, Head / 16], m![Head % 16]>()
+                .commit_trim::<m![Head % 16]>()
+                .commit()
+        };
         // Everything a window's attention reads of its place, so the place is free once prepared.
         let prepares = |device: &mut Device,
-                        landing: &Landing<Rows, KvHeads, Groups, Head, TileRows<Rows, N>>,
+                        landing: &Place<Rows, KvHeads, Groups, Head, N>,
                         values: &mut Transposed<Rows, KvHeads, Groups, Head, SCALE, N>|
          -> Registers<Rows, KvHeads, Groups, Head, SCALE, N> {
             let half = |at| {
@@ -779,10 +800,8 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
         };
         let attends =
             |device: &mut Device,
-             (_, registers): (
-                &Landing<Rows, KvHeads, Groups, Head, TileRows<Rows, N>>,
-                Registers<Rows, KvHeads, Groups, Head, SCALE, N>,
-            ),
+             projected: &Query<Rows, KvHeads, Groups, Head, TileRows<Rows, N>>,
+             registers: Registers<Rows, KvHeads, Groups, Head, SCALE, N>,
              values: &Transposed<Rows, KvHeads, Groups, Head, SCALE, N>| {
                 let mut partial =
                     shard::Partial::<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>>::new();
@@ -802,50 +821,114 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 );
                 (partial, lse)
             };
-        let merged = if const { Self::overlaps::<Rows>(N) } {
-            let mut landings = (
+        let mut stores =
+            |device: &mut Device,
+             merged: shard::Attended<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>>,
+             pass: Pass<N>| {
+                merged.view().to_dm_view(
+                    &mut device.tdma,
+                    attended.view_mut().tile::<Tiles<Rows, N>, 1, m![
+                        { Tiles<Rows, N> } = 1 #{!} ({ Tiles<Rows, N> }), { TileRows<Rows, N> },
+                        Groups, Head
+                    ]>(pass.tile),
+                );
+            };
+        if const { Self::overlaps::<Rows>(N) } {
+            let (mut even, mut odd) = (
+                Place::<Rows, KvHeads, Groups, Head, N>::new(),
                 Landing::new(),
-                Landing::new(),
-                Transposed::<Rows, KvHeads, Groups, Head, SCALE, N>::new(),
             );
-            <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::overlapped::<
-                _,
-                _,
-                _,
-                Rest<Windows>,
-            >(
-                device,
-                rest,
-                (&mut landings.0, &mut landings.1, &mut landings.2),
-                (&mut lands, prepares, attends),
-                boundary,
-            )
-        } else {
-            <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::windows(
-                device,
-                rest,
-                (
-                    |device: &mut Device, at| {
-                        let mut landing = Landing::new();
-                        lands(device, at, &mut landing);
-                        landing
-                    },
-                    |device: &mut Device, landing| {
-                        let mut values = Transposed::<Rows, KvHeads, Groups, Head, SCALE, N>::new();
-                        let registers = prepares(device, &landing, &mut values);
-                        attends(device, (&landing, registers), &values)
-                    },
+            let mut values = Transposed::<Rows, KvHeads, Groups, Head, SCALE, N>::new();
+            for tile in 0..count {
+                let pass = Pass::<N>::of(first + tile, live);
+                // A pass lands its own first window unless the pass before it did, under its last.
+                if const { Self::follows::<Rows, N>() } {
+                    for _ in 0..(1 - tile.min(1) + (1 - rest.min(1))).min(1) {
+                        lands(device, (0, pass), &mut even);
+                    }
+                } else {
+                    lands(device, (0, pass), &mut even);
+                }
+                let projected = projects(device, pass);
+                let mut land =
+                    |device: &mut Device,
+                     at,
+                     landing: &mut Place<Rows, KvHeads, Groups, Head, N>| {
+                        lands(device, (at, pass), landing)
+                    };
+                // Window `at` of this pass while its history holds it, past that the next pass's first.
+                let mut follow =
+                    |device: &mut Device,
+                     at: usize,
+                     landing: &mut Place<Rows, KvHeads, Groups, Head, N>| {
+                        let within = (rest + 1 - at).min(1);
+                        for _ in 0..within + (1 - within) * ((count - tile) / 2).min(1) {
+                            let pass = Pass::of(first + tile + 1 - within, live);
+                            lands(device, (within * at, pass), landing);
+                        }
+                    };
+                let mut attend = |device: &mut Device,
+                                  (_, registers): (
+                    &Place<Rows, KvHeads, Groups, Head, N>,
+                    Registers<Rows, KvHeads, Groups, Head, SCALE, N>,
                 ),
-                boundary,
-            )
-        };
-        merged.view().to_dm_view(
-            &mut device.tdma,
-            attended.view_mut().tile::<Tiles<Rows, N>, 1, m![
-                { Tiles<Rows, N> } = 1 #{!} ({ Tiles<Rows, N> }), { TileRows<Rows, N> },
-                Groups, Head
-            ]>(pass.tile),
-        );
+                                  values: &Transposed<Rows, KvHeads, Groups, Head, SCALE, N>| {
+                    attends(device, &projected, registers, values)
+                };
+                let boundary = |device: &mut Device| {
+                    for _ in 0..1 - tile.min(1) {
+                        boundary(device, times);
+                    }
+                };
+                let places = (&mut even, &mut odd, &mut values);
+                let steps = (&mut land, &prepares, &mut attend);
+                let merged = if const { Self::follows::<Rows, N>() } {
+                    <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::overlapped::<
+                        _,
+                        _,
+                        _,
+                        Rest<Windows>,
+                        true,
+                    >(device, rest, places, steps, (boundary, &mut follow))
+                } else {
+                    <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::overlapped::<
+                        _,
+                        _,
+                        _,
+                        Rest<Windows>,
+                        false,
+                    >(device, rest, places, steps, (boundary, &mut follow))
+                };
+                stores(device, merged, pass);
+            }
+        } else {
+            for tile in 0..count {
+                let pass = Pass::<N>::of(first + tile, live);
+                let projected = projects(device, pass);
+                let merged = <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::windows(
+                    device,
+                    rest,
+                    (
+                        |device: &mut Device, at| {
+                            let mut landing = Landing::new();
+                            lands(device, (at, pass), &mut landing);
+                            landing
+                        },
+                        |device: &mut Device, landing| {
+                            let mut values = Transposed::<Rows, KvHeads, Groups, Head, SCALE, N>::new();
+                            let registers = prepares(device, &landing, &mut values);
+                            attends(device, &projected, registers, &values)
+                        },
+                    ),
+                    |device: &mut Device| {
+                        for _ in 0..1 - tile.min(1) {
+                            boundary(device, times);
+                        }
+                    },
+                );
+                stores(device, merged, pass);
+            }
+        }
     }
 }
 
