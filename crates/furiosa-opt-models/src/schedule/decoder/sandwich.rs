@@ -18,7 +18,7 @@
 //! - Its tile is its envelope, so its attention hands its end the attended heads where they are,
 //!   with the landed output projection, and writes no HBM place.
 
-use super::{Cut, Output, Places, Pool, Staged, Stored, attend_stored};
+use super::{Cut, Output, Places, Pool, QueryRows, Staged, Stored, attend_stored};
 use crate::load::Named;
 use crate::models::decoder;
 use crate::modules::attention::{self, Attention, KeyValue, NormalizedQkv, Positioned, Projection};
@@ -206,7 +206,7 @@ where
         >,
     Attend: for<'q, 'b, 'h, 'o, 'l, 'x> Module<
             (
-                &'q Live<QueryHeads<A, R>, R>,
+                Live<&'q QueryRows<A, R>, R>,
                 &'b Pool<A>,
                 &'h Pages<R, Windows, Chip>,
                 (&'o O, &'l mut OL),
@@ -379,10 +379,9 @@ where
             (cache, operands),
             (pool, &*stored, live),
             |device, pool| {
-                let query = live.with(stored.queries.to_dm(&mut device.tdma));
                 let mut landed = OL::default();
                 let boundary = (&output.0.operation, &mut landed);
-                let input = (&query, pool, &call.read, boundary);
+                let input = (live.with(&stored.queries), pool, &call.read, boundary);
                 let rows = attend.forward(&mut *device, (), &mut (), input);
                 (landed, rows)
             },

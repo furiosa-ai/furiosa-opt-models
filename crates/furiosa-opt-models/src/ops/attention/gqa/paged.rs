@@ -442,3 +442,47 @@ where
         query.with(self.forward(device, (history, boundary)))
     }
 }
+
+/// The same attention over queries where their store left them in HBM, each pass landing its
+/// own rows, so the envelope's queries take no data memory beside the attention's working set.
+impl<
+    Heads: AxisName,
+    Groups: AxisName,
+    Head: AxisName,
+    Windows: AxisName,
+    Rows: AxisName,
+    H,
+    G,
+    const SCALE: usize,
+>
+    Op<(
+        Live<&super::Stored<Rows, Heads, Groups, Head>, Rows>,
+        &Blocks<Heads, Head>,
+        &Pages<Rows, Windows>,
+        (&H, &mut G),
+    )> for Windowed<Heads, Groups, Head, SCALE>
+where
+    H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()>,
+{
+    type Output = Live<Attended<Rows, Heads, Groups, Head>, Rows>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (query, blocks, read, boundary): (
+            Live<&super::Stored<Rows, Heads, Groups, Head>, Rows>,
+            &Blocks<Heads, Head>,
+            &Pages<Rows, Windows>,
+            (&H, &mut G),
+        ),
+    ) -> Self::Output {
+        let history = Paged {
+            blocks,
+            table: &read.table,
+            lengths: &read.lengths,
+        };
+        let live = query.with(());
+        let history = (query.into_value(), &history, &read.bias, &read.rest, live);
+        live.with(self.forward(device, (history, boundary)))
+    }
+}

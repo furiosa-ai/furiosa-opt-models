@@ -408,6 +408,103 @@ pub type Heads<Rows, KvHeads, Groups, Head> = DmTensor<
     m![{ RowGroups<Rows> }, Groups, Head],
 >;
 
+/// The query rows in HBM where their store left them, each row's heads and groups in order.
+pub type Stored<Rows, KvHeads, Groups, Head> =
+    HbmTensor<bf16, Chip, m![Rows, KvHeads, Groups, Head]>;
+
+/// Where attention reads the query rows it attends: a copy of every row group in data memory, or
+/// the rows where their store left them, each pass landing its own, so that an envelope's queries
+/// never take data memory at once.
+pub(crate) trait Queries<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName> {
+    /// Every row group's query rows on the slices of their heads' shards.
+    fn whole(&self, device: &mut Device) -> Query<Rows, KvHeads, Groups, Head>;
+
+    /// The query rows of `pass`'s row groups on the slices of their heads' shards.
+    fn pass<const N: usize>(
+        &self,
+        device: &mut Device,
+        pass: Pass<N>,
+    ) -> Query<Rows, KvHeads, Groups, Head, TileRows<Rows, N>>;
+}
+
+/// The copy in data memory: a pass reads its row groups where they lie.
+impl<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName>
+    Queries<Rows, KvHeads, Groups, Head> for Heads<Rows, KvHeads, Groups, Head>
+{
+    fn whole(&self, device: &mut Device) -> Query<Rows, KvHeads, Groups, Head> {
+        broadcast::<_, _, Groups, Head, RowGroups<Rows>, _>(device, self.view())
+    }
+
+    fn pass<const N: usize>(
+        &self,
+        device: &mut Device,
+        pass: Pass<N>,
+    ) -> Query<Rows, KvHeads, Groups, Head, TileRows<Rows, N>> {
+        let rows = self.view().tile::<Tiles<Rows, N>, 1, m![
+            { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), { TileRows<Rows, N> }, Groups, Head
+        ]>(pass.tile);
+        broadcast::<_, _, Groups, Head, TileRows<Rows, N>, _>(device, rows)
+    }
+}
+
+/// The rows in HBM: a pass lands its own row groups first, the whole envelope every one.
+impl<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName>
+    Queries<Rows, KvHeads, Groups, Head> for Stored<Rows, KvHeads, Groups, Head>
+{
+    fn whole(&self, device: &mut Device) -> Query<Rows, KvHeads, Groups, Head> {
+        let heads: Heads<Rows, KvHeads, Groups, Head> = self.to_dm(&mut device.tdma);
+        heads.whole(device)
+    }
+
+    fn pass<const N: usize>(
+        &self,
+        device: &mut Device,
+        pass: Pass<N>,
+    ) -> Query<Rows, KvHeads, Groups, Head, TileRows<Rows, N>> {
+        let mut rows = DmTensor::<
+            bf16,
+            Chip,
+            Cluster<Rows>,
+            Merged<Rows, KvHeads>,
+            m![{ TileRows<Rows, N> }, Groups, Head],
+        >::new();
+        (self.view())
+            .tile::<Tiles<Rows, N>, 1, m![
+                { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), { TileRows<Rows, N> },
+                { Layout<Rows>::Lanes }, KvHeads, Groups, Head
+            ]>(pass.tile)
+            .to_dm_view(&mut device.tdma, rows.view_mut());
+        broadcast::<_, _, Groups, Head, TileRows<Rows, N>, _>(device, rows.view())
+    }
+}
+
+/// `Count` row groups' query rows from the slices of their heads' merged attention to every shard
+/// slice of their heads: each head's rows read once, then carried round its shards' ring.
+fn broadcast<
+    Rows: AxisName,
+    KvHeads: AxisName,
+    Groups: AxisName,
+    Head: AxisName,
+    Count: M,
+    E: M,
+>(
+    device: &mut Device,
+    rows: DmTensorView<'_, bf16, Chip, Cluster<Rows>, Merged<Rows, KvHeads>, E>,
+) -> Query<Rows, KvHeads, Groups, Head, Count> {
+    device
+        .sub
+        .begin(rows)
+        .fetch::<m![{ Count }, Groups, Head / 16], m![Head % 16]>()
+        .switch::<CacheSlices<Rows, KvHeads>, m![{ Count }, Groups, Head / 16]>(
+            SwitchConfig::CustomBroadcast {
+                ring_size: Shards::<KvHeads>::SIZE,
+            },
+        )
+        .collect::<m![{ Count }, Groups, Head / 16], m![Head % 16]>()
+        .commit_trim::<m![Head % 16]>()
+        .commit()
+}
+
 /// Each shard's bias of its slots, held per query row: a register operand repeats a single flit,
 /// so an operand eight flits wide names the `Groups` axis of the logits it multiplies.
 type Bias<Rows, KvHeads, Groups, Count = RowGroups<Rows>> = DmTensor<
@@ -439,8 +536,8 @@ type Windowed<KvHeads, Groups, Head, const SCALE: usize> =
     Attention<PhantomData<(KvHeads, Groups, Head)>, F32<SCALE>, { Strategy::Windows }>;
 
 /// The queries, the history they read, its mask, the windows after the first and the live rows.
-pub type History<'a, Rows, KvHeads, Groups, Head, Windows, Source> = (
-    &'a Heads<Rows, KvHeads, Groups, Head>,
+pub type History<'a, Q, Rows, Windows, Source> = (
+    &'a Q,
     &'a Source,
     &'a HbmTensor<f32, Chip, m![Rows, Windows, Cache]>,
     &'a Value,
@@ -455,9 +552,9 @@ impl<
     Head: AxisName,
     Windows: AxisName,
     Source,
+    Q: Queries<Rows, KvHeads, Groups, Head>,
     const SCALE: usize,
-> Op<History<'a, Rows, KvHeads, Groups, Head, Windows, Source>>
-    for Windowed<KvHeads, Groups, Head, SCALE>
+> Op<History<'a, Q, Rows, Windows, Source>> for Windowed<KvHeads, Groups, Head, SCALE>
 where
     Source: for<'c> crate::Module<(usize, Live<(), Rows>), (), &'c mut InDm<Rows, KvHeads, Head>>
         + for<'c> crate::Module<
@@ -479,7 +576,7 @@ where
     fn forward(
         &self,
         device: &mut Device,
-        history: History<'a, Rows, KvHeads, Groups, Head, Windows, Source>,
+        history: History<'a, Q, Rows, Windows, Source>,
     ) -> Self::Output {
         self.forward(device, (history, (&(), &mut ())))
     }
@@ -495,14 +592,12 @@ impl<
     Head: AxisName,
     Windows: AxisName,
     Source,
+    Q: Queries<Rows, KvHeads, Groups, Head>,
     H,
     G,
     const SCALE: usize,
->
-    Op<(
-        History<'a, Rows, KvHeads, Groups, Head, Windows, Source>,
-        (&H, &mut G),
-    )> for Windowed<KvHeads, Groups, Head, SCALE>
+> Op<(History<'a, Q, Rows, Windows, Source>, (&H, &mut G))>
+    for Windowed<KvHeads, Groups, Head, SCALE>
 where
     Source: for<'c> crate::Module<(usize, Live<(), Rows>), (), &'c mut InDm<Rows, KvHeads, Head>>
         + for<'c> crate::Module<
@@ -529,7 +624,7 @@ where
         &self,
         device: &mut Device,
         ((query, history, bias, rest, live), (boundary, state)): (
-            History<'a, Rows, KvHeads, Groups, Head, Windows, Source>,
+            History<'a, Q, Rows, Windows, Source>,
             (&H, &mut G),
         ),
     ) -> Self::Output {
@@ -541,20 +636,7 @@ where
         };
         if const { Self::ROWS == 32 } && live.count::<Lanes<Rows>>() == <RowGroups<Rows> as M>::SIZE
         {
-            // A slice holds the query rows of the head it owns: each head is copied once, then
-            // broadcast to the head's shards.
-            let projected: Query<Rows, KvHeads, Groups, Head> = device
-                .sub
-                .begin(query.view())
-                .fetch::<m![{ RowGroups<Rows> }, Groups, Head / 16], m![Head % 16]>()
-                .switch::<CacheSlices<Rows, KvHeads>, m![{ RowGroups<Rows> }, Groups, Head / 16]>(
-                    SwitchConfig::CustomBroadcast {
-                        ring_size: Shards::<KvHeads>::SIZE,
-                    },
-                )
-                .collect::<m![{ RowGroups<Rows> }, Groups, Head / 16], m![Head % 16]>()
-                .commit_trim::<m![Head % 16]>()
-                .commit();
+            let projected = query.whole(device);
             let rest = rest.extent::<m![{ Symbol<Rest<Windows>> }]>();
             type Transposed<Rows, KvHeads, Groups, Head, const SCALE: usize> =
                 shard::Transposed<Partition<Rows, KvHeads, Groups, Head, SCALE>, RowGroups<Rows>>;
@@ -650,7 +732,7 @@ where
         );
         if const { Self::ROWS == 32 } {
             let (wides, halves) = (groups / wide, groups % wide / half);
-            self.passes::<_, _, _, 32>(
+            self.passes::<_, _, _, _, 32>(
                 device,
                 inputs,
                 (0, wides, live),
@@ -659,7 +741,7 @@ where
             );
             let first = wides * (wide / half);
             let times = 1 - wides.min(1);
-            self.passes::<_, _, _, 16>(
+            self.passes::<_, _, _, _, 16>(
                 device,
                 inputs,
                 (first, halves, live),
@@ -669,10 +751,10 @@ where
             let first = groups / half * half;
             let times = (1 - wides.min(1)) * (1 - halves);
             let pass = (first, groups % half, live);
-            self.passes::<_, _, _, 8>(device, inputs, pass, (&mut once, times), &mut attended);
+            self.passes::<_, _, _, _, 8>(device, inputs, pass, (&mut once, times), &mut attended);
         } else if const { Self::ROWS == 16 } {
             let halves = groups / half;
-            self.passes::<_, _, _, 16>(
+            self.passes::<_, _, _, _, 16>(
                 device,
                 inputs,
                 (0, halves, live),
@@ -681,9 +763,9 @@ where
             );
             let pass = (halves * half, groups % half, live);
             let times = 1 - halves.min(1);
-            self.passes::<_, _, _, 8>(device, inputs, pass, (&mut once, times), &mut attended);
+            self.passes::<_, _, _, _, 8>(device, inputs, pass, (&mut once, times), &mut attended);
         } else {
-            self.passes::<_, _, _, 8>(
+            self.passes::<_, _, _, _, 8>(
                 device,
                 inputs,
                 (0, groups, live),
@@ -724,11 +806,11 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
     /// Attends the row groups of `count` passes over the `N`-row tiles from tile `first` and writes
     /// their rows in `attended`; `boundary` runs `times` times once the first pass's first history
     /// is in flight. Overlapping passes share two places: each lands the next one's first window.
-    fn passes<Rows: AxisName, Windows: AxisName, Source, const N: usize>(
+    fn passes<Rows: AxisName, Windows: AxisName, Source, Q, const N: usize>(
         &self,
         device: &mut Device,
         (query, history, bias, rest): (
-            &Heads<Rows, KvHeads, Groups, Head>,
+            &Q,
             &Source,
             &HbmTensor<f32, Chip, m![Rows, Windows, Cache]>,
             usize,
@@ -742,6 +824,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 (),
                 &'c mut InDm<Rows, KvHeads, Head, TileRows<Rows, N>>,
             >,
+        Q: Queries<Rows, KvHeads, Groups, Head>,
     {
         type Place<Rows, KvHeads, Groups, Head, const N: usize> =
             Landing<Rows, KvHeads, Groups, Head, TileRows<Rows, N>>;
@@ -762,24 +845,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 .to_dm_view(&mut device.tdma, landing.bias.view_mut());
             crate::Module::forward(history, &mut *device, (), &mut landing.cells, (at, pass));
         };
-        let projects = |device: &mut Device,
-                        pass: Pass<N>|
-         -> Query<Rows, KvHeads, Groups, Head, TileRows<Rows, N>> {
-            device
-                .sub
-                .begin(query.view().tile::<Tiles<Rows, N>, 1, m![
-                    { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), { TileRows<Rows, N> }, Groups, Head
-                ]>(pass.tile))
-                .fetch::<m![{ TileRows<Rows, N> }, Groups, Head / 16], m![Head % 16]>()
-                .switch::<CacheSlices<Rows, KvHeads>, m![{ TileRows<Rows, N> }, Groups, Head / 16]>(
-                    SwitchConfig::CustomBroadcast {
-                        ring_size: Shards::<KvHeads>::SIZE,
-                    },
-                )
-                .collect::<m![{ TileRows<Rows, N> }, Groups, Head / 16], m![Head % 16]>()
-                .commit_trim::<m![Head % 16]>()
-                .commit()
-        };
+        let projects = |device: &mut Device, pass: Pass<N>| query.pass(device, pass);
         // Everything a window's attention reads of its place, so the place is free once prepared;
         // the registers fill first, so the key fill runs beside the values' transpose.
         let prepares = |device: &mut Device,
