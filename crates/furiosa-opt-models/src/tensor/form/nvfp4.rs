@@ -47,10 +47,12 @@ pub struct Early<A, X: Memory = Hbm> {
 
 /// The reduced FP32 sum divided by the tensor scale once, inputs in form `A`: an early checkpoint's
 /// `weight_global_scale` under the late contract's arithmetic. Experimental: a row projected this
-/// way differs from [`Early`]'s in the rounding of each coefficient, which it leaves out. A launch's
-/// projected rows end where `P` places them: in the feature slices ([`Features`]), or kept where
-/// their passes summed them for elementwise steps and a next summed projection to read there. HBM
-/// holds the tensor scale laid out as `S`, a [`Scale`]'s.
+/// way differs from [`Early`]'s in the rounding of each coefficient, which it leaves out. The order
+/// the sum adds a row's blocks follows how many rows a launch holds, so a row's outputs may change
+/// in their last bits with the rows beside it. A launch's projected rows end where `P` places
+/// them: in the feature slices ([`Features`]), or kept where their passes summed them for
+/// elementwise steps and a next summed projection to read there. HBM holds the tensor scale laid
+/// out as `S`, a [`Scale`]'s.
 #[derive(DeviceSend, Load)]
 pub struct Summed<A, X: Memory = Hbm, P = Features, S: M + 'static = m![1 # 8]> {
     /// The form inputs enter the contraction in.

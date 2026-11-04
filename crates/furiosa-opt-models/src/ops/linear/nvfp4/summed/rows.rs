@@ -12,6 +12,13 @@
 //! - A pass's vector engine takes each block's sums four lanes a step, so the last group, when its
 //!   live rows lie in its first four lanes, switches, fills and folds those four alone: one step a
 //!   block.
+//! - From three live lane groups whose lanes fill straight from the feature slices, each pass's
+//!   codes decode once instead, each times its block scale in BF16, which is exact, and the pass
+//!   meets every group there: the contraction adds a row's blocks and the vector engine divides
+//!   each sum by the tensor scale. Fewer groups keep the summed passes, which the decode would
+//!   cost more than it saves, and so do rows staged in data memory, which each pass would stage
+//!   again. The two add a row's products in another order, so its outputs may differ in their
+//!   last bits.
 //! - The projected rows end where the contract places them: in the output's feature slices once
 //!   the last pass ends, or [`Kept`] where the passes summed them. Rows bound for the feature
 //!   slices are owned in whole chunks of them, the owners' odd factor the top output digit, so
@@ -24,6 +31,7 @@
 use crate::ops::linear::kernel::Rounded;
 use crate::ops::normalization::{self, FeatureSlices, Spread};
 use crate::ops::pointwise::Kept;
+use crate::ops::vector::Restore;
 use crate::specialize::{PACKET, SLICES, TRF, VRF, contraction};
 use crate::tensor::form::BlockScaled;
 use crate::tensor::form::nvfp4::{Features, Held, Scale, Scales, Summed, W4A16};
@@ -130,6 +138,10 @@ type Scaled<I, O, P> = m![O % ({ Owner<I, O, P> }), { Part<I> } / 16];
 
 /// A slice's codes: its rows over its part of the inputs.
 type Coded<I, O, P> = m![O % ({ Owner<I, O, P> }), { Part<I> }];
+
+/// A pass's weights in BF16, each code times its block scale.
+type Decoded<I, O, P> =
+    DmTensor<bf16, Chip, Cluster<I, O, P>, Owners<I, O, P>, m![{ Elements<I, O, P> }, { Part<I> }]>;
 
 /// Values of a slice's run of `R` values of `D` in whole packets, an odd number of them, so that
 /// the slices' runs start alternately in the HBM's two stacks.
@@ -307,14 +319,22 @@ impl<I: AxisName, O: AxisName, P: Ownership> Landed<I, O, P> {
         let mut projected = Summing::<I, O, R, P>::new();
         let (first, count) = input.groups::<Lanes<R>>();
         let rows = input.value();
-        // The last group folds its first four lanes alone when its live rows end there: one group
-        // or none, counted by arithmetic, as a device cannot cast a comparison to a count.
-        let front = if const { Lanes::<R>::SIZE == 8 } {
-            count.min(1) * ((11 - (input.start() + input.rows() + 7) % 8) / 8)
+        // One from three live groups whose lanes fill straight from the feature slices, as each
+        // decoded tile fills every group again; counted by arithmetic, as a device cannot cast a
+        // comparison to a count.
+        let dense = if const { R::SIZE / Lanes::<R>::SIZE >= 3 && X::PARTS == 0 } {
+            (count.max(2) - 2).min(1)
         } else {
             0
         };
-        let whole = count - front;
+        // The summed passes' last group folds its first four lanes alone when its live rows end
+        // there: one group or none.
+        let front = if const { Lanes::<R>::SIZE == 8 } {
+            (1 - dense) * count.min(1) * ((11 - (input.start() + input.rows() + 7) % 8) / 8)
+        } else {
+            0
+        };
+        let whole = (1 - dense) * count - front;
         let last = first + count.max(1) - 1;
         let operands = (&scales, &global);
         let tiles = <Tiles<I, O, P> as M>::SIZE;
@@ -403,6 +423,24 @@ impl<I: AxisName, O: AxisName, P: Ownership> Landed<I, O, P> {
                 }
             }
         }
+        // Last, so that nothing after it holds the summed passes' FP32 scales.
+        for _ in 0..dense {
+            let staged = X::staged();
+            for tile in 0..tiles {
+                // A tile decodes once and meets every group; the next group's lanes switch into
+                // the other half of the TRF under each pass.
+                let weights = self.decode(device, tile);
+                let operands = (&weights, &global);
+                let mut lanes = rows.fill(device, first, &staged);
+                for next in 1..count {
+                    let at = (first + next - 1, tile);
+                    Self::decoded_pass(device, (&lanes, operands), at, &mut projected);
+                    lanes = rows.fill(device, first + next, &staged);
+                }
+                let at = (first + count - 1, tile);
+                Self::decoded_pass(device, (&lanes, operands), at, &mut projected);
+            }
+        }
         projected
     }
 
@@ -466,6 +504,96 @@ impl<I: AxisName, O: AxisName, P: Ownership> Landed<I, O, P> {
             _,
         >(sums)
         .commit_view(F::sums(projected, (group, tile)));
+    }
+
+    /// Pass `tile`'s weights in BF16, each code times its block scale.
+    fn decode(&self, device: &mut Device, tile: usize) -> Decoded<I, O, P> {
+        let scale: Scaling<I, O, P> = device
+            .sub
+            .begin(
+                self.blocks
+                    .view()
+                    .unpad::<Scaled<I, O, P>>()
+                    .tile::<Tiles<I, O, P>, 1, m![
+                        { Elements<I, O, P> } # ({ Owner<I, O, P> }), { Part<I> } / 16
+                    ]>(tile),
+            )
+            .fetch::<Elements<I, O, P>, m![{ Part<I> } / 16]>()
+            .fetch_cast::<f32>()
+            .collect::<m![{ Elements<I, O, P> }, { Part<I> } / 128], m![I / 16 % 8]>()
+            .to_vrf();
+        let mut weights = Decoded::<I, O, P>::new();
+        device
+            .main
+            .begin(
+                self.codes
+                    .view()
+                    .unpad::<Coded<I, O, P>>()
+                    .tile::<Tiles<I, O, P>, 1, m![
+                        { Elements<I, O, P> } # ({ Owner<I, O, P> }), { Part<I> }
+                    ]>(tile),
+            )
+            .fetch::<m![{ Elements<I, O, P> }, { Part<I> } / 64], m![I % 64]>()
+            .fetch_table_lookup::<bf16>()
+            .fetch_cast::<f32>()
+            .collect::<m![{ Elements<I, O, P> }, { Part<I> } / 8], m![I % 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_split::<m![{ Elements<I, O, P> }, { Part<I> } / 4], m![I % 4]>()
+            .vector_restore::<m![{ Elements<I, O, P> }, { Part<I> } / 8], m![I % 8], _, _>(
+                &scale,
+                |values| values,
+            )
+            .commit_view(weights.view_mut());
+        weights
+    }
+
+    /// Pass `tile` of lane group `group` over weights that carry their block scales: the
+    /// contraction adds a row's blocks, the vector engine divides each sum by the tensor scale.
+    fn decoded_pass<R: AxisName>(
+        device: &mut Device,
+        (lanes, (weights, global)): (
+            &Registers<I, O, Lane<R>, P>,
+            (&Decoded<I, O, P>, &Global<I, O, P>),
+        ),
+        at: (usize, usize),
+        projected: &mut Summing<I, O, R, P>,
+    ) {
+        let sums = device
+            .main
+            .begin(weights.view())
+            .fetch::<m![{ Elements<I, O, P> }, { Part<I> } / 16], m![I % 16]>()
+            .collect::<m![{ Elements<I, O, P> }, { Part<I> } / 16], m![I % 16]>()
+            .contract_outer::<m![{ Elements<I, O, P> }, { Part<I> } / 16, 1], m![I % 16], _, _, _>(
+                lanes,
+            )
+            .contract_packet::<m![1]>()
+            .contract_time::<m![{ Elements<I, O, P> }, 1]>()
+            .contract_lane::<m![{ Elements<I, O, P> }, 1], m![{ Lane<R> } # 8]>(LaneMode::Interleaved)
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_split::<
+                m![{ Elements<I, O, P> }, 1, { Lane<R> } # 8 / 4],
+                m![{ Lane<R> } # 8 % 4],
+            >()
+            .vector_fp_div(global)
+            .vector_widen_concat::<m![{ Elements<I, O, P> }, 1], m![{ Lane<R> } # 8]>()
+            .vector_inter_slice_reduce::<Reduced<I, O, P>, m![{ Elements<I, O, P> }, 1]>(
+                InterSliceReduceOpF32::Add,
+            )
+            .vector_final();
+        Rounded::rounded::<
+            bf16,
+            _,
+            _,
+            _,
+            _,
+            Lane<R>,
+            m![{ Elements<I, O, P> } / 4, 1, { Lane<R> }],
+            m![O % 4],
+            _,
+        >(sums)
+        .commit_view(<Split as Fold<I, O, R, P>>::sums(projected, at));
     }
 }
 

@@ -1,6 +1,7 @@
 //! A summed NVFP4 projection's live rows at the feed-forward's shapes: wherever the live rows of
 //! a 64-row envelope start and however many there are, each live row's outputs are the ones the
-//! whole envelope gives it, bit for bit.
+//! envelope gives it, bit for bit, in the form the launch takes: the summed passes or the passes
+//! over the decoded weights, whose sums add a row's products in another order.
 //!
 //! - Into the intermediate width from feature-slice rows, a lane group's switch straight into the
 //!   tensor registers; back from feature-slice rows, a group switched whole into DM first; and
@@ -161,7 +162,7 @@ fn count(value: usize) -> HostTensor<i32, m![1]> {
 }
 
 /// The live rows these cases name: none, the first rows of a group up to and past its half, whole
-/// groups, and rows that start inside a group, end inside one or cross groups.
+/// groups, rows that start inside a group, end inside one or cross groups, and two or three groups.
 const CASES: &[(usize, usize)] = &[
     (0, 0),
     (0, 1),
@@ -171,26 +172,32 @@ const CASES: &[(usize, usize)] = &[
     (0, 9),
     (0, 12),
     (0, 13),
+    (0, 16),
+    (0, 17),
+    (0, 20),
     (0, 32),
     (1, 3),
     (7, 1),
+    (7, 10),
     (13, 4),
     (13, 8),
     (60, 4),
     (3, 61),
 ];
 
-/// Each live row of every case at widths `$hidden` and `$intermediate` gives the outputs the whole
-/// envelope gives it, in each of the three ways a projection stages its rows.
+/// Each live row of every case at widths `$hidden` and `$intermediate` gives the outputs one form's
+/// envelope gives it, in each of the three ways a projection stages its rows: the whole envelope in
+/// one launch, or every row from launches of one lane group.
 macro_rules! envelope {
     ($device:expr, $hidden:ident, $intermediate:ident) => {{
         let device: &mut Device = $device;
         let up = weight::<$hidden, $intermediate, Features>(device, 1).await;
         let gate = weight::<$hidden, $intermediate, Kept>(device, 1).await;
         let down = weight::<$intermediate, $hidden, Features>(device, 4).await;
-        let mut envelope: [Vec<bf16>; 3] = Default::default();
-        for (start, live) in [(0, Rows::SIZE)].iter().chain(CASES) {
-            let (start, live) = (*start, *live);
+        let mut envelopes: [[Vec<bf16>; 3]; 2] = Default::default();
+        let groups = (0..Rows::SIZE / 8).map(|group| (8 * group, 8));
+        let launches = [(0, Rows::SIZE)].into_iter().chain(groups);
+        for (at, (start, live)) in launches.chain(CASES.iter().copied()).enumerate() {
             let first = count(start).to_hbm(&mut device.pdma).await.unwrap();
             let counted = count(live).to_hbm(&mut device.pdma).await.unwrap();
             let narrow = rows::<$hidden>(3, start..start + live);
@@ -245,26 +252,43 @@ macro_rules! envelope {
                 ),
             ];
             for (form, (found, width)) in forms.into_iter().enumerate() {
-                if live == Rows::SIZE {
-                    envelope[form] = found;
-                    continue;
-                }
                 let rows = start * width..(start + live) * width;
-                for at in rows.clone() {
-                    assert_eq!(
-                        found[at].to_bits(),
-                        envelope[form][at].to_bits(),
-                        "{}x{} form {form}, rows {start}+{live}: output {at}",
+                if at == 0 {
+                    envelopes[0][form] = found;
+                } else if at <= Rows::SIZE / 8 {
+                    let envelope = &mut envelopes[1][form];
+                    envelope.resize(found.len(), bf16::from_bits(0));
+                    envelope[rows.clone()].copy_from_slice(&found[rows]);
+                } else {
+                    // A launch's rows take one form, so one envelope gives all of them.
+                    let differs = |envelope: &[Vec<bf16>; 3]| {
+                        rows.clone()
+                            .find(|&at| found[at].to_bits() != envelope[form][at].to_bits())
+                    };
+                    let differs = envelopes.each_ref().map(differs);
+                    assert!(
+                        differs.contains(&None),
+                        "{}x{} form {form}, rows {start}+{live}: outputs {differs:?} differ",
                         $hidden::SIZE,
                         $intermediate::SIZE,
                     );
                 }
             }
         }
+        for (form, (whole, grouped)) in envelopes[0].iter().zip(&envelopes[1]).enumerate() {
+            let apart = (whole.iter().zip(grouped)).filter(|(a, b)| a.to_bits() != b.to_bits());
+            println!(
+                "{}x{} form {form}: {} of {} outputs differ between the two forms",
+                $hidden::SIZE,
+                $intermediate::SIZE,
+                apart.count(),
+                whole.len(),
+            );
+        }
     }};
 }
 
-/// Each live row of every case gives the outputs the whole envelope gives it, in each of the three
+/// Each live row of every case gives the outputs one form's envelope gives it, in each of the three
 /// ways a projection stages its rows, at Gemma 4's widths and at a SwiGLU decoder's.
 #[tokio::test(flavor = "current_thread")]
 async fn projects_each_live_row_as_the_envelope() {
