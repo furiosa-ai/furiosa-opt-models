@@ -6,6 +6,7 @@
 //!   hold the leaf's query heads and their features.
 //! - A chip mapping naming one of them splits it, a share a chip (`m![W / 1024]` with
 //!   `m![W % 1024, In]`); one naming none holds every value on every chip, read as one copy.
+//! - A broadcast term of the element mapping holds every value once in each of its copies.
 
 use furiosa_opt_std::prelude::{
     AxisTerm, HostTensor, Index, M, Mapping, MappingExt, MaterializableScalar, SequencerMode,
@@ -380,6 +381,19 @@ mod tests {
                 if name == "w" && reason == "the leaf holds part of the axis I"),
             "{part:?}"
         );
+    }
+
+    /// A scalar held as copies, a broadcast term, holds the stored value in each copy's first cell
+    /// and zero in its padding, as one copy holds it.
+    #[test]
+    fn every_copy_holds_the_stored_value() {
+        use crate::tensor::scalar::Copies;
+        let stored = 0.75f32.to_le_bytes();
+        let scale = TensorView::new(Dtype::F32, vec![], &stored).unwrap();
+        let copies = Checkpoint::value::<f32, Copies, Copies>(&scale, "s").unwrap();
+        let packet = [0.75, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let expected = packet.repeat(<Copies as M>::SIZE / packet.len());
+        assert_eq!(copies.into_vec(), expected);
     }
 
     /// A layout whose cells a walk of whole-byte runs reads gets each cell where it places it, for

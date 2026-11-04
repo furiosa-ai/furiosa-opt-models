@@ -44,6 +44,10 @@ impl<const BITS: usize, S: M> Load<HostTensor<f32, S>> for F32<BITS> {
 /// Scalar repeated over the eight cells of a vector packet in both clusters and 256 slices.
 pub type Packet<D = i32, Chips = Chip> = DmTensor<D, Chips, Cluster, Slices, m![1 # 8]>;
 
+/// A scalar's padded packet in HBM once for each slice a [`Packet`] spans, so a landing into many
+/// slices reads a copy a slice rather than one address a slice in turn; a load writes every copy.
+pub type Copies = m![{ Broadcast<{ <Cluster as M>::SIZE * <Slices as M>::SIZE }> }, 1 # 8];
+
 /// A packet in the main vector engine at stage `S`; it enters as I32 at the tag stage.
 pub type Stream<'l, S = stage::Tag, D = i32, Stash = Fresh, Chips = Chip> = VectorTensor<
     'l,
