@@ -8,6 +8,7 @@ use crate::tensor::cache::Block;
 use crate::tensor::mapping::{BroadcastClusters as Cluster, BroadcastSlices as Slices};
 use crate::tensor::memory::{Hbm, Memory};
 use crate::tensor::parallel::Chip;
+use crate::tensor::scalar;
 use furiosa_opt_std::prelude::*;
 use std::borrow::Borrow;
 
@@ -72,19 +73,27 @@ impl<'t, 's, Rows: AxisName, Chips: M + 'static, X: Memory>
     }
 }
 
-type Cells<R, Chips> = DmTensor<i32, Chips, Cluster, Slices, Grid<R>>;
+/// Row `r` on slice `r`, so a pass over every row and segment moves a row's segments a slice.
+type RowSlices<R> = m![R # 256];
+
+/// Each row's value for every segment, a value a flit.
+type Cells<R, Chips> =
+    DmTensor<i32, Chips, Cluster, RowSlices<R>, m![{ Symbol<Segment<R>> }, 1 # 8]>;
+
+/// Each row's value, on the row's slice.
+type Sums<R, Chips> = DmTensor<i32, Chips, Cluster, RowSlices<R>, m![1 # 8]>;
 
 /// One value per row, a row a flit.
 type Rows<R, Chips> = DmTensor<i32, Chips, Cluster, Slices, m![R, 1 # 8]>;
 type RowOperand<R, Chips> = VrfTensor<i32, Chips, Cluster, Slices, m![R, 1 # 8]>;
 
-/// One value per segment, a segment a flit.
+/// One value per segment, a segment a flit, on every row's slice.
 type SegmentOperand<R, Chips> =
-    VrfTensor<i32, Chips, Cluster, Slices, m![{ Symbol<Segment<R>> }, 1 # 8]>;
+    VrfTensor<i32, Chips, Cluster, RowSlices<R>, m![{ Symbol<Segment<R>> }, 1 # 8]>;
 
-/// The segment table, field by field.
+/// The segment table, field by field, on every row's slice.
 type Columns<R, Chips> =
-    DmTensor<i32, Chips, Cluster, Slices, m![Fields, { Symbol<Segment<R>> }, 1 # 8]>;
+    DmTensor<i32, Chips, Cluster, RowSlices<R>, m![Fields, { Symbol<Segment<R>> }, 1 # 8]>;
 
 /// Each row's logical position, write slot, visible length and table entry, from the segment
 /// table of a history and its flat table of block IDs.
@@ -143,8 +152,8 @@ where
             device
                 .main
                 .begin(cells.view())
-                .fetch::<m![R, { Symbol<Segment<R>> }], m![1 # 8]>()
-                .collect::<m![R, { Symbol<Segment<R>> }], m![1 # 8]>()
+                .fetch::<m![{ Symbol<Segment<R>> }], m![1 # 8]>()
+                .collect::<m![{ Symbol<Segment<R>> }], m![1 # 8]>()
                 .vector_init()
                 .vector_intra_slice_tag(TagMode::Zero)
                 .vector_fxp(FxpBinaryOp::SubFxp, value)
@@ -156,18 +165,18 @@ where
         let masked = |device: &mut Device,
                       d: &Cells<R, Chips>,
                       value: &SegmentOperand<R, Chips>|
-         -> Rows<R, Chips> {
+         -> Sums<R, Chips> {
             device
                 .main
                 .begin(d.view())
-                .fetch::<m![R, { Symbol<Segment<R>> }], m![1 # 8]>()
-                .collect::<m![R, { Symbol<Segment<R>> }], m![1 # 8]>()
+                .fetch::<m![{ Symbol<Segment<R>> }], m![1 # 8]>()
+                .collect::<m![{ Symbol<Segment<R>> }], m![1 # 8]>()
                 .vector_init()
                 .vector_intra_slice_tag(TagMode::Zero)
                 .vector_fxp(FxpBinaryOp::ArithRightShift, 31)
                 .vector_fxp(FxpBinaryOp::MulInt, value)
                 .vector_narrow_trim::<m![1 # 4]>()
-                .vector_intra_slice_reduce::<Segment<R>, m![R], m![1 # 4]>(
+                .vector_intra_slice_reduce::<Segment<R>, m![1], m![1 # 4]>(
                     IntraSliceReduceOpI32::AddSat,
                 )
                 .vector_widen_pad::<m![1 # 8]>()
@@ -175,22 +184,28 @@ where
                 .commit_trim::<m![1 # 8]>()
                 .commit()
         };
-        // Each row's value of the segment that holds it, from the two masked sums.
+        // Each row's value of the segment that holds it, from the two masked sums, a row a flit
+        // of one slice as the steps after the grid take their rows.
         let select = |device: &mut Device,
-                      (starts, ends): (&Rows<R, Chips>, &Rows<R, Chips>)|
+                      (starts, ends): (&Sums<R, Chips>, &Sums<R, Chips>)|
          -> Rows<R, Chips> {
-            let ends = row_operand(device, ends);
-            device
+            let ends = scalar::register(device, ends);
+            let selected: Sums<R, Chips> = device
                 .main
                 .begin(starts.view())
-                .fetch::<m![R], m![1 # 8]>()
-                .collect::<m![R], m![1 # 8]>()
+                .fetch::<m![1], m![1 # 8]>()
+                .collect::<m![1], m![1 # 8]>()
                 .vector_init()
                 .vector_intra_slice_tag(TagMode::Zero)
                 .vector_fxp(FxpBinaryOp::SubFxp, &ends)
                 .vector_final()
                 .commit_trim::<m![1 # 8]>()
-                .commit()
+                .commit();
+            let mut rows = Rows::<R, Chips>::new();
+            selected
+                .view()
+                .to_dm_view(&mut device.tdma, rows.view_mut());
+            rows
         };
         // A field a flit in HBM first: a DMA into data memory moves whole eight-byte cells.
         let mut padded: HbmTensor<i32, Chips, m![Fields, { Symbol<Segment<R>> }, 1 # 8]> =
@@ -215,7 +230,7 @@ where
             i32,
             Chips,
             Cluster,
-            Slices,
+            RowSlices<R>,
             m![{ Symbol<Segment<R>> }, 1 # 8],
         > = device
             .main
