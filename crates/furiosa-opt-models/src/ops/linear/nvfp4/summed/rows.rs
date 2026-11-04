@@ -246,14 +246,46 @@ impl<H: AxisName, I: AxisName> AxisName for Piece<H, I> {
 }
 
 /// A weight's tensor scale, E4M3 block scales and codes on the slices of its passes: the weight
-/// begun.
-pub struct Landed<I: AxisName, O: AxisName, P: Ownership> {
+/// begun. Its codes are `C`: its own, borrowed from where a schedule landed them ahead, or none
+/// while they wait there.
+pub struct Landed<I: AxisName, O: AxisName, P: Ownership, C = InDm<I, O, P>> {
     global: DmTensor<f32, Chip, Cluster<I, O, P>, Owners<I, O, P>, m![1 # 8]>,
     blocks: DmTensor<f8e4m3, Chip, Cluster<I, O, P>, Owners<I, O, P>, Padded<I, O, P>>,
-    codes: DmTensor<f4e2m1, Chip, Cluster<I, O, P>, Owners<I, O, P>, Packed<I, O, P>>,
+    codes: C,
+}
+
+/// A weight's codes on the slices of its passes.
+type InDm<I, O, P> = DmTensor<f4e2m1, Chip, Cluster<I, O, P>, Owners<I, O, P>, Packed<I, O, P>>;
+
+/// The place a weight lands in, before it lands.
+impl<I: AxisName, O: AxisName, P: Ownership> Default for Landed<I, O, P> {
+    fn default() -> Self {
+        Self {
+            global: DmTensor::new(),
+            blocks: DmTensor::new(),
+            codes: DmTensor::new(),
+        }
+    }
 }
 
 impl<I: AxisName, O: AxisName, P: Ownership> Landed<I, O, P> {
+    /// The slices hold the weight: whole parts of its inputs, each owner's run of outputs whole
+    /// in the passes, the owners and parts filling every slice.
+    const TILED: () = {
+        let parts = I::SIZE / Chunk::<I>::SIZE;
+        let owners = O::SIZE / 2 / Owned::<I, O, P>::SIZE;
+        assert!(
+            I::SIZE.is_multiple_of(Chunk::<I>::SIZE)
+                && Chunk::<I>::SIZE.is_multiple_of(128)
+                && SLICES.is_multiple_of(parts)
+                && O::SIZE.is_multiple_of(2 * Owned::<I, O, P>::SIZE)
+                && TopSlots::<I, O, P>::SIZE * (owners / TopDigit::<I, O, P>::SIZE) * parts
+                    == SLICES
+                && Owned::<I, O, P>::SIZE.is_multiple_of(Height::<I, O, P>::SIZE)
+                && Height::<I, O, P>::SIZE.is_multiple_of(4)
+        )
+    };
+
     /// The weight's tensor scale, block scales and codes, in that order, one transfer each: a
     /// transfer into part of an owner would hold every later command until the part before it
     /// lands.
@@ -276,20 +308,7 @@ impl<I: AxisName, O: AxisName, P: Ownership> Landed<I, O, P> {
         V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O, P>>>,
         Held<Y, S>: Borrow<Scale<S>>,
     {
-        const {
-            let parts = I::SIZE / Chunk::<I>::SIZE;
-            let owners = O::SIZE / 2 / Owned::<I, O, P>::SIZE;
-            assert!(
-                I::SIZE.is_multiple_of(Chunk::<I>::SIZE)
-                    && Chunk::<I>::SIZE.is_multiple_of(128)
-                    && SLICES.is_multiple_of(parts)
-                    && O::SIZE.is_multiple_of(2 * Owned::<I, O, P>::SIZE)
-                    && TopSlots::<I, O, P>::SIZE * (owners / TopDigit::<I, O, P>::SIZE) * parts
-                        == SLICES
-                    && Owned::<I, O, P>::SIZE.is_multiple_of(Height::<I, O, P>::SIZE)
-                    && Height::<I, O, P>::SIZE.is_multiple_of(4)
-            )
-        };
+        const { Self::TILED };
         let global: &Scale<S> = weight.contract.global.borrow();
         Self {
             global: global.to_dm(&mut device.tdma),
@@ -297,7 +316,9 @@ impl<I: AxisName, O: AxisName, P: Ownership> Landed<I, O, P> {
             codes: weight.weight.borrow().to_dm(&mut device.tdma),
         }
     }
+}
 
+impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I, O, P, C> {
     /// Every live row's outputs `bf16(sum_b scale_b (sum_{k in b} code_k x_k) / global)`, a lane
     /// group at a time, each in the slices that sum it.
     fn project<R: AxisName, X: Stage<I, O, R, P>>(
@@ -467,8 +488,7 @@ impl<I: AxisName, O: AxisName, P: Ownership> Landed<I, O, P> {
         let sums = device
             .main
             .begin(
-                self.codes
-                    .view()
+                (self.codes.borrow().view())
                     .unpad::<Coded<I, O, P>>()
                     .tile::<Tiles<I, O, P>, 1, m![
                         { Elements<I, O, P> } # ({ Owner<I, O, P> }), { Part<I> }
@@ -526,8 +546,7 @@ impl<I: AxisName, O: AxisName, P: Ownership> Landed<I, O, P> {
         device
             .main
             .begin(
-                self.codes
-                    .view()
+                (self.codes.borrow().view())
                     .unpad::<Coded<I, O, P>>()
                     .tile::<Tiles<I, O, P>, 1, m![
                         { Elements<I, O, P> } # ({ Owner<I, O, P> }), { Part<I> }
@@ -807,6 +826,47 @@ where
     }
 }
 
+/// The same weight's codes landed into a place made before, so a schedule can land them a step
+/// ahead of the rows they meet and hold them across other work; its scales land when it is begun
+/// beside them.
+impl<'l, I: AxisName, O: AxisName, K, V, Y: Memory, P, S: M + 'static> Op<&'l mut Landed<I, O, P>>
+    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P, S>, Chip, K, V>
+where
+    K: Borrow<HbmTensor<f4e2m1, Chip, Codes<I, O, P>>>,
+    V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O, P>>>,
+    Held<Y, S>: Borrow<Scale<S>>,
+    P: Ownership,
+{
+    type Output = ();
+
+    fn forward(&self, device: &mut Device, landed: &'l mut Landed<I, O, P>) {
+        const { Landed::<I, O, P>::TILED };
+        (self.weight.borrow().view()).to_dm_view(&mut device.tdma, landed.codes.view_mut());
+    }
+}
+
+/// The same weight begun beside its codes landed in a place: its tensor scale and block scales,
+/// one transfer each.
+impl<'l, I: AxisName, O: AxisName, K, V, Y: Memory, P, S: M + 'static>
+    Op<Begin<&'l Landed<I, O, P>>>
+    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P, S>, Chip, K, V>
+where
+    V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O, P>>>,
+    Held<Y, S>: Borrow<Scale<S>>,
+    P: Ownership,
+{
+    type Output = Landed<I, O, P, ()>;
+
+    fn forward(&self, device: &mut Device, _: Begin<&'l Landed<I, O, P>>) -> Self::Output {
+        let global: &Scale<S> = self.contract.global.borrow();
+        Landed {
+            global: global.to_dm(&mut device.tdma),
+            blocks: self.weight_scale.borrow().to_dm(&mut device.tdma),
+            codes: (),
+        }
+    }
+}
+
 /// The live rows of a launch in their feature slices through a weight under the summed contract,
 /// into where its placement `P` puts them; the projected rows keep the live rows.
 impl<'x, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P: Place<I, O, R>, S: M + 'static>
@@ -837,6 +897,45 @@ impl<'x, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P: Place<I, O, 
         device: &mut Device,
         (landed, input): (Landed<I, O, P>, &'x Live<Spread<I, R>, R>),
     ) -> Self::Output {
+        let projected = landed.project(device, input);
+        P::place(device, input.with(projected))
+    }
+}
+
+/// The same rows through the weight begun beside its codes, which lie in their place.
+impl<
+    'l,
+    'x,
+    I: AxisName,
+    O: AxisName,
+    R: AxisName,
+    K,
+    V,
+    Y: Memory,
+    P: Place<I, O, R>,
+    S: M + 'static,
+>
+    Op<(
+        (Landed<I, O, P, ()>, &'l Landed<I, O, P>),
+        &'x Live<Spread<I, R>, R>,
+    )> for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P, S>, Chip, K, V>
+{
+    type Output = Live<P::Rows, R>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        ((scales, place), input): (
+            (Landed<I, O, P, ()>, &'l Landed<I, O, P>),
+            &'x Live<Spread<I, R>, R>,
+        ),
+    ) -> Self::Output {
+        let Landed { global, blocks, .. } = scales;
+        let landed = Landed {
+            global,
+            blocks,
+            codes: &place.codes,
+        };
         let projected = landed.project(device, input);
         P::place(device, input.with(projected))
     }
