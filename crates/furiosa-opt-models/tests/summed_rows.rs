@@ -22,7 +22,7 @@ use furiosa_opt_models::tensor::form::nvfp4::{Features, Scales, Summed, W4A16};
 use furiosa_opt_models::tensor::live::Live;
 use furiosa_opt_models::tensor::memory::Hbm;
 use furiosa_opt_models::tensor::parallel::Chip;
-use furiosa_opt_models::tensor::scalar::Value;
+use furiosa_opt_models::tensor::scalar::{Copies, Value};
 use furiosa_opt_std::{prelude::*, runtime::launch};
 use tokio::sync::Mutex;
 
@@ -48,7 +48,7 @@ type Nvfp4<I, O, P> = BlockScaled<
     f4e2m1,
     f8e4m3,
     Scales<I, O>,
-    Summed<W4A16, Hbm, P>,
+    Summed<W4A16, Hbm, P, Copies>,
     Chip,
     HbmTensor<f4e2m1, Chip, Codes<I, O, P>>,
     HbmTensor<f8e4m3, Chip, Blocks<I, O, P>>,

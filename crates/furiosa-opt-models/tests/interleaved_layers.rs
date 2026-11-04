@@ -25,7 +25,7 @@ use furiosa_opt_models::tensor::form::nvfp4::{Early, Features, Scale, Scales, Su
 use furiosa_opt_models::tensor::live::Live;
 use furiosa_opt_models::tensor::memory::Hbm;
 use furiosa_opt_models::tensor::parallel::Chip;
-use furiosa_opt_models::tensor::scalar::Value;
+use furiosa_opt_models::tensor::scalar::{Copies, Value};
 use furiosa_opt_models::{Branch, Interleave, Module, Op};
 use furiosa_opt_std::prelude::*;
 use furiosa_opt_std::runtime::{HbmBuffer, launch};
@@ -1066,8 +1066,13 @@ type Nvfp4<I, O, C, K = m![O, I], V = Scales<I, O>> = BlockScaled<
 >;
 
 /// An NVFP4 projection under the summed contract, held as the catalog's summed form holds it.
-type Summing<I, O> =
-    Nvfp4<I, O, Summed<W4A16>, summed::Codes<I, O, Features>, summed::Blocks<I, O, Features>>;
+type Summing<I, O> = Nvfp4<
+    I,
+    O,
+    Summed<W4A16, Hbm, Features, Copies>,
+    summed::Codes<I, O, Features>,
+    summed::Blocks<I, O, Features>,
+>;
 
 /// The call's live rows through one NVFP4 projection, from and back to HBM rows.
 #[device(chip = 1)]
@@ -1124,11 +1129,12 @@ impl Drawn {
         }
     }
 
-    /// The weights on the device under the contract `contract` makes of the tensor scale.
-    async fn coded<I: AxisName, O: AxisName, C, K: M, V: M>(
+    /// The weights on the device under the contract `contract` makes of the tensor scale, laid
+    /// out as `G`.
+    async fn coded<I: AxisName, O: AxisName, C, K: M, V: M, G: M>(
         &self,
         device: &mut Device,
-        contract: impl FnOnce(Scale) -> C,
+        contract: impl FnOnce(Scale<G>) -> C,
     ) -> Nvfp4<I, O, C, K, V> {
         let global = HostTensor::<f32, m![1 # 8]>::from_vec([
             self.global,

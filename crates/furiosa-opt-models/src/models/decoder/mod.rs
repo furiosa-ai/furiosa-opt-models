@@ -636,7 +636,7 @@ pub mod form {
     use crate::tensor::form::fp8::Block;
     use crate::tensor::form::fp8::Scales;
     use crate::tensor::form::nvfp4::{self, Early, Features, Late, Summed, W4A4, W4A16};
-    use crate::tensor::parallel::Chip;
+    use crate::tensor::{parallel::Chip, scalar};
     use furiosa_opt_std::prelude::*;
 
     /// BF16 weights.
@@ -666,7 +666,8 @@ pub mod form {
     /// [`Nvfp4`]'s weights under the experimental summed contract: a row's FP32 sum divides by the
     /// global scale, so no coefficient rounds to BF16. Opt in by naming it in place of [`Nvfp4`].
     /// A launch's projected rows end where `P` places them, as [`Summed`] reads it. HBM holds the
-    /// codes and block scales as the slices that sum them hold them, a load lays them out so.
+    /// codes and block scales as the slices that sum them hold them, and the global scale as
+    /// [`Copies`](crate::tensor::scalar::Copies); a load lays them out so.
     pub struct Nvfp4Summed<P = Features>(PhantomData<P>);
 
     /// How HBM holds [`Nvfp4Summed`]'s codes and block scales.
@@ -827,7 +828,7 @@ pub mod form {
                 f4e2m1,
                 f8e4m3,
                 nvfp4::Scales<In, Out>,
-                Summed<W4A16, X, P>,
+                Summed<W4A16, X, P, scalar::Copies>,
                 Chip,
                 X::Tensor<f4e2m1, Chip, summed::Codes<In, Out, P>>,
                 X::Tensor<f8e4m3, Chip, summed::Blocks<In, Out, P>>,
