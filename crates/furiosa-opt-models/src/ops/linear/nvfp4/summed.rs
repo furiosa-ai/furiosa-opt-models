@@ -3,10 +3,18 @@
 //! contraction, which sums every 16-input block; the vector engine multiplies each block sum by its
 //! E4M3 scale, adds a row's blocks, divides by the tensor scale and adds the slices that hold parts
 //! of the row. The live rows of a launch through such a weight are a todo.
+//!
+//! - A row splits into the input parts [`contraction::summed_parts`] derives, each in a slice.
+//! - Each cluster keeps half of the outputs in the blocks [`contraction::summed_blocks`] derives, a
+//!   block's parts in adjacent slices; the slices no block fills idle.
 
 use super::Vector;
 use crate::Op;
 use crate::ops::normalization::Spread;
+use crate::specialize::{
+    SLICES,
+    contraction::{self, SUMMED},
+};
 use crate::tensor::form::BlockScaled;
 use crate::tensor::form::nvfp4::{Held, Scale, Scales, Summed, W4A16};
 use crate::tensor::memory::Memory;
@@ -14,29 +22,31 @@ use crate::tensor::{live::Live, parallel::Chip, scalar};
 use core::borrow::Borrow;
 use furiosa_opt_std::prelude::*;
 
-/// Ways a row's inputs split over slices: the fewest, a power of two, that keep a slice's part
-/// within 4096 inputs, so its four rows' FP32 block scales take at most 4 KiB of the VRF.
+/// Ways a row's inputs split over slices.
 #[derive(Clone, Debug)]
 struct Parts<I>(std::marker::PhantomData<I>);
 
 impl<I: AxisName> AxisName for Parts<I> {
     const NAME: Ident = Ident::new("Parts");
-    const SIZE: usize = {
-        let mut parts = 1;
-        while I::SIZE / parts > 4096 {
-            parts *= 2;
-        }
-        parts
-    };
+    const SIZE: usize = contraction::summed_parts(I::SIZE);
 }
 
-/// Blocks each cluster keeps: as many as fill 128 of its slices with the parts of their rows.
+/// Blocks each cluster keeps.
 #[derive(Clone, Debug)]
-struct Blocks<I>(std::marker::PhantomData<I>);
+struct Blocks<I, O>(std::marker::PhantomData<(I, O)>);
 
-impl<I: AxisName> AxisName for Blocks<I> {
+impl<I: AxisName, O: AxisName> AxisName for Blocks<I, O> {
     const NAME: Ident = Ident::new("Blocks");
-    const SIZE: usize = 128 / <Parts<I> as AxisName>::SIZE;
+    const SIZE: usize = contraction::summed_blocks(I::SIZE, O::SIZE);
+}
+
+/// Slices of a block's span no part fills, so the blocks span a cluster's slices.
+#[derive(Clone, Debug)]
+struct Idle<I, O>(std::marker::PhantomData<(I, O)>);
+
+impl<I: AxisName, O: AxisName> AxisName for Idle<I, O> {
+    const NAME: Ident = Ident::new("Idle");
+    const SIZE: usize = SLICES / <Blocks<I, O> as AxisName>::SIZE / <Parts<I> as AxisName>::SIZE;
 }
 
 /// Rows of a block: each cluster keeps half of the outputs in its blocks.
@@ -45,22 +55,23 @@ struct Rows<I, O>(std::marker::PhantomData<(I, O)>);
 
 impl<I: AxisName, O: AxisName> AxisName for Rows<I, O> {
     const NAME: Ident = Ident::new("Rows");
-    const SIZE: usize = O::SIZE / 2 / <Blocks<I> as AxisName>::SIZE;
+    const SIZE: usize = O::SIZE / 2 / <Blocks<I, O> as AxisName>::SIZE;
 }
 
 type Block<I, O> = Symbol<Rows<I, O>>;
 type Ways<I> = Symbol<Parts<I>>;
+type Spare<I, O> = Symbol<Idle<I, O>>;
 /// The first half of the outputs in cluster 0, the second in cluster 1.
 type Cluster<O> = m![O / (O / 2)];
 /// A slice keeps one part of the rows of one block; the parts of a block are adjacent, innermost,
 /// for the inter-slice reducer.
-type Slices<I, O> = m![O % (O / 2) / ({ Block<I, O> }), 1 # 2, I / (I / ({ Ways<I> }))];
-type Reduced<I, O> = m![O % (O / 2) / ({ Block<I, O> }), 1 # 2, 1 # ({ Ways<I> })];
+type Slices<I, O> =
+    m![O % (O / 2) / ({ Block<I, O> }), 1 # ({ Spare<I, O> }), I / (I / ({ Ways<I> }))];
+type Reduced<I, O> = m![O % (O / 2) / ({ Block<I, O> }), 1 # ({ Spare<I, O> }), 1 # ({ Ways<I> })];
 /// A slice's part of a row's inputs.
 type Part<I> = m![I % (I / ({ Ways<I> }))];
-/// The four rows of every block one pass covers: the transpose to the output packet takes at
-/// most four, and a commit packet at least eight bytes.
-type Elements<I, O> = m![O % ({ Block<I, O> }) = 4];
+/// The rows of every block one pass covers.
+type Elements<I, O> = m![O % ({ Block<I, O> }) = { SUMMED }];
 
 /// One contiguous BF16 row through a weight under the summed contract.
 impl<I: AxisName, O: AxisName, K, V, Y: Memory> Op<&Vector<I>>
@@ -130,16 +141,12 @@ fn project<I: AxisName, O: AxisName>(
     global: &Scale,
     input: HbmTensorView<'_, bf16, Chip, m![I]>,
 ) -> HbmTensor<bf16, Chip, m![O]> {
-    const {
-        assert!(I::SIZE.is_multiple_of(<Parts<I> as AxisName>::SIZE * 128));
-        assert!(O::SIZE.is_multiple_of(2 * <Blocks<I> as AxisName>::SIZE * 4));
-    };
     // Every slice of a block's part holds that part of the row, in both clusters.
     let input: DmTensor<
         bf16,
         Chip,
         m![2],
-        m![{ Symbol<Blocks<I>> }, 1 # 2, I / (I / ({ Ways<I> }))],
+        m![{ Symbol<Blocks<I, O>> }, 1 # ({ Spare<I, O> }), I / (I / ({ Ways<I> }))],
         Part<I>,
     > = input.to_dm(&mut device.tdma);
     // SAFETY: the copies of a block's part of the row sit where its slices are.
@@ -163,18 +170,18 @@ fn project<I: AxisName, O: AxisName>(
     let mut output: DmTensor<bf16, Chip, Cluster<O>, Reduced<I, O>, m![O % ({ Block<I, O> })]> =
         DmTensor::new();
     #[unroll]
-    for pass in 0..(<Rows<I, O> as AxisName>::SIZE / 4) {
-        let at = 4 * pass;
+    for pass in 0..(<Rows<I, O> as AxisName>::SIZE / SUMMED) {
+        let at = SUMMED * pass;
         let scale: VrfTensor<f32, Chip, Cluster<O>, Slices<I, O>, m![{ Elements<I, O> }, { Part<I> } / 16]> = device
             .sub
-            .begin(scales.view().tile::<m![O % ({ Block<I, O> })], 4, m![{ Elements<I, O> } # ({ Block<I, O> }), { Part<I> } / 16]>(at))
+            .begin(scales.view().tile::<m![O % ({ Block<I, O> })], SUMMED, m![{ Elements<I, O> } # ({ Block<I, O> }), { Part<I> } / 16]>(at))
             .fetch::<Elements<I, O>, m![{ Part<I> } / 16]>()
             .fetch_cast::<f32>()
             .collect::<m![{ Elements<I, O> }, { Part<I> } / 128], m![I / 16 % 8]>()
             .to_vrf();
         let codes: DmTensor<f4e2m1, Chip, Cluster<O>, Slices<I, O>, m![{ Elements<I, O> }, { Part<I> }]> = codes
             .view()
-            .tile::<m![O % ({ Block<I, O> })], 4, m![O / (O / 2), O % (O / 2) / ({ Block<I, O> }), { Elements<I, O> } # ({ Block<I, O> }), I]>(at)
+            .tile::<m![O % ({ Block<I, O> })], SUMMED, m![O / (O / 2), O % (O / 2) / ({ Block<I, O> }), { Elements<I, O> } # ({ Block<I, O> }), I]>(at)
             .to_dm(&mut device.tdma);
         // A packet is one block of 16 BF16 values, which the packet reducer sums, so each block
         // sum meets its scale as a broadcast VRF read.
@@ -203,7 +210,7 @@ fn project<I: AxisName, O: AxisName>(
             .commit_view(
                 output
                     .view_mut()
-                    .tile::<m![O % ({ Block<I, O> })], 4, m![{ Elements<I, O> } #{!} ({ Block<I, O> })]>(at),
+                    .tile::<m![O % ({ Block<I, O> })], SUMMED, m![{ Elements<I, O> } #{!} ({ Block<I, O> })]>(at),
             );
     }
     output.to_hbm(&mut device.tdma)
@@ -220,7 +227,14 @@ mod tests {
     use furiosa_opt_std::runtime::launch;
     use std::iter;
 
-    axes![Hidden = 3840, Intermediate = 15360];
+    axes![
+        Hidden = 3840,
+        Intermediate = 15360,
+        Width = 4096,
+        Span = 12288,
+        Narrow = 2560,
+        Uneven = 9728
+    ];
 
     type Coded<I, O> = BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16>>;
 
@@ -317,5 +331,27 @@ mod tests {
         let mut device = Device::new(projected.topology()).unwrap();
         rounds_the_product::<Hidden, Intermediate>(&mut device, 1).await;
         rounds_the_product::<Intermediate, Hidden>(&mut device, 4).await;
+    }
+
+    /// A Gemma 4 row stays whole beside 128 blocks a cluster, and its down projection's splits in
+    /// four beside 32; an output that 128 blocks of whole passes do not split takes fewer blocks,
+    /// and one that 256 split takes every slice.
+    #[test]
+    fn derives_the_widest_tiling() {
+        use crate::specialize::contraction::{summed_blocks, summed_parts};
+        let tiling = |i, o| (summed_parts(i), summed_blocks(i, o));
+        assert_eq!(tiling(3840, 15360), (1, 128));
+        assert_eq!(tiling(15360, 3840), (4, 32));
+        assert_eq!(tiling(4096, 12288), (1, 256));
+        assert_eq!(tiling(2560, 9728), (1, 64));
+    }
+
+    /// Qwen3 8B's and 4B's up projections: a block in every slice, and blocks that leave three of a
+    /// cluster's four slices idle.
+    #[tokio::test(flavor = "current_thread")]
+    async fn projects_rows_over_each_derived_tiling() {
+        let mut device = Device::new(projected.topology()).unwrap();
+        rounds_the_product::<Width, Span>(&mut device, 7).await;
+        rounds_the_product::<Narrow, Uneven>(&mut device, 10).await;
     }
 }
