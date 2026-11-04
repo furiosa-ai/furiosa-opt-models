@@ -20,11 +20,12 @@ use crate::load::{Checkpoint, Children, Context, Load, LoadError};
 use crate::tensor::memory::{Hbm, Memory};
 use crate::tensor::parallel::Chip;
 
-/// FP32 scalar in the first lane of an eight-element padded vector.
-pub type Scale = HbmTensor<f32, Chip, m![1 # 8]>;
+/// FP32 scalar in the first lane of an eight-element padded vector, laid out in HBM as `S`: one
+/// copy, or [`Copies`](crate::tensor::scalar::Copies) of it.
+pub type Scale<S = m![1 # 8]> = HbmTensor<f32, Chip, S>;
 
 /// A [`Scale`] held in memory `X`.
-pub type Held<X> = <X as Memory>::Tensor<f32, Chip, m![1 # 8]>;
+pub type Held<X, S = m![1 # 8]> = <X as Memory>::Tensor<f32, Chip, S>;
 
 /// One E4M3 scale for each 16 consecutive inputs of an output row.
 pub type Scales<In, Out> = m![Out, In / 16];
@@ -48,16 +49,17 @@ pub struct Early<A, X: Memory = Hbm> {
 /// `weight_global_scale` under the late contract's arithmetic. Experimental: a row projected this
 /// way differs from [`Early`]'s in the rounding of each coefficient, which it leaves out. A launch's
 /// projected rows end where `P` places them: in the feature slices ([`Features`]), or kept where
-/// their passes summed them for elementwise steps and a next summed projection to read there.
+/// their passes summed them for elementwise steps and a next summed projection to read there. HBM
+/// holds the tensor scale laid out as `S`, a [`Scale`]'s.
 #[derive(DeviceSend, Load)]
-pub struct Summed<A, X: Memory = Hbm, P = Features> {
+pub struct Summed<A, X: Memory = Hbm, P = Features, S: M + 'static = m![1 # 8]> {
     /// The form inputs enter the contraction in.
     #[load(rename = "")]
     pub input: A,
     /// The tensor scale the reduced sum divides by: an output is `sum(code * block scale * x) /
     /// global`.
     #[load(rename = "weight_global_scale")]
-    pub global: Held<X>,
+    pub global: Held<X, S>,
     /// Where a launch's projected rows end.
     pub place: PhantomData<P>,
 }

@@ -7,7 +7,7 @@
 use super::Vector;
 use crate::Op;
 use crate::tensor::form::BlockScaled;
-use crate::tensor::form::nvfp4::{Held, Scale, Scales, Summed, W4A16};
+use crate::tensor::form::nvfp4::{Features, Held, Scale, Scales, Summed, W4A16};
 use crate::tensor::memory::Memory;
 use crate::tensor::{parallel::Chip, scalar};
 use core::borrow::Borrow;
@@ -64,30 +64,30 @@ type Part<I> = m![I % (I / ({ Ways<I> }))];
 type Elements<I, O> = m![O % ({ Block<I, O> }) = 4];
 
 /// One contiguous BF16 row through a weight under the summed contract.
-impl<I: AxisName, O: AxisName, K, V, Y: Memory> Op<&Vector<I>>
-    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y>, Chip, K, V>
+impl<I: AxisName, O: AxisName, K, V, Y: Memory, S: M + 'static> Op<&Vector<I>>
+    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, Features, S>, Chip, K, V>
 where
     K: Borrow<HbmTensor<f4e2m1, Chip, m![O, I]>>,
     V: Borrow<HbmTensor<f8e4m3, Chip, Scales<I, O>>>,
-    Held<Y>: Borrow<Scale>,
+    Held<Y, S>: Borrow<Scale<S>>,
 {
     type Output = Vector<O>;
 
     /// The codes decode to BF16 straight into the contraction, and the scales apply to the block
     /// sums, so no tile is restored.
     fn forward(&self, device: &mut Device, input: &Vector<I>) -> Self::Output {
-        let global: &Scale = self.contract.global.borrow();
+        let global: &Scale<S> = self.contract.global.borrow();
         project(device, self.codes(), self.scales(), global, input.view())
     }
 }
 
 /// Every output `bf16(sum_b scale_b (sum_{k in b} code_k x_k) / global)`, the sums in FP32 and the
 /// result rounded once. Each pass lands four rows of every block; the block scales land once.
-fn project<I: AxisName, O: AxisName>(
+fn project<I: AxisName, O: AxisName, S: M>(
     device: &mut Device,
     codes: &HbmTensor<f4e2m1, Chip, m![O, I]>,
     scales: &HbmTensor<f8e4m3, Chip, Scales<I, O>>,
-    global: &Scale,
+    global: &Scale<S>,
     input: HbmTensorView<'_, bf16, Chip, m![I]>,
 ) -> HbmTensor<bf16, Chip, m![O]> {
     const {

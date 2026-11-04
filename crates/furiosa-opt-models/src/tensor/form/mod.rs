@@ -434,32 +434,33 @@ where
 /// An NVFP4 weight of a compressed-tensors checkpoint: its packed E2M1 codes under
 /// `weight_packed`, its E4M3 block scales under `weight_scale`, and its tensor scale read by the
 /// experimental summed contract.
-impl<'a, In: AxisName, Out: AxisName, A, X: Memory, P, W, T> Load<&'a Checkpoint>
-    for Nvfp4<In, Out, nvfp4::Summed<A, X, P>, W, T>
+impl<'a, In: AxisName, Out: AxisName, A, X: Memory, P, S: M + 'static, W, T> Load<&'a Checkpoint>
+    for Nvfp4<In, Out, nvfp4::Summed<A, X, P, S>, W, T>
 where
     W: Load<HostTensor<f4e2m1, m![{ Chip }, { m![Out, In] }]>>,
     T: Load<nvfp4::BlockScales<In, Out>>,
-    nvfp4::Summed<A, X, P>: Load<&'a Checkpoint>,
+    nvfp4::Summed<A, X, P, S>: Load<&'a Checkpoint>,
 {
     fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
         context.checkpoint(from, |cx| Self::read(from, cx, "weight_packed"))
     }
 }
 
-impl<'t, 's, In: AxisName, Out: AxisName, A, X: Memory, P, W, T>
+impl<'t, 's, In: AxisName, Out: AxisName, A, X: Memory, P, S: M + 'static, W, T>
     Load<(
-        &'t mut Nvfp4<In, Out, nvfp4::Summed<A, X, P>, W, T>,
+        &'t mut Nvfp4<In, Out, nvfp4::Summed<A, X, P, S>, W, T>,
         &'s Checkpoint,
-    )> for &'t mut Nvfp4<In, Out, nvfp4::Summed<A, X, P>, W, T>
+    )> for &'t mut Nvfp4<In, Out, nvfp4::Summed<A, X, P, S>, W, T>
 where
     for<'u> &'u mut W: Load<(&'u mut W, Codes<In, Out>)>,
     for<'u> &'u mut T: Load<(&'u mut T, nvfp4::BlockScales<In, Out>)>,
-    for<'u> &'u mut nvfp4::Summed<A, X, P>: Load<(&'u mut nvfp4::Summed<A, X, P>, &'s Checkpoint)>,
+    for<'u> &'u mut nvfp4::Summed<A, X, P, S>:
+        Load<(&'u mut nvfp4::Summed<A, X, P, S>, &'s Checkpoint)>,
 {
     fn load(
         context: &mut Context<'_>,
         (into, from): (
-            &'t mut Nvfp4<In, Out, nvfp4::Summed<A, X, P>, W, T>,
+            &'t mut Nvfp4<In, Out, nvfp4::Summed<A, X, P, S>, W, T>,
             &'s Checkpoint,
         ),
     ) -> Result<Self, LoadError> {

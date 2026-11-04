@@ -245,14 +245,24 @@ impl<I: AxisName, O: AxisName, P: Ownership> Landed<I, O, P> {
     /// The weight's tensor scale, block scales and codes, in that order, one transfer each: a
     /// transfer into part of an owner would hold every later command until the part before it
     /// lands.
-    fn land<Y: Memory, K, V>(
+    fn land<Y: Memory, S: M + 'static, K, V>(
         device: &mut Device,
-        weight: &BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P>, Chip, K, V>,
+        weight: &BlockScaled<
+            I,
+            O,
+            f4e2m1,
+            f8e4m3,
+            Scales<I, O>,
+            Summed<W4A16, Y, P, S>,
+            Chip,
+            K,
+            V,
+        >,
     ) -> Self
     where
         K: Borrow<HbmTensor<f4e2m1, Chip, Codes<I, O, P>>>,
         V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O, P>>>,
-        Held<Y>: Borrow<Scale>,
+        Held<Y, S>: Borrow<Scale<S>>,
     {
         const {
             let parts = I::SIZE / Chunk::<I>::SIZE;
@@ -268,7 +278,7 @@ impl<I: AxisName, O: AxisName, P: Ownership> Landed<I, O, P> {
                     && Height::<I, O, P>::SIZE.is_multiple_of(4)
             )
         };
-        let global: &Scale = weight.contract.global.borrow();
+        let global: &Scale<S> = weight.contract.global.borrow();
         Self {
             global: global.to_dm(&mut device.tdma),
             blocks: weight.weight_scale.borrow().to_dm(&mut device.tdma),
@@ -631,13 +641,13 @@ impl<I: AxisName, O: AxisName, R: AxisName> Place<I, O, R> for Kept {
 }
 
 /// The live rows of a launch in HBM through a weight under the summed contract, into HBM.
-impl<I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory>
+impl<I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, S: M + 'static>
     Op<(Live<(), R>, &HbmTensor<bf16, Chip, m![R, I]>)>
-    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y>, Chip, K, V>
+    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, Features, S>, Chip, K, V>
 where
     K: Borrow<HbmTensor<f4e2m1, Chip, Codes<I, O, Features>>>,
     V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O, Features>>>,
-    Held<Y>: Borrow<Scale>,
+    Held<Y, S>: Borrow<Scale<S>>,
 {
     type Output = HbmTensor<bf16, Chip, m![R, O]>;
 
@@ -654,12 +664,12 @@ where
 }
 
 /// A weight under the summed contract begun: its scales and codes land before any rows arrive.
-impl<I: AxisName, O: AxisName, K, V, Y: Memory, P> Op<Begin<()>>
-    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P>, Chip, K, V>
+impl<I: AxisName, O: AxisName, K, V, Y: Memory, P, S: M + 'static> Op<Begin<()>>
+    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P, S>, Chip, K, V>
 where
     K: Borrow<HbmTensor<f4e2m1, Chip, Codes<I, O, P>>>,
     V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O, P>>>,
-    Held<Y>: Borrow<Scale>,
+    Held<Y, S>: Borrow<Scale<S>>,
     P: Ownership,
 {
     type Output = Landed<I, O, P>;
@@ -671,13 +681,13 @@ where
 
 /// The live rows of a launch in their feature slices through a weight under the summed contract,
 /// into where its placement `P` puts them; the projected rows keep the live rows.
-impl<'x, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P: Place<I, O, R>>
+impl<'x, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P: Place<I, O, R>, S: M + 'static>
     Op<&'x Live<Spread<I, R>, R>>
-    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P>, Chip, K, V>
+    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P, S>, Chip, K, V>
 where
     K: Borrow<HbmTensor<f4e2m1, Chip, Codes<I, O, P>>>,
     V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O, P>>>,
-    Held<Y>: Borrow<Scale>,
+    Held<Y, S>: Borrow<Scale<S>>,
 {
     type Output = Live<P::Rows, R>;
 
@@ -688,9 +698,9 @@ where
 }
 
 /// The same rows through the weight as it landed.
-impl<'x, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P: Place<I, O, R>>
+impl<'x, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P: Place<I, O, R>, S: M + 'static>
     Op<(Landed<I, O, P>, &'x Live<Spread<I, R>, R>)>
-    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P>, Chip, K, V>
+    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P, S>, Chip, K, V>
 {
     type Output = Live<P::Rows, R>;
 
@@ -706,13 +716,13 @@ impl<'x, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P: Place<I, O, 
 
 /// The live rows a summed projection of `H` inputs kept where its passes summed them, through a
 /// weight under the summed contract, into where its placement `P` puts them.
-impl<'x, H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P>
+impl<'x, H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P, S: M + 'static>
     Op<&'x Live<Kept<Summing<H, I, R, Kept>>, R>>
-    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P>, Chip, K, V>
+    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P, S>, Chip, K, V>
 where
     K: Borrow<HbmTensor<f4e2m1, Chip, Codes<I, O, P>>>,
     V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O, P>>>,
-    Held<Y>: Borrow<Scale>,
+    Held<Y, S>: Borrow<Scale<S>>,
     P: Place<I, O, R>,
 {
     type Output = Live<P::Rows, R>;
@@ -729,9 +739,9 @@ where
 
 /// The same rows through the weight as it landed: they land in both clusters as they lie, or in
 /// the feature slices where they cannot lie so, then they project.
-impl<'x, H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P>
+impl<'x, H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P, S: M + 'static>
     Op<(Landed<I, O, P>, &'x Live<Kept<Summing<H, I, R, Kept>>, R>)>
-    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P>, Chip, K, V>
+    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P, S>, Chip, K, V>
 where
     P: Place<I, O, R>,
 {
@@ -755,9 +765,9 @@ where
 
 /// The same rows begun with the weight as it landed: one transfer lands them in both clusters as
 /// they lie, so a schedule can issue it ahead of other transfers; given back, they project.
-impl<'x, H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P>
+impl<'x, H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P, S: M + 'static>
     Op<Begin<(Landed<I, O, P>, &'x Live<Kept<Summing<H, I, R, Kept>>, R>)>>
-    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P>, Chip, K, V>
+    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P, S>, Chip, K, V>
 where
     P: Ownership,
 {
@@ -776,9 +786,9 @@ where
 }
 
 /// Rows landed in both clusters through the weight as it landed.
-impl<H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P>
+impl<H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P, S: M + 'static>
     Op<(Landed<I, O, P>, Live<Both<H, I, R>, R>)>
-    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P>, Chip, K, V>
+    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P, S>, Chip, K, V>
 where
     P: Place<I, O, R>,
 {
