@@ -87,6 +87,21 @@ pub(crate) type Attended<G> = DmTensor<
     }],
 >;
 
+/// A window's keys in the tensor registers and its score mask and bias in the vector registers,
+/// for `Count` row groups: all its scores read of where the window landed.
+pub(crate) struct Registers<G: Partition, Count: M> {
+    key: TrfTensor<
+        bf16,
+        Chip<G>,
+        G::Cluster,
+        G::Slices,
+        m![{ G::Keys } % 8],
+        m![{ Count }, { G::Keys } / 8, { G::Head }],
+    >,
+    mask: Mask<G, Count>,
+    bias: Mask<G, Count>,
+}
+
 /// Geometry and score scaling shared by shard-local attention and its softmax reduction.
 pub(crate) trait Partition: Sized {
     type Chip: M;
@@ -128,48 +143,48 @@ pub(crate) trait Partition: Sized {
 
     /// [`Self::windows`] landing windows alternately in two places, `rest` (at most `Rest`) after
     /// the first; `prepare` runs before the next lands: its page mapping waits for every transfer.
-    fn overlapped<P, V, Rest: AxisName>(
+    fn overlapped<P, V, F, Rest: AxisName>(
         device: &mut Device,
         rest: usize,
         (even, odd, values): (&mut P, &mut P, &mut V),
         (mut land, mut prepare, mut attend): (
             impl FnMut(&mut Device, usize, &mut P),
-            impl FnMut(&mut Device, &P, &mut V),
-            impl FnMut(&mut Device, &P, &V) -> (Partial<Self>, Local<Self>),
+            impl FnMut(&mut Device, &P, &mut V) -> F,
+            impl FnMut(&mut Device, (&P, F), &V) -> (Partial<Self>, Local<Self>),
         ),
         boundary: impl FnOnce(&mut Device),
     ) -> Attended<Self> {
         land(device, 0, even);
         boundary(device);
-        prepare(device, even, values);
+        let window = prepare(device, even, values);
         // A device loop whose bound folds to zero is refused, so fewer windows skip its loops.
         if const { Rest::SIZE > 0 } {
             for _ in 0..rest.min(1) {
                 land(device, 1, odd);
             }
         }
-        let (mut carry, mut running) = attend(device, even, values);
+        let (mut carry, mut running) = attend(device, (even, window), values);
         // Pair `p` attends windows `2p + 1` and `2p + 2`, each while the next one lands.
         if const { Rest::SIZE > 0 } {
             for pair in 0..(rest + 1) / 2 {
                 let after = rest - 2 * pair;
-                prepare(device, odd, values);
+                let window = prepare(device, odd, values);
                 if const { Rest::SIZE > 1 } {
                     for _ in 0..(after / 2).min(1) {
                         land(device, 2 * pair + 2, even);
                     }
                 }
-                let (partial, lse) = attend(device, odd, values);
+                let (partial, lse) = attend(device, (odd, window), values);
                 (carry, running) = Self::fold(device, &carry, &running, &partial, &lse);
                 if const { Rest::SIZE > 1 } {
                     for _ in 0..(after / 2).min(1) {
-                        prepare(device, even, values);
+                        let window = prepare(device, even, values);
                         if const { Rest::SIZE > 2 } {
                             for _ in 0..((after - 1) / 2).min(1) {
                                 land(device, 2 * pair + 3, odd);
                             }
                         }
-                        let (partial, lse) = attend(device, even, values);
+                        let (partial, lse) = attend(device, (even, window), values);
                         (carry, running) = Self::fold(device, &carry, &running, &partial, &lse);
                     }
                 }
@@ -236,26 +251,100 @@ pub(crate) trait Partition: Sized {
             .commit_view(values);
     }
 
-    /// The shard's attention of `query` over one window's `key` rows and its values transposed in
-    /// `values`: `partial` and `lse`.
-    fn attend<Count: M, Q: M, K: M, V: M, B: M, P: M, L: M>(
+    /// A window's `key` rows and its `bias` read into the registers its scores take them from.
+    fn fill<Count: M, K: M, B: M>(
+        device: &mut Device,
+        key: DmTensorView<'_, bf16, Chip<Self>, Self::Cluster, Self::Slices, K>,
+        bias: DmTensorView<'_, f32, Chip<Self>, Self::Cluster, Self::Slices, B>,
+    ) -> Registers<Self, Count> {
+        let mask = device
+            .main
+            .begin(bias.clone())
+            .fetch::<m![{ Count }, { Self::Groups }, { Self::Keys } / 8], m![{ Self::Keys } % 8]>()
+            .collect::<m![{ Count }, { Self::Groups }, { Self::Keys } / 8], m![{ Self::Keys } % 8]>(
+            )
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Comparison([
+                Cmp::Equal(0.0f32),
+                Cmp::Equal(0.0f32),
+                Cmp::Equal(0.0f32),
+                Cmp::Equal(0.0f32),
+            ]))
+            .vector_logic(LogicBinaryOpF32::BitAnd, 0.0f32)
+            .vector_logic(
+                LogicBinaryOpF32::BitOr,
+                Branched::imm(
+                    TagGuard::matches([
+                        BitReq::One,
+                        BitReq::Ignore,
+                        BitReq::Ignore,
+                        BitReq::Ignore,
+                    ]),
+                    f32::from_bits(u32::MAX),
+                ),
+            )
+            .vector_final()
+            .to_vrf(&mut device.sub);
+        let bias = device
+            .main
+            .begin(bias)
+            .fetch::<m![{ Count }, { Self::Groups }, { Self::Keys } / 8], m![{ Self::Keys } % 8]>()
+            .collect::<m![{ Count }, { Self::Groups }, { Self::Keys } / 8], m![{ Self::Keys } % 8]>(
+            )
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Comparison([Cmp::Equal(0.0f32); 4]))
+            .vector_logic(LogicBinaryOpF32::BitAnd, 0.0f32)
+            .vector_logic(
+                LogicBinaryOpF32::BitOr,
+                Branched::imm(
+                    TagGuard::matches([
+                        BitReq::Zero,
+                        BitReq::Ignore,
+                        BitReq::Ignore,
+                        BitReq::Ignore,
+                    ]),
+                    f32::NEG_INFINITY,
+                ),
+            )
+            .vector_final()
+            .to_vrf(&mut device.sub);
+        let key = device
+            .sub
+            .begin(key)
+            .fetch::<m![
+                { Self::Keys } % 8,
+                { Count },
+                { Self::Keys } / 8,
+                { Self::Head } / 16
+            ], m![{ Self::Head } % 16]>()
+            .collect::<m![
+                { Self::Keys } % 8,
+                { Count },
+                { Self::Keys } / 8,
+                { Self::Head } / 16
+            ], m![{ Self::Head } % 16]>()
+            .to_trf();
+        Registers { key, mask, bias }
+    }
+
+    /// The shard's attention of `query` over one window's `registers` and its values transposed
+    /// in `values`: `partial` and `lse`.
+    fn attend<Count: M, Q: M, V: M, P: M, L: M>(
         device: &mut Device,
         query: DmTensorView<'_, bf16, Chip<Self>, Self::Cluster, Self::Slices, Q>,
-        (key, values): (
-            DmTensorView<'_, bf16, Chip<Self>, Self::Cluster, Self::Slices, K>,
+        (registers, values): (
+            &Registers<Self, Count>,
             DmTensorView<'_, bf16, Chip<Self>, Self::Cluster, Self::Slices, V>,
         ),
-        bias: DmTensorView<'_, f32, Chip<Self>, Self::Cluster, Self::Slices, B>,
         (partial, lse): (
             DmTensorViewMut<'_, f32, Chip<Self>, Self::Cluster, Self::Slices, P>,
             DmTensorViewMut<'_, f32, Chip<Self>, Self::Cluster, Self::Slices, L>,
         ),
     ) {
-        let logits: Slots<Self, Count> =
-            qk_logits::<Self, Count, _, _, _>(device, query, key, bias)
-                .cast::<bf16, m![{Self::Keys} % 8 # 16]>()
-                .commit_trim::<m![{ Self::Keys } % 8]>()
-                .commit();
+        let logits: Slots<Self, Count> = qk_logits::<Self, Count, _>(device, query, registers)
+            .cast::<bf16, m![{Self::Keys} % 8 # 16]>()
+            .commit_trim::<m![{ Self::Keys } % 8]>()
+            .commit();
         // Shard-local softmax avoids broadcasting scores and three inter-slice reductions.
         // Its sum returns as a register operand for normalizing the shard's weighted values.
         let max: Statistics<Self, Count> = device
@@ -364,8 +453,9 @@ pub(crate) trait Partition: Sized {
         partial: DmTensorViewMut<'_, f32, Chip<Self>, Self::Cluster, Self::Slices, P>,
         lse: DmTensorViewMut<'_, f32, Chip<Self>, Self::Cluster, Self::Slices, L>,
     ) {
+        let registers = Self::fill::<Count, _, _>(device, key, bias);
         let logits: Slots<Self, Count, f32> =
-            qk_logits::<Self, Count, _, _, _>(device, query, key, bias)
+            qk_logits::<Self, Count, _>(device, query, &registers)
                 .commit_trim::<m![{ Self::Keys } % 8]>()
                 .commit();
         let max: Statistics<Self, Count> = device
@@ -707,11 +797,10 @@ pub(crate) trait Partition: Sized {
 const PRESENT: TagGuard =
     TagGuard::matches([BitReq::Zero, BitReq::Ignore, BitReq::Ignore, BitReq::Ignore]);
 
-fn qk_logits<'a, G: Partition, Count: M, Q: M, K: M, B: M>(
+fn qk_logits<'a, G: Partition, Count: M, Q: M>(
     device: &'a mut Device,
     query: DmTensorView<'a, bf16, Chip<G>, G::Cluster, G::Slices, Q>,
-    chunk: DmTensorView<'_, bf16, Chip<G>, G::Cluster, G::Slices, K>,
-    bias: DmTensorView<'_, f32, Chip<G>, G::Cluster, G::Slices, B>,
+    Registers { key, mask, bias }: &Registers<G, Count>,
 ) -> VectorFinalTensor<
     'a,
     { Tu::Main },
@@ -722,68 +811,6 @@ fn qk_logits<'a, G: Partition, Count: M, Q: M, K: M, B: M>(
     m![{ Count }, { G::Groups }, { G::Keys } / 8],
     m![{ G::Keys } % 8],
 > {
-    let mask: Mask<G, Count> = device
-        .main
-        .begin(bias.clone())
-        .fetch::<m![{ Count }, { G::Groups }, { G::Keys } / 8], m![{ G::Keys } % 8]>()
-        .collect::<m![{ Count }, { G::Groups }, { G::Keys } / 8], m![{ G::Keys } % 8]>()
-        .vector_init()
-        .vector_intra_slice_tag(TagMode::Comparison([
-            Cmp::Equal(0.0f32),
-            Cmp::Equal(0.0f32),
-            Cmp::Equal(0.0f32),
-            Cmp::Equal(0.0f32),
-        ]))
-        .vector_logic(LogicBinaryOpF32::BitAnd, 0.0f32)
-        .vector_logic(
-            LogicBinaryOpF32::BitOr,
-            Branched::imm(
-                TagGuard::matches([BitReq::One, BitReq::Ignore, BitReq::Ignore, BitReq::Ignore]),
-                f32::from_bits(u32::MAX),
-            ),
-        )
-        .vector_final()
-        .to_vrf(&mut device.sub);
-    let bias: Mask<G, Count> = device
-        .main
-        .begin(bias.clone())
-        .fetch::<m![{ Count }, { G::Groups }, { G::Keys } / 8], m![{ G::Keys } % 8]>()
-        .collect::<m![{ Count }, { G::Groups }, { G::Keys } / 8], m![{ G::Keys } % 8]>()
-        .vector_init()
-        .vector_intra_slice_tag(TagMode::Comparison([Cmp::Equal(0.0f32); 4]))
-        .vector_logic(LogicBinaryOpF32::BitAnd, 0.0f32)
-        .vector_logic(
-            LogicBinaryOpF32::BitOr,
-            Branched::imm(
-                TagGuard::matches([BitReq::Zero, BitReq::Ignore, BitReq::Ignore, BitReq::Ignore]),
-                f32::NEG_INFINITY,
-            ),
-        )
-        .vector_final()
-        .to_vrf(&mut device.sub);
-    let key: TrfTensor<
-        bf16,
-        Chip<G>,
-        G::Cluster,
-        G::Slices,
-        m![{ G::Keys } % 8],
-        m![{ Count }, { G::Keys } / 8, { G::Head }],
-    > = device
-        .sub
-        .begin(chunk)
-        .fetch::<m![
-            { G::Keys } % 8,
-            { Count },
-            { G::Keys } / 8,
-            { G::Head } / 16
-        ], m![{ G::Head } % 16]>()
-        .collect::<m![
-            { G::Keys } % 8,
-            { Count },
-            { G::Keys } / 8,
-            { G::Head } / 16
-        ], m![{ G::Head } % 16]>()
-        .to_trf();
     device
         .main
         .begin(query)
@@ -796,7 +823,7 @@ fn qk_logits<'a, G: Partition, Count: M, Q: M, K: M, B: M>(
             _,
             _,
         >(
-            &key,
+            key,
         )
         .contract_packet::<m![1]>()
         .contract_time::<m![{ Count }, { G::Groups }, { G::Keys } / 8]>()
@@ -805,7 +832,7 @@ fn qk_logits<'a, G: Partition, Count: M, Q: M, K: M, B: M>(
         )
         .vector_init()
         .vector_intra_slice_tag(TagMode::Zero)
-        .vector_logic(LogicBinaryOpF32::BitAnd, &mask)
+        .vector_logic(LogicBinaryOpF32::BitAnd, mask)
         .vector_narrow_split::<
             m![{ Count }, { G::Groups }, { G::Keys } / 8, { G::Keys } % 8 / 4],
             m![{ G::Keys } % 4],
@@ -813,7 +840,7 @@ fn qk_logits<'a, G: Partition, Count: M, Q: M, K: M, B: M>(
         )
         .vector_fp_div(G::DIVISOR)
         .vector_widen_concat::<m![{ Count }, { G::Groups }, { G::Keys } / 8], m![{ G::Keys } % 8]>()
-        .vector_clip(ClipBinaryOpF32::Add, &bias)
+        .vector_clip(ClipBinaryOpF32::Add, bias)
         .vector_final()
 }
 

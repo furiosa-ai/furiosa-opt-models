@@ -584,9 +584,10 @@ where
                         values,
                     )
                 };
+            // One tile's keys fill the tensor registers at a time, so the attention reads its place.
             let attends =
                 |device: &mut Device,
-                 landing: &Landing<Rows, KvHeads, Groups, Head, RowGroups<Rows>>,
+                 (landing, ()): (&Landing<Rows, KvHeads, Groups, Head, RowGroups<Rows>>, ()),
                  values: &Transposed<Rows, KvHeads, Groups, Head, SCALE>| {
                     attend::<Rows, KvHeads, Groups, Head, SCALE>(
                         device,
@@ -602,6 +603,7 @@ where
                     Transposed::<Rows, KvHeads, Groups, Head, SCALE>::new(),
                 );
                 return <Partition<Rows, KvHeads, Groups, Head, SCALE> as shard::Partition>::overlapped::<
+                    _,
                     _,
                     _,
                     Rest<Windows>,
@@ -625,7 +627,7 @@ where
                     |device: &mut Device, landing| {
                         let mut values = Transposed::<Rows, KvHeads, Groups, Head, SCALE>::new();
                         prepares(device, &landing, &mut values);
-                        attends(device, &landing, &values)
+                        attends(device, (&landing, ()), &values)
                     },
                 ),
                 |device| once(device, 1),
@@ -752,25 +754,35 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     ]>(pass.tile)
                     .to_dm_view(&mut device.tdma, landing.bias.view_mut());
             };
-        let prepares =
-            |device: &mut Device,
-             landing: &Landing<Rows, KvHeads, Groups, Head, TileRows<Rows, N>>,
-             values: &mut Transposed<Rows, KvHeads, Groups, Head, SCALE, N>| {
-                <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::transpose::<
-                    TileRows<Rows, N>,
-                    _,
-                    _,
-                >(
-                    device,
-                    landing
-                        .chunk()
-                        .tile::<m![KeyValue], 1, Half<TileRows<Rows, N>, KvHeads, Head>>(1),
-                    values.view_mut(),
-                )
+        type Registers<Rows, KvHeads, Groups, Head, const SCALE: usize, const N: usize> =
+            shard::Registers<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>, TileRows<Rows, N>>;
+        // Everything a window's attention reads of its place, so the place is free once prepared.
+        let prepares = |device: &mut Device,
+                        landing: &Landing<Rows, KvHeads, Groups, Head, TileRows<Rows, N>>,
+                        values: &mut Transposed<Rows, KvHeads, Groups, Head, SCALE, N>|
+         -> Registers<Rows, KvHeads, Groups, Head, SCALE, N> {
+            let half = |at| {
+                landing
+                    .chunk()
+                    .tile::<m![KeyValue], 1, Half<TileRows<Rows, N>, KvHeads, Head>>(at)
             };
+            <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::transpose::<
+                TileRows<Rows, N>,
+                _,
+                _,
+            >(device, half(1), values.view_mut());
+            <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::fill::<
+                TileRows<Rows, N>,
+                _,
+                _,
+            >(device, half(0), landing.bias.view())
+        };
         let attends =
             |device: &mut Device,
-             landing: &Landing<Rows, KvHeads, Groups, Head, TileRows<Rows, N>>,
+             (_, registers): (
+                &Landing<Rows, KvHeads, Groups, Head, TileRows<Rows, N>>,
+                Registers<Rows, KvHeads, Groups, Head, SCALE, N>,
+            ),
              values: &Transposed<Rows, KvHeads, Groups, Head, SCALE, N>| {
                 let mut partial =
                     shard::Partial::<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>>::new();
@@ -782,18 +794,10 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     _,
                     _,
                     _,
-                    _,
-                    _,
                 >(
                     device,
                     projected.view(),
-                    (
-                        landing
-                            .chunk()
-                            .tile::<m![KeyValue], 1, Half<TileRows<Rows, N>, KvHeads, Head>>(0),
-                        values.view(),
-                    ),
-                    landing.bias.view(),
+                    (&registers, values.view()),
                     (partial.view_mut(), lse.view_mut()),
                 );
                 (partial, lse)
@@ -805,6 +809,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 Transposed::<Rows, KvHeads, Groups, Head, SCALE, N>::new(),
             );
             <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::overlapped::<
+                _,
                 _,
                 _,
                 Rest<Windows>,
@@ -827,8 +832,8 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     },
                     |device: &mut Device, landing| {
                         let mut values = Transposed::<Rows, KvHeads, Groups, Head, SCALE, N>::new();
-                        prepares(device, &landing, &mut values);
-                        attends(device, &landing, &values)
+                        let registers = prepares(device, &landing, &mut values);
+                        attends(device, (&landing, registers), &values)
                     },
                 ),
                 boundary,
@@ -902,28 +907,35 @@ fn attend<
     let mut lse = Local::<Rows, KvHeads, Groups, Head, SCALE>::new();
     #[unroll]
     for tile in 0..<Tiles<Rows> as M>::SIZE {
-        <Partition<Rows, KvHeads, Groups, Head, SCALE> as shard::Partition>::attend::<TileRows<Rows>, _, _, _, _, _, _>(
+        let registers = <Partition<Rows, KvHeads, Groups, Head, SCALE> as shard::Partition>::fill::<
+            TileRows<Rows>,
+            _,
+            _,
+        >(
+            device,
+            chunk
+                .tile::<m![KeyValue], 1, Half<RowGroups<Rows>, KvHeads, Head>>(0)
+                .tile::<Tiles<Rows>, 1, m![
+                    { Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, KeyValue = 1 # 2,
+                    { ShardKeys<KvHeads> }, Head
+                ]>(tile),
+            bias.view().tile::<Tiles<Rows>, 1, m![
+                { Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, Groups,
+                { ShardKeys<KvHeads> }
+            ]>(tile),
+        );
+        <Partition<Rows, KvHeads, Groups, Head, SCALE> as shard::Partition>::attend::<TileRows<Rows>, _, _, _, _>(
             device,
             query
                 .view()
                 .tile::<Tiles<Rows>, 1, m![{ Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, Groups, Head]>(tile),
             (
-                chunk
-                    .tile::<m![KeyValue], 1, Half<RowGroups<Rows>, KvHeads, Head>>(0)
-                    .tile::<Tiles<Rows>, 1, m![
-                        { Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, KeyValue = 1 # 2,
-                        { ShardKeys<KvHeads> }, Head
-                    ]>(tile),
+                &registers,
                 values.view().tile::<Tiles<Rows>, 1, m![
                     { Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, Head,
                     { ShardKeys<KvHeads> }
                 ]>(tile),
             ),
-            bias.view()
-                .tile::<Tiles<Rows>, 1, m![
-                    { Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, Groups,
-                    { ShardKeys<KvHeads> }
-                ]>(tile),
             (
                 partial
                     .view_mut()
