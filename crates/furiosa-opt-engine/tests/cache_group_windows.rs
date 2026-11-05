@@ -21,7 +21,10 @@ use furiosa_opt_models::ops::attention::full::paged::{Options, Plan, Waves};
 use furiosa_opt_models::ops::attention::gqa;
 use furiosa_opt_models::ops::index::table::{BlockIndex, FIELDS};
 use furiosa_opt_models::specialize::attention::WAVES;
-use furiosa_opt_models::tensor::{cache::Block, parallel::Chip};
+use furiosa_opt_models::tensor::{
+    cache::{self, Block},
+    parallel::Chip,
+};
 use furiosa_opt_std::prelude::*;
 
 /// Each cache group's operands attend that group's window: a sliding group's decode rows and
@@ -449,8 +452,26 @@ fn continues_a_prompt_over_both_groups_as_the_reference() {
     let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
     let source = Checkpoint::new(snapshot(GEMMA4, &["*.json", "*.safetensors"]), None).unwrap();
     let root: gemma4::ForCausalLM = source.load(&mut device).unwrap();
-    let instance = Instance::new(root, Tiling::Adaptive);
-    let model: &dyn Served = &instance;
+    continues(&mut device, &Instance::new(root, Tiling::Adaptive));
+}
+
+/// The same continuation from caches that store each key and value as an E4M3 code under the
+/// checkpoint's static `k_scale` and `v_scale`.
+#[test]
+#[ignore = "reads the published checkpoint from the local hub cache"]
+fn continues_a_prompt_from_e4m3_caches_as_the_reference() {
+    let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+    let source = Checkpoint::new(snapshot(GEMMA4, &["*.json", "*.safetensors"]), None).unwrap();
+    let root: Coded = source.load(&mut device).unwrap();
+    continues(&mut device, &Instance::new(root, Tiling::Adaptive));
+}
+
+/// Gemma 4's decoder over caches of E4M3 codes.
+type Coded = gemma4::ForCausalLM<gemma4::Quantized, cache::E4m3>;
+
+/// `model`'s greedy continuations of the reference prompt, as
+/// [`continues_a_prompt_over_both_groups_as_the_reference`] states them.
+fn continues(device: &mut Device, model: &dyn Served) {
     let limits = model.limits();
     let [sliding, full] = &limits.cache.groups[..] else {
         panic!("{:?}", limits.cache.groups);
@@ -471,14 +492,14 @@ fn continues_a_prompt_over_both_groups_as_the_reference() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let cache = Cache::new(&device, &limits.cache, 8).unwrap();
-        let first = next(&mut device, model, &cache, (0, &PROMPT)).await;
-        let second = next(&mut device, model, &cache, (PROMPT.len(), &[first])).await;
+        let cache = Cache::new(&*device, &limits.cache, 8).unwrap();
+        let first = next(&mut *device, model, &cache, (0, &PROMPT)).await;
+        let second = next(&mut *device, model, &cache, (PROMPT.len(), &[first])).await;
         assert_eq!([first, second], CONTINUATION, "the prompt in one call");
         let mut stepped = Vec::new();
         for position in 0..PROMPT.len() + 1 {
             let token = PROMPT.get(position).copied().unwrap_or_else(|| stepped[0]);
-            let token = next(&mut device, model, &cache, (position, &[token])).await;
+            let token = next(&mut *device, model, &cache, (position, &[token])).await;
             if position + 1 >= PROMPT.len() {
                 stepped.push(token);
             }
@@ -486,14 +507,14 @@ fn continues_a_prompt_over_both_groups_as_the_reference() {
         assert_eq!(stepped, CONTINUATION, "one position a call");
         let mut prompts = Vec::new();
         for blocks in [BLOCKS, OTHER] {
-            prompts.push(request(&mut device, (&blocks, 0), &PROMPT).await);
+            prompts.push(request(&mut *device, (&blocks, 0), &PROMPT).await);
         }
-        let firsts = kept(&mut device, model, &cache, &prompts).await;
+        let firsts = kept(&mut *device, model, &cache, &prompts).await;
         let mut steps = Vec::new();
         for (blocks, &token) in [BLOCKS, OTHER].iter().zip(&firsts) {
-            steps.push(request(&mut device, (blocks, PROMPT.len()), &[token]).await);
+            steps.push(request(&mut *device, (blocks, PROMPT.len()), &[token]).await);
         }
-        let seconds = kept(&mut device, model, &cache, &steps).await;
+        let seconds = kept(&mut *device, model, &cache, &steps).await;
         let continued: Vec<_> = firsts
             .into_iter()
             .zip(seconds)
@@ -509,6 +530,32 @@ fn continues_a_prompt_over_both_groups_as_the_reference() {
 #[test]
 #[ignore = "reads the published checkpoint from the local hub cache"]
 fn gemma_profile() {
+    let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+    // Installed before the functions load, so that they load with the profile.
+    let _spans = lines();
+    let source = Checkpoint::new(snapshot(GEMMA4, &["*.json", "*.safetensors"]), None).unwrap();
+    let loading = std::time::Instant::now();
+    let root: gemma4::ForCausalLM = source.load(&mut device).unwrap();
+    println!("loaded in {:.1} s", loading.elapsed().as_secs_f64());
+    profile(&mut device, &Instance::new(root, Tiling::Adaptive));
+}
+
+/// The same calls profiled over caches of E4M3 codes.
+#[test]
+#[ignore = "reads the published checkpoint from the local hub cache"]
+fn gemma_profile_e4m3() {
+    let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+    // Installed before the functions load, so that they load with the profile.
+    let _spans = lines();
+    let source = Checkpoint::new(snapshot(GEMMA4, &["*.json", "*.safetensors"]), None).unwrap();
+    let loading = std::time::Instant::now();
+    let root: Coded = source.load(&mut device).unwrap();
+    println!("loaded in {:.1} s", loading.elapsed().as_secs_f64());
+    profile(&mut device, &Instance::new(root, Tiling::Adaptive));
+}
+
+/// `model`'s calls by shape, as [`gemma_profile`] profiles them.
+fn profile(device: &mut Device, model: &dyn Served) {
     use std::time::Instant;
     use tracing::Instrument;
     // Blocks of the history every sequence of a case shares; a decode row writes its position to
@@ -528,22 +575,13 @@ fn gemma_profile() {
     let steps: usize =
         std::env::var("GEMMA_PROFILE_STEPS").map_or(20, |steps| steps.parse().unwrap());
     let wanted = std::env::var("GEMMA_PROFILE_CASES").unwrap_or_default();
-    let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
-    // Installed before the functions load, so that they load with the profile.
-    let _spans = lines();
-    let source = Checkpoint::new(snapshot(GEMMA4, &["*.json", "*.safetensors"]), None).unwrap();
-    let loading = Instant::now();
-    let root: gemma4::ForCausalLM = source.load(&mut device).unwrap();
-    println!("loaded in {:.1} s", loading.elapsed().as_secs_f64());
-    let instance = Instance::new(root, Tiling::Adaptive);
-    let model: &dyn Served = &instance;
     let limits = model.limits();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     runtime.block_on(async {
-        let cache = Cache::new(&device, &limits.cache, SHARED + gemma4::Rows::SIZE).unwrap();
+        let cache = Cache::new(&*device, &limits.cache, SHARED + gemma4::Rows::SIZE).unwrap();
         let bytes: usize = cache.layers().iter().map(HbmBuffer::size).sum();
         println!("cache of {} blocks, {bytes} B", cache.blocks());
         let ids = |end: usize| (0..end).map(|id| id as u32);
@@ -557,7 +595,7 @@ fn gemma_profile() {
                     1 => (ids(cached / Block::SIZE).chain([(SHARED + sequence) as u32])).collect(),
                     _ => ids((cached + tokens).div_ceil(Block::SIZE)).collect(),
                 };
-                requests.push(request(&mut device, (&blocks, cached), &vec![0; tokens]).await);
+                requests.push(request(&mut *device, (&blocks, cached), &vec![0; tokens]).await);
             }
             for sample in 0..=steps {
                 let span = match sample {
@@ -566,7 +604,7 @@ fn gemma_profile() {
                 };
                 let started = Instant::now();
                 let tokens = async {
-                    let output = (model.forward(&mut device, &cache, &requests, &[]))
+                    let output = (model.forward(&mut *device, &cache, &requests, &[]))
                         .instrument(tracing::info_span!("submit"))
                         .await
                         .unwrap();
@@ -574,7 +612,7 @@ fn gemma_profile() {
                         .instrument(tracing::info_span!("wait"))
                         .await
                         .unwrap();
-                    (words(&mut device, &output.buffer))
+                    (words(&mut *device, &output.buffer))
                         .instrument(tracing::info_span!("readback"))
                         .await
                         .unwrap()
