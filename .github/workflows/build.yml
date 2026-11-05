@@ -181,5 +181,6 @@ jobs:
           toolchain: ${{ env.TOOLCHAIN }}
           components: clippy
       - run: >-
-          cargo clippy -p furiosa-opt-models -p furiosa-opt-models-macros --lib --tests --locked
+          cargo clippy -p furiosa-opt-models -p furiosa-opt-models-macros -p furiosa-opt-nemo
+          --lib --tests --locked
           -- --force-warn clippy::all
