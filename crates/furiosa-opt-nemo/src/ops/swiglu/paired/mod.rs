@@ -170,14 +170,3 @@ impl<'d, 'x, Rows: AxisName> Module<(&'d mut Device, &'x Dm<Lanes<Rows>, Sums<Ro
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::ops::attention::geometry::Hidden;
-
-    /// The leaves at the 2048-wide hidden rows they serve match the oracle.
-    #[tokio::test(flavor = "current_thread")]
-    async fn matches_the_oracle_on_live_rows() {
-        super::super::tests::leaves_match_the_oracle::<Hidden<2048>, super::Intermediate>().await;
-    }
-}

@@ -6,6 +6,8 @@ use crate::ops::layout::axes::{Parallel, Parallelism as Placement};
 use crate::ops::normalization::RmsNorm;
 
 pub mod parameters;
+/// The host tables of one step launch.
+pub mod plan;
 /// The serving step: the decode and prefill kernels the vLLM plugin runs, one image a step.
 pub mod serving;
 
