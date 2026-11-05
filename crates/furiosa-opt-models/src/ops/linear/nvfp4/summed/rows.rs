@@ -12,13 +12,11 @@
 //! - A pass's vector engine takes each block's sums four lanes a step, so the last group, when its
 //!   live rows lie in its first four lanes, switches, fills and folds those four alone: one step a
 //!   block.
-//! - From three live lane groups whose lanes fill straight from the feature slices, each pass's
-//!   codes decode once instead, each times its block scale in BF16, which is exact, and the pass
-//!   meets every group there: the contraction adds a row's blocks and the vector engine divides
-//!   each sum by the tensor scale. Fewer groups keep the summed passes, which the decode would
-//!   cost more than it saves, and so do rows staged in data memory, which each pass would stage
-//!   again. The two add a row's products in another order, so its outputs may differ in their
-//!   last bits.
+//! - From three live lane groups the weight decodes once instead, each code times its block scale
+//!   in BF16, which is exact, and every group meets it as the summed passes meet the codes: the
+//!   contraction adds a row's blocks and the vector engine divides each sum by the tensor scale.
+//!   Fewer groups keep the summed passes, which the decode would cost more than it saves. The two
+//!   add a row's products in another order, so its outputs may differ in their last bits.
 //! - The projected rows end where the contract places them: in the output's feature slices once
 //!   the last pass ends, or [`Kept`] where the passes summed them. Rows bound for the feature
 //!   slices are owned in whole chunks of them, the owners' odd factor the top output digit, so
@@ -139,9 +137,8 @@ type Scaled<I, O, P> = m![O % ({ Owner<I, O, P> }), { Part<I> } / 16];
 /// A slice's codes: its rows over its part of the inputs.
 type Coded<I, O, P> = m![O % ({ Owner<I, O, P> }), { Part<I> }];
 
-/// A pass's weights in BF16, each code times its block scale.
-type Decoded<I, O, P> =
-    DmTensor<bf16, Chip, Cluster<I, O, P>, Owners<I, O, P>, m![{ Elements<I, O, P> }, { Part<I> }]>;
+/// A slice's weights in BF16, each code times its block scale.
+type Decoded<I, O, P> = DmTensor<bf16, Chip, Cluster<I, O, P>, Owners<I, O, P>, Coded<I, O, P>>;
 
 /// Values of a slice's run of `R` values of `D` in whole packets, an odd number of them, so that
 /// the slices' runs start alternately in the HBM's two stacks.
@@ -340,11 +337,11 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
         let mut projected = Summing::<I, O, R, P>::new();
         let (first, count) = input.groups::<Lanes<R>>();
         let rows = input.value();
-        // One from three live groups whose lanes fill straight from the feature slices, as each
-        // decoded tile fills every group again; counted by arithmetic, as a device cannot cast a
-        // comparison to a count.
-        let dense = if const { R::SIZE / Lanes::<R>::SIZE >= 3 && X::PARTS == 0 } {
-            (count.max(2) - 2).min(1)
+        // One from three live groups, counted by arithmetic (a device cannot cast a comparison to a
+        // count) in a form the compiler bounds by one, so the loop over it frees what it read.
+        let groups = R::SIZE / Lanes::<R>::SIZE;
+        let dense = if const { R::SIZE / Lanes::<R>::SIZE >= 3 } {
+            (count + groups - 3) / groups
         } else {
             0
         };
@@ -359,53 +356,25 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
         let last = first + count.max(1) - 1;
         let operands = (&scales, &global);
         let tiles = <Tiles<I, O, P> as M>::SIZE;
+        let mut staged = X::staged();
+        let alone = |_: &mut Device, _: usize, _: &mut Staging<I, O, R, P>| {};
         if const { X::PARTS == 0 || X::PARTS >= <Tiles<I, O, P> as M>::SIZE } {
-            // Each pass of a group before the last switches a part of the next group beside its
-            // contraction, the parts past the passes after the last; the next group's lanes then
-            // fill the other half of the TRF. The last group's passes run alone.
-            let mut staged = X::staged();
             for _ in 0..whole.min(1) {
-                rows.switch(device, first, &mut staged);
-                let mut lanes = rows.fill(device, first, &staged);
-                for next in 1..whole {
-                    for tile in 0..tiles {
-                        self.pass::<R, Split>(
-                            device,
-                            (&lanes, operands),
-                            (first + next - 1, tile),
-                            &mut projected,
-                        );
-                        if const { X::PARTS > 0 } {
-                            rows.part(device, (first + next, tile), &mut staged);
-                        }
-                    }
-                    if const { X::PARTS > <Tiles<I, O, P> as M>::SIZE } {
-                        for part in 0..X::PARTS - tiles {
-                            rows.part(device, (first + next, tiles + part), &mut staged);
-                        }
-                    }
-                    lanes = rows.fill(device, first + next, &staged);
-                }
-                for tile in 0..tiles {
-                    self.pass::<R, Split>(
-                        device,
-                        (&lanes, operands),
-                        (first + whole - 1, tile),
-                        &mut projected,
-                    );
-                    if const { X::PARTS > 0 } {
-                        for _ in 0..front {
-                            rows.part(device, (last, tile), &mut staged);
-                        }
-                    }
-                }
-                if const { X::PARTS > <Tiles<I, O, P> as M>::SIZE } {
+                let summed = |device: &mut Device, lanes: &Registers<I, O, Lane<R>, P>, at| {
+                    self.pass::<R, Split>(device, (lanes, operands), at, &mut projected);
+                };
+                // The last group's parts come beside the passes of the whole groups' last.
+                let beside = |device: &mut Device, part, staged: &mut _| {
                     for _ in 0..front {
-                        for part in 0..X::PARTS - tiles {
-                            rows.part(device, (last, tiles + part), &mut staged);
-                        }
+                        rows.part(device, (last, part), staged);
                     }
-                }
+                };
+                Self::meet(
+                    device,
+                    (rows, &mut staged),
+                    (first, whole),
+                    (summed, beside),
+                );
             }
             for _ in 0..front {
                 // Behind whole groups its parts came under their passes; alone, it switches its
@@ -421,20 +390,10 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
                 }
             }
         } else {
-            for at in 0..whole {
-                let group = first + at;
-                let mut staged = X::staged();
-                rows.switch(device, group, &mut staged);
-                let lanes = rows.fill(device, group, &staged);
-                for tile in 0..tiles {
-                    self.pass::<R, Split>(
-                        device,
-                        (&lanes, operands),
-                        (group, tile),
-                        &mut projected,
-                    );
-                }
-            }
+            let summed = |device: &mut Device, lanes: &Registers<I, O, Lane<R>, P>, at| {
+                self.pass::<R, Split>(device, (lanes, operands), at, &mut projected);
+            };
+            Self::meet(device, (rows, &mut staged), (first, whole), (summed, alone));
             for _ in 0..front {
                 let mut staged = X::staged();
                 rows.switch_front(device, last, &mut staged);
@@ -446,23 +405,73 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
         }
         // Last, so that nothing after it holds the summed passes' FP32 scales.
         for _ in 0..dense {
-            let staged = X::staged();
-            for tile in 0..tiles {
-                // A tile decodes once and meets every group; the next group's lanes switch into
-                // the other half of the TRF under each pass.
-                let weights = self.decode(device, tile);
-                let operands = (&weights, &global);
-                let mut lanes = rows.fill(device, first, &staged);
-                for next in 1..count {
-                    let at = (first + next - 1, tile);
-                    Self::decoded_pass(device, (&lanes, operands), at, &mut projected);
-                    lanes = rows.fill(device, first + next, &staged);
-                }
-                let at = (first + count - 1, tile);
-                Self::decoded_pass(device, (&lanes, operands), at, &mut projected);
-            }
+            let weights = self.decode(device);
+            let decoded = |device: &mut Device, lanes: &Registers<I, O, Lane<R>, P>, at| {
+                Self::decoded_pass(device, (lanes, (&weights, &global)), at, &mut projected);
+            };
+            let mut staged = X::staged();
+            Self::meet(
+                device,
+                (rows, &mut staged),
+                (first, count),
+                (decoded, alone),
+            );
         }
         projected
+    }
+
+    /// Lane groups `first..first + count` of `rows`, each filled into the TRF once and met there by
+    /// every pass `pass` runs. Where the switch writes a group a part a pass or more, each pass of a
+    /// group switches a part of the next group beside its contraction, the parts past the passes
+    /// after the last, so the next group fills the other half of the TRF; `beside` takes each part
+    /// beside the last group's passes. Else a group switches whole before its own.
+    fn meet<R: AxisName, X: Stage<I, O, R, P>>(
+        device: &mut Device,
+        (rows, staged): (&X, &mut Staging<I, O, R, P>),
+        (first, count): (usize, usize),
+        (mut pass, mut beside): (
+            impl FnMut(&mut Device, &Registers<I, O, Lane<R>, P>, (usize, usize)),
+            impl FnMut(&mut Device, usize, &mut Staging<I, O, R, P>),
+        ),
+    ) {
+        let tiles = <Tiles<I, O, P> as M>::SIZE;
+        if const { X::PARTS == 0 || X::PARTS >= <Tiles<I, O, P> as M>::SIZE } {
+            rows.switch(device, first, staged);
+            let mut lanes = rows.fill(device, first, staged);
+            for next in 1..count {
+                for tile in 0..tiles {
+                    pass(device, &lanes, (first + next - 1, tile));
+                    if const { X::PARTS > 0 } {
+                        rows.part(device, (first + next, tile), staged);
+                    }
+                }
+                if const { X::PARTS > <Tiles<I, O, P> as M>::SIZE } {
+                    for part in 0..X::PARTS - tiles {
+                        rows.part(device, (first + next, tiles + part), staged);
+                    }
+                }
+                lanes = rows.fill(device, first + next, staged);
+            }
+            for tile in 0..tiles {
+                pass(device, &lanes, (first + count - 1, tile));
+                if const { X::PARTS > 0 } {
+                    beside(device, tile, staged);
+                }
+            }
+            if const { X::PARTS > <Tiles<I, O, P> as M>::SIZE } {
+                for part in tiles..X::PARTS {
+                    beside(device, part, staged);
+                }
+            }
+        } else {
+            for at in 0..count {
+                rows.switch(device, first + at, staged);
+                let lanes = rows.fill(device, first + at, staged);
+                for tile in 0..tiles {
+                    pass(device, &lanes, (first + at, tile));
+                }
+            }
+        }
     }
 
     /// Pass `tile` of lane group `group` over the lanes `lanes` holds: their block sums meet their
@@ -526,44 +535,48 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
         .commit_view(F::sums(projected, (group, tile)));
     }
 
-    /// Pass `tile`'s weights in BF16, each code times its block scale.
-    fn decode(&self, device: &mut Device, tile: usize) -> Decoded<I, O, P> {
-        let scale: Scaling<I, O, P> = device
-            .sub
-            .begin(
-                self.blocks
-                    .view()
-                    .unpad::<Scaled<I, O, P>>()
-                    .tile::<Tiles<I, O, P>, 1, m![
-                        { Elements<I, O, P> } # ({ Owner<I, O, P> }), { Part<I> } / 16
-                    ]>(tile),
-            )
-            .fetch::<Elements<I, O, P>, m![{ Part<I> } / 16]>()
-            .fetch_cast::<f32>()
-            .collect::<m![{ Elements<I, O, P> }, { Part<I> } / 128], m![I / 16 % 8]>()
-            .to_vrf();
+    /// The weights in BF16, each code times its block scale, a pass's rows at a time.
+    fn decode(&self, device: &mut Device) -> Decoded<I, O, P> {
         let mut weights = Decoded::<I, O, P>::new();
-        device
-            .main
-            .begin(
-                (self.codes.borrow().view())
-                    .unpad::<Coded<I, O, P>>()
-                    .tile::<Tiles<I, O, P>, 1, m![
-                        { Elements<I, O, P> } # ({ Owner<I, O, P> }), { Part<I> }
-                    ]>(tile),
-            )
-            .fetch::<m![{ Elements<I, O, P> }, { Part<I> } / 64], m![I % 64]>()
-            .fetch_table_lookup::<bf16>()
-            .fetch_cast::<f32>()
-            .collect::<m![{ Elements<I, O, P> }, { Part<I> } / 8], m![I % 8]>()
-            .vector_init()
-            .vector_intra_slice_tag(TagMode::Zero)
-            .vector_narrow_split::<m![{ Elements<I, O, P> }, { Part<I> } / 4], m![I % 4]>()
-            .vector_restore::<m![{ Elements<I, O, P> }, { Part<I> } / 8], m![I % 8], _, _>(
-                &scale,
-                |values| values,
-            )
-            .commit_view(weights.view_mut());
+        for tile in 0..<Tiles<I, O, P> as M>::SIZE {
+            let scale: Scaling<I, O, P> = device
+                .sub
+                .begin(
+                    self.blocks
+                        .view()
+                        .unpad::<Scaled<I, O, P>>()
+                        .tile::<Tiles<I, O, P>, 1, m![
+                            { Elements<I, O, P> } # ({ Owner<I, O, P> }), { Part<I> } / 16
+                        ]>(tile),
+                )
+                .fetch::<Elements<I, O, P>, m![{ Part<I> } / 16]>()
+                .fetch_cast::<f32>()
+                .collect::<m![{ Elements<I, O, P> }, { Part<I> } / 128], m![I / 16 % 8]>()
+                .to_vrf();
+            device
+                .main
+                .begin(
+                    (self.codes.borrow().view())
+                        .unpad::<Coded<I, O, P>>()
+                        .tile::<Tiles<I, O, P>, 1, m![
+                            { Elements<I, O, P> } # ({ Owner<I, O, P> }), { Part<I> }
+                        ]>(tile),
+                )
+                .fetch::<m![{ Elements<I, O, P> }, { Part<I> } / 64], m![I % 64]>()
+                .fetch_table_lookup::<bf16>()
+                .fetch_cast::<f32>()
+                .collect::<m![{ Elements<I, O, P> }, { Part<I> } / 8], m![I % 8]>()
+                .vector_init()
+                .vector_intra_slice_tag(TagMode::Zero)
+                .vector_narrow_split::<m![{ Elements<I, O, P> }, { Part<I> } / 4], m![I % 4]>()
+                .vector_restore::<m![{ Elements<I, O, P> }, { Part<I> } / 8], m![I % 8], _, _>(
+                    &scale,
+                    |values| values,
+                )
+                .commit_view(weights.view_mut().tile::<Tiles<I, O, P>, 1, m![
+                    { Elements<I, O, P> } #{!} ({ Owner<I, O, P> }), { Part<I> }
+                ]>(tile));
+        }
         weights
     }
 
@@ -575,12 +588,14 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
             &Registers<I, O, Lane<R>, P>,
             (&Decoded<I, O, P>, &Global<I, O, P>),
         ),
-        at: (usize, usize),
+        (group, tile): (usize, usize),
         projected: &mut Summing<I, O, R, P>,
     ) {
         let sums = device
             .main
-            .begin(weights.view())
+            .begin(weights.view().tile::<Tiles<I, O, P>, 1, m![
+                { Elements<I, O, P> } # ({ Owner<I, O, P> }), { Part<I> }
+            ]>(tile))
             .fetch::<m![{ Elements<I, O, P> }, { Part<I> } / 16], m![I % 16]>()
             .collect::<m![{ Elements<I, O, P> }, { Part<I> } / 16], m![I % 16]>()
             .contract_outer::<m![{ Elements<I, O, P> }, { Part<I> } / 16, 1], m![I % 16], _, _, _>(
@@ -612,7 +627,7 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
             m![O % 4],
             _,
         >(sums)
-        .commit_view(<Split as Fold<I, O, R, P>>::sums(projected, at));
+        .commit_view(<Split as Fold<I, O, R, P>>::sums(projected, (group, tile)));
     }
 }
 
