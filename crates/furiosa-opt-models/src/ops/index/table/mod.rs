@@ -791,6 +791,7 @@ mod tests {
             blocks,
             table,
             lengths,
+            scales: &(),
         };
         Attention::<
             PhantomData<(KvHeads, PrefixGroups, Head)>,

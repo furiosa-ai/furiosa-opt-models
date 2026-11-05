@@ -222,8 +222,8 @@ where
 }
 
 /// Attention over pages reads every row's keys and values from the pool, so every live row is
-/// stored before it, from its retained heads as attention's own write takes them, and none is
-/// deferred: `()` names no rows.
+/// stored before it, from its retained heads as attention's own write takes them under the write
+/// operand, and none is deferred: `()` names no rows.
 impl<
     'p,
     'w,
@@ -233,7 +233,8 @@ impl<
     KvHeads: AxisName,
     Head: AxisName,
     Windows: AxisName,
-    WI: Deref<Target = HbmTensor<i32, Chip, m![R]>>,
+    D: Scalar,
+    WI,
     W,
     Read,
     Env,
@@ -245,13 +246,13 @@ impl<
             Live<(), R>,
         ),
         Env,
-        &'s mut &'b mut Blocks<KvHeads, Head>,
+        &'s mut &'b mut Blocks<KvHeads, Head, D>,
     > for KeyValue<W, Read>
 where
     W: for<'d, 'r, 'k> Module<
             (
-                &'r mut Blocks<KvHeads, Head>,
-                &'r HbmTensor<i32, Chip, m![R]>,
+                &'r mut Blocks<KvHeads, Head, D>,
+                &'w WI,
                 (
                     &'k Live<Heads<R, KvHeads, Single, Head>, R>,
                     &'k Live<Heads<R, KvHeads, Single, Head>, R>,
@@ -268,7 +269,7 @@ where
         &self,
         device: &mut Device,
         _: Env,
-        pool: &'s mut &'b mut Blocks<KvHeads, Head>,
+        pool: &'s mut &'b mut Blocks<KvHeads, Head, D>,
         ((key, value), (slot, _), live): (
             &'p Retention<R, KvHeads, Head>,
             (&'w WI, &'w Pages<R, Windows, Chip>),
@@ -277,7 +278,7 @@ where
     ) {
         let keys = live.with(key.to_dm(&mut device.tdma));
         let values = live.with(value.to_dm(&mut device.tdma));
-        let rows = (&mut **pool, &**slot, (&keys, &values));
+        let rows = (&mut **pool, slot, (&keys, &values));
         self.write.forward(device, (), &mut (), rows);
     }
 }

@@ -234,12 +234,22 @@ impl<S: Config> Queries<()> for S {
 }
 
 /// One attention group: `Heads` key/value heads of `Head`, `Groups` query heads each, both
-/// projection widths, the heads' [`Rotation`] and the `Windows` of cache blocks a row reads.
-pub struct Group<Heads, Head, Groups, QueryWidth, KvWidth, Rotated, Windows>(
-    PhantomData<(Heads, Head, Groups, QueryWidth, KvWidth, Rotated, Windows)>,
+/// projection widths, the heads' [`Rotation`], the `Windows` of cache blocks a row reads and the
+/// element its cache stores each key and value as.
+pub struct Group<Heads, Head, Groups, QueryWidth, KvWidth, Rotated, Windows, Cache = bf16>(
+    PhantomData<(
+        Heads,
+        Head,
+        Groups,
+        QueryWidth,
+        KvWidth,
+        Rotated,
+        Windows,
+        Cache,
+    )>,
 );
 
-/// A [`Group`]'s axes by role.
+/// A [`Group`]'s axes by role, and its cache's element.
 pub trait Attention: 'static {
     type Heads: AxisName;
     type Head: AxisName;
@@ -248,6 +258,7 @@ pub trait Attention: 'static {
     type KvWidth: AxisName;
     type Rotated: Rotation;
     type Windows: AxisName;
+    type Cache: Cache = bf16;
 
     /// Whether the widths are the head products the attention kernels assume.
     const CONSISTENT: bool = Self::Groups::SIZE * Self::Heads::SIZE * Self::Head::SIZE
@@ -257,8 +268,8 @@ pub trait Attention: 'static {
         && Self::Windows::SIZE > 0;
 }
 
-impl<Heads, Head, Groups, QueryWidth, KvWidth, Rotated, Windows> Attention
-    for Group<Heads, Head, Groups, QueryWidth, KvWidth, Rotated, Windows>
+impl<Heads, Head, Groups, QueryWidth, KvWidth, Rotated, Windows, C> Attention
+    for Group<Heads, Head, Groups, QueryWidth, KvWidth, Rotated, Windows, C>
 where
     Heads: AxisName,
     Head: AxisName,
@@ -267,6 +278,7 @@ where
     KvWidth: AxisName,
     Rotated: Rotation,
     Windows: AxisName,
+    C: Cache,
 {
     type Heads = Heads;
     type Head = Head;
@@ -275,6 +287,27 @@ where
     type KvWidth = KvWidth;
     type Rotated = Rotated;
     type Windows = Windows;
+    type Cache = C;
+}
+
+/// How a cache stores each key and value: as BF16, or as an E4M3 code under its layer's static
+/// scales; the op that writes a call's rows into its blocks, holding its leaves in memory `X`, and
+/// what that op lands once a layer for itself and the attention that reads the blocks.
+pub trait Cache: MaterializableScalar + FetchCast<f32> + 'static {
+    type Write<X: Memory>;
+    type Landed: Default;
+}
+
+/// The rows as they are, read as stored.
+impl Cache for bf16 {
+    type Write<X: Memory> = ops::index::scatter::Scatter;
+    type Landed = ();
+}
+
+/// The rows divided by the layer's scales and rounded, read back times them.
+impl Cache for f8e4m3 {
+    type Write<X: Memory> = ops::index::scatter::Scaled<X>;
+    type Landed = crate::tensor::cache::Landed;
 }
 
 /// The coordinates of each head that a group's positions turn, which decide how its layers
@@ -955,17 +988,17 @@ pub type HeadView<Count, Head> = m![Count, Head];
 pub type Position<A, D = bf16, Chips = Chip> =
     <<A as Attention>::Rotated as Rotation>::Position<<A as Attention>::Head, D, Chips>;
 
-/// Group `A`'s constants that prepare a call of `R` rows over a cache of `C`: the rows' rotations,
+/// Group `A`'s constants that prepare a call of `R` rows over its cache: the rows' rotations,
 /// write slots and paged history reads, bound to the group's rotary spectrum and window; in memory
 /// `X`.
-pub type Paging<A, R, C = bf16, X = Hbm> = key_value::Preparation<
+pub type Paging<A, R, X = Hbm> = key_value::Preparation<
     R,
     key_value::Paging<
         <A as Attention>::Heads,
         <A as Attention>::Head,
         R,
         <A as Attention>::Windows,
-        C,
+        <A as Attention>::Cache,
         X,
         Chip,
         <A as Attention>::Rotated,
@@ -974,6 +1007,9 @@ pub type Paging<A, R, C = bf16, X = Hbm> = key_value::Preparation<
     Chip,
     X,
 >;
+
+/// The op that writes a call's keys and values into group `A`'s cache, its leaves in memory `X`.
+pub type Write<A, X = Hbm> = <<A as Attention>::Cache as Cache>::Write<X>;
 
 /// Grouped-query attention of group `A` over each chip's heads of placement `P`, its scores
 /// multiplied by `SCALE` (FP32 bits), over the windows of history a call pages.

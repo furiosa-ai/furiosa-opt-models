@@ -121,8 +121,14 @@ type KeyRows<A, Reach> = HbmTensor<
         { Symbol<<A as decoder::Attention>::Head> }
     ],
 >;
-/// A cache of group `A`'s key/value heads.
-type Pool<A> = Blocks<<A as decoder::Attention>::Heads, <A as decoder::Attention>::Head>;
+/// A cache of group `A`'s key/value heads, each key and value its cache's element.
+type Pool<A> = Blocks<
+    <A as decoder::Attention>::Heads,
+    <A as decoder::Attention>::Head,
+    <A as decoder::Attention>::Cache,
+>;
+/// What the write into group `A`'s cache lands once a layer for itself and the attention.
+type Scales<A> = <<A as decoder::Attention>::Cache as decoder::Cache>::Landed;
 type Norm<Z> = <Z as Geometry>::Norm<Width<Z>, Hbm>;
 /// A launch's call as its layers read it: the context its rotary table prepares and its token IDs.
 type Launched<'c, 'a, Z> = Call<
@@ -168,10 +174,12 @@ type Landing<'r, G, Z> = (ToDm<G, QueryHeads<Z>>, (&'r Rotation<Z>, usize));
 /// landed.
 type Projecting<'o, 'r, Z, L> = (&'o mut L, Live<&'r QueryRows<Z, Reach<Z>>, Capacity<Z>>);
 
-/// What a layer of group `A` stores of a launch's `Reach` rows: their queries, keys and values.
+/// What a layer of group `A` stores of a launch's `Reach` rows, their queries, keys and values,
+/// and what its cache's write lands for its attention: nothing for BF16, its scales for E4M3.
 pub struct Stored<A: decoder::Attention, Reach: AxisName> {
     queries: QueryRows<A, Reach>,
     retained: (KeyRows<A, Reach>, KeyRows<A, Reach>),
+    scales: Scales<A>,
 }
 
 /// The rows a layer of group `A` attends of a launch's `Reach` rows.
@@ -194,6 +202,7 @@ impl<A: decoder::Attention, Reach: AxisName> Places<A, Reach> {
             stored: Stored {
                 queries: HbmTensor::new(),
                 retained: (HbmTensor::new(), HbmTensor::new()),
+                scales: Scales::<A>::default(),
             },
             attended: Attended(HbmTensor::new()),
         }
@@ -401,7 +410,7 @@ where
     Rows<Z>: Fill<Device, Live<(), Capacity<Z>>, Rows = Owned<Width<Z>, Span>>
         + for<'r> Spill<Device, &'r Owned<Width<Z>, Span>, Live<(), Capacity<Z>>>,
     Z: Geometry<Hidden = H, Norm<H, Hbm> = RmsNorm<H, E, Chip>>
-        + decoder::Attention<Heads = KvHeads, Head = Head>
+        + decoder::Attention<Heads = KvHeads, Head = Head, Cache = bf16>
         + Decode
         + 'static,
     H: Tiled<Capacity = axis::Rows<C>, Last = axis::Rows<L>>,
@@ -536,7 +545,9 @@ where
         } = &attention.0;
         let context = &call.context.0;
         let Places { stored, attended } = places;
-        let Stored { queries, retained } = &*stored;
+        let Stored {
+            queries, retained, ..
+        } = &*stored;
         let operands = (&context.write, &context.read);
         attend_stored(
             device,
@@ -730,7 +741,7 @@ fn period<Z, G, P, GN, V, K, Q, QN, KN, QH, KH, T: States>(
     start: usize,
     (stored, adapters): (&mut Stored<Z, Reach<Z>>, &mut T),
 ) where
-    Z: decoder::Attention<Heads = KvHeads, Head = Head> + Decode + 'static,
+    Z: decoder::Attention<Heads = KvHeads, Head = Head, Cache = bf16> + Decode + 'static,
     G: Group,
     V: for<'r, 'x> Module<&'r P, Live<(), Capacity<Z>>, &'x mut T::Value, Output = Pairs<G>>,
     K: for<'r, 'x> Module<&'r P, Live<(), Capacity<Z>>, &'x mut T::Key, Output = KH>,
@@ -744,7 +755,9 @@ fn period<Z, G, P, GN, V, K, Q, QN, KN, QH, KH, T: States>(
         key_norm,
         ..
     } = front;
-    let Stored { queries, retained } = stored;
+    let Stored {
+        queries, retained, ..
+    } = stored;
     let projected = query.forward(&mut *device, tile, adapters.query(), &rows);
     // Behind the period's rows, which the projection reads first.
     let coefficients = crate::Op::forward(&landing, &mut *device, index);
@@ -885,7 +898,7 @@ impl<
     for Decoder<&'m launch::Base<Z, P>>
 where
     Z: Geometry<Hidden = H, Norm<H, Hbm> = RmsNorm<H, E, Chip>, Layers<()> = [(); DEPTH]>
-        + decoder::Attention<Heads = KvHeads, Head = Head>
+        + decoder::Attention<Heads = KvHeads, Head = Head, Cache = bf16>
         + Decode
         + qwen3::Front
         + 'static,

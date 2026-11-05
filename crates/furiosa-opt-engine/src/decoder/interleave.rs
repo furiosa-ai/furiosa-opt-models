@@ -27,7 +27,7 @@ use std::convert::Infallible;
 use std::io;
 
 /// A layer's blocks of group `A`'s cache.
-type Pages<A> = Blocks<<A as Attention>::Heads, <A as Attention>::Head>;
+type Pages<A> = Blocks<<A as Attention>::Heads, <A as Attention>::Head, <A as Attention>::Cache>;
 
 /// A launch's slots of the layers of a body `Body` whose collections attend in groups `A` and `B`.
 type Slots<'b, Body, A, B> =

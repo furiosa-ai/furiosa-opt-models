@@ -5,7 +5,7 @@ use furiosa_opt_std::prelude::*;
 use super::{Attention, Chip, KeyValue, TileGroups};
 use crate::ops::index::table::{BlockCounts, BlockIndex};
 use crate::specialize::attention::{self, Strategy};
-use crate::tensor::cache::{Block, Blocks};
+use crate::tensor::cache::{self, Block, Blocks};
 use crate::tensor::scalar::{F32, Value};
 use std::marker::PhantomData;
 
@@ -63,7 +63,7 @@ impl<KvHeads: AxisName> AxisName for Keys<KvHeads> {
 
 /// The consecutive blocks of a row's table one shard holds.
 #[derive(Clone, Debug)]
-struct ShardBlocks<KvHeads>(PhantomData<KvHeads>);
+pub struct ShardBlocks<KvHeads>(PhantomData<KvHeads>);
 
 impl<KvHeads: AxisName> AxisName for ShardBlocks<KvHeads> {
     const NAME: Ident = Ident::new("ShardBlocks");
@@ -155,9 +155,9 @@ pub(super) type Envelope<Rows, KvHeads, Head, Windows> =
     HbmTensor<bf16, Chip, m![Rows, Windows, Cache, KeyValue, KvHeads, Head]>;
 
 /// One chunk as the gather writes it, needing no repartition: each table entry's token block on its
-/// shard and its heads over their slices, the cells of [`ChunkView`].
-type InDm<Rows, KvHeads, Head, Count = RowGroups<Rows>> = DmTensor<
-    bf16,
+/// shard and its heads over their slices, the cells of [`ChunkView`], each a `D` the pool holds.
+type InDm<Rows, KvHeads, Head, Count = RowGroups<Rows>, D = bf16> = DmTensor<
+    D,
     Chip,
     Cluster<Rows>,
     m![
@@ -175,18 +175,28 @@ type Entries<Rows> = HbmTensor<i32, Chip, m![Rows, BlockIndex]>;
 type TileEntries<Rows, const N: usize> =
     HbmTensor<i32, Chip, m![{ TileRows<Rows, N> }, { Layout<Rows>::Lanes }, BlockIndex]>;
 
-/// A layer's cache blocks and the table of blocks each row reads.
-pub struct Paged<'l, Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName> {
-    pub blocks: &'l Blocks<KvHeads, Head>,
+/// A layer's cache blocks of `D`, the table of blocks each row reads, and the scales its codes are
+/// read under: nothing for BF16 blocks, the layer's [`cache::Landed`] scales for E4M3 ones.
+pub struct Paged<
+    'l,
+    Rows: AxisName,
+    KvHeads: AxisName,
+    Head: AxisName,
+    Windows: AxisName,
+    D: MaterializableScalar = bf16,
+    S = (),
+> {
+    pub blocks: &'l Blocks<KvHeads, Head, D>,
     pub table: &'l HbmTensor<i32, Chip, m![Rows, Windows, BlockIndex]>,
     pub lengths: &'l BlockCounts<Rows, Windows>,
+    pub scales: &'l S,
 }
 
 /// The cache rows a step reads, a shard's whole rows of one head per slice, each row its token's
 /// key and value; `Count` row groups of them, as attention reads a landing's cells.
-type ChunkView<'a, Rows, KvHeads, Head, Count> = DmTensorView<
+type ChunkView<'a, Rows, KvHeads, Head, Count, D = bf16> = DmTensorView<
     'a,
-    bf16,
+    D,
     Chip,
     Cluster<Rows>,
     CacheSlices<Rows, KvHeads>,
@@ -194,24 +204,31 @@ type ChunkView<'a, Rows, KvHeads, Head, Count> = DmTensorView<
 >;
 
 /// The same cells as a landing writes a copy of a chunk into them.
-type ChunkViewMut<'a, Rows, KvHeads, Head, Count> = DmTensorViewMut<
+type ChunkViewMut<'a, Rows, KvHeads, Head, Count, D = bf16> = DmTensorViewMut<
     'a,
-    bf16,
+    D,
     Chip,
     Cluster<Rows>,
     CacheSlices<Rows, KvHeads>,
     m![{ Count }, KeyValue, { ShardKeys<KvHeads> }, Head],
 >;
 
-/// One window as it lands, its cells and its bias: two alternate, so a window lands while the
-/// one before it is attended.
-struct Landing<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName, Count: M> {
-    cells: InDm<Rows, KvHeads, Head, Count>,
+/// One window as it lands, its cells of `D` and its bias: two alternate, so a window lands while
+/// the one before it is attended.
+struct Landing<
+    Rows: AxisName,
+    KvHeads: AxisName,
+    Groups: AxisName,
+    Head: AxisName,
+    Count: M,
+    D: Scalar = bf16,
+> {
+    cells: InDm<Rows, KvHeads, Head, Count, D>,
     bias: Bias<Rows, KvHeads, Groups, Count>,
 }
 
-impl<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName, Count: M>
-    Landing<Rows, KvHeads, Groups, Head, Count>
+impl<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName, Count: M, D: Scalar>
+    Landing<Rows, KvHeads, Groups, Head, Count, D>
 {
     fn new() -> Self {
         Self {
@@ -219,11 +236,161 @@ impl<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName, Count:
             bias: DmTensor::new(),
         }
     }
+}
 
-    fn chunk(&self) -> ChunkView<'_, Rows, KvHeads, Head, Count> {
-        // SAFETY: a shard's blocks are its consecutive slots, so both nests name the same cells in
-        // the same order.
-        unsafe { self.cells.view().reshape() }
+/// The cells of `cells` as attention reads a chunk.
+fn chunk<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Count: M, D: Scalar>(
+    cells: &InDm<Rows, KvHeads, Head, Count, D>,
+) -> ChunkView<'_, Rows, KvHeads, Head, Count, D> {
+    // SAFETY: a shard's blocks are its consecutive slots, so both nests name the same cells in the
+    // same order.
+    unsafe { cells.view().reshape() }
+}
+
+/// A history as its windows land and as attention reads them: BF16 cells as they landed, or a
+/// pool's E4M3 codes, whose keys widen to BF16 once a window is prepared (which leaves the widening
+/// behind no gather in flight), whose values widen in their transpose, and whose scales the scores
+/// and the weighted sum take.
+pub(crate) trait Landed<Rows: AxisName, KvHeads: AxisName, Head: AxisName> {
+    /// The element a window lands in.
+    type Element: shard::Value;
+    /// Where a window's keys of `Count` row groups widen to BF16: nothing for BF16 cells.
+    type Restored<Count: M>;
+
+    /// A place to widen a window's keys of `Count` row groups into.
+    fn place<Count: M>() -> Self::Restored<Count>;
+
+    /// The window landed in `cells` as the key fill reads it, its keys widened into `place`
+    /// first where they are codes; only its keys' half is read.
+    fn keys<'c, Count: M>(
+        &self,
+        device: &mut Device,
+        cells: &'c InDm<Rows, KvHeads, Head, Count, Self::Element>,
+        place: &'c mut Self::Restored<Count>,
+    ) -> ChunkView<'c, Rows, KvHeads, Head, Count>;
+
+    /// The same, once [`Self::keys`] widened them.
+    fn widened<'c, Count: M>(
+        cells: &'c InDm<Rows, KvHeads, Head, Count, Self::Element>,
+        place: &'c Self::Restored<Count>,
+    ) -> ChunkView<'c, Rows, KvHeads, Head, Count>;
+
+    /// The scales of a window's codes in the registers of partition `G`, none for BF16 cells.
+    fn scales<G>(&self, device: &mut Device) -> Option<shard::Scales<G>>
+    where
+        G: shard::Partition<
+                Chip = Chip,
+                Cluster = Cluster<Rows>,
+                Slices = CacheSlices<Rows, KvHeads>,
+            >;
+}
+
+/// The cells a window of `Count` row groups of `Source`'s history lands in.
+type Cells<Source, Rows, KvHeads, Head, Count = RowGroups<Rows>> =
+    InDm<Rows, KvHeads, Head, Count, <Source as Landed<Rows, KvHeads, Head>>::Element>;
+
+/// A history in BF16 is read as it landed.
+macro_rules! landed_as_is {
+    () => {
+        type Element = bf16;
+        type Restored<Count: M> = ();
+
+        fn place<Count: M>() {}
+
+        fn keys<'c, Count: M>(
+            &self,
+            _: &mut Device,
+            cells: &'c InDm<Rows, KvHeads, Head, Count>,
+            _: &'c mut (),
+        ) -> ChunkView<'c, Rows, KvHeads, Head, Count> {
+            chunk(cells)
+        }
+
+        fn widened<'c, Count: M>(
+            cells: &'c InDm<Rows, KvHeads, Head, Count>,
+            _: &'c (),
+        ) -> ChunkView<'c, Rows, KvHeads, Head, Count> {
+            chunk(cells)
+        }
+
+        fn scales<G>(&self, _: &mut Device) -> Option<shard::Scales<G>>
+        where
+            G: shard::Partition<
+                    Chip = Chip,
+                    Cluster = Cluster<Rows>,
+                    Slices = CacheSlices<Rows, KvHeads>,
+                >,
+        {
+            None
+        }
+    };
+}
+
+impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName>
+    Landed<Rows, KvHeads, Head> for Envelope<Rows, KvHeads, Head, Windows>
+{
+    landed_as_is!();
+}
+
+impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName>
+    Landed<Rows, KvHeads, Head> for Paged<'_, Rows, KvHeads, Head, Windows>
+{
+    landed_as_is!();
+}
+
+impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName>
+    Landed<Rows, KvHeads, Head> for Paged<'_, Rows, KvHeads, Head, Windows, f8e4m3, cache::Landed>
+{
+    type Element = f8e4m3;
+    type Restored<Count: M> = InDm<Rows, KvHeads, Head, Count>;
+
+    fn place<Count: M>() -> InDm<Rows, KvHeads, Head, Count> {
+        DmTensor::new()
+    }
+
+    /// Each key code widened to BF16, exactly, in one pass without the vector stage.
+    fn keys<'c, Count: M>(
+        &self,
+        device: &mut Device,
+        cells: &'c InDm<Rows, KvHeads, Head, Count, f8e4m3>,
+        place: &'c mut InDm<Rows, KvHeads, Head, Count>,
+    ) -> ChunkView<'c, Rows, KvHeads, Head, Count> {
+        type Time<Count, KvHeads, Head, const N: usize> =
+            m![{ Count }, { ShardKeys<KvHeads> }, Head / { N }];
+        // SAFETY: as in `chunk`.
+        let widened: ChunkViewMut<'_, Rows, KvHeads, Head, Count> =
+            unsafe { place.view_mut().reshape() };
+        device
+            .main
+            .begin(chunk(cells).tile::<m![KeyValue], 1, Half<Count, KvHeads, Head>>(0))
+            .fetch::<Time<Count, KvHeads, Head, 16>, m![Head % 16]>()
+            .fetch_cast::<f32>()
+            .collect::<Time<Count, KvHeads, Head, 8>, m![Head % 8]>()
+            .cast::<bf16, m![Head % 8 # 16]>()
+            .commit_trim::<m![Head % 8]>()
+            .commit_view(widened.tile::<m![KeyValue], 1, m![
+                { Count }, KeyValue = 1 #{!} 2, { ShardKeys<KvHeads> }, Head
+            ]>(0));
+        chunk(place)
+    }
+
+    fn widened<'c, Count: M>(
+        _: &'c InDm<Rows, KvHeads, Head, Count, f8e4m3>,
+        place: &'c InDm<Rows, KvHeads, Head, Count>,
+    ) -> ChunkView<'c, Rows, KvHeads, Head, Count> {
+        chunk(place)
+    }
+
+    fn scales<G>(&self, device: &mut Device) -> Option<shard::Scales<G>>
+    where
+        G: shard::Partition<
+                Chip = Chip,
+                Cluster = Cluster<Rows>,
+                Slices = CacheSlices<Rows, KvHeads>,
+            >,
+    {
+        let (key, value) = (self.scales).registers(device);
+        Some(shard::Scales(key, value))
     }
 }
 
@@ -277,8 +444,14 @@ impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName, E, co
     }
 }
 
-impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName>
-    Paged<'_, Rows, KvHeads, Head, Windows>
+impl<
+    Rows: AxisName,
+    KvHeads: AxisName,
+    Head: AxisName,
+    Windows: AxisName,
+    D: MaterializableScalar,
+    R,
+> Paged<'_, Rows, KvHeads, Head, Windows, D, R>
 {
     /// Gathers the pool blocks `entries` name into `chunk`, each row's up to its count in
     /// `lengths`: `SHARED`, in one plan up to the longest count, for a tile whose rows are all live;
@@ -288,7 +461,7 @@ impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName>
         &self,
         device: &mut Device,
         (entries, lengths): (&HbmTensor<i32, Chip, E>, &HbmTensor<i32, Chip, L>),
-        chunk: &mut InDm<Rows, KvHeads, Head, Count>,
+        chunk: &mut InDm<Rows, KvHeads, Head, Count, D>,
     ) {
         // The plan is one expression a branch: one bound to a name loses its slice table.
         if const { SHARED } {
@@ -311,9 +484,16 @@ impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName>
 }
 
 /// Window `at` of every row, the live ones `live`, into the cells of a chunk.
-impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName, E>
-    crate::Module<(usize, Live<(), Rows>), E, &mut InDm<Rows, KvHeads, Head>>
-    for Paged<'_, Rows, KvHeads, Head, Windows>
+impl<
+    Rows: AxisName,
+    KvHeads: AxisName,
+    Head: AxisName,
+    Windows: AxisName,
+    D: MaterializableScalar,
+    R,
+    E,
+> crate::Module<(usize, Live<(), Rows>), E, &mut InDm<Rows, KvHeads, Head, RowGroups<Rows>, D>>
+    for Paged<'_, Rows, KvHeads, Head, Windows, D, R>
 {
     type Output = ();
 
@@ -323,7 +503,7 @@ impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName, E>
         &self,
         device: &mut Device,
         _: E,
-        cells: &mut InDm<Rows, KvHeads, Head>,
+        cells: &mut InDm<Rows, KvHeads, Head, RowGroups<Rows>, D>,
         (at, live): (usize, Live<(), Rows>),
     ) {
         let mut entries = Entries::<Rows>::new();
@@ -348,9 +528,17 @@ impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName, E>
 
 /// Window `at` of the row groups of `pass` alone, into the cells of a chunk: only their entries
 /// address the pool.
-impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName, E, const N: usize>
-    crate::Module<(usize, Pass<N>), E, &mut InDm<Rows, KvHeads, Head, TileRows<Rows, N>>>
-    for Paged<'_, Rows, KvHeads, Head, Windows>
+impl<
+    Rows: AxisName,
+    KvHeads: AxisName,
+    Head: AxisName,
+    Windows: AxisName,
+    D: MaterializableScalar,
+    R,
+    E,
+    const N: usize,
+> crate::Module<(usize, Pass<N>), E, &mut InDm<Rows, KvHeads, Head, TileRows<Rows, N>, D>>
+    for Paged<'_, Rows, KvHeads, Head, Windows, D, R>
 {
     type Output = ();
 
@@ -358,7 +546,7 @@ impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName, E, co
         &self,
         device: &mut Device,
         _: E,
-        cells: &mut InDm<Rows, KvHeads, Head, TileRows<Rows, N>>,
+        cells: &mut InDm<Rows, KvHeads, Head, TileRows<Rows, N>, D>,
         (at, pass): (usize, Pass<N>),
     ) {
         let mut entries = TileEntries::<Rows, N>::new();
@@ -556,19 +744,23 @@ impl<
     const SCALE: usize,
 > Op<History<'a, Q, Rows, Windows, Source>> for Windowed<KvHeads, Groups, Head, SCALE>
 where
-    Source: for<'c> crate::Module<(usize, Live<(), Rows>), (), &'c mut InDm<Rows, KvHeads, Head>>
+    Source: Landed<Rows, KvHeads, Head>
         + for<'c> crate::Module<
+            (usize, Live<(), Rows>),
+            (),
+            &'c mut Cells<Source, Rows, KvHeads, Head>,
+        > + for<'c> crate::Module<
             (usize, Pass<32>),
             (),
-            &'c mut InDm<Rows, KvHeads, Head, TileRows<Rows, 32>>,
+            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 32>>,
         > + for<'c> crate::Module<
             (usize, Pass<16>),
             (),
-            &'c mut InDm<Rows, KvHeads, Head, TileRows<Rows, 16>>,
+            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 16>>,
         > + for<'c> crate::Module<
             (usize, Pass<8>),
             (),
-            &'c mut InDm<Rows, KvHeads, Head, TileRows<Rows, 8>>,
+            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 8>>,
         >,
 {
     type Output = Attended<Rows, KvHeads, Groups, Head>;
@@ -599,19 +791,23 @@ impl<
 > Op<(History<'a, Q, Rows, Windows, Source>, (&H, &mut G))>
     for Windowed<KvHeads, Groups, Head, SCALE>
 where
-    Source: for<'c> crate::Module<(usize, Live<(), Rows>), (), &'c mut InDm<Rows, KvHeads, Head>>
+    Source: Landed<Rows, KvHeads, Head>
         + for<'c> crate::Module<
+            (usize, Live<(), Rows>),
+            (),
+            &'c mut Cells<Source, Rows, KvHeads, Head>,
+        > + for<'c> crate::Module<
             (usize, Pass<32>),
             (),
-            &'c mut InDm<Rows, KvHeads, Head, TileRows<Rows, 32>>,
+            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 32>>,
         > + for<'c> crate::Module<
             (usize, Pass<16>),
             (),
-            &'c mut InDm<Rows, KvHeads, Head, TileRows<Rows, 16>>,
+            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 16>>,
         > + for<'c> crate::Module<
             (usize, Pass<8>),
             (),
-            &'c mut InDm<Rows, KvHeads, Head, TileRows<Rows, 8>>,
+            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 8>>,
         >,
     H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()>,
 {
@@ -642,40 +838,59 @@ where
                 shard::Transposed<Partition<Rows, KvHeads, Groups, Head, SCALE>, RowGroups<Rows>>;
             // Staged per window, not before the loop, a slice holds one or two windows' bias
             // however many a history spans, and a skipped window moves nothing.
-            let mut lands = |device: &mut Device,
-                             at: usize,
-                             landing: &mut Landing<
+            type Whole<Rows, KvHeads, Groups, Head, Source> = Landing<
                 Rows,
                 KvHeads,
                 Groups,
                 Head,
                 RowGroups<Rows>,
-            >| {
-                crate::Module::forward(history, &mut *device, (), &mut landing.cells, (at, live));
-                bias.view()
-                    .tile::<m![Windows], 1, m![Rows, Windows = 1 # Windows, Cache]>(at)
-                    .to_dm_view(&mut device.tdma, landing.bias.view_mut());
-            };
-            let prepares =
+                <Source as Landed<Rows, KvHeads, Head>>::Element,
+            >;
+            type Restored<Source, Rows, KvHeads, Head> =
+                <Source as Landed<Rows, KvHeads, Head>>::Restored<RowGroups<Rows>>;
+            let mut lands =
                 |device: &mut Device,
-                 landing: &Landing<Rows, KvHeads, Groups, Head, RowGroups<Rows>>,
-                 values: &mut Transposed<Rows, KvHeads, Groups, Head, SCALE>| {
-                    transposes::<Rows, KvHeads, Groups, Head, SCALE>(
-                        device,
-                        landing.chunk(),
-                        values,
-                    )
+                 at: usize,
+                 landing: &mut Whole<Rows, KvHeads, Groups, Head, Source>| {
+                    crate::Module::forward(
+                        history,
+                        &mut *device,
+                        (),
+                        &mut landing.cells,
+                        (at, live),
+                    );
+                    bias.view()
+                        .tile::<m![Windows], 1, m![Rows, Windows = 1 # Windows, Cache]>(at)
+                        .to_dm_view(&mut device.tdma, landing.bias.view_mut());
                 };
+            // The place a window's keys widen into holds them until they fill the registers.
+            let prepares = |device: &mut Device,
+                            landing: &Whole<Rows, KvHeads, Groups, Head, Source>,
+                            values: &mut Transposed<Rows, KvHeads, Groups, Head, SCALE>|
+             -> Restored<Source, Rows, KvHeads, Head> {
+                let mut restored = Source::place();
+                history.keys(device, &landing.cells, &mut restored);
+                transposes::<Rows, KvHeads, Groups, Head, SCALE, _>(
+                    device,
+                    chunk(&landing.cells),
+                    values,
+                );
+                restored
+            };
             // One tile's keys fill the tensor registers at a time, so the attention reads its place.
             let attends =
                 |device: &mut Device,
-                 (landing, ()): (&Landing<Rows, KvHeads, Groups, Head, RowGroups<Rows>>, ()),
+                 (landing, restored): (
+                    &Whole<Rows, KvHeads, Groups, Head, Source>,
+                    Restored<Source, Rows, KvHeads, Head>,
+                ),
                  values: &Transposed<Rows, KvHeads, Groups, Head, SCALE>| {
+                    let scales = history.scales(device);
                     attend::<Rows, KvHeads, Groups, Head, SCALE>(
                         device,
                         &projected,
-                        (landing.chunk(), values),
-                        &landing.bias,
+                        (Source::widened(&landing.cells, &restored), values),
+                        (&landing.bias, scales.as_ref()),
                     )
                 };
             if const { Self::overlaps::<Rows>(Rows::SIZE) } {
@@ -713,8 +928,8 @@ where
                     },
                     |device: &mut Device, landing| {
                         let mut values = Transposed::<Rows, KvHeads, Groups, Head, SCALE>::new();
-                        prepares(device, &landing, &mut values);
-                        attends(device, (&landing, ()), &values)
+                        let restored = prepares(device, &landing, &mut values);
+                        attends(device, (&landing, restored), &values)
                     },
                 ),
                 |device| once(device, 1),
@@ -819,55 +1034,65 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
         (boundary, times): (&mut impl FnMut(&mut Device, usize), usize),
         attended: &mut Attended<Rows, KvHeads, Groups, Head>,
     ) where
-        Source: for<'c> crate::Module<
+        Source: Landed<Rows, KvHeads, Head>
+            + for<'c> crate::Module<
                 (usize, Pass<N>),
                 (),
-                &'c mut InDm<Rows, KvHeads, Head, TileRows<Rows, N>>,
+                &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, N>>,
             >,
         Q: Queries<Rows, KvHeads, Groups, Head>,
     {
-        type Place<Rows, KvHeads, Groups, Head, const N: usize> =
-            Landing<Rows, KvHeads, Groups, Head, TileRows<Rows, N>>;
+        type Place<Rows, KvHeads, Groups, Head, Source, const N: usize> = Landing<
+            Rows,
+            KvHeads,
+            Groups,
+            Head,
+            TileRows<Rows, N>,
+            <Source as Landed<Rows, KvHeads, Head>>::Element,
+        >;
         type Transposed<Rows, KvHeads, Groups, Head, const SCALE: usize, const N: usize> =
             shard::Transposed<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>, TileRows<Rows, N>>;
         type Registers<Rows, KvHeads, Groups, Head, const SCALE: usize, const N: usize> =
             shard::Registers<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>, TileRows<Rows, N>>;
         // The bias goes first: a transfer issued after the gather may wait for it to finish.
-        let lands = |device: &mut Device,
-                     (at, pass): (usize, Pass<N>),
-                     landing: &mut Place<Rows, KvHeads, Groups, Head, N>| {
-            bias.view()
-                .tile::<m![Windows], 1, m![Rows, Windows = 1 # Windows, Cache]>(at)
-                .tile::<Tiles<Rows, N>, 1, m![
-                    { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), { TileRows<Rows, N> },
-                    { Layout<Rows>::Lanes }, Windows = 1 # Windows, Cache
-                ]>(pass.tile)
-                .to_dm_view(&mut device.tdma, landing.bias.view_mut());
-            crate::Module::forward(history, &mut *device, (), &mut landing.cells, (at, pass));
-        };
+        let lands =
+            |device: &mut Device,
+             (at, pass): (usize, Pass<N>),
+             landing: &mut Place<Rows, KvHeads, Groups, Head, Source, N>| {
+                bias.view()
+                    .tile::<m![Windows], 1, m![Rows, Windows = 1 # Windows, Cache]>(at)
+                    .tile::<Tiles<Rows, N>, 1, m![
+                        { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), { TileRows<Rows, N> },
+                        { Layout<Rows>::Lanes }, Windows = 1 # Windows, Cache
+                    ]>(pass.tile)
+                    .to_dm_view(&mut device.tdma, landing.bias.view_mut());
+                crate::Module::forward(history, &mut *device, (), &mut landing.cells, (at, pass));
+            };
         let projects = |device: &mut Device, pass: Pass<N>| query.pass(device, pass);
         // Everything a window's attention reads of its place, so the place is free once prepared;
         // the registers fill first, so the key fill runs beside the values' transpose.
         let prepares = |device: &mut Device,
-                        landing: &Place<Rows, KvHeads, Groups, Head, N>,
+                        landing: &Place<Rows, KvHeads, Groups, Head, Source, N>,
                         values: &mut Transposed<Rows, KvHeads, Groups, Head, SCALE, N>|
          -> Registers<Rows, KvHeads, Groups, Head, SCALE, N> {
-            let half = |at| {
-                landing
-                    .chunk()
-                    .tile::<m![KeyValue], 1, Half<TileRows<Rows, N>, KvHeads, Head>>(at)
-            };
+            let mut restored = Source::place::<TileRows<Rows, N>>();
+            let keys = history
+                .keys(device, &landing.cells, &mut restored)
+                .tile::<m![KeyValue], 1, Half<TileRows<Rows, N>, KvHeads, Head>>(0);
             let registers =
                 <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::fill::<
                     TileRows<Rows, N>,
                     _,
                     _,
-                >(device, half(0), landing.bias.view());
+                >(device, keys, landing.bias.view());
+            let values_half = chunk(&landing.cells)
+                .tile::<m![KeyValue], 1, Half<TileRows<Rows, N>, KvHeads, Head>>(1);
             <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::transpose::<
                 TileRows<Rows, N>,
                 _,
                 _,
-            >(device, half(1), values.view_mut());
+                _,
+            >(device, values_half, values.view_mut());
             registers
         };
         let attends =
@@ -879,6 +1104,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     shard::Partial::<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>>::new();
                 let mut lse =
                     shard::Local::<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>>::new();
+                let scales = history.scales(device);
                 <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::attend::<
                     TileRows<Rows, N>,
                     _,
@@ -888,7 +1114,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 >(
                     device,
                     projected.view(),
-                    (&registers, values.view()),
+                    (&registers, values.view(), scales.as_ref()),
                     (partial.view_mut(), lse.view_mut()),
                 );
                 (partial, lse)
@@ -907,7 +1133,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
             };
         if const { Self::overlaps::<Rows>(N) } {
             let (mut even, mut odd) = (
-                Place::<Rows, KvHeads, Groups, Head, N>::new(),
+                Place::<Rows, KvHeads, Groups, Head, Source, N>::new(),
                 Landing::new(),
             );
             let mut values = Transposed::<Rows, KvHeads, Groups, Head, SCALE, N>::new();
@@ -925,14 +1151,14 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 let mut land =
                     |device: &mut Device,
                      at,
-                     landing: &mut Place<Rows, KvHeads, Groups, Head, N>| {
+                     landing: &mut Place<Rows, KvHeads, Groups, Head, Source, N>| {
                         lands(device, (at, pass), landing)
                     };
                 // Window `at` of this pass while its history holds it, past that the next pass's first.
                 let mut follow =
                     |device: &mut Device,
                      at: usize,
-                     landing: &mut Place<Rows, KvHeads, Groups, Head, N>| {
+                     landing: &mut Place<Rows, KvHeads, Groups, Head, Source, N>| {
                         let within = (rest + 1 - at).min(1);
                         for _ in 0..within + (1 - within) * ((count - tile) / 2).min(1) {
                             let pass = Pass::of(first + tile + 1 - within, live);
@@ -941,7 +1167,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     };
                 let mut attend = |device: &mut Device,
                                   (_, registers): (
-                    &Place<Rows, KvHeads, Groups, Head, N>,
+                    &Place<Rows, KvHeads, Groups, Head, Source, N>,
                     Registers<Rows, KvHeads, Groups, Head, SCALE, N>,
                 ),
                                   values: &Transposed<Rows, KvHeads, Groups, Head, SCALE, N>| {
@@ -1007,22 +1233,25 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
     }
 }
 
-/// The values of every row group of `chunk` transposed into `values`, as [`attend`] reads them.
+/// The values of every row group of `chunk`, each a `D`, transposed into `values`, as
+/// [`attend`] reads them.
 fn transposes<
     Rows: AxisName,
     KvHeads: AxisName,
     Groups: AxisName,
     Head: AxisName,
     const SCALE: usize,
+    D: shard::Value,
 >(
     device: &mut Device,
-    chunk: ChunkView<'_, Rows, KvHeads, Head, RowGroups<Rows>>,
+    chunk: ChunkView<'_, Rows, KvHeads, Head, RowGroups<Rows>, D>,
     values: &mut shard::Transposed<Partition<Rows, KvHeads, Groups, Head, SCALE>, RowGroups<Rows>>,
 ) {
     #[unroll]
     for tile in 0..<Tiles<Rows> as M>::SIZE {
         <Partition<Rows, KvHeads, Groups, Head, SCALE> as shard::Partition>::transpose::<
             TileRows<Rows>,
+            _,
             _,
             _,
         >(
@@ -1056,7 +1285,10 @@ fn attend<
         ChunkView<'_, Rows, KvHeads, Head, RowGroups<Rows>>,
         &shard::Transposed<Partition<Rows, KvHeads, Groups, Head, SCALE>, RowGroups<Rows>>,
     ),
-    bias: &Bias<Rows, KvHeads, Groups>,
+    (bias, scales): (
+        &Bias<Rows, KvHeads, Groups>,
+        Option<&shard::Scales<Partition<Rows, KvHeads, Groups, Head, SCALE>>>,
+    ),
 ) -> (
     Partial<Rows, KvHeads, Groups, Head, SCALE>,
     Local<Rows, KvHeads, Groups, Head, SCALE>,
@@ -1093,6 +1325,7 @@ fn attend<
                     { Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, Head,
                     { ShardKeys<KvHeads> }
                 ]>(tile),
+                scales,
             ),
             (
                 partial
@@ -1193,6 +1426,7 @@ mod tests {
             blocks,
             table,
             lengths,
+            scales: &(),
         };
         for w in 0..Chunks::SIZE {
             let mut landing = super::Landing::<Count, KvHeads, Groups, Head, _>::new();
@@ -1203,7 +1437,7 @@ mod tests {
                 &mut landing.cells,
                 (w, Live::all()),
             );
-            landing.chunk().to_hbm_view(
+            super::chunk(&landing.cells).to_hbm_view(
                 &mut device.tdma,
                 output.view_mut().tile::<m![Chunks], 1, m![
                     Chunks = 1 #{!} Chunks, Count, Cache, KeyValue, KvHeads, Head
@@ -1549,6 +1783,7 @@ mod tests {
             blocks,
             table,
             lengths,
+            scales: &(),
         };
         Windowed::<KvHeads, PrefixGroups, Head, INVERSE_ROOT>::default()
             .forward(
@@ -1930,7 +2165,7 @@ mod tests {
                 |_: &mut Device, _| (),
                 |device: &mut Device, ()| {
                     let mut values = DmTensor::new();
-                    super::transposes::<Eight, KvHeads, Groups, Head, INVERSE_ROOT>(
+                    super::transposes::<Eight, KvHeads, Groups, Head, INVERSE_ROOT, _>(
                         device,
                         chunk.view(),
                         &mut values,
@@ -1939,7 +2174,7 @@ mod tests {
                         device,
                         &query,
                         (chunk.view(), &values),
-                        &bias,
+                        (&bias, None),
                     )
                 },
             ),

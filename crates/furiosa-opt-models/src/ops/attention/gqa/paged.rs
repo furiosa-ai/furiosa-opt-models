@@ -1,5 +1,5 @@
 use super::partition::Geometry;
-use super::{Attended, Cache, Paged, Windowed, shard};
+use super::{Attended, Cache, Landed, Paged, Windowed, shard};
 use crate::ops::index::table::{BlockCounts, BlockIndex};
 use crate::tensor::cache::{Block, Blocks, KeyValue};
 use crate::tensor::live::Live;
@@ -437,6 +437,7 @@ where
             blocks,
             table: &read.table,
             lengths: &read.lengths,
+            scales: &(),
         };
         let history = (&heads, &history, &read.bias, &read.rest, query.with(()));
         query.with(self.forward(device, (history, boundary)))
@@ -444,24 +445,29 @@ where
 }
 
 /// The same attention over queries where their store left them in HBM, each pass landing its
-/// own rows, so the envelope's queries take no data memory beside the attention's working set.
+/// own rows, so the envelope's queries take no data memory beside the attention's working set;
+/// the layer's blocks hold `D` and are read under the `scales` its write landed: nothing for BF16
+/// blocks, the layer's scales for E4M3 ones.
 impl<
     Heads: AxisName,
     Groups: AxisName,
     Head: AxisName,
     Windows: AxisName,
     Rows: AxisName,
+    D: MaterializableScalar,
+    S,
     H,
     G,
     const SCALE: usize,
 >
     Op<(
         Live<&super::Stored<Rows, Heads, Groups, Head>, Rows>,
-        &Blocks<Heads, Head>,
+        (&Blocks<Heads, Head, D>, &S),
         &Pages<Rows, Windows>,
         (&H, &mut G),
     )> for Windowed<Heads, Groups, Head, SCALE>
 where
+    for<'l> Paged<'l, Rows, Heads, Head, Windows, D, S>: Landed<Rows, Heads, Head, Element = D>,
     H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()>,
 {
     type Output = Live<Attended<Rows, Heads, Groups, Head>, Rows>;
@@ -469,9 +475,9 @@ where
     fn forward(
         &self,
         device: &mut Device,
-        (query, blocks, read, boundary): (
+        (query, (blocks, scales), read, boundary): (
             Live<&super::Stored<Rows, Heads, Groups, Head>, Rows>,
-            &Blocks<Heads, Head>,
+            (&Blocks<Heads, Head, D>, &S),
             &Pages<Rows, Windows>,
             (&H, &mut G),
         ),
@@ -480,6 +486,7 @@ where
             blocks,
             table: &read.table,
             lengths: &read.lengths,
+            scales,
         };
         let live = query.with(());
         let history = (query.into_value(), &history, &read.bias, &read.rest, live);

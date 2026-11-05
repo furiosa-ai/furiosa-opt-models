@@ -104,6 +104,94 @@ pub(crate) struct Registers<G: Partition, Count: M> {
     bias: Mask<G, Count>,
 }
 
+/// An FP32 scale in the vector registers of every slice of partition `G`.
+pub(crate) type Scale<G> =
+    VrfTensor<f32, Chip<G>, <G as Partition>::Cluster, <G as Partition>::Slices, m![1 # 8]>;
+
+/// A window's key and value scales where its cache holds codes: the factors of its scores and of
+/// its weighted sum.
+pub(crate) struct Scales<G: Partition>(pub Scale<G>, pub Scale<G>);
+
+/// An element a window's values land in, transposed into BF16 for the weighted sum's registers.
+pub(crate) trait Value: MaterializableScalar {
+    fn transpose<G: Partition, Count: M, K: M, V: M>(
+        device: &mut Device,
+        value: DmTensorView<'_, Self, Chip<G>, G::Cluster, G::Slices, K>,
+        values: DmTensorViewMut<'_, bf16, Chip<G>, G::Cluster, G::Slices, V>,
+    );
+}
+
+/// BF16 values move as they are.
+impl Value for bf16 {
+    fn transpose<G: Partition, Count: M, K: M, V: M>(
+        device: &mut Device,
+        value: DmTensorView<'_, bf16, Chip<G>, G::Cluster, G::Slices, K>,
+        values: DmTensorViewMut<'_, bf16, Chip<G>, G::Cluster, G::Slices, V>,
+    ) {
+        device
+            .main
+            .begin(value)
+            .fetch::<m![
+                { Count },
+                { G::Keys } / 16,
+                { G::Head } / 8,
+                { G::Keys } % 16
+            ], m![{ G::Head } % 8 # 16]>()
+            .collect::<m![
+                { Count },
+                { G::Keys } / 16,
+                { G::Head } / 8,
+                { G::Keys } % 16
+            ], m![{ G::Head } % 8 # 16]>()
+            .transpose::<m![
+                { Count },
+                { G::Keys } / 16,
+                { G::Head } / 8,
+                { G::Keys } % 16 / 4,
+                { G::Head } % 8
+            ], m![{ G::Keys } % 4 # 16]>()
+            .commit_trim::<m![{ G::Keys } % 4]>()
+            .commit_view(values);
+    }
+}
+
+/// E4M3 codes widen to BF16 on their way to the transpose, exactly: their scale is the weighted
+/// sum's.
+impl Value for f8e4m3 {
+    fn transpose<G: Partition, Count: M, K: M, V: M>(
+        device: &mut Device,
+        value: DmTensorView<'_, f8e4m3, Chip<G>, G::Cluster, G::Slices, K>,
+        values: DmTensorViewMut<'_, bf16, Chip<G>, G::Cluster, G::Slices, V>,
+    ) {
+        device
+            .main
+            .begin(value)
+            .fetch::<m![
+                { Count },
+                { G::Keys } / 16,
+                { G::Head } / 8,
+                { G::Keys } % 16
+            ], m![{ G::Head } % 8]>()
+            .fetch_cast::<f32>()
+            .collect::<m![
+                { Count },
+                { G::Keys } / 16,
+                { G::Head } / 8,
+                { G::Keys } % 16
+            ], m![{ G::Head } % 8]>()
+            .cast::<bf16, m![{ G::Head } % 8 # 16]>()
+            .transpose::<m![
+                { Count },
+                { G::Keys } / 16,
+                { G::Head } / 8,
+                { G::Keys } % 16 / 4,
+                { G::Head } % 8
+            ], m![{ G::Keys } % 4 # 16]>()
+            .commit_trim::<m![{ G::Keys } % 4]>()
+            .commit_view(values);
+    }
+}
+
 /// One window of a history that spans at most `Rest` windows after the first.
 #[derive(Clone, Debug)]
 pub(crate) struct Window<Rest>(PhantomData<Rest>);
@@ -397,37 +485,15 @@ pub(crate) trait Partition: Sized {
         )
     }
 
-    /// A window's `value` rows transposed into `values`, as the shard's attention reads them, in
-    /// runs of sixteen keys: a longer run holds one bank group past a DMA's NoC timeout.
-    fn transpose<Count: M, K: M, V: M>(
+    /// A window's `value` rows, each a `D` its cache holds, transposed into `values` as BF16, as
+    /// the shard's attention reads them, in runs of sixteen keys: a longer run holds one bank
+    /// group past a DMA's NoC timeout.
+    fn transpose<Count: M, K: M, V: M, D: Value>(
         device: &mut Device,
-        value: DmTensorView<'_, bf16, Chip<Self>, Self::Cluster, Self::Slices, K>,
+        value: DmTensorView<'_, D, Chip<Self>, Self::Cluster, Self::Slices, K>,
         values: DmTensorViewMut<'_, bf16, Chip<Self>, Self::Cluster, Self::Slices, V>,
     ) {
-        device
-            .main
-            .begin(value)
-            .fetch::<m![
-                { Count },
-                { Self::Keys } / 16,
-                { Self::Head } / 8,
-                { Self::Keys } % 16
-            ], m![{ Self::Head } % 8 # 16]>()
-            .collect::<m![
-                { Count },
-                { Self::Keys } / 16,
-                { Self::Head } / 8,
-                { Self::Keys } % 16
-            ], m![{ Self::Head } % 8 # 16]>()
-            .transpose::<m![
-                { Count },
-                { Self::Keys } / 16,
-                { Self::Head } / 8,
-                { Self::Keys } % 16 / 4,
-                { Self::Head } % 8
-            ], m![{ Self::Keys } % 4 # 16]>()
-            .commit_trim::<m![{ Self::Keys } % 4]>()
-            .commit_view(values);
+        D::transpose::<Self, Count, K, V>(device, value, values)
     }
 
     /// A window's `key` rows and its `bias` read into the registers its scores take them from.
@@ -507,20 +573,23 @@ pub(crate) trait Partition: Sized {
     }
 
     /// The shard's attention of `query` over one window's `registers` and its values transposed
-    /// in `values`: `partial` and `lse`.
+    /// in `values`, their codes times the window's `scales` where it has them: `partial` and
+    /// `lse`.
     fn attend<Count: M, Q: M, V: M, P: M, L: M>(
         device: &mut Device,
         query: DmTensorView<'_, bf16, Chip<Self>, Self::Cluster, Self::Slices, Q>,
-        (registers, values): (
+        (registers, values, scales): (
             &Registers<Self, Count>,
             DmTensorView<'_, bf16, Chip<Self>, Self::Cluster, Self::Slices, V>,
+            Option<&Scales<Self>>,
         ),
         (partial, lse): (
             DmTensorViewMut<'_, f32, Chip<Self>, Self::Cluster, Self::Slices, P>,
             DmTensorViewMut<'_, f32, Chip<Self>, Self::Cluster, Self::Slices, L>,
         ),
     ) {
-        let logits: Slots<Self, Count> = qk_logits::<Self, Count, _>(device, query, registers)
+        let key = scales.map(|Scales(key, _)| key);
+        let logits: Slots<Self, Count> = qk_logits::<Self, Count, _>(device, query, registers, key)
             .cast::<bf16, m![{Self::Keys} % 8 # 16]>()
             .commit_trim::<m![{ Self::Keys } % 8]>()
             .commit();
@@ -620,7 +689,8 @@ pub(crate) trait Partition: Sized {
             .vector_final()
             .commit_trim::<m![1 # 8]>()
             .commit_view(lse);
-        weighted_sum::<Self, Count, _, _>(device, (&weight, &total), values, partial);
+        let value = scales.map(|Scales(_, value)| value);
+        weighted_sum::<Self, Count, _, _>(device, (&weight, &total, value), values, partial);
     }
 
     fn attend_precise<Count: M, Q: M, K: M, B: M, P: M, L: M>(
@@ -634,7 +704,7 @@ pub(crate) trait Partition: Sized {
     ) {
         let registers = Self::fill::<Count, _, _>(device, key, bias);
         let logits: Slots<Self, Count, f32> =
-            qk_logits::<Self, Count, _>(device, query, &registers)
+            qk_logits::<Self, Count, _>(device, query, &registers, None)
                 .commit_trim::<m![{ Self::Keys } % 8]>()
                 .commit();
         let max: Statistics<Self, Count> = device
@@ -766,16 +836,17 @@ pub(crate) trait Partition: Sized {
         let mut a = Partial::<Self, Count>::new();
         let mut b = Partial::<Self, Count>::new();
         let mut high_values = Transposed::<Self, Count>::new();
-        Self::transpose::<Count, _, _>(device, value.clone(), high_values.view_mut());
+        Self::transpose::<Count, _, _, _>(device, value.clone(), high_values.view_mut());
         weighted_sum::<Self, Count, _, _>(
             device,
-            (&high, &total),
+            (&high, &total, None),
             high_values.view(),
             a.view_mut(),
         );
         let mut low_values = Transposed::<Self, Count>::new();
-        Self::transpose::<Count, _, _>(device, value, low_values.view_mut());
-        weighted_sum::<Self, Count, _, _>(device, (&low, &total), low_values.view(), b.view_mut());
+        Self::transpose::<Count, _, _, _>(device, value, low_values.view_mut());
+        let low_terms = (&low, &total, None);
+        weighted_sum::<Self, Count, _, _>(device, low_terms, low_values.view(), b.view_mut());
         device
             .main
             .begin_interleaved::<Summand, _, _, _, _, _>(a.view(), b.view())
@@ -986,10 +1057,13 @@ const fn holds<G: Partition, Rest: AxisName>() -> bool {
 const PRESENT: TagGuard =
     TagGuard::matches([BitReq::Zero, BitReq::Ignore, BitReq::Ignore, BitReq::Ignore]);
 
+/// The scores of `query` over a window's keys in the registers, each times the window's `scale`
+/// where its keys are codes, before the score divisor.
 fn qk_logits<'a, G: Partition, Count: M, Q: M>(
     device: &'a mut Device,
     query: DmTensorView<'a, bf16, Chip<G>, G::Cluster, G::Slices, Q>,
     Registers { key, mask, bias }: &Registers<G, Count>,
+    scale: Option<&Scale<G>>,
 ) -> VectorFinalTensor<
     'a,
     { Tu::Main },
@@ -1000,7 +1074,7 @@ fn qk_logits<'a, G: Partition, Count: M, Q: M>(
     m![{ Count }, { G::Groups }, { G::Keys } / 8],
     m![{ G::Keys } % 8],
 > {
-    device
+    let scores = device
         .main
         .begin(query)
         .fetch::<m![{ Count }, { G::Groups }, { G::Head } / 16], m![{ G::Head } % 16]>()
@@ -1026,16 +1100,33 @@ fn qk_logits<'a, G: Partition, Count: M, Q: M>(
             m![{ Count }, { G::Groups }, { G::Keys } / 8, { G::Keys } % 8 / 4],
             m![{ G::Keys } % 4],
         >(
-        )
-        .vector_fp_div(G::DIVISOR)
-        .vector_widen_concat::<m![{ Count }, { G::Groups }, { G::Keys } / 8], m![{ G::Keys } % 8]>()
-        .vector_clip(ClipBinaryOpF32::Add, bias)
-        .vector_final()
+        );
+    type Wide<G, Count> = m![
+        { Count },
+        { <G as Partition>::Groups },
+        { <G as Partition>::Keys } / 8
+    ];
+    type Lanes<G> = m![{ <G as Partition>::Keys } % 8];
+    match scale {
+        None => scores
+            .vector_fp_div(G::DIVISOR)
+            .vector_widen_concat::<Wide<G, Count>, Lanes<G>>()
+            .vector_clip(ClipBinaryOpF32::Add, bias)
+            .vector_final(),
+        Some(scale) => scores
+            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), scale)
+            .vector_fp_div(G::DIVISOR)
+            .vector_widen_concat::<Wide<G, Count>, Lanes<G>>()
+            .vector_clip(ClipBinaryOpF32::Add, bias)
+            .vector_final(),
+    }
 }
 
+/// The softmax `weight`s' sum of `values` over their `total`, each value times the window's
+/// `scale` where its values are codes.
 fn weighted_sum<G: Partition, Count: M, V: M, P: M>(
     device: &mut Device,
-    (weight, total): (&Slots<G, Count>, &Statistics<G, Count>),
+    (weight, total, scale): (&Slots<G, Count>, &Statistics<G, Count>, Option<&Scale<G>>),
     values: DmTensorView<'_, bf16, Chip<G>, G::Cluster, G::Slices, V>,
     output: DmTensorViewMut<'_, f32, Chip<G>, G::Cluster, G::Slices, P>,
 ) {
@@ -1062,7 +1153,7 @@ fn weighted_sum<G: Partition, Count: M, V: M, P: M>(
             { G::Keys } / 16
         ], m![{ G::Keys } % 16]>()
         .to_trf();
-    device
+    let sums = device
         .main
         .begin(weight.view())
         .fetch::<m![{ Count }, { G::Groups }, { G::Keys } / 16], m![{ G::Keys } % 16]>()
@@ -1086,12 +1177,25 @@ fn weighted_sum<G: Partition, Count: M, V: M, P: M>(
         .vector_narrow_split::<
             m![{ Count }, { G::Groups }, { G::Head } / 8, { G::Head } % 8 / 4],
             m![{ G::Head } % 4],
-        >()
-        .vector_fp_div(total)
-        .vector_widen_concat::<m![{ Count }, { G::Groups }, { G::Head } / 8], m![{ G::Head } % 8]>()
-        .vector_final()
-        .commit_trim::<m![{ G::Head } % 8]>()
-        .commit_view(output);
+        >();
+    type Wide<G, Count> = m![
+        { Count },
+        { <G as Partition>::Groups },
+        { <G as Partition>::Head } / 8
+    ];
+    type Lanes<G> = m![{ <G as Partition>::Head } % 8];
+    let summed = match scale {
+        None => sums
+            .vector_fp_div(total)
+            .vector_widen_concat::<Wide<G, Count>, Lanes<G>>()
+            .vector_final(),
+        Some(scale) => sums
+            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), scale)
+            .vector_fp_div(total)
+            .vector_widen_concat::<Wide<G, Count>, Lanes<G>>()
+            .vector_final(),
+    };
+    summed.commit_trim::<Lanes<G>>().commit_view(output);
 }
 
 fn operand<G: Partition, Count: M>(

@@ -19,7 +19,7 @@
 //! - Its tile is its envelope, so its attention hands its end the attended heads where they are,
 //!   with the landed output projection, and writes no HBM place.
 
-use super::{Cut, Output, Places, Pool, QueryRows, Staged, Stored, attend_stored};
+use super::{Cut, Output, Places, Pool, QueryRows, Scales, Staged, Stored, attend_stored};
 use crate::load::Named;
 use crate::models::decoder;
 use crate::modules::attention::{self, Attention, KeyValue, NormalizedQkv, Positioned, Projection};
@@ -196,20 +196,21 @@ where
             &'x mut (),
             Output = (Live<QueryHeads<A, R>, R>, Live<KeyHeads<A, R>, R>),
         >,
-    Write: for<'d, 'r, 'k> Module<
+    Write: for<'l, 'x> Module<&'l mut Scales<A>, (), &'x mut (), Output = ()>
+        + for<'d, 'r, 'o, 's, 'l, 'k> Module<
             (
                 &'r mut Pool<A>,
-                &'r HbmTensor<i32, Chip, m![R]>,
+                &'o (&'s HbmTensor<i32, Chip, m![R]>, &'l Scales<A>),
                 (&'k Live<KeyHeads<A, R>, R>, &'k Live<KeyHeads<A, R>, R>),
             ),
             (),
             &'d mut (),
             Output = (),
         >,
-    Attend: for<'q, 'b, 'h, 'o, 'l, 'x> Module<
+    Attend: for<'q, 'b, 's, 'h, 'o, 'l, 'x> Module<
             (
                 Live<&'q QueryRows<A, R>, R>,
-                &'b Pool<A>,
+                (&'b Pool<A>, &'s Scales<A>),
                 &'h Pages<R, Windows, Chip>,
                 (&'o O, &'l mut OL),
             ),
@@ -337,6 +338,9 @@ where
             positions,
         } = &attention.0.qkv;
         let normalized = norm.forward(&mut *device, (), &mut (), &rows);
+        // The cache's scales land for the attention ahead of the gate's codes, whose transfers
+        // take far longer.
+        (attention.0.cache.write).forward(&mut *device, (), &mut (), &mut stored.scales);
         // The gate's codes land for the end behind the norm's gain, where the transfers idle until
         // the query projection hands its rows on; its scales land in the end.
         gate.forward(&mut *device, (), &mut (), gate_landed);
@@ -364,7 +368,9 @@ where
         let key = key_norm.forward(&mut *device, (), &mut (), &key);
         let positioned = ((query, key), &call.positions);
         let (query, key) = positions.forward(&mut *device, (), &mut (), positioned);
-        let Stored { queries, retained } = stored;
+        let Stored {
+            queries, retained, ..
+        } = stored;
         let tdma = &mut device.tdma;
         query.value().view().to_hbm_view(tdma, queries.view_mut());
         key.value().view().to_hbm_view(tdma, retained.0.view_mut());
@@ -390,7 +396,7 @@ where
             ..
         } = &attention.0;
         let Places { stored, .. } = places;
-        let write = &call.write;
+        let write = (&call.write, &stored.scales);
         let operands = (&write, &call.read);
         attend_stored(
             device,
@@ -399,7 +405,8 @@ where
             |device, pool| {
                 let mut landed = OL::default();
                 let boundary = (&output.0.operation, &mut landed);
-                let input = (live.with(&stored.queries), pool, &call.read, boundary);
+                let blocks = (pool, &stored.scales);
+                let input = (live.with(&stored.queries), blocks, &call.read, boundary);
                 let rows = attend.forward(&mut *device, (), &mut (), input);
                 (landed, rows)
             },
