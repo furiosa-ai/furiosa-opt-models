@@ -668,8 +668,9 @@ where
     }
 }
 
-/// A launch's keys and values as attention projects them, coded under the layer's landed scales:
-/// only the live rows write, each into the slot the write operand names for it.
+/// A launch's keys and values as attention projects them, coded under the layer's landed scales
+/// where they stand, then copied together into each row's token: only the live rows write, each
+/// into the slot the write operand names for it.
 impl<R: AxisName, Heads: AxisName, Head: AxisName, X: Memory>
     Op<(
         &mut Blocks<Heads, Head, f8e4m3>,
@@ -694,49 +695,52 @@ impl<R: AxisName, Heads: AxisName, Head: AxisName, X: Memory>
             ),
         ),
     ) {
-        type Slices<Heads> = m![Heads, 1 # (256 / Heads)];
-        type Token<D, R, Heads, Head> =
-            DmTensor<D, Chip, m![1 # 2], Slices<Heads>, m![R, KeyValue, Head]>;
-        type Scale<Heads> = VrfTensor<f32, Chip, m![1 # 2], Slices<Heads>, m![1 # 8]>;
-        let (key_scale, value_scale) = landed.registers::<m![1 # 2], Slices<Heads>>(device);
-        let mut rows = Token::<bf16, R, Heads, Head>::new();
-        let mut codes = Token::<f8e4m3, R, Heads, Head>::new();
+        // Where attention projects them, a head's rows spread over the slices of its lanes, so a
+        // pass codes far fewer elements a slice there than in the tokens, one slice a head.
+        type Slices<R, Heads> = attention::HeadSlice<R, Heads>;
+        type RowGroups<R> = attention::RowGroups<R, Single>;
+        type Codes<R, Heads, Head> = DmTensor<
+            f8e4m3,
+            Chip,
+            m![1 # 2],
+            Slices<R, Heads>,
+            m![{ RowGroups<R> }, KeyValue, Head],
+        >;
+        type Token<R, Heads, Head> =
+            DmTensor<f8e4m3, Chip, m![1 # 2], m![Heads, 1 # (256 / Heads)], m![R, KeyValue, Head]>;
+        type Scale<R, Heads> = VrfTensor<f32, Chip, m![1 # 2], Slices<R, Heads>, m![1 # 8]>;
+        let (key_scale, value_scale) = landed.registers::<m![1 # 2], Slices<R, Heads>>(device);
+        let mut codes = Codes::<R, Heads, Head>::new();
         let mut code = |device: &mut Device,
                         (at, part): (usize, &attention::Heads<R, Heads, Single, Head>),
-                        scale: &Scale<Heads>| {
-            part.view().to_dm_view(
-                &mut device.tdma,
-                rows.view_mut()
-                    .tile::<m![KeyValue], 1, m![R, KeyValue = 1 #{!} 2, Head]>(at),
-            );
+                        scale: &Scale<R, Heads>| {
             device
                 .main
-                .begin(
-                    rows.view()
-                        .tile::<m![KeyValue], 1, m![R, KeyValue = 1 # 2, Head]>(at),
-                )
-                .fetch::<m![R, Head / 16], m![Head % 16]>()
+                .begin(part.view())
+                .fetch::<m![{ RowGroups<R> }, Head / 16], m![Head % 16]>()
                 .fetch_cast::<f32>()
-                .collect::<m![R, Head / 8], m![Head % 8]>()
+                .collect::<m![{ RowGroups<R> }, Head / 8], m![Head % 8]>()
                 .vector_init()
                 .vector_intra_slice_tag(TagMode::Zero)
-                .vector_narrow_split::<m![R, Head / 4], m![Head % 4]>()
+                .vector_narrow_split::<m![{ RowGroups<R> }, Head / 4], m![Head % 4]>()
                 .vector_fp_div(scale)
-                .vector_widen_concat::<m![R, Head / 8], m![Head % 8]>()
+                .vector_widen_concat::<m![{ RowGroups<R> }, Head / 8], m![Head % 8]>()
                 .vector_clip(ClipBinaryOpF32::Max, -f8e4m3::LARGEST)
                 .vector_clip(ClipBinaryOpF32::Min, f8e4m3::LARGEST)
                 .vector_final()
                 .cast::<f8e4m3, m![Head % 8 # 32]>()
                 .commit_trim::<m![Head % 8]>()
-                .commit_view(
-                    codes
-                        .view_mut()
-                        .tile::<m![KeyValue], 1, m![R, KeyValue = 1 #{!} 2, Head]>(at),
-                );
+                .commit_view(codes.view_mut().tile::<m![KeyValue], 1, m![
+                    { RowGroups<R> },
+                    KeyValue = 1 #{!} 2,
+                    Head
+                ]>(at));
         };
         code(device, (0, key.value()), &key_scale);
         code(device, (1, value.value()), &value_scale);
-        Scatter.forward(device, (layer, (slot, key.with(())), &codes));
+        let mut token = Token::<R, Heads, Head>::new();
+        codes.view().to_dm_view(&mut device.tdma, token.view_mut());
+        Scatter.forward(device, (layer, (slot, key.with(())), &token));
     }
 }
 
