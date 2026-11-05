@@ -294,18 +294,22 @@ where
 /// scales; the op that writes a call's rows into its blocks, holding its leaves in memory `X`, and
 /// what that op lands once a layer for itself and the attention that reads the blocks.
 pub trait Cache: MaterializableScalar + FetchCast<f32> + 'static {
+    /// The element as a checkpoint's tensors name it.
+    const DTYPE: safetensors::Dtype;
     type Write<X: Memory>;
     type Landed: Default;
 }
 
 /// The rows as they are, read as stored.
 impl Cache for bf16 {
+    const DTYPE: safetensors::Dtype = safetensors::Dtype::BF16;
     type Write<X: Memory> = ops::index::scatter::Scatter;
     type Landed = ();
 }
 
 /// The rows divided by the layer's scales and rounded, read back times them.
 impl Cache for f8e4m3 {
+    const DTYPE: safetensors::Dtype = safetensors::Dtype::F8_E4M3;
     type Write<X: Memory> = ops::index::scatter::Scaled<X>;
     type Landed = crate::tensor::cache::Landed;
 }

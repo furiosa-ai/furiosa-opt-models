@@ -19,7 +19,7 @@ use furiosa_opt_models::modules::language::Input;
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
 use furiosa_opt_models::ops::attention::gqa::Cache;
 use furiosa_opt_models::tensor::cache::{Block, Blocks};
-use furiosa_opt_models::tensor::memory::alias;
+use furiosa_opt_models::tensor::memory::{Dtype, alias};
 use furiosa_opt_models::tensor::parallel::Chip;
 use furiosa_opt_std::prelude::*;
 use furiosa_opt_std::runtime::DeviceOutput;
@@ -56,13 +56,14 @@ where
 
 /// One paging a group binds each collection of a body's layers to a cache group of its own, in the
 /// collections' order, for calls of `R` rows: the device prepares each group's rows from the
-/// history the host stages, so a call's rows attend under the adaptive tiling only.
+/// history the host stages, so a call's rows attend under the adaptive tiling only; both groups
+/// cache keys and values in one element.
 impl<T, A, B, R> Groups<T> for (decoder::Paging<A, R>, decoder::Paging<B, R>)
 where
     T: Root + DeviceSend + Sync,
     T::Body: Collections,
     A: Attention<Rotated: AxisName> + LayerType,
-    B: Attention<Rotated: AxisName> + LayerType,
+    B: Attention<Rotated: AxisName, Cache = <A as Attention>::Cache> + LayerType,
     R: AxisName,
     Pages<A>: Send,
     Pages<B>: Send,
@@ -76,6 +77,7 @@ where
 {
     const ADAPTERS: usize = 0;
     const FIXED: bool = false;
+    const KV_CACHE: Dtype = <<A as Attention>::Cache as decoder::Cache>::DTYPE;
     type Adapter = Infallible;
     type Layers = (Vec<Pages<A>>, Vec<Pages<B>>);
 

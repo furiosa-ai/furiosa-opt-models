@@ -8,8 +8,12 @@
 //!   checkpoint.
 //! - A load reads the whole model, or its media encoder alone, which the registry lists as an
 //!   implementation of its own.
-//! - Every implementation runs on one chip, caches keys and values in BF16 and loads whole; any
-//!   other choice is unsupported until the registry holds an implementation that makes it.
+//! - Every implementation runs on one chip and loads whole; any other choice is unsupported until
+//!   the registry holds an implementation that makes it.
+//! - A decoder's cache stores keys and values in the one element its implementation lists; a load
+//!   caches them in the element its options name, else in the one the checkpoint declares, E4M3
+//!   where its `quantization_config` declares a KV cache scheme, where an implementation caches in
+//!   it, else in BF16.
 //! - A batch-invariant load asks every implementation's calls to tile their attention fixed, which
 //!   they serve as an `Instance` of their decoder.
 //! - A quantization reads the checkpoint quantized, so only an implementation whose projections a
@@ -24,6 +28,7 @@ use std::str::FromStr;
 
 use crate::registry::{Implementation, Model};
 use furiosa_opt_models::load::{Checkpoint, Context, LoadError, Part};
+use furiosa_opt_models::models::config;
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
 use furiosa_opt_models::tensor::form::fp8::Granularity;
 use furiosa_opt_std::prelude::Device;
@@ -86,7 +91,7 @@ impl LoadOptions {
         })
     }
 
-    /// Cache keys and values as `dtype` instead of BF16.
+    /// Cache keys and values as `dtype` instead of the element the checkpoint declares.
     pub fn kv_cache(self, dtype: Dtype) -> Self {
         Self {
             kv_cache: Some(dtype),
@@ -203,7 +208,13 @@ impl LoadOptions {
             });
         }
         let (architecture, implementations) = Implementation::listed(&names)?;
-        let implementation = Implementation::choose(architecture, implementations, checkpoint)?;
+        let kv_cache = self.cached(checkpoint, implementations)?;
+        let caching = (implementations.iter()).filter(|implementation| {
+            implementation
+                .kv_cache()
+                .is_none_or(|kept| kept == kv_cache)
+        });
+        let implementation = Implementation::choose(architecture, caching, checkpoint)?;
         let unsupported = |name: &str, reason: &str| LoadError::Unsupported {
             name: name.into(),
             reason: reason.into(),
@@ -212,12 +223,6 @@ impl LoadOptions {
             return Err(unsupported(
                 "chips",
                 "every implementation runs on one chip",
-            ));
-        }
-        if self.kv_cache.is_some_and(|dtype| dtype != Dtype::BF16) {
-            return Err(unsupported(
-                "kv_cache",
-                "every implementation caches keys and values in BF16",
             ));
         }
         if self.layers.is_some() {
@@ -248,10 +253,57 @@ impl LoadOptions {
                 (Part::Encoder, ..) | (Part::Whole, None, None) => Dtype::BF16,
                 _ => Dtype::F8_E4M3,
             },
-            kv_cache: Dtype::BF16,
+            kv_cache,
             chips: 1,
             tiling: self.tiling,
         })
+    }
+
+    /// The element a load of `checkpoint` caches keys and values in, of those `implementations`
+    /// cache in, BF16 if none has a cache: the options' element, else the checkpoint's where one
+    /// caches in it, else BF16; refuses an element none caches in.
+    fn cached(
+        &self,
+        checkpoint: &Checkpoint,
+        implementations: &[Implementation],
+    ) -> Result<Dtype, LoadError> {
+        let cached = (implementations.iter())
+            .filter_map(Implementation::kv_cache)
+            .fold(Vec::new(), |mut cached, dtype| {
+                if !cached.contains(&dtype) {
+                    cached.push(dtype);
+                }
+                cached
+            });
+        let cached = if cached.is_empty() {
+            vec![Dtype::BF16]
+        } else {
+            cached
+        };
+        // A declaration that does not parse is the scope's to refuse.
+        let declared = (checkpoint.declaration())
+            .and_then(|declared| config::parse::<config::Quantization>(declared).ok())
+            .is_some_and(|declared| declared.kv_cache);
+        let declared = if declared {
+            Dtype::F8_E4M3
+        } else {
+            Dtype::BF16
+        };
+        match self.kv_cache {
+            Some(dtype) if cached.contains(&dtype) => Ok(dtype),
+            Some(_) => {
+                let elements: Vec<_> = cached.iter().map(|dtype| format!("{dtype:?}")).collect();
+                Err(LoadError::Unsupported {
+                    name: "kv_cache".into(),
+                    reason: format!(
+                        "every implementation caches keys and values in {}",
+                        elements.join(" or ")
+                    ),
+                })
+            }
+            None if cached.contains(&declared) => Ok(declared),
+            None => Ok(Dtype::BF16),
+        }
     }
 }
 
