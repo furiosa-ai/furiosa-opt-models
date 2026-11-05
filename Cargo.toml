@@ -4,6 +4,7 @@ members = [
     "crates/furiosa-opt-engine",
     "crates/furiosa-opt-models",
     "crates/furiosa-opt-models/macros",
+    "crates/furiosa-opt-nemo",
     "crates/furiosa-opt-python",
 ]
 
