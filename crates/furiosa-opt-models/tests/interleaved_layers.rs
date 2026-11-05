@@ -12,7 +12,7 @@ use furiosa_opt_models::models::decoder::attention::gemma4::{self, full, sliding
 use furiosa_opt_models::models::decoder::form::summed;
 use furiosa_opt_models::models::decoder::{self, Attention};
 use furiosa_opt_models::modules::{attention, language};
-use furiosa_opt_models::ops::attention::gqa::{Attended, Cache, Pages};
+use furiosa_opt_models::ops::attention::gqa::{Attended, Cache, Pages, Wrap};
 use furiosa_opt_models::ops::index::table::{BlockIndex, PADDING_BIAS};
 use furiosa_opt_models::ops::normalization::Spread;
 use furiosa_opt_models::ops::rotary::{PairFrequencies, Rotation};
@@ -30,6 +30,7 @@ use furiosa_opt_models::{Branch, Interleave, Module, Op};
 use furiosa_opt_std::prelude::*;
 use furiosa_opt_std::runtime::{HbmBuffer, launch};
 use safetensors::Dtype;
+use std::ops::Range;
 use tokio::sync::Mutex;
 
 /// The device tests share one chip, so they run one at a time.
@@ -694,33 +695,40 @@ fn hidden(live: usize) -> Vec<bf16> {
         .collect()
 }
 
-/// Pages of `Windows` windows: row `row` sees its first `visible(row)` keys, its table's entry `e`
-/// naming the block at byte offset `block(row, e)`; a row that sees none still names a readable
-/// block.
+/// Pages of `Windows` windows: row `row` sees the keys `visible(row)`, which the windows hold as a
+/// ring from the block pair of its first one, the keys past the ring in the slots before it; key
+/// `k` of row `row` lies at byte offset `key(row, k)` of the pool, and a row that sees none still
+/// names a readable block.
 async fn pages<Windows: AxisName>(
     device: &mut Device,
-    visible: impl Fn(usize) -> usize,
-    block: impl Fn(usize, usize) -> i32,
+    visible: impl Fn(usize) -> Range<usize>,
+    key: impl Fn(usize, usize) -> i32,
 ) -> Pages<Rows, Windows, Chip> {
     let (windows, entries) = (Windows::SIZE, BlockIndex::SIZE);
+    let (ring, pair) = (windows * Cache::SIZE, 2 * Block::SIZE);
+    let first = |row: usize| visible(row).start / pair * pair;
+    let kept = |row: usize| (visible(row).end - first(row)).min(ring);
+    let wrapped = |row: usize| visible(row).end.saturating_sub(first(row) + ring);
     let table: Vec<i32> = (0..Rows::SIZE * windows * entries)
         .map(|at| {
             let (row, entry) = (at / (windows * entries), at % (windows * entries));
-            let used = visible(row).div_ceil(Block::SIZE).max(1);
-            block(row, entry.min(used - 1))
+            let used = visible(row).end.div_ceil(Block::SIZE).max(1);
+            let block = (first(row) / Block::SIZE + entry).min(used - 1);
+            key(row, block * Block::SIZE)
         })
         .collect();
     let counts: Vec<i32> = (0..windows * Rows::SIZE)
         .map(|at| {
             let (window, row) = (at / Rows::SIZE, at % Rows::SIZE);
-            let seen = visible(row).saturating_sub(window * Cache::SIZE);
+            let seen = kept(row).saturating_sub(window * Cache::SIZE);
             seen.min(Cache::SIZE).div_ceil(Block::SIZE) as i32
         })
         .collect();
     let bias: Vec<f32> = (0..Rows::SIZE * windows * Cache::SIZE)
         .map(|at| {
-            let (row, key) = (at / (windows * Cache::SIZE), at % (windows * Cache::SIZE));
-            if key < visible(row) {
+            let (row, slot) = (at / (windows * Cache::SIZE), at % (windows * Cache::SIZE));
+            let held = [slot, slot + ring].map(|key| first(row) + key);
+            if held.iter().any(|key| visible(row).contains(key)) {
                 0.0
             } else {
                 PADDING_BIAS
@@ -728,10 +736,19 @@ async fn pages<Windows: AxisName>(
         })
         .collect();
     let rest = (0..Rows::SIZE)
-        .filter(|&row| visible(row) > 0)
-        .map(|row| (visible(row) - 1) / Cache::SIZE)
+        .filter(|&row| !visible(row).is_empty())
+        .map(|row| (kept(row) - 1) / Cache::SIZE)
         .max();
     let rest = HostTensor::<i32, m![1]>::from_vec([rest.unwrap_or(0) as i32]);
+    let offsets = (0..Rows::SIZE * pair).map(|at| {
+        let (row, past) = (at / pair, at % pair);
+        match past < wrapped(row) {
+            true => key(row, first(row) + ring + past),
+            false => 0,
+        }
+    });
+    let wraps: Vec<i32> = (0..Rows::SIZE).map(|row| wrapped(row) as i32).collect();
+    let any = wraps.iter().any(|&count| count > 0);
     Pages {
         table: HostTensor::<i32, m![Rows, Windows, BlockIndex]>::from_vec(table)
             .to_hbm(&mut device.pdma)
@@ -746,6 +763,22 @@ async fn pages<Windows: AxisName>(
             .await
             .unwrap(),
         rest: rest.to_hbm(&mut device.pdma).await.unwrap(),
+        wrap: Wrap {
+            offsets: HostTensor::<i32, m![Rows, BlockIndex % 2, Block]>::from_vec(
+                offsets.collect::<Vec<_>>(),
+            )
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap(),
+            counts: HostTensor::<i32, m![Rows]>::from_vec(wraps)
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap(),
+            any: HostTensor::<i32, m![1]>::from_vec([any as i32])
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap(),
+        },
     }
 }
 
@@ -759,7 +792,8 @@ async fn context<A: Attention<Rotated: AxisName>>(device: &mut Device, live: usi
 }
 
 /// The context of a call of `live` rows after `history` positions, its rows turning at
-/// `frequencies`, each row seeing the history and the rows up to its own.
+/// `frequencies`, each row seeing the history and the rows up to its own, at most the keys its
+/// group's windows hold.
 async fn context_at<A: Attention<Rotated: AxisName>>(
     device: &mut Device,
     (history, live): (usize, usize),
@@ -792,10 +826,14 @@ async fn context_at<A: Attention<Rotated: AxisName>>(
         false => 0,
     });
     let write = HostTensor::<i32, m![Rows]>::from_vec(slots.collect::<Vec<_>>());
-    // A row sees the history and every row up to its own.
-    let seen = |row: usize| if row < live { history + row + 1 } else { 0 };
-    let read = pages::<<A as Attention>::Windows>(device, seen, |_, entry| {
-        entry as i32 * Pool::<A>::BLOCK_STRIDE
+    let window = <A as Attention>::Windows::SIZE * Cache::SIZE;
+    let seen = |row: usize| match row < live {
+        true => (history + row + 1).saturating_sub(window)..history + row + 1,
+        false => 0..0,
+    };
+    let read = pages::<<A as Attention>::Windows>(device, seen, |_, key| {
+        let (block, slot) = (key / Block::SIZE, key % Block::SIZE);
+        block as i32 * Pool::<A>::BLOCK_STRIDE + slot as i32 * Pool::<A>::ROW_STRIDE
     })
     .await;
     attention::Context {
@@ -1236,12 +1274,18 @@ async fn one_head_attends_each_live_row_as_the_host() {
         .unwrap();
     let pool = Pool::<full::Group>::from_buffer(storage).unwrap();
     let bank = |row: usize| (row * 5 + row / LENGTHS.len()) % LENGTHS.len();
-    let stride = Pool::<full::Group>::BLOCK_STRIDE;
+    let (stride, row_stride) = (
+        Pool::<full::Group>::BLOCK_STRIDE,
+        Pool::<full::Group>::ROW_STRIDE,
+    );
     let banks = BANK / Block::SIZE;
     let read = pages::<<full::Group as Attention>::Windows>(
         &mut device,
-        |row| LENGTHS[bank(row)],
-        |row, entry| (bank(row) * banks + entry) as i32 * stride,
+        |row| 0..LENGTHS[bank(row)],
+        |row, key| {
+            let (block, slot) = (key / Block::SIZE, key % Block::SIZE);
+            (bank(row) * banks + block) as i32 * stride + slot as i32 * row_stride
+        },
     )
     .await;
     let queries = values(Rows::SIZE * heads * head, 0x7f4a_7c15, 0.125);

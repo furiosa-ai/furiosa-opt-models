@@ -20,7 +20,7 @@ use crate::models::decoder::attention::{ForCausalLM, Geometry, Model};
 use crate::models::decoder::{self, launch::interleaved};
 use crate::modules::attention;
 use crate::modules::language::{Backbone, Cap, Greedy, Normalized};
-use crate::ops::attention::gqa::Pages;
+use crate::ops::attention::gqa::{Counted, Pages};
 use crate::ops::embedding::Ids;
 use crate::ops::index::gather::Gather;
 use crate::ops::index::scatter::Store;
@@ -328,7 +328,7 @@ const fn runs<const FIRST: usize, const SECOND: usize>(
 type Context<A, R> = attention::Context<
     Rotation<<A as decoder::Attention>::Rotated, Chip, R>,
     HbmTensor<i32, Chip, m![R]>,
-    Pages<R, <A as decoder::Attention>::Windows, Chip>,
+    Pages<R, <A as decoder::Attention>::Windows, Chip, Counted<R>>,
 >;
 
 /// A launch's `R` rows of `Hidden` features in HBM, where a tile of them waits between two

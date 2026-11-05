@@ -121,8 +121,8 @@ fn plans_each_group_under_its_window() -> io::Result<()> {
 }
 
 /// What a call of Gemma 4's decoder is planned within: 64 rows up to the full group's context, the
-/// sliding group attending the positions of all but one of its cache windows, both paged in blocks
-/// of 16 positions; one layer a group, of pages no plan reads.
+/// sliding group attending the positions of its cache windows, both paged in blocks of 16
+/// positions; one layer a group, of pages no plan reads.
 fn limits() -> Limits {
     let positions = |windows: usize| windows * gqa::Cache::SIZE;
     let group = |layer, window| Group {
@@ -140,7 +140,7 @@ fn limits() -> Limits {
                 bytes: 64,
             }],
             groups: vec![
-                group(0, Some(positions(gemma4::sliding::Windows::SIZE - 1))),
+                group(0, Some(positions(gemma4::sliding::Windows::SIZE))),
                 group(1, None),
             ],
         },

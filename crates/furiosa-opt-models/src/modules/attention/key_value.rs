@@ -11,7 +11,7 @@ use crate::ops::rotary::{self, SplitHalf, group};
 use crate::ops::{
     attention::{
         full::paged,
-        gqa::{Cache, Pages},
+        gqa::{Cache, Counted, Pages, Wrap, Wrapped},
         latent::{self, Slot},
     },
     rotary::{Coefficients, PairFrequencies, Rotation},
@@ -434,14 +434,14 @@ where
             Output = Context<
                 Rotation<Rotated, Chips, Rows>,
                 HbmTensor<i32, Chips, m![Rows]>,
-                Pages<Rows, Windows, Chips>,
+                Pages<Rows, Windows, Chips, Counted<Rows, Chips>>,
             >,
         >,
 {
     type Output = Context<
         Rotation<Rotated, Chips, Rows>,
         HbmTensor<i32, Chips, m![Rows]>,
-        Pages<Rows, Windows, Chips>,
+        Pages<Rows, Windows, Chips, Counted<Rows, Chips>>,
     >;
 
     fn forward(
@@ -612,7 +612,7 @@ where
     type Output = Context<
         Rotation<Rotated, Chips, Rows>,
         HbmTensor<i32, Chips, m![Rows]>,
-        Pages<Rows, Windows, Chips>,
+        Pages<Rows, Windows, Chips, Counted<Rows, Chips>>,
     >;
 
     fn forward(
@@ -635,6 +635,27 @@ where
             const { Blocks::<Heads, Head, D, Chips>::BLOCK_STRIDE },
         );
         let bias = extents.bias(device, (starts, self.slots.borrow()));
+        let mut offsets = Wrapped::<Rows, Chips>::new();
+        // Only a history past its ring holds tokens to wrap; a group whose ring is its context
+        // never does. The layers take the count read here.
+        let times = extents.wraps.extent::<m![1]>();
+        for _ in 0..times {
+            extents.wrap(
+                device,
+                (&history.blocks, self.slots.borrow()),
+                (
+                    &logical.tables,
+                    const {
+                        (
+                            Blocks::<Heads, Head, D, Chips>::BLOCK_STRIDE,
+                            Blocks::<Heads, Head, D, Chips>::ROW_STRIDE,
+                        )
+                    },
+                ),
+                &mut offsets,
+            );
+        }
+        let counts = extents.wrapped(device);
         let positions =
             table::positions::<Rows, Rotated, _>(device, frequencies, &logical.positions);
         Context {
@@ -654,6 +675,14 @@ where
                 lengths: extents.counts,
                 bias,
                 rest: extents.rest,
+                wrap: (
+                    Wrap {
+                        offsets,
+                        counts,
+                        any: extents.wraps,
+                    },
+                    times,
+                ),
             },
         }
     }

@@ -237,12 +237,13 @@ impl<
     WI,
     W,
     Read,
+    Past,
     Env,
 >
     Module<
         (
             &'p Retention<R, KvHeads, Head>,
-            (&'w WI, &'w Pages<R, Windows, Chip>),
+            (&'w WI, &'w Pages<R, Windows, Chip, Past>),
             Live<(), R>,
         ),
         Env,
@@ -272,7 +273,7 @@ where
         pool: &'s mut &'b mut Blocks<KvHeads, Head, D>,
         ((key, value), (slot, _), live): (
             &'p Retention<R, KvHeads, Head>,
-            (&'w WI, &'w Pages<R, Windows, Chip>),
+            (&'w WI, &'w Pages<R, Windows, Chip, Past>),
             Live<(), R>,
         ),
     ) {

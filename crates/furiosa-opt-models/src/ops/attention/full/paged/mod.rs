@@ -382,7 +382,7 @@ mod tests {
     use crate::modules::attention::key_value::{History, Paging, Preparation};
     use crate::ops::attention::Attention;
     use crate::ops::attention::Heads;
-    use crate::ops::attention::gqa::{Cache, Pages};
+    use crate::ops::attention::gqa::{Cache, Pages, Wrap};
     use crate::ops::index::table::{BlockIndex, Fields, PADDING_BIAS};
     use crate::specialize::attention::{HISTORY_WAVES, Strategy, WAVES};
     use crate::tensor::axis::Rows;
@@ -548,6 +548,17 @@ mod tests {
                 .to_hbm(&mut device.pdma)
                 .await
                 .unwrap(),
+            wrap: Wrap {
+                offsets: HostTensor::<i32, m![R, BlockIndex % 2, Block]>::zero()
+                    .to_hbm(&mut device.pdma)
+                    .await
+                    .unwrap(),
+                counts: HostTensor::<i32, m![R]>::zero()
+                    .to_hbm(&mut device.pdma)
+                    .await
+                    .unwrap(),
+                any: count(0).to_hbm(&mut device.pdma).await.unwrap(),
+            },
         }
     }
 

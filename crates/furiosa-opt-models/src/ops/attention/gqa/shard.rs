@@ -327,13 +327,15 @@ pub(crate) trait Partition: Sized {
     /// The immediate the logits are divided by; its reciprocal is exactly the score scale.
     const DIVISOR: f32;
 
-    /// Every window of a history merged: `land` issues window `at`'s history, `attend` attends
-    /// what it landed into the slot it is given, and `boundary` runs once the first window's
-    /// history is in flight. A history of at most `Rest` windows after the first holds every
-    /// window's terms for one merge where they fit, else folds each into a running attention.
+    /// Every window of a history merged: `first` is the first window's history, which the caller
+    /// issued, `land` issues window `at`'s, `attend` attends what they landed into the slot it is
+    /// given, and `boundary` runs once the first window's history is in flight. A history of at
+    /// most `Rest` windows after the first holds every window's terms for one merge where they
+    /// fit, else folds each into a running attention.
     fn windows<H, Rest: AxisName>(
         device: &mut Device,
         rest: usize,
+        first: H,
         steps: (
             impl FnMut(&mut Device, usize) -> H,
             impl FnMut(&mut Device, H) -> (Partial<Self>, Local<Self>),
@@ -341,9 +343,9 @@ pub(crate) trait Partition: Sized {
         boundary: impl FnOnce(&mut Device),
     ) -> Attended<Self> {
         if const { holds::<Self, Rest>() } {
-            Self::serial::<_, Held<Self, Rest>>(device, rest, steps, boundary)
+            Self::serial::<_, Held<Self, Rest>>(device, rest, first, steps, boundary)
         } else {
-            Self::serial::<_, Folded<Self>>(device, rest, steps, boundary)
+            Self::serial::<_, Folded<Self>>(device, rest, first, steps, boundary)
         }
     }
 
@@ -386,13 +388,13 @@ pub(crate) trait Partition: Sized {
     fn serial<H, T: Terms<Self>>(
         device: &mut Device,
         rest: usize,
+        first: H,
         (mut land, mut attend): (
             impl FnMut(&mut Device, usize) -> H,
             impl FnMut(&mut Device, H) -> (Partial<Self>, Local<Self>),
         ),
         boundary: impl FnOnce(&mut Device),
     ) -> Attended<Self> {
-        let first = land(device, 0);
         boundary(device);
         let terms = attend(device, first);
         let mut terms = T::first(device, terms);

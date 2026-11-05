@@ -192,7 +192,7 @@ pub type Quantized = decoder::Projections<
     form::Nvfp4Summed,
 >;
 
-/// Sliding attention geometry: 256-wide heads and three cache windows.
+/// Sliding attention geometry: 256-wide heads and two cache windows.
 pub mod sliding {
     use crate::models::decoder;
     use furiosa_opt_std::prelude::*;
@@ -203,7 +203,7 @@ pub mod sliding {
         Groups = 2,
         QueryWidth = 4096,
         KvWidth = 2048,
-        Windows = 3
+        Windows = 2
     ];
 
     pub type Group<C = bf16> =
@@ -403,8 +403,8 @@ impl TryFrom<Hf> for Size<"12B"> {
             .collect();
         compiled("layer_types", text.layer_types(), order.as_slice())?;
         let window = text.extra.sliding_window.get();
-        // An unaligned start reserves one cache window for the partial prefix.
-        let maximum = (sliding::Windows::SIZE - 1) * Cache::SIZE;
+        // The windows are a ring: an unaligned start wraps its newest keys into the first one.
+        let maximum = sliding::Windows::SIZE * Cache::SIZE;
         if window > maximum {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -885,11 +885,11 @@ pub(in crate::models) mod tests {
     }
 
     /// A context past the compiled cache windows is served up to them; a sliding window past them
-    /// is refused, keeping one window for an unaligned prefix.
+    /// is refused.
     #[test]
     fn serves_a_context_up_to_the_compiled_windows() {
         let positions = full::Windows::SIZE * Cache::SIZE;
-        let window = (sliding::Windows::SIZE - 1) * Cache::SIZE;
+        let window = sliding::Windows::SIZE * Cache::SIZE;
         let mut document = document();
         document["max_position_embeddings"] = json!(positions + 1);
         assert_eq!(refusal(&document), None);

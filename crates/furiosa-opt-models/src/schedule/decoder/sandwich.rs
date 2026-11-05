@@ -41,9 +41,9 @@ use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
 
 /// A call's context of `R` rows: their positions `P`, the slot each writes and the pages of
-/// `Windows` each reads.
-type Context<P, R, Windows> =
-    attention::Context<P, HbmTensor<i32, Chip, m![R]>, Pages<R, Windows, Chip>>;
+/// `Windows` each reads, the tokens past their windows held as `Past`.
+type Context<P, R, Windows, Past> =
+    attention::Context<P, HbmTensor<i32, Chip, m![R]>, Pages<R, Windows, Chip, Past>>;
 
 /// The query heads of group `A` on `R` rows, as attention reads them.
 type QueryHeads<A, R> = Heads<
@@ -66,7 +66,8 @@ type AttendedHeads<A, R> = Attended<
 >;
 
 /// The sandwich-norm layer and its tail `L` in every form whose leaves take a whole envelope of
-/// `R` rows of `Hidden` features, attending in group `A` over pages of its cache. Its query, key
+/// `R` rows of `Hidden` features, attending in group `A` over pages of its cache that hold the
+/// tokens past their windows as `Past`. Its query, key
 /// and value projections land as `QL`, `KL`, `VL` and give `QO`, `KO` and the value heads, which
 /// the head norms leave as `NQ`, `NK`; its output projection lands as `OL` in its attention. Its
 /// norms land their gains as `NB`. Its gated feed-forward's gate, up and down projections land as
@@ -78,6 +79,7 @@ impl<
     P,
     R,
     Windows,
+    Past,
     Hidden,
     const EPSILON: usize,
     NC,
@@ -123,7 +125,7 @@ impl<
     Add,
     Tail,
     TB,
-> Cut<A, &'c Context<P, R, Windows>, ()>
+> Cut<A, &'c Context<P, R, Windows, Past>, ()>
     for Then<
         SandwichNorm<
             Attention<
@@ -212,7 +214,7 @@ where
             (
                 Live<&'q QueryRows<A, R>, R>,
                 (&'b Pool<A>, &'s Scales<A>),
-                &'h Pages<R, Windows, Chip>,
+                &'h Pages<R, Windows, Chip, Past>,
                 (&'o O, &'l mut OL),
             ),
             (),
@@ -319,7 +321,7 @@ where
     fn start(
         &self,
         device: &mut Device,
-        call: &'c Context<P, R, Windows>,
+        call: &'c Context<P, R, Windows, Past>,
         (query, key, value): Self::Front,
         rows: Live<Self::Rows, R>,
         (stored, gate_landed, _): (&mut Stored<A, R>, &mut GL, &mut ()),
@@ -397,7 +399,7 @@ where
     fn attend(
         &self,
         device: &mut Device,
-        call: &'c Context<P, R, Windows>,
+        call: &'c Context<P, R, Windows, Past>,
         (pool, live): (&mut &mut Pool<A>, Live<(), R>),
         places: &mut Places<A, R>,
     ) -> Self::Landed {
