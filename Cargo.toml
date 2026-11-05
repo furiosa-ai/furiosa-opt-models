@@ -11,7 +11,7 @@ members = [
 # branch `next`. CI and the install guide install the tip with `cargo binstall --git`, which takes no
 # revision, so a snapshot cut to `next` and the bump of this pin land together.
 [workspace.dependencies]
-furiosa-opt-std = { git = "https://github.com/furiosa-ai/furiosa-opt-preview", rev = "1c4be7055d106698141c2bcc8c501c074e45b790" }
+furiosa-opt-std = { git = "https://github.com/furiosa-ai/furiosa-opt-preview", rev = "129734d65e3298582516abcfbeebb67d02d690eb" }
 
 # The engine's monomorphized debug info overflows the linker's 4 GiB debug sections.
 [profile.dev.package.furiosa-opt-engine]
