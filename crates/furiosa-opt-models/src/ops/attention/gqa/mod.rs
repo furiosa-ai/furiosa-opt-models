@@ -774,8 +774,9 @@ where
     }
 }
 
-/// The same history attended, `boundary` running on its state once the first history of the
-/// first pass is in flight.
+/// The same history attended, `boundary` running on its state once in the first pass: before its
+/// last window is prepared where windows overlap and no next pass may land under it, else after
+/// its first window lands.
 impl<
     'a,
     Rows: AxisName,
@@ -1019,8 +1020,9 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
     }
 
     /// Attends the row groups of `count` passes over the `N`-row tiles from tile `first` and writes
-    /// their rows in `attended`; `boundary` runs `times` times once the first pass's first history
-    /// is in flight. Overlapping passes share two places: each lands the next one's first window.
+    /// their rows in `attended`; `boundary` runs `times` times in the first pass, where
+    /// [`Windowed`]'s runs. Overlapping passes share two places: each lands the next one's first
+    /// window.
     fn passes<Rows: AxisName, Windows: AxisName, Source, Q, const N: usize>(
         &self,
         device: &mut Device,

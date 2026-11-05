@@ -14,8 +14,8 @@
 //!   queries are handed on, into the place the decoder holds across its attention for its end,
 //!   and its scales under the post-attention and pre-feed-forward norms, whose gains land first;
 //!   the up projection's under those norms and the gate's passes; the down projection's under the activation and the up projection's
-//!   passes; its output projection's inside its attention, once the attention's first history is
-//!   in flight. Its leaves hold nothing in a call, so it takes `()`.
+//!   passes; its output projection's inside its attention, after the attention's first window
+//!   lands or before its last is prepared. Its leaves hold nothing in a call, so it takes `()`.
 //! - Its tile is its envelope, so its attention hands its end the attended heads where they are,
 //!   with the landed output projection, and writes no HBM place.
 
