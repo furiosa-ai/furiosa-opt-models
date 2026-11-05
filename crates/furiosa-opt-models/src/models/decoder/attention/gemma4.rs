@@ -22,7 +22,6 @@ use crate::modules::language::{self, Greedy};
 use crate::modules::{multimodal, transformer};
 use crate::ops::attention::gqa::Cache;
 use crate::ops::embedding::Embedding;
-use crate::ops::index::scatter::Scatter;
 use crate::ops::linear::{Affine, Native, Parted};
 use crate::ops::normalization::{RmsNorm, UnitRmsNorm};
 use crate::ops::pointwise::activation::{NewGelu, Softcap};
@@ -55,18 +54,19 @@ pub type Model<P = Quantized, C = cache::Bf16, X = Hbm, R = Rows> =
 pub type Body<P = Quantized, C = cache::Bf16, X = Hbm> = Catalog<P, C, X>::Body;
 
 /// The one binding of the [`Gemma4ForCausalLM`] recipe over the published size's axes, its
-/// projections in forms `P`, its cache of `C` and every leaf in memory `X`.
+/// projections in forms `P`, both groups' caches of `C` and every leaf in memory `X`; queries and
+/// keys rotate in BF16 whatever the cache stores.
 pub type Catalog<P, C, X> = Gemma4ForCausalLM<
     Then<Named<"embed_tokens", Table<X>>, Normalizer<X>>,
-    Qkv<sliding::Group, P, X, Named<"v_proj", Values<sliding::Group, P, X>>>,
-    decoder::Position<sliding::Group, C>,
-    decoder::Attend<sliding::Group, UNSCALED>,
-    Output<sliding::Group, P, X>,
-    Qkv<full::Group, P, X, Named<"k_proj", Keys<full::Group, P, X>>>,
-    decoder::Position<full::Group, C>,
-    decoder::Attend<full::Group, UNSCALED>,
-    Output<full::Group, P, X>,
-    Scatter,
+    Qkv<sliding::Group<C>, P, X, Named<"v_proj", Values<sliding::Group<C>, P, X>>>,
+    decoder::Position<sliding::Group<C>>,
+    decoder::Attend<sliding::Group<C>, UNSCALED>,
+    Output<sliding::Group<C>, P, X>,
+    Qkv<full::Group<C>, P, X, Named<"k_proj", Keys<full::Group<C>, P, X>>>,
+    decoder::Position<full::Group<C>>,
+    decoder::Attend<full::Group<C>, UNSCALED>,
+    Output<full::Group<C>, P, X>,
+    decoder::Write<sliding::Group<C>, X>,
     (),
     decoder::FeedForward<P, Hidden, Intermediate, NewGelu, Parallel<1>, X>,
     Norm<Hidden, X>,
@@ -145,8 +145,8 @@ type Scale<X> = multiply::Scale<<X as Memory>::Tensor<f32, Chip, m![1 # 8]>>;
 /// The constants that prepare a call's rotations, write slots and paged history reads, one set
 /// a group, for calls of `R` rows and a cache of `C`.
 type RotaryEmbedding<C, X, R> = (
-    decoder::Paging<sliding::Group, R, C, X>,
-    decoder::Paging<full::Group, R, C, X>,
+    decoder::Paging<sliding::Group<C>, R, X>,
+    decoder::Paging<full::Group<C>, R, X>,
 );
 
 /// The rows a call prepares its attention context for.
@@ -203,7 +203,8 @@ pub mod sliding {
         Windows = 3
     ];
 
-    pub type Group = decoder::Group<Heads, Head, Groups, QueryWidth, KvWidth, Head, Windows>;
+    pub type Group<C = bf16> =
+        decoder::Group<Heads, Head, Groups, QueryWidth, KvWidth, Head, Windows, C>;
 }
 
 /// Full attention geometry: 512-wide heads, 128 rotated coordinates and 512 cache windows.
@@ -221,15 +222,16 @@ pub mod full {
         Windows = 512
     ];
 
-    pub type Group = decoder::Group<Heads, Head, Groups, QueryWidth, KvWidth, Rotated, Windows>;
+    pub type Group<C = bf16> =
+        decoder::Group<Heads, Head, Groups, QueryWidth, KvWidth, Rotated, Windows, C>;
 }
 
-impl LayerType for sliding::Group {
+impl<C: decoder::Cache> LayerType for sliding::Group<C> {
     const NAME: Option<&'static str> = Some(LAYER_TYPES[0]);
     const WINDOW: Option<&'static str> = Some("sliding_window");
 }
 
-impl LayerType for full::Group {
+impl<C: decoder::Cache> LayerType for full::Group<C> {
     const NAME: Option<&'static str> = Some(LAYER_TYPES[1]);
 }
 
