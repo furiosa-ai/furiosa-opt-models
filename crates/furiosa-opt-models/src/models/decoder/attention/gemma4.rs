@@ -41,17 +41,19 @@ use std::{io, num::NonZeroUsize};
 pub struct Size<const N: &'static str>;
 
 /// HF `Gemma4ForCausalLM`: the text model, then the greedy head tied to its embedding, in
-/// projection forms `P`, a cache of `C` and memory `X`, for calls of `R` rows.
-pub type ForCausalLM<P = Quantized, C = cache::Bf16, X = Hbm, R = Rows> =
+/// projection forms `P`, a cache of `C` and memory `X`, for calls of `R` rows. Its cache holds E4M3
+/// codes under the checkpoint's static scales, as the published checkpoint declares and vLLM
+/// caches it, unless `C` is BF16.
+pub type ForCausalLM<P = Quantized, C = cache::E4m3, X = Hbm, R = Rows> =
     super::ForCausalLM<Size<"12B">, Model<P, C, X, R>, LmHead<X>, P>;
 
 /// HF `Gemma4TextModel`: the embedding, the layers and the final norm, and the constants that
 /// prepare a call's attention context in each group.
-pub type Model<P = Quantized, C = cache::Bf16, X = Hbm, R = Rows> =
+pub type Model<P = Quantized, C = cache::E4m3, X = Hbm, R = Rows> =
     super::Model<Size<"12B">, Body<P, C, X>, RotaryEmbedding<C, X, R>, P>;
 
 /// The embedding, the layers and the final norm: the body of the catalog binding.
-pub type Body<P = Quantized, C = cache::Bf16, X = Hbm> = Catalog<P, C, X>::Body;
+pub type Body<P = Quantized, C = cache::E4m3, X = Hbm> = Catalog<P, C, X>::Body;
 
 /// The one binding of the [`Gemma4ForCausalLM`] recipe over the published size's axes, its
 /// projections in forms `P`, both groups' caches of `C` and every leaf in memory `X`; queries and

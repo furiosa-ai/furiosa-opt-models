@@ -375,7 +375,9 @@ impl FromStr for Quantization {
 mod tests {
     use super::LoadOptions;
     use furiosa_opt_models::load::{Checkpoint, LoadError};
+    use safetensors::Dtype;
     use serde_json::json;
+    use std::process::{Command, Stdio};
 
     /// A config's architecture is the first of its `architectures`, then its `_class_name`, that the
     /// registry lists, refused or not, past any unknown name; names it lists none of are invalid.
@@ -411,6 +413,37 @@ mod tests {
             ),
         ] {
             assert_eq!(refusal(config), (kind, name.to_owned()));
+        }
+    }
+
+    /// A load of the published Gemma 4 12B NVFP4 config caches keys and values as E4M3 codes, the
+    /// KV cache scheme its quantization declares, BF16 when the options ask for it, and refuses any
+    /// other element.
+    #[test]
+    #[ignore = "reads the published checkpoint's config from the local hub cache"]
+    fn caches_in_the_declared_element_unless_asked_for_bf16() {
+        let mut download = Command::new("uvx");
+        download.args(["--from", "huggingface-hub", "hf", "download", "--quiet"]);
+        download.args(["unsloth/gemma-4-12b-it-NVFP4", "config.json"]);
+        download.args(["--revision", "b1f649734b34aa5575b03d186abd1b9be3d0d5c4"]);
+        let output = download.stderr(Stdio::inherit()).output().unwrap();
+        let config = std::fs::read(String::from_utf8(output.stdout).unwrap().trim()).unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let config = Some(serde_json::from_slice(&config).unwrap());
+        let source = Checkpoint::new(empty.path(), config).unwrap();
+        let cached = |options: LoadOptions| options.parse(&source).map(|config| config.kv_cache());
+        assert_eq!(cached(LoadOptions::new()).unwrap(), Dtype::F8_E4M3);
+        let bf16 = LoadOptions::new().kv_cache(Dtype::BF16);
+        assert_eq!(cached(bf16).unwrap(), Dtype::BF16);
+        match cached(LoadOptions::new().kv_cache(Dtype::F16)) {
+            Err(LoadError::Unsupported { name, reason }) => assert_eq!(
+                (name.as_str(), reason.as_str()),
+                (
+                    "kv_cache",
+                    "every implementation caches keys and values in F8_E4M3 or BF16"
+                )
+            ),
+            other => panic!("{other:?} is not `Unsupported`"),
         }
     }
 }

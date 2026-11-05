@@ -455,19 +455,18 @@ fn continues_a_prompt_over_both_groups_as_the_reference() {
     continues(&mut device, &Instance::new(root, Tiling::Adaptive));
 }
 
-/// The same continuation from caches that store each key and value as an E4M3 code under the
-/// checkpoint's static `k_scale` and `v_scale`.
+/// The same continuation from caches that store each key and value in BF16.
 #[test]
 #[ignore = "reads the published checkpoint from the local hub cache"]
-fn continues_a_prompt_from_e4m3_caches_as_the_reference() {
+fn continues_a_prompt_from_bf16_caches_as_the_reference() {
     let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
     let source = Checkpoint::new(snapshot(GEMMA4, &["*.json", "*.safetensors"]), None).unwrap();
-    let root: Coded = source.load(&mut device).unwrap();
+    let root: Bf16 = source.load(&mut device).unwrap();
     continues(&mut device, &Instance::new(root, Tiling::Adaptive));
 }
 
-/// Gemma 4's decoder over caches of E4M3 codes.
-type Coded = gemma4::ForCausalLM<gemma4::Quantized, cache::E4m3>;
+/// Gemma 4's decoder over caches of BF16 keys and values.
+type Bf16 = gemma4::ForCausalLM<gemma4::Quantized, cache::Bf16>;
 
 /// `model`'s greedy continuations of the reference prompt, as
 /// [`continues_a_prompt_over_both_groups_as_the_reference`] states them.
@@ -540,16 +539,16 @@ fn gemma_profile() {
     profile(&mut device, &Instance::new(root, Tiling::Adaptive));
 }
 
-/// The same calls profiled over caches of E4M3 codes.
+/// The same calls profiled over caches of BF16 keys and values.
 #[test]
 #[ignore = "reads the published checkpoint from the local hub cache"]
-fn gemma_profile_e4m3() {
+fn gemma_profile_bf16() {
     let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
     // Installed before the functions load, so that they load with the profile.
     let _spans = lines();
     let source = Checkpoint::new(snapshot(GEMMA4, &["*.json", "*.safetensors"]), None).unwrap();
     let loading = std::time::Instant::now();
-    let root: Coded = source.load(&mut device).unwrap();
+    let root: Bf16 = source.load(&mut device).unwrap();
     println!("loaded in {:.1} s", loading.elapsed().as_secs_f64());
     profile(&mut device, &Instance::new(root, Tiling::Adaptive));
 }

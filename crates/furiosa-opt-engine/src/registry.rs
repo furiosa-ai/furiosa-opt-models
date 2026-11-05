@@ -20,6 +20,7 @@ use furiosa_opt_models::models::decoder::launch;
 use furiosa_opt_models::models::vision_language::gemma4_unified;
 use furiosa_opt_models::models::{Class, Implements};
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
+use furiosa_opt_models::tensor::cache;
 use furiosa_opt_models::tensor::memory::{Dtype, Hbm};
 
 /// Every upstream architecture name, by family level, with the decoders that implement it; a
@@ -477,6 +478,7 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
         &[
             Implementation::of::<gemma4_unified::Encoder<Hbm>>(),
             Implementation::of::<gemma4::ForCausalLM>(),
+            Implementation::of::<gemma4::ForCausalLM<gemma4::Quantized, cache::Bf16>>(),
         ],
     ),
     ("Glm4vForConditionalGeneration", &[]),
