@@ -10,8 +10,9 @@
 //! - The codes reach the slices of every part over the switch ring once for all projections of the
 //!   same rows ([`Tokens`]), then fill the tensor registers from data memory: a live lane group at
 //!   a time for every slab, or, every row group live, both banks once for every projection
-//!   ([`TokenBanks`]). A part holds a whole number of E4M3 packets, so each contraction step takes
-//!   one packet.
+//!   ([`TokenBanks`]), each half of the envelope riding the ring and filling its bank while the
+//!   bank before contracts. A part holds a whole number of E4M3 packets, so each contraction step
+//!   takes one packet.
 
 use super::*;
 use crate::ops::linear::decode::Landed;
@@ -24,31 +25,41 @@ type Code = f8e4m3;
 /// The slices every row's scale reaches.
 type Every = m![256];
 
+/// The rows' E4M3 codes in the slices of each contraction part of the `In` by `Out` tiling.
+type Codes<In, Out, Rows> = DmTensor<
+    Code,
+    m![1],
+    Cluster<In, Out, Code>,
+    ProjectionSlices<In, Out, Code>,
+    m![Rows, { Chunked<In, Out, Code> }],
+>;
+
+/// The rows' E4M3 codes where the norm leaves the rows: sixteen inputs of each row a slice.
+type Coded<In, Out, Rows> =
+    DmTensor<Code, m![1], Cluster<In, Out, Code>, FeatureSlices<In>, m![Rows, In % 16]>;
+
+/// Each row's BF16 scale in every slice.
+type RowScales<In, Out, Rows> = DmTensor<bf16, m![1], Cluster<In, Out, Code>, Every, m![Rows]>;
+
 /// The rows' E4M3 codes in the slices of each contraction part of the `In` by `Out` tiling, and each
 /// row's BF16 scale in every slice: staged once, they serve every projection of the same rows whose
 /// tiling places each part's inputs on the same slices.
 pub struct Tokens<In: AxisName, Out: AxisName, Rows: AxisName> {
-    codes: DmTensor<
-        Code,
-        m![1],
-        Cluster<In, Out, Code>,
-        ProjectionSlices<In, Out, Code>,
-        m![Rows, { Chunked<In, Out, Code> }],
-    >,
-    scales: DmTensor<bf16, m![1], Cluster<In, Out, Code>, Every, m![Rows]>,
+    codes: Codes<In, Out, Rows>,
+    scales: RowScales<In, Out, Rows>,
 }
 
 /// Half the envelope's rows: the rows one bank of the tensor registers holds.
 type Half<In, Out, Rows> = Batch<In, Out, Code, Rows>;
 
-/// The rows [`Tokens`] staged, every row group of them live, in both banks of the tensor registers
-/// as the contraction of `In` inputs into `Out` outputs reads them, half the envelope a bank, beside
+/// The rows of an envelope, every row group of them live, in both banks of the tensor registers as
+/// the contraction of `In` inputs into `Out` outputs reads them, half the envelope a bank, beside
 /// each row's scale: filled once, they serve every slab of every congruent projection of the same
 /// rows.
 pub struct TokenBanks<In: AxisName, Out: AxisName, Rows: AxisName> {
     low: Lanes<In, Out, Rows, Half<In, Out, Rows>>,
     high: Lanes<In, Out, Rows, Half<In, Out, Rows>>,
-    scales: DmTensor<bf16, m![1], Cluster<In, Out, Code>, Every, m![Rows]>,
+    scales: RowScales<In, Out, Rows>,
 }
 
 /// A row's scale over sixteen inputs a feature slice, the feature slices reducing it among
@@ -81,81 +92,72 @@ type Chosen<Rows, B> = m![Rows / B = 1 # (Rows / B), Rows % B];
 type BatchedMut<Rows, B, Inner> = m![Rows / B = 1 #{!} (Rows / B), Rows % B, { Inner }];
 
 impl<In: AxisName, Out: AxisName> Contraction<In, Out, Code> {
-    /// The live rows of `input`, each quantized under its own scale, their codes in the slices of
-    /// each part: the live lane groups, or every row when all are live.
+    /// The live lane groups of `input`, fewer than all, each row quantized under its own scale,
+    /// their codes in the slices of each part.
     pub(crate) fn tokens<Rows: AxisName>(
         device: &mut Device,
         input: &Live<Spread<In, Rows>, Rows>,
     ) -> Tokens<In, Out, Rows> {
-        const {
-            assert!(
-                normalization::Chunk::<In>::SIZE == 16,
-                "a feature slice holds sixteen inputs of a row"
-            )
-        };
-        let rows = input.value().view();
-        let scales: DmTensor<bf16, m![1], normalization::Cluster, Every, m![Rows]> =
-            Scales::<In, Rows>::scales(&mut device.main, rows.clone()).commit();
-        // SAFETY: the reduction leaves each row's scale in every slice.
-        let local = unsafe {
-            scales
-                .view()
-                .reshape::<m![1], normalization::Cluster, FeatureSlices<In>, m![Rows]>()
-        };
-        let scale: VrfTensor<f32, m![1], normalization::Cluster, FeatureSlices<In>, m![Rows]> =
-            device
-                .sub
-                .begin(local)
-                .fetch::<Layout<Rows>::Groups, Layout<Rows>::Lanes>()
-                .fetch_cast::<f32>()
-                .collect::<Layout<Rows>::Groups, Layout<Rows>::Lanes>()
-                .to_vrf();
-        let coded: DmTensor<
-            Code,
-            m![1],
-            normalization::Cluster,
-            FeatureSlices<In>,
-            m![Rows, In % 16],
-        > = Scales::<In, Rows>::rows(&mut device.main, rows, &scale).commit();
-        // SAFETY: both physical clusters hold every row; only the logical cluster axis changes.
-        let coded: DmTensor<
-            Code,
-            m![1],
-            Cluster<In, Out, Code>,
-            FeatureSlices<In>,
-            m![Rows, In % 16],
-        > = unsafe { coded.reshape() };
+        let (coded, scales) = Self::quantized(device, input.value());
         let mut codes = DmTensor::new();
         let (first, count) = input.groups::<axis::Lanes<Rows>>();
-        if count == <Layout<Rows>::Groups as M>::SIZE {
-            Self::part::<Rows, Rows>(device, &coded, &mut codes, 0);
-        } else {
-            for at in 0..count {
-                Self::part::<Rows, axis::Lanes<Rows>>(device, &coded, &mut codes, first + at);
-            }
+        for at in 0..count {
+            Self::part::<Rows, axis::Lanes<Rows>>(device, &coded, &mut codes, first + at);
         }
-        // SAFETY: as the codes, the scales' clusters under the contraction's names.
-        let scales = unsafe { scales.reshape() };
         Tokens { codes, scales }
     }
 
-    /// Every row `tokens` staged, every row group of them live, in both banks of the tensor
-    /// registers.
-    pub(crate) fn token_banks<Rows: AxisName>(
+    /// Every row of `input`, every row group of it live, each quantized under its own scale,
+    /// against every slab of `landed`, each output rounded once to BF16, as [`Self::kept`]
+    /// contracts BF16 rows: each half of the envelope rides the ring and fills its bank of the
+    /// registers while the bank before contracts the first slab, and both banks stay filled for
+    /// every congruent projection of the same rows.
+    pub(crate) fn token_kept<Rows: AxisName>(
         device: &mut Device,
-        tokens: Tokens<In, Out, Rows>,
-    ) -> TokenBanks<In, Out, Rows> {
+        landed: &Landed<In, Out, Token>,
+        input: &Spread<In, Rows>,
+    ) -> (Result<In, Out, Code, Rows>, TokenBanks<In, Out, Rows>) {
         const {
             assert!(
                 Rows::SIZE == 2 * <Half<In, Out, Rows> as AxisName>::SIZE,
                 "a bank holds half the envelope"
             )
         };
-        TokenBanks {
-            low: Self::fill::<Rows, Half<In, Out, Rows>>(device, &tokens, 0),
-            high: Self::fill::<Rows, Half<In, Out, Rows>>(device, &tokens, 1),
-            scales: tokens.scales,
+        let (coded, scales) = Self::quantized(device, input);
+        let mut codes = DmTensor::new();
+        let mut result = DmTensor::new();
+        let mut bank = |device: &mut Device, at: usize| {
+            Self::part::<Rows, Half<In, Out, Rows>>(device, &coded, &mut codes, at);
+            let lanes = Self::fill::<Rows, Half<In, Out, Rows>>(device, &codes, at);
+            Self::contracted::<Rows, Half<In, Out, Rows>, Out>(
+                device,
+                landed,
+                (&lanes, &scales),
+                &mut result,
+                (0, at),
+            );
+            lanes
+        };
+        let low = bank(&mut *device, 0);
+        let high = bank(&mut *device, 1);
+        #[unroll]
+        for slab in 1..<Passes<In, Out, Code> as M>::SIZE {
+            Self::contracted::<Rows, Half<In, Out, Rows>, Out>(
+                device,
+                landed,
+                (&low, &scales),
+                &mut result,
+                (slab, 0),
+            );
+            Self::contracted::<Rows, Half<In, Out, Rows>, Out>(
+                device,
+                landed,
+                (&high, &scales),
+                &mut result,
+                (slab, 1),
+            );
         }
+        (result, TokenBanks { low, high, scales })
     }
 
     /// The rows `banks` hold, filled as the congruent tiling of `F` outputs reads them, against
@@ -211,8 +213,11 @@ impl<In: AxisName, Out: AxisName> Contraction<In, Out, Code> {
         let (first, count) = tokens.groups::<axis::Lanes<Rows>>();
         for at in 0..count {
             let group = first + at;
-            let lanes =
-                Contraction::<In, F, Code>::fill::<Rows, axis::Lanes<Rows>>(device, staged, group);
+            let lanes = Contraction::<In, F, Code>::fill::<Rows, axis::Lanes<Rows>>(
+                device,
+                &staged.codes,
+                group,
+            );
             #[unroll]
             for slab in 0..<Passes<In, Out, Code> as M>::SIZE {
                 Self::contracted::<Rows, axis::Lanes<Rows>, F>(
@@ -227,18 +232,53 @@ impl<In: AxisName, Out: AxisName> Contraction<In, Out, Code> {
         result
     }
 
+    /// Each row of `input` quantized under its own scale where the norm leaves it, and the scales
+    /// in every slice under the contraction's names.
+    fn quantized<Rows: AxisName>(
+        device: &mut Device,
+        input: &Spread<In, Rows>,
+    ) -> (Coded<In, Out, Rows>, RowScales<In, Out, Rows>) {
+        const {
+            assert!(
+                normalization::Chunk::<In>::SIZE == 16,
+                "a feature slice holds sixteen inputs of a row"
+            )
+        };
+        let rows = input.view();
+        let scales: DmTensor<bf16, m![1], normalization::Cluster, Every, m![Rows]> =
+            Scales::<In, Rows>::scales(&mut device.main, rows.clone()).commit();
+        // SAFETY: the reduction leaves each row's scale in every slice.
+        let local = unsafe {
+            scales
+                .view()
+                .reshape::<m![1], normalization::Cluster, FeatureSlices<In>, m![Rows]>()
+        };
+        let scale: VrfTensor<f32, m![1], normalization::Cluster, FeatureSlices<In>, m![Rows]> =
+            device
+                .sub
+                .begin(local)
+                .fetch::<Layout<Rows>::Groups, Layout<Rows>::Lanes>()
+                .fetch_cast::<f32>()
+                .collect::<Layout<Rows>::Groups, Layout<Rows>::Lanes>()
+                .to_vrf();
+        let coded: DmTensor<
+            Code,
+            m![1],
+            normalization::Cluster,
+            FeatureSlices<In>,
+            m![Rows, In % 16],
+        > = Scales::<In, Rows>::rows(&mut device.main, rows, &scale).commit();
+        // SAFETY: both physical clusters hold every row; only the logical cluster axis changes,
+        // for the codes and the scales alike.
+        unsafe { (coded.reshape(), scales.reshape()) }
+    }
+
     /// Batch `at` of `B` of the coded rows, from their feature slices into the slices of each part
     /// over the switch ring: each slice's sixteen inputs ride a packet of their own.
     fn part<Rows: AxisName, B: AxisName>(
         device: &mut Device,
-        coded: &DmTensor<Code, m![1], Cluster<In, Out, Code>, FeatureSlices<In>, m![Rows, In % 16]>,
-        codes: &mut DmTensor<
-            Code,
-            m![1],
-            Cluster<In, Out, Code>,
-            ProjectionSlices<In, Out, Code>,
-            m![Rows, { Chunked<In, Out, Code> }],
-        >,
+        coded: &Coded<In, Out, Rows>,
+        codes: &mut Codes<In, Out, Rows>,
         at: usize,
     ) {
         device
@@ -262,18 +302,17 @@ impl<In: AxisName, Out: AxisName> Contraction<In, Out, Code> {
             );
     }
 
-    /// Batch `at` of `B` of the rows `tokens` staged, from data memory into the tensor registers as
-    /// the contraction reads them.
+    /// Batch `at` of `B` of the staged `codes`, from data memory into the tensor registers as the
+    /// contraction reads them.
     fn fill<Rows: AxisName, B: AxisName>(
         device: &mut Device,
-        tokens: &Tokens<In, Out, Rows>,
+        codes: &Codes<In, Out, Rows>,
         at: usize,
     ) -> Lanes<In, Out, Rows, B> {
         device
             .sub
             .begin(
-                tokens
-                    .codes
+                codes
                     .view()
                     .tile::<m![Rows / B], 1, Batched<Rows, B, Chunked<In, Out, Code>>>(at),
             )

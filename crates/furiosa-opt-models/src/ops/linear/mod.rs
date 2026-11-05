@@ -656,9 +656,10 @@ where
 }
 
 /// The rows of a launch in their feature slices, every row group of them live, begun under the
-/// token contract: each row quantized under its own scale, its codes staged in the slices of each
-/// part and filled into both register banks, projected over the weight as it landed and split
-/// into heads; the banks are kept for every congruent projection of the same rows.
+/// token contract: each row quantized under its own scale, each half of the envelope staged in the
+/// slices of each part and filled into its register bank while the bank before contracts,
+/// projected over the weight as it landed and split into heads; the banks are kept for every
+/// congruent projection of the same rows.
 impl<'x, In, Out, Rows, W, View>
     Op<(
         Landed<In, Out, Token>,
@@ -683,10 +684,11 @@ where
             Begin<&'x Live<Spread<In, Rows>, Rows>>,
         ),
     ) -> Self::Output {
-        let tokens = kernel::Contraction::<In, Out, f8e4m3>::tokens(&mut *device, input);
-        let banks = kernel::Contraction::<In, Out, f8e4m3>::token_banks(&mut *device, tokens);
-        let projected =
-            kernel::Contraction::<In, Out, f8e4m3>::token_banked(&mut *device, &landed, &banks);
+        let (projected, banks) = kernel::Contraction::<In, Out, f8e4m3>::token_kept(
+            &mut *device,
+            &landed,
+            input.value(),
+        );
         let heads = mapping::Reshape::<View>::default().forward(device, input.with(projected));
         (heads, input.with(banks))
     }
