@@ -89,7 +89,7 @@ type Context<A> = attention::Context<
     Pages<Rows, <A as Attention>::Windows, Chip>,
 >;
 
-type Pool<A> = Blocks<<A as Attention>::Heads, <A as Attention>::Head>;
+type Pool<A> = Blocks<<A as Attention>::Heads, <A as Attention>::Head, <A as Attention>::Cache>;
 type Pools<B> = ([Pool<Group>; 2], [Pool<B>; 2]);
 type PeriodPools = ([Pool<Group>; 5], [Pool<full::Group>; 1]);
 
@@ -108,7 +108,7 @@ fn state<A: Attention>(pool: &mut Pool<A>) -> State<'_, A> {
 }
 
 /// A group whose layers these tests build and run as the second collection of [`Interleaved`].
-trait Kind: Attention<Rotated: AxisName> {
+trait Kind: Attention<Rotated: AxisName, Cache = bf16> {
     /// The catalog's layer of the group.
     type Layer: for<'c> Load<&'c Checkpoint>;
     /// The attention projections a layer's checkpoint stores: a full layer's values are its
@@ -330,6 +330,215 @@ fn scheduled_period(
     home
 }
 
+/// The catalog's layers caching each key and value as an E4M3 code under its layer's scales.
+type CodedCatalog = gemma4::Catalog<gemma4::Quantized, f8e4m3, Hbm>;
+type CodedGroup = sliding::Group<f8e4m3>;
+type CodedFull = full::Group<f8e4m3>;
+/// The catalog's period over E4M3 caches.
+type CodedPeriod = Interleave<
+    (
+        [<CodedCatalog as Collections>::Sliding; 5],
+        [<CodedCatalog as Collections>::Full; 1],
+    ),
+    PERIOD,
+>;
+type CodedPools = ([Pool<CodedGroup>; 5], [Pool<CodedFull>; 1]);
+
+/// The period over E4M3 caches run by the decoder schedule.
+#[device(chip = 1)]
+fn scheduled_coded(
+    device: &mut Device,
+    (layers, norm): (&CodedPeriod, &FinalNorm),
+    contexts: (&Context<CodedGroup>, &Context<CodedFull>),
+    pools: &mut CodedPools,
+    (hidden, live): (&HiddenRows, &Value),
+) -> HiddenRows {
+    let live = Live::<(), Rows>::read(live);
+    let mut home: HiddenRows = HbmTensor::new();
+    hidden.view().to_hbm_view(&mut device.tdma, home.view_mut());
+    let ([a, b, c, d, e], [f]) = pools;
+    let sliding = [(a, ()), (b, ()), (c, ()), (d, ()), (e, ())];
+    let mut state = (
+        (Places::<CodedGroup, Rows>::new(), sliding),
+        (Places::<CodedFull, Rows>::new(), [(f, ())]),
+    );
+    let schedule = Decoder((layers, norm));
+    Module::forward(
+        &schedule,
+        &mut *device,
+        contexts,
+        &mut state,
+        (&mut home, live),
+    );
+    home
+}
+
+/// The scale of every coded layer's keys and of its values: their codes saturate past 3.5, which
+/// some of a layer's normalized keys and values reach.
+const CODED: f32 = 1.0 / 128.0;
+
+/// Layer `layer`'s checkpoint of group `A` with the static cache scales an E4M3 cache reads.
+fn coded_checkpoint<A: Kind>(layer: usize) -> Checkpoint {
+    let mut checkpoint = checkpoint::<A>(layer);
+    for name in ["self_attn.k_scale", "self_attn.v_scale"] {
+        let scale = bf16::from_f32(CODED).to_bits().to_le_bytes().to_vec();
+        checkpoint.insert(name, Dtype::BF16, &[1], scale).unwrap();
+    }
+    checkpoint
+}
+
+/// A value as an E4M3 cache codes it under `scale`: divided, saturated, to nearest even.
+fn code(value: f32, scale: f32) -> f8e4m3 {
+    f8e4m3::from_f32((value / scale).clamp(-448.0, 448.0))
+}
+
+/// `values` coded in a new E4M3 cache of [`blocks`] blocks.
+async fn coded_pool<A: Attention<Cache = f8e4m3>>(device: &mut Device, values: &[bf16]) -> Pool<A> {
+    let bytes = blocks() * Pool::<A>::BLOCK_STRIDE as usize;
+    let mut pool = Pool::<A>::from_buffer(HbmBuffer::alloc(device, bytes).unwrap()).unwrap();
+    let codes: Vec<f8e4m3> = values
+        .iter()
+        .map(|value| code(value.to_f32(), CODED))
+        .collect();
+    for (block, codes) in codes.chunks_exact(codes.len() / blocks()).enumerate() {
+        HostTensor::<f8e4m3, Tokens<A>>::from_vec(codes.to_vec())
+            .to_hbm(&mut device.pdma)
+            .output(&mut pool.tokens[block])
+            .await
+            .unwrap();
+    }
+    pool
+}
+
+/// Every code of `pool`, block by block.
+async fn codes<A: Attention<Cache = f8e4m3>>(device: &mut Device, pool: &Pool<A>) -> Vec<f8e4m3> {
+    let mut codes = Vec::new();
+    for block in 0..blocks() {
+        let tokens = pool.tokens[block]
+            .to_host::<Tokens<A>>(&mut device.pdma)
+            .await;
+        codes.extend(tokens.unwrap().into_vec());
+    }
+    codes
+}
+
+/// The period's sliding layers and its full layer over E4M3 caches, each its own weights.
+fn coded_period(device: &mut Device) -> CodedPeriod {
+    let sliding =
+        [0, 1, 2, 3, 4].map(|at| coded_checkpoint::<Group>(at).load(&mut *device).unwrap());
+    let full = [coded_checkpoint::<full::Group>(5).load(device).unwrap()];
+    Interleave {
+        layers: (sliding, full),
+    }
+}
+
+/// The call's `live` rows through the period over E4M3 caches coded from `caches`: the live rows'
+/// outputs and the first layer's codes after it.
+async fn run_coded(
+    device: &mut Device,
+    model: (&CodedPeriod, &FinalNorm),
+    caches: &[Vec<bf16>; 6],
+    live: usize,
+) -> (Vec<bf16>, Vec<f8e4m3>) {
+    let contexts = (
+        context::<CodedGroup>(device, live).await,
+        context::<CodedFull>(device, live).await,
+    );
+    let mut pools = (
+        [
+            coded_pool::<CodedGroup>(device, &caches[0]).await,
+            coded_pool::<CodedGroup>(device, &caches[1]).await,
+            coded_pool::<CodedGroup>(device, &caches[2]).await,
+            coded_pool::<CodedGroup>(device, &caches[3]).await,
+            coded_pool::<CodedGroup>(device, &caches[4]).await,
+        ],
+        [coded_pool::<CodedFull>(device, &caches[5]).await],
+    );
+    let (input, count) = input(device, live).await;
+    let arguments = (
+        &mut *device,
+        model,
+        (&contexts.0, &contexts.1),
+        &mut pools,
+        (&input, &count),
+    );
+    let output = launch(scheduled_coded, arguments).await.unwrap();
+    let output = rows(device, &output, live).await;
+    let first = codes::<CodedGroup>(device, &pools.0[0]).await;
+    (output, first)
+}
+
+/// The largest and the mean distance of `found` from `want`, over the largest magnitude of `want`.
+fn deviation(found: &[bf16], want: &[bf16]) -> (f64, f64) {
+    let distances: Vec<f64> = (found.iter().zip(want))
+        .map(|(found, want)| (f64::from(found.to_f32()) - f64::from(want.to_f32())).abs())
+        .collect();
+    let largest = (want.iter()).fold(0.0f64, |top, want| top.max(f64::from(want.to_f32()).abs()));
+    let worst = distances.iter().copied().fold(0.0, f64::max);
+    let mean = distances.iter().sum::<f64>() / distances.len() as f64;
+    (worst / largest, mean / largest)
+}
+
+/// The catalog's layers in the published order, over caches of `C`.
+type Order<C> = Interleave<
+    (
+        [<gemma4::Catalog<gemma4::Quantized, C, Hbm> as Collections>::Sliding; gemma4::SLIDING],
+        [<gemma4::Catalog<gemma4::Quantized, C, Hbm> as Collections>::Full; gemma4::FULL],
+    ),
+    { gemma4::ORDER },
+>;
+
+/// Every layer's cache of `C`, the sliding layers' then the full ones', in their order.
+type Caches<C> = (
+    [Pool<sliding::Group<C>>; gemma4::SLIDING],
+    [Pool<full::Group<C>>; gemma4::FULL],
+);
+
+/// The published layers and final norm over caches of `$cache`, run by the decoder schedule: the
+/// call's rows after the final norm.
+macro_rules! decoded {
+    ($name:ident, $cache:ty) => {
+        #[device(chip = 1)]
+        fn $name(
+            device: &mut Device,
+            (layers, norm): (&Order<$cache>, &FinalNorm),
+            contexts: (
+                &Context<sliding::Group<$cache>>,
+                &Context<full::Group<$cache>>,
+            ),
+            pools: &mut Caches<$cache>,
+            (hidden, live): (&HiddenRows, &Value),
+        ) -> HiddenRows {
+            let live = Live::<(), Rows>::read(live);
+            let mut home: HiddenRows = HbmTensor::new();
+            hidden.view().to_hbm_view(&mut device.tdma, home.view_mut());
+            let (sliding, full) = pools;
+            let mut state = (
+                (
+                    Places::<sliding::Group<$cache>, Rows>::new(),
+                    sliding.each_mut().map(|pool| (pool, ())),
+                ),
+                (
+                    Places::<full::Group<$cache>, Rows>::new(),
+                    full.each_mut().map(|pool| (pool, ())),
+                ),
+            );
+            let schedule = Decoder((layers, norm));
+            Module::forward(
+                &schedule,
+                &mut *device,
+                contexts,
+                &mut state,
+                (&mut home, live),
+            );
+            home
+        }
+    };
+}
+
+decoded!(decoded_bf16, bf16);
+decoded!(decoded_e4m3, f8e4m3);
+
 /// Tokens of history before the call's first row: `PERIOD_PROFILE_HISTORY`, or 100, past a block
 /// boundary.
 fn history() -> usize {
@@ -485,11 +694,6 @@ fn hidden(live: usize) -> Vec<bf16> {
         .collect()
 }
 
-/// The keys a row of the call sees: the history and every row up to its own.
-fn visible(row: usize, live: usize) -> usize {
-    if row < live { history() + row + 1 } else { 0 }
-}
-
 /// Pages of `Windows` windows: row `row` sees its first `visible(row)` keys, its table's entry `e`
 /// naming the block at byte offset `block(row, e)`; a row that sees none still names a readable
 /// block.
@@ -547,15 +751,25 @@ async fn pages<Windows: AxisName>(
 
 /// The call's context of group `A`: each row's rotation at its position, its slot after the
 /// history and the pages of the history and the rows before it, in the blocks of a layer's cache.
-async fn context<A: Kind>(device: &mut Device, live: usize) -> Context<A> {
-    let rotated = <A as Attention>::Rotated::SIZE;
-    let pairs = rotated / 2;
+async fn context<A: Attention<Rotated: AxisName>>(device: &mut Device, live: usize) -> Context<A> {
     let frequencies =
         PairFrequencies::<<A as Attention>::Rotated>::unscaled::<<A as Attention>::Head>(1e4)
             .unwrap();
+    context_at::<A>(device, (history(), live), &frequencies).await
+}
+
+/// The context of a call of `live` rows after `history` positions, its rows turning at
+/// `frequencies`, each row seeing the history and the rows up to its own.
+async fn context_at<A: Attention<Rotated: AxisName>>(
+    device: &mut Device,
+    (history, live): (usize, usize),
+    frequencies: &PairFrequencies<<A as Attention>::Rotated>,
+) -> Context<A> {
+    let rotated = <A as Attention>::Rotated::SIZE;
+    let pairs = rotated / 2;
     let (mut low, mut high) = (Vec::new(), Vec::new());
     for row in 0..Rows::SIZE {
-        let position = (history() + row) as f32;
+        let position = (history + row) as f32;
         for at in 0..rotated {
             let (sin, cos) = f64::from(position * frequencies.pairs()[at % pairs]).sin_cos();
             let (l, h) = match at < pairs {
@@ -574,15 +788,15 @@ async fn context<A: Kind>(device: &mut Device, live: usize) -> Context<A> {
         high: table(high).to_hbm(&mut device.pdma).await.unwrap(),
     };
     let slots = (0..Rows::SIZE).map(|row| match row < live {
-        true => ((history() + row) as i32) * Pool::<A>::ROW_STRIDE,
+        true => ((history + row) as i32) * Pool::<A>::ROW_STRIDE,
         false => 0,
     });
     let write = HostTensor::<i32, m![Rows]>::from_vec(slots.collect::<Vec<_>>());
-    let read = pages::<<A as Attention>::Windows>(
-        device,
-        |row| visible(row, live),
-        |_, entry| entry as i32 * Pool::<A>::BLOCK_STRIDE,
-    )
+    // A row sees the history and every row up to its own.
+    let seen = |row: usize| if row < live { history + row + 1 } else { 0 };
+    let read = pages::<<A as Attention>::Windows>(device, seen, |_, entry| {
+        entry as i32 * Pool::<A>::BLOCK_STRIDE
+    })
     .await;
     attention::Context {
         positions: rotation,
@@ -618,7 +832,7 @@ type Tokens<A> = m![
 ];
 
 /// `values` in a new cache of [`blocks`] blocks.
-async fn pool<A: Attention>(device: &mut Device, values: &[bf16]) -> Pool<A> {
+async fn pool<A: Attention<Cache = bf16>>(device: &mut Device, values: &[bf16]) -> Pool<A> {
     let bytes = blocks() * Pool::<A>::BLOCK_STRIDE as usize;
     let mut pool = Pool::<A>::from_buffer(HbmBuffer::alloc(device, bytes).unwrap()).unwrap();
     for (block, values) in values.chunks_exact(values.len() / blocks()).enumerate() {
@@ -632,7 +846,7 @@ async fn pool<A: Attention>(device: &mut Device, values: &[bf16]) -> Pool<A> {
 }
 
 /// Every value of `pool`, block by block.
-async fn read<A: Attention>(device: &mut Device, pool: &Pool<A>) -> Vec<bf16> {
+async fn read<A: Attention<Cache = bf16>>(device: &mut Device, pool: &Pool<A>) -> Vec<bf16> {
     let mut values = Vec::new();
     for block in 0..blocks() {
         let tokens = pool.tokens[block]
@@ -830,6 +1044,47 @@ fn agree(live: usize, found: (&[bf16], &[Vec<bf16>]), want: (&[bf16], &[Vec<bf16
         assert_eq!(
             same, None,
             "layer {layer}, {live} rows: first differing cache element"
+        );
+    }
+}
+
+/// Over E4M3 caches the period writes each live row's key and value of its first layer as the
+/// host codes the BF16 period's: divided by the layer's scale, saturated, to nearest even; every
+/// other slot keeps its code, and the live rows stay finite.
+#[tokio::test(flavor = "current_thread")]
+async fn codes_the_first_layer_as_the_host_rounds_it() {
+    let _lease = DEVICE.lock().await;
+    let mut device = Device::new(scheduled_coded.topology()).unwrap();
+    let sliding = [0, 1, 2, 3, 4].map(|at| checkpoint::<Group>(at).load(&mut device).unwrap());
+    let full = [checkpoint::<full::Group>(5).load(&mut device).unwrap()];
+    let period: Period = Interleave {
+        layers: (sliding, full),
+    };
+    let coded = coded_period(&mut device);
+    let norm = norm(&mut device);
+    let caches = period_caches();
+    for live in [Rows::SIZE, 9] {
+        let (want, written) = run_period(&mut device, false, (&period, &norm), &caches, live).await;
+        let (found, first) = run_coded(&mut device, (&coded, &norm), &caches, live).await;
+        let expected: Vec<f8e4m3> = written[0]
+            .iter()
+            .map(|value| code(value.to_f32(), CODED))
+            .collect();
+        let (found_codes, expected_codes) = (f8e4m3::to_buf(&first), f8e4m3::to_buf(&expected));
+        let differs =
+            (found_codes.iter().zip(&expected_codes)).position(|(found, want)| found != want);
+        assert_eq!(
+            differs.map(|at| at / width::<Group>()),
+            None,
+            "{live} rows: first differing token"
+        );
+        assert!(
+            found.iter().all(|value| value.to_f32().is_finite()),
+            "{live} rows"
+        );
+        let (worst, mean) = deviation(&found, &want);
+        println!(
+            "deviation rows-{live} largest {worst:.5} mean {mean:.6} (of the largest BF16 output)"
         );
     }
 }
@@ -1507,8 +1762,23 @@ async fn period_profile() {
         layers: (sliding, full),
     };
     let (mixed, norm) = model::<full::Group>(&mut device);
+    let coded = coded_period(&mut device);
     let (held, mixes) = (period_caches(), caches::<full::Group>());
     for live in list("PERIOD_PROFILE_ROWS", "1,8,9,32,64") {
+        let coded_contexts = (
+            context::<CodedGroup>(&mut device, live).await,
+            context::<CodedFull>(&mut device, live).await,
+        );
+        let mut coded_pools = (
+            [
+                coded_pool::<CodedGroup>(&mut device, &held[0]).await,
+                coded_pool::<CodedGroup>(&mut device, &held[1]).await,
+                coded_pool::<CodedGroup>(&mut device, &held[2]).await,
+                coded_pool::<CodedGroup>(&mut device, &held[3]).await,
+                coded_pool::<CodedGroup>(&mut device, &held[4]).await,
+            ],
+            [coded_pool::<CodedFull>(&mut device, &held[5]).await],
+        );
         let contexts = (
             context::<Group>(&mut device, live).await,
             context::<full::Group>(&mut device, live).await,
@@ -1535,7 +1805,8 @@ async fn period_profile() {
         );
         let (input, count) = input(&mut device, live).await;
         let (contexts, rows) = ((&contexts.0, &contexts.1), (&input, &count));
-        for kernel in ["period", "mixed"] {
+        let mut outputs = Vec::new();
+        for kernel in ["period", "mixed", "coded"] {
             let case = format!("{kernel}-rows-{live}");
             let mut last = None;
             for sample in 0..=steps {
@@ -1554,10 +1825,18 @@ async fn period_profile() {
                                 .instrument(submit)
                                 .await
                         }
-                        _ => {
+                        "mixed" => {
                             let model = (&mixed, &norm);
                             let arguments = (&mut device, model, contexts, &mut pools, rows);
                             (launch(scheduled_mixed, arguments).into_future())
+                                .instrument(submit)
+                                .await
+                        }
+                        _ => {
+                            let model = (&coded, &norm);
+                            let contexts = (&coded_contexts.0, &coded_contexts.1);
+                            let arguments = (&mut device, model, contexts, &mut coded_pools, rows);
+                            (launch(scheduled_coded, arguments).into_future())
                                 .instrument(submit)
                                 .await
                         }
@@ -1575,9 +1854,12 @@ async fn period_profile() {
                 println!("{case} step {sample}: {elapsed:.3} ms");
                 last = Some(output);
             }
-            let hash = fingerprint(&crate::rows(&mut device, &last.unwrap(), live).await);
-            println!("hash {case} {hash:016x}");
+            let rows = crate::rows(&mut device, &last.unwrap(), live).await;
+            println!("hash {case} {:016x}", fingerprint(&rows));
+            outputs.push(rows);
         }
+        let (worst, mean) = deviation(&outputs[2], &outputs[0]);
+        println!("deviation rows-{live} largest {worst:.5} mean {mean:.6} (coded vs period)");
     }
 }
 
@@ -1780,6 +2062,302 @@ fn fingerprint(values: &[bf16]) -> u64 {
     (values.iter()).fold(0xcbf2_9ce4_8422_2325, |hash, value| {
         (hash ^ u64::from(value.to_bits())).wrapping_mul(0x0100_0000_01b3)
     })
+}
+
+/// The published checkpoint at the hub revision these probes read.
+const HUB: (&str, &str) = (
+    "unsloth/gemma-4-12b-it-NVFP4",
+    "b1f649734b34aa5575b03d186abd1b9be3d0d5c4",
+);
+
+/// "What is 2 + 2? Answer with just the number." in Gemma 4's chat template, in its tokens.
+const PROMPT: [u32; 27] = [
+    2, 105, 2364, 107, 3689, 563, 236743, 236778, 900, 236743, 236778, 236881, 25685, 607, 1164,
+    506, 1548, 236761, 106, 107, 105, 4368, 107, 100, 45518, 107, 101,
+];
+
+/// The hub cache's directory of the files of checkpoint `repo` at `revision` that `include`
+/// matches, fetched there once.
+fn snapshot((repo, revision): (&str, &str), include: &[&str]) -> std::path::PathBuf {
+    let mut command = std::process::Command::new("uvx");
+    command.args(["--from", "huggingface-hub", "hf", "download"]);
+    command.args([repo, "--revision", revision, "--quiet"]);
+    for pattern in include {
+        command.args(["--include", pattern]);
+    }
+    let output = command
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .expect("uvx fetches the checkpoint");
+    assert!(output.status.success(), "the {repo} download failed");
+    String::from_utf8(output.stdout).unwrap().trim().into()
+}
+
+/// The published checkpoint's rows of `tokens`, each its embedding times the BF16 rounding of
+/// `sqrt(hidden_size)`, rounded once, as the model's scaled embedding gives them.
+fn embedded(source: &Checkpoint, tokens: &[u32]) -> Vec<bf16> {
+    let table = source
+        .get("model.language_model.embed_tokens.weight")
+        .unwrap();
+    let factor = bf16::from_f32((Hidden::SIZE as f32).sqrt()).to_f32();
+    let row = Hidden::SIZE * size_of::<bf16>();
+    (tokens.iter())
+        .flat_map(|&token| table.data()[token as usize * row..][..row].chunks_exact(2))
+        .map(|pair| {
+            bf16::from_f32(
+                bf16::from_bits(u16::from_le_bytes([pair[0], pair[1]])).to_f32() * factor,
+            )
+        })
+        .collect()
+}
+
+/// The softcapped logits of a final-norm `row` over the tied embedding table, in FP64.
+fn logits(source: &Checkpoint, row: &[bf16], cap: f64) -> Vec<f64> {
+    let table = source
+        .get("model.language_model.embed_tokens.weight")
+        .unwrap();
+    let row: Vec<f64> = row.iter().map(|value| f64::from(value.to_f32())).collect();
+    (table.data().chunks_exact(Hidden::SIZE * size_of::<bf16>()))
+        .map(|entry| {
+            let dot = (entry.chunks_exact(2).zip(&row))
+                .map(|(pair, value)| {
+                    f64::from(bf16::from_bits(u16::from_le_bytes([pair[0], pair[1]])).to_f32())
+                        * value
+                })
+                .sum::<f64>();
+            cap * (dot / cap).tanh()
+        })
+        .collect()
+}
+
+/// The final-norm rows of `tokens` through `layers` over fresh caches, a launch of at most
+/// [`Rows`] of them after the ones before: the last launch's live rows.
+macro_rules! prompt {
+    ($device:expr, $kernel:ident, $cache:ty, ($layers:expr, $norm:expr), $tokens:expr, ($source:expr, $spectra:expr)) => {{
+        let device: &mut Device = $device;
+        let tokens: &[u32] = $tokens;
+        let blocks = (tokens.len() + Rows::SIZE).div_ceil(Block::SIZE) + 1;
+        let fresh = |device: &mut Device, bytes: i32| {
+            HbmBuffer::alloc(device, blocks * bytes as usize).unwrap()
+        };
+        let mut pools: Caches<$cache> = (
+            std::array::from_fn(|_| {
+                Pool::<sliding::Group<$cache>>::from_buffer(fresh(
+                    &mut *device,
+                    Pool::<sliding::Group<$cache>>::BLOCK_STRIDE,
+                ))
+                .unwrap()
+            }),
+            std::array::from_fn(|_| {
+                Pool::<full::Group<$cache>>::from_buffer(fresh(
+                    &mut *device,
+                    Pool::<full::Group<$cache>>::BLOCK_STRIDE,
+                ))
+                .unwrap()
+            }),
+        );
+        let mut last = Vec::new();
+        for (call, chunk) in tokens.chunks(Rows::SIZE).enumerate() {
+            let (history, live) = (call * Rows::SIZE, chunk.len());
+            let contexts = (
+                context_at::<sliding::Group<$cache>>(&mut *device, (history, live), &$spectra.0)
+                    .await,
+                context_at::<full::Group<$cache>>(&mut *device, (history, live), &$spectra.1).await,
+            );
+            let mut hidden = embedded($source, chunk);
+            hidden.resize(Rows::SIZE * Hidden::SIZE, bf16::from_bits(POISON));
+            let input = HostTensor::<bf16, m![Rows, Hidden]>::from_vec(hidden)
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+            let count = HostTensor::<i32, m![1]>::from_vec([live as i32])
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+            let arguments = (
+                &mut *device,
+                ($layers, $norm),
+                (&contexts.0, &contexts.1),
+                &mut pools,
+                (&input, &count),
+            );
+            let output = launch($kernel, arguments).await.unwrap();
+            last = rows(&mut *device, &output, live).await;
+        }
+        (last, pools)
+    }};
+}
+
+/// The fraction of the keys and of the values of `tokens` positions in an E4M3 `pool` that
+/// saturated, coded at the largest E4M3 magnitude.
+async fn saturated<A: Attention<Cache = f8e4m3>>(
+    device: &mut Device,
+    pool: &Pool<A>,
+    tokens: usize,
+) -> [f64; 2] {
+    let width = <A as Attention>::Heads::SIZE * <A as Attention>::Head::SIZE;
+    let mut counts = [0usize; 2];
+    for block in 0..tokens.div_ceil(Block::SIZE) {
+        let codes = pool.tokens[block]
+            .to_host::<Tokens<A>>(&mut device.pdma)
+            .await;
+        let codes = f8e4m3::to_buf(&codes.unwrap().into_vec());
+        for (at, code) in codes
+            .iter()
+            .enumerate()
+            .take((tokens - block * Block::SIZE).min(Block::SIZE) * 2 * width)
+        {
+            counts[at / width % 2] += usize::from(code & 0x7f == 0x7e);
+        }
+    }
+    counts.map(|count| count as f64 / (tokens * width) as f64)
+}
+
+/// The published checkpoint's logits over caches of E4M3 codes under its static scales beside
+/// the BF16 caches': for the reference prompt, one of `LOGITS_PROFILE_TOKENS` pseudo-random
+/// tokens (default 960) and the token IDs of the file `LOGITS_PROFILE_IDS` names, if any; every 16th
+/// row of the last launch and its last, the largest and the mean distance of each logit, the KL
+/// divergence and each cache's greedy token.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "reads the published checkpoint from the local hub cache"]
+async fn logits_profile() {
+    use furiosa_opt_models::Then;
+    use furiosa_opt_models::models::config::scaling::Spectrum;
+    use furiosa_opt_models::modules::language::Backbone;
+    let _lease = DEVICE.lock().await;
+    let mut device = Device::new(decoded_bf16.topology()).unwrap();
+    let source = Checkpoint::new(snapshot(HUB, &["*.json", "*.safetensors"]), None).unwrap();
+    let text = &source.config()["text_config"];
+    let cap = text["final_logit_softcapping"].as_f64().unwrap();
+    let spectrum = |layer: &str| -> Spectrum {
+        let parameters = serde_json::json!({"rope_parameters": text["rope_parameters"][layer]});
+        serde_json::from_value(parameters).unwrap()
+    };
+    let spectra = (
+        spectrum("sliding_attention")
+            .bind::<sliding::Head, sliding::Head>()
+            .unwrap(),
+        spectrum("full_attention")
+            .bind::<full::Head, full::Rotated>()
+            .unwrap(),
+    );
+    let plain: gemma4::ForCausalLM<gemma4::Quantized, bf16> = source.load(&mut device).unwrap();
+    let coded: gemma4::ForCausalLM<gemma4::Quantized, f8e4m3> = source.load(&mut device).unwrap();
+    let Then(
+        Backbone {
+            body: plain_layers, ..
+        },
+        plain_norm,
+    ) = &plain.model.body;
+    let Then(
+        Backbone {
+            body: coded_layers, ..
+        },
+        coded_norm,
+    ) = &coded.model.body;
+    let length =
+        std::env::var("LOGITS_PROFILE_TOKENS").map_or(960, |tokens| tokens.parse().unwrap());
+    let longer: Vec<u32> = bytes(4 * length, 0x7f4a_7c15)
+        .chunks_exact(4)
+        .map(|word| 1000 + u32::from_le_bytes(word.try_into().unwrap()) % 199_000)
+        .collect();
+    // A text's token IDs, whitespace-separated, as a third prompt.
+    let text: Vec<u32> = std::env::var("LOGITS_PROFILE_IDS").map_or(Vec::new(), |path| {
+        let ids = std::fs::read_to_string(path).unwrap();
+        ids.split_whitespace()
+            .map(|id| id.parse().unwrap())
+            .collect()
+    });
+    let prompts = [
+        ("reference", &PROMPT[..]),
+        ("longer", &longer[..]),
+        ("text", &text[..]),
+    ];
+    for (name, tokens) in prompts.into_iter().filter(|(_, tokens)| !tokens.is_empty()) {
+        let started = std::time::Instant::now();
+        let (want, _) = prompt!(
+            &mut device,
+            decoded_bf16,
+            bf16,
+            (plain_layers, plain_norm),
+            tokens,
+            (&source, spectra)
+        );
+        let (found, pools) = prompt!(
+            &mut device,
+            decoded_e4m3,
+            f8e4m3,
+            (coded_layers, coded_norm),
+            tokens,
+            (&source, spectra)
+        );
+        let (mut sliding, mut full) = ([0.0f64; 2], [0.0f64; 2]);
+        for pool in &pools.0 {
+            let [keys, values] =
+                saturated::<sliding::Group<f8e4m3>>(&mut device, pool, tokens.len()).await;
+            sliding = [sliding[0].max(keys), sliding[1].max(values)];
+        }
+        for pool in &pools.1 {
+            let [keys, values] =
+                saturated::<full::Group<f8e4m3>>(&mut device, pool, tokens.len()).await;
+            full = [full[0].max(keys), full[1].max(values)];
+        }
+        println!(
+            "{name} saturated codes, the most of a layer: sliding keys {:.2e} values {:.2e}, full keys {:.2e} values {:.2e}",
+            sliding[0], sliding[1], full[0], full[1],
+        );
+        let live = found.len() / Hidden::SIZE;
+        let (worst, mean) = deviation(&found, &want);
+        println!(
+            "{name} {} tokens: final rows largest {worst:.5} mean {mean:.6} ({:.1} s)",
+            tokens.len(),
+            started.elapsed().as_secs_f64()
+        );
+        for row in (0..live).filter(|row| row % 16 == 0 || row + 1 == live) {
+            let row_of = |rows: &[bf16]| rows[row * Hidden::SIZE..][..Hidden::SIZE].to_vec();
+            let (plain, coded) = (
+                logits(&source, &row_of(&want), cap),
+                logits(&source, &row_of(&found), cap),
+            );
+            let distances: Vec<f64> = plain
+                .iter()
+                .zip(&coded)
+                .map(|(p, c)| (p - c).abs())
+                .collect();
+            let largest = distances.iter().copied().fold(0.0, f64::max);
+            let average = distances.iter().sum::<f64>() / distances.len() as f64;
+            let argmax = |values: &[f64]| {
+                (0..values.len())
+                    .max_by(|&a, &b| values[a].total_cmp(&values[b]))
+                    .unwrap()
+            };
+            let softmax = |values: &[f64]| {
+                let top = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let weights: Vec<f64> = values.iter().map(|value| (value - top).exp()).collect();
+                let total: f64 = weights.iter().sum();
+                weights
+                    .into_iter()
+                    .map(|weight| weight / total)
+                    .collect::<Vec<_>>()
+            };
+            let (p, q) = (softmax(&plain), softmax(&coded));
+            let kl: f64 = p
+                .iter()
+                .zip(&q)
+                .filter(|(p, _)| **p > 0.0)
+                .map(|(p, q)| p * (p / q).ln())
+                .sum();
+            let (a, b) = (argmax(&plain), argmax(&coded));
+            let mut sorted = plain.clone();
+            sorted.sort_by(|x, y| y.total_cmp(x));
+            println!(
+                "{name} row {}: logit largest {largest:.4} mean {average:.5}, KL {kl:.3e}, greedy {a} / {b}, BF16 top {:.3} margin {:.3}",
+                tokens.len() - live + row,
+                sorted[0],
+                sorted[0] - sorted[1],
+            );
+        }
+    }
 }
 
 /// The catalog's attention projections alone, profiled as [`period_profile`] profiles the period:
