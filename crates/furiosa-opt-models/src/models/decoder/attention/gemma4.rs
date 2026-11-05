@@ -178,13 +178,14 @@ axes![
 ];
 
 /// FP8 per-channel attention projections and an NVFP4 feed-forward, as the published checkpoint
-/// stores them; the feed-forward's FP32 sums divide by its tensor scale, so no coefficient rounds.
-/// The gate and up rows stay where their passes summed them, for the activation, the product and
-/// the down projection to read there.
+/// stores them; the query, key and value rows quantize per row at run time as it declares, and the
+/// feed-forward's FP32 sums divide by its tensor scale, so no coefficient rounds. The gate and up
+/// rows stay where their passes summed them, for the activation, the product and the down
+/// projection to read there.
 pub type Quantized = decoder::Projections<
-    form::ChannelScaled,
-    form::ChannelScaled,
-    form::ChannelScaled,
+    form::TokenScaled,
+    form::TokenScaled,
+    form::TokenScaled,
     form::ChannelScaled,
     form::Nvfp4Summed<Kept>,
     form::Nvfp4Summed<Kept>,

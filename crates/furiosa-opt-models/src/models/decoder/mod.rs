@@ -689,6 +689,10 @@ pub mod form {
         pub use crate::ops::linear::fp8::Codes;
     }
 
+    /// [`ChannelScaled`]'s FP8 weights, whose inputs quantize to E4M3 at run time under one scale
+    /// a row, as a checkpoint declaring per-token dynamic activations states them.
+    pub struct TokenScaled;
+
     /// FP8 weights and activations with static per-tensor scales.
     pub struct TensorScaled;
 
@@ -774,6 +778,22 @@ pub mod form {
 
         const REQUIREMENT: Requirement =
             Requirement::quantizable(Declaration::Fp8(Scheme::Channel));
+
+        type Caches = (bf16,);
+    }
+
+    impl Form for TokenScaled {
+        type Stored = f8e4m3;
+
+        type Of<In: AxisName, Out: AxisName, D: Scalar, Chips: M + 'static, X: Memory, V> =
+            fp8::TokenScaled<
+                In,
+                Out,
+                X::Tensor<f8e4m3, Chip, channel::Codes<In, Out>>,
+                X::Tensor<f32, Chip, m![Out, 1 # 8]>,
+            >;
+
+        const REQUIREMENT: Requirement = Requirement::declared(Declaration::Fp8(Scheme::Channel));
 
         type Caches = (bf16,);
     }

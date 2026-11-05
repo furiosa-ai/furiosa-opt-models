@@ -94,6 +94,7 @@ impl<
     KL,
     VL,
     KB,
+    KG,
     QO,
     KO,
     NQ,
@@ -164,10 +165,10 @@ where
         >,
     Query: for<'x> Module<Begin<()>, (), &'x mut (), Output = QL>
         + for<'r, 'x> Module<
-            (QL, Grouped<&'r Live<Spread<Hidden, R, Chip>, R>>),
+            (QL, Begin<Grouped<&'r Live<Spread<Hidden, R, Chip>, R>>>),
             (),
             &'x mut (),
-            Output = QO,
+            Output = (QO, KG),
         > + for<'r, 'x> Module<
             (QL, Begin<&'r Live<Spread<Hidden, R, Chip>, R>>),
             (),
@@ -175,15 +176,15 @@ where
             Output = (QO, KB),
         >,
     Key: for<'x> Module<Begin<()>, (), &'x mut (), Output = KL>
-        + for<'r, 'x> Module<
-            (KL, Grouped<&'r Live<Spread<Hidden, R, Chip>, R>>),
+        + for<'r, 'g, 'x> Module<
+            (KL, (Grouped<&'r Live<Spread<Hidden, R, Chip>, R>>, &'g KG)),
             (),
             &'x mut (),
             Output = KO,
         > + for<'b, 'x> Module<(KL, &'b KB), (), &'x mut (), Output = KO>,
     Value: for<'x> Module<Begin<()>, (), &'x mut (), Output = VL>,
-    Then<Value, ValueNorm>: for<'r, 'x> Module<
-            (VL, Grouped<&'r Live<Spread<Hidden, R, Chip>, R>>),
+    Then<Value, ValueNorm>: for<'r, 'g, 'x> Module<
+            (VL, (Grouped<&'r Live<Spread<Hidden, R, Chip>, R>>, &'g KG)),
             (),
             &'x mut ((), ()),
             Output = Live<KeyHeads<A, R>, R>,
@@ -345,8 +346,8 @@ where
         // the query projection hands its rows on; its scales land in the end.
         gate.forward(&mut *device, (), &mut (), gate_landed);
         let input = &normalized;
-        // Where every row group is live, the query projection keeps the rows it filled into the
-        // tensor registers for the key and value projections; else each fills its live groups.
+        // The query projection keeps the rows it staged for the key and value projections: every
+        // row group live, in the tensor registers; else what its form stages for the live groups.
         let projected = |device: &mut Device| {
             if input.groups::<Lanes<R>>().1 == <Layout<R>::Groups as M>::SIZE {
                 let begun = (query, Begin(input));
@@ -357,10 +358,22 @@ where
                     (projections.value).forward(device, (), &mut ((), ()), (value, &banks)),
                 );
             }
+            let begun = (query, Begin(Grouped(input)));
+            let (query, kept) = (projections.query).forward(&mut *device, (), &mut (), begun);
             (
-                (projections.query).forward(&mut *device, (), &mut (), (query, Grouped(input))),
-                (projections.key).forward(&mut *device, (), &mut (), (key, Grouped(input))),
-                (projections.value).forward(device, (), &mut ((), ()), (value, Grouped(input))),
+                query,
+                (projections.key).forward(
+                    &mut *device,
+                    (),
+                    &mut (),
+                    (key, (Grouped(input), &kept)),
+                ),
+                (projections.value).forward(
+                    device,
+                    (),
+                    &mut ((), ()),
+                    (value, (Grouped(input), &kept)),
+                ),
             )
         };
         let (query, key, value) = projected(&mut *device);

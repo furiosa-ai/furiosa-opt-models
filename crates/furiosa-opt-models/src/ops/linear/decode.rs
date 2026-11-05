@@ -192,47 +192,83 @@ type Inputs<In, Out> = <Tiled<In, Out> as Tiling<In, Out>>::Inputs;
 type Parts<In, Out> = <Tiled<In, Out> as Tiling<In, Out>>::Restorations;
 type Part<In, Out> = <Tiled<In, Out> as Tiling<In, Out>>::Restored;
 
-/// A channel-scaled weight landed in the contraction's tiling: every slab's E4M3 codes and its
-/// rows' FP32 scales in data memory, the weight begun.
-pub struct Landed<In: AxisName, Out: AxisName> {
+/// A channel-scaled weight under contract `C` landed in the contraction's tiling: every slab's E4M3
+/// codes and its rows' FP32 scales in data memory, the weight begun.
+pub struct Landed<In: AxisName, Out: AxisName, C = ()> {
     codes: Landing<f8e4m3, In, Out, f8e4m3, m![{ Rows<In, Out> }, { Inputs<In, Out> }]>,
     scales: Landing<f32, In, Out, f8e4m3, m![{ Rows<In, Out> }, 1 # 8]>,
+    contract: PhantomData<C>,
 }
 
 /// The place a weight lands in, before it lands.
-impl<In: AxisName, Out: AxisName> Default for Landed<In, Out> {
+impl<In: AxisName, Out: AxisName, C> Default for Landed<In, Out, C> {
     fn default() -> Self {
         Self {
             codes: DmTensor::new(),
             scales: DmTensor::new(),
+            contract: PhantomData,
         }
+    }
+}
+
+impl<In: AxisName, Out: AxisName, C> Landed<In, Out, C> {
+    /// Slab `at`'s codes as the contraction's slices hold them.
+    pub(super) fn codes(
+        &self,
+        at: usize,
+    ) -> DmTensorView<
+        '_,
+        f8e4m3,
+        m![1],
+        kernel::Cluster<In, Out, f8e4m3>,
+        <Tiled<In, Out> as Tiling<In, Out>>::Slices,
+        m![{ kernel::Slab<In, Out, f8e4m3> }, { Rows<In, Out> }, { Inputs<In, Out> }],
+    > {
+        Tiled::<In, Out>::landed(&self.codes, at)
+    }
+
+    /// Slab `at`'s FP32 output scales, in every slice of each output block.
+    pub(super) fn scales(
+        &self,
+        at: usize,
+    ) -> DmTensorView<
+        '_,
+        f32,
+        m![1],
+        kernel::Cluster<In, Out, f8e4m3>,
+        <Tiled<In, Out> as Tiling<In, Out>>::Slices,
+        m![{ kernel::Slab<In, Out, f8e4m3> }, { Rows<In, Out> }, 1 # 8],
+    > {
+        Tiled::<In, Out>::landed(&self.scales, at)
     }
 }
 
 /// The weight's codes, then its scales, one transfer each, into a place made before: a transfer
 /// into part of a slice's codes would hold every later command until the part before it lands.
-impl<In: AxisName, Out: AxisName, K, V> Op<&mut Landed<In, Out>> for ChannelScaled<In, Out, K, V>
+impl<In: AxisName, Out: AxisName, C, K, V> Op<&mut Landed<In, Out, C>>
+    for BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], C, Chip, K, V>
 where
     K: Borrow<HbmTensor<f8e4m3, Chip, Codes<In, Out>>>,
     V: Borrow<HbmTensor<f32, Chip, m![Out, 1 # 8]>>,
 {
     type Output = ();
 
-    fn forward(&self, device: &mut Device, landed: &mut Landed<In, Out>) {
+    fn forward(&self, device: &mut Device, landed: &mut Landed<In, Out, C>) {
         Tiled::<In, Out>::land(device, self.weight.borrow(), &mut landed.codes);
         Tiled::<In, Out>::land(device, self.scales(), &mut landed.scales);
     }
 }
 
 /// The weight begun: it lands in a place of its own.
-impl<In: AxisName, Out: AxisName, K, V> Op<Begin<()>> for ChannelScaled<In, Out, K, V>
+impl<In: AxisName, Out: AxisName, C, K, V> Op<Begin<()>>
+    for BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], C, Chip, K, V>
 where
     K: Borrow<HbmTensor<f8e4m3, Chip, Codes<In, Out>>>,
     V: Borrow<HbmTensor<f32, Chip, m![Out, 1 # 8]>>,
 {
-    type Output = Landed<In, Out>;
+    type Output = Landed<In, Out, C>;
 
-    fn forward(&self, device: &mut Device, _: Begin<()>) -> Landed<In, Out> {
+    fn forward(&self, device: &mut Device, _: Begin<()>) -> Landed<In, Out, C> {
         let mut landed = Landed::default();
         self.forward(device, &mut landed);
         landed

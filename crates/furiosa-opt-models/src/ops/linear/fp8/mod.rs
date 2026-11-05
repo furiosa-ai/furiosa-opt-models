@@ -36,6 +36,15 @@ pub(crate) type ChannelScaled<
     T = HbmTensor<f32, Chip, m![Out, 1 # 8]>,
 > = BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], (), Chip, W, T>;
 
+/// [`ChannelScaled`]'s codes and scales, against input rows that quantize at run time, each under
+/// a scale of its own, as [`Token`](crate::tensor::form::fp8::Token) states.
+pub(crate) type TokenScaled<
+    In,
+    Out,
+    W = HbmTensor<f8e4m3, Chip, Codes<In, Out>>,
+    T = HbmTensor<f32, Chip, m![Out, 1 # 8]>,
+> = BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], crate::tensor::form::fp8::Token, Chip, W, T>;
+
 /// How HBM holds a channel-scaled weight's codes: as the contraction's slices hold them.
 pub type Codes<In, Out> = super::kernel::Tiles<In, Out, f8e4m3>;
 

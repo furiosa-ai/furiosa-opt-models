@@ -15,6 +15,9 @@ use crate::tensor::axis;
 use crate::tensor::live::Live;
 use crate::tensor::mapping::Rows as Layout;
 
+pub(crate) use token::{TokenBanks, Tokens};
+mod token;
+
 /// A projection's tiling: the measured choices and the geometry they fix.
 struct Config {
     /// Input features one contraction part holds.
