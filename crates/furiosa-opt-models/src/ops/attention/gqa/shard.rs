@@ -36,6 +36,21 @@ pub(crate) type Local<G, Count = <G as Partition>::Rows> = DmTensor<
     m![{Count}, {<G as Partition>::Groups}, 1 # 8],
 >;
 
+type Logits<'a, G, Count> = VectorFinalTensor<
+    'a,
+    { Tu::Main },
+    f32,
+    Chip<G>,
+    <G as Partition>::Cluster,
+    <G as Partition>::Slices,
+    m![
+        { Count },
+        { <G as Partition>::Groups },
+        { <G as Partition>::Keys } / 8
+    ],
+    m![{ <G as Partition>::Keys } % 8],
+>;
+
 type Statistics<G, Count = <G as Partition>::Rows> = VrfTensor<
     f32,
     Chip<G>,
@@ -89,8 +104,8 @@ pub(crate) type Attended<G> = DmTensor<
     }],
 >;
 
-/// A window's keys in the tensor registers and its score mask and bias in the vector registers,
-/// for `Count` row groups: all its scores read of where the window landed.
+/// A window's keys in the tensor registers and its score masks in the vector registers, for
+/// `Count` row groups: all its scores read of where the window landed.
 pub(crate) struct Registers<G: Partition, Count: M> {
     key: TrfTensor<
         bf16,
@@ -100,9 +115,26 @@ pub(crate) struct Registers<G: Partition, Count: M> {
         m![{ G::Keys } % 8],
         m![{ Count }, { G::Keys } / 8, { G::Head }],
     >,
+    masks: Masks<G, Count>,
+}
+
+/// A window's score mask and bias in the vector registers, for `Count` row groups: the slots its
+/// scores keep.
+pub(crate) struct Masks<G: Partition, Count: M> {
     mask: Mask<G, Count>,
     bias: Mask<G, Count>,
 }
+
+/// A pass's query rows in the tensor registers, a lane a query group, for `Count` row groups: each
+/// window the pass scores streams its keys past them.
+pub(crate) type Stationary<G, Count> = TrfTensor<
+    bf16,
+    Chip<G>,
+    <G as Partition>::Cluster,
+    <G as Partition>::Slices,
+    m![{ <G as Partition>::Groups }],
+    m![{ Count }, { <G as Partition>::Head }],
+>;
 
 /// An FP32 scale in the vector registers of every slice of partition `G`.
 pub(crate) type Scale<G> =
@@ -354,8 +386,10 @@ pub(crate) trait Partition: Sized {
     /// waits for every transfer.
     ///
     /// With `FOLLOW`, `follow` lands window `at` into `even`, or past the last window what follows
-    /// it, once the last window is prepared: `attend` must then read only what `prepare` returned.
-    /// A history of two windows or more lands what follows exactly once, one of a window never.
+    /// it, once the last window is prepared: `attend` must then read only what `prepare` returned,
+    /// or its window's place where a history spans two windows at most, whose first is attended
+    /// before what follows lands into its place. A history of two windows or more lands what
+    /// follows exactly once, one of a window never.
     ///
     /// `boundary` runs once, where the issue waits for a landing anyway, as a transfer issued while
     /// a window lands waits for it on both paths of a loop around it: before the last window is
@@ -525,6 +559,31 @@ pub(crate) trait Partition: Sized {
         key: DmTensorView<'_, bf16, Chip<Self>, Self::Cluster, Self::Slices, K>,
         bias: DmTensorView<'_, f32, Chip<Self>, Self::Cluster, Self::Slices, B>,
     ) -> Registers<Self, Count> {
+        let masks = Self::mask::<Count, _>(device, bias);
+        let key = device
+            .sub
+            .begin(key)
+            .fetch::<m![
+                { Self::Keys } % 8,
+                { Count },
+                { Self::Keys } / 8,
+                { Self::Head } / 16
+            ], m![{ Self::Head } % 16]>()
+            .collect::<m![
+                { Self::Keys } % 8,
+                { Count },
+                { Self::Keys } / 8,
+                { Self::Head } / 16
+            ], m![{ Self::Head } % 16]>()
+            .to_trf();
+        Registers { key, masks }
+    }
+
+    /// A window's `bias` read into the mask and the bias its scores take.
+    fn mask<Count: M, B: M>(
+        device: &mut Device,
+        bias: DmTensorView<'_, f32, Chip<Self>, Self::Cluster, Self::Slices, B>,
+    ) -> Masks<Self, Count> {
         let mask = device
             .main
             .begin(bias.clone())
@@ -576,23 +635,7 @@ pub(crate) trait Partition: Sized {
             )
             .vector_final()
             .to_vrf(&mut device.sub);
-        let key = device
-            .sub
-            .begin(key)
-            .fetch::<m![
-                { Self::Keys } % 8,
-                { Count },
-                { Self::Keys } / 8,
-                { Self::Head } / 16
-            ], m![{ Self::Head } % 16]>()
-            .collect::<m![
-                { Self::Keys } % 8,
-                { Count },
-                { Self::Keys } / 8,
-                { Self::Head } / 16
-            ], m![{ Self::Head } % 16]>()
-            .to_trf();
-        Registers { key, mask, bias }
+        Masks { mask, bias }
     }
 
     /// The shard's attention of `query` over one window's `registers` and its values transposed
@@ -616,104 +659,150 @@ pub(crate) trait Partition: Sized {
             .cast::<bf16, m![{Self::Keys} % 8 # 16]>()
             .commit_trim::<m![{ Self::Keys } % 8]>()
             .commit();
-        // Shard-local softmax avoids broadcasting scores and three inter-slice reductions.
-        // Its sum returns as a register operand for normalizing the shard's weighted values.
-        let max: Statistics<Self, Count> = device
-            .main
-            .begin(logits.view())
-            .fetch::<
-                m![{ Count }, { Self::Groups }, { Self::Keys } / 16],
-                m![{ Self::Keys } % 16],
-            >()
-            .fetch_cast::<f32>()
-            .collect::<
-                m![{ Count }, { Self::Groups }, { Self::Keys } / 8],
-                m![{ Self::Keys } % 8],
-            >()
-            .vector_init()
-            .vector_intra_slice_tag(TagMode::Zero)
-            .vector_narrow_split::<
-                m![{ Count }, { Self::Groups }, { Self::Keys } / 4],
-                m![{ Self::Keys } % 4],
-            >()
-            .vector_intra_slice_reduce::<Self::Key, m![{ Count }, { Self::Groups }], m![1 # 4]>(
-                IntraSliceReduceOpF32::Max,
-            )
-            .vector_widen_pad::<m![1 # 8]>()
-            .vector_final()
-            .to_vrf(&mut device.sub);
-        let weight: Slots<Self, Count> = device
-            .main
-            .begin(logits.view())
-            .fetch::<
-                m![{ Count }, { Self::Groups }, { Self::Keys } / 16],
-                m![{ Self::Keys } % 16],
-            >()
-            .fetch_cast::<f32>()
-            .collect::<
-                m![{ Count }, { Self::Groups }, { Self::Keys } / 8],
-                m![{ Self::Keys } % 8],
-            >()
-            .vector_init()
-            .vector_intra_slice_tag(TagMode::Comparison([Cmp::Equal(f32::NEG_INFINITY); 4]))
-            .vector_narrow_split::<
-                m![{ Count }, { Self::Groups }, { Self::Keys } / 4],
-                m![{ Self::Keys } % 4],
-            >()
-            .vector_fp_binary(FpBinaryOp::SubF, Branched::rf(PRESENT, &max))
-            .vector_fp_unary(FpUnaryOp::Exp)
-            .vector_widen_concat::<
-                m![{ Count }, { Self::Groups }, { Self::Keys } / 8],
-                m![{ Self::Keys } % 8],
-            >()
-            .vector_final()
-            .cast::<bf16, m![{ Self::Keys } % 8 # 16]>()
-            .commit_trim::<m![{ Self::Keys } % 8]>()
-            .commit();
-        // Empty shards need a finite divisor before their mass is marked absent.
-        let sum: Local<Self, Count> = device
-            .main
-            .begin(weight.view())
-            .fetch::<
-                m![{ Count }, { Self::Groups }, { Self::Keys } / 16],
-                m![{ Self::Keys } % 16],
-            >()
-            .fetch_cast::<f32>()
-            .collect::<
-                m![{ Count }, { Self::Groups }, { Self::Keys } / 8],
-                m![{ Self::Keys } % 8],
-            >()
-            .vector_init()
-            .vector_intra_slice_tag(TagMode::Zero)
-            .vector_narrow_split::<
-                m![{ Count }, { Self::Groups }, { Self::Keys } / 4],
-                m![{ Self::Keys } % 4],
-            >()
-            .vector_intra_slice_reduce::<Self::Key, m![{ Count }, { Self::Groups }], m![1 # 4]>(
-                IntraSliceReduceOpF32::Add,
-            )
-            .vector_widen_pad::<m![1 # 8]>()
-            .vector_clip(ClipBinaryOpF32::Add, 1e-6f32)
-            .vector_final()
-            .commit_trim::<m![1 # 8]>()
-            .commit();
-        let total = operand::<Self, Count>(device, &sum);
-        device
-            .main
-            .begin(sum.view())
-            .fetch::<m![{ Count }, { Self::Groups }], m![1 # 8]>()
-            .collect::<m![{ Count }, { Self::Groups }], m![1 # 8]>()
-            .vector_init()
-            .vector_intra_slice_tag(TagMode::Zero)
-            .vector_narrow_trim::<m![1 # 4]>()
-            .vector_fp_unary(FpUnaryOp::Log)
-            .vector_fp_binary(FpBinaryOp::AddF, &max)
-            .vector_widen_pad::<m![1 # 8]>()
-            .vector_final()
-            .commit_trim::<m![1 # 8]>()
-            .commit_view(lse);
+        let (weight, total) = softmax::<Self, Count, _>(device, &logits, lse);
         let value = scales.map(|Scales(_, value)| value);
         weighted_sum::<Self, Count, _, _>(device, (&weight, &total, value), values, partial);
+    }
+
+    /// A pass's `query` rows read into the registers, a lane a query group, for every window the
+    /// pass scores.
+    fn station<Count: M, Q: M>(
+        device: &mut Device,
+        query: DmTensorView<'_, bf16, Chip<Self>, Self::Cluster, Self::Slices, Q>,
+    ) -> Stationary<Self, Count> {
+        device
+            .sub
+            .begin(query)
+            .fetch::<m![{ Self::Groups }, { Count }, { Self::Head } / 16], m![{ Self::Head } % 16]>()
+            .collect::<m![{ Self::Groups }, { Count }, { Self::Head } / 16], m![{ Self::Head } % 16]>(
+            )
+            .to_trf()
+    }
+
+    /// The softmax weights and their total of the scores of `query` over a window's `key` rows,
+    /// which stream past it where they landed, each score kept where `masks` keep it and times the
+    /// window's `scale` where its keys are codes; `lse` takes each row's log-sum-exp.
+    fn score<Count: M, K: M, L: M>(
+        device: &mut Device,
+        query: &Stationary<Self, Count>,
+        (key, masks, scale): (
+            DmTensorView<'_, bf16, Chip<Self>, Self::Cluster, Self::Slices, K>,
+            &Masks<Self, Count>,
+            Option<&Scale<Self>>,
+        ),
+        lse: DmTensorViewMut<'_, f32, Chip<Self>, Self::Cluster, Self::Slices, L>,
+    ) -> (Slots<Self, Count>, Statistics<Self, Count>) {
+        // A key's scores leave the contraction a lane a group; the transpose lays them out a group
+        // a row, as the softmax reads them.
+        let scores: Slots<Self, Count, f32> = device
+            .main
+            .begin(key)
+            .fetch::<m![{ Count }, { Self::Keys }, { Self::Head } / 16], m![{ Self::Head } % 16]>()
+            .collect::<m![{ Count }, { Self::Keys }, { Self::Head } / 16], m![{ Self::Head } % 16]>(
+            )
+            .contract_outer::<
+                m![{ Count }, { Self::Keys }, { Self::Head } / 32],
+                m![{ Self::Head } % 32],
+                _,
+                _,
+                _,
+            >(query)
+            .contract_packet::<m![1]>()
+            .contract_time::<m![{ Count }, { Self::Keys }]>()
+            .contract_lane::<m![{ Count }, { Self::Keys }], m![{ Self::Groups } # 8]>(
+                LaneMode::Interleaved,
+            )
+            .transpose::<m![{ Count }, { Self::Keys } / 2, { Self::Groups }], m![{ Self::Keys } % 2 # 8]>(
+            )
+            .commit_trim::<m![{ Self::Keys } % 2]>()
+            .commit();
+        let logits: Slots<Self, Count> = logit::<Self, Count>(
+            device
+                .main
+                .begin(scores.view())
+                .fetch::<m![{ Count }, { Self::Groups }, { Self::Keys } / 8], m![{ Self::Keys } % 8]>()
+                .collect::<m![{ Count }, { Self::Groups }, { Self::Keys } / 8], m![{ Self::Keys } % 8]>(
+                )
+                .vector_init(),
+            masks,
+            scale,
+        )
+        .cast::<bf16, m![{ Self::Keys } % 8 # 16]>()
+        .commit_trim::<m![{ Self::Keys } % 8]>()
+        .commit();
+        softmax::<Self, Count, _>(device, &logits, lse)
+    }
+
+    /// The softmax `weight`s' sum of a window's `value` rows, which stream past them where they
+    /// landed, over their `total`, each value times the window's `scale` where its values are codes.
+    fn weigh<Count: M, V: M, P: M>(
+        device: &mut Device,
+        (weight, total, scale): (
+            &Slots<Self, Count>,
+            &Statistics<Self, Count>,
+            Option<&Scale<Self>>,
+        ),
+        value: DmTensorView<'_, bf16, Chip<Self>, Self::Cluster, Self::Slices, V>,
+        partial: DmTensorViewMut<'_, f32, Chip<Self>, Self::Cluster, Self::Slices, P>,
+    ) {
+        let weights: TrfTensor<
+            bf16,
+            Chip<Self>,
+            Self::Cluster,
+            Self::Slices,
+            m![{ Self::Groups }],
+            m![{ Count }, { Self::Keys }],
+        > = device
+            .sub
+            .begin(weight.view())
+            .fetch::<m![{ Self::Groups }, { Count }, { Self::Keys } / 16], m![{ Self::Keys } % 16]>()
+            .collect::<m![{ Self::Groups }, { Count }, { Self::Keys } / 16], m![{ Self::Keys } % 16]>(
+            )
+            .to_trf();
+        let sums = device
+            .main
+            .begin(value)
+            .fetch::<m![{ Count }, { Self::Keys }, { Self::Head } / 16], m![{ Self::Head } % 16]>()
+            .collect::<m![{ Count }, { Self::Keys }, { Self::Head } / 16], m![{ Self::Head } % 16]>(
+            )
+            .contract_outer::<
+                m![{ Count }, { Self::Keys }, { Self::Head } / 32],
+                m![{ Self::Head } % 32],
+                _,
+                _,
+                _,
+            >(&weights)
+            .contract_packet::<m![{ Self::Head } % 32]>()
+            .contract_time::<m![{ Count }, { Self::Head } / 32]>()
+            .contract_lane::<
+                m![{ Count }, { Self::Head } / 32, { Self::Groups }, { Self::Head } % 32 / 8],
+                m![{ Self::Head } % 8],
+            >(LaneMode::Sequential)
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_split::<
+                m![{ Count }, { Self::Head } / 32, { Self::Groups }, { Self::Head } % 32 / 4],
+                m![{ Self::Head } % 4],
+            >();
+        type Wide<G, Count> = m![
+            { Count },
+            { <G as Partition>::Head } / 32,
+            { <G as Partition>::Groups },
+            { <G as Partition>::Head } % 32 / 8
+        ];
+        type Lanes<G> = m![{ <G as Partition>::Head } % 8];
+        let summed = match scale {
+            None => sums
+                .vector_fp_div(total)
+                .vector_widen_concat::<Wide<Self, Count>, Lanes<Self>>()
+                .vector_final(),
+            Some(scale) => sums
+                .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), scale)
+                .vector_fp_div(total)
+                .vector_widen_concat::<Wide<Self, Count>, Lanes<Self>>()
+                .vector_final(),
+        };
+        summed.commit_trim::<Lanes<Self>>().commit_view(partial);
     }
 
     fn attend_precise<Count: M, Q: M, K: M, B: M, P: M, L: M>(
@@ -1085,18 +1174,9 @@ const PRESENT: TagGuard =
 fn qk_logits<'a, G: Partition, Count: M, Q: M>(
     device: &'a mut Device,
     query: DmTensorView<'a, bf16, Chip<G>, G::Cluster, G::Slices, Q>,
-    Registers { key, mask, bias }: &Registers<G, Count>,
+    Registers { key, masks }: &Registers<G, Count>,
     scale: Option<&Scale<G>>,
-) -> VectorFinalTensor<
-    'a,
-    { Tu::Main },
-    f32,
-    Chip<G>,
-    G::Cluster,
-    G::Slices,
-    m![{ Count }, { G::Groups }, { G::Keys } / 8],
-    m![{ G::Keys } % 8],
-> {
+) -> Logits<'a, G, Count> {
     let scores = device
         .main
         .begin(query)
@@ -1116,14 +1196,35 @@ fn qk_logits<'a, G: Partition, Count: M, Q: M>(
         .contract_lane::<m![{ Count }, { G::Groups }, { G::Keys } / 8], m![{ G::Keys } % 8]>(
             LaneMode::Interleaved,
         )
-        .vector_init()
+        .vector_init();
+    logit::<G, Count>(scores, masks, scale)
+}
+
+/// A window's `scores` kept where `masks` keep them, each times the window's `scale` where its keys
+/// are codes, over the score divisor: its logits, a dropped slot's negative infinity.
+fn logit<'a, G: Partition, Count: M>(
+    scores: VectorInitTensor<
+        'a,
+        { Tu::Main },
+        f32,
+        Chip<G>,
+        G::Cluster,
+        G::Slices,
+        m![{ Count }, { G::Groups }, { G::Keys } / 8],
+        m![{ G::Keys } % 8],
+    >,
+    Masks { mask, bias }: &Masks<G, Count>,
+    scale: Option<&Scale<G>>,
+) -> Logits<'a, G, Count> {
+    let scores = scores
         .vector_intra_slice_tag(TagMode::Zero)
         .vector_logic(LogicBinaryOpF32::BitAnd, mask)
-        .vector_narrow_split::<
-            m![{ Count }, { G::Groups }, { G::Keys } / 8, { G::Keys } % 8 / 4],
-            m![{ G::Keys } % 4],
-        >(
-        );
+        .vector_narrow_split::<m![
+            { Count },
+            { G::Groups },
+            { G::Keys } / 8,
+            { G::Keys } % 8 / 4
+        ], m![{ G::Keys } % 4]>();
     type Wide<G, Count> = m![
         { Count },
         { <G as Partition>::Groups },
@@ -1143,6 +1244,81 @@ fn qk_logits<'a, G: Partition, Count: M, Q: M>(
             .vector_clip(ClipBinaryOpF32::Add, bias)
             .vector_final(),
     }
+}
+
+/// The softmax weights of a window's `logits` and their total, each row's log-sum-exp in `lse`.
+fn softmax<G: Partition, Count: M, L: M>(
+    device: &mut Device,
+    logits: &Slots<G, Count>,
+    lse: DmTensorViewMut<'_, f32, Chip<G>, G::Cluster, G::Slices, L>,
+) -> (Slots<G, Count>, Statistics<G, Count>) {
+    // Shard-local softmax avoids broadcasting scores and three inter-slice reductions.
+    // Its sum returns as a register operand for normalizing the shard's weighted values.
+    let max: Statistics<G, Count> = device
+        .main
+        .begin(logits.view())
+        .fetch::<m![{ Count }, { G::Groups }, { G::Keys } / 16], m![{ G::Keys } % 16]>()
+        .fetch_cast::<f32>()
+        .collect::<m![{ Count }, { G::Groups }, { G::Keys } / 8], m![{ G::Keys } % 8]>()
+        .vector_init()
+        .vector_intra_slice_tag(TagMode::Zero)
+        .vector_narrow_split::<m![{ Count }, { G::Groups }, { G::Keys } / 4], m![{ G::Keys } % 4]>()
+        .vector_intra_slice_reduce::<G::Key, m![{ Count }, { G::Groups }], m![1 # 4]>(
+            IntraSliceReduceOpF32::Max,
+        )
+        .vector_widen_pad::<m![1 # 8]>()
+        .vector_final()
+        .to_vrf(&mut device.sub);
+    let weight: Slots<G, Count> = device
+        .main
+        .begin(logits.view())
+        .fetch::<m![{ Count }, { G::Groups }, { G::Keys } / 16], m![{ G::Keys } % 16]>()
+        .fetch_cast::<f32>()
+        .collect::<m![{ Count }, { G::Groups }, { G::Keys } / 8], m![{ G::Keys } % 8]>()
+        .vector_init()
+        .vector_intra_slice_tag(TagMode::Comparison([Cmp::Equal(f32::NEG_INFINITY); 4]))
+        .vector_narrow_split::<m![{ Count }, { G::Groups }, { G::Keys } / 4], m![{ G::Keys } % 4]>()
+        .vector_fp_binary(FpBinaryOp::SubF, Branched::rf(PRESENT, &max))
+        .vector_fp_unary(FpUnaryOp::Exp)
+        .vector_widen_concat::<m![{ Count }, { G::Groups }, { G::Keys } / 8], m![{ G::Keys } % 8]>()
+        .vector_final()
+        .cast::<bf16, m![{ G::Keys } % 8 # 16]>()
+        .commit_trim::<m![{ G::Keys } % 8]>()
+        .commit();
+    // Empty shards need a finite divisor before their mass is marked absent.
+    let sum: Local<G, Count> = device
+        .main
+        .begin(weight.view())
+        .fetch::<m![{ Count }, { G::Groups }, { G::Keys } / 16], m![{ G::Keys } % 16]>()
+        .fetch_cast::<f32>()
+        .collect::<m![{ Count }, { G::Groups }, { G::Keys } / 8], m![{ G::Keys } % 8]>()
+        .vector_init()
+        .vector_intra_slice_tag(TagMode::Zero)
+        .vector_narrow_split::<m![{ Count }, { G::Groups }, { G::Keys } / 4], m![{ G::Keys } % 4]>()
+        .vector_intra_slice_reduce::<G::Key, m![{ Count }, { G::Groups }], m![1 # 4]>(
+            IntraSliceReduceOpF32::Add,
+        )
+        .vector_widen_pad::<m![1 # 8]>()
+        .vector_clip(ClipBinaryOpF32::Add, 1e-6f32)
+        .vector_final()
+        .commit_trim::<m![1 # 8]>()
+        .commit();
+    let total = operand::<G, Count>(device, &sum);
+    device
+        .main
+        .begin(sum.view())
+        .fetch::<m![{ Count }, { G::Groups }], m![1 # 8]>()
+        .collect::<m![{ Count }, { G::Groups }], m![1 # 8]>()
+        .vector_init()
+        .vector_intra_slice_tag(TagMode::Zero)
+        .vector_narrow_trim::<m![1 # 4]>()
+        .vector_fp_unary(FpUnaryOp::Log)
+        .vector_fp_binary(FpBinaryOp::AddF, &max)
+        .vector_widen_pad::<m![1 # 8]>()
+        .vector_final()
+        .commit_trim::<m![1 # 8]>()
+        .commit_view(lse);
+    (weight, total)
 }
 
 /// The softmax `weight`s' sum of `values` over their `total`, each value times the window's

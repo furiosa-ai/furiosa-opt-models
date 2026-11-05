@@ -117,6 +117,14 @@ pub(crate) const fn holds(head: usize, groups: usize, count: usize, windows: usi
     windows > 1 && windows * count * groups * (head + LANES) * size_of::<f32>() <= super::DM / 16
 }
 
+/// Whether a window's keys and values stream past its `groups` query rows of `head` channels and
+/// their softmax weights in the tensor registers, rather than fill the registers themselves: when
+/// the groups fit the register lanes and the weighted sum's accumulators hold each lane's whole
+/// head while the keys stream.
+pub(crate) const fn streams(head: usize, groups: usize) -> bool {
+    groups.is_power_of_two() && groups <= LANES && groups * head <= super::ACCUMULATOR
+}
+
 /// Whether a pass of `rows` rows over an `envelope` lands a window while the one before it is
 /// attended: when two landings, a fold and the envelope's rows leave a quarter of DM to the layer.
 pub(crate) const fn overlaps(

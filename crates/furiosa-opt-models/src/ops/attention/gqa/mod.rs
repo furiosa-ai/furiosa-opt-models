@@ -272,20 +272,30 @@ fn chunk<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Count: M, D: Scalar>
 
 /// A history as its windows land and as attention reads them: BF16 cells as they landed, or a
 /// pool's E4M3 codes, whose keys widen to BF16 once a window is prepared (which leaves the widening
-/// behind no gather in flight), whose values widen in their transpose, and whose scales the scores
-/// and the weighted sum take.
+/// behind no gather in flight), whose values widen in their transpose or, where a window streams
+/// them, once it is scored, and whose scales the scores and the weighted sum take.
 pub(crate) trait Landed<Rows: AxisName, KvHeads: AxisName, Head: AxisName> {
     /// The element a window lands in.
     type Element: shard::Value;
-    /// Where a window's keys of `Count` row groups widen to BF16: nothing for BF16 cells.
+    /// Where a window's keys, and its values where it streams them, of `Count` row groups widen to
+    /// BF16: nothing for BF16 cells.
     type Restored<Count: M>;
 
-    /// A place to widen a window's keys of `Count` row groups into.
+    /// A place to widen a window's keys and values of `Count` row groups into.
     fn place<Count: M>() -> Self::Restored<Count>;
 
     /// The window landed in `cells` as the key fill reads it, its keys widened into `place`
     /// first where they are codes; only its keys' half is read.
     fn keys<'c, Count: M>(
+        &self,
+        device: &mut Device,
+        cells: &'c InDm<Rows, KvHeads, Head, Count, Self::Element>,
+        place: &'c mut Self::Restored<Count>,
+    ) -> ChunkView<'c, Rows, KvHeads, Head, Count>;
+
+    /// The window landed in `cells` as its weighted sum streams it, its values widened into `place`
+    /// first where they are codes; only its values' half is read.
+    fn values<'c, Count: M>(
         &self,
         device: &mut Device,
         cells: &'c InDm<Rows, KvHeads, Head, Count, Self::Element>,
@@ -321,6 +331,15 @@ macro_rules! landed_as_is {
         fn place<Count: M>() {}
 
         fn keys<'c, Count: M>(
+            &self,
+            _: &mut Device,
+            cells: &'c InDm<Rows, KvHeads, Head, Count>,
+            _: &'c mut (),
+        ) -> ChunkView<'c, Rows, KvHeads, Head, Count> {
+            chunk(cells)
+        }
+
+        fn values<'c, Count: M>(
             &self,
             _: &mut Device,
             cells: &'c InDm<Rows, KvHeads, Head, Count>,
@@ -379,23 +398,17 @@ impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName, W>
         cells: &'c InDm<Rows, KvHeads, Head, Count, f8e4m3>,
         place: &'c mut InDm<Rows, KvHeads, Head, Count>,
     ) -> ChunkView<'c, Rows, KvHeads, Head, Count> {
-        type Time<Count, KvHeads, Head, const N: usize> =
-            m![{ Count }, { ShardKeys<KvHeads> }, Head / { N }];
-        // SAFETY: as in `chunk`.
-        let widened: ChunkViewMut<'_, Rows, KvHeads, Head, Count> =
-            unsafe { place.view_mut().reshape() };
-        device
-            .main
-            .begin(chunk(cells).tile::<m![KeyValue], 1, Half<Count, KvHeads, Head>>(0))
-            .fetch::<Time<Count, KvHeads, Head, 16>, m![Head % 16]>()
-            .fetch_cast::<f32>()
-            .collect::<Time<Count, KvHeads, Head, 8>, m![Head % 8]>()
-            .cast::<bf16, m![Head % 8 # 16]>()
-            .commit_trim::<m![Head % 8]>()
-            .commit_view(widened.tile::<m![KeyValue], 1, m![
-                { Count }, KeyValue = 1 #{!} 2, { ShardKeys<KvHeads> }, Head
-            ]>(0));
-        chunk(place)
+        widen(device, cells, place, 0)
+    }
+
+    /// Each value code widened to BF16 as [`Self::keys`] widens the keys.
+    fn values<'c, Count: M>(
+        &self,
+        device: &mut Device,
+        cells: &'c InDm<Rows, KvHeads, Head, Count, f8e4m3>,
+        place: &'c mut InDm<Rows, KvHeads, Head, Count>,
+    ) -> ChunkView<'c, Rows, KvHeads, Head, Count> {
+        widen(device, cells, place, 1)
     }
 
     fn widened<'c, Count: M>(
@@ -1290,6 +1303,15 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
         N == Self::ROWS && <RowGroups<Rows> as M>::SIZE > <TileGroups<Rows, N> as AxisName>::SIZE
     }
 
+    /// Whether a pass of `N` rows streams each window's keys and values from where they landed:
+    /// where it lands each window while the one before is attended, and what follows its last
+    /// window, if anything, only into a place already attended: a history of two windows at most.
+    const fn streams<Rows: AxisName, Windows: AxisName, const N: usize>() -> bool {
+        attention::streams(Head::SIZE, Groups::SIZE)
+            && Self::overlaps::<Rows>(N)
+            && (!Self::follows::<Rows, N>() || Windows::SIZE <= 2)
+    }
+
     /// Attends the row groups of `count` passes over the `N`-row tiles from tile `first` and writes
     /// their rows in `attended`; `boundary` runs `times` times in the first pass, where
     /// [`Windowed`]'s runs. Overlapping passes share two places: each lands the next one's first
@@ -1421,7 +1443,143 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     ]>(pass.tile),
                 );
             };
-        if const { Self::overlaps::<Rows>(N) } {
+        if const { Self::streams::<Rows, Windows, N>() } {
+            type Masks<Rows, KvHeads, Groups, Head, const SCALE: usize, const N: usize> =
+                shard::Masks<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>, TileRows<Rows, N>>;
+            type Restored<Source, Rows, KvHeads, Head, const N: usize> =
+                <Source as Landed<Rows, KvHeads, Head>>::Restored<TileRows<Rows, N>>;
+            // Codes widen where they landed: the keys here, the values once scored, so that Main
+            // widens them while Sub fills the weights.
+            let prepares = |device: &mut Device,
+                            landing: &Place<Rows, KvHeads, Groups, Head, Source, N>,
+                            _: &mut ()|
+             -> (
+                Masks<Rows, KvHeads, Groups, Head, SCALE, N>,
+                Restored<Source, Rows, KvHeads, Head, N>,
+            ) {
+                let mut restored = Source::place::<TileRows<Rows, N>>();
+                history.keys(device, &landing.cells, &mut restored);
+                let masks =
+                    <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::mask::<
+                        TileRows<Rows, N>,
+                        _,
+                    >(device, landing.bias.view());
+                (masks, restored)
+            };
+            let (mut even, mut odd, mut nothing) = (
+                Place::<Rows, KvHeads, Groups, Head, Source, N>::new(),
+                Landing::new(),
+                (),
+            );
+            for tile in 0..count {
+                let pass = Pass::<N>::of(first + tile, live);
+                // A pass lands its own first window unless the pass before it did, under its last.
+                if const { Self::follows::<Rows, N>() } {
+                    for _ in 0..(1 - tile.min(1) + (1 - rest.min(1))).min(1) {
+                        lands(device, (0, pass), &mut even);
+                    }
+                } else {
+                    lands(device, (0, pass), &mut even);
+                }
+                let projected = projects(device, pass);
+                wraps(device, pass, &mut even);
+                let query =
+                    <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::station::<
+                        TileRows<Rows, N>,
+                        _,
+                    >(device, projected.view());
+                let mut land =
+                    |device: &mut Device,
+                     at,
+                     landing: &mut Place<Rows, KvHeads, Groups, Head, Source, N>| {
+                        lands(device, (at, pass), landing)
+                    };
+                let mut attend = |device: &mut Device,
+                                  (landing, (masks, mut restored)): (
+                    &Place<Rows, KvHeads, Groups, Head, Source, N>,
+                    (
+                        Masks<Rows, KvHeads, Groups, Head, SCALE, N>,
+                        Restored<Source, Rows, KvHeads, Head, N>,
+                    ),
+                ),
+                                  _: &()| {
+                    let mut partial =
+                        shard::Partial::<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>>::new();
+                    let mut lse =
+                        shard::Local::<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>>::new();
+                    let scales =
+                        history.scales::<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>>(device);
+                    let key = Source::widened(&landing.cells, &restored)
+                        .tile::<m![KeyValue], 1, Half<TileRows<Rows, N>, KvHeads, Head>>(0);
+                    let (weight, total) =
+                        <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::score::<
+                            TileRows<Rows, N>,
+                            _,
+                            _,
+                        >(
+                            device,
+                            &query,
+                            (key, &masks, scales.as_ref().map(|shard::Scales(key, _)| key)),
+                            lse.view_mut(),
+                        );
+                    let value = history
+                        .values(device, &landing.cells, &mut restored)
+                        .tile::<m![KeyValue], 1, Half<TileRows<Rows, N>, KvHeads, Head>>(1);
+                    <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::weigh::<
+                        TileRows<Rows, N>,
+                        _,
+                        _,
+                    >(
+                        device,
+                        (
+                            &weight,
+                            &total,
+                            scales.as_ref().map(|shard::Scales(_, value)| value),
+                        ),
+                        value,
+                        partial.view_mut(),
+                    );
+                    (partial, lse)
+                };
+                let boundary = |device: &mut Device| {
+                    for _ in 0..1 - tile.min(1) {
+                        boundary(device, times);
+                    }
+                };
+                // The next pass's first window, into the place of this pass's first, which its
+                // second is attended past.
+                let mut follow =
+                    |device: &mut Device,
+                     at: usize,
+                     landing: &mut Place<Rows, KvHeads, Groups, Head, Source, N>| {
+                        let within = (rest + 1 - at).min(1);
+                        for _ in 0..within + (1 - within) * ((count - tile) / 2).min(1) {
+                            let pass = Pass::of(first + tile + 1 - within, live);
+                            lands(device, (within * at, pass), landing);
+                        }
+                    };
+                let places = (&mut even, &mut odd, &mut nothing);
+                let steps = (&mut land, &prepares, &mut attend);
+                let merged = if const { Self::follows::<Rows, N>() } {
+                    <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::overlapped::<
+                        _,
+                        _,
+                        _,
+                        Rest<Windows>,
+                        true,
+                    >(device, rest, places, steps, (boundary, &mut follow))
+                } else {
+                    <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::overlapped::<
+                        _,
+                        _,
+                        _,
+                        Rest<Windows>,
+                        false,
+                    >(device, rest, places, steps, (boundary, &mut follow))
+                };
+                stores(device, merged, pass);
+            }
+        } else if const { Self::overlaps::<Rows>(N) } {
             let (mut even, mut odd) = (
                 Place::<Rows, KvHeads, Groups, Head, Source, N>::new(),
                 Landing::new(),
@@ -1528,6 +1686,33 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
             }
         }
     }
+}
+
+/// The codes of `cells`' half `half` (0 the keys, 1 the values) widened to BF16 into the same half
+/// of `place`, exactly, in one pass without the vector stage: the cells as attention reads them.
+fn widen<'c, Rows: AxisName, KvHeads: AxisName, Head: AxisName, Count: M>(
+    device: &mut Device,
+    cells: &'c InDm<Rows, KvHeads, Head, Count, f8e4m3>,
+    place: &'c mut InDm<Rows, KvHeads, Head, Count>,
+    half: usize,
+) -> ChunkView<'c, Rows, KvHeads, Head, Count> {
+    type Time<Count, KvHeads, Head, const N: usize> =
+        m![{ Count }, { ShardKeys<KvHeads> }, Head / { N }];
+    // SAFETY: as in `chunk`.
+    let widened: ChunkViewMut<'_, Rows, KvHeads, Head, Count> =
+        unsafe { place.view_mut().reshape() };
+    device
+        .main
+        .begin(chunk(cells).tile::<m![KeyValue], 1, Half<Count, KvHeads, Head>>(half))
+        .fetch::<Time<Count, KvHeads, Head, 16>, m![Head % 16]>()
+        .fetch_cast::<f32>()
+        .collect::<Time<Count, KvHeads, Head, 8>, m![Head % 8]>()
+        .cast::<bf16, m![Head % 8 # 16]>()
+        .commit_trim::<m![Head % 8]>()
+        .commit_view(widened.tile::<m![KeyValue], 1, m![
+            { Count }, KeyValue = 1 #{!} 2, { ShardKeys<KvHeads> }, Head
+        ]>(half));
+    chunk(place)
 }
 
 /// The values of every row group of `chunk`, each a `D`, transposed into `values`, as

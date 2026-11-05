@@ -23,6 +23,10 @@ pub(crate) const TRF: usize = 65_536;
 /// Bytes of the data memory a slice holds.
 pub(crate) const DM: usize = 524_288;
 
+/// FP32 cells of a slice's contraction accumulators: a reduction in time keeps every output it has
+/// not finished in them.
+pub(crate) const ACCUMULATOR: usize = 1024;
+
 /// Bytes of the HBM access a transfer's packets stream at full rate in: a run that is a whole
 /// number of them lands in them, any other run in packets that each cost an access more.
 pub(crate) const PACKET: usize = 256;
