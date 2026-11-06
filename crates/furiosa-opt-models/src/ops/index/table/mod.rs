@@ -201,10 +201,26 @@ impl<R: AxisName> AxisName for Segment<R> {
 
 axes![Quad = 4];
 
+/// The lane groups of eight rows that an `R`-row step fills, an axis apart from its rows.
+#[derive(Clone, Debug)]
+pub struct RowGroup<R>(PhantomData<R>);
+
+impl<R: AxisName> AxisName for RowGroup<R> {
+    const NAME: Ident = Ident::new("RowGroup");
+    const SIZE: usize = {
+        assert!(R::SIZE.is_multiple_of(RowLane::SIZE));
+        R::SIZE / RowLane::SIZE
+    };
+}
+
+axes![RowLane = 8, PacketLane = 8];
+
 /// One value per row and segment, a value a flit.
 pub type Grid<R> = m![R, { Symbol<Segment<R>> }, 1 # 8];
 /// Four lanes a row, a row a flit.
 pub type Pairs<R> = m![R, Quad # 8];
+/// Each row's lane of its group's packet, a row a flit: one in that lane, zero in the others.
+pub type Places<R> = m![{ Symbol<RowGroup<R>> }, RowLane, PacketLane];
 
 /// The segment words: first row, rows, cached tokens, first block ID and block IDs.
 pub(crate) const START: usize = 0;
