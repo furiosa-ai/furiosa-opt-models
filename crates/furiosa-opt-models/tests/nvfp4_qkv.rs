@@ -370,7 +370,8 @@ async fn resident_q_and_kv_match_scalar_w4a16() {
         .unwrap();
     // Distinct row values detect reuse of the first operand in a prefetched tail.
     for rows in [
-        17, 32, 33, 129, 256, 257, 264, 265, 288, 289, 320, 321, 383, 384, 385, 511, 512,
+        1, 4, 7, 8, 9, 15, 16, 17, 24, 32, 33, 129, 200, 256, 257, 264, 265, 288, 289, 320, 321,
+        383, 384, 385, 511, 512,
     ] {
         let input = HostTensor::<bf16, m![Rows, Hidden]>::from_vec(
             (0..Rows::SIZE * Hidden::SIZE).map(|i| {

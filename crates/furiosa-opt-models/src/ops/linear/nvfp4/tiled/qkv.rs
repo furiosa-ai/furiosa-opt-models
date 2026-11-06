@@ -1,7 +1,7 @@
 //! Qwen-style input partitioning with BF16 operands: four output groups and
 //! 64 input slices per cluster. Paired waves fill a 32-KiB TRF operand, with
 //! the next pair or final single wave prefetched into a separate TRF half.
-//! Direct launches use a 32-row tile; larger launches restore BF16 weights once.
+//! Direct launches use 16/32-row tiles; larger launches restore BF16 weights once.
 use super::prefetch::{Points, Stage};
 use super::{Scales, block};
 use crate::ops::normalization::span::Owned;
@@ -239,24 +239,23 @@ fn project<H: AxisName, O: AxisName, R: AxisName, const W: usize>(
         .fetch_cast::<f32>()
         .collect::<m![O % (O / 8) / 2], m![O % 2, H % 64 / 16]>()
         .to_vrf();
-    device
+    let products = device
         .main
         .begin(weight.packed.0.view())
-        // Four row groups reuse each weight block and fill the eight FP32
-        // reduction accumulators. Direct launches use exactly one 32-row tile.
-        // Each single tile computes all 32 rows; the consumer limits valid rows.
-        .fetch::<m![O % (O / 8), R % { W } / 32], m![H % 64]>()
+        // Two or four row groups reuse each weight block. Static
+        // 16/32-row geometry uses four or eight reduction slots.
+        .fetch::<m![O % (O / 8)], m![H % 64]>()
         .fetch_table_lookup::<bf16>()
-        .collect::<m![O % (O / 8), R % { W } / 32, H % 64 / 16], m![H % 16]>()
-        .contract_outer::<m![O % (O / 8), R % { W } / 32, H % 64 / 16, R % 32 / 8], m![H % 16], _, _, _>(input)
+        .collect::<m![O % (O / 8), H % 64 / 16], m![H % 16]>()
+        .contract_outer::<m![O % (O / 8), H % 64 / 16, R % { W } / 8], m![H % 16], _, _, _>(input)
         .contract_packet::<m![1]>()
-        .contract_time::<m![O % (O / 8), R % { W } / 32, H % 64 / 16, R % 32 / 8]>()
-        .contract_lane::<m![O % (O / 8), R % { W } / 32, H % 64 / 16, R % 32 / 8], m![R % 8]>(
+        .contract_time::<m![O % (O / 8), H % 64 / 16, R % { W } / 8]>()
+        .contract_lane::<m![O % (O / 8), H % 64 / 16, R % { W } / 8], m![R % 8]>(
             LaneMode::Interleaved,
         )
         .vector_init()
         .vector_intra_slice_tag(TagMode::Zero)
-        .vector_narrow_split::<m![O % (O / 8), R % { W } / 32, H % 64 / 16, R % 32 / 8, R % 8 / 4], m![R % 4]>()
+        .vector_narrow_split::<m![O % (O / 8), H % 64 / 16, R % { W } / 8, R % 8 / 4], m![R % 4]>()
         .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &scales)
         .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), &factor)
         .vector_intra_slice_reduce::<H, m![O % (O / 8), R % { W } / 8, R % 8 / 4], m![R % 4]>(
@@ -267,7 +266,8 @@ fn project<H: AxisName, O: AxisName, R: AxisName, const W: usize>(
             InterSliceReduceOpF32::Add,
         )
         .vector_final()
-        .cast::<bf16, m![R % 8 # 16]>()
+        .cast::<bf16, m![R % 8 # 16]>();
+    products
         .transpose::<m![O % ({LocalWidth<O, R, W>}) / 4, R % 8], m![O % 4 # 16]>()
         .commit_trim::<m![O % 4]>()
         .commit()
@@ -311,6 +311,7 @@ fn project_restored<H: AxisName, O: AxisName, R: AxisName, const W: usize>(
     output
 }
 
+type DirectTiles<R, const W: usize> = m![R % 128 / { W }];
 type WaveCount<R, const W: usize> = m![R % { W } / 128];
 
 fn land<O: AxisName, R: AxisName, const W: usize, const HALF: usize>(
@@ -450,9 +451,9 @@ pub(crate) fn consume<H: AxisName, Q: AxisName, K: AxisName, R: AxisName, F>(
     }
 }
 
-// The summed reduction cannot lower a runtime row prefix on this compiler.
-// A direct launch computes one complete 32-row tile. Input transfers still use
-// live prefixes, and downstream RoPE/cache writes consume only live rows.
+// Static 16/32-row direct contractions avoid runtime summed-reduction
+// prefixes. The consumer writes the 128-row scratch allocation; only live rows
+// are valid, and attention masks/zeros its padded key/value positions.
 fn single<H: AxisName, Q: AxisName, K: AxisName, R: AxisName, F>(
     device: &mut Device,
     projections: (
@@ -469,19 +470,33 @@ fn single<H: AxisName, Q: AxisName, K: AxisName, R: AxisName, F>(
     F: FnMut(&mut Device, WaveOutput<Q, R>, WaveOutput<K, R>, WaveOutput<K, R>, usize),
 {
     let mut output = (WaveOutput::new(), WaveOutput::new(), WaveOutput::new());
-    single_tile::<H, Q, K, R, 0>(
-        device,
-        projections,
-        weights,
-        stored,
-        wave,
-        live,
-        &mut output,
-    );
+    // W=16 leaves four BF16 KV columns per slice, the minimum contiguous
+    // output packet for the current transpose/commit layout.
+    if live <= 16 {
+        single_tile::<H, Q, K, R, 16>(
+            device,
+            projections,
+            weights,
+            stored,
+            wave,
+            live,
+            &mut output,
+        );
+    } else {
+        single_tile::<H, Q, K, R, 32>(
+            device,
+            projections,
+            weights,
+            stored,
+            wave,
+            live,
+            &mut output,
+        );
+    }
     consume(device, output.0, output.1, output.2, wave);
 }
 
-fn single_tile<H: AxisName, Q: AxisName, K: AxisName, R: AxisName, const QUARTER: usize>(
+fn single_tile<H: AxisName, Q: AxisName, K: AxisName, R: AxisName, const W: usize>(
     device: &mut Device,
     projections: (
         &QkvProjection<H, Q>,
@@ -494,39 +509,35 @@ fn single_tile<H: AxisName, Q: AxisName, K: AxisName, R: AxisName, const QUARTER
     live: usize,
     output: &mut (WaveOutput<Q, R>, WaveOutput<K, R>, WaveOutput<K, R>),
 ) {
-    let live = (live - QUARTER * 32).min(32);
-    let tile = wave * 4 + QUARTER;
+    let tile = wave * (128 / W);
     let input = if live <= 8 {
-        load_rows::<H, R, 8, 32>(device, stored, tile)
-    } else if live <= 16 {
-        load_rows::<H, R, 16, 32>(device, stored, tile)
+        load_rows::<H, R, 8, W>(device, stored, tile)
     } else {
-        load_rows::<H, R, 32, 32>(device, stored, tile)
+        load_rows::<H, R, W, W>(device, stored, tile)
     };
-    let groups = live.div_ceil(8);
-    let lanes = fill(device, &input, groups);
+    let lanes = fill(device, &input, live.div_ceil(8));
     let q = project(device, projections.0, weights.0, &lanes);
     let k = project(device, projections.1, weights.1, &lanes);
     let v = project(device, projections.2, weights.2, &lanes);
-    land_tile::<Q, R, QUARTER>(device, &q, &mut output.0);
-    land_tile::<K, R, QUARTER>(device, &k, &mut output.1);
-    land_tile::<K, R, QUARTER>(device, &v, &mut output.2);
+    land_tile::<Q, R, W>(device, &q, &mut output.0);
+    land_tile::<K, R, W>(device, &k, &mut output.1);
+    land_tile::<K, R, W>(device, &v, &mut output.2);
 }
 
-fn land_tile<O: AxisName, R: AxisName, const QUARTER: usize>(
+fn land_tile<O: AxisName, R: AxisName, const W: usize>(
     device: &mut Device,
-    values: &Values<O, R, 32>,
+    values: &Values<O, R, W>,
     output: &mut WaveOutput<O, R>,
 ) {
     // SAFETY: rename the same eight output owners without moving data.
     let values = unsafe {
         values.view().reshape::<Chip, Cluster<O>,
-            m![O % (O / 2) / (O / 8), R % 32 / 8, O % (O / 8) / ({LocalWidth<O, R, 32>})],
-            m![R % 8, O % ({LocalWidth<O, R, 32>})]>()
+            m![O % (O / 2) / (O / 8), R % {W} / 8, O % (O / 8) / ({LocalWidth<O, R, W>})],
+            m![R % 8, O % ({LocalWidth<O, R, W>})]>()
     };
     values.to_dm_view(&mut device.tdma,
-        output.view_mut().slice_tile::<m![R % 128 / 32], 1,
-            m![O % (O / 2) / 128 # 16, R % 128 / 32 = 1 #{!} 4, R % 32 / 8]>(QUARTER));
+        output.view_mut().slice_tile::<m![R % 128 / {W}], 1,
+            m![O % (O / 2) / 128 # 16, R % 128 / {W} = 1 #{!} ({DirectTiles<R, W>}), R % {W} / 8]>(0));
 }
 
 fn prepare_rows<H: AxisName, R: AxisName, const W: usize>(

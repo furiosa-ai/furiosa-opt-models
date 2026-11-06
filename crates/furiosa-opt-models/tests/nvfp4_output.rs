@@ -53,7 +53,8 @@ async fn streams_output_in_eight_and_32_row_passes() {
         .unwrap()
         .into_vec();
     for rows in [
-        1, 4, 8, 9, 16, 17, 31, 32, 33, 127, 128, 129, 255, 256, 257, 511, 512,
+        1, 4, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 63, 64, 65, 95, 96, 97, 127, 128, 129, 159, 160,
+        161, 200, 255, 256, 257, 497, 511, 512,
     ] {
         let mut padded = original.clone();
         padded[rows * Hidden::SIZE..].fill(bf16::from_f32(f32::NAN));
@@ -221,7 +222,7 @@ async fn streams_output_in_eight_and_32_row_passes() {
         .await
         .unwrap();
     // Check both sides of the direct/restored boundary and retain the full launch.
-    for rows in [32, 33, Rows::SIZE] {
+    for rows in [8, 9, 16, 17, 32, 33, 65, 129, 200, 257, Rows::SIZE] {
         let count = count(&mut device, rows).await;
         let result = launch(project_output, (&mut device, &projection, &count, &input))
             .await

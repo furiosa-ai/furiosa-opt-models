@@ -39,6 +39,7 @@ type WeightOperand<I, O> =
 type BlockScales<I, O> = VrfTensor<f32, Chip, Cluster<I>, Slices<I, O>, m![O % 256, I % 128 / 16]>;
 type Partial<I, O, R, const P: usize> =
     DmTensor<f32, Chip, Cluster<I>, Reduced<O>, m![R % { P }, O % 16]>;
+type OwnerRows<R, const P: usize> = m![R % { P } / 4];
 type Factor<I, O> = VrfTensor<f32, Chip, Selected<I>, Reduced<O>, m![1 # 8]>;
 axes![Term = 2];
 type Rows<R, W> = HbmTensor<bf16, Chip, m![R, W]>;
@@ -156,8 +157,9 @@ impl<I: AxisName, O: AxisName> Output<I, O> {
         next
     }
 
-    // Four 32-row owners share BF16 input blocks, broadcast over the switch.
-    fn compact_pass<R: AxisName, All: AxisName, N: Points<Device>>(
+    // Four row owners share BF16 input blocks: 128 rows for full waves,
+    // 32 rows for tails. Weight TRF and the output factor are reused.
+    fn compact_pass<R: AxisName, All: AxisName, const P: usize, N: Points<Device>>(
         &self,
         device: &mut Device,
         weight: &WeightOperand<I, O>,
@@ -170,33 +172,33 @@ impl<I: AxisName, O: AxisName> Output<I, O> {
     ) -> N::Next {
         let window = input
             .view()
-            .tile::<m![All], 128, m![All = 128 # All, I]>(start + wave * 128);
+            .tile::<m![All], P, m![All = {P} # All, I]>(start + wave * P);
         // SAFETY: rename the selected row window while retaining its source stride.
-        let window = unsafe { window.reshape::<Chip, m![R % 128 # All, I]>() };
+        let window = unsafe { window.reshape::<Chip, m![R % {P} # All, I]>() };
         let input: DmTensor<
             bf16,
             Chip,
             Cluster<I>,
-            m![O / 1024, R % 128 / 32, I % (I / 2) / 128],
-            m![R % 32, I % 128],
+            m![O / 1024, R % { P } / ({OwnerRows<R, P>}), I % (I / 2) / 128],
+            m![R % ({OwnerRows<R, P>}), I % 128],
         > = window.to_dm(&mut device.tdma);
-        let partial: Partial<I, O, R, 128> = device
+        let partial: Partial<I, O, R, P> = device
             .main.begin(input.view())
-            .fetch::<m![R % 32, I % 128 / 32], m![I % 32]>()
-            .switch::<Slices<I, O>, m![R % 32, I % 128 / 32, R % 128 / 32]>(
+            .fetch::<m![R % ({OwnerRows<R, P>}), I % 128 / 32], m![I % 32]>()
+            .switch::<Slices<I, O>, m![R % ({OwnerRows<R, P>}), I % 128 / 32, R % {P} / ({OwnerRows<R, P>})]>(
                 SwitchConfig::Broadcast1 { slice1: 4, slice0: 16 })
-            .collect::<m![R % 32, I % 128 / 32, R % 128 / 32, I % 32 / 16], m![I % 16]>()
-            .contract_outer::<m![R % 32, I % 128 / 32, R % 128 / 32, O % 256 / 8], m![I % 32], _, _, _>(weight)
+            .collect::<m![R % ({OwnerRows<R, P>}), I % 128 / 32, R % {P} / ({OwnerRows<R, P>}), I % 32 / 16], m![I % 16]>()
+            .contract_outer::<m![R % ({OwnerRows<R, P>}), I % 128 / 32, R % {P} / ({OwnerRows<R, P>}), O % 256 / 8], m![I % 32], _, _, _>(weight)
             .contract_packet::<m![1]>()
-            .contract_time::<m![R % 32, R % 128 / 32, O % 256 / 8]>()
-            .contract_lane::<m![R % 32, R % 128 / 32, O % 256 / 8], m![O % 8]>(LaneMode::Interleaved)
+            .contract_time::<m![R % ({OwnerRows<R, P>}), R % {P} / ({OwnerRows<R, P>}), O % 256 / 8]>()
+            .contract_lane::<m![R % ({OwnerRows<R, P>}), R % {P} / ({OwnerRows<R, P>}), O % 256 / 8], m![O % 8]>(LaneMode::Interleaved)
             .vector_init()
-            .vector_inter_slice_reduce::<Reduced<O>, m![R % 32, R % 128 / 32, O % 16 / 8]>(InterSliceReduceOpF32::Add)
+            .vector_inter_slice_reduce::<Reduced<O>, m![R % ({OwnerRows<R, P>}), R % {P} / ({OwnerRows<R, P>}), O % 16 / 8]>(InterSliceReduceOpF32::Add)
             .vector_final()
             .commit_trim::<m![O % 8]>()
             .commit();
         let next = next.at(device);
-        Self::handoff::<R, 128>(device, &partial, factor, output, wave);
+        Self::handoff::<R, P>(device, &partial, factor, output, wave);
         next
     }
 }
@@ -302,10 +304,12 @@ impl<I: AxisName, O: AxisName> Output<I, O> {
             assert!(I::SIZE == 4096 && O::SIZE == 4096 && R::SIZE == 512);
         }
         let mut output = Owned::new();
-        // Small launches need one live 8/32-row pass. Its tensor factor loads
+        // Small launches need one live 8/16/32-row pass. Its tensor factor loads
         // after the first contraction and the following-operand prefetch hook.
         let next = if live.rows() <= 8 {
             self.pass::<R, All, 8, _>(device, weight, input, &mut output, 0, start, next)
+        } else if live.rows() <= 16 {
+            self.pass::<R, All, 16, _>(device, weight, input, &mut output, 0, start, next)
         } else if live.rows() <= 32 {
             self.pass::<R, All, 32, _>(device, weight, input, &mut output, 0, start, next)
         } else {
@@ -319,25 +323,57 @@ impl<I: AxisName, O: AxisName> Output<I, O> {
                 .collect::<m![O % 8, O % 256 / 8, I % 128 / 16], m![I % 16]>()
                 .to_trf();
             let factor = block::scalar::<Selected<I>, Reduced<O>>(device, &self.scales.output);
-            let next = self.compact_pass(
-                device,
-                &resident,
-                &factor,
-                input,
-                &mut output,
-                0,
-                start,
-                next,
-            );
-            for following in 0..3 {
-                if following + 1 < live.rows().div_ceil(128) {
-                    self.compact_pass(
+            // Round coverage to 32 rows, then pack four such groups into a
+            // 128-row pass, matching Qwen's granularity without extra launches.
+            let groups = live.rows().div_ceil(32);
+            let full = groups / 4;
+            let next = if full > 0 {
+                self.compact_pass::<R, All, 128, _>(
+                    device,
+                    &resident,
+                    &factor,
+                    input,
+                    &mut output,
+                    0,
+                    start,
+                    next,
+                )
+            } else {
+                self.compact_pass::<R, All, 32, _>(
+                    device,
+                    &resident,
+                    &factor,
+                    input,
+                    &mut output,
+                    0,
+                    start,
+                    next,
+                )
+            };
+            // Full ranges from zero to four; this is max(full - 1, 0),
+            // with a zero-based loop for the device compiler.
+            for wave in 0..3 * full / 4 {
+                self.compact_pass::<R, All, 128, _>(
+                    device,
+                    &resident,
+                    &factor,
+                    input,
+                    &mut output,
+                    wave + 1,
+                    start,
+                    (),
+                );
+            }
+            for tail in 0..groups % 4 {
+                // The first 32-row pass already ran when there was no full wave.
+                if full > 0 || tail > 0 {
+                    self.compact_pass::<R, All, 32, _>(
                         device,
                         &resident,
                         &factor,
                         input,
                         &mut output,
-                        following + 1,
+                        full * 4 + tail,
                         start,
                         (),
                     );
