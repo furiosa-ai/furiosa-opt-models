@@ -237,11 +237,13 @@ trait Cut<A: decoder::Attention, C, T> {
     /// What its attention hands its end beside the attended place: its output projection as its
     /// form lands it at the attention's boundary, and the attended rows if the end reads them there.
     type Landed;
-    /// What its start lands for its end, held across its attention: a place the decoder makes once
-    /// for every layer, as a layer's start runs after the end of the layer before it.
+    /// What it lands ahead for its end, held across its attention: a place the decoder makes once
+    /// for every layer, as a layer lands it after the end of the layer before it.
     type Ahead: Default = ();
     /// A tile between its MLP's two steps.
     type Staged;
+    /// A tile between its MLP's second step and the MLP residual.
+    type Updated;
 
     /// The rows of `tile` from `home`.
     fn fill(
@@ -262,9 +264,13 @@ trait Cut<A: decoder::Attention, C, T> {
     /// Its front landed for the rows of `tile`.
     fn front(&self, device: &mut Device, tile: Live<(), Self::Envelope>) -> Self::Front;
 
+    /// What its end reads landed into `ahead`, behind the transfer that hands the layer before it
+    /// its MLP's output, so that layer's residual and this one's input norm run under it.
+    fn ahead(&self, _: &mut Device, _: &mut Self::Ahead) {}
+
     /// A tile's input `rows` through it up to its attention's store, its `front` landed: the input
     /// norm, then the tile's queries, keys and values, head-normed, rotated and stored in
-    /// `stored`, and what its end reads landed in `ahead`; the rows, for the residual.
+    /// `stored`, beside what it landed `ahead`; the rows, for the residual.
     fn start(
         &self,
         device: &mut Device,
@@ -298,11 +304,15 @@ trait Cut<A: decoder::Attention, C, T> {
         adapters: &mut T,
     ) -> Self::Staged;
 
-    /// A `staged` tile through its MLP's second step and the MLP residual; the rows.
-    fn update(
+    /// A `staged` tile through its MLP's second step, up to the transfer that hands it the MLP's
+    /// output.
+    fn update(&self, device: &mut Device, staged: Self::Staged, adapters: &mut T) -> Self::Updated;
+
+    /// An `updated` tile through the MLP residual; the rows.
+    fn finish(
         &self,
         device: &mut Device,
-        staged: Self::Staged,
+        updated: Self::Updated,
         adapters: &mut T,
     ) -> Live<Self::Rows, Self::Envelope>;
 }
@@ -352,8 +362,9 @@ struct Front<G, Q, QN, KN> {
     key_norm: KN,
 }
 
-/// A tile between its MLP's two steps: the down projection's inputs `R` landed, and the rows of the
-/// attention residual, which the MLP residual adds to.
+/// A tile between two of its MLP's steps: what the next step reads, `R` (the down projection's
+/// inputs landed, or the MLP's output), and the rows of the attention residual, which the MLP
+/// residual adds to.
 struct Staged<R, X> {
     ready: R,
     attended: X,
@@ -510,6 +521,7 @@ where
     type Front = Front<<Stage as crate::Op<&'static Norm<Z>>>::Output, QB, QNB, KNB>;
     type Landed = OL;
     type Staged = Staged<DR, RowTile<Z>>;
+    type Updated = Staged<RowTile<Z>, RowTile<Z>>;
 
     fn fill(
         &self,
@@ -717,13 +729,22 @@ where
         Staged { ready, attended }
     }
 
-    fn update(&self, device: &mut Device, staged: Self::Staged, adapters: &mut T) -> RowTile<Z> {
-        let Sequential(_, Residual(_, mlp, sum)) = self;
+    fn update(&self, device: &mut Device, staged: Self::Staged, adapters: &mut T) -> Self::Updated {
+        let Sequential(_, Residual(_, mlp, _)) = self;
         let (_, down) = mlp.0.parts();
         let Staged { ready, attended } = staged;
         let tile = attended.with(());
         let fed = tile.with(down.forward(&mut *device, (), adapters.down(), tile.with(ready)));
-        sum.forward(device, (), &mut (), (&attended, &fed))
+        Staged {
+            ready: fed,
+            attended,
+        }
+    }
+
+    fn finish(&self, device: &mut Device, updated: Self::Updated, _: &mut T) -> RowTile<Z> {
+        let Sequential(_, Residual(_, _, sum)) = self;
+        let Staged { ready, attended } = updated;
+        sum.forward(device, (), &mut (), (&attended, &ready))
     }
 }
 
@@ -798,15 +819,16 @@ where
         let Self(home, layer) = *self;
         let front = layer.front(device, tile);
         let rows = tile.with(layer.fill(&mut *device, home, tile));
+        layer.ahead(&mut *device, &mut *state.1);
         layer.start(device, call, front, rows, state)
     }
 }
 
 /// A tile through a layer from its attention and the next layer up to its attention's store, each
 /// layer's leaves running with its own slots and reading its own call, the place `ahead` holding
-/// what the layer's start landed for its end until the next layer's start lands its own; the next
-/// layer's input rows. The layers may attend in different groups; the next layer's front lands
-/// while this one's MLP projects.
+/// what the layer landed for its end until the next layer lands its own; the next layer's input
+/// rows. The layers may attend in different groups; the next layer's front lands while this one's
+/// MLP projects, what it lands ahead behind this one's MLP output.
 impl<'l, 'p, 's, A, B, C, D, X, T, U, K, P, Q, E, RA, RB, L>
     Module<
         (Output<'p, A, RA, E, L>, Live<X, E>),
@@ -839,7 +861,9 @@ where
         let tile = input.with(());
         let staged = layer.end(device, (output, &*ahead), input, adapters);
         let front = next.front(device, tile);
-        let rows = layer.update(device, staged, adapters);
+        let updated = layer.update(device, staged, adapters);
+        next.ahead(&mut *device, &mut *ahead);
+        let rows = layer.finish(device, updated, adapters);
         next.start(device, call, front, rows, (stored, ahead, following))
     }
 }
@@ -867,7 +891,8 @@ where
     ) -> Self::Output {
         let Self(layer, norm) = *self;
         let staged = layer.end(device, (output, ahead), input, adapters);
-        let rows = layer.update(device, staged, adapters);
+        let updated = layer.update(device, staged, adapters);
+        let rows = layer.finish(device, updated, adapters);
         norm.forward(device, (), &mut (), &rows)
     }
 }

@@ -2,18 +2,22 @@
 //! take them: each tile of the envelope's rows in the feature slices, the heads as attention reads
 //! them, the history in pages of the layer's cache.
 //!
-//! - Its front lands the query, key and value projections' weights; its start runs the input norm
-//!   and the positioned query/key/value stage over them, and stores the heads.
+//! - Its front lands the input norm's gain and the query, key and value projections' weights; its
+//!   start runs the input norm and the positioned query/key/value stage over them, and stores the
+//!   heads.
 //! - Its end runs the output projection, the post-attention norm, the attention residual, the
 //!   pre-feed-forward norm and the feed-forward up to the down projection begun with its input,
-//!   whose landing it issues; its update the down projection, the post-feed-forward norm, the
-//!   feed-forward residual and the layer's tail, whose factor it lands first. The next layer's
-//!   front lands between them, behind the down projection's input and under its passes.
+//!   whose landing it issues; its update the down projection, behind the layer's tail's factor,
+//!   and the post-feed-forward norm's gain behind its output; its finish that norm, the
+//!   feed-forward residual and the tail. The next layer's front lands between its end and its
+//!   update, behind the down projection's input and under its passes, and what the next layer
+//!   lands ahead between its update and its finish, behind the down projection's output.
 //! - Its feed-forward's projections land their weights ahead, under work that issues no transfer:
-//!   the gate projection's codes in its start, behind the input norm's gain and before the
-//!   queries are handed on, into the place the decoder holds across its attention for its end,
-//!   and its scales under the post-attention and pre-feed-forward norms, whose gains land first;
-//!   the up projection's under those norms and the gate's passes; the down projection's under the activation and the up projection's
+//!   the gate projection's codes ahead of its start, behind the down projection's output of the
+//!   layer before it and under that layer's finish and its own input norm, into the place the
+//!   decoder holds across its attention for its end, and its scales under the post-attention and
+//!   pre-feed-forward norms, whose gains land first; the up projection's under those norms and
+//!   the gate's passes; the down projection's under the activation and the up projection's
 //!   passes; its output projection's inside its attention, after the attention's first window
 //!   lands or before its last is prepared. Its leaves hold nothing in a call, so it takes `()`.
 //! - Its tile is its envelope, so its attention hands its end the attended heads where they are,
@@ -272,10 +276,11 @@ where
     type Tile = R;
     type Reach = R;
     type Home = HbmTensor<bf16, Chip, RowMajor<Hidden, R>>;
-    type Front = (QL, KL, VL);
+    type Front = (NB, (QL, KL, VL));
     type Landed = (OL, Live<AttendedHeads<A, R>, R>);
     type Ahead = GL;
     type Staged = Staged<DR, Live<Self::Rows, R>>;
+    type Updated = Staged<(Live<Self::Rows, R>, NB, TB), Live<Self::Rows, R>>;
 
     fn fill(&self, device: &mut Device, home: &Self::Home, tile: Live<(), R>) -> Self::Rows {
         type Feature<W> = Symbol<normalization::Chunk<W>>;
@@ -304,7 +309,7 @@ where
     }
 
     fn front(&self, device: &mut Device, _: Live<(), R>) -> Self::Front {
-        let Then(Sequential(Residual(_, Then(attention, _), _), _), _) = self;
+        let Then(Sequential(Residual(norm, Then(attention, _), _), _), _) = self;
         let Positioned { projection, .. } = &attention.0.qkv;
         let Projection {
             query,
@@ -312,25 +317,30 @@ where
             value: Then(value, _),
         } = &projection.projection;
         (
-            query.forward(&mut *device, (), &mut (), Begin(())),
-            key.forward(&mut *device, (), &mut (), Begin(())),
-            value.forward(device, (), &mut (), Begin(())),
+            norm.forward(&mut *device, (), &mut (), Begin(())),
+            (
+                query.forward(&mut *device, (), &mut (), Begin(())),
+                key.forward(&mut *device, (), &mut (), Begin(())),
+                value.forward(device, (), &mut (), Begin(())),
+            ),
         )
+    }
+
+    fn ahead(&self, device: &mut Device, gate_landed: &mut GL) {
+        let Then(Sequential(_, Residual(_, Then(mlp, _), _)), _) = self;
+        let Sum(Fork((Then(gate, _), _)), _) = &mlp.0;
+        gate.forward(device, (), &mut (), gate_landed);
     }
 
     fn start(
         &self,
         device: &mut Device,
         call: &'c Context<P, R, Windows, Past>,
-        (query, key, value): Self::Front,
+        (gain, (query, key, value)): Self::Front,
         rows: Live<Self::Rows, R>,
-        (stored, gate_landed, _): (&mut Stored<A, R>, &mut GL, &mut ()),
+        (stored, _, _): (&mut Stored<A, R>, &mut GL, &mut ()),
     ) -> Live<Self::Rows, R> {
-        let Then(
-            Sequential(Residual(norm, Then(attention, _), _), Residual(_, Then(mlp, _), _)),
-            _,
-        ) = self;
-        let Sum(Fork((Then(gate, _), _)), _) = &mlp.0;
+        let Then(Sequential(Residual(_, Then(attention, _), _), _), _) = self;
         let Positioned {
             projection:
                 NormalizedQkv {
@@ -340,13 +350,8 @@ where
                 },
             positions,
         } = &attention.0.qkv;
-        let normalized = norm.forward(&mut *device, (), &mut (), &rows);
-        // The cache's scales land for the attention ahead of the gate's codes, whose transfers
-        // take far longer.
+        let normalized = gain.forward(&mut *device, (), &mut (), &rows);
         (attention.0.cache.write).forward(&mut *device, (), &mut (), &mut stored.scales);
-        // The gate's codes land for the end behind the norm's gain, where the transfers idle until
-        // the query projection hands its rows on; its scales land in the end.
-        gate.forward(&mut *device, (), &mut (), gate_landed);
         let input = &normalized;
         // The query projection keeps the rows it staged for the key and value projections: every
         // row group live, in the tensor registers; else what its form stages for the live groups.
@@ -465,12 +470,29 @@ where
         device: &mut Device,
         Staged { ready, attended }: Self::Staged,
         _: &mut (),
-    ) -> Live<Self::Rows, R> {
-        let Then(Sequential(_, Residual(_, Then(mlp, post), add)), tail) = self;
+    ) -> Self::Updated {
+        let Then(Sequential(_, Residual(_, Then(mlp, post), _)), tail) = self;
         let Sum(_, Then(_, down)) = &mlp.0;
         let tail = tail.forward(&mut *device, (), &mut (), Begin(PhantomData::<Self::Rows>));
         let ready = down.forward(&mut *device, (), &mut (), ready);
-        let branch = post.forward(&mut *device, (), &mut (), &ready);
+        let gain = post.forward(&mut *device, (), &mut (), Begin(()));
+        Staged {
+            ready: (ready, gain, tail),
+            attended,
+        }
+    }
+
+    fn finish(
+        &self,
+        device: &mut Device,
+        Staged {
+            ready: (ready, gain, tail),
+            attended,
+        }: Self::Updated,
+        _: &mut (),
+    ) -> Live<Self::Rows, R> {
+        let Then(Sequential(_, Residual(_, _, add)), _) = self;
+        let branch = gain.forward(&mut *device, (), &mut (), &ready);
         let rows = add.forward(&mut *device, (), &mut (), (&attended, &branch));
         tail.forward(device, (), &mut (), &rows)
     }
