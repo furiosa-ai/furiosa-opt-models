@@ -203,6 +203,32 @@ impl<Hidden: AxisName, Intermediate: AxisName> Op<Begin<usize>>
     }
 }
 
+/// The down projection begun before any product arrives: the place its first weight panel lands
+/// in, which it does when the place is given back, e.g. at an attention's boundary.
+impl<Hidden: AxisName, Intermediate: AxisName> Op<Begin<Begin<()>>>
+    for DownWeights<Hidden, Intermediate>
+{
+    type Output = Down<Hidden, Intermediate>;
+
+    fn forward(&self, _: &mut Device, _: Begin<Begin<()>>) -> Self::Output {
+        Down::new()
+    }
+}
+
+/// The first down weight panel written into its place.
+impl<Hidden: AxisName, Intermediate: AxisName> Op<&mut Down<Hidden, Intermediate>>
+    for DownWeights<Hidden, Intermediate>
+{
+    type Output = ();
+
+    fn forward(&self, context: &mut Device, down: &mut Down<Hidden, Intermediate>) {
+        self.0
+            .view()
+            .tile::<m![{ Out<Intermediate> } / 64], 1, StoredPanel<Hidden, Intermediate>>(0)
+            .to_dm_view(&mut context.tdma, down.view_mut());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
