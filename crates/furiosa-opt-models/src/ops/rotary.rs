@@ -329,31 +329,37 @@ impl<Head: AxisName> Rotation<Head> {
 }
 
 type Scalars<Rows, Rotated, Chips = Chip> = HbmTensor<f32, Chips, m![Rows, Rotated]>;
-type Parameters<Rotated, Chips = Chip> = HbmTensor<f32, Chips, m![Rotated]>;
 
+/// A row's rotated coordinates on the row's slice, so a row lands and stores as one run.
 type Angles<Rows, Rotated, Chips = Chip> =
-    DmTensor<f32, Chips, Cluster, m![Rotated / 8 # 256], m![Rows, Rotated % 8]>;
+    DmTensor<f32, Chips, Cluster, m![Rows # 256], m![Rotated]>;
 
-type Constants<Rotated, Chips = Chip> =
-    VrfTensor<f32, Chips, Cluster, m![Rotated / 8 # 256], m![Rotated % 8]>;
+type Constants<Rows, Rotated, Chips = Chip> =
+    VrfTensor<f32, Chips, Cluster, m![Rows # 256], m![Rotated / 8, Rotated % 8]>;
 
 type CoefficientRows<Rows, Rotated, Chips = Chip> = HbmTensor<bf16, Chips, m![Rows, Rotated]>;
 
 type CoefficientSlices<Rows, Rotated, Chips = Chip> =
-    DmTensor<bf16, Chips, Cluster, m![Rotated / 8 # 256], m![Rows, Rotated % 8]>;
+    DmTensor<bf16, Chips, Cluster, m![Rows # 256], m![Rotated]>;
 
-/// Produce each row's rotation from the frequency of each rotated coordinate and the row's token
-/// position; each constant is held as `T`: the HBM tensor, or a borrow of it in a borrowed tree.
+/// Produce each row's rotation on the row's slice from the frequency of each rotated coordinate and
+/// the row's token position; each constant is held as `T`: the HBM tensor or a borrow of it.
 #[derive(DeviceSend, Load)]
 #[load(tree)]
-pub struct Coefficients<Rotated: AxisName, Chips: M = Chip, T = Parameters<Rotated, Chips>> {
+pub struct Coefficients<
+    Rows: AxisName,
+    Rotated: AxisName,
+    Chips: M = Chip,
+    T = Scalars<Rows, Rotated, Chips>,
+> {
     /// The first input half's coefficients.
     low: Component<T>,
     /// The second input half's coefficients.
     high: Component<T>,
     /// The amplitude of every coefficient, on each coordinate.
     amplitude: T,
-    shape: core::marker::PhantomData<fn() -> (Rotated, Chips)>,
+    /// Each constant's rows and coordinates: a copy a row, as each row's slice reads its own.
+    shape: core::marker::PhantomData<fn() -> (Rows, Rotated, Chips)>,
 }
 
 /// The constants of one half's coefficients: the sine of each angle times `sign` plus `phase`.
@@ -366,7 +372,7 @@ pub struct Component<T> {
     sign: T,
 }
 
-impl<Rotated: AxisName, Chips: M, T> Coefficients<Rotated, Chips, T> {
+impl<Rows: AxisName, Rotated: AxisName, Chips: M, T> Coefficients<Rows, Rotated, Chips, T> {
     /// The constants the rotation reads: each half's phase and sign, low first, then the amplitude.
     pub fn constants(&self) -> [&T; 5] {
         let (low, high) = (&self.low, &self.high);
@@ -381,10 +387,10 @@ impl<Rotated: AxisName, Chips: M, T> Coefficients<Rotated, Chips, T> {
 }
 
 /// The constants of a rotation at the amplitude of `frequencies`, as no checkpoint stores them.
-impl<'f, Rotated: AxisName, Chips: M, T> Load<&'f PairFrequencies<Rotated>>
-    for Coefficients<Rotated, Chips, T>
+impl<'f, Rows: AxisName, Rotated: AxisName, Chips: M, T> Load<&'f PairFrequencies<Rotated>>
+    for Coefficients<Rows, Rotated, Chips, T>
 where
-    T: Load<HostTensor<f32, m![{ Chips }, { m![Rotated] }]>>,
+    T: Load<HostTensor<f32, m![{ Chips }, { m![Rows, Rotated] }]>>,
 {
     fn load(
         context: &mut Context<'_>,
@@ -396,7 +402,7 @@ where
             (0..Rotated::SIZE)
                 .map(half)
                 .collect::<Vec<_>>()
-                .repeat(Chips::SIZE)
+                .repeat(Rows::SIZE * Chips::SIZE)
         };
         let constant = |cx: &mut Context<'_>, name: &str, values: Vec<f32>| {
             cx.field(name, name, |cx| T::load(cx, HostTensor::from_vec(values)))
@@ -419,31 +425,40 @@ where
     }
 }
 
-impl<Rotated: AxisName, Chip: M, T> Coefficients<Rotated, Chip, T> {
-    fn angle<Rows: AxisName>(
-        &self,
+impl<Rows: AxisName, Rotated: AxisName, Chip: M, T> Coefficients<Rows, Rotated, Chip, T>
+where
+    T: Borrow<Scalars<Rows, Rotated, Chip>>,
+{
+    /// A per-row constant as a vector-engine operand on each row's slice.
+    fn constant(
+        device: &mut Device,
+        input: &Scalars<Rows, Rotated, Chip>,
+    ) -> Constants<Rows, Rotated, Chip> {
+        let input: Angles<Rows, Rotated, Chip> = input.to_dm(&mut device.tdma);
+        device
+            .sub
+            .begin(input.view())
+            .fetch::<m![Rotated / 8], m![Rotated % 8]>()
+            .collect::<m![Rotated / 8], m![Rotated % 8]>()
+            .to_vrf()
+    }
+
+    fn angle(
         device: &mut Device,
         (frequency, position): (&Scalars<Rows, Rotated, Chip>, &Scalars<Rows, Rotated, Chip>),
     ) -> Angles<Rows, Rotated, Chip> {
         let frequency: Angles<Rows, Rotated, Chip> = frequency.to_dm(&mut device.tdma);
-        let position: Angles<Rows, Rotated, Chip> = position.to_dm(&mut device.tdma);
-        let position: VrfTensor<f32, Chip, Cluster, m![Rotated / 8 # 256], m![Rows, Rotated % 8]> =
-            device
-                .sub
-                .begin(position.view())
-                .fetch::<m![Rows], m![Rotated % 8]>()
-                .collect::<m![Rows], m![Rotated % 8]>()
-                .to_vrf();
+        let position = Self::constant(device, position);
         device
             .main
             .begin(frequency.view())
-            .fetch::<m![Rows], m![Rotated % 8]>()
-            .collect::<m![Rows], m![Rotated % 8]>()
+            .fetch::<m![Rotated / 8], m![Rotated % 8]>()
+            .collect::<m![Rotated / 8], m![Rotated % 8]>()
             .vector_init()
             .vector_intra_slice_tag(TagMode::Zero)
-            .vector_narrow_split::<m![Rows, Rotated % 8 / 4], m![Rotated % 4]>()
+            .vector_narrow_split::<m![Rotated / 8, Rotated % 8 / 4], m![Rotated % 4]>()
             .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &position)
-            .vector_widen_concat::<m![Rows], m![Rotated % 8]>()
+            .vector_widen_concat::<m![Rotated / 8], m![Rotated % 8]>()
             .vector_final()
             .commit_trim::<m![Rotated % 8]>()
             .commit()
@@ -451,86 +466,68 @@ impl<Rotated: AxisName, Chip: M, T> Coefficients<Rotated, Chip, T> {
 
     /// One coefficient component of each row: `amplitude` times the sine of its angle times
     /// `sign` plus `phase`.
-    fn component<Rows: AxisName>(
+    fn component(
         device: &mut Device,
         angle: &Angles<Rows, Rotated, Chip>,
         Component { phase, sign }: &Component<T>,
-        amplitude: &Parameters<Rotated, Chip>,
-    ) -> CoefficientSlices<Rows, Rotated, Chip>
-    where
-        T: Borrow<Parameters<Rotated, Chip>>,
-    {
-        let (phase, sign) = (phase.borrow(), sign.borrow());
-        let constants =
-            |device: &mut Device, input: &Parameters<Rotated, Chip>| -> Constants<Rotated, Chip> {
-                let input: DmTensor<f32, Chip, Cluster, m![Rotated / 8 # 256], m![Rotated % 8]> =
-                    input.to_dm(&mut device.tdma);
-                device
-                    .sub
-                    .begin(input.view())
-                    .fetch::<m![1], m![Rotated % 8]>()
-                    .collect::<m![1], m![Rotated % 8]>()
-                    .to_vrf()
-            };
-        let phase = constants(device, phase);
-        let sign = constants(device, sign);
-        let amplitude = constants(device, amplitude);
+        amplitude: &Constants<Rows, Rotated, Chip>,
+    ) -> CoefficientSlices<Rows, Rotated, Chip> {
+        let phase = Self::constant(device, phase.borrow());
+        let sign = Self::constant(device, sign.borrow());
         let shifted: Angles<Rows, Rotated, Chip> = device
             .main
             .begin(angle.view())
-            .fetch::<m![Rows], m![Rotated % 8]>()
-            .collect::<m![Rows], m![Rotated % 8]>()
+            .fetch::<m![Rotated / 8], m![Rotated % 8]>()
+            .collect::<m![Rotated / 8], m![Rotated % 8]>()
             .vector_init()
             .vector_intra_slice_tag(TagMode::Zero)
-            .vector_narrow_split::<m![Rows, Rotated % 8 / 4], m![Rotated % 4]>()
+            .vector_narrow_split::<m![Rotated / 8, Rotated % 8 / 4], m![Rotated % 4]>()
             .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &sign)
-            .vector_widen_concat::<m![Rows], m![Rotated % 8]>()
+            .vector_widen_concat::<m![Rotated / 8], m![Rotated % 8]>()
             .vector_clip(ClipBinaryOpF32::Add, &phase)
             .vector_final()
             .commit_trim::<m![Rotated % 8]>()
             .commit();
         // Hardware trigonometric instructions require a reduced angle within one turn.
-        let turns: DmTensor<i32, Chip, Cluster, m![Rotated / 8 # 256], m![Rows, Rotated % 8]> =
-            device
-                .main
-                .begin(shifted.view())
-                .fetch::<m![Rows], m![Rotated % 8]>()
-                .collect::<m![Rows], m![Rotated % 8]>()
-                .vector_init()
-                .vector_intra_slice_tag(TagMode::Zero)
-                .vector_narrow_split::<m![Rows, Rotated % 8 / 4], m![Rotated % 4]>()
-                .vector_fp_div(TAU)
-                .vector_widen_concat::<m![Rows], m![Rotated % 8]>()
-                .vector_fp_to_fxp(31)
-                .vector_final()
-                .commit_trim::<m![Rotated % 8]>()
-                .commit();
-        let turns: VrfTensor<f32, Chip, Cluster, m![Rotated / 8 # 256], m![Rows, Rotated % 8]> =
-            device
-                .sub
-                .begin(turns.view())
-                .fetch::<m![Rows], m![Rotated % 8]>()
-                .collect::<m![Rows], m![Rotated % 8]>()
-                .vector_init()
-                .vector_intra_slice_tag(TagMode::Zero)
-                .vector_fxp_to_fp(31)
-                .vector_narrow_split::<m![Rows, Rotated % 8 / 4], m![Rotated % 4]>()
-                .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), TAU)
-                .vector_widen_concat::<m![Rows], m![Rotated % 8]>()
-                .vector_final()
-                .to_vrf();
+        let turns: DmTensor<i32, Chip, Cluster, m![Rows # 256], m![Rotated]> = device
+            .main
+            .begin(shifted.view())
+            .fetch::<m![Rotated / 8], m![Rotated % 8]>()
+            .collect::<m![Rotated / 8], m![Rotated % 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_split::<m![Rotated / 8, Rotated % 8 / 4], m![Rotated % 4]>()
+            .vector_fp_div(TAU)
+            .vector_widen_concat::<m![Rotated / 8], m![Rotated % 8]>()
+            .vector_fp_to_fxp(31)
+            .vector_final()
+            .commit_trim::<m![Rotated % 8]>()
+            .commit();
+        let turns: Constants<Rows, Rotated, Chip> = device
+            .sub
+            .begin(turns.view())
+            .fetch::<m![Rotated / 8], m![Rotated % 8]>()
+            .collect::<m![Rotated / 8], m![Rotated % 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_fxp_to_fp(31)
+            .vector_narrow_split::<m![Rotated / 8, Rotated % 8 / 4], m![Rotated % 4]>()
+            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), TAU)
+            .vector_widen_concat::<m![Rotated / 8], m![Rotated % 8]>()
+            .vector_final()
+            .to_vrf();
         device
             .main
             .begin(shifted.view())
-            .fetch::<m![Rows], m![Rotated % 8]>()
-            .collect::<m![Rows], m![Rotated % 8]>()
+            .fetch::<m![Rotated / 8], m![Rotated % 8]>()
+            .collect::<m![Rotated / 8], m![Rotated % 8]>()
             .vector_init()
             .vector_intra_slice_tag(TagMode::Zero)
-            .vector_narrow_split::<m![Rows, Rotated % 8 / 4], m![Rotated % 4]>()
+            .vector_narrow_split::<m![Rotated / 8, Rotated % 8 / 4], m![Rotated % 4]>()
             .vector_fp_binary(FpBinaryOp::SubF, &turns)
             .vector_fp_unary(FpUnaryOp::Sin)
-            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), &amplitude)
-            .vector_widen_concat::<m![Rows], m![Rotated % 8]>()
+            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), amplitude)
+            .vector_widen_concat::<m![Rotated / 8], m![Rotated % 8]>()
             .vector_final()
             .cast::<bf16, m![Rotated % 8 # 16]>()
             .commit_trim::<m![Rotated % 8]>()
@@ -538,11 +535,12 @@ impl<Rotated: AxisName, Chip: M, T> Coefficients<Rotated, Chip, T> {
     }
 }
 
+/// Every row's rotation, each row's coefficients stored as one run from the row's slice.
 impl<Rows: AxisName, Rotated: AxisName, Chip: M, T>
     crate::Op<(&Scalars<Rows, Rotated, Chip>, &Scalars<Rows, Rotated, Chip>)>
-    for Coefficients<Rotated, Chip, T>
+    for Coefficients<Rows, Rotated, Chip, T>
 where
-    T: Borrow<Parameters<Rotated, Chip>>,
+    T: Borrow<Scalars<Rows, Rotated, Chip>>,
 {
     type Output = Rotation<Rotated, Chip, Rows>;
 
@@ -551,88 +549,10 @@ where
         device: &mut Device,
         scalars: (&Scalars<Rows, Rotated, Chip>, &Scalars<Rows, Rotated, Chip>),
     ) -> Self::Output {
-        let angle = self.angle(device, scalars);
-        let amplitude = self.amplitude.borrow();
-        let low = Self::component(device, &angle, &self.low, amplitude).to_hbm(&mut device.tdma);
-        let high = Self::component(device, &angle, &self.high, amplitude).to_hbm(&mut device.tdma);
-        Rotation { low, high }
-    }
-}
-
-/// The rotation of the live rows only; a later row's rotation is unspecified.
-impl<Rows: AxisName, Rotated: AxisName, Chip: M, T>
-    crate::Op<(
-        &Scalars<Rows, Rotated, Chip>,
-        &Scalars<Rows, Rotated, Chip>,
-        Live<(), Rows>,
-    )> for Coefficients<Rotated, Chip, T>
-where
-    T: Borrow<Parameters<Rotated, Chip>>,
-{
-    type Output = Rotation<Rotated, Chip, Rows>;
-
-    fn forward(
-        &self,
-        device: &mut Device,
-        (frequency, position, live): (
-            &Scalars<Rows, Rotated, Chip>,
-            &Scalars<Rows, Rotated, Chip>,
-            Live<(), Rows>,
-        ),
-    ) -> Self::Output {
-        // Stores only the live rows; a later row is left unwritten.
-        let store = |device: &mut Device,
-                     table: &CoefficientSlices<Rows, Rotated, Chip>|
-         -> CoefficientRows<Rows, Rotated, Chip> {
-            let mut output: CoefficientRows<Rows, Rotated, Chip> = HbmTensor::new();
-            live.cover::<Lanes<Rows>, _>(
-                &mut (device, &mut output),
-                (
-                    |(device, output)| {
-                        table
-                            .view()
-                            .to_hbm_view(&mut device.tdma, output.view_mut());
-                    },
-                    |(device, output), packet| {
-                        table
-                        .view()
-                        .tile::<Layout<Rows>::Groups, 1, Layout<Rows>::Elements<m![Rotated % 8]>>(
-                            packet,
-                        )
-                        .to_hbm_view(
-                            &mut device.tdma,
-                            output
-                                .view_mut()
-                                .tile::<
-                                    Layout<Rows>::Groups,
-                                    1,
-                                    Layout<Rows>::GroupMut<m![Rotated]>,
-                                >(
-                                    packet,
-                                ),
-                        );
-                    },
-                    |(device, output), row| {
-                        table
-                            .view()
-                            .tile::<m![Rows], 1, m![Rows = 1 # Rows, Rotated % 8]>(row)
-                            .to_hbm_view(
-                                &mut device.tdma,
-                                output
-                                    .view_mut()
-                                    .tile::<m![Rows], 1, m![Rows = 1 #{!} Rows, Rotated]>(row),
-                            );
-                    },
-                ),
-            );
-            output
-        };
-        let angle = self.angle(device, (frequency, position));
-        let amplitude = self.amplitude.borrow();
-        let low = Self::component(device, &angle, &self.low, amplitude);
-        let low = store(device, &low);
-        let high = Self::component(device, &angle, &self.high, amplitude);
-        let high = store(device, &high);
+        let angle = Self::angle(device, scalars);
+        let amplitude = Self::constant(device, self.amplitude.borrow());
+        let low = Self::component(device, &angle, &self.low, &amplitude).to_hbm(&mut device.tdma);
+        let high = Self::component(device, &angle, &self.high, &amplitude).to_hbm(&mut device.tdma);
         Rotation { low, high }
     }
 }
@@ -661,7 +581,7 @@ mod tests {
     #[device(chip = 1)]
     pub(super) fn positioned<Rows: AxisName, Rotated: AxisName>(
         device: &mut Device,
-        coefficients: &super::Coefficients<Rotated>,
+        coefficients: &super::Coefficients<Rows, Rotated>,
         frequency: &super::Scalars<Rows, Rotated>,
         position: &super::Scalars<Rows, Rotated>,
     ) -> (
@@ -675,7 +595,7 @@ mod tests {
     pub(super) async fn coefficients<Rotated: AxisName>(
         device: &mut Device,
         amplitude: f32,
-    ) -> super::Coefficients<Rotated> {
+    ) -> super::Coefficients<crate::tensor::axis::Eight, Rotated> {
         let pairs = vec![1.0; Rotated::SIZE / 2];
         let frequencies = super::PairFrequencies::<Rotated>::new(&pairs, amplitude.into()).unwrap();
         let mut context = crate::load::Context::new(device);
