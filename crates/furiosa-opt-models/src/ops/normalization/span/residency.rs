@@ -135,6 +135,31 @@ pub(crate) struct Selection<'a, Hidden: AxisName, Capacity: AxisName, Chips: M +
     pub(crate) rows: &'a HbmTensor<i32, Chips, m![Capacity]>,
 }
 
+impl<Hidden: AxisName, Capacity: AxisName, Chips: M + 'static>
+    Selection<'_, Hidden, Capacity, Chips>
+{
+    /// Tile `index` of `R` rows of the selected rows of span `tile`, counted from its first row,
+    /// gathered into the feature slices a head reads.
+    pub(crate) fn gather<R: AxisName>(
+        &self,
+        context: &mut Device,
+        tile: Live<(), Capacity>,
+        index: usize,
+    ) -> Spread<Hidden, R, Chips> {
+        let mut offsets = HbmTensor::<i32, Chips, m![R]>::new();
+        self.rows
+            .view()
+            .tile::<m![Capacity / R], 1, m![Capacity / R = 1 # (Capacity / R), Capacity % R]>(
+                tile.start() / R::SIZE + index,
+            )
+            .to_hbm_view(&mut context.tdma, offsets.view_mut());
+        self.hidden
+            .gather::<m![Capacity], m![Hidden]>()
+            .by_byte_offsets(&offsets)
+            .to_dm(&mut context.tdma)
+    }
+}
+
 /// A span of the selected rows, gathered a wave of 128 at a time into the feature slices the
 /// final norm reads.
 impl<Hidden: AxisName, Capacity: AxisName, Chips: M + 'static> Fill<Device, Live<(), Capacity>>
@@ -145,20 +170,9 @@ impl<Hidden: AxisName, Capacity: AxisName, Chips: M + 'static> Fill<Device, Live
     fn fill(&self, context: &mut Device, tile: Live<(), Capacity>) -> Self::Rows {
         const { assert!(Capacity::SIZE.is_multiple_of(Span::SIZE)) };
         let mut rows: Self::Rows = DmTensor::new();
-        let (first, waves) = tile.groups::<Tile>();
+        let (_, waves) = tile.groups::<Tile>();
         for wave in 0..waves {
-            let mut offsets = HbmTensor::<i32, Chips, m![Tile]>::new();
-            self.rows
-                .view()
-                .tile::<m![Capacity / Tile], 1, m![
-                    Capacity / Tile = 1 # (Capacity / Tile), Capacity % Tile
-                ]>(first + wave)
-                .to_hbm_view(&mut context.tdma, offsets.view_mut());
-            let gathered: Spread<Hidden, Tile, Chips> = self
-                .hidden
-                .gather::<m![Capacity], m![Hidden]>()
-                .by_byte_offsets(&offsets)
-                .to_dm(&mut context.tdma);
+            let gathered = self.gather::<Tile>(&mut *context, tile, wave);
             gathered.view().to_dm_view(
                 &mut context.tdma,
                 rows.view_mut().tile::<m![Span / Tile], 1, m![
