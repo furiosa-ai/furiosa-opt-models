@@ -1,10 +1,11 @@
 use super::{
     Grouped, HeadScales, HeadSquares, KeySquares, QuerySquares, Stored, ValueScale, Weight,
-    Weights, squares,
+    Weights, periods, squares,
 };
 use crate::Begin;
 use crate::Op;
 use crate::ops::linear::Affine;
+use crate::tensor::live::Live;
 use crate::tensor::parallel::Chip;
 use furiosa_opt_std::prelude::*;
 use std::marker::PhantomData;
@@ -82,8 +83,10 @@ impl<Hidden: AxisName, Heads: AxisName, Head: AxisName> Op<Begin<Begin<()>>>
 }
 
 /// The begun query projection's second half written, then its heads' squared scales in the slices
-/// of both period groups' outputs, so no period waits for them.
-impl<Hidden: AxisName, Heads: AxisName, Head: AxisName> Op<Begin<Weight<Hidden, Heads, Head>>>
+/// of the outputs of the period groups `tile`'s launch runs, so no period waits for them; each
+/// write is a short transfer the DMA queue serves at its latency.
+impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, C: AxisName>
+    crate::Module<Begin<Weight<Hidden, Heads, Head>>, Live<(), C>, &mut ()>
     for Affine<Weights<Hidden, Heads, Head, HeadSquares<Heads>>, ()>
 {
     type Output = Affine<(Weight<Hidden, Heads, Head>, QuerySquares<Heads>), ()>;
@@ -91,31 +94,44 @@ impl<Hidden: AxisName, Heads: AxisName, Head: AxisName> Op<Begin<Weight<Hidden, 
     fn forward(
         &self,
         device: &mut Device,
+        tile: Live<(), C>,
+        _: &mut (),
         Begin(mut weight): Begin<Weight<Hidden, Heads, Head>>,
     ) -> Self::Output {
-        Half::<_, _, _, 1>(&self.weight.0).forward(&mut *device, &mut weight);
-        let stored = &self.weight.1.0;
+        Op::forward(
+            &Half::<_, _, _, 1>(&self.weight.0),
+            &mut *device,
+            &mut weight,
+        );
+        let (stored, (pairs, single)) = (&self.weight.1.0, periods(tile));
         let squares = Grouped {
-            pair: squares(&mut *device, stored),
-            single: squares(device, stored),
+            pair: squares(&mut *device, stored, pairs),
+            single: squares(device, stored, single),
         };
         Affine::new((weight, squares), ())
     }
 }
 
 /// The key projection written to DM, then its heads' squared scales as the query projection's.
-impl<Hidden: AxisName, Heads: AxisName, Head: AxisName> Op<Begin<()>>
+impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, C: AxisName>
+    crate::Module<Begin<()>, Live<(), C>, &mut ()>
     for Affine<(Weights<Hidden, Heads, Head, HeadSquares<Heads>>, ()), ()>
 {
     type Output = Affine<((Weight<Hidden, Heads, Head>, KeySquares<Heads>), ()), ()>;
 
-    fn forward(&self, device: &mut Device, _: Begin<()>) -> Self::Output {
+    fn forward(
+        &self,
+        device: &mut Device,
+        tile: Live<(), C>,
+        _: &mut (),
+        _: Begin<()>,
+    ) -> Self::Output {
         let mut weight = DmTensor::new();
-        Panel(&self.weight.0.0).forward(&mut *device, &mut weight);
-        let stored = &self.weight.0.1.0;
+        Op::forward(&Panel(&self.weight.0.0), &mut *device, &mut weight);
+        let (stored, (pairs, single)) = (&self.weight.0.1.0, periods(tile));
         let squares = Grouped {
-            pair: squares(&mut *device, stored),
-            single: squares(device, stored),
+            pair: squares(&mut *device, stored, pairs),
+            single: squares(device, stored, single),
         };
         Affine::new(((weight, squares), ()), ())
     }
