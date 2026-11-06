@@ -289,8 +289,25 @@ where
         _: &mut (),
         (ids, tiles): (&'x Ids<Rows, Chips>, Live<(), Rows>),
     ) -> Self::Output {
+        type Feature<W> = Symbol<Chunk<W>>;
         let rows = self.weight.rows(&mut *device, ids, tiles);
-        tiles.with(rows.to_dm(&mut device.tdma))
+        let mut landed = Spread::<Hidden, Rows, Chips>::new();
+        // One transfer, as its setup costs about as much as all its rows: the live rows' lane group,
+        // or the envelope when they span groups.
+        let (first, count) = tiles.groups::<Lanes<Rows>>();
+        if count > 1 {
+            rows.view().to_dm_view(&mut device.tdma, landed.view_mut());
+        } else {
+            (rows.view())
+                .tile::<Layout<Rows>::Groups, 1, Layout<Rows>::Elements<m![Hidden]>>(first)
+                .to_dm_view(
+                    &mut device.tdma,
+                    (landed.view_mut()).tile::<Layout<Rows>::Groups, 1, Layout<Rows>::GroupMut<
+                        m![Hidden % ({ Feature<Hidden> })],
+                    >>(first),
+                );
+        }
+        tiles.with(landed)
     }
 }
 
