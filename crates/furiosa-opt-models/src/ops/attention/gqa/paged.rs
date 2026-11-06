@@ -432,8 +432,7 @@ impl<
     }
 }
 
-/// The same queries attending, `boundary` running on its state once their first history is in
-/// flight.
+/// The same queries attending, `boundary` running on its state once inside the attention.
 impl<
     Heads: AxisName,
     Groups: AxisName,

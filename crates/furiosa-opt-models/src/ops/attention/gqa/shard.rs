@@ -361,9 +361,10 @@ pub(crate) trait Partition: Sized {
 
     /// Every window of a history merged: `first` is the first window's history, which the caller
     /// issued, `land` issues window `at`'s, `attend` attends what they landed into the slot it is
-    /// given, and `boundary` runs once the first window's history is in flight. A history of at
-    /// most `Rest` windows after the first holds every window's terms for one merge where they
-    /// fit, else folds each into a running attention.
+    /// given, and `boundary` runs once the last window's history is in flight, so no window's
+    /// landing queues behind its transfer. A history of at most `Rest` windows after the first
+    /// holds every window's terms for one merge where they fit, else folds each into a running
+    /// attention.
     fn windows<H, Rest: AxisName>(
         device: &mut Device,
         rest: usize,
@@ -372,7 +373,7 @@ pub(crate) trait Partition: Sized {
             impl FnMut(&mut Device, usize) -> H,
             impl FnMut(&mut Device, H) -> (Partial<Self>, Local<Self>),
         ),
-        boundary: impl FnOnce(&mut Device),
+        boundary: impl FnMut(&mut Device),
     ) -> Attended<Self> {
         if const { holds::<Self, Rest>() } {
             Self::serial::<_, Held<Self, Rest>>(device, rest, first, steps, boundary)
@@ -418,7 +419,8 @@ pub(crate) trait Partition: Sized {
         }
     }
 
-    /// [`Self::windows`] with one place, each window landed after the one before is attended.
+    /// [`Self::windows`] with one place, each window landed after the one before is attended;
+    /// `boundary` runs behind the last window's landing, which the attention waits for anyway.
     fn serial<H, T: Terms<Self>>(
         device: &mut Device,
         rest: usize,
@@ -427,13 +429,18 @@ pub(crate) trait Partition: Sized {
             impl FnMut(&mut Device, usize) -> H,
             impl FnMut(&mut Device, H) -> (Partial<Self>, Local<Self>),
         ),
-        boundary: impl FnOnce(&mut Device),
+        mut boundary: impl FnMut(&mut Device),
     ) -> Attended<Self> {
-        boundary(device);
+        for _ in 0..1 - rest.min(1) {
+            boundary(device);
+        }
         let terms = attend(device, first);
         let mut terms = T::first(device, terms);
         for at in 0..rest {
             let window = land(device, at + 1);
+            for _ in 0..1 - (rest - 1 - at).min(1) {
+                boundary(device);
+            }
             let window = attend(device, window);
             terms.join(device, at + 1, window);
         }

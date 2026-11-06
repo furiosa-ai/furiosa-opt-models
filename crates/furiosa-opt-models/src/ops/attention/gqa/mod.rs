@@ -1036,8 +1036,8 @@ where
 }
 
 /// The same history attended, `boundary` running on its state once in the first pass: before its
-/// last window is prepared where windows overlap and no next pass may land under it, else after
-/// its first window lands.
+/// last window is prepared where no next pass may land under it, else after its first window
+/// lands.
 impl<
     'a,
     Rows: AxisName,
