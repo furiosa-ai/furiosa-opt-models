@@ -554,8 +554,8 @@ impl<
 {
     type Output = ();
 
-    /// A gather takes its index as a whole tensor, which a window's entries are where they lie; its
-    /// counts are copied, as its core reads counts in place only where it proves nothing writes.
+    /// A gather takes its index and counts as whole tensors, which a window's entries and counts
+    /// are where they lie.
     fn forward(
         &self,
         device: &mut Device,
@@ -563,18 +563,18 @@ impl<
         cells: &mut InDm<Rows, KvHeads, Head, RowGroups<Rows>, D>,
         (at, live): (usize, Live<(), Rows>),
     ) {
-        // SAFETY: a window's rows are consecutive cells of the table, which nothing writes while a
-        // step attends over it.
-        let entries: Entries<Rows> = unsafe {
-            (self.table.view())
-                .tile::<m![Windows], 1, m![Windows = 1 # Windows, Rows, BlockIndex]>(at)
-                .alias()
+        // SAFETY: a window's rows are consecutive cells of the table and of the counts, which
+        // nothing writes while a step attends over them.
+        let (entries, lengths): (Entries<Rows>, HbmTensor<i32, Chip, m![Rows]>) = unsafe {
+            (
+                (self.table.view())
+                    .tile::<m![Windows], 1, m![Windows = 1 # Windows, Rows, BlockIndex]>(at)
+                    .alias(),
+                (self.lengths.view())
+                    .tile::<m![Windows], 1, m![Windows = 1 # Windows, Rows]>(at)
+                    .alias(),
+            )
         };
-        let mut lengths: HbmTensor<i32, Chip, m![Rows]> = HbmTensor::new();
-        self.lengths
-            .view()
-            .tile::<m![Windows], 1, m![Windows = 1 # Windows, Rows]>(at)
-            .to_hbm_view(&mut device.tdma, lengths.view_mut());
         let whole = live.rows() / Rows::SIZE;
         for _ in 0..whole {
             self.land::<_, _, _, true>(device, (&entries, &lengths), cells);
@@ -609,26 +609,27 @@ impl<
         cells: &mut InDm<Rows, KvHeads, Head, TileRows<Rows, N>, D>,
         (at, pass): (usize, Pass<N>),
     ) {
+        type Lengths<Rows, const N: usize> =
+            HbmTensor<i32, Chip, m![{ TileRows<Rows, N> }, { Layout<Rows>::Lanes }]>;
         // SAFETY: as over every row; a tile's rows are consecutive rows of the window.
-        let entries: TileEntries<Rows, N> = unsafe {
-            (self.table.view())
-                .tile::<m![Windows], 1, m![Windows = 1 # Windows, Rows, BlockIndex]>(at)
-                .tile::<Tiles<Rows, N>, 1, m![
-                    Windows = 1 # Windows, { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }),
-                    { TileRows<Rows, N> }, { Layout<Rows>::Lanes }, BlockIndex
-                ]>(pass.tile)
-                .alias()
+        let (entries, lengths): (TileEntries<Rows, N>, Lengths<Rows, N>) = unsafe {
+            (
+                (self.table.view())
+                    .tile::<m![Windows], 1, m![Windows = 1 # Windows, Rows, BlockIndex]>(at)
+                    .tile::<Tiles<Rows, N>, 1, m![
+                        Windows = 1 # Windows, { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }),
+                        { TileRows<Rows, N> }, { Layout<Rows>::Lanes }, BlockIndex
+                    ]>(pass.tile)
+                    .alias(),
+                (self.lengths.view())
+                    .tile::<m![Windows], 1, m![Windows = 1 # Windows, Rows]>(at)
+                    .tile::<Tiles<Rows, N>, 1, m![
+                        Windows = 1 # Windows, { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }),
+                        { TileRows<Rows, N> }, { Layout<Rows>::Lanes }
+                    ]>(pass.tile)
+                    .alias(),
+            )
         };
-        let mut lengths: HbmTensor<i32, Chip, m![{ TileRows<Rows, N> }, { Layout<Rows>::Lanes }]> =
-            HbmTensor::new();
-        self.lengths
-            .view()
-            .tile::<m![Windows], 1, m![Windows = 1 # Windows, Rows]>(at)
-            .tile::<Tiles<Rows, N>, 1, m![
-                Windows = 1 # Windows, { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }),
-                { TileRows<Rows, N> }, { Layout<Rows>::Lanes }
-            ]>(pass.tile)
-            .to_hbm_view(&mut device.tdma, lengths.view_mut());
         // An envelope of fewer rows than the tile never fills it.
         if const { Rows::SIZE >= N } {
             for _ in 0..pass.rows / N {
@@ -792,33 +793,33 @@ impl<
         cells: &mut InDm<Rows, KvHeads, Head, TileRows<Rows, N>, D>,
         (_, pass): (Wraps, Pass<N>),
     ) {
+        type Offsets<Rows, const N: usize> = HbmTensor<
+            i32,
+            Chip,
+            m![{ TileRows<Rows, N> }, { Layout<Rows>::Lanes }, BlockIndex % 2, Block],
+        >;
+        type Counts<Rows, const N: usize> =
+            HbmTensor<i32, Chip, m![{ TileRows<Rows, N> }, { Layout<Rows>::Lanes }]>;
         let (wrap, times) = self.wrap;
         for _ in 0..times {
-            // SAFETY: a tile's rows are consecutive rows of the offsets, which nothing writes while a
-            // step attends over them.
-            let offsets: HbmTensor<
-                i32,
-                Chip,
-                m![{ TileRows<Rows, N> }, { Layout<Rows>::Lanes }, BlockIndex % 2, Block],
-            > = unsafe {
-                (wrap.offsets.view())
-                    .tile::<Tiles<Rows, N>, 1, m![
-                        { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), { TileRows<Rows, N> },
-                        { Layout<Rows>::Lanes }, BlockIndex % 2, Block
-                    ]>(pass.tile)
-                    .alias()
+            // SAFETY: a tile's rows are consecutive rows of the offsets and of the counts, which
+            // nothing writes while a step attends over them.
+            let (offsets, counts): (Offsets<Rows, N>, Counts<Rows, N>) = unsafe {
+                (
+                    (wrap.offsets.view())
+                        .tile::<Tiles<Rows, N>, 1, m![
+                            { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), { TileRows<Rows, N> },
+                            { Layout<Rows>::Lanes }, BlockIndex % 2, Block
+                        ]>(pass.tile)
+                        .alias(),
+                    (wrap.counts.view())
+                        .tile::<Tiles<Rows, N>, 1, m![
+                            { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), { TileRows<Rows, N> },
+                            { Layout<Rows>::Lanes }
+                        ]>(pass.tile)
+                        .alias(),
+                )
             };
-            let mut counts: HbmTensor<
-                i32,
-                Chip,
-                m![{ TileRows<Rows, N> }, { Layout<Rows>::Lanes }],
-            > = HbmTensor::new();
-            (wrap.counts.view())
-                .tile::<Tiles<Rows, N>, 1, m![
-                    { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), { TileRows<Rows, N> },
-                    { Layout<Rows>::Lanes }
-                ]>(pass.tile)
-                .to_hbm_view(&mut device.tdma, counts.view_mut());
             self.wraps(device, (&offsets, &counts), cells);
         }
     }
