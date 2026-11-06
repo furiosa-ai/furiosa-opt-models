@@ -11,15 +11,6 @@ pub struct Period<Hidden: AxisName, G: Group, KvHeads: AxisName> {
 }
 
 impl<Hidden: AxisName, G: Group, KvHeads: AxisName> Period<Hidden, G, KvHeads> {
-    /// Each row's scale in the slices of the output of `Heads`.
-    fn scales<Heads: AxisName, Spread: M>(
-        &self,
-    ) -> DmTensorView<'_, bf16, Chip, Cluster<Heads>, Reduced<G, Heads, Spread>, m![Tile % 8]> {
-        // SAFETY: each row's scale lies in every slice of its cluster, and both partitions place
-        // the rows' digits alike.
-        unsafe { self.scales.view().reshape() }
-    }
-
     pub(super) const fn new(
         own: Input<Hidden, G>,
         scales: RowGroups<G, KvHeads>,
@@ -33,59 +24,42 @@ impl<Hidden: AxisName, G: Group, KvHeads: AxisName> Period<Hidden, G, KvHeads> {
     }
 }
 
-/// A period's queries, their heads spread over the slices, with their heads' squared scales.
+/// A period's queries, their heads spread over the slices, known up to the factors their head
+/// norm cancels.
 impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, G: Group, KvHeads: AxisName>
-    Op<&Period<Hidden, G, KvHeads>>
-    for Affine<(Weight<Hidden, Heads, Head>, QuerySquares<Heads>), ()>
-where
-    QuerySquares<Heads>:
-        Of<G, Squares = Written<G, Heads, QuerySpread<G, Heads>, QueryLocal<G, Heads>>>,
+    Op<&Period<Hidden, G, KvHeads>> for Affine<Weight<Hidden, Heads, Head>, ()>
 {
-    type Output = Scaled<
-        Queries<G, Heads, Head>,
-        Inverse<G, Heads, QuerySpread<G, Heads>, QueryLocal<G, Heads>>,
-    >;
+    type Output = Scaled<Queries<G, Heads, Head>>;
+
+    fn forward(&self, context: &mut Device, rows: &Period<Hidden, G, KvHeads>) -> Self::Output {
+        let lanes = Fill(PhantomData).forward(&mut *context, (&rows.own, rows.groups));
+        Affine::new(&self.weight, ()).forward(
+            context,
+            Counted {
+                lanes: &lanes,
+                groups: rows.groups,
+                output: PhantomData,
+            },
+        )
+    }
+}
+
+/// A period's keys, each run of heads copied over the slices as values are, known up to the
+/// factors their head norm cancels.
+impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, G: Group, KvHeads: AxisName>
+    Op<&Period<Hidden, G, KvHeads>> for Affine<(Weight<Hidden, Heads, Head>, ()), ()>
+{
+    type Output = Scaled<Pairs<G, Heads, Head>>;
 
     fn forward(&self, context: &mut Device, rows: &Period<Hidden, G, KvHeads>) -> Self::Output {
         let lanes = Fill(PhantomData).forward(&mut *context, (&rows.own, rows.groups));
         Affine::new(&self.weight.0, ()).forward(
             context,
-            (
-                Counted {
-                    lanes: &lanes,
-                    rows: rows.scales(),
-                    groups: rows.groups,
-                    output: PhantomData,
-                },
-                Of::<G>::of(&self.weight.1),
-            ),
-        )
-    }
-}
-
-/// A period's keys, each run of heads copied over the slices as values are, with their heads'
-/// squared scales.
-impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, G: Group, KvHeads: AxisName>
-    Op<&Period<Hidden, G, KvHeads>>
-    for Affine<((Weight<Hidden, Heads, Head>, KeySquares<Heads>), ()), ()>
-where
-    KeySquares<Heads>: Of<G, Squares = Written<G, Heads, G::Copies, PairLocal<Heads>>>,
-{
-    type Output = Scaled<Pairs<G, Heads, Head>, Inverse<G, Heads, G::Copies, PairLocal<Heads>>>;
-
-    fn forward(&self, context: &mut Device, rows: &Period<Hidden, G, KvHeads>) -> Self::Output {
-        let lanes = Fill(PhantomData).forward(&mut *context, (&rows.own, rows.groups));
-        Affine::new(&self.weight.0.0, ()).forward(
-            context,
-            (
-                Counted {
-                    lanes: &lanes,
-                    rows: rows.scales(),
-                    groups: rows.groups,
-                    output: PhantomData,
-                },
-                Of::<G>::of(&self.weight.0.1),
-            ),
+            Counted {
+                lanes: &lanes,
+                groups: rows.groups,
+                output: PhantomData,
+            },
         )
     }
 }

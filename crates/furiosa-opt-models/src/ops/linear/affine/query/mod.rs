@@ -54,7 +54,7 @@ pub(crate) type Pairs<G, Heads, Head> =
 
 #[cfg(test)]
 mod tests {
-    use super::fp8::{HeadScales, HeadSquares, Layout, Stored};
+    use super::fp8::{HeadScales, Layout, Stored};
     use super::group::{TilePair, Tiles};
     use super::launch::Normalized;
     use super::matrix::Dense;
@@ -71,6 +71,7 @@ mod tests {
     use crate::ops::rotary::group::{InputHalf, OutputHalf, Rotation};
     use crate::ops::rotary::{Rotary, Row, SplitHalf};
     use crate::tensor::form::Weight;
+    use crate::tensor::form::fp8::Cancelled;
     use crate::tensor::live::{self, Fill, Live, Spill};
     use crate::tensor::scalar::{F32, Value};
     use crate::tests::DEVICE;
@@ -94,14 +95,8 @@ mod tests {
         Affine<(Dense<H, KvHeads, Head>, ()), ()>,
     >;
     type Quantized = Projection<
-        Affine<super::fp8::Weights<H, QueryHeads, Head, HeadSquares<QueryHeads>>, ()>,
-        Affine<
-            (
-                super::fp8::Weights<H, KvHeads, Head, HeadSquares<KvHeads>>,
-                (),
-            ),
-            (),
-        >,
+        Affine<super::fp8::Weights<H, QueryHeads, Head, Cancelled>, ()>,
+        Affine<(super::fp8::Weights<H, KvHeads, Head, Cancelled>, ()), ()>,
         Affine<super::fp8::Weights<H, KvHeads, Head, HeadScales<KvHeads, Head>>, ()>,
     >;
 
@@ -112,11 +107,11 @@ mod tests {
         fn rows(self) -> Self::Rows;
     }
 
-    impl<X, S> Rows for Scaled<X, S> {
+    impl<X> Rows for Scaled<X> {
         type Rows = X;
 
         fn rows(self) -> X {
-            self.cancel().0
+            self.cancel()
         }
     }
 
@@ -271,21 +266,11 @@ mod tests {
                 .to_hbm(&mut device.pdma)
                 .await
                 .unwrap();
-            // Codes that hold their scales: each head's squared scale is one.
-            async fn ones<Heads: AxisName>(device: &mut Device) -> HeadSquares<Heads> {
-                let ones = vec![1.0; Heads::SIZE * Tile::SIZE];
-                crate::tensor::form::fp8::Squares(
-                    HostTensor::<f32, m![Heads, Tile]>::from_vec(ones)
-                        .to_hbm(&mut device.pdma)
-                        .await
-                        .unwrap(),
-                )
-            }
             Projection {
                 query: Affine::new(
                     crate::tensor::form::fp8::Rows::new(
                         upload::<QueryHeads>(device, &self.codes[0]).await,
-                        ones::<QueryHeads>(device).await,
+                        Cancelled,
                     ),
                     (),
                 ),
@@ -293,7 +278,7 @@ mod tests {
                     (
                         crate::tensor::form::fp8::Rows::new(
                             upload::<KvHeads>(device, &self.codes[1]).await,
-                            ones::<KvHeads>(device).await,
+                            Cancelled,
                         ),
                         (),
                     ),
