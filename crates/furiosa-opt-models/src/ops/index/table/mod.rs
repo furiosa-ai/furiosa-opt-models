@@ -677,12 +677,14 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
         let tokens: DmTensor<i32, Chips, Cluster, m![R # 256], m![Block]> =
             unsafe { tokens.reshape() };
         for pair in 0..2 {
-            let mut block: HbmTensor<i32, Chips, m![R]> = HbmTensor::new();
+            // A row's block in a cell of its own: writes into one HBM cell serialize.
+            let mut block: HbmTensor<i32, Chips, m![R, 1 # 8]> = HbmTensor::new();
             scaled
                 .view()
                 .tile::<m![BlockIndex], 1, m![R, BlockIndex = 1 # BlockIndex]>(pair)
                 .to_hbm_view(&mut device.tdma, block.view_mut());
-            let block = per_row(device, &block);
+            let block: RowValues<Chips, R> = block.to_dm(&mut device.tdma);
+            let block = scalar::register(device, &block);
             let run: DmTensor<i32, Chips, Cluster, m![R # 256], m![Block]> = device
                 .main
                 .begin(tokens.view())
@@ -707,6 +709,8 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
 
 /// One window's token slots of a row on the row's slice, so a window's mask stores a row a run.
 type RowSlots<Chips, R> = DmTensor<f32, Chips, Cluster, m![R # 256], m![Cache]>;
+/// One value of a row on the row's slice.
+type RowValues<Chips, R, D = i32> = DmTensor<D, Chips, Cluster, m![R # 256], m![1 # 8]>;
 /// One value of a row on the row's slice, the per-row operand of a pass over [`RowSlots`].
 type PerRow<Chips, R, D = f32> = VrfTensor<D, Chips, Cluster, m![R # 256], m![1 # 8]>;
 
@@ -964,7 +968,7 @@ fn per_row<R: AxisName, D: VeScalar + MaterializableScalar, Chips: M>(
     values: &HbmTensor<D, Chips, m![R]>,
 ) -> PerRow<Chips, R, D> {
     let padded: HbmTensor<D, Chips, m![R, 1 # 8]> = values.to_hbm(&mut device.tdma);
-    let rows: DmTensor<D, Chips, Cluster, m![R # 256], m![1 # 8]> = padded.to_dm(&mut device.tdma);
+    let rows: RowValues<Chips, R, D> = padded.to_dm(&mut device.tdma);
     scalar::register(device, &rows)
 }
 
