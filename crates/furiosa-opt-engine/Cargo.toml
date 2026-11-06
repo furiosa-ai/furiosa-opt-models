@@ -14,6 +14,7 @@ readme = "README.md"
 futures-executor = "0.3"
 safetensors = "=0.4.5"
 furiosa-opt-models = { path = "../furiosa-opt-models", version = "0.1.0" }
+furiosa-opt-nemo = { path = "../furiosa-opt-nemo", version = "0.1.0" }
 furiosa-opt-std = { workspace = true }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 tokio = { version = "1", features = ["rt"] }

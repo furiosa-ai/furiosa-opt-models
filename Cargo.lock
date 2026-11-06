@@ -503,6 +503,7 @@ name = "furiosa-opt-engine"
 version = "0.1.0"
 dependencies = [
  "furiosa-opt-models",
+ "furiosa-opt-nemo",
  "furiosa-opt-std",
  "futures-executor",
  "rustix",

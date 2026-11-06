@@ -22,10 +22,10 @@ const RUN: usize = 16;
 
 /// One request's appended rows in a call: its call rows, the positions cached before them and the
 /// blocks its positions use.
-pub(super) struct Appended {
-    pub(super) rows: Range<usize>,
-    pub(super) cached: usize,
-    pub(super) blocks: Vec<u32>,
+pub struct Appended {
+    pub rows: Range<usize>,
+    pub cached: usize,
+    pub blocks: Vec<u32>,
 }
 
 /// A launch's rows as the host plans them, at the capacities of `Capacity` rows, `Reach` written

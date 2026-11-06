@@ -15,7 +15,7 @@
 
 use std::num::NonZeroUsize;
 
-use crate::decoder::{Decoder, Instance, Served};
+use crate::decoder::{Decoder, Instance, Nemo, Served};
 use crate::vision_language::Encoder;
 use furiosa_opt_models::load::{Checkpoint, Context, Load, LoadError, Part};
 use furiosa_opt_models::models::decoder::attention::{llama, qwen3};
@@ -228,15 +228,18 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
     ("Ministral3ForCausalLM", &[]),
     (
         "MistralForCausalLM",
-        &[Implementation::of::<
-            llama::ForCausalLM<
-                llama::Size<"Mistral-7B">,
-                form::Affine,
-                Parallel<1>,
-                cache::Bf16,
-                Hbm,
-            >,
-        >()],
+        &[
+            Implementation::of::<
+                llama::ForCausalLM<
+                    llama::Size<"Mistral-7B">,
+                    form::Affine,
+                    Parallel<1>,
+                    cache::Bf16,
+                    Hbm,
+                >,
+            >(),
+            Implementation::of::<Nemo>(),
+        ],
     ),
     ("MistralForCausalLMEagle", &[]),
     ("MistralLarge3ForCausalLM", &[]),

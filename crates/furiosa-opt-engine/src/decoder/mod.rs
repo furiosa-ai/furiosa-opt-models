@@ -17,11 +17,13 @@
 mod adapters;
 mod batch;
 mod cache;
+mod nemo;
 mod qwen3;
 
 pub use adapters::{Adapter, Binding, Loader, SLOTS};
-pub use batch::{Batch, Rows, Staged, Table};
+pub use batch::{Appended, Batch, Rows, Staged, Table};
 pub use cache::{Cache, CacheSpec, Group, Kind, Pool};
+pub use nemo::Nemo;
 
 use crate::{AsyncModule, Checkpoint, LoadError};
 use furiosa_opt_models::ops::attention::full::paged::Tiling;

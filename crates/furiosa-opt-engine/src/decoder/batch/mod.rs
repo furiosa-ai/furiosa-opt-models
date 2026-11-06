@@ -12,6 +12,7 @@ mod operands;
 mod staging;
 
 pub use compact::Table;
+pub use operands::Appended;
 pub use staging::Staged;
 
 use super::{Binding, Cache, Group, Keep, Kind, Limits, Request};
@@ -248,6 +249,16 @@ impl<'a, A> Batch<'a, A> {
     /// The call rows the call returns, in order.
     pub fn kept(&self) -> &[usize] {
         &self.kept
+    }
+
+    /// Each request's appended rows in cache group `group`, in call row order.
+    pub fn appended(&self, group: usize) -> &[Appended] {
+        &self.appended[group]
+    }
+
+    /// Each request's token IDs and the call rows they fill, in request order.
+    pub fn tokens(&self) -> &[(Rows<i32, m![1]>, Range<usize>)] {
+        &self.tokens
     }
 
     /// The adapters the call runs, bound to its slots and rows; none when no row runs with one.
