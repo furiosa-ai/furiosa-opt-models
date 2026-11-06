@@ -1,6 +1,8 @@
 //! Qwen-style input partitioning with BF16 operands: four output groups and
-//! 64 input slices per cluster. Paired waves fill a 32-KiB TRF operand; a final
-//! direct launches use a 32-row tile; larger launches restore BF16 weights once.
+//! 64 input slices per cluster. Paired waves fill a 32-KiB TRF operand, with
+//! the next pair or final single wave prefetched into a separate TRF half.
+//! Direct launches use a 32-row tile; larger launches restore BF16 weights once.
+use super::prefetch::{Points, Stage};
 use super::{Scales, block};
 use crate::ops::normalization::span::Owned;
 use crate::tensor::parallel::Chip;
@@ -364,28 +366,86 @@ pub(crate) fn consume<H: AxisName, Q: AxisName, K: AxisName, R: AxisName, F>(
         single::<H, Q, K, R, F>(device, projections, weights, &stored, 0, rows, &mut consume);
         return;
     }
-    let waves = rows.div_ceil(128);
-    for pair in 0..waves / 2 {
-        run_restored::<H, Q, K, R, 256, F>(
+    // A span has at most two pairs. Keep both operands in the same scheduling
+    // unit so the next DMA and sub-context TRF fill can overlap the first Q.
+    // A partial second wave still uses the paired contraction geometry.
+    if rows > 384 {
+        two_restored::<H, Q, K, R, 256, 256, F>(
             device,
             projections,
             weights,
             &stored,
-            pair,
-            (rows - pair * 256).min(256),
+            rows,
             &mut consume,
         );
-    }
-    if waves % 2 == 1 {
-        let wave = waves - 1;
-        run_restored::<H, Q, K, R, 128, F>(
+    } else if rows > 320 {
+        two_restored::<H, Q, K, R, 128, 128, F>(
             device,
             projections,
             weights,
             &stored,
-            wave,
-            rows - wave * 128,
+            rows,
             &mut consume,
+        );
+    } else if rows > 288 {
+        two_restored::<H, Q, K, R, 128, 64, F>(
+            device,
+            projections,
+            weights,
+            &stored,
+            rows,
+            &mut consume,
+        );
+    } else if rows > 272 {
+        two_restored::<H, Q, K, R, 128, 32, F>(
+            device,
+            projections,
+            weights,
+            &stored,
+            rows,
+            &mut consume,
+        );
+    } else if rows > 264 {
+        two_restored::<H, Q, K, R, 128, 16, F>(
+            device,
+            projections,
+            weights,
+            &stored,
+            rows,
+            &mut consume,
+        );
+    } else if rows > 256 {
+        two_restored::<H, Q, K, R, 128, 8, F>(
+            device,
+            projections,
+            weights,
+            &stored,
+            rows,
+            &mut consume,
+        );
+    } else if rows > 128 {
+        let lanes = prepare_rows::<H, R, 256>(device, &stored, 0, rows);
+        run_restored::<H, Q, K, R, 256, F, _>(
+            device,
+            projections,
+            weights,
+            lanes,
+            0,
+            rows,
+            &mut consume,
+            (),
+        );
+    } else {
+        let lanes = prepare_rows::<H, R, 128>(device, &stored, 0, rows);
+        run_restored::<H, Q, K, R, 128, F, _>(
+            device,
+            projections,
+            weights,
+            lanes,
+            0,
+            rows,
+            &mut consume,
+            (),
         );
     }
 }
@@ -469,25 +529,12 @@ fn land_tile<O: AxisName, R: AxisName, const QUARTER: usize>(
             m![O % (O / 2) / 128 # 16, R % 128 / 32 = 1 #{!} 4, R % 32 / 8]>(QUARTER));
 }
 
-fn run_restored<H: AxisName, Q: AxisName, K: AxisName, R: AxisName, const W: usize, F>(
+fn prepare_rows<H: AxisName, R: AxisName, const W: usize>(
     device: &mut Device,
-    projections: (
-        &QkvProjection<H, Q>,
-        &QkvProjection<H, K>,
-        &QkvProjection<H, K>,
-    ),
-    weights: (&Weight<H, Q>, &Weight<H, K>, &Weight<H, K>),
     stored: &StoredRows<H, R>,
     wave: usize,
     live: usize,
-    consume: &mut F,
-) where
-    F: FnMut(&mut Device, WaveOutput<Q, R>, WaveOutput<K, R>, WaveOutput<K, R>, usize),
-{
-    const {
-        assert!(W == 128 || W == 256);
-    }
-    let groups = live.div_ceil(8);
+) -> Operand<H, R, W> {
     let input = if live <= 8 {
         load_rows::<H, R, 8, W>(device, stored, wave)
     } else if live <= 16 {
@@ -501,8 +548,99 @@ fn run_restored<H: AxisName, Q: AxisName, K: AxisName, R: AxisName, const W: usi
     } else {
         load_rows::<H, R, 256, W>(device, stored, wave)
     };
-    let lanes = fill(device, &input, groups);
+    fill(device, &input, live.div_ceil(8))
+}
+
+/// The full first pair and either another pair or a final single wave. Keeping
+/// the next operand live while K/V read the first makes TRF allocation disjoint.
+fn two_restored<
+    H: AxisName,
+    Q: AxisName,
+    K: AxisName,
+    R: AxisName,
+    const W: usize,
+    const N: usize,
+    F,
+>(
+    device: &mut Device,
+    projections: (
+        &QkvProjection<H, Q>,
+        &QkvProjection<H, K>,
+        &QkvProjection<H, K>,
+    ),
+    weights: (&Weight<H, Q>, &Weight<H, K>, &Weight<H, K>),
+    stored: &StoredRows<H, R>,
+    rows: usize,
+    consume: &mut F,
+) where
+    F: FnMut(&mut Device, WaveOutput<Q, R>, WaveOutput<K, R>, WaveOutput<K, R>, usize),
+{
+    const {
+        assert!(R::SIZE == 512 && (W == 128 || W == 256));
+        assert!(N <= W && N.is_power_of_two());
+    }
+    let first = prepare_rows::<H, R, 256>(device, stored, 0, 256);
+    // Select N before issuing the first pair, keeping the next DMA and fill
+    // in the same branch-free scheduling unit as the current Q.
+    let next = Stage(|device: &mut Device| {
+        let input = load_rows::<H, R, N, W>(device, stored, 256 / W);
+        fill(device, &input, (rows - 256).div_ceil(8))
+    });
+    let second = run_restored::<H, Q, K, R, 256, F, _>(
+        device,
+        projections,
+        weights,
+        first,
+        0,
+        256,
+        consume,
+        next,
+    );
+    run_restored::<H, Q, K, R, W, F, _>(
+        device,
+        projections,
+        weights,
+        second,
+        256 / W,
+        rows - 256,
+        consume,
+        (),
+    );
+}
+
+fn run_restored<
+    H: AxisName,
+    Q: AxisName,
+    K: AxisName,
+    R: AxisName,
+    const W: usize,
+    F,
+    N: Points<Device>,
+>(
+    device: &mut Device,
+    projections: (
+        &QkvProjection<H, Q>,
+        &QkvProjection<H, K>,
+        &QkvProjection<H, K>,
+    ),
+    weights: (&Weight<H, Q>, &Weight<H, K>, &Weight<H, K>),
+    lanes: Operand<H, R, W>,
+    wave: usize,
+    live: usize,
+    consume: &mut F,
+    next: N,
+) -> N::Output
+where
+    F: FnMut(&mut Device, WaveOutput<Q, R>, WaveOutput<K, R>, WaveOutput<K, R>, usize),
+{
+    const {
+        assert!(W == 128 || W == 256);
+    }
+    let groups = live.div_ceil(8);
     let q = project_restored(device, projections.0, &weights.0.restored, &lanes, groups);
+    // Q is issued first; its factor is ready before the next activation fill
+    // uses the sub context. K and V still need the current TRF operand.
+    let next = next.at(device);
     let k = project_restored(device, projections.1, &weights.1.restored, &lanes, groups);
     let v = project_restored(device, projections.2, &weights.2.restored, &lanes, groups);
     let qo = land::<Q, R, W, 0>(device, &q);
@@ -515,6 +653,7 @@ fn run_restored<H: AxisName, Q: AxisName, K: AxisName, R: AxisName, const W: usi
         let vo = land::<K, R, W, 1>(device, &v);
         consume(device, qo, ko, vo, wave * 2 + 1);
     }
+    next.finish(device)
 }
 
 #[cfg(feature = "kernel-diagnostics")]

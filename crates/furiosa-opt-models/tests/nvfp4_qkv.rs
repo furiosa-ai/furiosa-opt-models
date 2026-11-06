@@ -116,7 +116,8 @@ async fn resident_q_and_kv_match_scalar_w4a16() {
         .into_vec();
     for rows in [
         1, 4, 8, 9, 16, 17, 23, 24, 25, 31, 32, 33, 63, 64, 65, 71, 72, 73, 127, 128, 129, 247,
-        248, 249, 255, 256, 257, 383, 384, 385, 511, 512,
+        248, 249, 255, 256, 257, 263, 264, 265, 271, 272, 273, 287, 288, 289, 319, 320, 321, 383,
+        384, 385, 511, 512,
     ] {
         let mut padded = original.clone();
         padded[rows * Hidden::SIZE..].fill(bf16::from_f32(f32::NAN));
@@ -367,7 +368,10 @@ async fn resident_q_and_kv_match_scalar_w4a16() {
         .to_hbm(&mut device.pdma)
         .await
         .unwrap();
-    for rows in [17, 32, 33, 129, 257, 512] {
+    // Distinct row values detect reuse of the first operand in a prefetched tail.
+    for rows in [
+        17, 32, 33, 129, 256, 257, 264, 265, 288, 289, 320, 321, 383, 384, 385, 511, 512,
+    ] {
         let input = HostTensor::<bf16, m![Rows, Hidden]>::from_vec(
             (0..Rows::SIZE * Hidden::SIZE).map(|i| {
                 let row = i / Hidden::SIZE;
