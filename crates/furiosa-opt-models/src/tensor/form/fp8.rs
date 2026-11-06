@@ -117,39 +117,28 @@ where
     }
 }
 
-/// Each head's squared row scale `s²`, `K` copies of it, for a projection whose rows of one head
-/// share one row scale: a head norm of the rows its codes give restores its epsilon from it.
+/// The row scales of a projection whose rows of one head share one row scale: none kept, as a
+/// head norm of the rows its codes give cancels each head's scale but in epsilon.
 #[derive(DeviceSend)]
-pub struct Squares<T>(pub T);
+pub struct Cancelled;
 
-/// The codes at the context's name and each head's squared row scale; a head whose rows hold
-/// different scales is refused.
-impl<'a, In: M + 'static, Heads: AxisName, Head: AxisName, W, K: M + 'static> Load<&'a Checkpoint>
-    for Rows<In, m![Heads, Head], W, Squares<HbmTensor<f32, Chip, m![Heads, { K }]>>>
+/// The codes at the context's name, without their row scales; a head whose rows hold different
+/// scales is refused.
+impl<'a, In: M + 'static, Heads: AxisName, Head: AxisName, W> Load<&'a Checkpoint>
+    for Rows<In, m![Heads, Head], W, Cancelled>
 where
     W: Load<HostTensor<f8e4m3, m![{ Chip }, { m![{ m![Heads, Head] }, { In }] }]>>,
 {
     fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
         let (codes, rows) = folded::<In, m![Heads, Head]>(from, context)?;
-        let squares = rows
-            .chunks_exact(Head::SIZE)
-            .map(|head| (head.iter().all(|&row| row == head[0])).then_some(head[0] * head[0]))
-            .collect::<Option<Vec<f32>>>()
-            .ok_or_else(|| LoadError::InvalidData {
+        let shared = |head: &[f32]| head.iter().all(|&row| row == head[0]);
+        if !rows.chunks_exact(Head::SIZE).all(shared) {
+            return Err(LoadError::InvalidData {
                 name: context.name(),
                 reason: "the rows of a head hold different block scales".into(),
-            })?;
-        let squares = squares
-            .iter()
-            .flat_map(|&square| std::iter::repeat_n(square, K::SIZE))
-            .collect::<Vec<_>>()
-            .repeat(Chip::SIZE);
-        let squares = HostTensor::<f32, m![{ Chip }, { m![Heads, { K }] }]>::from_vec(squares);
-        Self::place(
-            codes,
-            |cx| Ok(Squares(cx.field("0", "", |cx| Load::load(cx, squares))?)),
-            context,
-        )
+            });
+        }
+        Self::place(codes, |_| Ok(Cancelled), context)
     }
 }
 
