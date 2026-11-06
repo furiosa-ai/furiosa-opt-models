@@ -14,6 +14,7 @@ env:
   # A fork's code, which a maintainer approved but nobody trusts, gets caches of its own, so it
   # cannot change what later runs of this repository read.
   HF_HOME: ${{ github.event.pull_request.head.repo.fork && '/tmp/fork-cache/huggingface' || '/root/.cache/huggingface' }}
+  FURIOSA_OPT_REFERENCES: ${{ github.event.pull_request.head.repo.fork && '/tmp/fork-cache/references' || '/root/.cache/furiosa-opt-models/references' }}
   UV_PYTHON_INSTALL_DIR: ${{ github.event.pull_request.head.repo.fork && '/tmp/fork-cache/python' || '/root/.cache/furiosa-opt-models/python' }}
   XDG_CACHE_HOME: ${{ github.event.pull_request.head.repo.fork && '/tmp/fork-cache' || '/root/.cache' }}
   TIER: ${{ inputs.tier }}

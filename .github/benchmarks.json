@@ -124,9 +124,14 @@
       "id": "RedHatAI/Mistral-Nemo-Instruct-2407-FP8", "tier": "nightly",
       "task": "text",
       "doc": "mistral-nemo",
+      "forward": "nemo_forward",
       "quantization": {"weights": ["FP8"], "activations": ["Static FP8"]},
-      "serve": ["--kv-cache-dtype", "fp8_e4m3", "--max-model-len", "16384"],
-      "download": ["*.json", "*.safetensors", "*.model", "*.jinja"]
+      "serve": [
+        "--kv-cache-dtype", "fp8_e4m3", "--max-model-len", "16384", "--tensor-parallel-size", "2"
+      ],
+      "download": ["*.json", "*.safetensors", "*.model", "*.jinja"],
+      "revision": "2545394475682e98b69596fde20b7fa7b43789e1",
+      "reference": "references/RedHatAI--Mistral-Nemo-Instruct-2407-FP8@2545394"
     },
     {
       "id": "unsloth/gemma-4-12b-it-NVFP4", "tier": "nightly",
