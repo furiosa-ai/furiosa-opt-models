@@ -368,10 +368,8 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
             .vector_final()
             .commit_trim::<m![R % ({ Lane<R> }) # 8]>()
             .commit();
-        let wraps = rows(device, &wrapped);
-        let wraps: HbmTensor<i32, Chips, m![R, 1 # 8]> = wraps.to_hbm(&mut device.tdma);
         let wraps: DmTensor<i32, Chips, Cluster, Slices, m![R, 1 # 8]> =
-            wraps.to_dm(&mut device.tdma);
+            cells(device, &wrapped).to_dm(&mut device.tdma);
         let wraps: DmTensor<i32, Chips, Cluster, Slices, m![1 # 8]> = device
             .main
             .begin(wraps.view())
@@ -388,10 +386,8 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
             .commit();
         // The windows after the first that the longest span covers, reduced over one row a flit;
         // a row with no span covers none.
-        let spans = rows(device, &kept);
-        let spans: HbmTensor<i32, Chips, m![R, 1 # 8]> = spans.to_hbm(&mut device.tdma);
         let spans: DmTensor<i32, Chips, Cluster, Slices, m![R, 1 # 8]> =
-            spans.to_dm(&mut device.tdma);
+            cells(device, &kept).to_dm(&mut device.tdma);
         let rest: DmTensor<i32, Chips, Cluster, Slices, m![1 # 8]> = device
             .main
             .begin(spans.view())
@@ -740,7 +736,6 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
             .vector_final()
             .commit_trim::<m![R % ({ Lane<R> }) # 8]>()
             .commit();
-        let width = rows(device, &width);
         let width = per_row(device, &width);
         let ring = scalar::register(device, &extents.ring);
         let rings: Vector<R, f32, Chips> = device
@@ -756,7 +751,6 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
             .vector_final()
             .commit_trim::<m![R % ({ Lane<R> }) # 8]>()
             .commit();
-        let rings = rows(device, &rings);
         let rings = per_row(device, &rings);
         // Window w's first visible token of each row, relative to the row's first window.
         let starts: Table<Chips, W, R> = starts.to_dm(&mut device.tdma);
@@ -772,17 +766,17 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
             .vector_final()
             .commit_trim::<m![R % ({ Lane<R> }) # 8]>()
             .commit();
-        let firsts: HbmTensor<f32, Chips, m![W, { Packets<R> }]> = firsts.to_hbm(&mut device.tdma);
-        let firsts: HbmTensor<f32, Chips, m![W, R]> = firsts.to_hbm(&mut device.tdma);
         let slots: RowSlots<Chips, R> = slots.to_dm(&mut device.tdma);
         let mut output: HbmTensor<f32, Chips, m![R, W, Cache]> = HbmTensor::new();
         for w in 0..extents.spanned.extent::<m![W]>() {
-            let mut start: HbmTensor<f32, Chips, m![R]> = HbmTensor::new();
+            // A row a cell first, so the window's starts land on the rows' slices as whole cells.
+            let mut start: HbmTensor<f32, Chips, m![R, 1 # 8]> = HbmTensor::new();
             firsts
                 .view()
-                .tile::<m![W], 1, m![W = 1 # W, R]>(w)
+                .tile::<m![W], 1, m![W = 1 # W, { Packets<R> }]>(w)
                 .to_hbm_view(&mut device.tdma, start.view_mut());
-            let start = per_row(device, &start);
+            let start: RowValues<Chips, R, f32> = start.to_dm(&mut device.tdma);
+            let start = scalar::register(device, &start);
             // u (u - width) < 0 for u = t + 1/2 - start exactly where token t is visible.
             let shifted: RowSlots<Chips, R> = device
                 .main
@@ -901,8 +895,15 @@ fn rows<R: AxisName, D: MaterializableScalar, Chips: M>(
     device: &mut Device,
     vector: &Vector<R, D, Chips>,
 ) -> HbmTensor<D, Chips, m![R]> {
-    let padded: HbmTensor<D, Chips, Packets<R>> = vector.to_hbm(&mut device.tdma);
-    padded.to_hbm(&mut device.tdma)
+    vector.to_hbm(&mut device.tdma)
+}
+
+/// The rows of a padded vector, a row a cell: a landing into data memory moves whole cells.
+fn cells<R: AxisName, D: MaterializableScalar, Chips: M>(
+    device: &mut Device,
+    vector: &Vector<R, D, Chips>,
+) -> HbmTensor<D, Chips, m![R, 1 # 8]> {
+    vector.to_hbm(&mut device.tdma)
 }
 
 fn operand<R: AxisName, Chips: M>(
@@ -962,13 +963,12 @@ pub(crate) fn live<R: AxisName, Chips: M>(
     vector(device, &output)
 }
 
-/// A per-row value on each row's slice.
+/// A padded vector's value of each row on the row's slice.
 fn per_row<R: AxisName, D: VeScalar + MaterializableScalar, Chips: M>(
     device: &mut Device,
-    values: &HbmTensor<D, Chips, m![R]>,
+    vector: &Vector<R, D, Chips>,
 ) -> PerRow<Chips, R, D> {
-    let padded: HbmTensor<D, Chips, m![R, 1 # 8]> = values.to_hbm(&mut device.tdma);
-    let rows: RowValues<Chips, R, D> = padded.to_dm(&mut device.tdma);
+    let rows: RowValues<Chips, R, D> = cells(device, vector).to_dm(&mut device.tdma);
     scalar::register(device, &rows)
 }
 
