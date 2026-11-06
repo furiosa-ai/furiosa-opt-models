@@ -7,7 +7,11 @@ use crate::ops::linear::{Contraction, Parted};
 use crate::tensor::cache::Blocks;
 use crate::tensor::cache::{Block, KeyValue};
 use crate::tensor::{
-    axis::Tile, live::Live, mapping::Rows as Layout, parallel::Chip, scalar::Value,
+    axis::{Lanes, Tile},
+    live::Live,
+    mapping::Rows as Layout,
+    parallel::Chip,
+    scalar::Value,
 };
 use furiosa_opt_std::prelude::*;
 use std::{io, marker::PhantomData};
@@ -123,12 +127,60 @@ impl<W: AxisName, R: M, D: MaterializableScalar, C: AxisName, Chips: M + 'static
     }
 }
 
-/// Rows of a table that lies by parts, a lane group of at most eight rows a transfer: each row is
-/// read from every part at its offset in the part.
+/// The live rows of a dense table's rows: each lane group that holds one, a transfer each; a later
+/// group's rows are left unwritten.
+impl<W: AxisName, R: M, D: MaterializableScalar, C: AxisName, Chips: M + 'static>
+    Op<(
+        &HbmTensor<D, Chips, m![{ R }, W]>,
+        &HbmTensor<i32, Chips, m![C]>,
+        Live<(), C>,
+    )> for Gather
+{
+    type Output = HbmTensor<D, Chips, m![C, W]>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (input, offsets, live): (
+            &HbmTensor<D, Chips, m![{ R }, W]>,
+            &HbmTensor<i32, Chips, m![C]>,
+            Live<(), C>,
+        ),
+    ) -> Self::Output {
+        if const { <Groups<C> as M>::SIZE == 1 } {
+            self.forward(device, (input, offsets))
+        } else {
+            let (first, count) = live.groups::<Lanes<C>>();
+            let mut output = HbmTensor::new();
+            for group in 0..count {
+                let group = first + group;
+                let mut index: Indices<Chips, C> = HbmTensor::new();
+                offsets
+                    .view()
+                    .tile::<Groups<C>, 1, m![{ Layout<C>::Selected }, { Layout<C>::Lanes }]>(group)
+                    .to_hbm_view(&mut device.tdma, index.view_mut());
+                let selected: Selected<Chips, W, C, D> = input
+                    .gather::<R, m![W]>()
+                    .by_byte_offsets(&index)
+                    .to_dm(&mut device.tdma);
+                selected.view().to_hbm_view(
+                    &mut device.tdma,
+                    output.view_mut().tile::<Groups<C>, 1, Write<W, C>>(group),
+                );
+            }
+            output
+        }
+    }
+}
+
+/// The live rows of a table that lies by parts, a lane group of at most eight rows a transfer:
+/// each row is read from every part at its offset in the part; a later group's rows are left
+/// unwritten.
 impl<W: AxisName, V: AxisName, C: AxisName, Chips: M + 'static>
     Op<(
         &HbmTensor<bf16, Chips, Parted<W, V>>,
         &HbmTensor<i32, Chips, m![C]>,
+        Live<(), C>,
     )> for Gather
 {
     type Output = HbmTensor<bf16, Chips, m![C, W]>;
@@ -136,17 +188,20 @@ impl<W: AxisName, V: AxisName, C: AxisName, Chips: M + 'static>
     fn forward(
         &self,
         device: &mut Device,
-        (input, offsets): (
+        (input, offsets, live): (
             &HbmTensor<bf16, Chips, Parted<W, V>>,
             &HbmTensor<i32, Chips, m![C]>,
+            Live<(), C>,
         ),
     ) -> Self::Output {
         type Part<W> = Symbol<Contraction<W>>;
         type Parts<W> = m![W / ({ Part<W> }), W % ({ Part<W> })];
         type Rows<Chips, W, C> =
             DmTensor<bf16, Chips, m![1 # 2], m![{ Layout<C>::Lanes } # 256], Parts<W>>;
+        let (first, count) = live.groups::<Lanes<C>>();
         let mut output = HbmTensor::new();
-        for group in 0..<Groups<C> as M>::SIZE {
+        for group in 0..count {
+            let group = first + group;
             let mut index: Indices<Chips, C> = HbmTensor::new();
             offsets
                 .view()

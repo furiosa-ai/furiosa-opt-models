@@ -16,7 +16,7 @@ use crate::ops::normalization::{self, FeatureSlices, Spread};
 use crate::specialize::vocabulary;
 use crate::tensor::form::Weight;
 use crate::tensor::mapping::Packets;
-use crate::tensor::{axis::Tile, mapping::Rows as Layout, parallel::Chip};
+use crate::tensor::{axis::Tile, live::Live, mapping::Rows as Layout, parallel::Chip};
 use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
 use std::borrow::Borrow;
@@ -117,11 +117,13 @@ pub trait Table<Chips: M + 'static> {
     /// Pass `at`'s rows.
     fn pass(&self, at: usize) -> HbmTensorView<'_, bf16, Chips, Self::Pass>;
 
-    /// The rows of the tokens `ids`, in order.
+    /// The rows of the tokens `ids`, in order: the live rows' lane groups; a later group's rows are
+    /// left unwritten.
     fn rows<R: AxisName>(
         &self,
         device: &mut Device,
         ids: &HbmTensor<i32, Chips, Packets<R>>,
+        live: Live<(), R>,
     ) -> HbmTensor<bf16, Chips, m![R, { Symbol<Self::Hidden> }]>;
 }
 
@@ -146,10 +148,11 @@ impl<Hidden: AxisName, V: AxisName, Chips: M + 'static> Table<Chips>
         &self,
         device: &mut Device,
         ids: &HbmTensor<i32, Chips, Packets<R>>,
+        live: Live<(), R>,
     ) -> HbmTensor<bf16, Chips, m![R, Hidden]> {
         let row = ByteOffset::<bf16, m![Hidden], m![R]>::default();
         let offsets = Op::forward(&row, &mut *device, ids);
-        Op::forward(&Gather, device, (self, &offsets))
+        Op::forward(&Gather, device, (self, &offsets, live))
     }
 }
 
@@ -174,10 +177,11 @@ impl<Hidden: AxisName, V: AxisName, Chips: M + 'static> Table<Chips>
         &self,
         device: &mut Device,
         ids: &HbmTensor<i32, Chips, Packets<R>>,
+        live: Live<(), R>,
     ) -> HbmTensor<bf16, Chips, m![R, Hidden]> {
         let row = ByteOffset::<bf16, m![Hidden % ({ Chunk<Hidden> })], m![R]>::default();
         let offsets = Op::forward(&row, &mut *device, ids);
-        Op::forward(&Gather, device, (self, &offsets))
+        Op::forward(&Gather, device, (self, &offsets, live))
     }
 }
 
@@ -195,8 +199,9 @@ impl<T: Table<Chips>, Chips: M + 'static> Table<Chips> for &T {
         &self,
         device: &mut Device,
         ids: &HbmTensor<i32, Chips, Packets<R>>,
+        live: Live<(), R>,
     ) -> HbmTensor<bf16, Chips, m![R, { Symbol<Self::Hidden> }]> {
-        (**self).rows(device, ids)
+        (**self).rows(device, ids, live)
     }
 }
 
@@ -214,8 +219,9 @@ impl<S: M, T: Table<Chips>, Chips: M + 'static> Table<Chips> for Weight<S, Chips
         &self,
         device: &mut Device,
         ids: &HbmTensor<i32, Chips, Packets<R>>,
+        live: Live<(), R>,
     ) -> HbmTensor<bf16, Chips, m![R, { Symbol<Self::Hidden> }]> {
-        self.held().rows(device, ids)
+        self.held().rows(device, ids, live)
     }
 }
 

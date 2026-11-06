@@ -266,7 +266,7 @@ where
 
 /// The rows of a launch's tokens in the decoder's feature mapping, with the launch's live rows:
 /// each token's table row gathered whole as the table lies, so any width a row's slices hold
-/// serves, then landed in the feature slices.
+/// serves, then landed in the feature slices; a row past the live rows' lane groups is unspecified.
 impl<
     'x,
     Vocabulary: AxisName,
@@ -289,7 +289,7 @@ where
         _: &mut (),
         (ids, tiles): (&'x Ids<Rows, Chips>, Live<(), Rows>),
     ) -> Self::Output {
-        let rows = self.weight.rows(&mut *device, ids);
+        let rows = self.weight.rows(&mut *device, ids, tiles);
         tiles.with(rows.to_dm(&mut device.tdma))
     }
 }
