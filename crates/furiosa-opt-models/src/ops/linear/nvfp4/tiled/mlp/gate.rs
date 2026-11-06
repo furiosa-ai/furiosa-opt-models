@@ -303,8 +303,6 @@ pub(super) fn sweep<H: AxisName, I: AxisName, R: AxisName>(
     } else {
         resident::<H, I, R, 512, 8>(device, &packed)
     };
-    let g1 = gate.load(device, 1);
-    let u1 = up.load(device, 1);
     let restore =
         |device: &mut Device, packed: super::super::panels::Packed<H, I>| -> Weight<H, I> {
             let value = block::restore(device, packed.0, packed.1);
@@ -315,8 +313,10 @@ pub(super) fn sweep<H: AxisName, I: AxisName, R: AxisName>(
     let mut b0 = Both::new();
     let first = lanes(device, &input, 0, 0, rows);
     let first = panel::<H, I, R, false>(device, &input, (&g0, &u0), None, &mut b0, first, 0, rows);
-    let g2 = gate.load(device, 2);
-    let u2 = up.load(device, 2);
+    // Issue the next packed slab after the current contractions, so it overlaps
+    // their execution without staying resident through two BF16 restores.
+    let g1 = gate.load(device, 1);
+    let u1 = up.load(device, 1);
     let (g1, u1) = (restore(device, g1), restore(device, u1));
     let mut b1 = Both::new();
     let first = panel::<H, I, R, true>(
@@ -329,8 +329,8 @@ pub(super) fn sweep<H: AxisName, I: AxisName, R: AxisName>(
         1,
         rows,
     );
-    let g3 = gate.load(device, 3);
-    let u3 = up.load(device, 3);
+    let g2 = gate.load(device, 2);
+    let u2 = up.load(device, 2);
     let (g2, u2) = (restore(device, g2), restore(device, u2));
     let mut b2 = Both::new();
     let first = panel::<H, I, R, true>(
@@ -343,6 +343,8 @@ pub(super) fn sweep<H: AxisName, I: AxisName, R: AxisName>(
         2,
         rows,
     );
+    let g3 = gate.load(device, 3);
+    let u3 = up.load(device, 3);
     let down1 = down.stage(device, 1);
     let g3 = restore(device, g3);
     let (g, first) = last(device, &input, &g3, &b2, 0, &gate.scales, first, rows);

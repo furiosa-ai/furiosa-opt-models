@@ -50,6 +50,14 @@ type Lanes<I, O, R, K, const W: usize> = TrfTensor<
     Cluster<I>,
     Partition<I, O>,
     m![R % 8],
+    m![R % {W} / 16, { Symbol<K> } / 32, {Symbol<K>} % 32 / 16, R % 16 / 8, {Symbol<K>} % 16],
+>;
+type RestoredLanes<I, O, R, K, const W: usize> = TrfTensor<
+    bf16,
+    Chip,
+    Cluster<I>,
+    Partition<I, O>,
+    m![R % 8],
     m![R % {W} / 16, { Symbol<K> } / 32, I % 32 / 16, R % 16 / 8, I % 16],
 >;
 type Partial<I, O, R, const W: usize> =
@@ -159,10 +167,15 @@ impl<I: AxisName, O: AxisName> Down<I, O> {
         wave: usize,
         groups: usize,
     ) -> Lanes<I, O, R, K, W> {
-        let stream = device.sub.begin(input.view().tile::<m![R / {W}],1,
-            m![{Symbol<K>} / 32,R / {W} = 1 # (R / {W}),R % {W},I % 32]>(wave))
-            .fetch::<m![R % 8,R % {W} / 16,{Symbol<K>} / 32,I % 32 / 16,R % 16 / 8],m![I % 16]>()
-            .collect::<m![R % 8,R % {W} / 16,{Symbol<K>} / 32,I % 32 / 16,R % 16 / 8],m![I % 16]>()
+        // SAFETY: only rename the contiguous local 32-input stripe; I owners stay fixed.
+        let input = unsafe {
+            input.view().reshape::<Chip, Cluster<I>, Partition<I, O>,
+            m![{Symbol<K>} / 32, R, {Symbol<K>} % 32]>()
+        };
+        let stream = device.sub.begin(input.tile::<m![R / {W}],1,
+            m![{Symbol<K>} / 32,R / {W} = 1 # (R / {W}),R % {W},{Symbol<K>} % 32]>(wave))
+            .fetch::<m![R % 8,R % {W} / 16,{Symbol<K>} / 32,{Symbol<K>} % 32 / 16,R % 16 / 8],m![{Symbol<K>} % 16]>()
+            .collect::<m![R % 8,R % {W} / 16,{Symbol<K>} / 32,{Symbol<K>} % 32 / 16,R % 16 / 8],m![{Symbol<K>} % 16]>()
             ;
         if W == 16 {
             stream.to_trf()
@@ -172,24 +185,52 @@ impl<I: AxisName, O: AxisName> Down<I, O> {
     }
 
     // Pack two future output owners (O bit 4), not two local output features.
-    // Row bit 3 is a TRF-only time broadcast. This reuses streamed weights and
-    // preserves the efficient inter-slice reduction order with FP32 output.
+    // Row bit 3 is a TRF-only time broadcast. Group the local output bits
+    // together so packed fetch and FP32 scale addressing fit eight sequencer entries.
     fn contract<R: AxisName, K: AxisName, const W: usize, E: M>(
         device: &mut Device,
-        weight: &Weight<I, O, bf16, K>,
+        weight: &Packed<I, O, K>,
         input: &Lanes<I, O, R, K, W>,
         output: DmTensorViewMut<'_, f32, Chip, Cluster<I>, m![O / 16], E>,
         groups: usize,
     ) {
-        let result = device.main.begin(weight.view())
-            .fetch::<m![R % {W} / 16,O % 16 / 2,O % 512 / 32,O % 2,{Symbol<K>} / 32,I % 32 / 16,O % 32 / 16],m![I % 16]>()
-            .collect::<m![R % {W} / 16,O % 16 / 2,O % 512 / 32,O % 2,{Symbol<K>} / 32,I % 32 / 16,O % 32 / 16],m![I % 16]>()
-            .contract_outer::<m![R % {W} / 16,O % 16 / 2,O % 512 / 32,O % 2,{Symbol<K>} / 32,I % 32 / 16,R % 16 / 8],m![O % 32 / 16,I % 16],_,_,_>(input)
+        // SAFETY: K names this panel's local input coordinates without changing storage.
+        let codes = unsafe {
+            weight.0.view().reshape::<Chip, Cluster<I>, Partition<I, O>,
+            m![{Symbol<K>} / 32, O % 512, {Symbol<K>} % 32]>()
+        };
+        let blocks = unsafe {
+            weight.1.view().reshape::<Chip, Cluster<I>, Partition<I, O>,
+            m![{Symbol<K>} / 32, O % 512, {Symbol<K>} % 32 / 16]>()
+        };
+        let scales: VrfTensor<
+            f32,
+            Chip,
+            Cluster<I>,
+            Partition<I, O>,
+            m![{Symbol<K>} / 32, O % 512, {Symbol<K>} % 32 / 16],
+        > = device
+            .sub
+            .begin(blocks)
+            .fetch::<m![{Symbol<K>} / 32,O % 512 / 4], m![O % 4,{Symbol<K>} % 32 / 16]>()
+            .fetch_cast::<f32>()
+            .collect::<m![{Symbol<K>} / 32,O % 512 / 4], m![O % 4,{Symbol<K>} % 32 / 16]>()
+            .to_vrf();
+        let result = device.main.begin(codes)
+            .fetch::<m![R % {W} / 16,O % 512 / 32,O % 16,{Symbol<K>} / 32,{Symbol<K>} % 32 / 16,O % 32 / 16],m![{Symbol<K>} % 16]>()
+            .fetch_table_lookup::<bf16>()
+            .collect::<m![R % {W} / 16,O % 512 / 32,O % 16,{Symbol<K>} / 32,{Symbol<K>} % 32 / 16,O % 32 / 16],m![{Symbol<K>} % 16]>()
+            .contract_outer::<m![R % {W} / 16,O % 512 / 32,O % 16,{Symbol<K>} / 32,{Symbol<K>} % 32 / 16,R % 16 / 8],m![O % 32 / 16,{Symbol<K>} % 16],_,_,_>(input)
             .contract_packet::<m![O % 32 / 16]>()
-            .contract_time::<m![R % {W} / 16,O % 16 / 2,O % 512 / 32,O % 2,R % 16 / 8]>()
-            .contract_lane::<m![R % {W} / 16,O % 16 / 2,O % 512 / 32,O % 2,R % 16 / 8,O % 32 / 16],m![R % 8]>(LaneMode::Interleaved)
+            .contract_time::<m![R % {W} / 16,O % 512 / 32,O % 16,{Symbol<K>} / 32,{Symbol<K>} % 32 / 16,R % 16 / 8]>()
+            .contract_lane::<m![R % {W} / 16,O % 512 / 32,O % 16,{Symbol<K>} / 32,{Symbol<K>} % 32 / 16,R % 16 / 8,O % 32 / 16],m![R % 8]>(LaneMode::Interleaved)
             .vector_init()
-            .vector_inter_slice_reduce::<m![O / 16],m![R % {W} / 16,O % 16 / 2,O % 2,R % 16 / 8]>(InterSliceReduceOpF32::Add)
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_split::<m![R % {W} / 16,O % 512 / 32,O % 16,{Symbol<K>} / 32,{Symbol<K>} % 32 / 16,R % 16 / 8,O % 32 / 16,R % 8 / 4],m![R % 4]>()
+            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &scales)
+            .vector_intra_slice_reduce::<K,m![R % {W} / 16,O % 512 / 32,O % 16,R % 16 / 8,O % 32 / 16,R % 8 / 4],m![R % 4]>(IntraSliceReduceOpF32::Add)
+            .vector_widen_concat::<m![R % {W} / 16,O % 512 / 32,O % 16,R % 16 / 8,O % 32 / 16],m![R % 8]>()
+            .vector_inter_slice_reduce::<m![O / 16],m![R % {W} / 16,O % 16,R % 16 / 8]>(InterSliceReduceOpF32::Add)
             .vector_final()
             .transpose::<m![R % {W} / 16,O % 16 / 2,R % 16],m![O % 2 # 8]>()
             .commit_trim::<m![O % 2]>();
@@ -202,7 +243,7 @@ impl<I: AxisName, O: AxisName> Down<I, O> {
 
     fn panel<R: AxisName, K: AxisName, const W: usize, const ADD: bool>(
         device: &mut Device,
-        weight: &Weight<I, O, bf16, K>,
+        weight: &Packed<I, O, K>,
         input: &Activation<I, O, R, K>,
         previous: Option<&Accum<I, O, R>>,
         output: &mut Accum<I, O, R>,
@@ -260,7 +301,6 @@ impl<I: AxisName, O: AxisName> Down<I, O> {
         next: N,
     ) -> (Owned<O, R>, N::Output) {
         let (first, second) = first;
-        let first = Self::restore(device, first);
         let mut b0 = Accum::new();
         let input0 = Self::land::<R, Wide, 2>(device, product, 0, rows);
         let tail = self.load::<Tail, 1>(device, 6);
@@ -271,19 +311,170 @@ impl<I: AxisName, O: AxisName> Down<I, O> {
         let third = self.stage(device, 2);
         // These loads follow command issuance, so they can execute during down 0.
         let input1 = Self::land::<R, Wide, 2>(device, product, 2, rows);
-        let second = Self::restore(device, second);
         next.between(device);
         let next = next.at(device);
         let mut b1 = Accum::new();
         Self::panel::<R, Wide, W, true>(device, &second, &input1, Some(&b0), &mut b1, rows);
         let input2 = Self::land::<R, Wide, 2>(device, product, 4, rows);
-        let third = Self::restore(device, third);
         let mut b2 = Accum::new();
         Self::panel::<R, Wide, W, true>(device, &third, &input2, Some(&b1), &mut b2, rows);
         let input3 = Self::land::<R, Tail, 1>(device, product, 6, rows);
-        let tail = block::restore(device, tail.0, tail.1);
         let mut b3 = Accum::new();
         Self::panel::<R, Tail, W, true>(device, &tail, &input3, Some(&b2), &mut b3, rows);
+        let output = if rows <= 16 {
+            self.finish::<R, 16>(device, &b3)
+        } else if rows <= 128 {
+            self.finish::<R, 128>(device, &b3)
+        } else {
+            self.finish::<R, 256>(device, &b3)
+        };
+        (output, next.finish(device))
+    }
+
+    fn lanes_restored<R: AxisName, K: AxisName, const W: usize>(
+        device: &mut Device,
+        input: &Activation<I, O, R, K>,
+        wave: usize,
+        groups: usize,
+    ) -> RestoredLanes<I, O, R, K, W> {
+        let stream = device.sub.begin(input.view().tile::<m![R / {W}],1,
+            m![{Symbol<K>} / 32,R / {W} = 1 # (R / {W}),R % {W},I % 32]>(wave))
+            .fetch::<m![R % 8,R % {W} / 16,{Symbol<K>} / 32,I % 32 / 16,R % 16 / 8],m![I % 16]>()
+            .collect::<m![R % 8,R % {W} / 16,{Symbol<K>} / 32,I % 32 / 16,R % 16 / 8],m![I % 16]>()
+            ;
+        if W == 16 {
+            stream.to_trf()
+        } else {
+            stream.to_trf_prefix::<m![R % { W } / 16], _, _>(groups)
+        }
+    }
+
+    // Pack two future output owners (O bit 4), not two local output features.
+    // Row bit 3 is a TRF-only time broadcast. This reuses streamed weights and
+    // preserves the efficient inter-slice reduction order with FP32 output.
+    fn contract_restored<R: AxisName, K: AxisName, const W: usize, E: M>(
+        device: &mut Device,
+        weight: &Weight<I, O, bf16, K>,
+        input: &RestoredLanes<I, O, R, K, W>,
+        output: DmTensorViewMut<'_, f32, Chip, Cluster<I>, m![O / 16], E>,
+        groups: usize,
+    ) {
+        let result = device.main.begin(weight.view())
+            .fetch::<m![R % {W} / 16,O % 16 / 2,O % 512 / 32,O % 2,{Symbol<K>} / 32,I % 32 / 16,O % 32 / 16],m![I % 16]>()
+            .collect::<m![R % {W} / 16,O % 16 / 2,O % 512 / 32,O % 2,{Symbol<K>} / 32,I % 32 / 16,O % 32 / 16],m![I % 16]>()
+            .contract_outer::<m![R % {W} / 16,O % 16 / 2,O % 512 / 32,O % 2,{Symbol<K>} / 32,I % 32 / 16,R % 16 / 8],m![O % 32 / 16,I % 16],_,_,_>(input)
+            .contract_packet::<m![O % 32 / 16]>()
+            .contract_time::<m![R % {W} / 16,O % 16 / 2,O % 512 / 32,O % 2,R % 16 / 8]>()
+            .contract_lane::<m![R % {W} / 16,O % 16 / 2,O % 512 / 32,O % 2,R % 16 / 8,O % 32 / 16],m![R % 8]>(LaneMode::Interleaved)
+            .vector_init()
+            .vector_inter_slice_reduce::<m![O / 16],m![R % {W} / 16,O % 16 / 2,O % 2,R % 16 / 8]>(InterSliceReduceOpF32::Add)
+            .vector_final()
+            .transpose::<m![R % {W} / 16,O % 16 / 2,R % 16],m![O % 2 # 8]>()
+            .commit_trim::<m![O % 2]>();
+        if W == 16 {
+            result.commit_view(output);
+        } else {
+            result.commit_prefix::<m![R % { W } / 16], _, _>(output, groups);
+        }
+    }
+
+    fn panel_restored<R: AxisName, K: AxisName, const W: usize, const ADD: bool>(
+        device: &mut Device,
+        weight: &Weight<I, O, bf16, K>,
+        input: &Activation<I, O, R, K>,
+        previous: Option<&Accum<I, O, R>>,
+        output: &mut Accum<I, O, R>,
+        rows: usize,
+    ) {
+        let groups = rows.div_ceil(16);
+        let mut current = Self::lanes_restored::<R, K, W>(device, input, 0, groups);
+        let mut part = Partial::<I, O, R, W>::new();
+        // Keep the accumulator views statically indexed. Runtime-indexed views
+        // failed the A16 MLP-to-QKV transition when next-layer preparation was
+        // live. Static waves preserve the overlap without copies or snapshots.
+        // The compact branch has at most 16 rows; prefill has two span waves.
+        let waves = if W == 16 { 1 } else { R::SIZE / W };
+        #[unroll]
+        for wave in 0..waves {
+            if wave * W < rows {
+                let next = Self::lanes_restored::<R, K, W>(
+                    device,
+                    input,
+                    (wave + 1) % (R::SIZE / W),
+                    groups - groups.min(W / 16 * (wave + 1)),
+                );
+                let live = groups - W / 16 * wave;
+                let target = output
+                    .view_mut()
+                    .tile::<m![R / { W }], 1, m![R / {W} = 1 #{!} (R / {W}),R % {W},O % 16]>(wave);
+                if ADD {
+                    Self::contract_restored::<R, K, W, _>(
+                        device,
+                        weight,
+                        &current,
+                        part.view_mut(),
+                        live,
+                    );
+                    let old = previous
+                        .unwrap()
+                        .view()
+                        .tile::<m![R / { W }], 1, m![R / {W} = 1 # (R / {W}),R % {W},O % 16]>(wave)
+                        .unpad::<m![R % { W }, O % 16]>();
+                    super::sum_into::<_, _, m![R % { W }], m![O % 16], m![R % { W } / 8], _, _>(
+                        device,
+                        old,
+                        part.view(),
+                        target,
+                        live * 2,
+                    );
+                } else {
+                    Self::contract_restored::<R, K, W, _>(device, weight, &current, target, live);
+                }
+                current = next;
+            }
+        }
+    }
+
+    fn run_restored<R: AxisName, const W: usize, N: Points<Device>>(
+        &self,
+        device: &mut Device,
+        product: &impl Product<I, R>,
+        first: Ahead<I, O>,
+        rows: usize,
+        next: N,
+    ) -> (Owned<O, R>, N::Output) {
+        let (first, second) = first;
+        let first = Self::restore(device, first);
+        let mut b0 = Accum::new();
+        let input0 = Self::land::<R, Wide, 2>(device, product, 0, rows);
+        let tail = self.load::<Tail, 1>(device, 6);
+        let mut next = next.at(device);
+        Self::panel_restored::<R, Wide, W, false>(device, &first, &input0, None, &mut b0, rows);
+        // Fetch panel 2 during down 0, after gate/up buffers have been released.
+        // This bounds SRAM while retaining O-weight reuse across spans.
+        let third = self.stage(device, 2);
+        // These loads follow command issuance, so they can execute during down 0.
+        let input1 = Self::land::<R, Wide, 2>(device, product, 2, rows);
+        let second = Self::restore(device, second);
+        next.between(device);
+        let next = next.at(device);
+        let mut b1 = Accum::new();
+        Self::panel_restored::<R, Wide, W, true>(
+            device,
+            &second,
+            &input1,
+            Some(&b0),
+            &mut b1,
+            rows,
+        );
+        let input2 = Self::land::<R, Wide, 2>(device, product, 4, rows);
+        let third = Self::restore(device, third);
+        let mut b2 = Accum::new();
+        Self::panel_restored::<R, Wide, W, true>(device, &third, &input2, Some(&b1), &mut b2, rows);
+        let input3 = Self::land::<R, Tail, 1>(device, product, 6, rows);
+        let tail = block::restore(device, tail.0, tail.1);
+        let mut b3 = Accum::new();
+        Self::panel_restored::<R, Tail, W, true>(device, &tail, &input3, Some(&b2), &mut b3, rows);
         let output = if rows <= 16 {
             self.finish::<R, 16>(device, &b3)
         } else if rows <= 128 {
@@ -338,7 +529,7 @@ impl<I: AxisName, O: AxisName> Down<I, O> {
         if rows <= 16 {
             self.run::<R, 16, N>(device, product, first, rows, next)
         } else {
-            self.run::<R, 256, N>(device, product, first, rows, next)
+            self.run_restored::<R, 256, N>(device, product, first, rows, next)
         }
     }
 }

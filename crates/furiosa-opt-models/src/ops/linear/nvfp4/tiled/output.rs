@@ -1,7 +1,7 @@
-//! Weight-stationary O projection partitioned across clusters by input features.
-//! Each slice restores a [256 output, 128 input] BF16 tile into 64 KiB of TRF.
-//! Only the owned input columns land in each cluster. FP32 partials exchange in
-//! DM and add before tensor scaling and the single final BF16 rounding.
+//! O projection partitioned across clusters by input features. Up to 32 live rows
+//! keep BF16 activations in TRF and decode packed codes into 16-input dot products.
+//! Larger launches restore one BF16 weight tile per slice and reuse it across
+//! 128-row waves. Cluster partials add before tensor scaling and BF16 rounding.
 use super::{Scales as Factors, block};
 use crate::Op;
 use crate::ops::linear::nvfp4::tiled::prefetch::Points;
@@ -32,8 +32,11 @@ type Slices<I, O> = m![O / 256, I % (I / 2) / 128];
 type Reduced<O> = m![O / 16];
 type Weight<I, O, D> = DmTensor<D, Chip, Cluster<I>, Slices<I, O>, m![O % 256, I % 128]>;
 type Scales<I, O> = DmTensor<f8e4m3, Chip, Cluster<I>, Slices<I, O>, m![O % 256, I % 128 / 16]>;
-type Operand<I, O> =
+type Operand<I, O, R, const P: usize> =
+    TrfTensor<bf16, Chip, Cluster<I>, Slices<I, O>, m![R % 8], m![R % { P } / 8, I % 128]>;
+type WeightOperand<I, O> =
     TrfTensor<bf16, Chip, Cluster<I>, Slices<I, O>, m![O % 8], m![O % 256 / 8, I % 128]>;
+type BlockScales<I, O> = VrfTensor<f32, Chip, Cluster<I>, Slices<I, O>, m![O % 256, I % 128 / 16]>;
 type Partial<I, O, R, const P: usize> =
     DmTensor<f32, Chip, Cluster<I>, Reduced<O>, m![R % { P }, O % 16]>;
 type Factor<I, O> = VrfTensor<f32, Chip, Selected<I>, Reduced<O>, m![1 # 8]>;
@@ -66,10 +69,63 @@ impl<I: AxisName, O: AxisName> Output<I, O> {
         result
     }
 
+    fn block_scales(device: &mut Device, weight: &Scales<I, O>) -> BlockScales<I, O> {
+        device
+            .sub
+            .begin(weight.view())
+            .fetch::<m![O % 256], m![I % 128 / 16]>()
+            .fetch_cast::<f32>()
+            .collect::<m![O % 256], m![I % 128 / 16]>()
+            .to_vrf()
+    }
+
+    fn project<R: AxisName, const P: usize, E: M, F: M>(
+        device: &mut Device,
+        weight: &Weight<I, O, f4e2m1>,
+        scales: &BlockScales<I, O>,
+        input: DmTensorView<'_, bf16, Chip, Cluster<I>, Slices<I, O>, E>,
+        output: DmTensorViewMut<'_, f32, Chip, Cluster<I>, Reduced<O>, F>,
+    ) {
+        let input: Operand<I, O, R, P> = device
+            .sub
+            .begin(input)
+            .fetch::<m![R % 8, R % { P } / 8, I % 128 / 16], m![I % 16]>()
+            .collect::<m![R % 8, R % { P } / 8, I % 128 / 16], m![I % 16]>()
+            .to_trf();
+        device
+            .main
+            .begin(weight.view())
+            .fetch::<m![O % 256, I % 128 / 64], m![I % 64]>()
+            .fetch_table_lookup::<bf16>()
+            .collect::<m![O % 256, I % 128 / 16], m![I % 16]>()
+            .contract_outer::<m![O % 256, I % 128 / 16, R % { P } / 8], m![I % 16], _, _, _>(&input)
+            .contract_packet::<m![1]>()
+            .contract_time::<m![O % 256, I % 128 / 16, R % { P } / 8]>()
+            .contract_lane::<m![O % 256, I % 128 / 16, R % { P } / 8], m![R % 8]>(
+                LaneMode::Interleaved,
+            )
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_split::<m![O % 256, I % 128 / 16, R % { P } / 4], m![R % 4]>()
+            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), scales)
+            .vector_intra_slice_reduce::<I, m![O % 256, R % { P } / 4], m![R % 4]>(
+                IntraSliceReduceOpF32::Add,
+            )
+            .vector_widen_concat::<m![O % 256, R % { P } / 8], m![R % 8]>()
+            .vector_inter_slice_reduce::<Reduced<O>, m![O % 16, R % { P } / 8]>(
+                InterSliceReduceOpF32::Add,
+            )
+            .vector_final()
+            // FP32 transpose emits two output columns per padded flit.
+            .transpose::<m![O % 16 / 2, R % { P }], m![O % 2 # 8]>()
+            .commit_trim::<m![O % 2]>()
+            .commit_view(output);
+    }
+
     fn pass<R: AxisName, All: AxisName, const PASS: usize, N: Points<Device>>(
         &self,
         device: &mut Device,
-        weight: &Operand<I, O>,
+        weight: &Staged<I, O>,
         input: &Rows<All, I>,
         output: &mut Owned<O, R>,
         at: usize,
@@ -83,25 +139,15 @@ impl<I: AxisName, O: AxisName> Output<I, O> {
         let window = unsafe { window.reshape::<Chip, m![R % {PASS} # All, I]>() };
         let input: DmTensor<bf16, Chip, Cluster<I>, Slices<I, O>, m![R % { PASS }, I % 128]> =
             window.to_dm(&mut device.tdma);
-        // Stream BF16 activations directly from their landed DM buffer.
-        let partial: Partial<I, O, R, PASS> = device
-            .main
-            .begin(input.view())
-            .fetch::<m![R % { PASS }, O % 256 / 8, I % 128 / 16], m![I % 16]>()
-            .collect::<m![R % { PASS }, O % 256 / 8, I % 128 / 16], m![I % 16]>()
-            .contract_outer::<m![R % { PASS }, O % 256 / 8, I % 128 / 32], m![I % 32], _, _, _>(
-                weight,
-            )
-            .contract_packet::<m![1]>()
-            .contract_time::<m![R % { PASS }, O % 256 / 8]>()
-            .contract_lane::<m![R % { PASS }, O % 256 / 8], m![O % 8]>(LaneMode::Interleaved)
-            .vector_init()
-            .vector_inter_slice_reduce::<Reduced<O>, m![R % { PASS }, O % 16 / 8]>(
-                InterSliceReduceOpF32::Add,
-            )
-            .vector_final()
-            .commit_trim::<m![O % 8]>()
-            .commit();
+        let scales = Self::block_scales(device, &weight.1);
+        let mut partial: Partial<I, O, R, PASS> = DmTensor::new();
+        Self::project::<R, PASS, _, _>(
+            device,
+            &weight.0,
+            &scales,
+            input.view(),
+            partial.view_mut(),
+        );
         // Request following operands before enqueueing the output transfer. Otherwise
         // that DMA waits for this contraction and holds the prefetch behind it.
         let next = next.at(device);
@@ -109,11 +155,12 @@ impl<I: AxisName, O: AxisName> Output<I, O> {
         Self::handoff::<R, PASS>(device, &partial, &factor, output, at);
         next
     }
+
     // Four 32-row owners share BF16 input blocks, broadcast over the switch.
     fn compact_pass<R: AxisName, All: AxisName, N: Points<Device>>(
         &self,
         device: &mut Device,
-        weight: &Operand<I, O>,
+        weight: &WeightOperand<I, O>,
         factor: &Factor<I, O>,
         input: &Rows<All, I>,
         output: &mut Owned<O, R>,
@@ -198,6 +245,8 @@ impl<I: AxisName, O: AxisName> Output<I, O> {
             .vector_intra_slice_unzip::<Term, m![R % {P}, O % 16 / 8]>()
             .vector_narrow_split::<m![R % {P}, O % 16 / 4], m![O % 4]>()
             .vector_fp_zip(FpBinaryOp::AddF)
+            // Scaling shares the mandatory cluster-combine pass. Moving it into
+            // each partial would not remove a pass and would round before the add.
             .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), factor)
             .vector_widen_concat::<m![R % {P}, O % 16 / 8], m![O % 8]>()
             .vector_final()
@@ -252,22 +301,23 @@ impl<I: AxisName, O: AxisName> Output<I, O> {
         const {
             assert!(I::SIZE == 4096 && O::SIZE == 4096 && R::SIZE == 512);
         }
-        let weight = block::restore_view(device, weight.0.view(), weight.1.view());
-        // Attention's hook stages packed DM only. TRF becomes resident after attention.
-        let resident: Operand<I, O> = device
-            .sub
-            .begin(weight.view())
-            .fetch::<m![O % 8, O % 256 / 8, I % 128 / 16], m![I % 16]>()
-            .collect::<m![O % 8, O % 256 / 8, I % 128 / 16], m![I % 16]>()
-            .to_trf();
         let mut output = Owned::new();
         // Small launches need one live 8/32-row pass. Its tensor factor loads
         // after the first contraction and the following-operand prefetch hook.
         let next = if live.rows() <= 8 {
-            self.pass::<R, All, 8, _>(device, &resident, input, &mut output, 0, start, next)
+            self.pass::<R, All, 8, _>(device, weight, input, &mut output, 0, start, next)
         } else if live.rows() <= 32 {
-            self.pass::<R, All, 32, _>(device, &resident, input, &mut output, 0, start, next)
+            self.pass::<R, All, 32, _>(device, weight, input, &mut output, 0, start, next)
         } else {
+            // Restore once for all live 128-row waves. Attention's prefetch hook
+            // stages packed DM only; the weight TRF becomes resident here.
+            let weight = block::restore_view(device, weight.0.view(), weight.1.view());
+            let resident: WeightOperand<I, O> = device
+                .sub
+                .begin(weight.view())
+                .fetch::<m![O % 8, O % 256 / 8, I % 128 / 16], m![I % 16]>()
+                .collect::<m![O % 8, O % 256 / 8, I % 128 / 16], m![I % 16]>()
+                .to_trf();
             let factor = block::scalar::<Selected<I>, Reduced<O>>(device, &self.scales.output);
             let next = self.compact_pass(
                 device,

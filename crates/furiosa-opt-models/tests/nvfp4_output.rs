@@ -220,43 +220,49 @@ async fn streams_output_in_eight_and_32_row_passes() {
         .to_hbm(&mut device.pdma)
         .await
         .unwrap();
-    let count = count(&mut device, Rows::SIZE).await;
-    let result = launch(project_output, (&mut device, &projection, &count, &input))
-        .await
-        .unwrap()
-        .to_host::<m![Rows, OutputWidth]>(&mut device.pdma)
-        .await
-        .unwrap()
-        .into_vec();
-    let (mut checked, mut exact, mut max_rounding_units) = (0, 0, 0.0_f64);
-    for row in [0, 7, 31, 32, 127, 128, 255, 256, 511] {
-        for output in 0..OutputWidth::SIZE {
-            let (mut sum, mut absolute_sum) = (0.0_f64, 0.0_f64);
-            for input in 0..Hidden::SIZE {
-                let term = inputs[row * Hidden::SIZE + input].to_f32() as f64
-                    * codes[output * Hidden::SIZE + input].to_f32() as f64
-                    * scales[output * Hidden::SIZE / 16 + input / 16].to_f32() as f64;
-                sum += term;
-                absolute_sum += term.abs();
+    // Check both sides of the direct/restored boundary and retain the full launch.
+    for rows in [32, 33, Rows::SIZE] {
+        let count = count(&mut device, rows).await;
+        let result = launch(project_output, (&mut device, &projection, &count, &input))
+            .await
+            .unwrap()
+            .to_host::<m![Rows, OutputWidth]>(&mut device.pdma)
+            .await
+            .unwrap()
+            .into_vec();
+        let (mut checked, mut exact, mut max_rounding_units) = (0, 0, 0.0_f64);
+        for row in [0, 7, 31, 32, 127, 128, 255, 256, 511]
+            .into_iter()
+            .filter(|row| *row < rows)
+        {
+            for output in 0..OutputWidth::SIZE {
+                let (mut sum, mut absolute_sum) = (0.0_f64, 0.0_f64);
+                for input in 0..Hidden::SIZE {
+                    let term = inputs[row * Hidden::SIZE + input].to_f32() as f64
+                        * codes[output * Hidden::SIZE + input].to_f32() as f64
+                        * scales[output * Hidden::SIZE / 16 + input / 16].to_f32() as f64;
+                    sum += term;
+                    absolute_sum += term.abs();
+                }
+                let expected = sum * factor as f64;
+                let rounded = bf16::from_f32(expected as f32);
+                let ulp = 2.0_f64.powi(((rounded.to_bits() >> 7) & 255) as i32 - 127 - 7);
+                let actual = result[row * OutputWidth::SIZE + output];
+                let error = (actual.to_f32() as f64 - expected).abs();
+                // BF16 rounding plus a small FP32 accumulation allowance. The dense
+                // oracle is independent of the cluster, slice, and contraction order.
+                let tolerance = 0.5 * ulp + 1e-6 * absolute_sum * (factor as f64).abs();
+                assert!(
+                    actual.to_f32().is_finite() && error <= tolerance,
+                    "dense oracle rows={rows} row={row} output={output}: actual={actual:?} expected={expected} error={error} tolerance={tolerance}"
+                );
+                checked += 1;
+                exact += usize::from(actual == rounded);
+                max_rounding_units = max_rounding_units.max(error / ulp);
             }
-            let expected = sum * factor as f64;
-            let rounded = bf16::from_f32(expected as f32);
-            let ulp = 2.0_f64.powi(((rounded.to_bits() >> 7) & 255) as i32 - 127 - 7);
-            let actual = result[row * OutputWidth::SIZE + output];
-            let error = (actual.to_f32() as f64 - expected).abs();
-            // BF16 rounding plus a small FP32 accumulation allowance. The dense
-            // oracle is independent of the cluster, slice, and contraction order.
-            let tolerance = 0.5 * ulp + 1e-6 * absolute_sum * (factor as f64).abs();
-            assert!(
-                actual.to_f32().is_finite() && error <= tolerance,
-                "dense oracle row={row} output={output}: actual={actual:?} expected={expected} error={error} tolerance={tolerance}"
-            );
-            checked += 1;
-            exact += usize::from(actual == rounded);
-            max_rounding_units = max_rounding_units.max(error / ulp);
         }
+        eprintln!(
+            "Dense FP64 oracle rows={rows}: {exact}/{checked} match rounded reference; max error {max_rounding_units:.6} BF16 ULP"
+        );
     }
-    eprintln!(
-        "Dense FP64 oracle: {exact}/{checked} match rounded reference; max error {max_rounding_units:.6} BF16 ULP"
-    );
 }

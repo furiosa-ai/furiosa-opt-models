@@ -175,9 +175,9 @@ pub fn inspect_qkv_heads<H: AxisName, Q: AxisName, K: AxisName, R: AxisName>(
     };
     {
         let (q, k, v) = (
-            qkv_resident::prepare(device, projections.0),
-            qkv_resident::prepare(device, projections.1),
-            qkv_resident::prepare(device, projections.2),
+            qkv_resident::prepare(device, projections.0, rows),
+            qkv_resident::prepare(device, projections.1, rows),
+            qkv_resident::prepare(device, projections.2, rows),
         );
         qkv_resident::consume(
             device,

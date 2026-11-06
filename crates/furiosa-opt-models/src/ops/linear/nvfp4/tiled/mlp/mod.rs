@@ -11,6 +11,7 @@ mod compact;
 pub mod down;
 mod gate;
 mod product;
+mod restored_compact;
 
 pub use down::Down;
 
@@ -152,12 +153,14 @@ pub(crate) fn forward_prepared<H: AxisName, I: AxisName, R: AxisName, N: Points<
         assert!(H::SIZE == 4096 && I::SIZE == 14336 && R::SIZE == 512);
     }
     let mut product = Products::new();
-    let first = if rows <= 16 {
-        compact::prepare::<H, I, R, 16>(device, gate, up, down, input, entry, &mut product)
-    } else {
+    let first = if rows > 16 {
         let (g, u, first) = gate::sweep::<H, I, R>(device, gate, up, down, input, rows, entry);
         product::stage(device, &g, &u, rows, &mut product);
         first
+    } else if rows > 8 {
+        restored_compact::prepare::<H, I, R, 16>(device, gate, up, down, input, entry, &mut product)
+    } else {
+        compact::prepare::<H, I, R, 8>(device, gate, up, down, input, entry, &mut product)
     };
     down.forward(device, &product, first, rows, next)
 }

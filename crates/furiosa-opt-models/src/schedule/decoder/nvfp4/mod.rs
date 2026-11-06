@@ -68,6 +68,7 @@ impl<'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, Size>, Env, launch::S
                 norm: &first_norm.0,
                 qkv: &attention.0.qkv.projection,
                 enabled: true,
+                rows: tile.rows(),
             }
             .load(device);
             let rows = Op::forward(&gain, &mut *device, &rows);
@@ -169,6 +170,7 @@ impl<'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, Size>, Env, launch::S
                         norm: &next_norm.0,
                         qkv: &next_attention.0.qkv.projection,
                         enabled: index + 1 < DEPTH,
+                        rows: tile.rows(),
                     },
                 );
                 let output = Op::forward(&Add, &mut *device, (&residual, &tile.with(output)));
@@ -232,6 +234,7 @@ pub fn inspect_transition(
             norm,
             qkv,
             enabled: true,
+            rows,
         },
     );
     let live = Live::<(), Span>::all().subrange(0, rows);

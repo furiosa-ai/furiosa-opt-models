@@ -1,4 +1,4 @@
-//! Complete restored QKV operands and norm gain, hosted by the preceding MLP's down panels.
+//! Packed QKV operands and norm gain, hosted by the preceding MLP's down panels.
 use super::*;
 use crate::ops::linear::nvfp4::tiled::prefetch::{Issued, Points};
 use crate::ops::linear::nvfp4::tiled::qkv::{self, Weight};
@@ -15,11 +15,13 @@ pub(super) struct Head<'a> {
     pub norm: &'a super::Norm,
     pub qkv: &'a Qkv,
     pub enabled: bool,
+    pub rows: usize,
 }
 
 pub(super) struct First<'a> {
     qkv: &'a Qkv,
     enabled: bool,
+    rows: usize,
     norm: Norm,
     value: Weight<Hidden, KvWidth>,
 }
@@ -38,15 +40,16 @@ impl<'a> Points<Device> for Head<'a> {
         // No speculative loads on the final layer. Empty buffers are never consumed there.
         let (value, norm) = if self.enabled {
             (
-                qkv::prepare(device, &self.qkv.value.0),
+                qkv::prepare(device, &self.qkv.value.0, self.rows),
                 crate::Op::forward(&crate::ops::normalization::span::Stage, device, self.norm),
             )
         } else {
-            (DmTensor::new(), RmsNorm::new(DmTensor::new()))
+            (Weight::empty(), RmsNorm::new(DmTensor::new()))
         };
         First {
             qkv: self.qkv,
             enabled: self.enabled,
+            rows: self.rows,
             norm,
             value,
         }
@@ -63,13 +66,16 @@ impl Points<Device> for First<'_> {
 
     fn at(self, device: &mut Device) -> Self::Next {
         let (key, query) = if self.enabled {
-            // Queue both complete packed operands before either restoration stream.
+            // Queue both complete packed operands for the next layer.
             // Their storage stays at this boundary, rather than spanning all down panels.
             let key = qkv::stage(device, &self.qkv.key.0);
             let query = qkv::stage(device, &self.qkv.query.0);
-            (qkv::restore(device, key), qkv::restore(device, query))
+            (
+                qkv::prepared(device, key, self.rows),
+                qkv::prepared(device, query, self.rows),
+            )
         } else {
-            (DmTensor::new(), DmTensor::new())
+            (Weight::empty(), Weight::empty())
         };
         Issued((
             self.norm,
