@@ -443,10 +443,10 @@ where
         let post = post.forward(&mut *device, (), &mut (), Begin(()));
         let norm = norm.forward(&mut *device, (), &mut (), Begin(()));
         let gate_scales = gate.forward(&mut *device, (), &mut (), Begin(gate_landed));
+        let up_landed = up.forward(&mut *device, (), &mut (), Begin(()));
         let branch = post.forward(&mut *device, (), &mut (), &projected);
         let residual = add.forward(&mut *device, (), &mut (), (&input, &branch));
         let normalized = norm.forward(&mut *device, (), &mut (), &residual);
-        let up_landed = up.forward(&mut *device, (), &mut (), Begin(()));
         let begun = (gate_scales, gate_landed);
         let gated = gate.forward(&mut *device, (), &mut (), (begun, &normalized));
         let down_landed = (down.0.operation).forward(&mut *device, (), &mut (), Begin(()));
