@@ -448,7 +448,7 @@ where
         let call = (&contexts.0, &contexts.1);
         Decoder((body, norm)).forward(&mut *device, call, &mut places, (&mut home, live));
         let rows: HbmTensor<bf16, Chip, m![R, Hidden]> =
-            crate::Op::forward(&Gather, &mut *device, (&home, &*returned));
+            crate::Op::forward(&Gather, &mut *device, (&home, &*returned, live));
         let rows: Spread<Hidden, R, Chip> = rows.to_dm(&mut device.tdma);
         let head = self.lm_head.to_dm(&mut *device);
         let chosen = head.forward(&mut *device, (), &mut (), &rows);
