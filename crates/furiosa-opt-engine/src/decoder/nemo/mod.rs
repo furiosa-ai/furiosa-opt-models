@@ -1,5 +1,5 @@
 //! Mistral NeMo's static-scale FP8 checkpoint on two chips over E4M3 records, served by its own
-//! serving step: one launch a call, planned on the host from the call's rows.
+//! serving step: one launch a call (a request under the fixed tiling), planned on the host.
 //!
 //! - A call's one-row requests are decode rows, the others one prompt chunk of a segment each,
 //!   from the first wave past the decode rows; the planner picks each segment's attention spans
@@ -89,8 +89,9 @@ impl Implements for Nemo {
     }
 }
 
-/// A call launches the step once over the call's rows: its decode rows from row 0, its prompt
-/// chunk from the next whole wave; every kept row reads out its greedy token.
+/// A launch runs the step over its rows: its decode rows from row 0, its prompt chunk from the
+/// next whole wave; every kept row reads out its greedy token. The adaptive tiling launches once a
+/// call; the fixed tiling once a request, so no row's sums see another request's rows.
 impl Decoder for Nemo {
     const OUTPUT: Output = Output::Tokens;
     const CHIPS: usize = 2;
@@ -138,91 +139,108 @@ impl Decoder for Nemo {
         device: &mut Device,
         pool: &mut attention::Pool,
         batch: Batch<'_, Infallible>,
-        _: Tiling,
+        tiling: Tiling,
     ) -> impl Future<Output = io::Result<Rows<i32, m![1]>>> + Send {
         async move {
             let refused = |error: plan::Error| io::Error::new(io::ErrorKind::InvalidInput, error);
             let appended = batch.appended(0);
-            let decode = appended
-                .iter()
-                .take_while(|request| request.rows.len() == 1);
-            let decode = decode.count();
-            let chunked = decode < appended.len();
-            let start = plan::chunk_start(decode);
-            // A call row's capacity row: the chunk starts at the wave after the decode rows.
-            let capacity = |row: usize| {
-                if row < decode {
-                    row
-                } else {
-                    row - decode + start
-                }
+            let launches = match tiling {
+                Tiling::Adaptive => vec![appended],
+                Tiling::Fixed => appended.chunks(1).collect(),
             };
-            let pages = plan::Pages::new(
-                pool.len() / LAYERS,
-                (appended.iter()).flat_map(|request| request.blocks.iter().map(|&id| id as usize)),
-            )
-            .map_err(refused)?;
-            let mut rows = Vec::with_capacity(Capacity::SIZE);
-            let mut base = 0;
-            for request in appended {
-                if rows.len() == decode && chunked {
-                    rows.extend((decode..start).map(|slot| plan::Row::padding(&pages, slot)));
-                }
-                rows.extend((0..request.rows.len()).map(|row| plan::Row {
-                    token: 0,
-                    base,
-                    position: request.cached + row,
-                }));
-                base += request.blocks.len();
-            }
-            let planned = plan::Launch {
-                rows,
-                decode,
-                start,
-                selected: batch.kept().iter().map(|&row| capacity(row)).collect(),
-            };
-            // Rows past the call's embed token 0, a row of the table.
-            let zeros = vec![0_u8; Two::SIZE * Capacity::SIZE * size_of::<i32>()];
-            let ids = (HostBufferSlice::from(&zeros[..])
-                .to_hbm(&mut device.pdma)
-                .await)
-                .map_err(io::Error::other)?;
-            let mut targets = (batch.tokens().iter())
-                .map(|(_, rows)| {
-                    let at = capacity(rows.start) * size_of::<i32>();
-                    ids.alias(at..at + rows.len() * size_of::<i32>())
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(io::Error::other)?;
-            let sources = batch.tokens().iter().map(|(tokens, _)| tokens.buffer());
-            copy::<Two>(&mut *device, sources.zip(&mut targets))?;
-            let ids = alias(&ids, ..)?;
-            let input = (planned.input(device, &pages, ids).await).map_err(refused)?;
             let kept = batch.kept().len();
-            let mut output = HbmBuffer::alloc(device, kept.max(1) * size_of::<i32>())
+            let output = HbmBuffer::alloc(device, kept.max(1) * size_of::<i32>())
                 .map_err(io::Error::other)?;
-            let mut resident = self.resident.lock().unwrap_or_else(PoisonError::into_inner);
-            let Resident { state, tokens } = &mut *resident;
-            std::mem::swap(pool, &mut state.pool);
-            let submitted = launch(
-                step::forward,
-                (&mut *device, &self.model, (&input, &mut *state)),
-            )
-            .submit()
-            .accepted();
-            std::mem::swap(pool, &mut state.pool);
-            submitted.map(drop).map_err(io::Error::other)?;
-            let mut targets = (0..kept)
-                .map(|row| output.alias(row * size_of::<i32>()..(row + 1) * size_of::<i32>()))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(io::Error::other)?;
-            let sources = (0..kept)
-                .map(|row| tokens.alias(row * TOKEN..row * TOKEN + size_of::<i32>()))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(io::Error::other)?;
-            copy::<Two>(&mut *device, sources.iter().zip(&mut targets))?;
-            drop(resident);
-            output = output
+            for requests in launches {
+                // The launch's call rows.
+                let first = requests.first().map_or(0, |request| request.rows.start);
+                let end = requests.last().map_or(0, |request| request.rows.end);
+                let decode = (requests.iter())
+                    .take_while(|request| request.rows.len() == 1)
+                    .count();
+                let chunked = decode < requests.len();
+                let start = plan::chunk_start(decode);
+                // A call row's capacity row: the chunk starts at the wave after the decode rows.
+                let capacity = |row: usize| {
+                    let row = row - first;
+                    if row < decode {
+                        row
+                    } else {
+                        row - decode + start
+                    }
+                };
+                let pages = plan::Pages::new(
+                    pool.len() / LAYERS,
+                    (requests.iter())
+                        .flat_map(|request| request.blocks.iter().map(|&id| id as usize)),
+                )
+                .map_err(refused)?;
+                let mut rows = Vec::with_capacity(Capacity::SIZE);
+                let mut base = 0;
+                for request in requests {
+                    if rows.len() == decode && chunked {
+                        rows.extend((decode..start).map(|slot| plan::Row::padding(&pages, slot)));
+                    }
+                    rows.extend((0..request.rows.len()).map(|row| plan::Row {
+                        token: 0,
+                        base,
+                        position: request.cached + row,
+                    }));
+                    base += request.blocks.len();
+                }
+                // The launch's kept rows, each with its row of the call's output.
+                let selected = (batch.kept().iter().enumerate())
+                    .filter(|&(_, row)| (first..end).contains(row))
+                    .collect::<Vec<_>>();
+                let planned = plan::Launch {
+                    rows,
+                    decode,
+                    start,
+                    selected: selected.iter().map(|&(_, &row)| capacity(row)).collect(),
+                };
+                // Rows past the launch's embed token 0, a row of the table.
+                let zeros = vec![0_u8; Two::SIZE * Capacity::SIZE * size_of::<i32>()];
+                let ids = (HostBufferSlice::from(&zeros[..])
+                    .to_hbm(&mut device.pdma)
+                    .await)
+                    .map_err(io::Error::other)?;
+                let inputs =
+                    (batch.tokens().iter()).filter(|(_, rows)| (first..end).contains(&rows.start));
+                let mut targets = (inputs.clone())
+                    .map(|(_, rows)| {
+                        let at = capacity(rows.start) * size_of::<i32>();
+                        ids.alias(at..at + rows.len() * size_of::<i32>())
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(io::Error::other)?;
+                let sources = inputs.map(|(tokens, _)| tokens.buffer());
+                copy::<Two>(&mut *device, sources.zip(&mut targets))?;
+                let ids = alias(&ids, ..)?;
+                let input = (planned.input(device, &pages, ids).await).map_err(refused)?;
+                let mut resident = self.resident.lock().unwrap_or_else(PoisonError::into_inner);
+                let Resident { state, tokens } = &mut *resident;
+                std::mem::swap(pool, &mut state.pool);
+                let submitted = launch(
+                    step::forward,
+                    (&mut *device, &self.model, (&input, &mut *state)),
+                )
+                .submit()
+                .accepted();
+                std::mem::swap(pool, &mut state.pool);
+                submitted.map(drop).map_err(io::Error::other)?;
+                let mut targets = (selected.iter())
+                    .map(|&(at, _)| {
+                        output.alias(at * size_of::<i32>()..(at + 1) * size_of::<i32>())
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(io::Error::other)?;
+                let sources = (0..selected.len())
+                    .map(|row| tokens.alias(row * TOKEN..row * TOKEN + size_of::<i32>()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(io::Error::other)?;
+                copy::<Two>(&mut *device, sources.iter().zip(&mut targets))?;
+            }
+            let output = output
                 .alias(..kept * size_of::<i32>())
                 .map_err(io::Error::other)?;
             Rows::new(&output, 0..kept)
