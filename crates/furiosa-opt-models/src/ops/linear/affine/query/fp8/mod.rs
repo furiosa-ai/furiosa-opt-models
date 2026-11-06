@@ -5,6 +5,7 @@ pub(crate) use super::{
 };
 use crate::ops::linear::query::group::{Group, TilePair, Tiles};
 use crate::ops::normalization::Scaled;
+use crate::tensor::live::Live;
 use crate::tensor::parallel::Chip;
 use crate::{Op, ops::linear::Affine};
 pub(crate) use activation::{Fill, Quantize, RowScales};
@@ -209,19 +210,32 @@ impl<Hidden: AxisName, Head: AxisName, G: Group, Heads: AxisName, Spread: M, Loc
     }
 }
 
-/// The squares of a projection's head scales, written into the slices of its output.
+/// The squares of a projection's head scales, written into the slices of its output when a period
+/// of group `G` reads them: `periods` is one when the launch has such a period, else zero.
 pub(crate) fn squares<G: Group, Heads: AxisName, Spread: M, Local: M>(
     context: &mut Device,
     stored: &Squared<Heads>,
+    periods: usize,
 ) -> Written<G, Heads, Spread, Local> {
-    let written: DmTensor<
+    let mut written: DmTensor<
         f32,
         Chip,
         Cluster<Heads>,
         Reduced<G, Heads, Spread>,
         m![{ Local }, Tile % 8],
-    > = stored.to_dm(&mut context.tdma);
+    > = DmTensor::new();
+    for _ in 0..periods {
+        stored
+            .view()
+            .to_dm_view(&mut context.tdma, written.view_mut());
+    }
     // SAFETY: BF16's slice names for Reduced's slices, as the products' are; row digits only
     // replicate each head's square.
     unsafe { written.reshape() }
+}
+
+/// Whether a launch of `tile`'s rows runs a period of a pair of tiles and one of a single tile.
+fn periods<C: AxisName>(tile: Live<(), C>) -> (usize, usize) {
+    let tiles = tile.count::<Tile>();
+    ((tiles / 2).min(1), tiles % 2)
 }
