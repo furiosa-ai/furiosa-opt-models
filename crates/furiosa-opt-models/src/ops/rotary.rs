@@ -1874,7 +1874,7 @@ impl<R: AxisName> PairFrequencies<R> {
 pub mod group {
     use super::SplitHalf;
     use crate::Op;
-    use crate::load::{Checkpoint, Children, Context, Load, LoadError};
+    use crate::load::{Checkpoint, Context, Load, LoadError};
     use crate::modules::generic::Either;
     use crate::ops::linear::query::group::Group;
     use crate::ops::linear::query::{Cluster, Tile, fp8};
@@ -1911,31 +1911,37 @@ pub mod group {
         }
     }
 
-    /// Each position's rotation from the config's `rope_theta`: pair `j` of position `p` turns by
-    /// `p theta^(-2j / Head)`, an output half the sum over the input halves of `[[cos, -sin], [sin,
-    /// cos]]` times them, for the positions of `max_position_embeddings` the compiled `Position`
-    /// holds; every position past them rotates to zero.
+    /// Each position's rotation from the configured spectrum, including scaled RoPE. An output
+    /// half is the sum over the input halves of `[[cos, -sin], [sin, cos]]` times them, for the
+    /// positions of `max_position_embeddings` the compiled `Position` holds; later positions
+    /// rotate to zero.
     impl<'a, Head: AxisName, Position: AxisName> Load<&'a Checkpoint>
         for SplitHalf<Head, Table<Position, super::Row<Head>>>
     {
         fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
-            let mut children = Children::default();
-            let theta = children.ask(context.config_number(from, "rope_theta"))?;
-            let positions = children.ask(context.config_number(from, "max_position_embeddings"))?;
-            let (theta, positions) = children.node(theta.zip(positions))?;
-            let frequencies = super::PairFrequencies::<Head>::unscaled::<Head>(theta.1 as f32)
-                .map_err(|error| LoadError::InvalidData {
-                    name: theta.0,
-                    reason: error.to_string(),
-                })?;
-            let (name, positions) = positions;
+            let (name, positions) = context.config_number(from, "max_position_embeddings")?;
             if positions < 1.0 || positions.fract() != 0.0 {
                 return Err(LoadError::InvalidData {
                     name,
                     reason: format!("{positions} is no count of positions"),
                 });
             }
+            let spectrum: crate::models::config::scaling::Spectrum =
+                crate::models::config::parse(from.config()).map_err(|error| {
+                    LoadError::InvalidData {
+                        name: "config.json:rope_scaling".into(),
+                        reason: error.to_string(),
+                    }
+                })?;
+            let frequencies =
+                spectrum
+                    .bind::<Head, Head>()
+                    .map_err(|error| LoadError::Unsupported {
+                        name: "config.json:rope_scaling".into(),
+                        reason: error.to_string(),
+                    })?;
             let positions = positions.min(Position::SIZE as f64);
+            let amplitude = f64::from(frequencies.amplitude());
             let pairs = frequencies.pairs();
             let table = (0..Position::SIZE).flat_map(|position| {
                 pairs.iter().flat_map(move |&frequency| {
@@ -1944,7 +1950,7 @@ pub mod group {
                         true => angle.sin_cos(),
                         false => (0.0, 0.0),
                     };
-                    [cos, -sin, sin, cos].map(|value| bf16::from_f32(value as f32))
+                    [cos, -sin, sin, cos].map(|value| bf16::from_f32((value * amplitude) as f32))
                 })
             });
             let table = HostTensor::<

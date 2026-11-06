@@ -506,6 +506,7 @@ launches!(
     [B] launch::Over<qwen3::Size<"4B">, B>, qwen3::Size<"4B">;
     [B] launch::Over<qwen3::Size<"8B">, B>, qwen3::Size<"8B">;
     [] fp8::ForCausalLM, qwen3::Size<"8B">;
+    [] llama::nvfp4::ForCausalLM, llama::nvfp4::Size;
 );
 
 #[cfg(test)]

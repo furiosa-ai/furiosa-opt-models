@@ -25,7 +25,7 @@ pub(crate) mod experts;
 pub(crate) mod fp8;
 pub(crate) mod kernel;
 pub mod modulation;
-pub(crate) mod nvfp4;
+pub mod nvfp4;
 mod projection;
 mod quantize;
 pub(crate) mod rows;
