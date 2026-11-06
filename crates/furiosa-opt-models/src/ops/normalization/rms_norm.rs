@@ -57,53 +57,18 @@ impl<Width: AxisName, const EPSILON: usize, Chips: M, Parameter: Clone> Clone
     }
 }
 
-/// Rows `u` whose true values are `c s u` for finite, positive factors, `c` of each row and `s`
-/// of each head, with each row's `1 / (c s)²`: an RMS norm of the true rows runs on `u` with
-/// epsilon `epsilon / (c s)²`.
-pub struct Scaled<X, S> {
-    value: X,
-    inverse: S,
-}
+/// Rows `u` whose true values are `c s u`, `c` a positive factor of each row and `s` of each head,
+/// which only a head norm takes: its norm of `u` is the true rows' with epsilon `epsilon (c s)²`.
+pub struct Scaled<X>(X);
 
-impl<X, Chips: M, C: M, P: M, L: M, R: M> Scaled<X, VrfTensor<f32, Chips, C, P, m![{ L }, { R }]>> {
-    /// `value` with the factor `c` of each of its rows in `factors`, which names the rows `R` of a
-    /// slice, and `s²` of each of its heads `L` in `heads`: one, or each head's value.
-    pub fn new<H>(
-        device: &mut Device,
-        value: X,
-        factors: DmTensorView<'_, bf16, Chips, C, P, R>,
-        heads: H,
-    ) -> Self
-    where
-        H: IntoBranchedOperand<
-                f32,
-                VeTensorShape<Chips, C, P, m![{ L }, { R } / 4], m![{ R } % 4]>,
-            > + StashTransition<Spent, f32, { Way4 }>,
-    {
-        let inverse = device
-            .sub
-            .begin(factors)
-            .fetch::<L, R>()
-            .fetch_cast::<f32>()
-            .collect::<L, R>()
-            .vector_init()
-            .vector_intra_slice_tag(TagMode::Zero)
-            .vector_narrow_split::<m![{ L }, { R } / 4], m![{ R } % 4]>()
-            .vector_stash()
-            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), Stash)
-            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), heads)
-            .vector_fp_div_with_mode(BinaryArgMode::Mode10, 1.0f32)
-            .vector_widen_concat::<L, R>()
-            .vector_final()
-            .to_vrf();
-        Self { value, inverse }
+impl<X> Scaled<X> {
+    pub fn new(value: X) -> Self {
+        Self(value)
     }
-}
 
-impl<X, S> Scaled<X, S> {
-    /// The rows and their inverse squared factors, for a norm that applies them.
-    pub fn cancel(self) -> (X, S) {
-        (self.value, self.inverse)
+    /// The rows `u`, for a norm that cancels their factors.
+    pub fn cancel(self) -> X {
+        self.0
     }
 }
 
