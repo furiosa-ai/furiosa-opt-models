@@ -26,8 +26,8 @@ pub struct Landed<Hidden: AxisName, QWidth: AxisName, Rows: AxisName> {
 }
 
 /// The projection begun before any attended row arrives: the place its weights and their channel
-/// scales land in, which they do when the landed projection is given back, e.g. while an
-/// attention's last history is in flight.
+/// scales land in, which they do when the landed projection is given back, e.g. during the layer
+/// before's last period.
 impl<Hidden: AxisName, QWidth: AxisName> Op<Begin<()>> for Stored<Hidden, QWidth> {
     type Output = Landed<Hidden, QWidth, Span>;
 
@@ -50,13 +50,13 @@ impl<Hidden: AxisName, QWidth: AxisName> Op<&mut Landed<Hidden, QWidth, Span>>
     fn forward(&self, context: &mut Device, landed: &mut Landed<Hidden, QWidth, Span>) {
         let (weight, channels) = &mut landed.staged.weight;
         self.weight
-            .0
-            .view()
-            .to_dm_view(&mut context.tdma, weight.view_mut());
-        self.weight
             .1
             .view()
             .to_dm_view(&mut context.tdma, channels.view_mut());
+        self.weight
+            .0
+            .view()
+            .to_dm_view(&mut context.tdma, weight.view_mut());
     }
 }
 
