@@ -157,11 +157,25 @@ impl<In: AxisName, Out: AxisName, Code: Scalar> AxisName for PassCount<In, Out, 
 
 pub(crate) type Passes<In, Out, Code> = Symbol<PassCount<In, Out, Code>>;
 
+#[derive(Clone, Debug)]
+pub struct PartSlots<In, Out, Code>(PhantomData<(In, Out, Code)>);
+
+impl<In: AxisName, Out: AxisName, Code: Scalar> AxisName for PartSlots<In, Out, Code> {
+    const NAME: Ident = Ident::new("PartSlots");
+
+    const SIZE: usize = contraction::slots(In::SIZE / Contraction::<In, Out, Code>::config().chunk);
+}
+
+/// Slices a block's parts take: the parts, padded to a power of two.
+pub(crate) type Slots<In, Out, Code> = Symbol<PartSlots<In, Out, Code>>;
+
 pub(crate) type Input<In, Out, Code, Rows> =
     m![In / ({ Chunk<In, Out, Code> }), Rows, In % ({ Chunk<In, Out, Code> })];
 pub(crate) type Output<In, Out, Code, Rows> =
     m![Out / ({ Block<In, Out, Code> }), Rows, Out % ({ Block<In, Out, Code> })];
 type Parts<In, Out, Code> = m![In / ({ Chunk<In, Out, Code> })];
+/// The part digit of a block's slices, padded to its slots.
+type Parted<In, Out, Code> = m![In / ({ Chunk<In, Out, Code> }) # ({ Slots<In, Out, Code> })];
 type Chunked<In, Out, Code> = m![In % ({ Chunk<In, Out, Code> })];
 
 pub(crate) type Cluster<In, Out, Code> =
@@ -170,19 +184,19 @@ pub(crate) type Cluster<In, Out, Code> =
 type Blocks<In, Out, Code> =
     m![Out % ((Out / ({ Carve<In, Out, Code> })) / 2) / ({ Block<In, Out, Code> })];
 type Idle<In, Out, Code> = m![
-    256 / ({ Blocks<In, Out, Code> }) / ({ Parts<In, Out, Code> }) / ({ Padded<In, Out, Code> })
+    256 / ({ Blocks<In, Out, Code> }) / ({ Slots<In, Out, Code> }) / ({ Padded<In, Out, Code> })
 ];
 type ProjectionSlices<In, Out, Code> = m![
     Out / (Out / ({ Top<In, Out, Code> })) # ({ Padded<In, Out, Code> }),
     { Blocks<In, Out, Code> },
     1 # ({ Idle<In, Out, Code> }),
-    { Parts<In, Out, Code> }
+    { Parted<In, Out, Code> }
 ];
 pub(crate) type Reduced<In, Out, Code> = m![
     Out / (Out / ({ Top<In, Out, Code> })) # ({ Padded<In, Out, Code> }),
     { Blocks<In, Out, Code> },
     1 # ({ Idle<In, Out, Code> }),
-    1 # ({ Parts<In, Out, Code> })
+    1 # ({ Slots<In, Out, Code> })
 ];
 type SlabIndex<In, Out, Code> = m![Out / (Out / ({ Passes<In, Out, Code> }))];
 type SlabSelected<In, Out, Code> =

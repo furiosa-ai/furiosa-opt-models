@@ -7,12 +7,14 @@
 //! - The feature slices a norm leaves the rows in reduce each row's largest magnitude among
 //!   themselves, as the norm reduces its squares, so a row's scale and codes cost one pass over
 //!   sixteen inputs a slice.
-//! - The codes reach the slices of every part over the switch ring once for all projections of the
-//!   same rows ([`Tokens`]), then fill the tensor registers from data memory: a live lane group at
-//!   a time for every slab, or, every row group live, both banks once for every projection
-//!   ([`TokenBanks`]), each half of the envelope riding the ring and filling its bank while the
-//!   bank before contracts. A part holds a whole number of E4M3 packets, so each contraction step
-//!   takes one packet.
+//! - The codes reach the slices of every part once for all projections of the same rows, then fill
+//!   the tensor registers from data memory. A live lane group at a time rides the switch ring
+//!   ([`Tokens`]) and fills the registers for every slab: a tensor-unit pass, it does not wait for
+//!   the weights that transfers land meanwhile. Every row group live, each half of the envelope is
+//!   stored to HBM as the feature slices hold it, landed in the slices of each part of every block
+//!   and relaid row-major ([`TokenBanks`]), the second half landing while the first fills its bank
+//!   and contracts: the ring would take longer than waiting for the transfers ahead and landing.
+//! - A part holds whole E4M3 steps, so each contraction step takes two packets.
 
 use super::*;
 use crate::ops::linear::decode::Landed;
@@ -21,6 +23,9 @@ use crate::tensor::form::fp8::Token;
 
 /// The codes the weights store and the rows quantize to.
 type Code = f8e4m3;
+
+/// Codes one contraction step takes: two packets.
+const STEP: usize = 64;
 
 /// The slices every row's scale reaches.
 type Every = m![256];
@@ -34,9 +39,25 @@ type Codes<In, Out, Rows> = DmTensor<
     m![Rows, { Chunked<In, Out, Code> }],
 >;
 
-/// The rows' E4M3 codes where the norm leaves the rows: sixteen inputs of each row a slice.
-type Coded<In, Out, Rows> =
-    DmTensor<Code, m![1], Cluster<In, Out, Code>, FeatureSlices<In>, m![Rows, In % 16]>;
+/// The rows' E4M3 codes where the norm leaves the rows: sixteen inputs of each row a slice, both
+/// clusters holding every row.
+type Coded<In, Rows> =
+    DmTensor<Code, m![1], normalization::Cluster, FeatureSlices<In>, m![Rows, In % 16]>;
+
+/// Codes moving from the feature slices to the slices of each part, `B` of the rows at a time: in
+/// HBM as the feature slices hold them, then in every block's slices of each part, a part's
+/// sixteen-input runs in turn. A batch is outermost in both, so a batch of a part is one run in
+/// HBM and one in each of its slices.
+struct Staging<In: AxisName, Out: AxisName, Rows: AxisName, B: AxisName> {
+    stored: HbmTensor<Code, m![1], m![Rows / B, In / 16, Rows % B, In % 16]>,
+    landed: DmTensor<
+        Code,
+        m![1],
+        Cluster<In, Out, Code>,
+        ProjectionSlices<In, Out, Code>,
+        m![Rows / B, { Chunked<In, Out, Code> } / 16, Rows % B, In % 16],
+    >,
+}
 
 /// Each row's BF16 scale in every slice.
 type RowScales<In, Out, Rows> = DmTensor<bf16, m![1], Cluster<In, Out, Code>, Every, m![Rows]>;
@@ -109,9 +130,9 @@ impl<In: AxisName, Out: AxisName> Contraction<In, Out, Code> {
 
     /// Every row of `input`, every row group of it live, each quantized under its own scale,
     /// against every slab of `landed`, each output rounded once to BF16, as [`Self::kept`]
-    /// contracts BF16 rows: each half of the envelope rides the ring and fills its bank of the
-    /// registers while the bank before contracts the first slab, and both banks stay filled for
-    /// every congruent projection of the same rows.
+    /// contracts BF16 rows: the second half of the envelope lands while the first fills its bank
+    /// of the registers and contracts the first slab, and both banks stay filled for every
+    /// congruent projection of the same rows.
     pub(crate) fn token_kept<Rows: AxisName>(
         device: &mut Device,
         landed: &Landed<In, Out, Token>,
@@ -124,11 +145,14 @@ impl<In: AxisName, Out: AxisName> Contraction<In, Out, Code> {
             )
         };
         let (coded, scales) = Self::quantized(device, input);
+        let mut staging = Staging::<In, Out, Rows, Half<In, Out, Rows>>::new();
         let mut codes = DmTensor::new();
         let mut result = DmTensor::new();
-        let mut bank = |device: &mut Device, at: usize| {
-            Self::part::<Rows, Half<In, Out, Rows>>(device, &coded, &mut codes, at);
-            let lanes = Self::fill::<Rows, Half<In, Out, Rows>>(device, &codes, at);
+        staging.land(device, &coded, 0);
+        staging.relay(device, &mut codes, 0);
+        staging.land(device, &coded, 1);
+        let mut bank = |device: &mut Device, codes: &Codes<In, Out, Rows>, at: usize| {
+            let lanes = Self::fill::<Rows, Half<In, Out, Rows>>(device, codes, at);
             Self::contracted::<Rows, Half<In, Out, Rows>, Out>(
                 device,
                 landed,
@@ -138,8 +162,9 @@ impl<In: AxisName, Out: AxisName> Contraction<In, Out, Code> {
             );
             lanes
         };
-        let low = bank(&mut *device, 0);
-        let high = bank(&mut *device, 1);
+        let low = bank(&mut *device, &codes, 0);
+        staging.relay(device, &mut codes, 1);
+        let high = bank(&mut *device, &codes, 1);
         #[unroll]
         for slab in 1..<Passes<In, Out, Code> as M>::SIZE {
             Self::contracted::<Rows, Half<In, Out, Rows>, Out>(
@@ -237,7 +262,7 @@ impl<In: AxisName, Out: AxisName> Contraction<In, Out, Code> {
     fn quantized<Rows: AxisName>(
         device: &mut Device,
         input: &Spread<In, Rows>,
-    ) -> (Coded<In, Out, Rows>, RowScales<In, Out, Rows>) {
+    ) -> (Coded<In, Rows>, RowScales<In, Out, Rows>) {
         const {
             assert!(
                 normalization::Chunk::<In>::SIZE == 16,
@@ -261,33 +286,28 @@ impl<In: AxisName, Out: AxisName> Contraction<In, Out, Code> {
                 .fetch_cast::<f32>()
                 .collect::<Layout<Rows>::Groups, Layout<Rows>::Lanes>()
                 .to_vrf();
-        let coded: DmTensor<
-            Code,
-            m![1],
-            normalization::Cluster,
-            FeatureSlices<In>,
-            m![Rows, In % 16],
-        > = Scales::<In, Rows>::rows(&mut device.main, rows, &scale).commit();
-        // SAFETY: both physical clusters hold every row; only the logical cluster axis changes,
-        // for the codes and the scales alike.
-        unsafe { (coded.reshape(), scales.reshape()) }
+        let coded = Scales::<In, Rows>::rows(&mut device.main, rows, &scale).commit();
+        // SAFETY: both physical clusters hold every row; only the logical cluster axis changes.
+        (coded, unsafe { scales.reshape() })
     }
 
     /// Batch `at` of `B` of the coded rows, from their feature slices into the slices of each part
     /// over the switch ring: each slice's sixteen inputs ride a packet of their own.
     fn part<Rows: AxisName, B: AxisName>(
         device: &mut Device,
-        coded: &Coded<In, Out, Rows>,
+        coded: &Coded<In, Rows>,
         codes: &mut Codes<In, Out, Rows>,
         at: usize,
     ) {
+        // SAFETY: both physical clusters hold every row; only the logical cluster axis changes.
+        let coded = unsafe {
+            coded
+                .view()
+                .reshape::<m![1], Cluster<In, Out, Code>, FeatureSlices<In>, m![Rows, In % 16]>()
+        };
         device
             .sub
-            .begin(
-                coded
-                    .view()
-                    .tile::<m![Rows / B], 1, Batched<Rows, B, m![In % 16]>>(at),
-            )
+            .begin(coded.tile::<m![Rows / B], 1, Batched<Rows, B, m![In % 16]>>(at))
             .fetch::<m![Rows % B], m![In % 16]>()
             .switch::<ProjectionSlices<In, Out, Code>, m![
                 Rows % B,
@@ -330,9 +350,9 @@ impl<In: AxisName, Out: AxisName> Contraction<In, Out, Code> {
     }
 
     /// Batch `at` of `B` of the rows in `lanes`, filled as the congruent tiling of `F` outputs reads
-    /// them, against slab `slab` of `landed`: the codes contract a packet a step, take their rows'
-    /// and their outputs' scales once the parts meet, and round once into the batch's cells of
-    /// `result`.
+    /// them, against slab `slab` of `landed`: the codes contract a step of two packets at a time,
+    /// take their rows' and their outputs' scales once the parts meet, and round once into the
+    /// batch's cells of `result`.
     fn contracted<Rows: AxisName, B: AxisName, F: AxisName>(
         device: &mut Device,
         landed: &Landed<In, Out, Token>,
@@ -395,22 +415,28 @@ impl<In: AxisName, Out: AxisName> Contraction<In, Out, Code> {
             .fetch::<m![Out % ({ Block<In, Out, Code> })], m![1 # 8]>()
             .collect::<m![Out % ({ Block<In, Out, Code> })], m![1 # 8]>()
             .to_vrf();
+        const {
+            assert!(
+                <Chunked<In, F, Code> as M>::SIZE.is_multiple_of(STEP),
+                "a part is whole E4M3 steps"
+            )
+        };
         let scaled = device
             .main
             .begin(codes)
             .fetch::<m![
                 Out % ({ Block<In, Out, Code> }),
-                { Chunked<In, F, Code> } / 32
-            ], m![In % 32]>()
+                { Chunked<In, F, Code> } / 64
+            ], m![In % 64]>()
             .collect::<m![
                 Out % ({ Block<In, Out, Code> }),
                 { Chunked<In, F, Code> } / 32
             ], m![In % 32]>()
             .contract_outer::<m![
                 Out % ({ Block<In, Out, Code> }),
-                { Chunked<In, F, Code> } / 32,
+                { Chunked<In, F, Code> } / 64,
                 { Count<Rows, B> }
-            ], m![In % 32], _, _, _>(lanes)
+            ], m![In % 64], _, _, _>(lanes)
             .contract_packet::<m![1]>()
             .contract_time::<m![Out % ({ Block<In, Out, Code> }), { Count<Rows, B> }]>()
             .contract_lane::<
@@ -460,5 +486,61 @@ impl<In: AxisName, Out: AxisName> Contraction<In, Out, Code> {
             _,
         >(scaled)
         .commit_view(cells);
+    }
+}
+
+impl<In: AxisName, Out: AxisName, Rows: AxisName, B: AxisName> Staging<In, Out, Rows, B> {
+    fn new() -> Self {
+        Self {
+            stored: HbmTensor::new(),
+            landed: DmTensor::new(),
+        }
+    }
+
+    /// Batch `at` of the coded rows into the slices of each part of every block, through HBM:
+    /// each feature slice stores the batch's rows as one run, and each part's slice lands its
+    /// sixteen-input runs, one run in HBM and in the slice.
+    fn land(&mut self, device: &mut Device, coded: &Coded<In, Rows>, at: usize) {
+        coded
+            .view()
+            .tile::<m![Rows / B], 1, Batched<Rows, B, m![In % 16]>>(at)
+            .to_hbm_view(
+                &mut device.tdma,
+                self.stored.view_mut().tile::<m![Rows / B], 1, m![
+                    Rows / B = 1 #{!} (Rows / B), In / 16, Rows % B, In % 16
+                ]>(at),
+            );
+        self.stored
+            .view()
+            .tile::<m![Rows / B], 1, m![Rows / B = 1 # (Rows / B), In / 16, Rows % B, In % 16]>(at)
+            .to_dm_view(
+                &mut device.tdma,
+                self.landed.view_mut().tile::<m![Rows / B], 1, m![
+                    Rows / B = 1 #{!} (Rows / B),
+                    { Chunked<In, Out, Code> } / 16,
+                    Rows % B,
+                    In % 16
+                ]>(at),
+            );
+    }
+
+    /// Batch `at` of the landed codes relaid row-major in `codes`, as the registers read them.
+    fn relay(&self, device: &mut Device, codes: &mut Codes<In, Out, Rows>, at: usize) {
+        device
+            .main
+            .begin(self.landed.view().tile::<m![Rows / B], 1, m![
+                Rows / B = 1 # (Rows / B),
+                { Chunked<In, Out, Code> } / 16,
+                Rows % B,
+                In % 16
+            ]>(at))
+            .fetch::<m![{ Chunked<In, Out, Code> } / 16, Rows % B], m![In % 16]>()
+            .collect::<m![{ Chunked<In, Out, Code> } / 16, Rows % B], m![In % 16 # 32]>()
+            .commit_trim::<m![In % 16]>()
+            .commit_view(
+                codes
+                    .view_mut()
+                    .tile::<m![Rows / B], 1, BatchedMut<Rows, B, Chunked<In, Out, Code>>>(at),
+            );
     }
 }

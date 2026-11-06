@@ -795,7 +795,9 @@ pub(crate) const fn tiling(
 /// The widest legal replicated tiling of fewest passes whose parts hold at most `most` inputs,
 /// preferring parts of whole E2M1 scale blocks, over the fewest passes that hold a slab restored
 /// from codes, if any; a slab restored from codes takes its rows over the ring where the ring
-/// carries all their inputs.
+/// carries all their inputs. Parts of 8-bit codes keep whole scale blocks, so whole 64-code E4M3
+/// steps, over a part digit padded to the next power of two where no power-of-two part count holds
+/// them and at most one slice in sixteen idles.
 const fn parted(
     input: usize,
     output: usize,
@@ -806,21 +808,25 @@ const fn parted(
     loop {
         let mut passes = 1;
         while passes <= output / 8 {
-            if let Some((chunk, block, passes, routing)) =
-                widest(input, output, passes, (unit, most))
-            {
-                // A BF16 slab is staged as stored, beside the replicated rows the listed tilings
-                // were timed against; one restored from codes must hold, beside rows on the ring.
-                if bits >= 8 * BF16 {
-                    let block = carved(input, output, (chunk, block, passes), bits);
-                    return Some((chunk, block, passes, routing));
-                }
-                let (block, passes) = held(input, output, (chunk, block, passes));
-                let routing = if input <= RING { Ring } else { routing };
-                let block = carved(input, output, (chunk, block, passes), bits);
-                return Some((chunk, block, passes, routing));
+            if let Some(tiling) = widest(input, output, passes, (unit, most), false) {
+                return Some(fitted(input, output, tiling, bits));
             }
             passes += 1;
+        }
+        if bits == 8 && unit == SCALED {
+            let mut passes = 1;
+            while passes <= output / 8 {
+                if let Some((chunk, block, passes, routing)) =
+                    widest(input, output, passes, (unit, most), true)
+                {
+                    let (slices, active) = occupancy(input, output, (chunk, block, passes));
+                    if full(active, slices) {
+                        let (block, passes) = scaled(input, output, (chunk, block, passes));
+                        return Some(fitted(input, output, (chunk, block, passes, routing), bits));
+                    }
+                }
+                passes += 1;
+            }
         }
         if unit == 1 {
             return None;
@@ -829,14 +835,63 @@ const fn parted(
     }
 }
 
+/// The derived `(chunk, block, passes, routing)` fitted to its weight: a BF16 slab is staged as
+/// stored, beside the replicated rows the listed tilings were timed against; one restored from
+/// codes must hold, beside rows on the ring.
+const fn fitted(
+    input: usize,
+    output: usize,
+    (chunk, block, passes, routing): (usize, usize, usize, Routing),
+    bits: usize,
+) -> (usize, usize, usize, Routing) {
+    if bits >= 8 * BF16 {
+        let block = carved(input, output, (chunk, block, passes), bits);
+        return (chunk, block, passes, routing);
+    }
+    let (block, passes) = held(input, output, (chunk, block, passes));
+    let routing = if input <= RING { Ring } else { routing };
+    let block = carved(input, output, (chunk, block, passes), bits);
+    (chunk, block, passes, routing)
+}
+
+/// The `(block, passes)` of a padded tiling of 8-bit codes: as derived, unless a block's FP32
+/// output scales take over half the vector registers, which an E4M3 contraction's epilogue holds
+/// at once; then of the fewest more passes of the same parts whose block's do not.
+const fn scaled(
+    input: usize,
+    output: usize,
+    (chunk, block, passes): (usize, usize, usize),
+) -> (usize, usize) {
+    if block * SCALE <= super::VRF / 2 {
+        return (block, passes);
+    }
+    let blocks = super::SLICES / slots(input / chunk);
+    let mut more = passes + 1;
+    while more <= output / 8 {
+        if output.is_multiple_of(2 * more) && (output / (2 * more)).is_multiple_of(blocks) {
+            let block = output / (2 * more) / blocks;
+            if block * SCALE <= super::VRF / 2
+                && legal(input, output, (chunk, block, more))
+                && holds(chunk, block, more)
+            {
+                return (block, more);
+            }
+        }
+        more += 1;
+    }
+    (block, passes)
+}
+
 /// The legal replicated tiling of `passes` slabs, parts a multiple of `unit` and at most `most`
 /// inputs, with the most active slices, then cheap row staging, then fewest parts; none if no
-/// tiling is legal.
+/// tiling is legal. Part counts are powers of two, or, `padded`, the others, each over
+/// [`slots`] slices.
 const fn widest(
     input: usize,
     output: usize,
     passes: usize,
     (unit, most): (usize, usize),
+    padded: bool,
 ) -> Option<(usize, usize, usize, Routing)> {
     if !output.is_multiple_of(2 * passes) {
         return None;
@@ -846,31 +901,38 @@ const fn widest(
     let mut rank = (0, false);
     let mut parts = 1;
     while parts <= super::SLICES {
-        let mut blocks = 1;
-        while parts * blocks <= super::SLICES {
-            // A slab index shares its digit with the top, so several passes leave it one.
-            let mut top = 1;
-            while top <= if passes == 1 { super::SLICES - 1 } else { 1 } {
-                if input.is_multiple_of(parts) && half.is_multiple_of(blocks * top) {
-                    let (chunk, block) = (input / parts, half / (blocks * top));
-                    let active = parts * blocks * top;
-                    let cheap = cheap(chunk, block);
-                    if (active > rank.0 || (active == rank.0 && cheap && !rank.1))
-                        && chunk.is_multiple_of(unit)
-                        && chunk <= most
-                        && legal(input, output, (chunk, block, passes))
-                    {
-                        rank = (active, cheap);
-                        best = Some((chunk, block, passes, Replicated));
+        if parts.is_power_of_two() != padded {
+            let mut blocks = 1;
+            while slots(parts) * blocks <= super::SLICES {
+                // A slab index shares its digit with the top, so several passes leave it one.
+                let mut top = 1;
+                while top <= if passes == 1 { super::SLICES - 1 } else { 1 } {
+                    if input.is_multiple_of(parts) && half.is_multiple_of(blocks * top) {
+                        let (chunk, block) = (input / parts, half / (blocks * top));
+                        let active = parts * blocks * top;
+                        let cheap = cheap(chunk, block);
+                        if (active > rank.0 || (active == rank.0 && cheap && !rank.1))
+                            && chunk.is_multiple_of(unit)
+                            && chunk <= most
+                            && legal(input, output, (chunk, block, passes))
+                        {
+                            rank = (active, cheap);
+                            best = Some((chunk, block, passes, Replicated));
+                        }
                     }
+                    top += 2;
                 }
-                top += 2;
+                blocks *= 2;
             }
-            blocks *= 2;
         }
-        parts *= 2;
+        parts += 1;
     }
     best
+}
+
+/// Slices a contraction's `parts` parts take: the next power of two, the rest idle.
+pub(crate) const fn slots(parts: usize) -> usize {
+    parts.next_power_of_two()
 }
 
 /// Whether a part's eight-lane fill ping-pongs in half the tensor registers and a band of staged
@@ -893,7 +955,7 @@ const fn held(
     while more <= output / 8 {
         if output.is_multiple_of(2 * more) {
             let half = output / (2 * more);
-            let mut blocks = super::SLICES / (input / chunk);
+            let mut blocks = super::SLICES / slots(input / chunk);
             while blocks > 0
                 && !(half.is_multiple_of(blocks)
                     && legal(input, output, (chunk, half / blocks, more)))
@@ -979,15 +1041,20 @@ const fn full(active: usize, slices: usize) -> bool {
     16 * active >= 15 * slices
 }
 
-/// The slices `(chunk, block, passes)` takes, its top digit padded, and the active ones.
+/// The slices `(chunk, block, passes)` takes, its top digit and its parts padded, and the active
+/// ones.
 const fn occupancy(
     input: usize,
     output: usize,
     (chunk, block, passes): (usize, usize, usize),
 ) -> (usize, usize) {
     let top = odd(output / (2 * passes * block));
-    let blocks = output / (2 * passes * block * top) * (input / chunk);
-    (blocks * top.next_power_of_two(), blocks * top)
+    let blocks = output / (2 * passes * block * top);
+    let parts = input / chunk;
+    (
+        blocks * slots(parts) * top.next_power_of_two(),
+        blocks * parts * top,
+    )
 }
 
 /// Whether a slice holds `(chunk, block, passes)` while it restores a slab beside a band of staged
@@ -1016,7 +1083,8 @@ pub(crate) const fn legal(
         return false;
     }
     let top = odd(output / (2 * passes * block));
-    let slices = output / (2 * passes * block * top) * (input / chunk) * top.next_power_of_two();
+    let slices =
+        output / (2 * passes * block * top) * slots(input / chunk) * top.next_power_of_two();
     (top == 1 || passes == 1)
         && super::SLICES.is_multiple_of(slices)
         && LANES * chunk * 2 <= super::TRF
