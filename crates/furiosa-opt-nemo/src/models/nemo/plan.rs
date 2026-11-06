@@ -1187,30 +1187,19 @@ impl Tables {
     }
 }
 
-async fn slice<D: MaterializableScalar + Copy, E: M>(
-    device: &mut Device,
-    tensors: &[Vec<D>],
-) -> Result<Slice<HbmTensor<D, Chips, E>>> {
-    let mut uploaded = Vec::with_capacity(tensors.len());
-    for values in tensors {
-        uploaded.push(copies(device, values).await?);
-    }
-    Ok(uploaded.into())
-}
-
-async fn passes(device: &mut Device, passes: &Passes) -> Result<attention::Passes> {
+fn passes(stage: &mut Stage<'_>, passes: &Passes) -> Result<attention::Passes> {
     Ok(attention::Passes {
-        statistics: slice(device, &passes.statistics).await?,
-        outputs: slice(device, &passes.outputs).await?,
-        visible: slice(device, &passes.visible).await?,
+        statistics: stage.slice(&passes.statistics)?,
+        outputs: stage.slice(&passes.outputs)?,
+        visible: stage.slice(&passes.visible)?,
     })
 }
 
 /// The attention plan of `rows` over a layer of `pages` pool pages ahead of a prompt chunk of
 /// `chunk` rows, on both chips. A step whose rows are all a prompt chunk still carries one batch,
 /// of one row on the last page, never read.
-pub async fn plan(
-    device: &mut Device,
+pub fn plan(
+    stage: &mut Stage<'_>,
     rows: &[Row],
     (pages, chunk): (&Pages, usize),
 ) -> Result<attention::Plan> {
@@ -1219,36 +1208,29 @@ pub async fn plan(
         base: pages.len() - 1,
         position: 0,
     }];
-    Tables::new(if rows.is_empty() { &idle } else { rows }, pages, chunk)?
-        .upload(device)
-        .await
+    Tables::new(if rows.is_empty() { &idle } else { rows }, pages, chunk)?.upload(stage)
 }
 
 impl Tables {
     /// The tables on both chips, as the step reads them.
-    pub async fn upload(&self, device: &mut Device) -> Result<attention::Plan> {
+    pub fn upload(&self, stage: &mut Stage<'_>) -> Result<attention::Plan> {
         Ok(attention::Plan {
-            batches: slice(device, &self.words()?).await?,
-            pages: slice(device, &self.pages).await?,
+            batches: stage.slice(&self.words()?)?,
+            pages: stage.slice(&self.pages)?,
             lengths: {
                 // The kernel chooses the few-row chains' tables 1 ..= 4 in every step.
                 let mut lengths = self.lengths.clone();
                 lengths.resize(lengths.len().max(5), vec![0; JOBS]);
-                slice(device, &lengths).await?
+                stage.slice(&lengths)?
             },
-            counts: slice(device, &self.counts).await?,
-            positions: copies(
-                device,
-                &(0..JOB_PAGES).map(|page| page as f32).collect::<Vec<_>>(),
-            )
-            .await?,
-            queries: slice(device, &self.queries).await?,
-            merge: passes(device, &self.merge).await?,
+            counts: stage.slice(&self.counts)?,
+            positions: stage.copies(&(0..JOB_PAGES).map(|page| page as f32).collect::<Vec<_>>())?,
+            queries: stage.slice(&self.queries)?,
+            merge: passes(stage, &self.merge)?,
             runs: attention::RunPasses {
-                statistics: slice(device, &self.merge.runs(|pass| &pass.statistics)).await?,
-                outputs: slice(device, &self.merge.runs(|pass| &pass.outputs)).await?,
-                visible: slice(
-                    device,
+                statistics: stage.slice(&self.merge.runs(|pass| &pass.statistics))?,
+                outputs: stage.slice(&self.merge.runs(|pass| &pass.outputs))?,
+                visible: stage.slice(
                     &self
                         .merge
                         .visible
@@ -1260,10 +1242,9 @@ impl Tables {
                                 .collect()
                         })
                         .collect::<Vec<_>>(),
-                )
-                .await?,
+                )?,
             },
-            fold: passes(device, &self.fold).await?,
+            fold: passes(stage, &self.fold)?,
         })
     }
 
@@ -1627,31 +1608,31 @@ impl Prompt {
     }
 
     /// The D-sharded route's chunk counts, both 0 when the TP2 body runs the chunk.
-    pub async fn upload_routed(&self, device: &mut Device) -> Result<step::Routed> {
+    pub fn upload_routed(&self, stage: &mut Stage<'_>) -> Result<step::Routed> {
         let (blocks, segments) = if self.routed {
             (self.blocks, offset(self.bounds.len() - 1)?)
         } else {
             (0, 0)
         };
         Ok(step::Routed {
-            blocks: copies(device, &[blocks]).await?,
-            segments: copies(device, &[segments]).await?,
+            blocks: stage.copies(&[blocks])?,
+            segments: stage.copies(&[segments])?,
         })
     }
 
-    pub async fn upload_short(&self, device: &mut Device) -> Result<attention::short::Plan> {
+    pub fn upload_short(&self, stage: &mut Stage<'_>) -> Result<attention::short::Plan> {
         let positions: Vec<f32> = (0..SHORT_KEYS)
             .map(|key| Ok(f32::from(u16::try_from(key)?)))
             .collect::<Result<_>>()?;
         Ok(attention::short::Plan {
-            passes: copies(device, &[self.passes]).await?,
-            pages: copies(device, &self.short_pages).await?,
-            limits: copies(device, &self.short_limits).await?,
-            positions: copies(device, &positions).await?,
+            passes: stage.copies(&[self.passes])?,
+            pages: stage.copies(&self.short_pages)?,
+            limits: stage.copies(&self.short_limits)?,
+            positions: stage.copies(&positions)?,
         })
     }
 
-    pub async fn upload(&self, device: &mut Device) -> Result<attention::prompt::Plan> {
+    pub fn upload(&self, stage: &mut Stage<'_>) -> Result<attention::prompt::Plan> {
         let per_segment = |values: &[i32]| {
             let mut table = values.to_vec();
             table.resize(SEGMENTS, 0);
@@ -1670,36 +1651,36 @@ impl Prompt {
             (self.blocks, segments)
         };
         Ok(attention::prompt::Plan {
-            blocks: copies(device, &[blocks]).await?,
-            start: copies(device, &[self.start]).await?,
-            segments: copies(device, &[offset(counted)?]).await?,
-            first: copies(device, &per_segment(&self.bounds[..segments])).await?,
-            end: copies(device, &per_segment(&self.bounds[1..])).await?,
+            blocks: stage.copies(&[blocks])?,
+            start: stage.copies(&[self.start])?,
+            segments: stage.copies(&[offset(counted)?])?,
+            first: stage.copies(&per_segment(&self.bounds[..segments]))?,
+            end: stage.copies(&per_segment(&self.bounds[1..]))?,
             narrow: attention::prompt::narrow::Tables {
-                spans: copies(device, &narrow.0).await?,
-                full: copies(device, &narrow.1).await?,
-                ahead: copies(device, &narrow.2).await?,
-                pages: slice(device, &self.narrow.pages).await?,
-                limits: copies(device, &self.narrow.limits).await?,
-                positions: copies(device, &self.narrow.positions()?).await?,
+                spans: stage.copies(&narrow.0)?,
+                full: stage.copies(&narrow.1)?,
+                ahead: stage.copies(&narrow.2)?,
+                pages: stage.slice(&self.narrow.pages)?,
+                limits: stage.copies(&self.narrow.limits)?,
+                positions: stage.copies(&self.narrow.positions()?)?,
             },
             wide: attention::prompt::wide::Tables {
-                spans: copies(device, &wide.0).await?,
-                full: copies(device, &wide.1).await?,
-                ahead: copies(device, &wide.2).await?,
-                pages: slice(device, &self.wide.pages).await?,
-                limits: copies(device, &self.wide.limits).await?,
-                positions: copies(device, &self.wide.positions()?).await?,
+                spans: stage.copies(&wide.0)?,
+                full: stage.copies(&wide.1)?,
+                ahead: stage.copies(&wide.2)?,
+                pages: stage.slice(&self.wide.pages)?,
+                limits: stage.copies(&self.wide.limits)?,
+                positions: stage.copies(&self.wide.positions()?)?,
             },
             small: attention::prompt::small::Tables {
-                spans: copies(device, &small.0).await?,
-                full: copies(device, &small.1).await?,
-                ahead: copies(device, &small.2).await?,
-                pages: slice(device, &self.small.pages).await?,
-                limits: copies(device, &self.small.limits).await?,
-                positions: copies(device, &self.small.positions()?).await?,
+                spans: stage.copies(&small.0)?,
+                full: stage.copies(&small.1)?,
+                ahead: stage.copies(&small.2)?,
+                pages: stage.slice(&self.small.pages)?,
+                limits: stage.copies(&self.small.limits)?,
+                positions: stage.copies(&self.small.positions()?)?,
             },
-            half: copies(device, &per_segment(&self.half)).await?,
+            half: stage.copies(&per_segment(&self.half))?,
         })
     }
 }
@@ -1748,6 +1729,70 @@ pub fn writes(rows: &[Row], pages: &Pages) -> Result<(Vec<i32>, Vec<i32>)> {
     Ok((keys, values))
 }
 
+/// Bytes of one hidden row, the unit of a selected row's offset.
+const ROW_BYTES: usize = super::serving::Hidden::SIZE * 2;
+
+/// One launch's rows (its decode rows, padding up to the chunk's first wave, then the chunk) and
+/// the capacity rows its readout selects, in order.
+pub struct Launch {
+    pub rows: Vec<Row>,
+    /// The decode rows ahead of the padding.
+    pub decode: usize,
+    /// The chunk's first capacity row.
+    pub start: usize,
+    pub selected: Vec<usize>,
+}
+
+impl Launch {
+    /// The step's operands on both chips over a layer's `pages`, its capacity rows' token IDs
+    /// being `ids`; every selected row reads out greedy.
+    pub async fn input(
+        &self,
+        device: &mut Device,
+        pages: &Pages,
+        ids: HbmTensor<i32, Chips, m![Capacity]>,
+    ) -> Result<step::Input> {
+        let (rows, start) = (&self.rows, self.start);
+        if rows.len() > Capacity::SIZE || self.selected.len() > step::Selected::SIZE {
+            return Err("the launch holds more rows than the step".into());
+        }
+        // Every entry of the table is written: both chips must read the same rows.
+        let last = self.selected.last().copied().unwrap_or(0);
+        let offsets: Vec<i32> = (0..step::Selected::SIZE)
+            .map(|at| offset(self.selected.get(at).copied().unwrap_or(last) * ROW_BYTES))
+            .collect::<Result<_>>()?;
+        let (keys, values) = writes(rows, pages)?;
+        let tables = Prompt::new(rows, start, pages)?;
+        let chunk = rows.len().saturating_sub(start);
+        let mut stage = Stage::new(device);
+        let input = step::Input {
+            ids,
+            live: stage.copies(&[offset(tables.live(rows.len()))?])?,
+            layers: stage.copies(&[offset(super::LAYERS)?])?,
+            pages: stage.copies(&[offset(pages.count)?])?,
+            rotation: stage.copies(&coefficients(rows)?)?,
+            keys: stage.copies(&keys)?,
+            values: stage.copies(&values)?,
+            // Padding rows stay off the job plan: a batch's rows past its plan merge to zeros.
+            attention: plan(&mut stage, &rows[..self.decode], (pages, chunk))?,
+            selected: stage.copies(&offsets)?,
+            count: stage.copies(&[offset(self.selected.len())?])?,
+            prompt: tables.upload(&mut stage)?,
+            short: tables.upload_short(&mut stage)?,
+            chip: stage.upload(vec![0_i32, 1])?,
+            routed: tables.upload_routed(&mut stage)?,
+            sampling: greedy(&mut stage)?,
+        };
+        // One transfer writes every operand, so a call pays the transfer's latency once.
+        let Stage { mut writes, .. } = stage;
+        let pairs = (writes.iter_mut())
+            .map(|(bytes, buffer)| Ok((HostBufferSlice::from(&*bytes), buffer.slice_mut(.., ..)?)))
+            .collect::<Result<Vec<_>>>()?;
+        device.pdma.to_hbm(pairs).await?;
+        Ok(input)
+    }
+}
+
 /// One draw: (inverse temperature, top-k, top-p, ban, uniform).
 pub type Draw = (f32, i32, f32, f32, f32);
 /// The greedy draw.
@@ -1755,8 +1800,8 @@ pub const GREEDY: Draw = (1.0, 1, f32::INFINITY, 0.0, 0.0);
 
 /// A plan that draws the first `rows` selected rows, row `at` by `draws(at)`; every other row
 /// greedy.
-pub async fn sampling(
-    device: &mut Device,
+pub fn sampling(
+    stage: &mut Stage<'_>,
     (rows, draws): (usize, &dyn Fn(usize) -> Draw),
 ) -> Result<step::sample::Plan> {
     let table: Vec<Draw> = (0..step::Selected::SIZE)
@@ -1770,40 +1815,63 @@ pub async fn sampling(
     };
     let top_k: Vec<i32> = table.iter().flat_map(|draw| [draw.1, 0, 0, 0]).collect();
     Ok(step::sample::Plan {
-        rows: copies(device, &[i32::try_from(rows)?]).await?,
-        inverse: copies(device, &field(&|draw| draw.0)).await?,
-        top_k: copies(device, &top_k).await?,
-        top_p: copies(device, &field(&|draw| draw.2)).await?,
-        ban: copies(device, &field(&|draw| draw.3)).await?,
-        uniform: copies(device, &field(&|draw| draw.4)).await?,
+        rows: stage.copies(&[i32::try_from(rows)?])?,
+        inverse: stage.copies(&field(&|draw| draw.0))?,
+        top_k: stage.copies(&top_k)?,
+        top_p: stage.copies(&field(&|draw| draw.2))?,
+        ban: stage.copies(&field(&|draw| draw.3))?,
+        uniform: stage.copies(&field(&|draw| draw.4))?,
     })
 }
 
 /// A plan that samples no row: the readout's tokens are its greedy tokens.
-pub async fn greedy(device: &mut Device) -> Result<step::sample::Plan> {
-    sampling(device, (0, &|_| GREEDY)).await
+pub fn greedy(stage: &mut Stage<'_>) -> Result<step::sample::Plan> {
+    sampling(stage, (0, &|_| GREEDY))
 }
 
-/// `values`, chip-major, on both chips.
-pub async fn upload<D: MaterializableScalar, E: M>(
-    device: &mut Device,
-    values: Vec<D>,
-) -> Result<HbmTensor<D, Chips, E>> {
-    Ok(HostTensor::<D, m![{ Chips }, { E }]>::from_vec(values)
-        .to_hbm(&mut device.pdma)
-        .await?)
+/// A launch's operands, each in a device buffer of its own, their bytes held on the host until
+/// `Launch::input` writes them all in one transfer.
+pub struct Stage<'d> {
+    device: &'d Device,
+    /// Each operand's bytes as the device holds them, chip after chip, and its buffer.
+    writes: Vec<(HostBuffer, HbmBuffer)>,
 }
 
-/// `values`, repeated to fill `E`, on each chip.
-pub async fn copies<D: MaterializableScalar + Copy, E: M>(
-    device: &mut Device,
-    values: &[D],
-) -> Result<HbmTensor<D, Chips, E>> {
-    upload(
-        device,
-        values.iter().copied().cycle().take(2 * E::SIZE).collect(),
-    )
-    .await
+impl<'d> Stage<'d> {
+    pub fn new(device: &'d Device) -> Self {
+        Self {
+            device,
+            writes: Vec::new(),
+        }
+    }
+
+    /// `values`, chip-major, on both chips.
+    pub fn upload<D: MaterializableScalar, E: M>(
+        &mut self,
+        values: Vec<D>,
+    ) -> Result<HbmTensor<D, Chips, E>> {
+        let bytes = HostTensor::<D, m![{ Chips }, { E }]>::from_vec(values).into_buffer();
+        let buffer = HbmBuffer::alloc(self.device, bytes.len() / Chips::SIZE)?;
+        let tensor = HbmTensor::try_from(buffer.alias(..)?)?;
+        self.writes.push((bytes, buffer));
+        Ok(tensor)
+    }
+
+    /// `values`, repeated to fill `E`, on each chip.
+    pub fn copies<D: MaterializableScalar + Copy, E: M>(
+        &mut self,
+        values: &[D],
+    ) -> Result<HbmTensor<D, Chips, E>> {
+        self.upload(values.iter().copied().cycle().take(2 * E::SIZE).collect())
+    }
+
+    /// One tensor of each of `tensors` as `copies` lays it out.
+    fn slice<D: MaterializableScalar + Copy, E: M>(
+        &mut self,
+        tensors: &[Vec<D>],
+    ) -> Result<Slice<HbmTensor<D, Chips, E>>> {
+        tensors.iter().map(|values| self.copies(values)).collect()
+    }
 }
 
 #[cfg(test)]
