@@ -3,7 +3,7 @@
 use super::{InDm, Tree};
 use crate::Module;
 use crate::ops::index::scatter::Store;
-use crate::ops::normalization::span::{Selection, Span, Tile};
+use crate::ops::normalization::span::{Selection, Span};
 use crate::ops::normalization::{Blocked, Spread};
 use crate::ops::reduction;
 use crate::tensor::live::{Fill, Live, OnTile, Spill};
@@ -82,12 +82,11 @@ where
         };
         for index in 0..chosen.count::<Span>() {
             let tile = chosen.tile::<Span>(index);
-            let rows = selection.fill(&mut *context, tile);
             let head = self.to_dm(&mut *context);
             tile.tiles::<_, Rows<128>, Rows<64>, Rows<8>>(
                 &mut *context,
                 &mut Tiles {
-                    rows: &rows,
+                    selection: &selection,
                     head: &head,
                     tokens: &mut *tokens,
                     tile,
@@ -97,10 +96,10 @@ where
     }
 }
 
-/// One span's tiles: each read by the head, and its tokens stored where its rows sit among the
-/// launch's.
+/// One span's tiles of the selected rows: each gathered and read by the head, and its tokens
+/// stored where its rows sit among the launch's.
 struct Tiles<'a, Width: AxisName, V: AxisName, Capacity: AxisName> {
-    rows: &'a Spread<Width, Span>,
+    selection: &'a Selection<'a, Width, Capacity>,
     head: &'a InDm<'a, Width, V>,
     tokens: &'a mut HbmTensor<i32, Chip, m![Capacity]>,
     tile: Live<(), Capacity>,
@@ -110,9 +109,7 @@ impl<R: AxisName, Width: AxisName, V: AxisName, Capacity: AxisName> OnTile<Devic
     for Tiles<'_, Width, V, Capacity>
 {
     fn run(&mut self, device: &mut Device, index: usize) {
-        let mut rows: Spread<Width, R> = DmTensor::new();
-        let wave = Tile::<Width, m![Span % R]>::of(self.rows, index, &mut rows);
-        wave.input.to_dm_view(&mut device.tdma, wave.output);
+        let rows: Spread<Width, R> = self.selection.gather(&mut *device, self.tile, index);
         let selected = self.head.forward(&mut *device, (), &mut (), &rows);
         self.tokens.spill(device, &selected, (self.tile, index));
     }
