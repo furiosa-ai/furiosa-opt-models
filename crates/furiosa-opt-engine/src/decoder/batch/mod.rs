@@ -293,6 +293,7 @@ mod tests {
                     layers: 0..1,
                     kind: Kind::Paged,
                     window: None,
+                    scratch: 0,
                 }],
             },
             adapters: 0,
@@ -383,6 +384,7 @@ mod tests {
             layers: 1..2,
             kind: Kind::Paged,
             window: Some(8),
+            scratch: 0,
         });
         let cache = Cache::new(&device, &limits.cache, 8)?;
         let mut request = request(&device, &[7, 5], 3, 2)?;

@@ -261,6 +261,7 @@ mod tests {
                         layers: 0..1,
                         kind: Kind::Paged,
                         window: None,
+                        scratch: 0,
                     }],
                 },
                 adapters: 0,
