@@ -5,11 +5,15 @@
 //!   implementations: a decoder or media encoder type at one size each.
 //! - `Implementation::listed` finds the first of some architecture names that the list holds, with
 //!   its implementations, and `choose` picks the one whose scope serves a checkpoint, from its
-//!   config and names alone; its `load` then reads the checkpoint strictly at that scope into HBM,
-//!   as the `Model` a framework serves.
+//!   config and names alone, among those of the chips and KV cache a load chooses; its `load` then
+//!   reads the checkpoint strictly at that scope into HBM, as the `Model` a framework serves.
+//! - An implementation runs on its decoder's chips and caches keys and values in its decoder's
+//!   dtype; a load that names neither gets BF16 records on the one chip count left.
 //! - A decoder reads a whole model, a media encoder a load of the encoder part alone; each refuses
 //!   a checkpoint read for the other part.
 //! - A refused name is `Unsupported`, an unknown one `InvalidData`.
+
+use std::num::NonZeroUsize;
 
 use crate::decoder::{Decoder, Instance, Served};
 use crate::vision_language::Encoder;
@@ -22,6 +26,7 @@ use furiosa_opt_models::ops::attention::full::paged::Tiling;
 use furiosa_opt_models::tensor::cache;
 use furiosa_opt_models::tensor::memory::Hbm;
 use furiosa_opt_models::tensor::parallel::Parallel;
+use safetensors::Dtype;
 
 /// Every upstream architecture name, by family level, with the decoders that implement it; a
 /// refused name has none.
@@ -885,14 +890,25 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
 ];
 
 /// A type that implements an architecture at one size: its size, its class, the scope it reads a
-/// checkpoint at, the adapters its calls run, and its strict load into HBM.
+/// checkpoint at, the adapters its calls run, the chips it runs on, the dtype its KV cache stores
+/// keys and values in, and its strict load into HBM.
 #[derive(Debug)]
 pub struct Implementation {
     size: &'static str,
     class: Class,
     scope: fn(&Checkpoint) -> Result<&'static str, LoadError>,
     adapters: usize,
+    chips: usize,
+    kv_cache: Dtype,
     load: fn(&mut Context<'_>, &Checkpoint, Tiling) -> Result<Model, LoadError>,
+}
+
+/// The chips and KV cache dtype a load chooses among a name's implementations, each `None` where it
+/// names none: then the one chip count the others leave, and BF16 records.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Choice {
+    pub chips: Option<NonZeroUsize>,
+    pub kv_cache: Option<Dtype>,
 }
 
 /// A model a load returns, as a framework serves it.
@@ -917,6 +933,10 @@ impl Model {
 pub trait Listed: Implements + for<'a> Load<&'a Checkpoint> + Sized + 'static {
     /// Adapters a call of the model runs at most: none for a model whose projections take none.
     const ADAPTERS: usize = 0;
+    /// The chips the model runs on.
+    const CHIPS: usize = 1;
+    /// The dtype the model's KV cache stores keys and values in.
+    const KV_CACHE: Dtype = Dtype::BF16;
 
     /// Refuses a load of `part`, which the type does not read.
     fn reads(part: Part) -> Result<(), LoadError>;
@@ -925,9 +945,12 @@ pub trait Listed: Implements + for<'a> Load<&'a Checkpoint> + Sized + 'static {
     fn served(self, tiling: Tiling) -> Model;
 }
 
-/// A decoder reads a whole model and serves requests as an instance of the load's tiling.
+/// A decoder reads a whole model and serves requests as an instance of the load's tiling, on its
+/// chips over a cache of its dtype.
 impl<D: Implements + for<'a> Load<&'a Checkpoint> + Decoder + 'static> Listed for D {
     const ADAPTERS: usize = <D as Decoder>::ADAPTERS;
+    const CHIPS: usize = <D as Decoder>::CHIPS;
+    const KV_CACHE: Dtype = <D as Decoder>::KV_CACHE;
 
     fn reads(part: Part) -> Result<(), LoadError> {
         match part {
@@ -955,6 +978,8 @@ impl Implementation {
                 T::scope(source)
             },
             adapters: T::ADAPTERS,
+            chips: T::CHIPS,
+            kv_cache: T::KV_CACHE,
             load: |context, source, tiling| Ok(T::load(context, source)?.served(tiling)),
         }
     }
@@ -978,11 +1003,14 @@ impl Implementation {
     }
 
     /// The one of `implementations`, those listed for `name`, whose scope serves `source`, from its
-    /// config and names alone; when none serves, a lone refusal is returned as it is.
+    /// config and names alone, of the chips and KV cache `choice` gives; when none serves, a lone
+    /// refusal is returned as it is. Chips and a KV cache that no serving one holds are unsupported
+    /// by their names, and chip counts several serving ones leave a load that names none invalid.
     pub fn choose(
         name: &str,
         implementations: &'static [Self],
         source: &Checkpoint,
+        choice: Choice,
     ) -> Result<&'static Self, LoadError> {
         let (mut served, mut refused) = (Vec::new(), Vec::new());
         for implementation in implementations {
@@ -996,6 +1024,60 @@ impl Implementation {
             reason,
         };
         let joined = |parts: Vec<String>| parts.join("; ");
+        if !served.is_empty() {
+            let serving = format!("the {name} implementations that serve the checkpoint");
+            let kv_cache = choice.kv_cache.unwrap_or(Dtype::BF16);
+            let cached: Vec<_> = (served.iter().copied())
+                .filter(|implementation| implementation.kv_cache == kv_cache)
+                .collect();
+            if cached.is_empty() {
+                let mut dtypes: Vec<_> = (served.iter())
+                    .map(|chosen| format!("{:?}", chosen.kv_cache))
+                    .collect();
+                dtypes.sort_unstable();
+                dtypes.dedup();
+                return Err(LoadError::Unsupported {
+                    name: "kv_cache".into(),
+                    reason: format!("{serving} cache keys and values in {}", dtypes.join(" or ")),
+                });
+            }
+            let placed: Vec<_> = (cached.iter().copied())
+                .filter(|implementation| {
+                    (choice.chips).is_none_or(|chips| implementation.chips == chips.get())
+                })
+                .collect();
+            // The distinct chip counts of `implementations`, ascending.
+            let counts = |implementations: &[&Self]| {
+                let mut counts: Vec<_> =
+                    implementations.iter().map(|chosen| chosen.chips).collect();
+                counts.sort_unstable();
+                counts.dedup();
+                counts
+            };
+            let phrase = |counts: &[usize]| {
+                let counts: Vec<_> = counts.iter().map(|&count| chips(count)).collect();
+                counts.join(" or ")
+            };
+            match counts(&placed)[..] {
+                [] => {
+                    return Err(LoadError::Unsupported {
+                        name: "chips".into(),
+                        reason: format!("{serving} run on {}", phrase(&counts(&cached))),
+                    });
+                }
+                [_] => served = placed,
+                ref several => {
+                    return Err(LoadError::InvalidData {
+                        name: "chips".into(),
+                        reason: format!(
+                            "the {name} implementations on {} serve the checkpoint, and the load \
+                             names none",
+                            phrase(several)
+                        ),
+                    });
+                }
+            }
+        }
         match served.as_slice() {
             [implementation] => Ok(implementation),
             [] if refused.len() == 1 => Err(refused.remove(0)),
@@ -1010,14 +1092,26 @@ impl Implementation {
         }
     }
 
-    /// A model of this implementation's type, loaded strictly from `source` at its scope, serving
-    /// its calls with the attention tiled as `tiling` says.
+    /// A model of this implementation's type, loaded strictly from `source` at its scope into the
+    /// device of `context`, serving its calls with the attention tiled as `tiling` says; a device
+    /// of other chips than the implementation runs on is refused before any weight is read.
     pub fn load(
         &self,
         context: &mut Context<'_>,
         source: &Checkpoint,
         tiling: Tiling,
     ) -> Result<Model, LoadError> {
+        let held = usize::from(context.device().topology().chips);
+        if held != self.chips {
+            return Err(LoadError::Unsupported {
+                name: "chips".into(),
+                reason: format!(
+                    "the {} implementation runs on {}, the device holds {held}",
+                    self.size,
+                    chips(self.chips)
+                ),
+            });
+        }
         let scope = (self.scope)(source)?;
         context.field("", scope, |cx| (self.load)(cx, source, tiling))
     }
@@ -1036,23 +1130,46 @@ impl Implementation {
     pub fn adapters(&self) -> usize {
         self.adapters
     }
+
+    /// The chips the implementation runs on.
+    pub fn chips(&self) -> usize {
+        self.chips
+    }
+
+    /// The dtype its KV cache stores keys and values in.
+    pub fn kv_cache(&self) -> Dtype {
+        self.kv_cache
+    }
+}
+
+/// A count of chips as a refusal names it: `1 chip`, `2 chips`.
+fn chips(count: usize) -> String {
+    match count {
+        1 => "1 chip".into(),
+        count => format!("{count} chips"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ARCHITECTURES, Implementation, Tiling};
+    use super::{ARCHITECTURES, Choice, Implementation, Tiling};
     use crate::decoder::{Batch, Decoder, Limits, Output, Rows};
     use furiosa_opt_models::load::{Checkpoint, Context, Load, LoadError};
     use furiosa_opt_models::models::{Class, Implements};
-    use furiosa_opt_std::prelude::{Broadcast, Device, HbmBuffer, m};
+    use furiosa_opt_std::prelude::{Broadcast, Device, HbmBuffer, Topology, m};
+    use safetensors::Dtype;
     use std::collections::HashSet;
     use std::io;
+    use std::num::NonZeroUsize;
 
     /// A decoder that serves the checkpoints whose config's `size` is its `SIZE` or `every`: a
-    /// hidden-row decoder when large, a token decoder when small.
-    struct Fixture<const LARGE: bool>;
+    /// hidden-row decoder when large, a token decoder when small; on `CHIPS` chips over a cache of
+    /// E4M3 records when `E4M3`, else of BF16 ones.
+    struct Fixture<const LARGE: bool, const CHIPS: usize = 1, const E4M3: bool = false>;
 
-    impl<const LARGE: bool> Implements for Fixture<LARGE> {
+    impl<const LARGE: bool, const CHIPS: usize, const E4M3: bool> Implements
+        for Fixture<LARGE, CHIPS, E4M3>
+    {
         const SIZE: &'static str = if LARGE { "large" } else { "small" };
         const CLASS: Class = Class {
             family: "fixture",
@@ -1070,18 +1187,24 @@ mod tests {
         }
     }
 
-    impl<'a, const LARGE: bool> Load<&'a Checkpoint> for Fixture<LARGE> {
+    impl<'a, const LARGE: bool, const CHIPS: usize, const E4M3: bool> Load<&'a Checkpoint>
+        for Fixture<LARGE, CHIPS, E4M3>
+    {
         fn load(_: &mut Context<'_>, _: &'a Checkpoint) -> Result<Self, LoadError> {
             Ok(Self)
         }
     }
 
-    impl<const LARGE: bool> Decoder for Fixture<LARGE> {
+    impl<const LARGE: bool, const CHIPS: usize, const E4M3: bool> Decoder
+        for Fixture<LARGE, CHIPS, E4M3>
+    {
         const OUTPUT: Output = if LARGE {
             Output::Hidden
         } else {
             Output::Tokens
         };
+        const CHIPS: usize = CHIPS;
+        const KV_CACHE: Dtype = if E4M3 { Dtype::F8_E4M3 } else { Dtype::BF16 };
         type Output = Rows<i32, m![1]>;
         type Layers = ();
         type Adapter = std::convert::Infallible;
@@ -1110,6 +1233,108 @@ mod tests {
         Implementation::of::<Fixture<false>>(),
         Implementation::of::<Fixture<true>>(),
     ];
+
+    /// The small size on one chip and on two over BF16 records, and on two over E4M3 ones.
+    const PLACED: &[Implementation] = &[
+        Implementation::of::<Fixture<false>>(),
+        Implementation::of::<Fixture<false, 2>>(),
+        Implementation::of::<Fixture<false, 2, true>>(),
+    ];
+
+    /// A load's chips narrow the implementations that serve a checkpoint to those on them, and its
+    /// KV cache, BF16 when it names none, to those that cache in it: a choice none holds is refused
+    /// by its name, even where it leaves one of another cache, and implementations on two counts of
+    /// chips that a load naming none leaves are refused as several.
+    #[test]
+    fn chooses_by_the_chips_and_cache_a_load_names() {
+        let empty = tempfile::tempdir().unwrap();
+        let config = Some(serde_json::json!({ "size": "small" }));
+        let small = Checkpoint::new(empty.path(), config).unwrap();
+        let choose = |chips: usize, kv_cache, implementations| {
+            let choice = Choice {
+                chips: NonZeroUsize::new(chips),
+                kv_cache,
+            };
+            Implementation::choose("Causal", implementations, &small, choice)
+        };
+        let chosen = |chips, kv_cache| {
+            let chosen = choose(chips, kv_cache, PLACED).unwrap();
+            (chosen.chips(), chosen.kv_cache())
+        };
+        let e4m3 = Some(Dtype::F8_E4M3);
+        assert_eq!(chosen(1, None), (1, Dtype::BF16));
+        assert_eq!(chosen(2, None), (2, Dtype::BF16));
+        assert_eq!(chosen(2, e4m3), (2, Dtype::F8_E4M3));
+        assert_eq!(chosen(0, e4m3), (2, Dtype::F8_E4M3));
+        let refused = |chosen: Result<&Implementation, LoadError>| match chosen {
+            Err(LoadError::Unsupported { name, reason }) => ("unsupported", name, reason),
+            Err(LoadError::InvalidData { name, reason }) => ("invalid", name, reason),
+            other => panic!("{:?} is not a refusal", other.map(Implementation::size)),
+        };
+        let serving = "the Causal implementations that serve the checkpoint";
+        let refusal = |kind, name: &str, reason: String| (kind, name.to_owned(), reason);
+        assert_eq!(
+            refused(choose(4, None, PLACED)),
+            refusal(
+                "unsupported",
+                "chips",
+                format!("{serving} run on 1 chip or 2 chips")
+            ),
+        );
+        assert_eq!(
+            refused(choose(1, e4m3, PLACED)),
+            refusal("unsupported", "chips", format!("{serving} run on 2 chips")),
+        );
+        assert_eq!(
+            refused(choose(0, Some(Dtype::F32), PLACED)),
+            refusal(
+                "unsupported",
+                "kv_cache",
+                format!("{serving} cache keys and values in BF16 or F8_E4M3"),
+            ),
+        );
+        assert_eq!(
+            refused(choose(0, None, &PLACED[2..])),
+            refusal(
+                "unsupported",
+                "kv_cache",
+                format!("{serving} cache keys and values in F8_E4M3"),
+            ),
+        );
+        let several = "the Causal implementations on 1 chip or 2 chips serve the checkpoint, and \
+                       the load names none";
+        assert_eq!(
+            refused(choose(0, None, PLACED)),
+            refusal("invalid", "chips", several.into()),
+        );
+    }
+
+    /// An implementation loads onto a device of the chips it runs on, and onto one of other chips
+    /// is refused before its scope reads the checkpoint.
+    #[test]
+    fn loads_only_onto_its_chips() {
+        let empty = tempfile::tempdir().unwrap();
+        let config = Some(serde_json::json!({ "size": "small" }));
+        let small = Checkpoint::new(empty.path(), config).unwrap();
+        let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+        let mut load = |implementation: &Implementation| {
+            let context = &mut Context::new(&mut device);
+            implementation
+                .load(context, &small, Tiling::Adaptive)
+                .map(drop)
+        };
+        assert!(load(&PLACED[0]).is_ok());
+        match load(&PLACED[1]) {
+            Err(LoadError::Unsupported { name, reason }) => assert_eq!(
+                (name.as_str(), reason.as_str()),
+                (
+                    "chips",
+                    "the small implementation runs on 2 chips, the device holds 1"
+                ),
+            ),
+            other => panic!("{other:?} is not refused by its chips"),
+        }
+    }
 
     /// Every name is listed once, and parses to its row: one with implementations to them, a
     /// refused one as unsupported, by its name.
@@ -1145,8 +1370,8 @@ mod tests {
     }
 
     /// The one implementation whose scope serves the checkpoint's config is chosen and loads as its
-    /// decoder; a config none serves is refused with each one's refusal, or a lone one's own, and
-    /// one that several serve is refused.
+    /// decoder onto a device of its chip; a config none serves is refused with each one's refusal,
+    /// or a lone one's own, and one that several serve is refused.
     #[test]
     fn chooses_the_one_implementation_that_serves_the_config() {
         let empty = tempfile::tempdir().unwrap();
@@ -1155,12 +1380,14 @@ mod tests {
             Checkpoint::new(empty.path(), config).unwrap()
         };
         let large = source("large");
-        let chosen = Implementation::choose("Causal", SIZES, &large).unwrap();
+        let chosen = Implementation::choose("Causal", SIZES, &large, Choice::default()).unwrap();
         assert_eq!(chosen.size(), "large");
-        let loaded = chosen.load(&mut Context::new(None), &large, Tiling::Adaptive);
+        let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+        let loaded = chosen.load(&mut Context::new(&mut device), &large, Tiling::Adaptive);
         assert_eq!(loaded.unwrap().decoder().unwrap().output(), Output::Hidden);
         let refusal = |implementations, size| {
-            let chosen = Implementation::choose("Causal", implementations, &source(size));
+            let chosen =
+                Implementation::choose("Causal", implementations, &source(size), Choice::default());
             match chosen {
                 Err(LoadError::InvalidData { name, reason }) => (name, reason),
                 other => panic!("{size}: {:?}", other.map(Implementation::size)),
@@ -1194,19 +1421,20 @@ mod tests {
         let media = Checkpoint::new(empty.path(), Some(config)).unwrap();
         let (name, encoders) =
             Implementation::listed(&["Gemma4UnifiedForConditionalGeneration"]).unwrap();
-        let chosen = Implementation::choose(name, encoders, &media.encoder()).unwrap();
+        let chosen =
+            Implementation::choose(name, encoders, &media.encoder(), Choice::default()).unwrap();
         assert_eq!(chosen.size(), "12B");
         let small = Checkpoint::new(empty.path(), Some(serde_json::json!({ "size": "small" })));
         let small = small.unwrap();
         assert_eq!(
-            Implementation::choose("Causal", &SIZES[..1], &small)
+            Implementation::choose("Causal", &SIZES[..1], &small, Choice::default())
                 .unwrap()
                 .size(),
             "small"
         );
         for refused in [
-            Implementation::choose(name, encoders, &media),
-            Implementation::choose("Causal", &SIZES[..1], &small.encoder()),
+            Implementation::choose(name, encoders, &media, Choice::default()),
+            Implementation::choose("Causal", &SIZES[..1], &small.encoder(), Choice::default()),
         ] {
             assert!(
                 matches!(&refused, Err(LoadError::Unsupported { name, .. }) if name == "encoder"),

@@ -10,7 +10,7 @@ mod common;
 use std::io;
 
 use furiosa_opt_engine::Checkpoint;
-use furiosa_opt_engine::registry::Implementation;
+use furiosa_opt_engine::registry::{Choice, Implementation};
 use furiosa_opt_models::load::LoadError;
 use furiosa_opt_models::models::Family;
 use furiosa_opt_models::models::decoder::recurrent::mamba::Size;
@@ -43,7 +43,8 @@ const MAMBA_1_4B: Published = Published::new(
 /// The size of the implementation the registry chooses under `architecture` for `source`.
 fn load(architecture: &str, source: &Checkpoint) -> Result<&'static str, LoadError> {
     let (name, implementations) = Implementation::listed(&[architecture])?;
-    Implementation::choose(name, implementations, source).map(Implementation::size)
+    Implementation::choose(name, implementations, source, Choice::default())
+        .map(Implementation::size)
 }
 
 // # Strict loads of the published checkpoints
