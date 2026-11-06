@@ -718,7 +718,10 @@ fn loaded<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>(
 /// the panel's input.
 fn copied<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>(
     context: &mut Device,
-    (staged, scales): (&Staged<Intermediate, Rows>, &StagedScales<Intermediate, Rows>),
+    (staged, scales): (
+        &Staged<Intermediate, Rows>,
+        &StagedScales<Intermediate, Rows>,
+    ),
     panel: usize,
     live: usize,
     (_, activation, scale): &mut Landed<Hidden, Intermediate, Rows>,
