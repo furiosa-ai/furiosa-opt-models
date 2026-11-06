@@ -3,12 +3,11 @@
 //! codes meet the rows unrestored, a lane group of eight rows at a time.
 //!
 //! - A weight begun lands its tensor scale, block scales and codes, one transfer each, before any
-//!   rows arrive, so a schedule can land it under earlier work; its projection widens the block
-//!   scales to FP32 once, then runs every lane group.
+//!   rows arrive, so a schedule can land it under earlier work.
 //! - A lane group fills half of the tensor registers through the switch ring once and meets every
-//!   pass there; a pass covers the most rows whose FP32 block scales fit the vector registers. The
-//!   next group fills the other half under the passes when its switch takes at least one part a
-//!   pass, the parts past the passes after the last.
+//!   pass there; a pass covers the most rows whose FP32 block scales fit the vector registers, and
+//!   loads them there from E4M3 as it begins. The next group fills the other half under the passes
+//!   when its switch takes at least one part a pass, the parts past the passes after the last.
 //! - A pass's vector engine takes each block's sums four lanes a step, so the last group, when its
 //!   live rows lie in its first four lanes, switches, fills and folds those four alone: one step a
 //!   block.
@@ -189,15 +188,6 @@ type Registers<I, O, L, P> =
 /// The tensor scale in the vector registers of every slice of a projection.
 type Global<I, O, P> = VrfTensor<f32, Chip, Cluster<I, O, P>, Owners<I, O, P>, m![1 # 8]>;
 
-/// The FP32 block scales of every row a slice owns, widened once from E4M3.
-type Widened<I, O, P> = DmTensor<
-    f32,
-    Chip,
-    Cluster<I, O, P>,
-    Owners<I, O, P>,
-    m![O % ({ Owner<I, O, P> }), { Part<I> } / 16],
->;
-
 /// The FP32 block scales of one pass's rows, in the vector registers.
 type Scaling<I, O, P> = VrfTensor<
     f32,
@@ -324,16 +314,6 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
         input: &Live<X, R>,
     ) -> Summing<I, O, R, P> {
         let global = scalar::register(device, &self.global);
-        // The block scales widen to FP32 once, so each pass of every group loads its rows' as is.
-        let mut scales = Widened::<I, O, P>::new();
-        device
-            .sub
-            .begin(self.blocks.view().unpad::<Scaled<I, O, P>>())
-            .fetch::<m![O % ({ Owner<I, O, P> })], m![{ Part<I> } / 16]>()
-            .fetch_cast::<f32>()
-            .collect::<m![O % ({ Owner<I, O, P> }), { Part<I> } / 128], m![I / 16 % 8]>()
-            .commit_trim::<m![I / 16 % 8]>()
-            .commit_view(scales.view_mut());
         let mut projected = Summing::<I, O, R, P>::new();
         let (first, count) = input.groups::<Lanes<R>>();
         let rows = input.value();
@@ -354,14 +334,13 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
         };
         let whole = (1 - dense) * count - front;
         let last = first + count.max(1) - 1;
-        let operands = (&scales, &global);
         let tiles = <Tiles<I, O, P> as M>::SIZE;
         let mut staged = X::staged();
         let alone = |_: &mut Device, _: usize, _: &mut Staging<I, O, R, P>| {};
         if const { X::PARTS == 0 || X::PARTS >= <Tiles<I, O, P> as M>::SIZE } {
             for _ in 0..whole.min(1) {
                 let summed = |device: &mut Device, lanes: &Registers<I, O, Lane<R>, P>, at| {
-                    self.pass::<R, Split>(device, (lanes, operands), at, &mut projected);
+                    self.pass::<R, Split>(device, (lanes, &global), at, &mut projected);
                 };
                 // The last group's parts come beside the passes of the whole groups' last.
                 let beside = |device: &mut Device, part, staged: &mut _| {
@@ -386,12 +365,12 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
                 }
                 let lanes = rows.front(device, last, &staged);
                 for tile in 0..tiles {
-                    self.pass::<R, Trim>(device, (&lanes, operands), (last, tile), &mut projected);
+                    self.pass::<R, Trim>(device, (&lanes, &global), (last, tile), &mut projected);
                 }
             }
         } else {
             let summed = |device: &mut Device, lanes: &Registers<I, O, Lane<R>, P>, at| {
-                self.pass::<R, Split>(device, (lanes, operands), at, &mut projected);
+                self.pass::<R, Split>(device, (lanes, &global), at, &mut projected);
             };
             Self::meet(device, (rows, &mut staged), (first, whole), (summed, alone));
             for _ in 0..front {
@@ -399,11 +378,10 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
                 rows.switch_front(device, last, &mut staged);
                 let lanes = rows.front(device, last, &staged);
                 for tile in 0..tiles {
-                    self.pass::<R, Trim>(device, (&lanes, operands), (last, tile), &mut projected);
+                    self.pass::<R, Trim>(device, (&lanes, &global), (last, tile), &mut projected);
                 }
             }
         }
-        // Last, so that nothing after it holds the summed passes' FP32 scales.
         for _ in 0..dense {
             let weights = self.decode(device);
             let decoded = |device: &mut Device, lanes: &Registers<I, O, Lane<R>, P>, at| {
@@ -479,21 +457,11 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
     fn pass<R: AxisName, F: Fold<I, O, R, P>>(
         &self,
         device: &mut Device,
-        (lanes, (scales, global)): (
-            &Registers<I, O, F::Filled, P>,
-            (&Widened<I, O, P>, &Global<I, O, P>),
-        ),
+        (lanes, global): (&Registers<I, O, F::Filled, P>, &Global<I, O, P>),
         (group, tile): (usize, usize),
         projected: &mut Summing<I, O, R, P>,
     ) {
-        let scale: Scaling<I, O, P> = device
-            .sub
-            .begin(scales.view().tile::<Tiles<I, O, P>, 1, m![
-                { Elements<I, O, P> } # ({ Owner<I, O, P> }), { Part<I> } / 16
-            ]>(tile))
-            .fetch::<m![{ Elements<I, O, P> }, { Part<I> } / 128], m![I / 16 % 8]>()
-            .collect::<m![{ Elements<I, O, P> }, { Part<I> } / 128], m![I / 16 % 8]>()
-            .to_vrf();
+        let scale = self.scaling(device, tile);
         let sums = device
             .main
             .begin(
@@ -539,20 +507,7 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
     fn decode(&self, device: &mut Device) -> Decoded<I, O, P> {
         let mut weights = Decoded::<I, O, P>::new();
         for tile in 0..<Tiles<I, O, P> as M>::SIZE {
-            let scale: Scaling<I, O, P> = device
-                .sub
-                .begin(
-                    self.blocks
-                        .view()
-                        .unpad::<Scaled<I, O, P>>()
-                        .tile::<Tiles<I, O, P>, 1, m![
-                            { Elements<I, O, P> } # ({ Owner<I, O, P> }), { Part<I> } / 16
-                        ]>(tile),
-                )
-                .fetch::<Elements<I, O, P>, m![{ Part<I> } / 16]>()
-                .fetch_cast::<f32>()
-                .collect::<m![{ Elements<I, O, P> }, { Part<I> } / 128], m![I / 16 % 8]>()
-                .to_vrf();
+            let scale = self.scaling(device, tile);
             device
                 .main
                 .begin(
@@ -628,6 +583,24 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
             _,
         >(sums)
         .commit_view(<Split as Fold<I, O, R, P>>::sums(projected, (group, tile)));
+    }
+
+    /// The block scales of pass `tile`'s rows in the vector registers, widened to FP32 as they load.
+    fn scaling(&self, device: &mut Device, tile: usize) -> Scaling<I, O, P> {
+        device
+            .sub
+            .begin(
+                self.blocks
+                    .view()
+                    .unpad::<Scaled<I, O, P>>()
+                    .tile::<Tiles<I, O, P>, 1, m![
+                        { Elements<I, O, P> } # ({ Owner<I, O, P> }), { Part<I> } / 16
+                    ]>(tile),
+            )
+            .fetch::<Elements<I, O, P>, m![{ Part<I> } / 16]>()
+            .fetch_cast::<f32>()
+            .collect::<m![{ Elements<I, O, P> }, { Part<I> } / 128], m![I / 16 % 8]>()
+            .to_vrf()
     }
 }
 
