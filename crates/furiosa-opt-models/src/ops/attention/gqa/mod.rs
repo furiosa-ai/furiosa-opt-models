@@ -239,20 +239,13 @@ type ChunkViewMut<'a, Rows, KvHeads, Head, Count, D = bf16> = DmTensorViewMut<
 
 /// One window as it lands, its cells of `D` and its bias: two alternate, so a window lands while
 /// the one before it is attended.
-struct Landing<
-    Rows: AxisName,
-    KvHeads: AxisName,
-    Groups: AxisName,
-    Head: AxisName,
-    Count: M,
-    D: Scalar = bf16,
-> {
+struct Landing<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Count: M, D: Scalar = bf16> {
     cells: InDm<Rows, KvHeads, Head, Count, D>,
-    bias: Bias<Rows, KvHeads, Groups, Count>,
+    bias: Bias<Rows, KvHeads, Count>,
 }
 
-impl<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName, Count: M, D: Scalar>
-    Landing<Rows, KvHeads, Groups, Head, Count, D>
+impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Count: M, D: Scalar>
+    Landing<Rows, KvHeads, Head, Count, D>
 {
     fn new() -> Self {
         Self {
@@ -938,14 +931,14 @@ fn broadcast<
         .commit()
 }
 
-/// Each shard's bias of its slots, held per query row: a register operand repeats a single flit,
-/// so an operand eight flits wide names the `Groups` axis of the logits it multiplies.
-type Bias<Rows, KvHeads, Groups, Count = RowGroups<Rows>> = DmTensor<
+/// Each shard's bias of its slots, once a row: the masks read it once a query group, as a register
+/// operand repeats only a single flit and these are eight flits wide.
+type Bias<Rows, KvHeads, Count = RowGroups<Rows>> = DmTensor<
     f32,
     Chip,
     Cluster<Rows>,
     CacheSlices<Rows, KvHeads>,
-    m![{ Count }, Groups, { ShardKeys<KvHeads> }],
+    m![{ Count }, { ShardKeys<KvHeads> }],
 >;
 
 pub(super) type Local<Rows, KvHeads, Groups, Head, const SCALE: usize> =
@@ -1116,10 +1109,9 @@ where
                 shard::Transposed<Partition<Rows, KvHeads, Groups, Head, SCALE>, RowGroups<Rows>>;
             // Staged per window, not before the loop, a slice holds one or two windows' bias
             // however many a history spans, and a skipped window moves nothing.
-            type Whole<Rows, KvHeads, Groups, Head, Source> = Landing<
+            type Whole<Rows, KvHeads, Head, Source> = Landing<
                 Rows,
                 KvHeads,
-                Groups,
                 Head,
                 RowGroups<Rows>,
                 <Source as Landed<Rows, KvHeads, Head>>::Element,
@@ -1129,7 +1121,7 @@ where
             let mut lands =
                 |device: &mut Device,
                  at: usize,
-                 landing: &mut Whole<Rows, KvHeads, Groups, Head, Source>| {
+                 landing: &mut Whole<Rows, KvHeads, Head, Source>| {
                     crate::Module::forward(
                         history,
                         &mut *device,
@@ -1141,19 +1133,18 @@ where
                         .tile::<m![Windows], 1, m![Rows, Windows = 1 # Windows, Cache]>(at)
                         .to_dm_view(&mut device.tdma, landing.bias.view_mut());
                 };
-            let wraps =
-                |device: &mut Device, landing: &mut Whole<Rows, KvHeads, Groups, Head, Source>| {
-                    crate::Module::forward(
-                        history,
-                        &mut *device,
-                        (),
-                        &mut landing.cells,
-                        (Wraps, live),
-                    );
-                };
+            let wraps = |device: &mut Device, landing: &mut Whole<Rows, KvHeads, Head, Source>| {
+                crate::Module::forward(
+                    history,
+                    &mut *device,
+                    (),
+                    &mut landing.cells,
+                    (Wraps, live),
+                );
+            };
             // The place a window's keys widen into holds them until they fill the registers.
             let prepares = |device: &mut Device,
-                            landing: &Whole<Rows, KvHeads, Groups, Head, Source>,
+                            landing: &Whole<Rows, KvHeads, Head, Source>,
                             values: &mut Transposed<Rows, KvHeads, Groups, Head, SCALE>|
              -> Restored<Source, Rows, KvHeads, Head> {
                 let mut restored = Source::place();
@@ -1169,7 +1160,7 @@ where
             let attends =
                 |device: &mut Device,
                  (landing, restored): (
-                    &Whole<Rows, KvHeads, Groups, Head, Source>,
+                    &Whole<Rows, KvHeads, Head, Source>,
                     Restored<Source, Rows, KvHeads, Head>,
                 ),
                  values: &Transposed<Rows, KvHeads, Groups, Head, SCALE>| {
@@ -1349,10 +1340,9 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
             >,
         Q: Queries<Rows, KvHeads, Groups, Head>,
     {
-        type Place<Rows, KvHeads, Groups, Head, Source, const N: usize> = Landing<
+        type Place<Rows, KvHeads, Head, Source, const N: usize> = Landing<
             Rows,
             KvHeads,
-            Groups,
             Head,
             TileRows<Rows, N>,
             <Source as Landed<Rows, KvHeads, Head>>::Element,
@@ -1362,37 +1352,29 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
         type Registers<Rows, KvHeads, Groups, Head, const SCALE: usize, const N: usize> =
             shard::Registers<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>, TileRows<Rows, N>>;
         // The bias goes first: a transfer issued after the gather may wait for it to finish.
-        let lands =
-            |device: &mut Device,
-             (at, pass): (usize, Pass<N>),
-             landing: &mut Place<Rows, KvHeads, Groups, Head, Source, N>| {
-                bias.view()
-                    .tile::<m![Windows], 1, m![Rows, Windows = 1 # Windows, Cache]>(at)
-                    .tile::<Tiles<Rows, N>, 1, m![
-                        { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), { TileRows<Rows, N> },
-                        { Layout<Rows>::Lanes }, Windows = 1 # Windows, Cache
-                    ]>(pass.tile)
-                    .to_dm_view(&mut device.tdma, landing.bias.view_mut());
-                crate::Module::forward(history, &mut *device, (), &mut landing.cells, (at, pass));
-            };
+        let lands = |device: &mut Device,
+                     (at, pass): (usize, Pass<N>),
+                     landing: &mut Place<Rows, KvHeads, Head, Source, N>| {
+            bias.view()
+                .tile::<m![Windows], 1, m![Rows, Windows = 1 # Windows, Cache]>(at)
+                .tile::<Tiles<Rows, N>, 1, m![
+                    { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), { TileRows<Rows, N> },
+                    { Layout<Rows>::Lanes }, Windows = 1 # Windows, Cache
+                ]>(pass.tile)
+                .to_dm_view(&mut device.tdma, landing.bias.view_mut());
+            crate::Module::forward(history, &mut *device, (), &mut landing.cells, (at, pass));
+        };
         // The tokens past the rows' last window, into the head of their first window's place.
-        let wraps =
-            |device: &mut Device,
-             pass: Pass<N>,
-             landing: &mut Place<Rows, KvHeads, Groups, Head, Source, N>| {
-                crate::Module::forward(
-                    history,
-                    &mut *device,
-                    (),
-                    &mut landing.cells,
-                    (Wraps, pass),
-                );
-            };
+        let wraps = |device: &mut Device,
+                     pass: Pass<N>,
+                     landing: &mut Place<Rows, KvHeads, Head, Source, N>| {
+            crate::Module::forward(history, &mut *device, (), &mut landing.cells, (Wraps, pass));
+        };
         let projects = |device: &mut Device, pass: Pass<N>| query.pass(device, pass);
         // Everything a window's attention reads of its place, so the place is free once prepared;
         // the registers fill first, so the key fill runs beside the values' transpose.
         let prepares = |device: &mut Device,
-                        landing: &Place<Rows, KvHeads, Groups, Head, Source, N>,
+                        landing: &Place<Rows, KvHeads, Head, Source, N>,
                         values: &mut Transposed<Rows, KvHeads, Groups, Head, SCALE, N>|
          -> Registers<Rows, KvHeads, Groups, Head, SCALE, N> {
             let mut restored = Source::place::<TileRows<Rows, N>>();
@@ -1459,7 +1441,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
             // Codes widen where they landed: the keys last here, as the next window's landing is
             // issued, and the values once scored, as Sub fills the weights.
             let prepares = |device: &mut Device,
-                            landing: &Place<Rows, KvHeads, Groups, Head, Source, N>,
+                            landing: &Place<Rows, KvHeads, Head, Source, N>,
                             _: &mut ()|
              -> (
                 Masks<Rows, KvHeads, Groups, Head, SCALE, N>,
@@ -1475,7 +1457,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 (masks, restored)
             };
             let (mut even, mut odd, mut nothing) = (
-                Place::<Rows, KvHeads, Groups, Head, Source, N>::new(),
+                Place::<Rows, KvHeads, Head, Source, N>::new(),
                 Landing::new(),
                 (),
             );
@@ -1501,12 +1483,12 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 let mut land =
                     |device: &mut Device,
                      at,
-                     landing: &mut Place<Rows, KvHeads, Groups, Head, Source, N>| {
+                     landing: &mut Place<Rows, KvHeads, Head, Source, N>| {
                         lands(device, (at, pass), landing)
                     };
                 let mut attend = |device: &mut Device,
                                   (landing, (masks, mut restored)): (
-                    &Place<Rows, KvHeads, Groups, Head, Source, N>,
+                    &Place<Rows, KvHeads, Head, Source, N>,
                     (
                         Masks<Rows, KvHeads, Groups, Head, SCALE, N>,
                         Restored<Source, Rows, KvHeads, Head, N>,
@@ -1561,7 +1543,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 let mut follow =
                     |device: &mut Device,
                      at: usize,
-                     landing: &mut Place<Rows, KvHeads, Groups, Head, Source, N>| {
+                     landing: &mut Place<Rows, KvHeads, Head, Source, N>| {
                         let within = (rest + 1 - at).min(1);
                         for _ in 0..within + (1 - within) * ((count - tile) / 2).min(1) {
                             let pass = Pass::of(first + tile + 1 - within, live);
@@ -1591,7 +1573,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
             }
         } else if const { Self::overlaps::<Rows>(N) } {
             let (mut even, mut odd) = (
-                Place::<Rows, KvHeads, Groups, Head, Source, N>::new(),
+                Place::<Rows, KvHeads, Head, Source, N>::new(),
                 Landing::new(),
             );
             let mut values = Transposed::<Rows, KvHeads, Groups, Head, SCALE, N>::new();
@@ -1612,14 +1594,14 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 let mut land =
                     |device: &mut Device,
                      at,
-                     landing: &mut Place<Rows, KvHeads, Groups, Head, Source, N>| {
+                     landing: &mut Place<Rows, KvHeads, Head, Source, N>| {
                         lands(device, (at, pass), landing)
                     };
                 // Window `at` of this pass while its history holds it, past that the next pass's first.
                 let mut follow =
                     |device: &mut Device,
                      at: usize,
-                     landing: &mut Place<Rows, KvHeads, Groups, Head, Source, N>| {
+                     landing: &mut Place<Rows, KvHeads, Head, Source, N>| {
                         let within = (rest + 1 - at).min(1);
                         for _ in 0..within + (1 - within) * ((count - tile) / 2).min(1) {
                             let pass = Pass::of(first + tile + 1 - within, live);
@@ -1628,7 +1610,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     };
                 let mut attend = |device: &mut Device,
                                   (_, registers): (
-                    &Place<Rows, KvHeads, Groups, Head, Source, N>,
+                    &Place<Rows, KvHeads, Head, Source, N>,
                     Registers<Rows, KvHeads, Groups, Head, SCALE, N>,
                 ),
                                   values: &Transposed<Rows, KvHeads, Groups, Head, SCALE, N>| {
@@ -1778,7 +1760,7 @@ fn attend<
         &shard::Transposed<Partition<Rows, KvHeads, Groups, Head, SCALE>, RowGroups<Rows>>,
     ),
     (bias, scales): (
-        &Bias<Rows, KvHeads, Groups>,
+        &Bias<Rows, KvHeads>,
         Option<&shard::Scales<Partition<Rows, KvHeads, Groups, Head, SCALE>>>,
     ),
 ) -> (
@@ -1802,8 +1784,7 @@ fn attend<
                     { ShardKeys<KvHeads> }, Head
                 ]>(tile),
             bias.view().tile::<Tiles<Rows>, 1, m![
-                { Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, Groups,
-                { ShardKeys<KvHeads> }
+                { Tiles<Rows> } = 1 # ({ Tiles<Rows> }), { TileRows<Rows> }, { ShardKeys<KvHeads> }
             ]>(tile),
         );
         <Partition<Rows, KvHeads, Groups, Head, SCALE> as shard::Partition>::attend::<TileRows<Rows>, _, _, _, _>(
@@ -1922,7 +1903,7 @@ mod tests {
             wrap: (),
         };
         for w in 0..Chunks::SIZE {
-            let mut landing = super::Landing::<Count, KvHeads, Groups, Head, _>::new();
+            let mut landing = super::Landing::<Count, KvHeads, Head, _>::new();
             crate::Module::forward(
                 &history,
                 &mut *device,
@@ -2652,7 +2633,7 @@ mod tests {
             m![{ super::RowGroups<Eight> }, KeyValue, { super::ShardKeys<KvHeads> }, Head],
         > = source.to_dm(&mut device.tdma);
         let query: super::Query<Eight, KvHeads, Groups, Head> = query.to_dm(&mut device.tdma);
-        let bias: super::Bias<Eight, KvHeads, Groups> = bias.to_dm(&mut device.tdma);
+        let bias: super::Bias<Eight, KvHeads> = bias.to_dm(&mut device.tdma);
         <super::Partition<Eight, KvHeads, Groups, Head, INVERSE_ROOT> as Partition>::windows::<
             _,
             super::Rest<Single>,

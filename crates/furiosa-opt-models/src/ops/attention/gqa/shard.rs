@@ -586,7 +586,8 @@ pub(crate) trait Partition: Sized {
         Registers { key, masks }
     }
 
-    /// A window's `bias` read into the mask and the bias its scores take.
+    /// A window's `bias`, a row's, read once each query group into the mask and the bias its scores
+    /// take.
     fn mask<Count: M, B: M>(
         device: &mut Device,
         bias: DmTensorView<'_, f32, Chip<Self>, Self::Cluster, Self::Slices, B>,
