@@ -516,7 +516,8 @@ mod tests {
         let length = |row: usize| lengths.get(row).copied().unwrap_or(0);
         // Every entry names a readable block: past a row's blocks, its last one.
         let block = |at: usize| {
-            let (row, at) = (at / (windows * slots), at % (windows * slots));
+            let (window, row, slot) = (at / (rows * slots), at / slots % rows, at % slots);
+            let at = window * slots + slot;
             let history = items::history(row, length(row).max(1));
             let last = firsts[history] + items::keys(history).div_ceil(Block::SIZE) - 1;
             let used = length(row).div_ceil(Block::SIZE).max(1);
@@ -537,7 +538,7 @@ mod tests {
             })
             .collect();
         let rest = lengths.iter().map(|keys| (keys - 1) / Cache::SIZE).max();
-        let table = HostTensor::<i32, m![R, Windows, BlockIndex]>::from_vec(table);
+        let table = HostTensor::<i32, m![Windows, R, BlockIndex]>::from_vec(table);
         let counts = HostTensor::<i32, m![Windows, R]>::from_vec(counts);
         let bias = HostTensor::<f32, m![R, Windows, Cache]>::from_vec(bias);
         Pages {

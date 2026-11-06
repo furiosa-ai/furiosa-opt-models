@@ -39,9 +39,9 @@ pub struct Read<Windows: AxisName, Chips: M = Chip> {
 /// `W` is the tokens past each row's last window, as a launch or a paging holds them ([`Wrapping`]).
 #[derive(DeviceSend)]
 pub struct Pages<Rows: AxisName, Windows: AxisName, Chips: M = Chip, W = Wrap<Rows, Chips>> {
-    /// Byte offsets of pool blocks, per row and window. Every entry must be readable, including
-    /// rounded overfetch.
-    pub table: HbmTensor<i32, Chips, m![Rows, Windows, BlockIndex]>,
+    /// Byte offsets of pool blocks, per window and row: a window's rows lie together, as its
+    /// gather reads them. Every entry must be readable, including rounded overfetch.
+    pub table: HbmTensor<i32, Chips, m![Windows, Rows, BlockIndex]>,
     /// Blocks read per row and window, including the block of the row's own token.
     pub lengths: BlockCounts<Rows, Windows, Chips>,
     /// Additive mask of each token: 0 for the visible prefix, padding past it.

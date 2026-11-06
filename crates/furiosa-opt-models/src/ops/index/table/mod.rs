@@ -447,8 +447,9 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
 type Entries<Chips, R> = DmTensor<i32, Chips, Cluster, m![R # 256], m![BlockIndex]>;
 
 impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
-    /// Each row's pool-block byte offsets for the windows the rows span: its table's window rows
-    /// from its first window, `bytes` a block; a window past the table reads its last row.
+    /// Each row's pool-block byte offsets for the windows the rows span, a window's rows together:
+    /// its table's window rows from its first window, `bytes` a block; a window past the table
+    /// reads its last row.
     pub(crate) fn table<B: AxisName>(
         &self,
         device: &mut Device,
@@ -458,7 +459,7 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
         ),
         starts: &HbmTensor<i32, Chips, m![R]>,
         bytes: i32,
-    ) -> HbmTensor<i32, Chips, m![R, W, BlockIndex]> {
+    ) -> HbmTensor<i32, Chips, m![W, R, BlockIndex]> {
         let (first, spanned) = (&self.first, &self.spanned);
         let starts = vector(device, starts);
         let head: Vector<R, i32, Chips> = device
@@ -506,7 +507,7 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
             .vector_final()
             .commit_trim::<m![R % ({ Lane<R> }) # 8]>()
             .commit();
-        let mut output: HbmTensor<i32, Chips, m![R, W, BlockIndex]> = HbmTensor::new();
+        let mut output: HbmTensor<i32, Chips, m![W, R, BlockIndex]> = HbmTensor::new();
         for w in 0..spanned.extent::<m![W]>() {
             let mut index: HbmTensor<i32, Chips, m![R]> = HbmTensor::new();
             offsets
@@ -538,7 +539,7 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
                 &mut device.tdma,
                 output
                     .view_mut()
-                    .tile::<m![W], 1, m![R, W = 1 #{!} W, BlockIndex]>(w),
+                    .tile::<m![W], 1, m![W = 1 #{!} W, R, BlockIndex]>(w),
             );
         }
         output
@@ -1029,7 +1030,7 @@ mod tests {
         device: &mut Device,
         query: &PrefixQuery<Eight>,
         blocks: &Blocks,
-        table: &HbmTensor<i32, Chip, m![Eight, Chunks, BlockIndex]>,
+        table: &HbmTensor<i32, Chip, m![Chunks, Eight, BlockIndex]>,
         lengths: &BlockCounts<Eight, Chunks>,
         bias: &Bias<Eight>,
         rest: &Value,
@@ -1141,15 +1142,17 @@ mod tests {
             .to_hbm(&mut device.pdma)
             .await
             .unwrap();
-        let table = HostTensor::<i32, m![Eight, Chunks, BlockIndex]>::from_vec(
-            (0..Eight::SIZE).flat_map(|row| {
-                (0..Chunks::SIZE * BlockIndex::SIZE).map(move |entry| {
-                    let block = if entry < (Chunks::SIZE - 1) * BlockIndex::SIZE {
-                        row
-                    } else {
-                        blocks - (row + 1) * BlockIndex::SIZE + entry % BlockIndex::SIZE
-                    };
-                    i32::try_from(block * <Blocks>::BLOCK_STRIDE as usize).unwrap()
+        let table = HostTensor::<i32, m![Chunks, Eight, BlockIndex]>::from_vec(
+            (0..Chunks::SIZE).flat_map(|window| {
+                (0..Eight::SIZE).flat_map(move |row| {
+                    (0..BlockIndex::SIZE).map(move |entry| {
+                        let block = if window < Chunks::SIZE - 1 {
+                            row
+                        } else {
+                            blocks - (row + 1) * BlockIndex::SIZE + entry
+                        };
+                        i32::try_from(block * <Blocks>::BLOCK_STRIDE as usize).unwrap()
+                    })
                 })
             }),
         )

@@ -711,7 +711,8 @@ async fn pages<Windows: AxisName>(
     let wrapped = |row: usize| visible(row).end.saturating_sub(first(row) + ring);
     let table: Vec<i32> = (0..Rows::SIZE * windows * entries)
         .map(|at| {
-            let (row, entry) = (at / (windows * entries), at % (windows * entries));
+            let (window, row) = (at / (Rows::SIZE * entries), at / entries % Rows::SIZE);
+            let entry = window * entries + at % entries;
             let used = visible(row).end.div_ceil(Block::SIZE).max(1);
             let block = (first(row) / Block::SIZE + entry).min(used - 1);
             key(row, block * Block::SIZE)
@@ -750,7 +751,7 @@ async fn pages<Windows: AxisName>(
     let wraps: Vec<i32> = (0..Rows::SIZE).map(|row| wrapped(row) as i32).collect();
     let any = wraps.iter().any(|&count| count > 0);
     Pages {
-        table: HostTensor::<i32, m![Rows, Windows, BlockIndex]>::from_vec(table)
+        table: HostTensor::<i32, m![Windows, Rows, BlockIndex]>::from_vec(table)
             .to_hbm(&mut device.pdma)
             .await
             .unwrap(),

@@ -182,17 +182,18 @@ type InDm<Rows, KvHeads, Head, Count = RowGroups<Rows>, D = bf16> = DmTensor<
     m![{ Count }, KeyValue, BlockIndex % ({ Symbol<ShardBlocks<KvHeads>> }), Block, Head],
 >;
 
-/// One chunk's entries of a step's table, the only shape a gather takes an index in.
+/// One chunk's entries of a step's table, the only shape a gather takes an index in: a window's
+/// tile of the table, whose rows lie together.
 type Entries<Rows> = HbmTensor<i32, Chip, m![Rows, BlockIndex]>;
 
 /// One chunk's entries of the row groups of one `N`-row tile, their lanes in order.
 type TileEntries<Rows, const N: usize> =
     HbmTensor<i32, Chip, m![{ TileRows<Rows, N> }, { Layout<Rows>::Lanes }, BlockIndex]>;
 
-/// A layer's cache blocks of `D`, the table of blocks each row reads, the scales its codes are
-/// read under (nothing for BF16 blocks, the layer's [`cache::Landed`] scales for E4M3 ones), and
-/// the tokens each row holds past its last window: a [`Wrap`] with the times it lands, one if any
-/// row holds one, else none, or nothing for histories that hold none.
+/// A layer's cache blocks of `D`, the table of blocks each row reads by window, the scales its
+/// codes are read under (nothing for BF16 blocks, the layer's [`cache::Landed`] scales for E4M3
+/// ones), and the tokens each row holds past its last window: a [`Wrap`] with the times it lands,
+/// one if any row holds one, else none, or nothing for histories that hold none.
 pub struct Paged<
     'l,
     Rows: AxisName,
@@ -204,7 +205,7 @@ pub struct Paged<
     W = (),
 > {
     pub blocks: &'l Blocks<KvHeads, Head, D>,
-    pub table: &'l HbmTensor<i32, Chip, m![Rows, Windows, BlockIndex]>,
+    pub table: &'l HbmTensor<i32, Chip, m![Windows, Rows, BlockIndex]>,
     pub lengths: &'l BlockCounts<Rows, Windows>,
     pub scales: &'l S,
     pub wrap: W,
@@ -553,8 +554,8 @@ impl<
 {
     type Output = ();
 
-    /// A gather takes its index as a whole tensor, so one chunk's entries are copied out of the
-    /// table before they address the pool.
+    /// A gather takes its index as a whole tensor, which a window's entries are where they lie; its
+    /// counts are copied, as its core reads counts in place only where it proves nothing writes.
     fn forward(
         &self,
         device: &mut Device,
@@ -562,11 +563,13 @@ impl<
         cells: &mut InDm<Rows, KvHeads, Head, RowGroups<Rows>, D>,
         (at, live): (usize, Live<(), Rows>),
     ) {
-        let mut entries = Entries::<Rows>::new();
-        self.table
-            .view()
-            .tile::<m![Windows], 1, m![Rows, Windows = 1 # Windows, BlockIndex]>(at)
-            .to_hbm_view(&mut device.tdma, entries.view_mut());
+        // SAFETY: a window's rows are consecutive cells of the table, which nothing writes while a
+        // step attends over it.
+        let entries: Entries<Rows> = unsafe {
+            (self.table.view())
+                .tile::<m![Windows], 1, m![Windows = 1 # Windows, Rows, BlockIndex]>(at)
+                .alias()
+        };
         let mut lengths: HbmTensor<i32, Chip, m![Rows]> = HbmTensor::new();
         self.lengths
             .view()
@@ -606,15 +609,16 @@ impl<
         cells: &mut InDm<Rows, KvHeads, Head, TileRows<Rows, N>, D>,
         (at, pass): (usize, Pass<N>),
     ) {
-        let mut entries = TileEntries::<Rows, N>::new();
-        self.table
-            .view()
-            .tile::<m![Windows], 1, m![Rows, Windows = 1 # Windows, BlockIndex]>(at)
-            .tile::<Tiles<Rows, N>, 1, m![
-                { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), { TileRows<Rows, N> },
-                { Layout<Rows>::Lanes }, Windows = 1 # Windows, BlockIndex
-            ]>(pass.tile)
-            .to_hbm_view(&mut device.tdma, entries.view_mut());
+        // SAFETY: as over every row; a tile's rows are consecutive rows of the window.
+        let entries: TileEntries<Rows, N> = unsafe {
+            (self.table.view())
+                .tile::<m![Windows], 1, m![Windows = 1 # Windows, Rows, BlockIndex]>(at)
+                .tile::<Tiles<Rows, N>, 1, m![
+                    Windows = 1 # Windows, { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }),
+                    { TileRows<Rows, N> }, { Layout<Rows>::Lanes }, BlockIndex
+                ]>(pass.tile)
+                .alias()
+        };
         let mut lengths: HbmTensor<i32, Chip, m![{ TileRows<Rows, N> }, { Layout<Rows>::Lanes }]> =
             HbmTensor::new();
         self.lengths
@@ -790,17 +794,20 @@ impl<
     ) {
         let (wrap, times) = self.wrap;
         for _ in 0..times {
-            let mut offsets: HbmTensor<
+            // SAFETY: a tile's rows are consecutive rows of the offsets, which nothing writes while a
+            // step attends over them.
+            let offsets: HbmTensor<
                 i32,
                 Chip,
                 m![{ TileRows<Rows, N> }, { Layout<Rows>::Lanes }, BlockIndex % 2, Block],
-            > = HbmTensor::new();
-            (wrap.offsets.view())
-                .tile::<Tiles<Rows, N>, 1, m![
-                    { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), { TileRows<Rows, N> },
-                    { Layout<Rows>::Lanes }, BlockIndex % 2, Block
-                ]>(pass.tile)
-                .to_hbm_view(&mut device.tdma, offsets.view_mut());
+            > = unsafe {
+                (wrap.offsets.view())
+                    .tile::<Tiles<Rows, N>, 1, m![
+                        { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), { TileRows<Rows, N> },
+                        { Layout<Rows>::Lanes }, BlockIndex % 2, Block
+                    ]>(pass.tile)
+                    .alias()
+            };
             let mut counts: HbmTensor<
                 i32,
                 Chip,
@@ -1448,8 +1455,8 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 shard::Masks<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>, TileRows<Rows, N>>;
             type Restored<Source, Rows, KvHeads, Head, const N: usize> =
                 <Source as Landed<Rows, KvHeads, Head>>::Restored<TileRows<Rows, N>>;
-            // Codes widen where they landed: the keys here, the values once scored, so that Main
-            // widens them while Sub fills the weights.
+            // Codes widen where they landed: the keys last here, as the next window's landing is
+            // issued, and the values once scored, as Sub fills the weights.
             let prepares = |device: &mut Device,
                             landing: &Place<Rows, KvHeads, Groups, Head, Source, N>,
                             _: &mut ()|
@@ -1457,13 +1464,13 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 Masks<Rows, KvHeads, Groups, Head, SCALE, N>,
                 Restored<Source, Rows, KvHeads, Head, N>,
             ) {
-                let mut restored = Source::place::<TileRows<Rows, N>>();
-                history.keys(device, &landing.cells, &mut restored);
                 let masks =
                     <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::mask::<
                         TileRows<Rows, N>,
                         _,
                     >(device, landing.bias.view());
+                let mut restored = Source::place::<TileRows<Rows, N>>();
+                history.keys(device, &landing.cells, &mut restored);
                 (masks, restored)
             };
             let (mut even, mut odd, mut nothing) = (
@@ -1473,6 +1480,9 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
             );
             for tile in 0..count {
                 let pass = Pass::<N>::of(first + tile, live);
+                // The query rows go ahead of the first window, which would hold them back in the
+                // transfer queue, so they are spread while the window's landing is issued.
+                let projected = projects(device, pass);
                 // A pass lands its own first window unless the pass before it did, under its last.
                 if const { Self::follows::<Rows, N>() } {
                     for _ in 0..(1 - tile.min(1) + (1 - rest.min(1))).min(1) {
@@ -1481,7 +1491,6 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 } else {
                     lands(device, (0, pass), &mut even);
                 }
-                let projected = projects(device, pass);
                 wraps(device, pass, &mut even);
                 let query =
                     <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::station::<
@@ -1587,6 +1596,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
             let mut values = Transposed::<Rows, KvHeads, Groups, Head, SCALE, N>::new();
             for tile in 0..count {
                 let pass = Pass::<N>::of(first + tile, live);
+                let projected = projects(device, pass);
                 // A pass lands its own first window unless the pass before it did, under its last.
                 if const { Self::follows::<Rows, N>() } {
                     for _ in 0..(1 - tile.min(1) + (1 - rest.min(1))).min(1) {
@@ -1595,7 +1605,6 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 } else {
                     lands(device, (0, pass), &mut even);
                 }
-                let projected = projects(device, pass);
                 // Behind the first window, whichever pass landed it, and ahead of every attention
                 // of the pass, so none waits for it.
                 wraps(device, pass, &mut even);
@@ -1900,7 +1909,7 @@ mod tests {
     fn gather_rows<Count: AxisName>(
         device: &mut Device,
         blocks: &Blocks,
-        table: &HbmTensor<i32, Chip, m![Count, Chunks, BlockIndex]>,
+        table: &HbmTensor<i32, Chip, m![Chunks, Count, BlockIndex]>,
         lengths: &BlockCounts<Count, Chunks>,
         output: &mut HbmTensor<bf16, Chip, m![Chunks, Count, Cache, KeyValue, KvHeads, Head]>,
     ) {
@@ -1937,16 +1946,17 @@ mod tests {
         let row_len = KeyValue::SIZE * KvHeads::SIZE * Head::SIZE;
         let rows = random(TEST_TOKENS * row_len, 0x5851_f42d_4c95_7f2d);
         let blocks = Blocks::from_rows(&mut device, rows.clone()).await;
-        let entries = Chunks::SIZE * Cache::SIZE / Block::SIZE;
+        let entries = BlockIndex::SIZE;
         let block = |row: usize, at: usize| (3 + row * 37 + at * 11) % (TEST_TOKENS / Block::SIZE);
-        let table = HostTensor::<i32, m![Count, Chunks, BlockIndex]>::from_vec(
-            (0..Count::SIZE)
-                .flat_map(|row| {
-                    (0..entries).map(move |at| block(row, at) as i32 * <Blocks>::BLOCK_STRIDE)
+        let table = HostTensor::<i32, m![Chunks, Count, BlockIndex]>::from_vec(
+            (0..Chunks::SIZE * Count::SIZE * entries)
+                .map(|at| {
+                    let (window, row) = (at / (Count::SIZE * entries), at / entries % Count::SIZE);
+                    block(row, window * entries + at % entries) as i32 * <Blocks>::BLOCK_STRIDE
                 })
                 .collect::<Vec<_>>(),
         )
-        .to_hbm::<Chip, m![Count, Chunks, BlockIndex]>(&mut device.pdma)
+        .to_hbm::<Chip, m![Chunks, Count, BlockIndex]>(&mut device.pdma)
         .await
         .unwrap();
         let mut host =
@@ -2255,7 +2265,7 @@ mod tests {
         device: &mut Device,
         query: &PrefixQuery<Count>,
         blocks: &Blocks,
-        table: &HbmTensor<i32, Chip, m![Count, Depth, BlockIndex]>,
+        table: &HbmTensor<i32, Chip, m![Depth, Count, BlockIndex]>,
         lengths: &BlockCounts<Count, Depth>,
         bias: &Bias<Count, Depth>,
         (rest, live): (&Value, &Value),
@@ -2328,11 +2338,14 @@ mod tests {
                 .collect(),
         )
         .await;
-        let table = HostTensor::<i32, m![Count, Depth, BlockIndex]>::from_vec(
-            rows.iter().flat_map(|&row| {
-                (0..Depth::SIZE * Cache::SIZE / Block::SIZE).map(move |at| {
-                    (((row % 8) * 1024 / Block::SIZE + at % (1024 / Block::SIZE)) as i32)
-                        * <Blocks>::BLOCK_STRIDE
+        let table = HostTensor::<i32, m![Depth, Count, BlockIndex]>::from_vec(
+            (0..Depth::SIZE).flat_map(|window| {
+                rows.iter().flat_map(move |&row| {
+                    (0..BlockIndex::SIZE).map(move |entry| {
+                        let at = window * BlockIndex::SIZE + entry;
+                        (((row % 8) * 1024 / Block::SIZE + at % (1024 / Block::SIZE)) as i32)
+                            * <Blocks>::BLOCK_STRIDE
+                    })
                 })
             }),
         )
