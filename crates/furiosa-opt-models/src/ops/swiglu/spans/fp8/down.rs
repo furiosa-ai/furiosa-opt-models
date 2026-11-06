@@ -389,11 +389,13 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
         let channels = self.1.to_dm(&mut context.tdma);
         // Every panel's input lands ahead of the projections, in the order they read it with their
         // weight panels.
-        let stored = (&products, &scales);
-        let input0 = landed(&mut *context, stored, (0, &h0), (live, rows));
-        let input1 = landed(&mut *context, stored, (1, &h1), (live, rows));
+        let mut input0 = loaded(&mut *context, &products, 0, (live, rows));
+        copied(&mut *context, (&h0, &scales), 0, live, &mut input0);
+        let mut input1 = loaded(&mut *context, &products, 1, (live, rows));
+        copied(&mut *context, (&h1, &scales), 1, live, &mut input1);
         let second = self.forward(&mut *context, Begin(1));
-        let input2 = landed(&mut *context, stored, (2, &h2), (live, rows));
+        let mut input2 = loaded(&mut *context, &products, 2, (live, rows));
+        copied(&mut *context, (&h2, &scales), 2, live, &mut input2);
         let third = |context: &mut Device| self.forward(context, Begin(2));
         let inputs = (input0, input1, input2);
         let exchange = projected(
@@ -406,8 +408,17 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
     }
 }
 
+/// A larger product's third quantized panel and its row scales, which the third input copies once
+/// the third weight panel is issued, and the product's waves.
+type Pending<Intermediate, Rows> = (
+    Staged<Intermediate, Rows>,
+    StagedScales<Intermediate, Rows>,
+    usize,
+);
+
 /// A staged product's down panels' inputs and channel scales landed, its second weight panel
-/// landed beforehand and its third still to land.
+/// landed beforehand and its third still to land, and with it a larger product's third input:
+/// that copy's cluster sync would hold back the third panel's transfer behind it.
 impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>
     Op<
         Live<
@@ -419,7 +430,10 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
         >,
     > for DownWeights<Hidden, Intermediate>
 {
-    type Output = Ready<Hidden, Intermediate, Rows, ()>;
+    type Output = (
+        Ready<Hidden, Intermediate, Rows, ()>,
+        Pending<Intermediate, Rows>,
+    );
 
     fn forward(
         &self,
@@ -445,24 +459,28 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
         let products: HbmTensor<bf16, Chip, Chunks<Intermediate, Rows>> =
             unsafe { products.reshape() };
         let channels = self.1.to_dm(&mut context.tdma);
-        let stored = (&products, &scales);
-        let inputs = (
-            landed(&mut *context, stored, (0, &h0), (live, rows)),
-            landed(&mut *context, stored, (1, &h1), (live, rows)),
-            landed(&mut *context, stored, (2, &h2), (live, rows)),
-        );
-        Ready {
+        let mut input0 = loaded(&mut *context, &products, 0, (live, rows));
+        copied(&mut *context, (&h0, &scales), 0, live, &mut input0);
+        let mut input1 = loaded(&mut *context, &products, 1, (live, rows));
+        copied(&mut *context, (&h1, &scales), 1, live, &mut input1);
+        let input2 = loaded(&mut *context, &products, 2, (live, rows));
+        let ready = Ready {
             weights: (first, second, ()),
-            inputs,
+            inputs: (input0, input1, input2),
             channels,
-        }
+        };
+        (ready, (h2, scales, live))
     }
 }
 
-/// A down projection whose inputs landed, with its third weight panel, landed behind them.
+/// A down projection whose inputs landed, with its third weight panel, landed behind them, and a
+/// larger product's third input copied behind that panel.
 impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>
     Op<(
-        Ready<Hidden, Intermediate, Rows, ()>,
+        (
+            Ready<Hidden, Intermediate, Rows, ()>,
+            Pending<Intermediate, Rows>,
+        ),
         Down<Hidden, Intermediate>,
     )> for DownWeights<Hidden, Intermediate>
 {
@@ -470,20 +488,24 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>
 
     fn forward(
         &self,
-        _: &mut Device,
-        (ready, third): (
-            Ready<Hidden, Intermediate, Rows, ()>,
+        context: &mut Device,
+        ((ready, (staged, scales, live)), third): (
+            (
+                Ready<Hidden, Intermediate, Rows, ()>,
+                Pending<Intermediate, Rows>,
+            ),
             Down<Hidden, Intermediate>,
         ),
     ) -> Self::Output {
         let Ready {
             weights: (first, second, ()),
-            inputs,
+            inputs: (input0, input1, mut input2),
             channels,
         } = ready;
+        copied(context, (&staged, &scales), 2, live, &mut input2);
         Ready {
             weights: (first, second, third),
-            inputs,
+            inputs: (input0, input1, input2),
             channels,
         }
     }
@@ -674,28 +696,37 @@ fn spill<Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>(
     (products, (h0, h1, h2), scales)
 }
 
-/// Panel `panel`'s input as it lands: a product of at most two waves as it is, of more its
-/// quantized panel and row scales.
-fn landed<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>(
+/// Panel `panel`'s input as it lands: a product of at most two waves as it is; a larger
+/// product's panel and row scales are [`copied`] into it.
+fn loaded<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>(
     context: &mut Device,
-    (products, scales): (
-        &HbmTensor<bf16, Chip, Chunks<Intermediate, Rows>>,
-        &StagedScales<Intermediate, Rows>,
-    ),
-    (panel, staged): (usize, &Staged<Intermediate, Rows>),
+    products: &HbmTensor<bf16, Chip, Chunks<Intermediate, Rows>>,
+    panel: usize,
     (live, rows): (usize, usize),
 ) -> Landed<Hidden, Intermediate, Rows> {
     let mut product = Product::<Hidden, Intermediate, Rows>::new();
-    let mut activation = Activation::<Hidden, Intermediate, Rows>::new();
-    let mut scale = Scale::<Hidden, Intermediate, Rows>::new();
+    let activation = Activation::<Hidden, Intermediate, Rows>::new();
+    let scale = Scale::<Hidden, Intermediate, Rows>::new();
     if live <= 2 {
         product = LoadProduct::<Hidden>(PhantomData)
             .forward(&mut *context, (products, panel, (live, rows)));
-    } else {
-        CopyPanel.forward(&mut *context, (staged, &mut activation));
-        CopyScales.forward(&mut *context, (scales, panel, &mut scale));
     }
     (product, activation, scale)
+}
+
+/// A product of more than two waves: its quantized panel `panel` and its row scales copied into
+/// the panel's input.
+fn copied<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>(
+    context: &mut Device,
+    (staged, scales): (&Staged<Intermediate, Rows>, &StagedScales<Intermediate, Rows>),
+    panel: usize,
+    live: usize,
+    (_, activation, scale): &mut Landed<Hidden, Intermediate, Rows>,
+) {
+    if live > 2 {
+        CopyPanel.forward(&mut *context, (staged, activation));
+        CopyScales.forward(&mut *context, (scales, panel, scale));
+    }
 }
 
 /// The down projection of a staged product from its first two weight panels, the third taken
