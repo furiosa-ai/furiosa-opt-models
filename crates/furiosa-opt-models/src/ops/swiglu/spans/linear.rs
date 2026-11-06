@@ -208,6 +208,52 @@ where
     fn forward(&self, _: &mut Device, _: Env, _: &mut (), _: Begin<usize>) {}
 }
 
+/// Nor a place for its first panel before any product arrives.
+impl<Hidden: AxisName, Intermediate: AxisName, T, Env> Module<Begin<Begin<()>>, Env, &mut ()>
+    for Linear<Intermediate, Hidden, Chip, T>
+where
+    T: Matrix<In = Intermediate, Out = Hidden>,
+{
+    type Output = ();
+
+    fn forward(&self, _: &mut Device, _: Env, _: &mut (), _: Begin<Begin<()>>) {}
+}
+
+/// Nor anything into that place.
+impl<Hidden: AxisName, Intermediate: AxisName, T, Env> Module<&mut (), Env, &mut ()>
+    for Linear<Intermediate, Hidden, Chip, T>
+where
+    T: Matrix<In = Intermediate, Out = Hidden>,
+{
+    type Output = ();
+
+    fn forward(&self, _: &mut Device, _: Env, _: &mut (), _: &mut ()) {}
+}
+
+/// The product waits in HBM for the down projection whatever its first panel's place holds.
+impl<'f, Hidden, Intermediate, Rows, Capacity, T, Env>
+    Module<Begin<Live<(Lines<Rows, Intermediate>, &'f ()), Capacity>>, Env, &mut ()>
+    for Linear<Intermediate, Hidden, Chip, T>
+where
+    Hidden: AxisName,
+    Intermediate: AxisName,
+    Rows: AxisName,
+    Capacity: AxisName,
+    T: Matrix<In = Intermediate, Out = Hidden>,
+{
+    type Output = Lines<Rows, Intermediate>;
+
+    fn forward(
+        &self,
+        _: &mut Device,
+        _: Env,
+        _: &mut (),
+        Begin(product): Begin<Live<(Lines<Rows, Intermediate>, &'f ()), Capacity>>,
+    ) -> Lines<Rows, Intermediate> {
+        product.into_value().0
+    }
+}
+
 /// The product, already in HBM, waits there for the down projection, no panel landed for it.
 impl<Hidden, Intermediate, Rows, Capacity, T, Env>
     Module<Begin<(Live<Lines<Rows, Intermediate>, Capacity>, ())>, Env, &mut ()>
