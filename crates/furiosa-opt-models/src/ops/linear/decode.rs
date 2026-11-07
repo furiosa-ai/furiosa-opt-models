@@ -12,7 +12,7 @@ use core::{fmt, marker::PhantomData};
 use furiosa_opt_std::prelude::*;
 
 use super::fp8::{ChannelScaled, Codes};
-use super::kernel::{self, Contraction, Landing, Resident, Run, Slabs, Tiling};
+use super::kernel::{self, Contraction, Landing, Resident, Slabs, Tiling};
 use crate::{Begin, Op};
 
 /// A weight form a contraction reads as BF16 tiles: BF16 as stored, E4M3 restored by its row's FP32
@@ -101,11 +101,11 @@ where
     ) -> DmTensor<bf16, m![1], T::Cluster, T::Slices, m![{ T::Rows }, { T::Inputs }]> {
         const {
             assert!(
-                <Run<In, Out, f8e4m3> as AxisName>::SIZE == In::SIZE,
+                <Tiled<In, Out> as AxisName>::SIZE == In::SIZE,
                 "codes held as the contraction's tiles are read by its slabs alone"
             )
         };
-        // SAFETY: codes whose rows stay whole are held in the checkpoint's order.
+        // SAFETY: the tiles of a contraction whose parts are whole rows are the checkpoint's order.
         let codes: HbmTensor<f8e4m3, Chip, m![Out, In]> =
             unsafe { self.weight.borrow().view().alias() };
         let coded = T::to_dm(device, &codes, at);

@@ -3,7 +3,6 @@ use core::borrow::Borrow;
 use core::marker::PhantomData;
 
 use crate::Op;
-use crate::specialize::PACKET;
 use crate::specialize::contraction::{self, BAND, Routing};
 use furiosa_opt_std::prelude;
 use furiosa_opt_std::prelude::*;
@@ -1097,31 +1096,13 @@ impl<In: AxisName, Out: AxisName, Code: Scalar> Tiling<In, Out> for Contraction<
     }
 }
 
-/// Inputs of a row a slice's tile holds together in HBM: a part's, unless a part is a whole number
-/// of packets, when the rows stay whole as a checkpoint stores them.
-#[derive(Clone, Debug)]
-pub struct Run<In, Out, Code>(PhantomData<(In, Out, Code)>);
-
-impl<In: AxisName, Out: AxisName, Code: Scalar> AxisName for Run<In, Out, Code> {
-    const NAME: Ident = Ident::new("Run");
-
-    const SIZE: usize = {
-        let c = Contraction::<In, Out, Code>::config();
-        if (c.chunk * Code::BITS / 8).is_multiple_of(PACKET) {
-            In::SIZE
-        } else {
-            c.chunk
-        }
-    };
-}
-
 /// A weight in HBM as the contraction's slices hold it, each slice's tile of a slab after the one
-/// before, so a transfer cuts it into whole packets; [`Run`] keeps whole rows that already are.
+/// before: a transfer reads each tile as one run of HBM, faster than a part of every row.
 pub(crate) type Tiles<In, Out, Code> = m![
     Out / ({ Block<In, Out, Code> }),
-    In / ({ Symbol<Run<In, Out, Code>> }),
+    In / ({ Chunk<In, Out, Code> }),
     Out % ({ Block<In, Out, Code> }),
-    In % ({ Symbol<Run<In, Out, Code>> })
+    In % ({ Chunk<In, Out, Code> })
 ];
 
 /// Every slab of a weight tensor on the contraction's slices, a slice keeping `E` of each slab,
@@ -1164,9 +1145,9 @@ impl<In: AxisName, Out: AxisName, Code: Scalar> Contraction<In, Out, Code> {
             .tile::<SlabIndex<In, Out, Code>, 1, m![
                 Out % (Out / ({ Passes<In, Out, Code> })) / ({ Block<In, Out, Code> })
                     # (Out / ({ Block<In, Out, Code> })),
-                In / ({ Symbol<Run<In, Out, Code>> }),
+                In / ({ Chunk<In, Out, Code> }),
                 Out % ({ Block<In, Out, Code> }),
-                In % ({ Symbol<Run<In, Out, Code>> })
+                In % ({ Chunk<In, Out, Code> })
             ]>(at)
             .to_dm(&mut device.tdma)
     }
