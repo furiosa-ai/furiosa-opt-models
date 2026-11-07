@@ -485,7 +485,8 @@ def test_refuses_scored_requests(
         ),
         pytest.param(
             DEFAULT | {"serve": [CACHE_DTYPE, "fp8_e4m3"]},
-            "kv_cache: unsupported, every implementation caches keys and values in BF16",
+            "kv_cache: unsupported, the Qwen3ForCausalLM implementations that serve the checkpoint"
+            " cache keys and values in BF16",
             marks=pytest.mark.feature("FP8 KV cache"),
             id="fp8-cache",
         ),
@@ -497,7 +498,8 @@ def test_refuses_scored_requests(
         ),
         pytest.param(
             DEFAULT | {"flags": ["--tp-size", "2"]},
-            "chips: unsupported, every implementation runs on one chip",
+            "chips: unsupported, the Qwen3ForCausalLM implementations that serve the checkpoint run"
+            " on 1 chip",
             marks=pytest.mark.feature("Tensor parallelism over a compiled chip count"),
             id="tensor-parallel",
         ),

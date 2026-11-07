@@ -17,11 +17,13 @@
 mod adapters;
 mod batch;
 mod cache;
+mod nemo;
 mod qwen3;
 
 pub use adapters::{Adapter, Binding, Loader, SLOTS};
-pub use batch::{Batch, Rows, Staged, Table};
+pub use batch::{Appended, Batch, Rows, Staged, Table};
 pub use cache::{Cache, CacheSpec, Group, Kind, Pool};
+pub use nemo::Nemo;
 
 use crate::{AsyncModule, Checkpoint, LoadError};
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
@@ -145,6 +147,10 @@ pub trait Decoder: Send + Sync {
     /// Adapters a call runs at most, which its limits hold: none for a decoder whose projections
     /// take no adapter terms.
     const ADAPTERS: usize = 0;
+    /// The chips a call runs on.
+    const CHIPS: usize = 1;
+    /// The dtype its cache stores keys and values in.
+    const KV_CACHE: Dtype = Dtype::BF16;
     /// What a call returns: the kept rows' token IDs, hidden values or scores.
     type Output: TryInto<HbmTensor, Error = io::Error>;
     /// The views a call borrows of a cache's layers.

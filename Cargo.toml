@@ -4,6 +4,7 @@ members = [
     "crates/furiosa-opt-engine",
     "crates/furiosa-opt-models",
     "crates/furiosa-opt-models/macros",
+    "crates/furiosa-opt-nemo",
     "crates/furiosa-opt-python",
 ]
 
@@ -11,7 +12,7 @@ members = [
 # branch `next`. CI and the install guide install the tip with `cargo binstall --git`, which takes no
 # revision, so a snapshot cut to `next` and the bump of this pin land together.
 [workspace.dependencies]
-furiosa-opt-std = { git = "https://github.com/furiosa-ai/furiosa-opt-preview", rev = "0dc3ceab827a859882860c32eae51d02aa2e2634" }
+furiosa-opt-std = { git = "https://github.com/furiosa-ai/furiosa-opt-preview", rev = "8149c7dbff9308522accdb20f99d8b6f3cc7724e" }
 
 # The engine's monomorphized debug info overflows the linker's 4 GiB debug sections.
 [profile.dev.package.furiosa-opt-engine]

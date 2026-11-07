@@ -3,7 +3,8 @@
 //!
 //! - A spec lists pools, each the tokens a block holds and the bytes a block of one layer spans
 //!   (its page), and groups, each layers of one kind whose blocks come from one pool.
-//! - A `Cache` holds `blocks` pages of every layer of every group, one allocation a layer.
+//! - A `Cache` holds `blocks` pages of every layer of every group, then the group's scratch pages,
+//!   one allocation a layer.
 //! - A cache serves the decoders whose spec it was allocated for. A decoder's first call builds
 //!   its views of the layers; every later call borrows them, one call at a time.
 
@@ -44,6 +45,9 @@ pub struct Group {
     pub kind: Kind,
     /// Positions a row attends back to in a sliding window; `None` attends the whole history.
     pub window: Option<usize>,
+    /// Pages each layer holds past the blocks a request names, which only the decoder's calls
+    /// address.
+    pub scratch: usize,
 }
 
 /// What the blocks of a group hold.
@@ -79,7 +83,8 @@ impl CacheSpec {
                     return Err(invalid("cache pool has empty blocks"));
                 }
                 // A device table holds a page's byte offset within its layer as an I32.
-                let size = (blocks.checked_mul(pool.bytes))
+                let size = (blocks.checked_add(group.scratch))
+                    .and_then(|pages| pages.checked_mul(pool.bytes))
                     .filter(|&size| size <= 1 << 31)
                     .ok_or_else(|| invalid("cache blocks pass I32 byte offsets"))?;
                 Ok(iter::repeat_n(size, group.layers.len()))
@@ -214,6 +219,7 @@ mod tests {
                 layers,
                 kind: Kind::Paged,
                 window: None,
+                scratch: 0,
             }],
         }
     }
@@ -228,7 +234,8 @@ mod tests {
         }
     }
 
-    /// Every layer of every group holds a page of its pool for each block, group by group.
+    /// Every layer of every group holds a page of its pool for each block, then its group's
+    /// scratch pages, group by group.
     #[test]
     fn sizes_each_layer_a_page_a_block() -> io::Result<()> {
         let mut spec = paged(64, 0..2);
@@ -241,8 +248,9 @@ mod tests {
             layers: 2..3,
             kind: Kind::State,
             window: None,
+            scratch: 1,
         });
-        assert_eq!(spec.sizes(3)?, [192, 192, 96]);
+        assert_eq!(spec.sizes(3)?, [192, 192, 128]);
         Ok(())
     }
 

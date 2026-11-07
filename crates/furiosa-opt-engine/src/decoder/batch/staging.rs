@@ -93,7 +93,7 @@ impl<A> Batch<'_, A> {
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(io::Error::other)?;
                 let sources = self.tokens.iter().map(|(tokens, _)| tokens.buffer());
-                copy(&mut *device, sources.zip(&mut targets))?;
+                copy::<Chips>(&mut *device, sources.zip(&mut targets))?;
                 target
             }
             None => {
@@ -261,6 +261,7 @@ mod tests {
                         layers: 0..1,
                         kind: Kind::Paged,
                         window: None,
+                        scratch: 0,
                     }],
                 },
                 adapters: 0,

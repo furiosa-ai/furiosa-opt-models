@@ -8,8 +8,10 @@
 //!   checkpoint.
 //! - A load reads the whole model, or its media encoder alone, which the registry lists as an
 //!   implementation of its own.
-//! - Every implementation runs on one chip, caches keys and values in BF16 and loads whole; any
-//!   other choice is unsupported until the registry holds an implementation that makes it.
+//! - An implementation runs on its own count of chips and caches keys and values in its own dtype;
+//!   a load chooses among the ones that serve the checkpoint by its chips and KV cache, BF16 when
+//!   it names none, and a load onto a device of other chips is refused before any weight is read.
+//!   Every implementation loads whole.
 //! - A batch-invariant load asks every implementation's calls to tile their attention fixed, which
 //!   they serve as an `Instance` of their decoder.
 //! - A quantization reads the checkpoint quantized, so an implementation whose projections a load
@@ -22,7 +24,7 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::str::FromStr;
 
-use crate::registry::{Implementation, Model};
+use crate::registry::{Choice, Implementation, Model};
 use furiosa_opt_models::load::{Checkpoint, Context, LoadError, Part};
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
 use furiosa_opt_models::tensor::form::fp8::Granularity;
@@ -74,7 +76,8 @@ impl LoadOptions {
         Self::default()
     }
 
-    /// Load onto `chips` chips instead of the one count the selected model allows; refuses zero.
+    /// Load the implementation that runs on `chips` chips, not the one count the implementations
+    /// that serve the checkpoint leave; refuses zero.
     pub fn chips(self, chips: usize) -> Result<Self, LoadError> {
         let chips = NonZeroUsize::new(chips).ok_or_else(|| LoadError::InvalidData {
             name: "chips".into(),
@@ -86,7 +89,7 @@ impl LoadOptions {
         })
     }
 
-    /// Cache keys and values as `dtype` instead of BF16.
+    /// Load the implementation that caches keys and values as `dtype`, not BF16.
     pub fn kv_cache(self, dtype: Dtype) -> Self {
         Self {
             kv_cache: Some(dtype),
@@ -155,9 +158,10 @@ impl LoadOptions {
 
     /// The implementation `checkpoint` loads as with these choices, loaded strictly into HBM of
     /// `device` as the model a framework serves: a decoder, or the media encoder of a load of the
-    /// encoder alone; a refused choice is reported before any weight is read. A decoder serves its
-    /// calls with the config's tiling. Dropping the model frees its device memory, and a new load
-    /// of the same implementation serves the caches the dropped one did.
+    /// encoder alone; a refused choice, or a device of other chips than the implementation runs
+    /// on, is reported before any weight is read. A decoder serves its calls with the config's
+    /// tiling. Dropping the model frees its device memory, and a new load of the same
+    /// implementation serves the caches the dropped one did.
     pub fn load(&self, device: &mut Device, checkpoint: &Checkpoint) -> Result<Model, LoadError> {
         self.read(checkpoint, |checkpoint| {
             let Config {
@@ -203,25 +207,17 @@ impl LoadOptions {
             });
         }
         let (architecture, implementations) = Implementation::listed(&names)?;
-        let implementation = Implementation::choose(architecture, implementations, checkpoint)?;
-        let unsupported = |name: &str, reason: &str| LoadError::Unsupported {
-            name: name.into(),
-            reason: reason.into(),
+        let choice = Choice {
+            chips: self.chips,
+            kv_cache: self.kv_cache,
         };
-        if self.chips.is_some_and(|chips| chips.get() != 1) {
-            return Err(unsupported(
-                "chips",
-                "every implementation runs on one chip",
-            ));
-        }
-        if self.kv_cache.is_some_and(|dtype| dtype != Dtype::BF16) {
-            return Err(unsupported(
-                "kv_cache",
-                "every implementation caches keys and values in BF16",
-            ));
-        }
+        let implementation =
+            Implementation::choose(architecture, implementations, checkpoint, choice)?;
         if self.layers.is_some() {
-            return Err(unsupported("layers", "every implementation loads whole"));
+            return Err(LoadError::Unsupported {
+                name: "layers".into(),
+                reason: "every implementation loads whole".into(),
+            });
         }
         if self.adapters && implementation.adapters() == 0 {
             return Err(LoadError::Unsupported {
@@ -247,8 +243,8 @@ impl LoadOptions {
                 (Part::Encoder, ..) | (Part::Whole, None, None) => Dtype::BF16,
                 _ => Dtype::F8_E4M3,
             },
-            kv_cache: Dtype::BF16,
-            chips: 1,
+            kv_cache: implementation.kv_cache(),
+            chips: implementation.chips(),
             tiling: self.tiling,
         })
     }
@@ -285,6 +281,7 @@ impl Config {
         self.kv_cache
     }
 
+    /// The chips the implementation runs on.
     pub fn chips(&self) -> usize {
         self.chips
     }

@@ -68,6 +68,7 @@ fn limits<S: Geometry + Decode>(adapters: usize) -> Limits {
                 layers: 0..S::LAYERS,
                 kind: Kind::Paged,
                 window: None,
+                scratch: 0,
             }],
         },
         adapters,
@@ -103,7 +104,7 @@ fn keep<W: AxisName>(
         .map(|(at, &source)| Ok((row(hidden, source)?, row(&target, at)?)))
         .collect::<io::Result<Vec<_>>>()?;
     let pairs = pairs.iter_mut().map(|(from, to)| (&*from, to));
-    furiosa_opt_models::ops::index::copy(&mut *device, pairs)?;
+    furiosa_opt_models::ops::index::copy::<Chip>(&mut *device, pairs)?;
     Rows::new(&target, 0..kept.len())
 }
 
@@ -410,6 +411,7 @@ macro_rules! launches {
                             layers: 0..<$size as Geometry>::LAYERS,
                             kind: Kind::Paged,
                             window: None,
+                            scratch: 0,
                         }],
                     },
                     adapters: Self::ADAPTERS,

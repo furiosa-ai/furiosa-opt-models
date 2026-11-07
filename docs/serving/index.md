@@ -387,8 +387,8 @@ Why each feature is not served yet:
 - **Prompt embeddings**: a decoder call takes token IDs.
 - **Multimodal inputs**: no served checkpoint answers about images, video or audio; Gemma 4 unified's media encoder runs [on an encoder-only instance](#embed-media-on-an-encoder-only-instance), but the engine serves no language model of it.
 - **Speculative methods other than ngram and suffix** (vLLM, which also has no draft model yet) or NGRAM and STANDALONE (SGLang).
-- **FP8 KV cache and quantized checkpoints**: the served checkpoints load BF16 weights and cache keys and values in BF16.
+- **FP8 KV cache and quantized checkpoints** but [Mistral NeMo](../models/mistral-nemo.md)'s FP8 checkpoint, whose weights and KV records are E4M3: the other served checkpoints load BF16 weights and cache keys and values in BF16.
 - **Online quantization** with SGLang, and with vLLM any method but `fp8_per_tensor`: the other methods quantize the activations too or use other formats, and the SGLang plugin passes no quantization to the load.
-- **Tensor, pipeline, expert and context parallelism**, and serving across nodes: each served checkpoint runs on one chip.
+- **Tensor, pipeline, expert and context parallelism**, and serving across nodes: each served checkpoint runs on one chip, but Mistral NeMo's FP8 checkpoint, which runs on two.
 - **LoRA with SGLang**: `--enable-lora` and `--lora-paths` are refused; the SGLang plugin runs no adapter yet.
 - **Disaggregated prefill, KV connectors and a disaggregated encoder**: no cache row moves to another instance, and of a disaggregated encoder only the [encoder-only instance](#embed-media-on-an-encoder-only-instance) runs.

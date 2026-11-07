@@ -1,0 +1,26 @@
+[package]
+name = "furiosa-opt-nemo"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Mistral NeMo's serving step for FuriosaAI NPUs, with the operations it is built of"
+repository = "https://github.com/furiosa-ai/furiosa-opt-models"
+
+[package.metadata.furiosa-opt]
+
+[dependencies]
+furiosa-opt-std = { workspace = true }
+half = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+safetensors = "=0.4.5"
+
+[features]
+# The serving step's CPU check also copies each layer's piece outputs into a `Trace`.
+trace = []
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "sync"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(backend, values("npu"))'] }

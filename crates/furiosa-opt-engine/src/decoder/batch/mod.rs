@@ -12,6 +12,7 @@ mod operands;
 mod staging;
 
 pub use compact::Table;
+pub use operands::Appended;
 pub use staging::Staged;
 
 use super::{Binding, Cache, Group, Keep, Kind, Limits, Request};
@@ -250,6 +251,16 @@ impl<'a, A> Batch<'a, A> {
         &self.kept
     }
 
+    /// Each request's appended rows in cache group `group`, in call row order.
+    pub fn appended(&self, group: usize) -> &[Appended] {
+        &self.appended[group]
+    }
+
+    /// Each request's token IDs and the call rows they fill, in request order.
+    pub fn tokens(&self) -> &[(Rows<i32, m![1]>, Range<usize>)] {
+        &self.tokens
+    }
+
     /// The adapters the call runs, bound to its slots and rows; none when no row runs with one.
     pub fn adapters(&self) -> Option<&Binding<'a, A>> {
         self.adapters.as_ref()
@@ -293,6 +304,7 @@ mod tests {
                     layers: 0..1,
                     kind: Kind::Paged,
                     window: None,
+                    scratch: 0,
                 }],
             },
             adapters: 0,
@@ -383,6 +395,7 @@ mod tests {
             layers: 1..2,
             kind: Kind::Paged,
             window: Some(8),
+            scratch: 0,
         });
         let cache = Cache::new(&device, &limits.cache, 8)?;
         let mut request = request(&device, &[7, 5], 3, 2)?;

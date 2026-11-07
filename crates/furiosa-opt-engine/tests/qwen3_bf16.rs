@@ -922,7 +922,8 @@ fn refusals_read_no_weight() {
             (
                 "unsupported",
                 "chips",
-                "every implementation runs on one chip".into(),
+                "the Qwen3ForCausalLM implementations that serve the checkpoint run on 1 chip"
+                    .into(),
             ),
         ),
         (
@@ -930,7 +931,11 @@ fn refusals_read_no_weight() {
             (
                 "unsupported",
                 "kv_cache",
-                "every implementation caches keys and values in BF16".into(),
+                concat!(
+                    "the Qwen3ForCausalLM implementations that serve the checkpoint cache keys ",
+                    "and values in BF16",
+                )
+                .into(),
             ),
         ),
         (
