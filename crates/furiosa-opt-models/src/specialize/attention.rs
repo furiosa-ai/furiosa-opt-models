@@ -60,6 +60,10 @@ pub(crate) const LANES: usize = 8;
 /// Row lanes a cluster holds: a row group's lanes split over the chip's two clusters.
 pub(crate) const CLUSTER_LANES: usize = LANES / 2;
 
+/// Shard slices a ring carries a pass's query rows over at most: a ring takes about half a
+/// microsecond a slice whatever it carries, so a head of more shards lands a copy a ring.
+pub(crate) const RING: usize = 8;
+
 /// Slots each slice holds of a work item's landed history, a key and a value of `heads` KV heads
 /// of `head` BF16 channels a slot: 64, or fewer so a landing takes at most a quarter of the slice's
 /// data memory and the two a domain keeps in flight leave half of it to the rest of the layer.

@@ -138,6 +138,37 @@ pub(super) type Merged<Rows, KvHeads, Heads = m![KvHeads]> = m![
     1 # ({ Symbol<Shards<KvHeads>> })
 ];
 
+/// The consecutive shards of a head one ring carries its query rows over: all of them, or
+/// [`attention::RING`] where a head has more.
+#[derive(Clone, Debug)]
+struct Ring<KvHeads>(PhantomData<KvHeads>);
+
+impl<KvHeads: AxisName> AxisName for Ring<KvHeads> {
+    const NAME: Ident = Ident::new("Ring");
+    const SIZE: usize = if Shards::<KvHeads>::SIZE < attention::RING {
+        Shards::<KvHeads>::SIZE
+    } else {
+        attention::RING
+    };
+}
+
+/// The keys of a window the shards of one [`Ring`] hold.
+#[derive(Clone, Debug)]
+struct RingKeys<KvHeads>(PhantomData<KvHeads>);
+
+impl<KvHeads: AxisName> AxisName for RingKeys<KvHeads> {
+    const NAME: Ident = Ident::new("RingKeys");
+    const SIZE: usize = Keys::<KvHeads>::SIZE * Ring::<KvHeads>::SIZE;
+}
+
+/// The first slice of each [`Ring`] of a head's shards, where a pass's query rows land.
+type RingHeads<Rows, KvHeads> = m![
+    KvHeads # ({ Symbol<HeadSlots<KvHeads>> }),
+    { Layout<Rows>::Lanes } # 8 % 4,
+    Cache / ({ Symbol<RingKeys<KvHeads>> }),
+    1 # ({ Symbol<Ring<KvHeads>> })
+];
+
 /// A cluster's row lanes, over which a pass's one live row may hold its windows.
 #[derive(Clone, Debug)]
 pub(crate) struct ClusterLanes;
@@ -1045,7 +1076,7 @@ impl<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName>
     Queries<Rows, KvHeads, Groups, Head> for Heads<Rows, KvHeads, Groups, Head>
 {
     fn whole(&self, device: &mut Device) -> Query<Rows, KvHeads, Groups, Head> {
-        broadcast::<_, _, Groups, Head, RowGroups<Rows>, _>(device, self.view())
+        broadcast::<_, _, Groups, Head, RowGroups<Rows>, _, Shards<KvHeads>, _>(device, self.view())
     }
 
     fn pass<const N: usize, const S: Spread>(
@@ -1062,11 +1093,12 @@ impl<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName>
         let rows = self.view().tile::<Tiles<Rows, N>, 1, m![
             { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), { TileRows<Rows, N> }, Groups, Head
         ]>(pass.tile);
-        broadcast::<_, _, Groups, Head, TileRows<Rows, N>, _>(device, rows)
+        broadcast::<_, _, Groups, Head, TileRows<Rows, N>, _, Shards<KvHeads>, _>(device, rows)
     }
 }
 
-/// The rows in HBM: a pass lands its own row groups first, the whole envelope every one.
+/// The rows in HBM: a pass lands its own row groups on the first slice of each ring of their
+/// heads' shards, the whole envelope every one.
 impl<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName>
     Queries<Rows, KvHeads, Groups, Head> for Stored<Rows, KvHeads, Groups, Head>
 {
@@ -1084,7 +1116,7 @@ impl<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName>
             bf16,
             Chip,
             Cluster<Rows>,
-            Merged<Rows, KvHeads>,
+            RingHeads<Rows, KvHeads>,
             m![{ TileRows<Rows, N> }, Groups, Head],
         >::new();
         if const { matches!(S, Spread::Rows) } {
@@ -1107,31 +1139,31 @@ impl<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName>
             // which their bias masks.
             live.view().to_dm_view(&mut device.tdma, rows.view_mut());
         }
-        broadcast::<_, _, Groups, Head, TileRows<Rows, N>, _>(device, rows.view())
+        broadcast::<_, _, Groups, Head, TileRows<Rows, N>, _, Ring<KvHeads>, _>(device, rows.view())
     }
 }
 
-/// `Count` row groups' query rows from the slices of their heads' merged attention to every shard
-/// slice of their heads: each head's rows read once, then carried round its shards' ring.
+/// `Count` row groups' query rows from the first slice of each ring of `R` consecutive shards of
+/// their heads, as `Slices` holds them, to every shard slice of their heads, round the rings.
 fn broadcast<
     Rows: AxisName,
     KvHeads: AxisName,
     Groups: AxisName,
     Head: AxisName,
     Count: M,
+    Slices: M,
+    R: AxisName,
     E: M,
 >(
     device: &mut Device,
-    rows: DmTensorView<'_, bf16, Chip, Cluster<Rows>, Merged<Rows, KvHeads>, E>,
+    rows: DmTensorView<'_, bf16, Chip, Cluster<Rows>, Slices, E>,
 ) -> Query<Rows, KvHeads, Groups, Head, Count> {
     device
         .sub
         .begin(rows)
         .fetch::<m![{ Count }, Groups, Head / 16], m![Head % 16]>()
         .switch::<CacheSlices<Rows, KvHeads>, m![{ Count }, Groups, Head / 16]>(
-            SwitchConfig::CustomBroadcast {
-                ring_size: Shards::<KvHeads>::SIZE,
-            },
+            SwitchConfig::CustomBroadcast { ring_size: R::SIZE },
         )
         .collect::<m![{ Count }, Groups, Head / 16], m![Head % 16]>()
         .commit_trim::<m![Head % 16]>()
