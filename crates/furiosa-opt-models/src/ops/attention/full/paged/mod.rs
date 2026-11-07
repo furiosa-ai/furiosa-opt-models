@@ -382,7 +382,7 @@ mod tests {
     use crate::modules::attention::key_value::{History, Paging, Preparation};
     use crate::ops::attention::Attention;
     use crate::ops::attention::Heads;
-    use crate::ops::attention::gqa::{Cache, Pages, Wrap};
+    use crate::ops::attention::gqa::{Cache, LaneWindows, Pages, RowMajor, WindowRow, Wrap};
     use crate::ops::index::table::{BlockIndex, Fields, PADDING_BIAS};
     use crate::specialize::attention::{HISTORY_WAVES, Strategy, WAVES};
     use crate::tensor::axis::Rows;
@@ -549,6 +549,23 @@ mod tests {
                 .to_hbm(&mut device.pdma)
                 .await
                 .unwrap(),
+            // No pass of these windows spreads, so none reads the copy.
+            rows: RowMajor {
+                table: HostTensor::<
+                    i32,
+                    m![{ WindowRow<R, Windows> }, { Symbol<LaneWindows<Windows>> }, BlockIndex],
+                >::zero()
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap(),
+                lengths: HostTensor::<
+                    i32,
+                    m![{ WindowRow<R, Windows> }, { Symbol<LaneWindows<Windows>> }],
+                >::zero()
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap(),
+            },
             wrap: Wrap {
                 offsets: HostTensor::<i32, m![R, BlockIndex % 2, Block]>::zero()
                     .to_hbm(&mut device.pdma)

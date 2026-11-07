@@ -1029,7 +1029,7 @@ mod tests {
     use super::*;
     use crate::ops::attention::Attention;
     use crate::ops::attention::geometry::QueryGroups;
-    use crate::ops::attention::gqa::{self, Paged};
+    use crate::ops::attention::gqa::{self, Paged, RowMajor};
     use crate::ops::attention::tests::{Blocks, Chunks, Head, KvHeads};
     use crate::specialize::attention::Strategy;
     use crate::tensor::axis::Eight;
@@ -1057,10 +1057,12 @@ mod tests {
         output: &mut PrefixOutput<Eight>,
     ) {
         let query: gqa::Heads<Eight, KvHeads, PrefixGroups, Head> = query.to_dm(&mut device.tdma);
+        let rows = RowMajor::new::<bf16>(&mut *device, (table, lengths), Live::all());
         let history = Paged {
             blocks,
             table,
             lengths,
+            rows: &rows,
             scales: &(),
             wrap: (),
         };

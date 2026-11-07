@@ -94,11 +94,11 @@ type Summands<G> = DmTensor<
     ],
 >;
 
-pub(crate) type Attended<G> = DmTensor<
+pub(crate) type Attended<G, Merged = <G as Partition>::Merged> = DmTensor<
     bf16,
     Chip<G>,
     <G as Partition>::Cluster,
-    <G as Partition>::Merged,
+    Merged,
     m![{ <G as Partition>::Rows }, { <G as Partition>::Groups }, {
         <G as Partition>::Head
     }],
@@ -349,6 +349,11 @@ pub(crate) trait Partition: Sized {
     type Slices: M;
     type Agreed: M;
     type Merged: M;
+    /// The slices of a head's lanes and shards, which agree on a statistic where a pass spreads
+    /// one row's windows over its lanes.
+    type HeadSlices: M;
+    /// A head's one slice over its lanes, its first lane's merged slot.
+    type FirstLane: M;
     type Rows: M;
     type Groups: M;
     type Head: M;
@@ -546,6 +551,33 @@ pub(crate) trait Partition: Sized {
             device,
             (carry.view(), running.view()),
             const { 1e-6f32 / Self::SHARDS as f32 },
+        )
+    }
+
+    /// The attention of a lone row whose windows a pass's lanes hold, one a lane: each lane's
+    /// window terms merged over its head's lanes and shards onto the head's first lane.
+    fn spread(
+        device: &mut Device,
+        (partial, lse): (&Partial<Self>, &Local<Self>),
+    ) -> Attended<Self, Self::FirstLane> {
+        // Each of a head's lane and shard slices adds its part of the epsilon, so it is added once.
+        merge::<
+            Self::Key,
+            m![1],
+            m![{ Self::Rows }, { Self::Groups }],
+            Self::Head,
+            Self::HeadSlices,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        >(
+            device,
+            (partial.view(), lse.view()),
+            const { 1e-6f32 / (attention::CLUSTER_LANES * Self::SHARDS) as f32 },
         )
     }
 
@@ -1165,7 +1197,7 @@ pub(crate) trait Partition: Sized {
 }
 
 /// Whether a history of at most `Rest` windows after the first holds every window's terms.
-const fn holds<G: Partition, Rest: AxisName>() -> bool {
+pub(crate) const fn holds<G: Partition, Rest: AxisName>() -> bool {
     attention::holds(
         <G::Head as M>::SIZE,
         <G::Groups as M>::SIZE,

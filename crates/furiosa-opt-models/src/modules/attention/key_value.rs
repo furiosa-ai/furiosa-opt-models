@@ -11,7 +11,7 @@ use crate::ops::rotary::{self, SplitHalf, group};
 use crate::ops::{
     attention::{
         full::paged,
-        gqa::{Cache, Counted, Pages, Wrap, Wrapped},
+        gqa::{Cache, Counted, Pages, RowMajor, Wrap, Wrapped},
         latent::{self, Slot},
     },
     rotary::{Coefficients, PairFrequencies, Rotation},
@@ -631,6 +631,9 @@ where
             const { Blocks::<Heads, Head, D, Chips>::BLOCK_STRIDE },
         );
         let bias = extents.bias(device, (starts, self.slots.borrow()));
+        // Copied here, once a step, so no layer writes the memory its gathers read their entries
+        // from: that write would sync the cores ahead of each gather.
+        let rows = RowMajor::new::<D>(device, (&blocks, &extents.counts), tiles);
         let mut offsets = Wrapped::<Rows, Chips>::new();
         // Only a history past its ring holds tokens to wrap; a group whose ring is its context
         // never does. The layers take the count read here.
@@ -671,6 +674,7 @@ where
                 lengths: extents.counts,
                 bias,
                 rest: extents.rest,
+                rows,
                 wrap: (
                     Wrap {
                         offsets,

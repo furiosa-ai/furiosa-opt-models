@@ -12,7 +12,9 @@ use furiosa_opt_models::models::decoder::attention::gemma4::{self, full, sliding
 use furiosa_opt_models::models::decoder::form::summed;
 use furiosa_opt_models::models::decoder::{self, Attention};
 use furiosa_opt_models::modules::{attention, language};
-use furiosa_opt_models::ops::attention::gqa::{Attended, Cache, Pages, Wrap};
+use furiosa_opt_models::ops::attention::gqa::{
+    Attended, Cache, LaneWindows, Pages, RowMajor, WindowRow, WindowRows, Wrap,
+};
 use furiosa_opt_models::ops::index::table::{BlockIndex, PADDING_BIAS};
 use furiosa_opt_models::ops::normalization::Spread;
 use furiosa_opt_models::ops::rotary::{PairFrequencies, Rotation};
@@ -750,6 +752,22 @@ async fn pages<Windows: AxisName>(
     });
     let wraps: Vec<i32> = (0..Rows::SIZE).map(|row| wrapped(row) as i32).collect();
     let any = wraps.iter().any(|&count| count > 0);
+    // The paging's copy of the rows that hold the last live row, each row's windows together, of
+    // the windows a cluster's lanes hold.
+    let (lanes, tile) = (LaneWindows::<Windows>::SIZE, WindowRows::<Windows>::SIZE);
+    let last = (0..Rows::SIZE)
+        .filter(|&row| !visible(row).is_empty())
+        .max();
+    let first = last.unwrap_or(0) / tile * tile;
+    let row_table: Vec<i32> = (0..tile * lanes * entries)
+        .map(|at| {
+            let (row, window) = (first + at / (lanes * entries), at / entries % lanes);
+            table[(window * Rows::SIZE + row) * entries + at % entries]
+        })
+        .collect();
+    let row_counts: Vec<i32> = (0..tile * lanes)
+        .map(|at| counts[at % lanes * Rows::SIZE + first + at / lanes])
+        .collect();
     Pages {
         table: HostTensor::<i32, m![Windows, Rows, BlockIndex]>::from_vec(table)
             .to_hbm(&mut device.pdma)
@@ -764,6 +782,22 @@ async fn pages<Windows: AxisName>(
             .await
             .unwrap(),
         rest: rest.to_hbm(&mut device.pdma).await.unwrap(),
+        rows: RowMajor {
+            table: HostTensor::<
+                i32,
+                m![{ WindowRow<Rows, Windows> }, { Symbol<LaneWindows<Windows>> }, BlockIndex],
+            >::from_vec(row_table)
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap(),
+            lengths: HostTensor::<
+                i32,
+                m![{ WindowRow<Rows, Windows> }, { Symbol<LaneWindows<Windows>> }],
+            >::from_vec(row_counts)
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap(),
+        },
         wrap: Wrap {
             offsets: HostTensor::<i32, m![Rows, BlockIndex % 2, Block]>::from_vec(
                 offsets.collect::<Vec<_>>(),

@@ -55,10 +55,10 @@ pub const DECODES: usize = 1024;
 pub const INPUTS: usize = 64;
 
 /// Rows of a row group, the lanes of a vector packet.
-const LANES: usize = 8;
+pub(crate) const LANES: usize = 8;
 
 /// Row lanes a cluster holds: a row group's lanes split over the chip's two clusters.
-const CLUSTER_LANES: usize = LANES / 2;
+pub(crate) const CLUSTER_LANES: usize = LANES / 2;
 
 /// Slots each slice holds of a work item's landed history, a key and a value of `heads` KV heads
 /// of `head` BF16 channels a slot: 64, or fewer so a landing takes at most a quarter of the slice's
@@ -159,4 +159,21 @@ pub(crate) const fn shards(heads: usize, keys: usize, block: usize) -> usize {
 /// Heads a cluster's slices hold at `shards` shards of each of its row lanes.
 pub(crate) const fn heads(shards: usize) -> usize {
     super::SLICES / (CLUSTER_LANES * shards)
+}
+
+/// Windows of a lone row its cluster's lanes hold at once, one a lane: all of its `windows` where
+/// whole rows' windows fill the lanes, else one.
+pub(crate) const fn lanes(windows: usize) -> usize {
+    if windows > 1 && CLUSTER_LANES.is_multiple_of(windows) {
+        windows
+    } else {
+        1
+    }
+}
+
+/// Whether a pass holds a lone row's every window at once, one a lane: where the lanes hold them
+/// and each cell is `element` bytes, narrower than BF16, as landing them together then costs less
+/// than attending them in turn saves; a BF16 window's landing costs about as much.
+pub(crate) const fn spreads(windows: usize, element: usize) -> bool {
+    lanes(windows) > 1 && element < size_of::<bf16>()
 }

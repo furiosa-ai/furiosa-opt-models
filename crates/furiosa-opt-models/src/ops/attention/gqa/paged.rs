@@ -1,6 +1,10 @@
 use super::partition::Geometry;
-use super::{Attended, Cache, Landed, Paged, Windowed, shard};
+use super::{
+    Attended, Cache, Landed, LaneWindows, Paged, WindowRow, WindowRows, WindowTiles, Windowed,
+    shard,
+};
 use crate::ops::index::table::{BlockCounts, BlockIndex};
+use crate::specialize::attention;
 use crate::tensor::cache::{Block, Blocks, KeyValue};
 use crate::tensor::live::Live;
 use crate::tensor::scalar::Value;
@@ -48,8 +52,78 @@ pub struct Pages<Rows: AxisName, Windows: AxisName, Chips: M = Chip, W = Wrap<Ro
     pub bias: HbmTensor<f32, Chips, m![Rows, Windows, Cache]>,
     /// Windows after the first, which every row attends over at least.
     pub rest: Value<Chips>,
+    /// The table and the lengths again, each row's windows together, which a pass that spreads
+    /// its lone row gathers.
+    pub rows: RowMajor<Rows, Windows, Chips>,
     /// The tokens each row's history holds past its last window.
     pub wrap: W,
+}
+
+type Table<Rows, Windows, Chips = Chip> = HbmTensor<i32, Chips, m![Windows, Rows, BlockIndex]>;
+type RowEntries<Rows, Windows, Chips = Chip> = HbmTensor<
+    i32,
+    Chips,
+    m![{ WindowRow<Rows, Windows> }, { Symbol<LaneWindows<Windows>> }, BlockIndex],
+>;
+type RowLengths<Rows, Windows, Chips = Chip> =
+    HbmTensor<i32, Chips, m![{ WindowRow<Rows, Windows> }, { Symbol<LaneWindows<Windows>> }]>;
+
+/// The block table and its lengths of the [`WindowRows`] rows that hold the last live row, each
+/// row's windows together where a row's windows fill its cluster's lanes ([`LaneWindows`]): the
+/// lanes of a pass that spreads its lone row, the last live one, a window a lane.
+#[derive(DeviceSend)]
+pub struct RowMajor<Rows: AxisName, Windows: AxisName, Chips: M = Chip> {
+    /// Byte offsets of pool blocks, per row and window.
+    pub table: RowEntries<Rows, Windows, Chips>,
+    /// Blocks read per row and window.
+    pub lengths: RowLengths<Rows, Windows, Chips>,
+}
+
+impl<Rows: AxisName, Windows: AxisName, Chips: M> RowMajor<Rows, Windows, Chips> {
+    /// The copy of the rows of `table` and its `lengths` that hold the last of the rows `live`,
+    /// whose windows' cells are `D`s; nothing is copied where no pass over such windows spreads
+    /// them.
+    pub fn new<D>(
+        device: &mut Device,
+        (table, lengths): (
+            &Table<Rows, Windows, Chips>,
+            &BlockCounts<Rows, Windows, Chips>,
+        ),
+        live: Live<(), Rows>,
+    ) -> Self {
+        let mut rows = Self {
+            table: HbmTensor::new(),
+            lengths: HbmTensor::new(),
+        };
+        if const { attention::spreads(Windows::SIZE, size_of::<D>()) } {
+            let last = (live.rows() - live.rows().min(1)) / WindowRows::<Windows>::SIZE;
+            // SAFETY: where a row's windows fill its cluster's lanes, its lane windows are all of
+            // its windows, in order.
+            let (copy, counts) = unsafe {
+                (
+                    rows.table
+                        .view_mut()
+                        .reshape::<Chips, m![{ WindowRow<Rows, Windows> }, Windows, BlockIndex]>(),
+                    rows.lengths
+                        .view_mut()
+                        .reshape::<Chips, m![{ WindowRow<Rows, Windows> }, Windows]>(),
+                )
+            };
+            (table.view())
+                .tile::<WindowTiles<Rows, Windows>, 1, m![
+                    Windows, { WindowTiles<Rows, Windows> } = 1 # ({ WindowTiles<Rows, Windows> }),
+                    { WindowRow<Rows, Windows> }, BlockIndex
+                ]>(last)
+                .to_hbm_view(&mut device.tdma, copy);
+            (lengths.view())
+                .tile::<WindowTiles<Rows, Windows>, 1, m![
+                    Windows, { WindowTiles<Rows, Windows> } = 1 # ({ WindowTiles<Rows, Windows> }),
+                    { WindowRow<Rows, Windows> }
+                ]>(last)
+                .to_hbm_view(&mut device.tdma, counts);
+        }
+        rows
+    }
 }
 
 /// Each row's tokens past its last window as the pool's token rows, in token order.
@@ -474,6 +548,7 @@ where
             blocks,
             table: &read.table,
             lengths: &read.lengths,
+            rows: &read.rows,
             scales: &(),
             wrap: read.wrap.wrapping(),
         };
@@ -526,6 +601,7 @@ where
             blocks,
             table: &read.table,
             lengths: &read.lengths,
+            rows: &read.rows,
             scales,
             wrap: read.wrap.wrapping(),
         };
