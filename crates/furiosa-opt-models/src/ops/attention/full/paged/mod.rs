@@ -382,7 +382,7 @@ mod tests {
     use crate::modules::attention::key_value::{History, Paging, Preparation};
     use crate::ops::attention::Attention;
     use crate::ops::attention::Heads;
-    use crate::ops::attention::gqa::{Cache, Pages};
+    use crate::ops::attention::gqa::{Cache, LaneWindows, Pages, RowMajor, WindowRow, Wrap};
     use crate::ops::index::table::{BlockIndex, Fields, PADDING_BIAS};
     use crate::specialize::attention::{HISTORY_WAVES, Strategy, WAVES};
     use crate::tensor::axis::Rows;
@@ -516,7 +516,8 @@ mod tests {
         let length = |row: usize| lengths.get(row).copied().unwrap_or(0);
         // Every entry names a readable block: past a row's blocks, its last one.
         let block = |at: usize| {
-            let (row, at) = (at / (windows * slots), at % (windows * slots));
+            let (window, row, slot) = (at / (rows * slots), at / slots % rows, at % slots);
+            let at = window * slots + slot;
             let history = items::history(row, length(row).max(1));
             let last = firsts[history] + items::keys(history).div_ceil(Block::SIZE) - 1;
             let used = length(row).div_ceil(Block::SIZE).max(1);
@@ -537,7 +538,7 @@ mod tests {
             })
             .collect();
         let rest = lengths.iter().map(|keys| (keys - 1) / Cache::SIZE).max();
-        let table = HostTensor::<i32, m![R, Windows, BlockIndex]>::from_vec(table);
+        let table = HostTensor::<i32, m![Windows, R, BlockIndex]>::from_vec(table);
         let counts = HostTensor::<i32, m![Windows, R]>::from_vec(counts);
         let bias = HostTensor::<f32, m![R, Windows, Cache]>::from_vec(bias);
         Pages {
@@ -548,6 +549,34 @@ mod tests {
                 .to_hbm(&mut device.pdma)
                 .await
                 .unwrap(),
+            // No pass of these windows spreads, so none reads the copy.
+            rows: RowMajor {
+                table: HostTensor::<
+                    i32,
+                    m![{ WindowRow<R, Windows> }, { Symbol<LaneWindows<Windows>> }, BlockIndex],
+                >::zero()
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap(),
+                lengths: HostTensor::<
+                    i32,
+                    m![{ WindowRow<R, Windows> }, { Symbol<LaneWindows<Windows>> }],
+                >::zero()
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap(),
+            },
+            wrap: Wrap {
+                offsets: HostTensor::<i32, m![R, BlockIndex % 2, Block]>::zero()
+                    .to_hbm(&mut device.pdma)
+                    .await
+                    .unwrap(),
+                counts: HostTensor::<i32, m![R]>::zero()
+                    .to_hbm(&mut device.pdma)
+                    .await
+                    .unwrap(),
+                any: count(0).to_hbm(&mut device.pdma).await.unwrap(),
+            },
         }
     }
 

@@ -8,12 +8,15 @@
 //!   once a call; scores stage a 32-row tile's lanes each pass, the most a transposition takes.
 
 use crate::Op;
-use crate::ops::index::gather;
+use crate::ops::index::gather::{self, Gather};
+use crate::ops::index::table::ByteOffset;
 use crate::ops::linear::kernel::{self, Unrounded};
 use crate::ops::linear::{Affine, Groups};
 use crate::ops::normalization::{self, FeatureSlices, Spread};
 use crate::specialize::vocabulary;
-use crate::tensor::{axis::Tile, mapping::Rows as Layout, parallel::Chip};
+use crate::tensor::form::Weight;
+use crate::tensor::mapping::Packets;
+use crate::tensor::{axis::Tile, live::Live, mapping::Rows as Layout, parallel::Chip};
 use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
 use std::borrow::Borrow;
@@ -22,7 +25,7 @@ use std::borrow::Borrow;
 /// the slice's `Hidden` chunk fit and whole multiples of `vocabulary::STEP`, that split the
 /// slice's `Block` of rows into passes.
 #[derive(Clone, Debug)]
-pub(crate) struct Pass<Hidden, Block>(PhantomData<(Hidden, Block)>);
+pub struct Pass<Hidden, Block>(PhantomData<(Hidden, Block)>);
 
 impl<Hidden: AxisName, Block: M + 'static> AxisName for Pass<Hidden, Block> {
     const NAME: Ident = Ident::new("Pass");
@@ -38,7 +41,7 @@ pub(crate) type PassRows<Hidden, V> = Symbol<Pass<Hidden, Block<Hidden, V>>>;
 
 /// The hidden features each slice contracts, its block of every hidden row.
 #[derive(Clone, Debug)]
-pub(crate) struct Contraction<Hidden>(PhantomData<Hidden>);
+pub struct Contraction<Hidden>(PhantomData<Hidden>);
 
 impl<Hidden: AxisName> AxisName for Contraction<Hidden> {
     const NAME: Ident = Ident::new("Contraction");
@@ -96,6 +99,132 @@ type Weights<Chips, Hidden, V> = DmTensor<
     ],
 >;
 
+/// A vocabulary table in HBM by its parts, as a stream's passes land it: part `p`'s chunk of
+/// every row in row order, so what a slice lands in a pass, the next rows of its block in its
+/// part, is one run.
+pub type Parted<Hidden, V> = m![{ Parts<Hidden> }, V, Hidden % ({ Chunk<Hidden> })];
+
+/// A vocabulary table in HBM, row-major `[V, Hidden]` or [`Parted`], as its readers read it: the
+/// rows a head's pass lands on every slice's block, and the rows of a launch's tokens.
+pub trait Table<Chips: M + 'static> {
+    /// Features of a row.
+    type Hidden: AxisName;
+    /// The table's rows, a padded vocabulary.
+    type Vocabulary: AxisName;
+    /// A pass's rows of every block, in the table's order.
+    type Pass: M;
+
+    /// Pass `at`'s rows.
+    fn pass(&self, at: usize) -> HbmTensorView<'_, bf16, Chips, Self::Pass>;
+
+    /// The rows of the tokens `ids`, in order: the live rows' lane groups; a later group's rows are
+    /// left unwritten.
+    fn rows<R: AxisName>(
+        &self,
+        device: &mut Device,
+        ids: &HbmTensor<i32, Chips, Packets<R>>,
+        live: Live<(), R>,
+    ) -> HbmTensor<bf16, Chips, m![R, { Symbol<Self::Hidden> }]>;
+}
+
+type PassIndex<Hidden, V> = m![V % ({ Block<Hidden, V> }) / ({ PassRows<Hidden, V> })];
+
+impl<Hidden: AxisName, V: AxisName, Chips: M + 'static> Table<Chips>
+    for HbmTensor<bf16, Chips, m![V, Hidden]>
+{
+    type Hidden = Hidden;
+    type Vocabulary = V;
+    type Pass = m![
+        V / ({ Block<Hidden, V> }),
+        V % ({ PassRows<Hidden, V> }) # ({ Block<Hidden, V> }),
+        Hidden
+    ];
+
+    fn pass(&self, at: usize) -> HbmTensorView<'_, bf16, Chips, Self::Pass> {
+        self.view().tile::<PassIndex<Hidden, V>, 1, Self::Pass>(at)
+    }
+
+    fn rows<R: AxisName>(
+        &self,
+        device: &mut Device,
+        ids: &HbmTensor<i32, Chips, Packets<R>>,
+        live: Live<(), R>,
+    ) -> HbmTensor<bf16, Chips, m![R, Hidden]> {
+        let row = ByteOffset::<bf16, m![Hidden], m![R]>::default();
+        let offsets = Op::forward(&row, &mut *device, ids);
+        Op::forward(&Gather, device, (self, &offsets, live))
+    }
+}
+
+impl<Hidden: AxisName, V: AxisName, Chips: M + 'static> Table<Chips>
+    for HbmTensor<bf16, Chips, Parted<Hidden, V>>
+{
+    type Hidden = Hidden;
+    type Vocabulary = V;
+    type Pass = m![
+        { Parts<Hidden> },
+        V / ({ Block<Hidden, V> }),
+        V % ({ PassRows<Hidden, V> }) # ({ Block<Hidden, V> }),
+        Hidden % ({ Chunk<Hidden> })
+    ];
+
+    fn pass(&self, at: usize) -> HbmTensorView<'_, bf16, Chips, Self::Pass> {
+        self.view().tile::<PassIndex<Hidden, V>, 1, Self::Pass>(at)
+    }
+
+    /// A row's offset steps over its chunk, the part's row length.
+    fn rows<R: AxisName>(
+        &self,
+        device: &mut Device,
+        ids: &HbmTensor<i32, Chips, Packets<R>>,
+        live: Live<(), R>,
+    ) -> HbmTensor<bf16, Chips, m![R, Hidden]> {
+        let row = ByteOffset::<bf16, m![Hidden % ({ Chunk<Hidden> })], m![R]>::default();
+        let offsets = Op::forward(&row, &mut *device, ids);
+        Op::forward(&Gather, device, (self, &offsets, live))
+    }
+}
+
+/// A borrowed table reads as the table.
+impl<T: Table<Chips>, Chips: M + 'static> Table<Chips> for &T {
+    type Hidden = T::Hidden;
+    type Vocabulary = T::Vocabulary;
+    type Pass = T::Pass;
+
+    fn pass(&self, at: usize) -> HbmTensorView<'_, bf16, Chips, Self::Pass> {
+        (**self).pass(at)
+    }
+
+    fn rows<R: AxisName>(
+        &self,
+        device: &mut Device,
+        ids: &HbmTensor<i32, Chips, Packets<R>>,
+        live: Live<(), R>,
+    ) -> HbmTensor<bf16, Chips, m![R, { Symbol<Self::Hidden> }]> {
+        (**self).rows(device, ids, live)
+    }
+}
+
+/// A parameter reads as the table it holds.
+impl<S: M, T: Table<Chips>, Chips: M + 'static> Table<Chips> for Weight<S, Chips, T> {
+    type Hidden = T::Hidden;
+    type Vocabulary = T::Vocabulary;
+    type Pass = T::Pass;
+
+    fn pass(&self, at: usize) -> HbmTensorView<'_, bf16, Chips, Self::Pass> {
+        self.held().pass(at)
+    }
+
+    fn rows<R: AxisName>(
+        &self,
+        device: &mut Device,
+        ids: &HbmTensor<i32, Chips, Packets<R>>,
+        live: Live<(), R>,
+    ) -> HbmTensor<bf16, Chips, m![R, { Symbol<Self::Hidden> }]> {
+        self.held().rows(device, ids, live)
+    }
+}
+
 /// `Count` lane groups of the rows as the tensor-register lanes of every slice, each slice the
 /// rows' features in its chunk.
 type Lanes<Chips, Hidden, V, Rows, Count> = TrfTensor<
@@ -128,12 +257,13 @@ pub(crate) type Column<Hidden, V> = m![
 ];
 
 /// Every row's logits into `push` with their pass, pass by pass while each pass is live.
-impl<Hidden, V, Rows, Offset, Push, Chips: M + 'static> Op<(&Spread<Hidden, Rows, Chips>, Push)>
-    for Affine<&HbmTensor<bf16, Chips, m![V, Hidden]>, Offset>
+impl<Hidden, V, Rows, T, Offset, Push, Chips: M + 'static> Op<(&Spread<Hidden, Rows, Chips>, Push)>
+    for Affine<&T, Offset>
 where
     Hidden: AxisName,
     V: AxisName,
     Rows: AxisName,
+    T: Table<Chips, Hidden = Hidden, Vocabulary = V>,
     Offset: Borrow<Columns<Hidden, V, f32, Chips>>,
     Push: FnMut(&mut Device, &Logits<Hidden, V, Rows, Chips>, usize),
 {
@@ -283,28 +413,19 @@ impl<Hidden: AxisName, R: AxisName, Chips: M + 'static>
 }
 
 /// Runs `pass` on each pass's written weights, pass `p + 1`'s weights issued before pass `p` runs.
-fn stream<Hidden: AxisName, V: AxisName, Chips: M + 'static>(
+fn stream<T: Table<Chips>, Chips: M + 'static>(
     device: &mut Device,
-    weight: &HbmTensor<bf16, Chips, m![V, Hidden]>,
-    mut pass: impl FnMut(&mut Device, &Weights<Chips, Hidden, V>, usize),
+    weight: &T,
+    mut pass: impl FnMut(&mut Device, &Weights<Chips, T::Hidden, T::Vocabulary>, usize),
 ) {
-    let mut current: Weights<Chips, Hidden, V> = weight
-        .view()
-        .tile::<m![V % ({ Block<Hidden, V> }) / ({ PassRows<Hidden, V> })], 1, m![
-            V / ({ Block<Hidden, V> }),
-            V % ({ PassRows<Hidden, V> }) # ({ Block<Hidden, V> }), Hidden
-        ]>(0)
-        .to_dm(&mut device.tdma);
+    let mut current: Weights<Chips, T::Hidden, T::Vocabulary> =
+        weight.pass(0).to_dm(&mut device.tdma);
     #[unroll]
-    for at in 0..<Passes<Hidden, V> as M>::SIZE {
-        let mut next: Weights<Chips, Hidden, V> = DmTensor::new();
-        if at + 1 < <Passes<Hidden, V> as M>::SIZE {
+    for at in 0..<Passes<T::Hidden, T::Vocabulary> as M>::SIZE {
+        let mut next: Weights<Chips, T::Hidden, T::Vocabulary> = DmTensor::new();
+        if at + 1 < <Passes<T::Hidden, T::Vocabulary> as M>::SIZE {
             weight
-                .view()
-                .tile::<m![V % ({ Block<Hidden, V> }) / ({ PassRows<Hidden, V> })], 1, m![
-                    V / ({ Block<Hidden, V> }),
-                    V % ({ PassRows<Hidden, V> }) # ({ Block<Hidden, V> }), Hidden
-                ]>(at + 1)
+                .pass(at + 1)
                 .to_dm_view(&mut device.tdma, next.view_mut());
         }
         pass(&mut *device, &current, at);

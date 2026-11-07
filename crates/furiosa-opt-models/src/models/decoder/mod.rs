@@ -234,12 +234,22 @@ impl<S: Config> Queries<()> for S {
 }
 
 /// One attention group: `Heads` key/value heads of `Head`, `Groups` query heads each, both
-/// projection widths, the heads' [`Rotation`] and the `Windows` of cache blocks a row reads.
-pub struct Group<Heads, Head, Groups, QueryWidth, KvWidth, Rotated, Windows>(
-    PhantomData<(Heads, Head, Groups, QueryWidth, KvWidth, Rotated, Windows)>,
+/// projection widths, the heads' [`Rotation`], the `Windows` of cache blocks a row reads and the
+/// element its cache stores each key and value as.
+pub struct Group<Heads, Head, Groups, QueryWidth, KvWidth, Rotated, Windows, Cache = bf16>(
+    PhantomData<(
+        Heads,
+        Head,
+        Groups,
+        QueryWidth,
+        KvWidth,
+        Rotated,
+        Windows,
+        Cache,
+    )>,
 );
 
-/// A [`Group`]'s axes by role.
+/// A [`Group`]'s axes by role, and its cache's element.
 pub trait Attention: 'static {
     type Heads: AxisName;
     type Head: AxisName;
@@ -248,6 +258,7 @@ pub trait Attention: 'static {
     type KvWidth: AxisName;
     type Rotated: Rotation;
     type Windows: AxisName;
+    type Cache: Cache = bf16;
 
     /// Whether the widths are the head products the attention kernels assume.
     const CONSISTENT: bool = Self::Groups::SIZE * Self::Heads::SIZE * Self::Head::SIZE
@@ -257,8 +268,8 @@ pub trait Attention: 'static {
         && Self::Windows::SIZE > 0;
 }
 
-impl<Heads, Head, Groups, QueryWidth, KvWidth, Rotated, Windows> Attention
-    for Group<Heads, Head, Groups, QueryWidth, KvWidth, Rotated, Windows>
+impl<Heads, Head, Groups, QueryWidth, KvWidth, Rotated, Windows, C> Attention
+    for Group<Heads, Head, Groups, QueryWidth, KvWidth, Rotated, Windows, C>
 where
     Heads: AxisName,
     Head: AxisName,
@@ -267,6 +278,7 @@ where
     KvWidth: AxisName,
     Rotated: Rotation,
     Windows: AxisName,
+    C: Cache,
 {
     type Heads = Heads;
     type Head = Head;
@@ -275,6 +287,31 @@ where
     type KvWidth = KvWidth;
     type Rotated = Rotated;
     type Windows = Windows;
+    type Cache = C;
+}
+
+/// How a cache stores each key and value: as BF16, or as an E4M3 code under its layer's static
+/// scales; the op that writes a call's rows into its blocks, holding its leaves in memory `X`, and
+/// what that op lands once a layer for itself and the attention that reads the blocks.
+pub trait Cache: MaterializableScalar + FetchCast<f32> + 'static {
+    /// The element as a checkpoint's tensors name it.
+    const DTYPE: safetensors::Dtype;
+    type Write<X: Memory>;
+    type Landed: Default;
+}
+
+/// The rows as they are, read as stored.
+impl Cache for bf16 {
+    const DTYPE: safetensors::Dtype = safetensors::Dtype::BF16;
+    type Write<X: Memory> = ops::index::scatter::Scatter;
+    type Landed = ();
+}
+
+/// The rows divided by the layer's scales and rounded, read back times them.
+impl Cache for f8e4m3 {
+    const DTYPE: safetensors::Dtype = safetensors::Dtype::F8_E4M3;
+    type Write<X: Memory> = ops::index::scatter::Scaled<X>;
+    type Landed = crate::tensor::cache::Landed;
 }
 
 /// The coordinates of each head that a group's positions turn, which decide how its layers
@@ -635,16 +672,26 @@ pub mod form {
     use crate::tensor;
     use crate::tensor::form::fp8::Block;
     use crate::tensor::form::fp8::Scales;
-    use crate::tensor::form::nvfp4::{self, Early, Late, W4A4, W4A16};
-    use crate::tensor::parallel::Chip;
+    use crate::tensor::form::nvfp4::{self, Early, Features, Late, Summed, W4A4, W4A16};
+    use crate::tensor::{parallel::Chip, scalar};
     use furiosa_opt_std::prelude::*;
 
     /// BF16 weights.
     pub struct Affine;
 
     /// FP8 weights with one FP32 scale per output channel, as a load quantizes BF16 ones or a
-    /// checkpoint declares them; inputs stay BF16.
+    /// checkpoint declares them; inputs stay BF16. HBM holds the codes as the contraction's slices
+    /// hold them, a load lays them out so.
     pub struct ChannelScaled;
+
+    /// How HBM holds [`ChannelScaled`]'s codes.
+    pub mod channel {
+        pub use crate::ops::linear::fp8::Codes;
+    }
+
+    /// [`ChannelScaled`]'s FP8 weights, whose inputs quantize to E4M3 at run time under one scale
+    /// a row, as a checkpoint declaring per-token dynamic activations states them.
+    pub struct TokenScaled;
 
     /// FP8 weights and activations with static per-tensor scales.
     pub struct TensorScaled;
@@ -656,6 +703,18 @@ pub mod form {
     /// FP4 weights with per-16 FP8 block scales and one global scale, as a compressed-tensors
     /// checkpoint stores them; inputs stay BF16.
     pub struct Nvfp4;
+
+    /// [`Nvfp4`]'s weights under the experimental summed contract: a row's FP32 sum divides by the
+    /// global scale, so no coefficient rounds to BF16. Opt in by naming it in place of [`Nvfp4`].
+    /// A launch's projected rows end where `P` places them, as [`Summed`] reads it. HBM holds the
+    /// codes and block scales as the slices that sum them hold them, and the global scale as
+    /// [`Copies`](crate::tensor::scalar::Copies); a load lays them out so.
+    pub struct Nvfp4Summed<P = Features>(PhantomData<P>);
+
+    /// How HBM holds [`Nvfp4Summed`]'s codes and block scales.
+    pub mod summed {
+        pub use crate::ops::linear::nvfp4::summed::rows::{Blocks, Codes, Ownership};
+    }
 
     /// FP4 weights with per-16 FP8 block scales under a late FP32 tensor scale, whose inputs enter
     /// in form `A`: quantized at run time as the weights are, or as the BF16 they are.
@@ -689,7 +748,12 @@ pub mod form {
         type Stored = f8e4m3;
 
         type Of<In: AxisName, Out: AxisName, D: Scalar, Chips: M + 'static, X: Memory, V> =
-            fp8::ChannelScaled<In, Out, V, X::Tensor<f32, Chip, m![Out, 1 # 8]>>;
+            fp8::ChannelScaled<
+                In,
+                Out,
+                X::Tensor<f8e4m3, Chip, channel::Codes<In, Out>>,
+                X::Tensor<f32, Chip, m![Out, 1 # 8]>,
+            >;
 
         type Query<Hidden: AxisName, Heads: AxisName, Head: AxisName, X: Memory> =
             query::matrix::ChannelScaled<Hidden, Heads, Head, X>;
@@ -714,6 +778,22 @@ pub mod form {
 
         const REQUIREMENT: Requirement =
             Requirement::quantizable(Declaration::Fp8(Scheme::Channel));
+
+        type Caches = (bf16,);
+    }
+
+    impl Form for TokenScaled {
+        type Stored = f8e4m3;
+
+        type Of<In: AxisName, Out: AxisName, D: Scalar, Chips: M + 'static, X: Memory, V> =
+            fp8::TokenScaled<
+                In,
+                Out,
+                X::Tensor<f8e4m3, Chip, channel::Codes<In, Out>>,
+                X::Tensor<f32, Chip, m![Out, 1 # 8]>,
+            >;
+
+        const REQUIREMENT: Requirement = Requirement::declared(Declaration::Fp8(Scheme::Channel));
 
         type Caches = (bf16,);
     }
@@ -788,6 +868,27 @@ pub mod form {
                 Chip,
                 V,
                 X::Tensor<f8e4m3, Chip, nvfp4::Scales<In, Out>>,
+            >;
+
+        const REQUIREMENT: Requirement = Requirement::declared(Declaration::Nvfp4);
+
+        type Caches = (bf16,);
+    }
+
+    impl<P: summed::Ownership + 'static> Form for Nvfp4Summed<P> {
+        type Stored = f4e2m1;
+
+        type Of<In: AxisName, Out: AxisName, D: Scalar, Chips: M + 'static, X: Memory, V> =
+            tensor::form::BlockScaled<
+                In,
+                Out,
+                f4e2m1,
+                f8e4m3,
+                nvfp4::Scales<In, Out>,
+                Summed<W4A16, X, P, scalar::Copies>,
+                Chip,
+                X::Tensor<f4e2m1, Chip, summed::Codes<In, Out, P>>,
+                X::Tensor<f8e4m3, Chip, summed::Blocks<In, Out, P>>,
             >;
 
         const REQUIREMENT: Requirement = Requirement::declared(Declaration::Nvfp4);
@@ -911,17 +1012,17 @@ pub type HeadView<Count, Head> = m![Count, Head];
 pub type Position<A, D = bf16, Chips = Chip> =
     <<A as Attention>::Rotated as Rotation>::Position<<A as Attention>::Head, D, Chips>;
 
-/// Group `A`'s constants that prepare a call of `R` rows over a cache of `C`: the rows' rotations,
+/// Group `A`'s constants that prepare a call of `R` rows over its cache: the rows' rotations,
 /// write slots and paged history reads, bound to the group's rotary spectrum and window; in memory
 /// `X`.
-pub type Paging<A, R, C = bf16, X = Hbm> = key_value::Preparation<
+pub type Paging<A, R, X = Hbm> = key_value::Preparation<
     R,
     key_value::Paging<
         <A as Attention>::Heads,
         <A as Attention>::Head,
         R,
         <A as Attention>::Windows,
-        C,
+        <A as Attention>::Cache,
         X,
         Chip,
         <A as Attention>::Rotated,
@@ -930,6 +1031,9 @@ pub type Paging<A, R, C = bf16, X = Hbm> = key_value::Preparation<
     Chip,
     X,
 >;
+
+/// The op that writes a call's keys and values into group `A`'s cache, its leaves in memory `X`.
+pub type Write<A, X = Hbm> = <<A as Attention>::Cache as Cache>::Write<X>;
 
 /// Grouped-query attention of group `A` over each chip's heads of placement `P`, its scores
 /// multiplied by `SCALE` (FP32 bits), over the windows of history a call pages.
@@ -1022,7 +1126,7 @@ mod tests {
     #[test]
     fn requires_each_declaration_its_forms_read() {
         use crate::tensor::form::nvfp4::W4A16;
-        use form::{Affine, BlockScaled, ChannelScaled, Nvfp4, Nvfp4BlockScaled};
+        use form::{Affine, BlockScaled, ChannelScaled, Nvfp4, Nvfp4BlockScaled, Nvfp4Summed};
         let channel = Declaration::Fp8(config::Scheme::Channel);
         let nvfp4 = Declaration::Nvfp4;
         type Mixed<F> = Projections<ChannelScaled, ChannelScaled, ChannelScaled, ChannelScaled, F>;
@@ -1040,6 +1144,10 @@ mod tests {
                 (true, Some(channel), true),
             ),
             (<Mixed<Nvfp4> as Forms>::REQUIREMENT, (true, None, false)),
+            (
+                <Mixed<Nvfp4Summed> as Forms>::REQUIREMENT,
+                (true, None, false),
+            ),
             (
                 <Mlp<Nvfp4BlockScaled> as Forms>::REQUIREMENT,
                 (true, Some(nvfp4), false),

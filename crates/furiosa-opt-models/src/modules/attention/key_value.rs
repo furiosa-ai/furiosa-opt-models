@@ -11,7 +11,7 @@ use crate::ops::rotary::{self, SplitHalf, group};
 use crate::ops::{
     attention::{
         full::paged,
-        gqa::{Cache, Pages},
+        gqa::{Cache, Counted, Pages, RowMajor, Wrap, Wrapped},
         latent::{self, Slot},
     },
     rotary::{Coefficients, PairFrequencies, Rotation},
@@ -183,8 +183,8 @@ pub struct Paging<
 > {
     /// The frequency of each coordinate, on every row.
     frequencies: X::Tensor<f32, Chips, m![Rows, Rotated]>,
-    /// The phases and signs that turn each row's angles into its rotation.
-    coefficients: Coefficients<Rotated, Chips, X::Tensor<f32, Chips, m![Rotated]>>,
+    /// The phases and signs that turn each row's angles into its rotation, on every row.
+    coefficients: RowCoefficients<X, Rows, Rotated, Chips>,
     /// Longest visible history in tokens.
     window: X::Tensor<i32, Chips, m![1]>,
     /// The same, on the host.
@@ -247,7 +247,6 @@ impl<
 where
     X::Tensor<f32, Chips, m![Rows, Rotated]>:
         Load<HostTensor<f32, m![{ Chips }, { m![Rows, Rotated] }]>>,
-    X::Tensor<f32, Chips, m![Rotated]>: Load<HostTensor<f32, m![{ Chips }, { m![Rotated] }]>>,
     X::Tensor<i32, Chips, m![1]>: Load<HostTensor<i32, m![{ Chips }, { m![1] }]>>,
     X::Tensor<i32, Chips, m![Windows, { Packets<Rows> }]>:
         Load<HostTensor<i32, m![{ Chips }, { m![Windows, { Packets<Rows> }] }]>>,
@@ -361,7 +360,6 @@ impl<
     for Paging<Heads, Head, Rows, Windows, D, X, Chips, Rotated, Layer>
 where
     X::Tensor<f32, Chips, m![Rows, Rotated]>: Load<&'a Y::Tensor<f32, Chips, m![Rows, Rotated]>>,
-    X::Tensor<f32, Chips, m![Rotated]>: Load<&'a Y::Tensor<f32, Chips, m![Rotated]>>,
     X::Tensor<i32, Chips, m![1]>: Load<&'a Y::Tensor<i32, Chips, m![1]>>,
     X::Tensor<i32, Chips, m![Windows, { Packets<Rows> }]>:
         Load<&'a Y::Tensor<i32, Chips, m![Windows, { Packets<Rows> }]>>,
@@ -434,14 +432,14 @@ where
             Output = Context<
                 Rotation<Rotated, Chips, Rows>,
                 HbmTensor<i32, Chips, m![Rows]>,
-                Pages<Rows, Windows, Chips>,
+                Pages<Rows, Windows, Chips, Counted<Rows, Chips>>,
             >,
         >,
 {
     type Output = Context<
         Rotation<Rotated, Chips, Rows>,
         HbmTensor<i32, Chips, m![Rows]>,
-        Pages<Rows, Windows, Chips>,
+        Pages<Rows, Windows, Chips, Counted<Rows, Chips>>,
     >;
 
     fn forward(
@@ -520,7 +518,6 @@ where
             Output = Logical<Rows, Chips>,
         >,
     X::Tensor<f32, Chips, m![Rows, Rotated]>: Borrow<HbmTensor<f32, Chips, m![Rows, Rotated]>>,
-    X::Tensor<f32, Chips, m![Rotated]>: Borrow<HbmTensor<f32, Chips, m![Rotated]>>,
 {
     type Output = Context<
         Rotation<Rotated, Chips, Rows>,
@@ -602,7 +599,6 @@ where
     Windows: AxisName,
     D: Scalar,
     X::Tensor<f32, Chips, m![Rows, Rotated]>: Borrow<HbmTensor<f32, Chips, m![Rows, Rotated]>>,
-    X::Tensor<f32, Chips, m![Rotated]>: Borrow<HbmTensor<f32, Chips, m![Rotated]>>,
     X::Tensor<i32, Chips, m![1]>: Borrow<Value<Chips>>,
     X::Tensor<i32, Chips, m![Windows, { Packets<Rows> }]>:
         Borrow<HbmTensor<i32, Chips, m![Windows, { Packets<Rows> }]>>,
@@ -612,7 +608,7 @@ where
     type Output = Context<
         Rotation<Rotated, Chips, Rows>,
         HbmTensor<i32, Chips, m![Rows]>,
-        Pages<Rows, Windows, Chips>,
+        Pages<Rows, Windows, Chips, Counted<Rows, Chips>>,
     >;
 
     fn forward(
@@ -635,6 +631,30 @@ where
             const { Blocks::<Heads, Head, D, Chips>::BLOCK_STRIDE },
         );
         let bias = extents.bias(device, (starts, self.slots.borrow()));
+        // Copied here, once a step, so no layer writes the memory its gathers read their entries
+        // from: that write would sync the cores ahead of each gather.
+        let rows = RowMajor::new::<D>(device, (&blocks, &extents.counts), tiles);
+        let mut offsets = Wrapped::<Rows, Chips>::new();
+        // Only a history past its ring holds tokens to wrap; a group whose ring is its context
+        // never does. The layers take the count read here.
+        let times = extents.wraps.extent::<m![1]>();
+        for _ in 0..times {
+            extents.wrap(
+                device,
+                (&history.blocks, self.slots.borrow()),
+                (
+                    &logical.tables,
+                    const {
+                        (
+                            Blocks::<Heads, Head, D, Chips>::BLOCK_STRIDE,
+                            Blocks::<Heads, Head, D, Chips>::ROW_STRIDE,
+                        )
+                    },
+                ),
+                &mut offsets,
+            );
+        }
+        let counts = extents.wrapped(device);
         let positions =
             table::positions::<Rows, Rotated, _>(device, frequencies, &logical.positions);
         Context {
@@ -654,10 +674,23 @@ where
                 lengths: extents.counts,
                 bias,
                 rest: extents.rest,
+                rows,
+                wrap: (
+                    Wrap {
+                        offsets,
+                        counts,
+                        any: extents.wraps,
+                    },
+                    times,
+                ),
             },
         }
     }
 }
+
+/// A rotation's constants in memory `X`, a copy for each of `Rows` rows.
+type RowCoefficients<X, Rows, Rotated, Chips> =
+    Coefficients<Rows, Rotated, Chips, <X as Memory>::Tensor<f32, Chips, m![Rows, Rotated]>>;
 
 #[cfg(test)]
 mod tests {

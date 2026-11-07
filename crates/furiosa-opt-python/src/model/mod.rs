@@ -116,7 +116,8 @@ impl LoadOptions {
         Ok(Self(self.0.clone().chips(chips)?))
     }
 
-    /// Cache keys and values as `dtype`, a tensor dtype name, instead of `bfloat16`.
+    /// Cache keys and values as `dtype`, a tensor dtype name, instead of the one the checkpoint
+    /// declares.
     ///
     /// Raises:
     ///     ValueError: `dtype` names no tensor dtype.

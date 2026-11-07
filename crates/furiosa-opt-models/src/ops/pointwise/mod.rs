@@ -248,6 +248,53 @@ axes![Factors = 2];
 /// Two factors' tiles of every row, interleaved row by row.
 pub(super) type SpreadPairs<W, R> = m![R, Factors, W % ({ Symbol<Chunk<W>> }) / 8];
 
+/// A launch's rows left in the DM layout `T` their producer computed them in: elementwise steps
+/// run on them there and keep the layout, and a reader that knows it takes them as they lie.
+/// `Kept` alone names that choice, as a projection's contract states where its rows end.
+#[derive(Clone, Debug)]
+pub struct Kept<T = ()>(pub T);
+
+/// How an elementwise step walks each slice's cells: `Time` steps of an eight-cell `Packet`, the
+/// vector engine's `Narrow` steps of four `Half` cells, and two operands' tiles interleaved in
+/// `Pairs`.
+pub(super) trait Walk {
+    type Time: M;
+    type Packet: M;
+    type Narrow: M;
+    type Half: M;
+    type Pairs: M;
+    /// A BF16 result's packet, padded to the sixteen cells a BF16 cast packs.
+    type Padded: M;
+}
+
+/// Each row's chunk of `W` features in the feature slices, row by row.
+pub(super) struct Chunks<W, R>(PhantomData<(W, R)>);
+
+impl<W: AxisName, R: AxisName> Walk for Chunks<W, R> {
+    type Time = SpreadTime<W, R>;
+    type Packet = SpreadPacket<W>;
+    type Narrow = m![R, W % ({ Symbol<Chunk<W>> }) / 4];
+    type Half = m![W % 4];
+    type Pairs = SpreadPairs<W, R>;
+    type Padded = m![W % 8 # 16];
+}
+
+/// A slice's cells `E` as one axis: in whatever order a layout holds them, an elementwise step
+/// meets each cell once.
+pub(super) type Cell<E> = m![{ Symbol<Flat<E>> }];
+
+/// The [`Cell`]s of a slice in order, two operands' interleaved 64 cells at a time.
+pub(super) struct Cells<E>(PhantomData<E>);
+
+impl<E: M + 'static> Walk for Cells<E> {
+    type Time = m![{ Symbol<Flat<E>> } / 8];
+    type Packet = m![{ Symbol<Flat<E>> } % 8];
+    type Narrow = m![{ Symbol<Flat<E>> } / 4];
+    type Half = m![{ Symbol<Flat<E>> } % 4];
+    type Pairs = m![{ Symbol<Flat<E>> } / 64, Factors, { Symbol<Flat<E>> } % 64 / 8];
+    type Padded = m![{ Symbol<Flat<E>> } % 8 # 16];
+}
+
 #[cfg(test)]
 mod tests {
     use super::{activation::Silu, add::Add, multiply::Multiply};

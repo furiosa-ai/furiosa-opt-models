@@ -97,7 +97,8 @@ impl<const N: usize> Projections<'_, N> {
 
 /// Another handle to the same codes and scales, so a module's copy can outlive the borrow of the
 /// tree.
-impl<In, Out, E, S, B, C, Chips> Clone for BlockScaled<In, Out, E, S, B, C, Chips>
+impl<In, Out, E, S, B, C, Chips, K> Clone
+    for BlockScaled<In, Out, E, S, B, C, Chips, HbmTensor<E, Chips, K>>
 where
     In: AxisName,
     Out: AxisName,
@@ -106,6 +107,7 @@ where
     B: M,
     C: Copy,
     Chips: M,
+    K: M,
 {
     fn clone(&self) -> Self {
         // SAFETY: parameters are read-only; each alias names the same cells in the same order.
@@ -128,12 +130,20 @@ impl<In: AxisName, Out: AxisName, E: Scalar, S: Scalar, B: M, C, Chips: M, W, T>
     }
 }
 
-/// E4M3 codes under no contract, one FP32 scale per output row: its codes and scales as stored,
-/// under `weight` and `weight_scale`; in a checkpoint a load quantizes, the codes and scales of
-/// the BF16 weight stored under `weight`.
+/// The contracts of E4M3 codes with one FP32 scale per output row: none, whose inputs stay BF16, or
+/// [`fp8::Token`], whose inputs quantize per row at run time; either loads the same tensors.
+pub trait Channel: Copy + Default + 'static {}
+
+impl Channel for () {}
+
+impl Channel for fp8::Token {}
+
+/// E4M3 codes under a channel contract `C`, one FP32 scale per output row: its codes and scales as
+/// stored, under `weight` and `weight_scale`; in a checkpoint a load quantizes, the codes and scales
+/// of the BF16 weight stored under `weight`.
 /// By hand, with the update below: one impl per weight form, where a derived impl is generic.
-impl<'a, In: AxisName, Out: AxisName, Chips: M + 'static, W, T> Load<&'a Checkpoint>
-    for BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], (), Chips, W, T>
+impl<'a, In: AxisName, Out: AxisName, C: Channel, Chips: M + 'static, W, T> Load<&'a Checkpoint>
+    for BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], C, Chips, W, T>
 where
     W: Load<&'a Checkpoint>
         + online::Unquantized<In, Out, Chips>
@@ -153,23 +163,23 @@ where
                 });
                 let scale = children.ask(scale)?;
                 let (weight, scale) = children.node(weight.zip(scale))?;
-                Ok(Self::new(weight, scale, ()))
+                Ok(Self::new(weight, scale, C::default()))
             }
             Some(_) => {
                 let (codes, scales) = Self::quantized(from, cx)?;
                 let weight = cx.field("weight", "weight", |cx| W::load(cx, W::host(codes)))?;
                 let scale = cx.field("weight_scale", "weight_scale", |cx| T::load(cx, scales))?;
-                Ok(Self::new(weight, scale, ()))
+                Ok(Self::new(weight, scale, C::default()))
             }
         })
     }
 }
 
-impl<'t, 's, In: AxisName, Out: AxisName, Chips: M + 'static, W, T>
+impl<'t, 's, In: AxisName, Out: AxisName, C: Channel, Chips: M + 'static, W, T>
     Load<(
-        &'t mut BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], (), Chips, W, T>,
+        &'t mut BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], C, Chips, W, T>,
         &'s Checkpoint,
-    )> for &'t mut BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], (), Chips, W, T>
+    )> for &'t mut BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], C, Chips, W, T>
 where
     W: online::Unquantized<In, Out, Chips>,
     for<'u> &'u mut W: Load<(&'u mut W, &'s Checkpoint)>
@@ -180,7 +190,7 @@ where
     fn load(
         context: &mut Context<'_>,
         (into, from): (
-            &'t mut BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], (), Chips, W, T>,
+            &'t mut BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], C, Chips, W, T>,
             &'s Checkpoint,
         ),
     ) -> Result<Self, LoadError> {
@@ -197,7 +207,7 @@ where
             Some(_) => cx
                 .rule(
                     |cx| {
-                        BlockScaled::<In, Out, f8e4m3, f32, m![Out, 1 # 8], (), Chips, W, T>::quantized(
+                        BlockScaled::<In, Out, f8e4m3, f32, m![Out, 1 # 8], C, Chips, W, T>::quantized(
                             from, cx,
                         )
                     },
@@ -217,8 +227,8 @@ where
     }
 }
 
-impl<In: AxisName, Out: AxisName, Chips: M + 'static, W, T>
-    BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], (), Chips, W, T>
+impl<In: AxisName, Out: AxisName, C: Channel, Chips: M + 'static, W, T>
+    BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], C, Chips, W, T>
 {
     /// The codes and row scales the BF16 weight under `weight` quantizes to.
     fn quantized(
@@ -421,6 +431,44 @@ where
         context: &mut Context<'_>,
         (into, from): (
             &'t mut Nvfp4<In, Out, nvfp4::Early<A, X>, W, T>,
+            &'s Checkpoint,
+        ),
+    ) -> Result<Self, LoadError> {
+        context.checkpoint(from, |cx| into.update(from, cx, "weight_packed"))?;
+        Ok(into)
+    }
+}
+
+/// An NVFP4 weight of a compressed-tensors checkpoint: its packed E2M1 codes under
+/// `weight_packed`, its E4M3 block scales under `weight_scale`, and its tensor scale read by the
+/// experimental summed contract.
+impl<'a, In: AxisName, Out: AxisName, A, X: Memory, P, S: M + 'static, W, T> Load<&'a Checkpoint>
+    for Nvfp4<In, Out, nvfp4::Summed<A, X, P, S>, W, T>
+where
+    W: Load<HostTensor<f4e2m1, m![{ Chip }, { m![Out, In] }]>>,
+    T: Load<nvfp4::BlockScales<In, Out>>,
+    nvfp4::Summed<A, X, P, S>: Load<&'a Checkpoint>,
+{
+    fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
+        context.checkpoint(from, |cx| Self::read(from, cx, "weight_packed"))
+    }
+}
+
+impl<'t, 's, In: AxisName, Out: AxisName, A, X: Memory, P, S: M + 'static, W, T>
+    Load<(
+        &'t mut Nvfp4<In, Out, nvfp4::Summed<A, X, P, S>, W, T>,
+        &'s Checkpoint,
+    )> for &'t mut Nvfp4<In, Out, nvfp4::Summed<A, X, P, S>, W, T>
+where
+    for<'u> &'u mut W: Load<(&'u mut W, Codes<In, Out>)>,
+    for<'u> &'u mut T: Load<(&'u mut T, nvfp4::BlockScales<In, Out>)>,
+    for<'u> &'u mut nvfp4::Summed<A, X, P, S>:
+        Load<(&'u mut nvfp4::Summed<A, X, P, S>, &'s Checkpoint)>,
+{
+    fn load(
+        context: &mut Context<'_>,
+        (into, from): (
+            &'t mut Nvfp4<In, Out, nvfp4::Summed<A, X, P, S>, W, T>,
             &'s Checkpoint,
         ),
     ) -> Result<Self, LoadError> {

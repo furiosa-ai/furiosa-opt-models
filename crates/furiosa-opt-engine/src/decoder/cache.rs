@@ -10,6 +10,7 @@
 use super::Decoder;
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
 use furiosa_opt_std::prelude::{Device, HbmBuffer};
+use furiosa_opt_std::runtime::Layout;
 use std::any::Any;
 use std::io;
 use std::iter;
@@ -102,6 +103,11 @@ pub struct Cache {
     views: Mutex<Views>,
 }
 
+// Rows gathering one history's pages together ran up to 0.9 ms slower or faster with where the
+// layers start; 16 KiB past a MiB measured within 0.1 ms of the fastest, whatever loaded before.
+const LAYER_ALIGNMENT: usize = 1 << 20;
+const LAYER_PHASE: usize = 16 << 10;
+
 /// The views a decoder keeps of a cache's layers.
 enum Views {
     /// No call has built any.
@@ -117,7 +123,12 @@ impl Cache {
     /// `j * page..(j + 1) * page`.
     pub fn new(device: &Device, spec: &CacheSpec, blocks: usize) -> io::Result<Self> {
         let layers = (spec.sizes(blocks)?.into_iter())
-            .map(|size| HbmBuffer::alloc(device, size).map_err(io::Error::other))
+            .map(|size| {
+                (HbmBuffer::alloc(device, Layout::new(LAYER_PHASE + size, LAYER_ALIGNMENT)))
+                    .and_then(|layer| layer.split_at(LAYER_PHASE))
+                    .map(|(_, layer)| layer)
+                    .map_err(io::Error::other)
+            })
             .collect::<io::Result<_>>()?;
         Ok(Self {
             layers,

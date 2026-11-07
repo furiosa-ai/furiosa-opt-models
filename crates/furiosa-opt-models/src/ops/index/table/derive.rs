@@ -1,13 +1,17 @@
 //! The logical rows of a step: each packed row's position, write slot, visible length and table
 //! entry, derived on the device from its history's segment table and load-time coordinates.
 
-use super::{CACHED, Fields, Grid, LEN, Logical, Pairs, Quad, START, Segment, TABLE};
+use super::{
+    CACHED, Fields, Grid, LEN, Logical, PacketLane, Pairs, Places, Quad, RowGroup, RowLane, START,
+    Segment, TABLE,
+};
 use crate::Op;
 use crate::load::{self, Checkpoint, Load, LoadError};
 use crate::tensor::cache::Block;
 use crate::tensor::mapping::{BroadcastClusters as Cluster, BroadcastSlices as Slices};
 use crate::tensor::memory::{Hbm, Memory};
 use crate::tensor::parallel::Chip;
+use crate::tensor::scalar;
 use furiosa_opt_std::prelude::*;
 use std::borrow::Borrow;
 
@@ -22,6 +26,8 @@ pub struct Derive<Rows: AxisName, Chips: M + 'static = Chip, X: Memory = Hbm> {
     pub grid: X::Tensor<i32, Chips, Grid<Rows>>,
     /// The four lanes of an entry quad, 0 to 3, on every row.
     pub pairs: X::Tensor<i32, Chips, Pairs<Rows>>,
+    /// Each row's lane of its group's packet.
+    pub places: X::Tensor<i32, Chips, Places<Rows>>,
 }
 
 /// The coordinates a load computes, as no checkpoint stores them.
@@ -33,6 +39,7 @@ where
         Load<HostTensor<i32, m![{ Chips }, { m![Rows, 1 # 8] }]>>,
     X::Tensor<i32, Chips, Grid<Rows>>: Load<HostTensor<i32, m![{ Chips }, { Grid<Rows> }]>>,
     X::Tensor<i32, Chips, Pairs<Rows>>: Load<HostTensor<i32, m![{ Chips }, { Pairs<Rows> }]>>,
+    X::Tensor<i32, Chips, Places<Rows>>: Load<HostTensor<i32, m![{ Chips }, { Places<Rows> }]>>,
 {
     fn load(context: &mut load::Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
         let lanes = |count: usize, value: &dyn Fn(usize) -> Option<usize>| -> Vec<i32> {
@@ -54,6 +61,10 @@ where
                     let pairs = lanes(row * 8, &|at| (at % 8 < 4).then_some(at % 8));
                     Load::load(cx, HostTensor::from_vec(pairs))
                 })?,
+                places: cx.field("places", "places", |cx| {
+                    let places = lanes(row * 8, &|at| (at % 8 == at / 8 % 8).then_some(1));
+                    Load::load(cx, HostTensor::from_vec(places))
+                })?,
             })
         })
     }
@@ -72,19 +83,35 @@ impl<'t, 's, Rows: AxisName, Chips: M + 'static, X: Memory>
     }
 }
 
-type Cells<R, Chips> = DmTensor<i32, Chips, Cluster, Slices, Grid<R>>;
+/// Row `r` on slice `r`, so a pass over every row and segment moves a row's segments a slice.
+type RowSlices<R> = m![R # 256];
+
+/// Each row's value for every segment, a value a flit.
+type Cells<R, Chips> =
+    DmTensor<i32, Chips, Cluster, RowSlices<R>, m![{ Symbol<Segment<R>> }, 1 # 8]>;
+
+/// Each row's value, on the row's slice.
+type Sums<R, Chips> = DmTensor<i32, Chips, Cluster, RowSlices<R>, m![1 # 8]>;
 
 /// One value per row, a row a flit.
 type Rows<R, Chips> = DmTensor<i32, Chips, Cluster, Slices, m![R, 1 # 8]>;
 type RowOperand<R, Chips> = VrfTensor<i32, Chips, Cluster, Slices, m![R, 1 # 8]>;
 
-/// One value per segment, a segment a flit.
+/// One value per segment, a segment a flit, on every row's slice.
 type SegmentOperand<R, Chips> =
-    VrfTensor<i32, Chips, Cluster, Slices, m![{ Symbol<Segment<R>> }, 1 # 8]>;
+    VrfTensor<i32, Chips, Cluster, RowSlices<R>, m![{ Symbol<Segment<R>> }, 1 # 8]>;
 
-/// The segment table, field by field.
+/// The segment table, field by field, on every row's slice.
 type Columns<R, Chips> =
-    DmTensor<i32, Chips, Cluster, Slices, m![Fields, { Symbol<Segment<R>> }, 1 # 8]>;
+    DmTensor<i32, Chips, Cluster, RowSlices<R>, m![Fields, { Symbol<Segment<R>> }, 1 # 8]>;
+
+/// The rows in their lane groups of eight.
+type Members<R> = m![{ Symbol<RowGroup<R>> }, RowLane];
+/// One value per row, a row a flit, in lane groups, as a vector-engine operand.
+type MemberOperand<R, Chips> = VrfTensor<i32, Chips, Cluster, Slices, m![{ Members<R> }, 1 # 8]>;
+/// One value per row, each lane group's rows in a packet of their own.
+type Grouped<R, Chips> =
+    DmTensor<i32, Chips, Cluster, Slices, m![{ Symbol<RowGroup<R>> }, PacketLane]>;
 
 /// Each row's logical position, write slot, visible length and table entry, from the segment
 /// table of a history and its flat table of block IDs.
@@ -97,6 +124,7 @@ where
     X::Tensor<i32, Chips, m![R, 1 # 8]>: Borrow<HbmTensor<i32, Chips, m![R, 1 # 8]>>,
     X::Tensor<i32, Chips, Grid<R>>: Borrow<HbmTensor<i32, Chips, Grid<R>>>,
     X::Tensor<i32, Chips, Pairs<R>>: Borrow<HbmTensor<i32, Chips, Pairs<R>>>,
+    X::Tensor<i32, Chips, Places<R>>: Borrow<HbmTensor<i32, Chips, Places<R>>>,
 {
     type Output = Logical<R, Chips>;
 
@@ -143,8 +171,8 @@ where
             device
                 .main
                 .begin(cells.view())
-                .fetch::<m![R, { Symbol<Segment<R>> }], m![1 # 8]>()
-                .collect::<m![R, { Symbol<Segment<R>> }], m![1 # 8]>()
+                .fetch::<m![{ Symbol<Segment<R>> }], m![1 # 8]>()
+                .collect::<m![{ Symbol<Segment<R>> }], m![1 # 8]>()
                 .vector_init()
                 .vector_intra_slice_tag(TagMode::Zero)
                 .vector_fxp(FxpBinaryOp::SubFxp, value)
@@ -156,18 +184,18 @@ where
         let masked = |device: &mut Device,
                       d: &Cells<R, Chips>,
                       value: &SegmentOperand<R, Chips>|
-         -> Rows<R, Chips> {
+         -> Sums<R, Chips> {
             device
                 .main
                 .begin(d.view())
-                .fetch::<m![R, { Symbol<Segment<R>> }], m![1 # 8]>()
-                .collect::<m![R, { Symbol<Segment<R>> }], m![1 # 8]>()
+                .fetch::<m![{ Symbol<Segment<R>> }], m![1 # 8]>()
+                .collect::<m![{ Symbol<Segment<R>> }], m![1 # 8]>()
                 .vector_init()
                 .vector_intra_slice_tag(TagMode::Zero)
                 .vector_fxp(FxpBinaryOp::ArithRightShift, 31)
                 .vector_fxp(FxpBinaryOp::MulInt, value)
                 .vector_narrow_trim::<m![1 # 4]>()
-                .vector_intra_slice_reduce::<Segment<R>, m![R], m![1 # 4]>(
+                .vector_intra_slice_reduce::<Segment<R>, m![1], m![1 # 4]>(
                     IntraSliceReduceOpI32::AddSat,
                 )
                 .vector_widen_pad::<m![1 # 8]>()
@@ -175,22 +203,68 @@ where
                 .commit_trim::<m![1 # 8]>()
                 .commit()
         };
-        // Each row's value of the segment that holds it, from the two masked sums.
+        // Each row's value of the segment that holds it, from the two masked sums, a row a flit
+        // of one slice as the steps after the grid take their rows.
         let select = |device: &mut Device,
-                      (starts, ends): (&Rows<R, Chips>, &Rows<R, Chips>)|
+                      (starts, ends): (&Sums<R, Chips>, &Sums<R, Chips>)|
          -> Rows<R, Chips> {
-            let ends = row_operand(device, ends);
-            device
+            let ends = scalar::register(device, ends);
+            let selected: Sums<R, Chips> = device
                 .main
                 .begin(starts.view())
-                .fetch::<m![R], m![1 # 8]>()
-                .collect::<m![R], m![1 # 8]>()
+                .fetch::<m![1], m![1 # 8]>()
+                .collect::<m![1], m![1 # 8]>()
                 .vector_init()
                 .vector_intra_slice_tag(TagMode::Zero)
                 .vector_fxp(FxpBinaryOp::SubFxp, &ends)
                 .vector_final()
                 .commit_trim::<m![1 # 8]>()
-                .commit()
+                .commit();
+            let mut rows = Rows::<R, Chips>::new();
+            selected
+                .view()
+                .to_dm_view(&mut device.tdma, rows.view_mut());
+            rows
+        };
+        // Each row's value moved into its lane of its group's packet, so a store writes whole HBM
+        // cells: stored a row a cell, the writes into one cell serialize.
+        let packed = |device: &mut Device,
+                      places: &DmTensor<i32, Chips, Cluster, Slices, Places<R>>,
+                      rows: &Rows<R, Chips>|
+         -> HbmTensor<i32, Chips, m![R]> {
+            // SAFETY: a regroup of the rows into groups of eight, in order.
+            let rows = unsafe {
+                rows.view()
+                    .reshape::<Chips, Cluster, Slices, m![{ Members<R> }, 1 # 8]>()
+            };
+            let rows: MemberOperand<R, Chips> = device
+                .sub
+                .begin(rows)
+                .fetch::<Members<R>, m![1 # 8]>()
+                .collect::<Members<R>, m![1 # 8]>()
+                .to_vrf();
+            let packets: Grouped<R, Chips> = device
+                .main
+                .begin(places.view())
+                .fetch::<Members<R>, m![PacketLane]>()
+                .collect::<Members<R>, m![PacketLane]>()
+                .vector_init()
+                .vector_intra_slice_tag(TagMode::Zero)
+                .vector_fxp(FxpBinaryOp::MulInt, &rows)
+                .vector_narrow_split::<m![{ Members<R> }, PacketLane / 4], m![PacketLane % 4]>()
+                .vector_intra_slice_reduce::<
+                    RowLane,
+                    m![{ Symbol<RowGroup<R>> }, PacketLane / 4],
+                    m![PacketLane % 4],
+                >(IntraSliceReduceOpI32::AddSat)
+                .vector_widen_concat::<m![{ Symbol<RowGroup<R>> }], m![PacketLane]>()
+                .vector_final()
+                .commit_trim::<m![PacketLane]>()
+                .commit();
+            // SAFETY: lane `l` of group `g`'s packet holds row `8 g + l`, the rows in order.
+            let packets: DmTensor<i32, Chips, Cluster, Slices, m![R]> =
+                unsafe { packets.reshape() };
+            packets.to_hbm(&mut device.tdma)
         };
         // A field a flit in HBM first: a DMA into data memory moves whole eight-byte cells.
         let mut padded: HbmTensor<i32, Chips, m![Fields, { Symbol<Segment<R>> }, 1 # 8]> =
@@ -215,7 +289,7 @@ where
             i32,
             Chips,
             Cluster,
-            Slices,
+            RowSlices<R>,
             m![{ Symbol<Segment<R>> }, 1 # 8],
         > = device
             .main
@@ -254,6 +328,8 @@ where
             select(device, (&starts, &ends))
         };
         let iota: Rows<R, Chips> = self.iota.borrow().to_dm(&mut device.tdma);
+        let places: DmTensor<i32, Chips, Cluster, Slices, Places<R>> =
+            self.places.borrow().to_dm(&mut device.tdma);
         let positions: Rows<R, Chips> = device
             .main
             .begin(iota.view())
@@ -310,7 +386,7 @@ where
             .vector_final()
             .commit_trim::<m![1 # 8]>()
             .commit();
-        let pairs: HbmTensor<i32, Chips, m![R]> = pairs.to_hbm(&mut device.tdma);
+        let pairs = packed(device, &places, &pairs);
         // SAFETY: the flat table holds whole window rows, a multiple of four entries.
         let blocks = unsafe { blocks.view().reshape::<Chips, m![B / 4, Quad]>() };
         let ids: DmTensor<i32, Chips, Cluster, Slices, m![R, Quad # 8]> = blocks
@@ -379,10 +455,10 @@ where
             .commit_trim::<m![1 # 8]>()
             .commit();
         Logical {
-            positions: positions.to_hbm(&mut device.tdma),
-            slots: slots.to_hbm(&mut device.tdma),
-            lengths: lengths.to_hbm(&mut device.tdma),
-            tables: tables.to_hbm(&mut device.tdma),
+            positions: packed(device, &places, &positions),
+            slots: packed(device, &places, &slots),
+            lengths: packed(device, &places, &lengths),
+            tables: packed(device, &places, &tables),
         }
     }
 }

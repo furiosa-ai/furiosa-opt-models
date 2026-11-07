@@ -278,7 +278,7 @@ impl<
 > Op<&'x Live<gqa::Attended<Rows, KvHeads, Groups, Head>, Rows>>
     for BlockScaled<QWidth, Hidden, f8e4m3, f32, m![Hidden, 1 # 8], (), Chip, K, V>
 where
-    K: Borrow<HbmTensor<f8e4m3, Chip, m![Hidden, QWidth]>>,
+    K: Borrow<HbmTensor<f8e4m3, Chip, linear::fp8::Codes<QWidth, Hidden>>>,
     V: Borrow<HbmTensor<f32, Chip, m![Hidden, 1 # 8]>>,
 {
     type Output = Live<Spread<Hidden, Rows>, Rows>;
@@ -290,6 +290,41 @@ where
     ) -> Self::Output {
         let rows = read::<QWidth, _, _, _, _>(input);
         project(&linear::Affine::new(self, ()), device, rows)
+    }
+}
+
+/// The same rows through the channel-scaled weight as it landed.
+impl<
+    'x,
+    Hidden: AxisName,
+    QWidth: AxisName,
+    Rows: AxisName,
+    KvHeads: AxisName,
+    Groups: AxisName,
+    Head: AxisName,
+    K,
+    V,
+    L,
+>
+    Op<(
+        L,
+        &'x Live<gqa::Attended<Rows, KvHeads, Groups, Head>, Rows>,
+    )> for BlockScaled<QWidth, Hidden, f8e4m3, f32, m![Hidden, 1 # 8], (), Chip, K, V>
+where
+    L: linear::Slabs<Chip, In = QWidth, Out = Hidden, Stored = f8e4m3>,
+{
+    type Output = Live<Spread<Hidden, Rows>, Rows>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (landed, input): (
+            L,
+            &'x Live<gqa::Attended<Rows, KvHeads, Groups, Head>, Rows>,
+        ),
+    ) -> Self::Output {
+        let rows = read::<QWidth, _, _, _, _>(input);
+        project(&linear::Affine::new(landed, ()), device, rows)
     }
 }
 
@@ -362,7 +397,7 @@ where
     QWidth: AxisName,
     Rows: AxisName,
     KvHeads: AxisName,
-    Matrix: linear::Matrix<Chip, In = QWidth, Out = Hidden>,
+    Matrix: linear::Slabs<Chip, In = QWidth, Out = Hidden>,
 {
     let group = |at| {
         rows.clone().tile::<Layout<Rows>::Groups, 1, m![

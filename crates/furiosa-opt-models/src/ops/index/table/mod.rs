@@ -2,11 +2,11 @@
 //! a paged history, which a gather or scatter and the attention over the history read.
 
 use crate::Op;
-use crate::ops::attention::gqa::Cache;
+use crate::ops::attention::gqa::{Cache, Wrapped};
 use crate::ops::index::gather::RowStorage;
 use crate::ops::linear::Groups;
 use crate::tensor::cache::Block;
-use crate::tensor::scalar::{self, Value};
+use crate::tensor::scalar::{self, Packet, Value};
 use crate::tensor::{
     axis::{Lanes, Single},
     live::Live,
@@ -201,10 +201,26 @@ impl<R: AxisName> AxisName for Segment<R> {
 
 axes![Quad = 4];
 
+/// The lane groups of eight rows that an `R`-row step fills, an axis apart from its rows.
+#[derive(Clone, Debug)]
+pub struct RowGroup<R>(PhantomData<R>);
+
+impl<R: AxisName> AxisName for RowGroup<R> {
+    const NAME: Ident = Ident::new("RowGroup");
+    const SIZE: usize = {
+        assert!(R::SIZE.is_multiple_of(RowLane::SIZE));
+        R::SIZE / RowLane::SIZE
+    };
+}
+
+axes![RowLane = 8, PacketLane = 8];
+
 /// One value per row and segment, a value a flit.
 pub type Grid<R> = m![R, { Symbol<Segment<R>> }, 1 # 8];
 /// Four lanes a row, a row a flit.
 pub type Pairs<R> = m![R, Quad # 8];
+/// Each row's lane of its group's packet, a row a flit: one in that lane, zero in the others.
+pub type Places<R> = m![{ Symbol<RowGroup<R>> }, RowLane, PacketLane];
 
 /// The segment words: first row, rows, cached tokens, first block ID and block IDs.
 pub(crate) const START: usize = 0;
@@ -236,15 +252,28 @@ type Table<Chips, W, R, D = i32> = DmTensor<D, Chips, Cluster, Slices, m![W, { P
 /// A vector as a vector-engine operand.
 type VectorOperand<Chips, R> = VrfTensor<i32, Chips, Cluster, Slices, Packets<R>>;
 
+/// Tokens of a block pair, which a row's first window starts on a multiple of: its first table
+/// entry then lies 8-byte aligned, and the slots before its first visible token fill a pair.
+const PAIR: usize = 2 * Block::SIZE;
+
 /// What the rows' visible histories span: per-window block counts, the windows after the first,
-/// and each row's first window token, span from it and lowest visible token past it.
+/// the windows' ring, and each row's first window token, span from it, lowest visible token past it
+/// and tokens past the ring.
+///
+/// The windows a row's history needs are a ring of whole windows, its window rounded up to them: a
+/// span longer than the ring wraps its tokens past it into the first window's slots before the
+/// lowest visible token, which are at least as many.
 pub(crate) struct Extents<R: AxisName, W: AxisName, Chips: M = Chip> {
     pub(crate) counts: BlockCounts<R, W, Chips>,
     pub(crate) rest: Value<Chips>,
     spanned: Value<Chips>,
+    ring: Packet<i32, Chips>,
     first: Vector<R, i32, Chips>,
     span: Vector<R, i32, Chips>,
     lower: Vector<R, i32, Chips>,
+    wrapped: Vector<R, i32, Chips>,
+    /// Whether any row wraps.
+    pub(crate) wraps: Value<Chips>,
 }
 
 impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
@@ -256,8 +285,17 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
         length: &Vector<R, i32, Chips>,
     ) -> Self {
         let window = scalar::packet(device, window);
+        let ring = scalar::map(device, &window, |window| {
+            window
+                .vector_fxp(FxpBinaryOp::AddFxp, const { Cache::SIZE as i32 - 1 })
+                .vector_fxp(
+                    FxpBinaryOp::LogicRightShift,
+                    const { Cache::SIZE.ilog2() as i32 },
+                )
+                .vector_fxp(FxpBinaryOp::LeftShift, const { Cache::SIZE.ilog2() as i32 })
+        });
         let window = scalar::register(device, &window);
-        // The lowest visible token, then the first token of the window that holds it.
+        // The lowest visible token, then the first token of the block pair that holds it.
         let low: Vector<R, i32, Chips> = device
             .main
             .begin(length.view())
@@ -277,11 +315,8 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
             .collect::<m![R / ({ Lane<R> })], m![R % ({ Lane<R> }) # 8]>()
             .vector_init()
             .vector_intra_slice_tag(TagMode::Zero)
-            .vector_fxp(
-                FxpBinaryOp::LogicRightShift,
-                const { Cache::SIZE.ilog2() as i32 },
-            )
-            .vector_fxp(FxpBinaryOp::LeftShift, const { Cache::SIZE.ilog2() as i32 })
+            .vector_fxp(FxpBinaryOp::LogicRightShift, const { PAIR.ilog2() as i32 })
+            .vector_fxp(FxpBinaryOp::LeftShift, const { PAIR.ilog2() as i32 })
             .vector_final()
             .commit_trim::<m![R % ({ Lane<R> }) # 8]>()
             .commit();
@@ -308,12 +343,51 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
             .vector_final()
             .commit_trim::<m![R % ({ Lane<R> }) # 8]>()
             .commit();
+        let ring_operand = scalar::register(device, &ring);
+        let wrapped: Vector<R, i32, Chips> = device
+            .main
+            .begin(span.view())
+            .fetch::<m![R / ({ Lane<R> })], m![R % ({ Lane<R> }) # 8]>()
+            .collect::<m![R / ({ Lane<R> })], m![R % ({ Lane<R> }) # 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_fxp(FxpBinaryOp::SubFxp, &ring_operand)
+            .vector_clip(ClipBinaryOpI32::Max, 0)
+            .vector_final()
+            .commit_trim::<m![R % ({ Lane<R> }) # 8]>()
+            .commit();
+        // The slots the ring holds of each row's span.
+        let kept: Vector<R, i32, Chips> = device
+            .main
+            .begin(span.view())
+            .fetch::<m![R / ({ Lane<R> })], m![R % ({ Lane<R> }) # 8]>()
+            .collect::<m![R / ({ Lane<R> })], m![R % ({ Lane<R> }) # 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_clip(ClipBinaryOpI32::Min, &ring_operand)
+            .vector_final()
+            .commit_trim::<m![R % ({ Lane<R> }) # 8]>()
+            .commit();
+        let wraps: DmTensor<i32, Chips, Cluster, Slices, m![R, 1 # 8]> =
+            cells(device, &wrapped).to_dm(&mut device.tdma);
+        let wraps: DmTensor<i32, Chips, Cluster, Slices, m![1 # 8]> = device
+            .main
+            .begin(wraps.view())
+            .fetch::<m![R], m![1 # 8]>()
+            .collect::<m![R], m![1 # 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_trim::<m![1 # 4]>()
+            .vector_intra_slice_reduce::<R, m![1], m![1 # 4]>(IntraSliceReduceOpI32::Max)
+            .vector_widen_pad::<m![1 # 8]>()
+            .vector_clip(ClipBinaryOpI32::Min, 1)
+            .vector_final()
+            .commit_trim::<m![1 # 8]>()
+            .commit();
         // The windows after the first that the longest span covers, reduced over one row a flit;
         // a row with no span covers none.
-        let spans = rows(device, &span);
-        let spans: HbmTensor<i32, Chips, m![R, 1 # 8]> = spans.to_hbm(&mut device.tdma);
         let spans: DmTensor<i32, Chips, Cluster, Slices, m![R, 1 # 8]> =
-            spans.to_dm(&mut device.tdma);
+            cells(device, &kept).to_dm(&mut device.tdma);
         let rest: DmTensor<i32, Chips, Cluster, Slices, m![1 # 8]> = device
             .main
             .begin(spans.view())
@@ -335,9 +409,9 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
         let spanned = scalar::map(device, &rest, |rest| {
             rest.vector_fxp(FxpBinaryOp::AddFxp, 1)
         });
-        // count = clip(span - 512 w, 0, 512) rounded up to blocks.
+        // count = clip(kept - 512 w, 0, 512) rounded up to blocks.
         let starts: Table<Chips, W, R> = starts.to_dm(&mut device.tdma);
-        let span_operand = operand(device, &span);
+        let span_operand = operand(device, &kept);
         let counts: Table<Chips, W, R> = device
             .main
             .begin(starts.view())
@@ -371,9 +445,12 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
             counts: counts.to_hbm(&mut device.tdma),
             rest: rest.to_hbm(&mut device.tdma),
             spanned: spanned.to_hbm(&mut device.tdma),
+            ring,
             first,
             span,
             lower,
+            wrapped,
+            wraps: wraps.to_hbm(&mut device.tdma),
         }
     }
 }
@@ -382,8 +459,9 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
 type Entries<Chips, R> = DmTensor<i32, Chips, Cluster, m![R # 256], m![BlockIndex]>;
 
 impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
-    /// Each row's pool-block byte offsets for the windows the rows span: its table's window rows
-    /// from its first window, `bytes` a block; a window past the table reads its last row.
+    /// Each row's pool-block byte offsets for the windows the rows span, a window's rows together:
+    /// its table's window rows from its first window, `bytes` a block; a window past the table
+    /// reads its last row.
     pub(crate) fn table<B: AxisName>(
         &self,
         device: &mut Device,
@@ -393,7 +471,7 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
         ),
         starts: &HbmTensor<i32, Chips, m![R]>,
         bytes: i32,
-    ) -> HbmTensor<i32, Chips, m![R, W, BlockIndex]> {
+    ) -> HbmTensor<i32, Chips, m![W, R, BlockIndex]> {
         let (first, spanned) = (&self.first, &self.spanned);
         let starts = vector(device, starts);
         let head: Vector<R, i32, Chips> = device
@@ -441,7 +519,7 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
             .vector_final()
             .commit_trim::<m![R % ({ Lane<R> }) # 8]>()
             .commit();
-        let mut output: HbmTensor<i32, Chips, m![R, W, BlockIndex]> = HbmTensor::new();
+        let mut output: HbmTensor<i32, Chips, m![W, R, BlockIndex]> = HbmTensor::new();
         for w in 0..spanned.extent::<m![W]>() {
             let mut index: HbmTensor<i32, Chips, m![R]> = HbmTensor::new();
             offsets
@@ -473,21 +551,169 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
                 &mut device.tdma,
                 output
                     .view_mut()
-                    .tile::<m![W], 1, m![R, W = 1 #{!} W, BlockIndex]>(w),
+                    .tile::<m![W], 1, m![W = 1 #{!} W, R, BlockIndex]>(w),
             );
         }
         output
     }
 }
 
-/// One window's token slots of every row, on the 64 slices a window spans.
-type WindowSlots<Chips, R> = DmTensor<f32, Chips, Cluster, m![Cache / 8 # 256], m![R, Cache % 8]>;
-/// One value per row on each of those slices, the per-row operand of a pass over [`WindowSlots`].
-type PerRow<Chips, R> = VrfTensor<f32, Chips, Cluster, m![Cache / 8 # 256], m![R, 1 # 8]>;
+impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
+    /// How many tokens each row holds past its ring.
+    pub(crate) fn wrapped(&self, device: &mut Device) -> HbmTensor<i32, Chips, m![R]> {
+        rows(device, &self.wrapped)
+    }
+
+    /// The pool byte offset of each token row past each row's ring into `offsets`, from the two
+    /// entries past the ring in its table at `starts`, `bytes` a block and `row` a token row; a
+    /// window slot's middle `t + 1/2` in `slots` places token `t` of a block.
+    pub(crate) fn wrap<B: AxisName>(
+        &self,
+        device: &mut Device,
+        (blocks, slots): (
+            &HbmTensor<i32, Chips, m![B]>,
+            &HbmTensor<f32, Chips, m![R, Cache]>,
+        ),
+        (starts, (bytes, row)): (&HbmTensor<i32, Chips, m![R]>, (i32, i32)),
+        offsets: &mut Wrapped<R, Chips>,
+    ) {
+        let ring = scalar::map(device, &self.ring, |ring| {
+            ring.vector_fxp(
+                FxpBinaryOp::LogicRightShift,
+                const { Block::SIZE.ilog2() as i32 },
+            )
+        });
+        let ring = scalar::register(device, &ring);
+        // The first block past the ring.
+        let head: Vector<R, i32, Chips> = device
+            .main
+            .begin(self.first.view())
+            .fetch::<m![R / ({ Lane<R> })], m![R % ({ Lane<R> }) # 8]>()
+            .collect::<m![R / ({ Lane<R> })], m![R % ({ Lane<R> }) # 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_fxp(
+                FxpBinaryOp::LogicRightShift,
+                const { Block::SIZE.ilog2() as i32 },
+            )
+            .vector_fxp(FxpBinaryOp::AddFxp, &ring)
+            .vector_final()
+            .commit_trim::<m![R % ({ Lane<R> }) # 8]>()
+            .commit();
+        let head = operand(device, &head);
+        let starts = vector(device, starts);
+        let index: Vector<R, i32, Chips> = device
+            .main
+            .begin(starts.view())
+            .fetch::<m![R / ({ Lane<R> })], m![R % ({ Lane<R> }) # 8]>()
+            .collect::<m![R / ({ Lane<R> })], m![R % ({ Lane<R> }) # 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_fxp(FxpBinaryOp::AddFxp, &head)
+            .vector_fxp(FxpBinaryOp::MulInt, const { size_of::<i32>() as i32 })
+            .vector_clip(ClipBinaryOpI32::Max, 0)
+            .vector_clip(
+                ClipBinaryOpI32::Min,
+                const { ((B::SIZE - BlockIndex::SIZE) * size_of::<i32>()) as i32 },
+            )
+            .vector_final()
+            .commit_trim::<m![R % ({ Lane<R> }) # 8]>()
+            .commit();
+        let index = rows(device, &index);
+        // SAFETY: the flat table is whole window rows in order.
+        let table = unsafe {
+            blocks
+                .view()
+                .reshape::<Chips, m![{ Symbol<TableRows<B>> }, BlockIndex]>()
+        };
+        let ids: Entries<Chips, R> = table
+            .gather::<m![{ Symbol<TableRows<B>> }], m![BlockIndex]>()
+            .by_byte_offsets(&index)
+            .to_dm(&mut device.tdma);
+        let scaled: Entries<Chips, R> = device
+            .main
+            .begin(ids.view())
+            .fetch::<m![BlockIndex / 8], m![BlockIndex % 8]>()
+            .collect::<m![BlockIndex / 8], m![BlockIndex % 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_fxp(FxpBinaryOp::MulInt, bytes)
+            .vector_final()
+            .commit_trim::<m![BlockIndex % 8]>()
+            .commit();
+        let scaled: HbmTensor<i32, Chips, m![R, BlockIndex]> = scaled.to_hbm(&mut device.tdma);
+        let slots: DmTensor<f32, Chips, Cluster, m![R # 256], m![Cache % ({ Symbol<Block> })]> =
+            slots
+                .view()
+                .tile::<m![Cache / ({ Symbol<Block> })], 1, m![
+                    R,
+                    Cache / ({ Symbol<Block> }) = 1 # (Cache / ({ Symbol<Block> })),
+                    Cache % ({ Symbol<Block> })
+                ]>(0)
+                .to_dm(&mut device.tdma);
+        let tokens: DmTensor<i32, Chips, Cluster, m![R # 256], m![Cache % ({ Symbol<Block> })]> =
+            device
+                .main
+                .begin(slots.view())
+                .fetch::<m![Cache % ({ Symbol<Block> }) / 8], m![Cache % 8]>()
+                .collect::<m![Cache % ({ Symbol<Block> }) / 8], m![Cache % 8]>()
+                .vector_init()
+                .vector_intra_slice_tag(TagMode::Zero)
+                .vector_narrow_split::<
+                    m![Cache % ({ Symbol<Block> }) / 8, Cache % 8 / 4],
+                    m![Cache % 4],
+                >()
+                .vector_fp_binary(FpBinaryOp::SubF, 0.5)
+                .vector_widen_concat::<m![Cache % ({ Symbol<Block> }) / 8], m![Cache % 8]>()
+                .vector_fp_to_fxp(31)
+                .vector_final()
+                .commit_trim::<m![Cache % 8]>()
+                .commit();
+        // SAFETY: a block's tokens take the first `Block` slots of a window, in order.
+        let tokens: DmTensor<i32, Chips, Cluster, m![R # 256], m![Block]> =
+            unsafe { tokens.reshape() };
+        for pair in 0..2 {
+            // A row's block in a cell of its own: writes into one HBM cell serialize.
+            let mut block: HbmTensor<i32, Chips, m![R, 1 # 8]> = HbmTensor::new();
+            scaled
+                .view()
+                .tile::<m![BlockIndex], 1, m![R, BlockIndex = 1 # BlockIndex]>(pair)
+                .to_hbm_view(&mut device.tdma, block.view_mut());
+            let block: RowValues<Chips, R> = block.to_dm(&mut device.tdma);
+            let block = scalar::register(device, &block);
+            let run: DmTensor<i32, Chips, Cluster, m![R # 256], m![Block]> = device
+                .main
+                .begin(tokens.view())
+                .fetch::<m![Block / 8], m![Block % 8]>()
+                .collect::<m![Block / 8], m![Block % 8]>()
+                .vector_init()
+                .vector_intra_slice_tag(TagMode::Zero)
+                .vector_fxp(FxpBinaryOp::MulInt, row)
+                .vector_fxp(FxpBinaryOp::AddFxp, &block)
+                .vector_final()
+                .commit_trim::<m![Block % 8]>()
+                .commit();
+            run.view().to_hbm_view(
+                &mut device.tdma,
+                offsets
+                    .view_mut()
+                    .tile::<m![BlockIndex % 2], 1, m![R, BlockIndex % 2 = 1 #{!} 2, Block]>(pair),
+            );
+        }
+    }
+}
+
+/// One window's token slots of a row on the row's slice, so a window's mask stores a row a run.
+type RowSlots<Chips, R> = DmTensor<f32, Chips, Cluster, m![R # 256], m![Cache]>;
+/// One value of a row on the row's slice.
+type RowValues<Chips, R, D = i32> = DmTensor<D, Chips, Cluster, m![R # 256], m![1 # 8]>;
+/// One value of a row on the row's slice, the per-row operand of a pass over [`RowSlots`].
+type PerRow<Chips, R, D = f32> = VrfTensor<D, Chips, Cluster, m![R # 256], m![1 # 8]>;
 
 impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
-    /// The mask of every window the rows span: 0 where a row's token `512 w + t` lies in
-    /// `[lower, span)` from its first window, padding elsewhere; later windows stay unwritten.
+    /// The mask of every window the rows span: 0 where a row's token `512 w + t`, taken cyclically
+    /// over the ring, lies in `[lower, span)` from its first window, padding elsewhere; later
+    /// windows stay unwritten.
     pub(crate) fn bias(
         &self,
         device: &mut Device,
@@ -510,8 +736,22 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
             .vector_final()
             .commit_trim::<m![R % ({ Lane<R> }) # 8]>()
             .commit();
-        let width = rows(device, &width);
         let width = per_row(device, &width);
+        let ring = scalar::register(device, &extents.ring);
+        let rings: Vector<R, f32, Chips> = device
+            .main
+            .begin(extents.span.view())
+            .fetch::<m![R / ({ Lane<R> })], m![R % ({ Lane<R> }) # 8]>()
+            .collect::<m![R / ({ Lane<R> })], m![R % ({ Lane<R> }) # 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_fxp(FxpBinaryOp::MulInt, 0)
+            .vector_fxp(FxpBinaryOp::AddFxp, &ring)
+            .vector_fxp_to_fp(31)
+            .vector_final()
+            .commit_trim::<m![R % ({ Lane<R> }) # 8]>()
+            .commit();
+        let rings = per_row(device, &rings);
         // Window w's first visible token of each row, relative to the row's first window.
         let starts: Table<Chips, W, R> = starts.to_dm(&mut device.tdma);
         let firsts: Table<Chips, W, R, f32> = device
@@ -526,51 +766,76 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
             .vector_final()
             .commit_trim::<m![R % ({ Lane<R> }) # 8]>()
             .commit();
-        let firsts: HbmTensor<f32, Chips, m![W, { Packets<R> }]> = firsts.to_hbm(&mut device.tdma);
-        let firsts: HbmTensor<f32, Chips, m![W, R]> = firsts.to_hbm(&mut device.tdma);
-        let slots: WindowSlots<Chips, R> = slots.to_dm(&mut device.tdma);
+        let slots: RowSlots<Chips, R> = slots.to_dm(&mut device.tdma);
         let mut output: HbmTensor<f32, Chips, m![R, W, Cache]> = HbmTensor::new();
         for w in 0..extents.spanned.extent::<m![W]>() {
-            let mut start: HbmTensor<f32, Chips, m![R]> = HbmTensor::new();
+            // A row a cell first, so the window's starts land on the rows' slices as whole cells.
+            let mut start: HbmTensor<f32, Chips, m![R, 1 # 8]> = HbmTensor::new();
             firsts
                 .view()
-                .tile::<m![W], 1, m![W = 1 # W, R]>(w)
+                .tile::<m![W], 1, m![W = 1 # W, { Packets<R> }]>(w)
                 .to_hbm_view(&mut device.tdma, start.view_mut());
-            let start = per_row(device, &start);
+            let start: RowValues<Chips, R, f32> = start.to_dm(&mut device.tdma);
+            let start = scalar::register(device, &start);
             // u (u - width) < 0 for u = t + 1/2 - start exactly where token t is visible.
-            let shifted: WindowSlots<Chips, R> = device
+            let shifted: RowSlots<Chips, R> = device
                 .main
                 .begin(slots.view())
-                .fetch::<m![R], m![Cache % 8]>()
-                .collect::<m![R], m![Cache % 8]>()
+                .fetch::<m![Cache / 8], m![Cache % 8]>()
+                .collect::<m![Cache / 8], m![Cache % 8]>()
                 .vector_init()
                 .vector_intra_slice_tag(TagMode::Zero)
-                .vector_narrow_split::<m![R, Cache % 8 / 4], m![Cache % 4]>()
+                .vector_narrow_split::<m![Cache / 8, Cache % 8 / 4], m![Cache % 4]>()
                 .vector_fp_binary(FpBinaryOp::SubF, &start)
-                .vector_widen_concat::<m![R], m![Cache % 8]>()
+                .vector_widen_concat::<m![Cache / 8], m![Cache % 8]>()
                 .vector_final()
                 .commit_trim::<m![Cache % 8]>()
                 .commit();
-            let product: WindowSlots<Chips, R> = device
+            // A slot before the lowest visible token holds one a ring later.
+            let shifted: RowSlots<Chips, R> = device
                 .main
                 .begin(shifted.view())
-                .fetch::<m![R], m![Cache % 8]>()
-                .collect::<m![R], m![Cache % 8]>()
+                .fetch::<m![Cache / 8], m![Cache % 8]>()
+                .collect::<m![Cache / 8], m![Cache % 8]>()
+                .vector_init()
+                .vector_intra_slice_tag(TagMode::Comparison([Cmp::Less(0.0f32); 4]))
+                .vector_narrow_split::<m![Cache / 8, Cache % 8 / 4], m![Cache % 4]>()
+                .vector_fp_binary(
+                    FpBinaryOp::AddF,
+                    Branched::rf(
+                        TagGuard::matches([
+                            BitReq::One,
+                            BitReq::Ignore,
+                            BitReq::Ignore,
+                            BitReq::Ignore,
+                        ]),
+                        &rings,
+                    ),
+                )
+                .vector_widen_concat::<m![Cache / 8], m![Cache % 8]>()
+                .vector_final()
+                .commit_trim::<m![Cache % 8]>()
+                .commit();
+            let product: RowSlots<Chips, R> = device
+                .main
+                .begin(shifted.view())
+                .fetch::<m![Cache / 8], m![Cache % 8]>()
+                .collect::<m![Cache / 8], m![Cache % 8]>()
                 .vector_init()
                 .vector_intra_slice_tag(TagMode::Zero)
-                .vector_narrow_split::<m![R, Cache % 8 / 4], m![Cache % 4]>()
+                .vector_narrow_split::<m![Cache / 8, Cache % 8 / 4], m![Cache % 4]>()
                 .vector_stash()
                 .vector_fp_binary(FpBinaryOp::SubF, &width)
                 .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), Stash)
-                .vector_widen_concat::<m![R], m![Cache % 8]>()
+                .vector_widen_concat::<m![Cache / 8], m![Cache % 8]>()
                 .vector_final()
                 .commit_trim::<m![Cache % 8]>()
                 .commit();
-            let masked: WindowSlots<Chips, R> = device
+            let masked: RowSlots<Chips, R> = device
                 .main
                 .begin(product.view())
-                .fetch::<m![R], m![Cache % 8]>()
-                .collect::<m![R], m![Cache % 8]>()
+                .fetch::<m![Cache / 8], m![Cache % 8]>()
+                .collect::<m![Cache / 8], m![Cache % 8]>()
                 .vector_init()
                 .vector_intra_slice_tag(TagMode::Comparison([Cmp::Less(0.0f32); 4]))
                 .vector_logic(LogicBinaryOpF32::BitAnd, 0.0f32)
@@ -630,8 +895,15 @@ fn rows<R: AxisName, D: MaterializableScalar, Chips: M>(
     device: &mut Device,
     vector: &Vector<R, D, Chips>,
 ) -> HbmTensor<D, Chips, m![R]> {
-    let padded: HbmTensor<D, Chips, Packets<R>> = vector.to_hbm(&mut device.tdma);
-    padded.to_hbm(&mut device.tdma)
+    vector.to_hbm(&mut device.tdma)
+}
+
+/// The rows of a padded vector, a row a cell: a landing into data memory moves whole cells.
+fn cells<R: AxisName, D: MaterializableScalar, Chips: M>(
+    device: &mut Device,
+    vector: &Vector<R, D, Chips>,
+) -> HbmTensor<D, Chips, m![R, 1 # 8]> {
+    vector.to_hbm(&mut device.tdma)
 }
 
 fn operand<R: AxisName, Chips: M>(
@@ -691,20 +963,13 @@ pub(crate) fn live<R: AxisName, Chips: M>(
     vector(device, &output)
 }
 
-/// A per-row value over the slots of every slice a window spans.
-fn per_row<R: AxisName, Chips: M>(
+/// A padded vector's value of each row on the row's slice.
+fn per_row<R: AxisName, D: VeScalar + MaterializableScalar, Chips: M>(
     device: &mut Device,
-    values: &HbmTensor<f32, Chips, m![R]>,
-) -> PerRow<Chips, R> {
-    let padded: HbmTensor<f32, Chips, m![R, 1 # 8]> = values.to_hbm(&mut device.tdma);
-    let rows: DmTensor<f32, Chips, Cluster, m![Cache / 8 # 256], m![R, 1 # 8]> =
-        padded.to_dm(&mut device.tdma);
-    device
-        .sub
-        .begin(rows.view())
-        .fetch::<m![R], m![1 # 8]>()
-        .collect::<m![R], m![1 # 8]>()
-        .to_vrf()
+    vector: &Vector<R, D, Chips>,
+) -> PerRow<Chips, R, D> {
+    let rows: RowValues<Chips, R, D> = cells(device, vector).to_dm(&mut device.tdma);
+    scalar::register(device, &rows)
 }
 
 /// Each row's token position as F32, repeated over its rotated coordinates: one pass over a row a
@@ -764,7 +1029,7 @@ mod tests {
     use super::*;
     use crate::ops::attention::Attention;
     use crate::ops::attention::geometry::QueryGroups;
-    use crate::ops::attention::gqa::{self, Paged};
+    use crate::ops::attention::gqa::{self, Paged, RowMajor};
     use crate::ops::attention::tests::{Blocks, Chunks, Head, KvHeads};
     use crate::specialize::attention::Strategy;
     use crate::tensor::axis::Eight;
@@ -785,17 +1050,21 @@ mod tests {
         device: &mut Device,
         query: &PrefixQuery<Eight>,
         blocks: &Blocks,
-        table: &HbmTensor<i32, Chip, m![Eight, Chunks, BlockIndex]>,
+        table: &HbmTensor<i32, Chip, m![Chunks, Eight, BlockIndex]>,
         lengths: &BlockCounts<Eight, Chunks>,
         bias: &Bias<Eight>,
         rest: &Value,
         output: &mut PrefixOutput<Eight>,
     ) {
         let query: gqa::Heads<Eight, KvHeads, PrefixGroups, Head> = query.to_dm(&mut device.tdma);
+        let rows = RowMajor::new::<bf16>(&mut *device, (table, lengths), Live::all());
         let history = Paged {
             blocks,
             table,
             lengths,
+            rows: &rows,
+            scales: &(),
+            wrap: (),
         };
         Attention::<
             PhantomData<(KvHeads, PrefixGroups, Head)>,
@@ -895,15 +1164,17 @@ mod tests {
             .to_hbm(&mut device.pdma)
             .await
             .unwrap();
-        let table = HostTensor::<i32, m![Eight, Chunks, BlockIndex]>::from_vec(
-            (0..Eight::SIZE).flat_map(|row| {
-                (0..Chunks::SIZE * BlockIndex::SIZE).map(move |entry| {
-                    let block = if entry < (Chunks::SIZE - 1) * BlockIndex::SIZE {
-                        row
-                    } else {
-                        blocks - (row + 1) * BlockIndex::SIZE + entry % BlockIndex::SIZE
-                    };
-                    i32::try_from(block * <Blocks>::BLOCK_STRIDE as usize).unwrap()
+        let table = HostTensor::<i32, m![Chunks, Eight, BlockIndex]>::from_vec(
+            (0..Chunks::SIZE).flat_map(|window| {
+                (0..Eight::SIZE).flat_map(move |row| {
+                    (0..BlockIndex::SIZE).map(move |entry| {
+                        let block = if window < Chunks::SIZE - 1 {
+                            row
+                        } else {
+                            blocks - (row + 1) * BlockIndex::SIZE + entry
+                        };
+                        i32::try_from(block * <Blocks>::BLOCK_STRIDE as usize).unwrap()
+                    })
                 })
             }),
         )

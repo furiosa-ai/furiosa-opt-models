@@ -1,6 +1,10 @@
 use super::partition::Geometry;
-use super::{Attended, Cache, Paged, Windowed, shard};
+use super::{
+    Attended, Cache, Landed, LaneWindows, Paged, WindowRow, WindowRows, WindowTiles, Windowed,
+    shard,
+};
 use crate::ops::index::table::{BlockCounts, BlockIndex};
+use crate::specialize::attention;
 use crate::tensor::cache::{Block, Blocks, KeyValue};
 use crate::tensor::live::Live;
 use crate::tensor::scalar::Value;
@@ -35,18 +39,129 @@ pub struct Read<Windows: AxisName, Chips: M = Chip> {
     pub rest: HbmTensor<i32, Chips, m![1]>,
 }
 
-/// The pool blocks each row of an envelope attends over, as the block-indexed history of a step.
+/// The pool blocks each row of an envelope attends over, as the block-indexed history of a step;
+/// `W` is the tokens past each row's last window, as a launch or a paging holds them ([`Wrapping`]).
 #[derive(DeviceSend)]
-pub struct Pages<Rows: AxisName, Windows: AxisName, Chips: M = Chip> {
-    /// Byte offsets of pool blocks, per row and window. Every entry must be readable, including
-    /// rounded overfetch.
-    pub table: HbmTensor<i32, Chips, m![Rows, Windows, BlockIndex]>,
+pub struct Pages<Rows: AxisName, Windows: AxisName, Chips: M = Chip, W = Wrap<Rows, Chips>> {
+    /// Byte offsets of pool blocks, per window and row: a window's rows lie together, as its
+    /// gather reads them. Every entry must be readable, including rounded overfetch.
+    pub table: HbmTensor<i32, Chips, m![Windows, Rows, BlockIndex]>,
     /// Blocks read per row and window, including the block of the row's own token.
     pub lengths: BlockCounts<Rows, Windows, Chips>,
     /// Additive mask of each token: 0 for the visible prefix, padding past it.
     pub bias: HbmTensor<f32, Chips, m![Rows, Windows, Cache]>,
     /// Windows after the first, which every row attends over at least.
     pub rest: Value<Chips>,
+    /// The table and the lengths again, each row's windows together, which a pass that spreads
+    /// its lone row gathers.
+    pub rows: RowMajor<Rows, Windows, Chips>,
+    /// The tokens each row's history holds past its last window.
+    pub wrap: W,
+}
+
+type Table<Rows, Windows, Chips = Chip> = HbmTensor<i32, Chips, m![Windows, Rows, BlockIndex]>;
+type RowEntries<Rows, Windows, Chips = Chip> = HbmTensor<
+    i32,
+    Chips,
+    m![{ WindowRow<Rows, Windows> }, { Symbol<LaneWindows<Windows>> }, BlockIndex],
+>;
+type RowLengths<Rows, Windows, Chips = Chip> =
+    HbmTensor<i32, Chips, m![{ WindowRow<Rows, Windows> }, { Symbol<LaneWindows<Windows>> }]>;
+
+/// The block table and its lengths of the [`WindowRows`] rows that hold the last live row, each
+/// row's windows together where a row's windows fill its cluster's lanes ([`LaneWindows`]): the
+/// lanes of a pass that spreads its lone row, the last live one, a window a lane.
+#[derive(DeviceSend)]
+pub struct RowMajor<Rows: AxisName, Windows: AxisName, Chips: M = Chip> {
+    /// Byte offsets of pool blocks, per row and window.
+    pub table: RowEntries<Rows, Windows, Chips>,
+    /// Blocks read per row and window.
+    pub lengths: RowLengths<Rows, Windows, Chips>,
+}
+
+impl<Rows: AxisName, Windows: AxisName, Chips: M> RowMajor<Rows, Windows, Chips> {
+    /// The copy of the rows of `table` and its `lengths` that hold the last of the rows `live`,
+    /// whose windows' cells are `D`s; nothing is copied where no pass over such windows spreads
+    /// them.
+    pub fn new<D>(
+        device: &mut Device,
+        (table, lengths): (
+            &Table<Rows, Windows, Chips>,
+            &BlockCounts<Rows, Windows, Chips>,
+        ),
+        live: Live<(), Rows>,
+    ) -> Self {
+        let mut rows = Self {
+            table: HbmTensor::new(),
+            lengths: HbmTensor::new(),
+        };
+        if const { attention::spreads(Windows::SIZE, size_of::<D>()) } {
+            let last = (live.rows() - live.rows().min(1)) / WindowRows::<Windows>::SIZE;
+            // SAFETY: where a row's windows fill its cluster's lanes, its lane windows are all of
+            // its windows, in order.
+            let (copy, counts) = unsafe {
+                (
+                    rows.table
+                        .view_mut()
+                        .reshape::<Chips, m![{ WindowRow<Rows, Windows> }, Windows, BlockIndex]>(),
+                    rows.lengths
+                        .view_mut()
+                        .reshape::<Chips, m![{ WindowRow<Rows, Windows> }, Windows]>(),
+                )
+            };
+            (table.view())
+                .tile::<WindowTiles<Rows, Windows>, 1, m![
+                    Windows, { WindowTiles<Rows, Windows> } = 1 # ({ WindowTiles<Rows, Windows> }),
+                    { WindowRow<Rows, Windows> }, BlockIndex
+                ]>(last)
+                .to_hbm_view(&mut device.tdma, copy);
+            (lengths.view())
+                .tile::<WindowTiles<Rows, Windows>, 1, m![
+                    Windows, { WindowTiles<Rows, Windows> } = 1 # ({ WindowTiles<Rows, Windows> }),
+                    { WindowRow<Rows, Windows> }
+                ]>(last)
+                .to_hbm_view(&mut device.tdma, counts);
+        }
+        rows
+    }
+}
+
+/// Each row's tokens past its last window as the pool's token rows, in token order.
+pub type Wrapped<Rows, Chips = Chip> = HbmTensor<i32, Chips, m![Rows, BlockIndex % 2, Block]>;
+
+/// The tokens a row's history holds past its last window, which wrap into its first window's slots
+/// before its lowest visible token: the windows are a ring.
+#[derive(DeviceSend)]
+pub struct Wrap<Rows: AxisName, Chips: M = Chip> {
+    /// The byte offset of each one's row in the pool.
+    pub offsets: Wrapped<Rows, Chips>,
+    /// How many each row holds, at most its first window's slots before its lowest visible token.
+    pub counts: HbmTensor<i32, Chips, m![Rows]>,
+    /// Whether any row holds one.
+    pub any: Value<Chips>,
+}
+
+/// A [`Wrap`] with the times its tokens land, once if any row holds one, as a call's paging read
+/// it: the layers that attend over the call's pages read nothing more.
+pub type Counted<Rows, Chips = Chip> = (Wrap<Rows, Chips>, usize);
+
+/// The tokens past the rows' last windows and the times they land: a launch's [`Wrap`] reads its
+/// flag where the attention starts, a paging's [`Counted`] holds what it read.
+pub trait Wrapping<Rows: AxisName> {
+    /// The tokens and the times they land.
+    fn wrapping(&self) -> (&Wrap<Rows>, usize);
+}
+
+impl<Rows: AxisName> Wrapping<Rows> for Wrap<Rows> {
+    fn wrapping(&self) -> (&Wrap<Rows>, usize) {
+        (self, self.any.extent::<m![1]>())
+    }
+}
+
+impl<Rows: AxisName> Wrapping<Rows> for Counted<Rows> {
+    fn wrapping(&self) -> (&Wrap<Rows>, usize) {
+        (&self.0, self.1)
+    }
 }
 
 type Partition<Heads, Groups, Head, const SCALE: usize, Chips> = Geometry<
@@ -108,46 +223,50 @@ where
         // The broadcast copies become the shards that consume the same query.
         let query: DmTensor<bf16, Chip, Cluster, Slices<Heads>, m![1, Groups, Head]> =
             unsafe { query.reshape() };
-        let attended = <Partition<Heads, Groups, Head, SCALE, Chip> as shard::Partition>::windows(
+        let lands = |device: &mut Device, at| {
+            let mut blocks: HbmTensor<i32, Chip, m![BlockIndex]> = HbmTensor::new();
+            read.blocks
+                .view()
+                .tile::<m![Windows], 1, m![Windows = 1 # Windows, BlockIndex]>(at)
+                .to_hbm_view(&mut device.tdma, blocks.view_mut());
+            let mut lengths: HbmTensor<i32, Chip, m![1]> = HbmTensor::new();
+            read.lengths
+                .view()
+                .tile::<m![Windows], 1, m![Windows = 1 # Windows, 1]>(at)
+                .to_hbm_view(&mut device.tdma, lengths.view_mut());
+            let in_dm: CacheTile<Heads, Head, D, Chip> = cache
+                .tokens
+                .gather::<m![1], m![Block, KeyValue, Heads, Head]>()
+                .by_byte_offsets(&blocks)
+                .prefix::<m![BlockIndex], _>(&lengths, 0)
+                .to_dm(&mut device.tdma);
+            let in_dm = Convert::<bf16>::default().forward(device, in_dm);
+            // Two consecutive blocks fill each shard's 32 token slots.
+            let in_dm: DmTensor<
+                bf16,
+                Chip,
+                Cluster,
+                Slices<Heads>,
+                m![1, KeyValue, Cache % 32, Head],
+            > = unsafe { in_dm.reshape() };
+            let mut bias: DmTensor<f32, Chip, Cluster, Slices<Heads>, m![1, Groups, Cache % 32]> =
+                DmTensor::new();
+            read.bias
+                .view()
+                .tile::<m![Windows], 1, m![Windows = 1 # Windows, Cache]>(at)
+                .to_dm_view(&mut device.tdma, bias.view_mut());
+            (in_dm, bias)
+        };
+        let rest = read.rest.extent::<m![Windows]>();
+        let first = lands(device, 0);
+        let attended = <Partition<Heads, Groups, Head, SCALE, Chip> as shard::Partition>::windows::<
+            _,
+            super::Rest<Windows>,
+        >(
             device,
-            read.rest.extent::<m![Windows]>(),
-            |device, at| {
-                let mut blocks: HbmTensor<i32, Chip, m![BlockIndex]> = HbmTensor::new();
-                read.blocks
-                    .view()
-                    .tile::<m![Windows], 1, m![Windows = 1 # Windows, BlockIndex]>(at)
-                    .to_hbm_view(&mut device.tdma, blocks.view_mut());
-                let mut lengths: HbmTensor<i32, Chip, m![1]> = HbmTensor::new();
-                read.lengths
-                    .view()
-                    .tile::<m![Windows], 1, m![Windows = 1 # Windows, 1]>(at)
-                    .to_hbm_view(&mut device.tdma, lengths.view_mut());
-                let in_dm: CacheTile<Heads, Head, D, Chip> = cache
-                    .tokens
-                    .gather::<m![1], m![Block, KeyValue, Heads, Head]>()
-                    .by_byte_offsets(&blocks)
-                    .prefix::<m![BlockIndex], _>(&lengths, 0)
-                    .to_dm(&mut device.tdma);
-                let in_dm = Convert::<bf16>::default().forward(device, in_dm);
-                // Two consecutive blocks fill each shard's 32 token slots.
-                let in_dm: DmTensor<
-                    bf16,
-                    Chip,
-                    Cluster,
-                    Slices<Heads>,
-                    m![1, KeyValue, Cache % 32, Head],
-                > = unsafe { in_dm.reshape() };
-                let mut bias: DmTensor<
-                    f32,
-                    Chip,
-                    Cluster,
-                    Slices<Heads>,
-                    m![1, Groups, Cache % 32],
-                > = DmTensor::new();
-                read.bias
-                    .view()
-                    .tile::<m![Windows], 1, m![Windows = 1 # Windows, Cache]>(at)
-                    .to_dm_view(&mut device.tdma, bias.view_mut());
+            rest,
+            first,
+            (&lands, |device: &mut Device, (in_dm, bias)| {
                 let mut partial =
                     shard::Partial::<Partition<Heads, Groups, Head, SCALE, Chip>>::new();
                 let mut lse = shard::Local::<Partition<Heads, Groups, Head, SCALE, Chip>>::new();
@@ -172,7 +291,8 @@ where
                     lse.view_mut(),
                 );
                 (partial, lse)
-            },
+            }),
+            |_| (),
         );
         let output: HbmTensor<bf16, Chip, m![Heads, Groups, Head]> =
             attended.to_hbm(&mut device.tdma);
@@ -362,12 +482,13 @@ impl<
     Head: AxisName,
     Windows: AxisName,
     Rows: AxisName,
+    W: Wrapping<Rows>,
     const SCALE: usize,
 >
     Op<(
         &Live<super::super::Heads<Rows, Heads, Groups, Head>, Rows>,
         &Blocks<Heads, Head>,
-        &Pages<Rows, Windows>,
+        &Pages<Rows, Windows, Chip, W>,
     )> for Windowed<Heads, Groups, Head, SCALE>
 {
     type Output = Live<Attended<Rows, Heads, Groups, Head>, Rows>;
@@ -378,7 +499,44 @@ impl<
         (query, blocks, read): (
             &Live<super::super::Heads<Rows, Heads, Groups, Head>, Rows>,
             &Blocks<Heads, Head>,
-            &Pages<Rows, Windows>,
+            &Pages<Rows, Windows, Chip, W>,
+        ),
+    ) -> Self::Output {
+        self.forward(device, (query, blocks, read, (&(), &mut ())))
+    }
+}
+
+/// The same queries attending, `boundary` running on its state once inside the attention.
+impl<
+    Heads: AxisName,
+    Groups: AxisName,
+    Head: AxisName,
+    Windows: AxisName,
+    Rows: AxisName,
+    W: Wrapping<Rows>,
+    H,
+    G,
+    const SCALE: usize,
+>
+    Op<(
+        &Live<super::super::Heads<Rows, Heads, Groups, Head>, Rows>,
+        &Blocks<Heads, Head>,
+        &Pages<Rows, Windows, Chip, W>,
+        (&H, &mut G),
+    )> for Windowed<Heads, Groups, Head, SCALE>
+where
+    H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()>,
+{
+    type Output = Live<Attended<Rows, Heads, Groups, Head>, Rows>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (query, blocks, read, boundary): (
+            &Live<super::super::Heads<Rows, Heads, Groups, Head>, Rows>,
+            &Blocks<Heads, Head>,
+            &Pages<Rows, Windows, Chip, W>,
+            (&H, &mut G),
         ),
     ) -> Self::Output {
         let mut heads = DmTensor::new();
@@ -390,10 +548,65 @@ impl<
             blocks,
             table: &read.table,
             lengths: &read.lengths,
+            rows: &read.rows,
+            scales: &(),
+            wrap: read.wrap.wrapping(),
         };
-        query.with(self.forward(
-            device,
-            (&heads, &history, &read.bias, &read.rest, query.with(())),
-        ))
+        let history = (&heads, &history, &read.bias, &read.rest, query.with(()));
+        query.with(self.forward(device, (history, boundary)))
+    }
+}
+
+/// The same attention over queries where their store left them in HBM, each pass landing its
+/// own rows, so the envelope's queries take no data memory beside the attention's working set;
+/// the layer's blocks hold `D` and are read under the `scales` its write landed: nothing for BF16
+/// blocks, the layer's scales for E4M3 ones.
+impl<
+    Heads: AxisName,
+    Groups: AxisName,
+    Head: AxisName,
+    Windows: AxisName,
+    Rows: AxisName,
+    D: MaterializableScalar,
+    S,
+    W: Wrapping<Rows>,
+    H,
+    G,
+    const SCALE: usize,
+>
+    Op<(
+        Live<&super::Stored<Rows, Heads, Groups, Head>, Rows>,
+        (&Blocks<Heads, Head, D>, &S),
+        &Pages<Rows, Windows, Chip, W>,
+        (&H, &mut G),
+    )> for Windowed<Heads, Groups, Head, SCALE>
+where
+    for<'l> Paged<'l, Rows, Heads, Head, Windows, D, S, (&'l Wrap<Rows>, usize)>:
+        Landed<Rows, Heads, Head, Element = D>,
+    H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()>,
+{
+    type Output = Live<Attended<Rows, Heads, Groups, Head>, Rows>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (query, (blocks, scales), read, boundary): (
+            Live<&super::Stored<Rows, Heads, Groups, Head>, Rows>,
+            (&Blocks<Heads, Head, D>, &S),
+            &Pages<Rows, Windows, Chip, W>,
+            (&H, &mut G),
+        ),
+    ) -> Self::Output {
+        let history = Paged {
+            blocks,
+            table: &read.table,
+            lengths: &read.lengths,
+            rows: &read.rows,
+            scales,
+            wrap: read.wrap.wrapping(),
+        };
+        let live = query.with(());
+        let history = (query.into_value(), &history, &read.bias, &read.rest, live);
+        live.with(self.forward(device, (history, boundary)))
     }
 }

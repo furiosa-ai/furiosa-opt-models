@@ -7,10 +7,12 @@ use crate::ops::index::gather::RowStorage;
 use crate::ops::index::table::{self, Access, Length, Offsets};
 use crate::ops::normalization::Chunk;
 use crate::ops::normalization::{RowMajor, Spread};
+use crate::ops::pointwise::cast::Finite;
 use crate::ops::reduction::Selected;
 use crate::specialize::index::store;
-use crate::tensor::cache::Blocks;
-use crate::tensor::cache::{Block, KeyValue};
+use crate::tensor::cache::{self, Block, Blocks, KeyValue};
+use crate::tensor::memory::{Hbm, Memory};
+use crate::tensor::scalar::Copies;
 use crate::tensor::{
     axis::{self, Lanes, Single, Tile},
     live::Live,
@@ -642,6 +644,139 @@ impl<R: AxisName, Heads: AxisName, Head: AxisName, Chips: M + 'static>
                 .tile::<m![KeyValue], 1, m![R, KeyValue = 1 #{!} 2, Head]>(1),
         );
         self.forward(device, (layer, slots, &token))
+    }
+}
+
+/// Write key and value rows as E4M3 codes under the layer's static scales, which it holds and
+/// lands once for its write and its attention: each value divided by its scale, saturated at the
+/// largest E4M3 magnitude and rounded to nearest even.
+#[derive(DeviceSend, Load)]
+pub struct Scaled<X: Memory = Hbm> {
+    #[load(rename = "")]
+    pub scales: cache::Scales<X>,
+}
+
+/// The layer's scales landed into `landed`, ahead of its write and its attention.
+impl<X: Memory> Op<&mut cache::Landed> for Scaled<X>
+where
+    X::Tensor<f32, Chip, Copies>: Borrow<HbmTensor<f32, Chip, Copies>>,
+{
+    type Output = ();
+
+    fn forward(&self, device: &mut Device, landed: &mut cache::Landed) {
+        self.scales.forward(device, landed)
+    }
+}
+
+/// A launch's keys and values as attention projects them, coded under the layer's landed scales
+/// where they stand, then copied together into each row's token: only the live rows write, each
+/// into the slot the write operand names for it.
+impl<R: AxisName, Heads: AxisName, Head: AxisName, X: Memory>
+    Op<(
+        &mut Blocks<Heads, Head, f8e4m3>,
+        &(&HbmTensor<i32, Chip, m![R]>, &cache::Landed),
+        (
+            &Live<attention::Heads<R, Heads, Single, Head>, R>,
+            &Live<attention::Heads<R, Heads, Single, Head>, R>,
+        ),
+    )> for Scaled<X>
+{
+    type Output = ();
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (layer, &(slot, landed), (key, value)): (
+            &mut Blocks<Heads, Head, f8e4m3>,
+            &(&HbmTensor<i32, Chip, m![R]>, &cache::Landed),
+            (
+                &Live<attention::Heads<R, Heads, Single, Head>, R>,
+                &Live<attention::Heads<R, Heads, Single, Head>, R>,
+            ),
+        ),
+    ) {
+        // Where attention projects them, a head's rows spread over the slices of its lanes, so a
+        // pass codes far fewer elements a slice there than in the tokens, one slice a head.
+        type Slices<R, Heads> = attention::HeadSlice<R, Heads>;
+        type RowGroups<R> = attention::RowGroups<R, Single>;
+        type Codes<R, Heads, Head> = DmTensor<
+            f8e4m3,
+            Chip,
+            m![1 # 2],
+            Slices<R, Heads>,
+            m![{ RowGroups<R> }, KeyValue, Head],
+        >;
+        type Token<R, Heads, Head> =
+            DmTensor<f8e4m3, Chip, m![1 # 2], m![Heads, 1 # (256 / Heads)], m![R, KeyValue, Head]>;
+        type Scale<R, Heads> = VrfTensor<f32, Chip, m![1 # 2], Slices<R, Heads>, m![1 # 8]>;
+        let (key_scale, value_scale) = landed.registers::<m![1 # 2], Slices<R, Heads>>(device);
+        let mut codes = Codes::<R, Heads, Head>::new();
+        let mut code = |device: &mut Device,
+                        (at, part): (usize, &attention::Heads<R, Heads, Single, Head>),
+                        scale: &Scale<R, Heads>| {
+            device
+                .main
+                .begin(part.view())
+                .fetch::<m![{ RowGroups<R> }, Head / 16], m![Head % 16]>()
+                .fetch_cast::<f32>()
+                .collect::<m![{ RowGroups<R> }, Head / 8], m![Head % 8]>()
+                .vector_init()
+                .vector_intra_slice_tag(TagMode::Zero)
+                .vector_narrow_split::<m![{ RowGroups<R> }, Head / 4], m![Head % 4]>()
+                .vector_fp_div(scale)
+                .vector_widen_concat::<m![{ RowGroups<R> }, Head / 8], m![Head % 8]>()
+                .vector_clip(ClipBinaryOpF32::Max, -f8e4m3::LARGEST)
+                .vector_clip(ClipBinaryOpF32::Min, f8e4m3::LARGEST)
+                .vector_final()
+                .cast::<f8e4m3, m![Head % 8 # 32]>()
+                .commit_trim::<m![Head % 8]>()
+                .commit_view(codes.view_mut().tile::<m![KeyValue], 1, m![
+                    { RowGroups<R> },
+                    KeyValue = 1 #{!} 2,
+                    Head
+                ]>(at));
+        };
+        code(device, (0, key.value()), &key_scale);
+        code(device, (1, value.value()), &value_scale);
+        let mut token = Token::<R, Heads, Head>::new();
+        codes.view().to_dm_view(&mut device.tdma, token.view_mut());
+        Scatter.forward(device, (layer, (slot, key.with(())), &token));
+    }
+}
+
+/// A BF16 cache lands nothing for its write or its attention.
+impl Op<&mut ()> for Scatter {
+    type Output = ();
+
+    fn forward(&self, _: &mut Device, _: &mut ()) {}
+}
+
+/// The same rows written as they are, under nothing landed.
+impl<R: AxisName, Heads: AxisName, Head: AxisName, Chips: M + 'static>
+    Op<(
+        &mut Blocks<Heads, Head, bf16, Chips>,
+        &(&HbmTensor<i32, Chips, m![R]>, &()),
+        (
+            &Live<attention::Heads<R, Heads, Single, Head>, R>,
+            &Live<attention::Heads<R, Heads, Single, Head>, R>,
+        ),
+    )> for Scatter
+{
+    type Output = ();
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (layer, &(slot, _), rows): (
+            &mut Blocks<Heads, Head, bf16, Chips>,
+            &(&HbmTensor<i32, Chips, m![R]>, &()),
+            (
+                &Live<attention::Heads<R, Heads, Single, Head>, R>,
+                &Live<attention::Heads<R, Heads, Single, Head>, R>,
+            ),
+        ),
+    ) {
+        self.forward(device, (layer, slot, rows))
     }
 }
 

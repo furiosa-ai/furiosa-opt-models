@@ -1,16 +1,17 @@
 //! Elementwise products: of two tensors, of a tensor and a scalar, and of rows and per-row scalars.
 
 use super::{
-    Batch, BatchMut, Extent, Factors, Float, Rows, Segment, Slices, SpreadPacket, SpreadPairs,
-    SpreadTime, Width, Window,
+    Batch, BatchMut, Cell, Cells, Chunks, Extent, Factors, Float, Kept, Rows, Segment, Slices,
+    SpreadPacket, SpreadTime, Walk, Width, Window,
 };
-use crate::Op;
 use crate::load::Load;
 use crate::ops::normalization::{Chunk, Cluster, FeatureSlices, Spread};
 use crate::ops::vector::Zip;
 use crate::tensor::{axis::Single, live::Live, scalar};
+use crate::{Begin, Op};
 use furiosa_opt_std::prelude::*;
 use std::borrow::Borrow;
+use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 
 /// Multiply a single-chip tensor by an FP32 scalar; the kernel requires eight padded cells.
@@ -163,6 +164,29 @@ impl<F: M, Chips: M + 'static> Scale<HbmTensor<f32, Chips, F>> {
     }
 }
 
+/// A scale's factor written in the feature slices of rows of `W` features.
+pub struct Landed<W: AxisName, Chips: M>(
+    DmTensor<f32, Chips, Cluster, FeatureSlices<W>, m![1 # 8]>,
+);
+
+/// A scale begun for rows in feature slices: its factor written in their slices before they
+/// arrive.
+impl<W: AxisName, R: AxisName, Chips: M + 'static, F> Op<Begin<PhantomData<Spread<W, R, Chips>>>>
+    for Scale<F>
+where
+    F: Borrow<HbmTensor<f32, Chips, m![1 # 8]>>,
+{
+    type Output = Scale<Landed<W, Chips>>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        _: Begin<PhantomData<Spread<W, R, Chips>>>,
+    ) -> Self::Output {
+        Scale(Landed(self.0.borrow().to_dm(&mut device.tdma)))
+    }
+}
+
 /// Every row of one launch in feature slices times the FP32 scalar in the first cell of the factor,
 /// rounded once to BF16; the result keeps their live rows.
 impl<'x, W: AxisName, R: AxisName, Chips: M + 'static, F> Op<&'x Live<Spread<W, R, Chips>, R>>
@@ -177,9 +201,23 @@ where
         device: &mut Device,
         input: &'x Live<Spread<W, R, Chips>, R>,
     ) -> Self::Output {
-        let factor: DmTensor<f32, Chips, Cluster, FeatureSlices<W>, m![1 # 8]> =
-            self.0.borrow().to_dm(&mut device.tdma);
-        let factor = scalar::register(device, &factor);
+        let begun = self.forward(&mut *device, Begin(PhantomData::<Spread<W, R, Chips>>));
+        begun.forward(device, input)
+    }
+}
+
+/// The same rows times the factor as it landed.
+impl<'x, W: AxisName, R: AxisName, Chips: M + 'static> Op<&'x Live<Spread<W, R, Chips>, R>>
+    for Scale<Landed<W, Chips>>
+{
+    type Output = Live<Spread<W, R, Chips>, R>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        input: &'x Live<Spread<W, R, Chips>, R>,
+    ) -> Self::Output {
+        let factor = scalar::register(device, &self.0.0);
         let value = device
             .main
             .begin(input.value().view())
@@ -217,25 +255,63 @@ impl<'x, 'y, W: AxisName, R: AxisName, Chips: M + 'static>
             &'y Live<Spread<W, R, Chips>, R>,
         ),
     ) -> Self::Output {
-        let value = device
-            .main
-            .begin_interleaved::<Factors, _, _, _, _, _>(left.value().view(), right.value().view())
-            .fetch::<SpreadPairs<W, R>, SpreadPacket<W>>()
-            .fetch_cast::<f32>()
-            .collect::<SpreadPairs<W, R>, SpreadPacket<W>>()
-            .vector_init()
-            .vector_zip::<
-                Factors,
-                SpreadTime<W, R>,
-                m![R, W % ({ Symbol<Chunk<W>> }) / 4],
-                m![W % 4],
-            >(FpBinaryOp::MulF(FpMulAlu::Mul0))
-            .vector_final()
-            .cast::<bf16, m![W % 8 # 16]>()
-            .commit_trim::<m![W % 8]>()
-            .commit();
-        left.with(value)
+        let factors = (left.value().view(), right.value().view());
+        left.with(product::<Chunks<W, R>, _, _, _, _>(device, factors))
     }
+}
+
+/// The product of two launches' rows their producers kept in one layout, cell by cell as in feature
+/// slices; it keeps their layout and live rows.
+impl<'x, 'y, R: AxisName, Chips: M + 'static, C: M, S: M, E: M + 'static>
+    Op<(
+        &'x Live<Kept<DmTensor<bf16, Chips, C, S, E>>, R>,
+        &'y Live<Kept<DmTensor<bf16, Chips, C, S, E>>, R>,
+    )> for Multiply
+{
+    type Output = Live<Kept<DmTensor<bf16, Chips, C, S, E>>, R>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (left, right): (
+            &'x Live<Kept<DmTensor<bf16, Chips, C, S, E>>, R>,
+            &'y Live<Kept<DmTensor<bf16, Chips, C, S, E>>, R>,
+        ),
+    ) -> Self::Output {
+        // SAFETY: the cells keep their order; only their names merge into one axis.
+        let factors = unsafe {
+            (
+                left.value().0.view().reshape::<Chips, C, S, Cell<E>>(),
+                right.value().0.view().reshape::<Chips, C, S, Cell<E>>(),
+            )
+        };
+        let value = product::<Cells<E>, _, _, _, _>(device, factors);
+        // SAFETY: as above, back.
+        left.with(Kept(unsafe { value.reshape::<Chips, C, S, E>() }))
+    }
+}
+
+/// The FP32 product of each pair of BF16 cells walked as `K` says, the factors read interleaved,
+/// rounded once to BF16.
+fn product<K: Walk, Chips: M + 'static, C: M, S: M, E: M>(
+    device: &mut Device,
+    (left, right): (
+        DmTensorView<'_, bf16, Chips, C, S, E>,
+        DmTensorView<'_, bf16, Chips, C, S, E>,
+    ),
+) -> DmTensor<bf16, Chips, C, S, E> {
+    device
+        .main
+        .begin_interleaved::<Factors, _, _, _, _, _>(left, right)
+        .fetch::<K::Pairs, K::Packet>()
+        .fetch_cast::<f32>()
+        .collect::<K::Pairs, K::Packet>()
+        .vector_init()
+        .vector_zip::<Factors, K::Time, K::Narrow, K::Half>(FpBinaryOp::MulF(FpMulAlu::Mul0))
+        .vector_final()
+        .cast::<bf16, K::Padded>()
+        .commit_trim::<K::Packet>()
+        .commit()
 }
 
 #[cfg(test)]

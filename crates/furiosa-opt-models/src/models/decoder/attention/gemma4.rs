@@ -22,11 +22,10 @@ use crate::modules::language::{self, Greedy};
 use crate::modules::{multimodal, transformer};
 use crate::ops::attention::gqa::Cache;
 use crate::ops::embedding::Embedding;
-use crate::ops::index::scatter::Scatter;
-use crate::ops::linear::Affine;
+use crate::ops::linear::{Affine, Native, Parted};
 use crate::ops::normalization::{RmsNorm, UnitRmsNorm};
 use crate::ops::pointwise::activation::{NewGelu, Softcap};
-use crate::ops::pointwise::{add, multiply};
+use crate::ops::pointwise::{Kept, add, multiply};
 use crate::ops::reduction::Argmax;
 use crate::tensor::axis;
 use crate::tensor::cache;
@@ -42,31 +41,34 @@ use std::{io, num::NonZeroUsize};
 pub struct Size<const N: &'static str>;
 
 /// HF `Gemma4ForCausalLM`: the text model, then the greedy head tied to its embedding, in
-/// projection forms `P`, a cache of `C` and memory `X`, for calls of `R` rows.
-pub type ForCausalLM<P = Quantized, C = cache::Bf16, X = Hbm, R = Rows> =
+/// projection forms `P`, a cache of `C` and memory `X`, for calls of `R` rows. Its cache holds E4M3
+/// codes under the checkpoint's static scales, as the published checkpoint declares and vLLM
+/// caches it, unless `C` is BF16.
+pub type ForCausalLM<P = Quantized, C = cache::E4m3, X = Hbm, R = Rows> =
     super::ForCausalLM<Size<"12B">, Model<P, C, X, R>, LmHead<X>, P>;
 
 /// HF `Gemma4TextModel`: the embedding, the layers and the final norm, and the constants that
 /// prepare a call's attention context in each group.
-pub type Model<P = Quantized, C = cache::Bf16, X = Hbm, R = Rows> =
+pub type Model<P = Quantized, C = cache::E4m3, X = Hbm, R = Rows> =
     super::Model<Size<"12B">, Body<P, C, X>, RotaryEmbedding<C, X, R>, P>;
 
 /// The embedding, the layers and the final norm: the body of the catalog binding.
-pub type Body<P = Quantized, C = cache::Bf16, X = Hbm> = Catalog<P, C, X>::Body;
+pub type Body<P = Quantized, C = cache::E4m3, X = Hbm> = Catalog<P, C, X>::Body;
 
 /// The one binding of the [`Gemma4ForCausalLM`] recipe over the published size's axes, its
-/// projections in forms `P`, its cache of `C` and every leaf in memory `X`.
+/// projections in forms `P`, both groups' caches of `C` and every leaf in memory `X`; queries and
+/// keys rotate in BF16 whatever the cache stores.
 pub type Catalog<P, C, X> = Gemma4ForCausalLM<
     Then<Named<"embed_tokens", Table<X>>, Normalizer<X>>,
-    Qkv<sliding::Group, P, X, Named<"v_proj", Values<sliding::Group, P, X>>>,
-    decoder::Position<sliding::Group, C>,
-    decoder::Attend<sliding::Group, UNSCALED>,
-    Output<sliding::Group, P, X>,
-    Qkv<full::Group, P, X, Named<"k_proj", Keys<full::Group, P, X>>>,
-    decoder::Position<full::Group, C>,
-    decoder::Attend<full::Group, UNSCALED>,
-    Output<full::Group, P, X>,
-    Scatter,
+    Qkv<sliding::Group<C>, P, X, Named<"v_proj", Values<sliding::Group<C>, P, X>>>,
+    decoder::Position<sliding::Group<C>>,
+    decoder::Attend<sliding::Group<C>, UNSCALED>,
+    Output<sliding::Group<C>, P, X>,
+    Qkv<full::Group<C>, P, X, Named<"k_proj", Keys<full::Group<C>, P, X>>>,
+    decoder::Position<full::Group<C>>,
+    decoder::Attend<full::Group<C>, UNSCALED>,
+    Output<full::Group<C>, P, X>,
+    decoder::Write<sliding::Group<C>, X>,
     (),
     decoder::FeedForward<P, Hidden, Intermediate, NewGelu, Parallel<1>, X>,
     Norm<Hidden, X>,
@@ -84,21 +86,17 @@ pub type Catalog<P, C, X> = Gemma4ForCausalLM<
 pub type LmHead<X = Hbm> = Greedy<
     Hidden,
     Vocabulary,
-    Affine<
-        <X as Memory>::Tensor<bf16, Chip, m![Vocabulary, Hidden]>,
-        <X as Memory>::Tensor<f32, Chip, m![Vocabulary]>,
-    >,
+    Affine<Tied<X>, <X as Memory>::Tensor<f32, Chip, m![Vocabulary]>>,
     Argmax<Vocabulary, Chip, <X as Memory>::Tensor<i32, Chip, m![Vocabulary]>>,
     Softcap<<X as Memory>::Tensor<f32, Chip, m![1 # 8]>>,
 >;
 
 /// The token table.
-type Table<X> = Embedding<
-    Vocabulary,
-    Hidden,
-    Chip,
-    Weight<m![Vocabulary, Hidden], Chip, <X as Memory>::Tensor<bf16, Chip, m![Vocabulary, Hidden]>>,
->;
+type Table<X> = Embedding<Vocabulary, Hidden, Chip, Weight<m![Vocabulary, Hidden], Chip, Tied<X>>>;
+
+/// The table the embedding and the head share, by parts as the head's passes land it: each pass
+/// reads one run a slice, and a token's row is read from every part.
+type Tied<X> = <X as Memory>::Tensor<bf16, Chip, Parted<Hidden, Vocabulary>>;
 
 /// Group `A`'s query, key and value heads: queries and keys normalized by learned gains, and the
 /// heads of value projection `V` by unit gain.
@@ -130,8 +128,9 @@ type Values<A, P, X> = Heads<<P as Forms>::Value, <A as Attention>::KvWidth, KvV
 /// Group `A`'s key/value heads.
 type KvView<A> = decoder::HeadView<<A as Attention>::Heads, <A as Attention>::Head>;
 
-/// Heads read as `View`, projected from a row in form `F` to `Width` features.
-type Heads<F, Width, View, X> = decoder::Heads<F, Hidden, Width, View, bf16, Parallel<1>, X>;
+/// Heads read as `View`, projected from a row in form `F` to `Width` features, which the head
+/// split takes where the contraction leaves them.
+type Heads<F, Width, View, X> = Native<decoder::Projection<F, Hidden, Width, bf16, Chip, X>, View>;
 
 /// Group `A`'s attended heads projected back to rows.
 type Output<A, P, X> = Named<"o_proj", decoder::Output<P, Hidden, A, Parallel<1>, X>>;
@@ -148,8 +147,8 @@ type Scale<X> = multiply::Scale<<X as Memory>::Tensor<f32, Chip, m![1 # 8]>>;
 /// The constants that prepare a call's rotations, write slots and paged history reads, one set
 /// a group, for calls of `R` rows and a cache of `C`.
 type RotaryEmbedding<C, X, R> = (
-    decoder::Paging<sliding::Group, R, C, X>,
-    decoder::Paging<full::Group, R, C, X>,
+    decoder::Paging<sliding::Group<C>, R, X>,
+    decoder::Paging<full::Group<C>, R, X>,
 );
 
 /// The rows a call prepares its attention context for.
@@ -179,16 +178,21 @@ axes![
 ];
 
 /// FP8 per-channel attention projections and an NVFP4 feed-forward, as the published checkpoint
-/// stores them.
+/// stores them; the query, key and value rows quantize per row at run time as it declares, and the
+/// feed-forward's FP32 sums divide by its tensor scale, so no coefficient rounds. The gate and up
+/// rows stay where their passes summed them, for the activation, the product and the down
+/// projection to read there.
 pub type Quantized = decoder::Projections<
+    form::TokenScaled,
+    form::TokenScaled,
+    form::TokenScaled,
     form::ChannelScaled,
-    form::ChannelScaled,
-    form::ChannelScaled,
-    form::ChannelScaled,
-    form::Nvfp4,
+    form::Nvfp4Summed<Kept>,
+    form::Nvfp4Summed<Kept>,
+    form::Nvfp4Summed,
 >;
 
-/// Sliding attention geometry: 256-wide heads and three cache windows.
+/// Sliding attention geometry: 256-wide heads and two cache windows.
 pub mod sliding {
     use crate::models::decoder;
     use furiosa_opt_std::prelude::*;
@@ -199,10 +203,11 @@ pub mod sliding {
         Groups = 2,
         QueryWidth = 4096,
         KvWidth = 2048,
-        Windows = 3
+        Windows = 2
     ];
 
-    pub type Group = decoder::Group<Heads, Head, Groups, QueryWidth, KvWidth, Head, Windows>;
+    pub type Group<C = bf16> =
+        decoder::Group<Heads, Head, Groups, QueryWidth, KvWidth, Head, Windows, C>;
 }
 
 /// Full attention geometry: 512-wide heads, 128 rotated coordinates and 512 cache windows.
@@ -220,15 +225,16 @@ pub mod full {
         Windows = 512
     ];
 
-    pub type Group = decoder::Group<Heads, Head, Groups, QueryWidth, KvWidth, Rotated, Windows>;
+    pub type Group<C = bf16> =
+        decoder::Group<Heads, Head, Groups, QueryWidth, KvWidth, Rotated, Windows, C>;
 }
 
-impl LayerType for sliding::Group {
+impl<C: decoder::Cache> LayerType for sliding::Group<C> {
     const NAME: Option<&'static str> = Some(LAYER_TYPES[0]);
     const WINDOW: Option<&'static str> = Some("sliding_window");
 }
 
-impl LayerType for full::Group {
+impl<C: decoder::Cache> LayerType for full::Group<C> {
     const NAME: Option<&'static str> = Some(LAYER_TYPES[1]);
 }
 
@@ -397,8 +403,8 @@ impl TryFrom<Hf> for Size<"12B"> {
             .collect();
         compiled("layer_types", text.layer_types(), order.as_slice())?;
         let window = text.extra.sliding_window.get();
-        // An unaligned start reserves one cache window for the partial prefix.
-        let maximum = (sliding::Windows::SIZE - 1) * Cache::SIZE;
+        // The windows are a ring: an unaligned start wraps its newest keys into the first one.
+        let maximum = sliding::Windows::SIZE * Cache::SIZE;
         if window > maximum {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -879,11 +885,11 @@ pub(in crate::models) mod tests {
     }
 
     /// A context past the compiled cache windows is served up to them; a sliding window past them
-    /// is refused, keeping one window for an unaligned prefix.
+    /// is refused.
     #[test]
     fn serves_a_context_up_to_the_compiled_windows() {
         let positions = full::Windows::SIZE * Cache::SIZE;
-        let window = (sliding::Windows::SIZE - 1) * Cache::SIZE;
+        let window = sliding::Windows::SIZE * Cache::SIZE;
         let mut document = document();
         document["max_position_embeddings"] = json!(positions + 1);
         assert_eq!(refusal(&document), None);
