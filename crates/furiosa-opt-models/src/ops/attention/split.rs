@@ -1,4 +1,4 @@
-use super::{Chip, HeadSlice, Heads, Single};
+use super::{Chip, HeadClusters, HeadSlice, Heads, Single, SplitHeads};
 use crate::Op;
 use crate::load::quantization::fp8::{Codes, Unquantized};
 use crate::load::{Checkpoint, Context, Load, LoadError};
@@ -440,20 +440,26 @@ impl<Width: AxisName, Heads: AxisName, Groups: AxisName, Head: AxisName, Rows: A
 
 type HeadFeatures<Width, Heads> = m![Width % (Width / ({ Symbol<Heads> }))];
 
-/// Head slices holding a head-major row's `Width` features before they are named as heads: each
-/// KV head is the features' top digit.
+type Clusters<Heads> = Symbol<HeadClusters<Heads>>;
+
+/// [`SplitHeads`] holding a head-major row's `Width` features before they are named as heads:
+/// each KV head is the features' top digit, the cluster its top digit when the KV heads pair up.
 type Unsplit<'h, Rows, Width, Heads> = DmTensorViewMut<
     'h,
     bf16,
     Chip,
-    m![1 # 2],
-    m![{ Layout<Rows>::Lanes } # 8, Width / (Width / ({ Symbol<Heads> })) # 8, 1 # 4],
+    m![Width / (Width / ({ Clusters<Heads> })) # 2],
+    m![
+        { Layout<Rows>::Lanes } # 8,
+        Width % (Width / ({ Clusters<Heads> })) / (Width / ({ Symbol<Heads> })) # 8,
+        1 # 4
+    ],
     m![{ linear::Groups<Rows> }, { HeadFeatures<Width, Heads> }],
 >;
 
 /// The rows a projection of one head kind leaves where its contraction computes them, as `Heads`
-/// heads of `Groups` query heads each, moved straight into the head slices: the row groups live
-/// rows touch one by one unless every group is live.
+/// heads of `Groups` query heads each, moved straight into the head slices of each KV head's
+/// cluster: the row groups live rows touch one by one unless every group is live.
 impl<In, Width, Code, Heads, Groups, Head, Rows>
     Op<Live<linear::Projected<In, Width, Code, Rows>, Rows>> for Reshape<m![Heads, Groups, Head]>
 where
@@ -465,7 +471,7 @@ where
     Head: AxisName,
     Rows: AxisName,
 {
-    type Output = Live<super::Heads<Rows, Heads, Groups, Head>, Rows>;
+    type Output = Live<SplitHeads<Rows, Heads, Groups, Head>, Rows>;
 
     fn forward(
         &self,
@@ -473,7 +479,7 @@ where
         input: Live<linear::Projected<In, Width, Code, Rows>, Rows>,
     ) -> Self::Output {
         const { assert!(Width::SIZE == Heads::SIZE * Groups::SIZE * Head::SIZE) };
-        let mut heads: super::Heads<Rows, Heads, Groups, Head> = DmTensor::new();
+        let mut heads: SplitHeads<Rows, Heads, Groups, Head> = DmTensor::new();
         let (first, count) = input.groups::<crate::tensor::axis::Lanes<Rows>>();
         if count < <linear::Groups<Rows> as M>::SIZE {
             for at in 0..count {
@@ -523,7 +529,7 @@ where
     Head: AxisName,
     Rows: AxisName,
 {
-    type Output = Live<super::Heads<Rows, Heads, Single, Head>, Rows>;
+    type Output = Live<SplitHeads<Rows, Heads, Single, Head>, Rows>;
 
     fn forward(
         &self,

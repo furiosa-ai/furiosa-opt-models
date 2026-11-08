@@ -269,27 +269,28 @@ impl<Width: AxisName, const EPSILON: usize, Chips: M> Op<&HbmTensor<bf16, Chips,
     }
 }
 
-/// `input * weight / sqrt(mean(input^2) + epsilon)` over each of the `P` head rows of every slice,
-/// the squares summed in one pass and scaled in another; `EPSILON` holds epsilon's FP32 bits. The
-/// head rows lead with the row group, and both passes stop at the group of the last live row.
-impl<'x, S: M, P: M, Head: AxisName, R: AxisName, const EPSILON: usize, T, Chips: M + 'static>
-    Op<&'x Live<DmTensor<bf16, Chips, m![1 # 2], S, m![{ P }, Head]>, R>>
+/// `input * weight / sqrt(mean(input^2) + epsilon)` over each of the `P` head rows of every slice
+/// of clusters `C`, the squares summed in one pass and scaled in another; `EPSILON` holds epsilon's
+/// FP32 bits. The head rows lead with the row group, and both passes stop at the group of the last
+/// live row.
+impl<'x, C: M, S: M, P: M, Head: AxisName, R: AxisName, const EPSILON: usize, T, Chips: M + 'static>
+    Op<&'x Live<DmTensor<bf16, Chips, C, S, m![{ P }, Head]>, R>>
     for RmsNorm<Head, EPSILON, Chips, Weight<m![Head], Chips, T>>
 where
     T: Borrow<HbmTensor<bf16, Chips, m![Head]>>,
 {
-    type Output = Live<DmTensor<bf16, Chips, m![1 # 2], S, m![{ P }, Head]>, R>;
+    type Output = Live<DmTensor<bf16, Chips, C, S, m![{ P }, Head]>, R>;
 
     fn forward(
         &self,
         device: &mut Device,
-        input: &'x Live<DmTensor<bf16, Chips, m![1 # 2], S, m![{ P }, Head]>, R>,
+        input: &'x Live<DmTensor<bf16, Chips, C, S, m![{ P }, Head]>, R>,
     ) -> Self::Output {
         let (first, count) = input.groups::<axis::Lanes<R>>();
         // Issued first, so the weight lands while the squares and their root compute.
-        let weight: DmTensor<bf16, Chips, m![1 # 2], S, m![Head]> =
+        let weight: DmTensor<bf16, Chips, C, S, m![Head]> =
             self.weight.tensor().to_dm(&mut device.tdma);
-        let mut mean: DmTensor<f32, Chips, m![1 # 2], S, m![{ P }, 1 # 8]> = DmTensor::new();
+        let mut mean: DmTensor<f32, Chips, C, S, m![{ P }, 1 # 8]> = DmTensor::new();
         Squares::<HeadLanes<P, Head>, Head, m![{ P }], m![1], EPSILON>::of(
             &mut device.main,
             input.value().view(),
@@ -297,10 +298,10 @@ where
         .vector_final()
         .commit_trim::<m![1 # 8]>()
         .commit_prefix::<Groups<R>, _, _>(mean.view_mut(), first + count);
-        let inverse: VrfTensor<f32, Chips, m![1 # 2], S, m![{ P }, 1 # 8]> =
+        let inverse: VrfTensor<f32, Chips, C, S, m![{ P }, 1 # 8]> =
             Root::<m![{ P }], m![1 # 8]>::of(&mut device.sub, mean.view(), |square| square)
                 .to_vrf();
-        let weight: VrfTensor<f32, Chips, m![1 # 2], S, m![Head]> = device
+        let weight: VrfTensor<f32, Chips, C, S, m![Head]> = device
             .sub
             .begin(weight.view())
             .fetch::<m![Head / 16], m![Head % 16]>()

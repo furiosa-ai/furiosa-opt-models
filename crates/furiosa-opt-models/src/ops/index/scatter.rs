@@ -598,16 +598,17 @@ impl<
     }
 }
 
+/// Key or value heads of every row as attention projects them, on clusters `C` and slices `S`.
+type KeyRows<R, C, S, Head> =
+    DmTensor<bf16, Chip, C, S, m![{ attention::RowGroups<R, Single> }, Head]>;
+
 /// Rows spread over the lanes of each head's slices, as the dense projection leaves them: each
 /// row's key and value move beside each other into the row's token, then only the live rows write.
-impl<R: AxisName, Heads: AxisName, Head: AxisName, Chips: M + 'static>
+impl<R: AxisName, Heads: AxisName, Head: AxisName, C: M, S: M, Chips: M + 'static>
     Op<(
         &mut Blocks<Heads, Head, bf16, Chips>,
         Slots<'_, R, Chips>,
-        (
-            &attention::Heads<R, Heads, Single, Head>,
-            &attention::Heads<R, Heads, Single, Head>,
-        ),
+        (&KeyRows<R, C, S, Head>, &KeyRows<R, C, S, Head>),
     )> for Scatter
 {
     type Output = ();
@@ -618,10 +619,7 @@ impl<R: AxisName, Heads: AxisName, Head: AxisName, Chips: M + 'static>
         (layer, slots, (key, value)): (
             &mut Blocks<Heads, Head, bf16, Chips>,
             Slots<'_, R, Chips>,
-            (
-                &attention::Heads<R, Heads, Single, Head>,
-                &attention::Heads<R, Heads, Single, Head>,
-            ),
+            (&KeyRows<R, C, S, Head>, &KeyRows<R, C, S, Head>),
         ),
     ) {
         let mut token: DmTensor<
@@ -671,13 +669,13 @@ where
 /// A launch's keys and values as attention projects them, coded under the layer's landed scales
 /// where they stand, then copied together into each row's token: only the live rows write, each
 /// into the slot the write operand names for it.
-impl<R: AxisName, Heads: AxisName, Head: AxisName, X: Memory>
+impl<R: AxisName, Heads: AxisName, Head: AxisName, C: M, S: M, X: Memory>
     Op<(
         &mut Blocks<Heads, Head, f8e4m3>,
         &(&HbmTensor<i32, Chip, m![R]>, &cache::Landed),
         (
-            &Live<attention::Heads<R, Heads, Single, Head>, R>,
-            &Live<attention::Heads<R, Heads, Single, Head>, R>,
+            &Live<KeyRows<R, C, S, Head>, R>,
+            &Live<KeyRows<R, C, S, Head>, R>,
         ),
     )> for Scaled<X>
 {
@@ -690,30 +688,24 @@ impl<R: AxisName, Heads: AxisName, Head: AxisName, X: Memory>
             &mut Blocks<Heads, Head, f8e4m3>,
             &(&HbmTensor<i32, Chip, m![R]>, &cache::Landed),
             (
-                &Live<attention::Heads<R, Heads, Single, Head>, R>,
-                &Live<attention::Heads<R, Heads, Single, Head>, R>,
+                &Live<KeyRows<R, C, S, Head>, R>,
+                &Live<KeyRows<R, C, S, Head>, R>,
             ),
         ),
     ) {
         // Where attention projects them, a head's rows spread over the slices of its lanes, so a
         // pass codes far fewer elements a slice there than in the tokens, one slice a head.
-        type Slices<R, Heads> = attention::HeadSlice<R, Heads>;
         type RowGroups<R> = attention::RowGroups<R, Single>;
-        type Codes<R, Heads, Head> = DmTensor<
-            f8e4m3,
-            Chip,
-            m![1 # 2],
-            Slices<R, Heads>,
-            m![{ RowGroups<R> }, KeyValue, Head],
-        >;
+        type Codes<R, C, S, Head> =
+            DmTensor<f8e4m3, Chip, C, S, m![{ RowGroups<R> }, KeyValue, Head]>;
         type Token<R, Heads, Head> =
             DmTensor<f8e4m3, Chip, m![1 # 2], m![Heads, 1 # (256 / Heads)], m![R, KeyValue, Head]>;
-        type Scale<R, Heads> = VrfTensor<f32, Chip, m![1 # 2], Slices<R, Heads>, m![1 # 8]>;
-        let (key_scale, value_scale) = landed.registers::<m![1 # 2], Slices<R, Heads>>(device);
-        let mut codes = Codes::<R, Heads, Head>::new();
+        type Scale<C, S> = VrfTensor<f32, Chip, C, S, m![1 # 8]>;
+        let (key_scale, value_scale) = landed.registers::<C, S>(device);
+        let mut codes = Codes::<R, C, S, Head>::new();
         let mut code = |device: &mut Device,
-                        (at, part): (usize, &attention::Heads<R, Heads, Single, Head>),
-                        scale: &Scale<R, Heads>| {
+                        (at, part): (usize, &KeyRows<R, C, S, Head>),
+                        scale: &Scale<C, S>| {
             device
                 .main
                 .begin(part.view())
@@ -752,13 +744,13 @@ impl Op<&mut ()> for Scatter {
 }
 
 /// The same rows written as they are, under nothing landed.
-impl<R: AxisName, Heads: AxisName, Head: AxisName, Chips: M + 'static>
+impl<R: AxisName, Heads: AxisName, Head: AxisName, C: M, S: M, Chips: M + 'static>
     Op<(
         &mut Blocks<Heads, Head, bf16, Chips>,
         &(&HbmTensor<i32, Chips, m![R]>, &()),
         (
-            &Live<attention::Heads<R, Heads, Single, Head>, R>,
-            &Live<attention::Heads<R, Heads, Single, Head>, R>,
+            &Live<KeyRows<R, C, S, Head>, R>,
+            &Live<KeyRows<R, C, S, Head>, R>,
         ),
     )> for Scatter
 {
@@ -771,8 +763,8 @@ impl<R: AxisName, Heads: AxisName, Head: AxisName, Chips: M + 'static>
             &mut Blocks<Heads, Head, bf16, Chips>,
             &(&HbmTensor<i32, Chips, m![R]>, &()),
             (
-                &Live<attention::Heads<R, Heads, Single, Head>, R>,
-                &Live<attention::Heads<R, Heads, Single, Head>, R>,
+                &Live<KeyRows<R, C, S, Head>, R>,
+                &Live<KeyRows<R, C, S, Head>, R>,
             ),
         ),
     ) {
@@ -782,13 +774,13 @@ impl<R: AxisName, Heads: AxisName, Head: AxisName, Chips: M + 'static>
 
 /// A launch's keys and values as attention projects them: only the live rows write, each into the
 /// slot the write operand names for it, in the layer's blocks.
-impl<R: AxisName, Heads: AxisName, Head: AxisName, Chips: M + 'static>
+impl<R: AxisName, Heads: AxisName, Head: AxisName, C: M, S: M, Chips: M + 'static>
     Op<(
         &mut Blocks<Heads, Head, bf16, Chips>,
         &HbmTensor<i32, Chips, m![R]>,
         (
-            &Live<attention::Heads<R, Heads, Single, Head>, R>,
-            &Live<attention::Heads<R, Heads, Single, Head>, R>,
+            &Live<KeyRows<R, C, S, Head>, R>,
+            &Live<KeyRows<R, C, S, Head>, R>,
         ),
     )> for Scatter
 {
@@ -801,8 +793,8 @@ impl<R: AxisName, Heads: AxisName, Head: AxisName, Chips: M + 'static>
             &mut Blocks<Heads, Head, bf16, Chips>,
             &HbmTensor<i32, Chips, m![R]>,
             (
-                &Live<attention::Heads<R, Heads, Single, Head>, R>,
-                &Live<attention::Heads<R, Heads, Single, Head>, R>,
+                &Live<KeyRows<R, C, S, Head>, R>,
+                &Live<KeyRows<R, C, S, Head>, R>,
             ),
         ),
     ) {

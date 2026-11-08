@@ -258,6 +258,41 @@ impl<Rows: AxisName, const N: usize> AxisName for TileGroups<Rows, N> {
 pub(crate) type Heads<Rows, KvHeads, Group, Head> =
     DmTensor<bf16, Chip, m![1 # 2], HeadSlice<Rows, KvHeads>, m![{ RowGroups<Rows, Group> }, Head]>;
 
+/// The clusters that hold a split's KV heads: two when the KV heads pair up, one otherwise.
+#[derive(Clone, Debug)]
+pub struct HeadClusters<KvHeads>(PhantomData<KvHeads>);
+
+impl<KvHeads: AxisName> AxisName for HeadClusters<KvHeads> {
+    const NAME: Ident = Ident::new("HeadClusters");
+    const SIZE: usize = if KvHeads::SIZE.is_multiple_of(2) {
+        2
+    } else {
+        1
+    };
+}
+
+/// The cluster of each KV head: their top digit when they pair up, which is the digit a
+/// projection that carves no outputs splits them over both clusters by; else cluster 0.
+pub(crate) type HeadCluster<KvHeads> =
+    m![KvHeads / (KvHeads / ({ Symbol<HeadClusters<KvHeads>> })) # 2];
+
+/// [`HeadSlice`] within each cluster: one slice per lane and KV head of the cluster.
+pub(super) type ClusterSlice<Rows, KvHeads> = m![
+    { Layout<Rows>::Lanes } # 8,
+    KvHeads % (KvHeads / ({ Symbol<HeadClusters<KvHeads>> })) # 8,
+    1 # 4
+];
+
+/// [`Heads`] with each KV head on its [`HeadCluster`]: a split from the clusters a projection
+/// computed its outputs on moves each cluster's heads within it.
+pub type SplitHeads<Rows, KvHeads, Group, Head> = DmTensor<
+    bf16,
+    Chip,
+    HeadCluster<KvHeads>,
+    ClusterSlice<Rows, KvHeads>,
+    m![{ RowGroups<Rows, Group> }, Head],
+>;
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::geometry;

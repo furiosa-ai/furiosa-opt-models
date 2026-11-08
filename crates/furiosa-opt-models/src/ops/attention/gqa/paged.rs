@@ -483,19 +483,26 @@ mod tests {
     }
 }
 
+/// The query heads of each row of `Rows` as attention projects them, on clusters `C` and slices
+/// `S`.
+type Queries<Rows, C, S, Groups, Head> =
+    DmTensor<bf16, Chip, C, S, m![{ super::super::RowGroups<Rows, Groups> }, Head]>;
+
 /// Each live row's queries, as attention projects them, attend over the pages its row of the
 /// read operand names in the layer's blocks; a row group past the live rows reads nothing.
 impl<
     Heads: AxisName,
     Groups: AxisName,
     Head: AxisName,
+    C: M,
+    S: M,
     Windows: AxisName,
     Rows: AxisName,
     W: Wrapping<Rows>,
     const SCALE: usize,
 >
     Op<(
-        &Live<super::super::Heads<Rows, Heads, Groups, Head>, Rows>,
+        &Live<Queries<Rows, C, S, Groups, Head>, Rows>,
         &Blocks<Heads, Head>,
         &Pages<Rows, Windows, Chip, W>,
     )> for Windowed<Heads, Groups, Head, SCALE>
@@ -506,7 +513,7 @@ impl<
         &self,
         device: &mut Device,
         (query, blocks, read): (
-            &Live<super::super::Heads<Rows, Heads, Groups, Head>, Rows>,
+            &Live<Queries<Rows, C, S, Groups, Head>, Rows>,
             &Blocks<Heads, Head>,
             &Pages<Rows, Windows, Chip, W>,
         ),
@@ -520,6 +527,8 @@ impl<
     Heads: AxisName,
     Groups: AxisName,
     Head: AxisName,
+    C: M,
+    S: M,
     Windows: AxisName,
     Rows: AxisName,
     W: Wrapping<Rows>,
@@ -528,7 +537,7 @@ impl<
     const SCALE: usize,
 >
     Op<(
-        &Live<super::super::Heads<Rows, Heads, Groups, Head>, Rows>,
+        &Live<Queries<Rows, C, S, Groups, Head>, Rows>,
         &Blocks<Heads, Head>,
         &Pages<Rows, Windows, Chip, W>,
         (&H, &mut G),
@@ -542,7 +551,7 @@ where
         &self,
         device: &mut Device,
         (query, blocks, read, boundary): (
-            &Live<super::super::Heads<Rows, Heads, Groups, Head>, Rows>,
+            &Live<Queries<Rows, C, S, Groups, Head>, Rows>,
             &Blocks<Heads, Head>,
             &Pages<Rows, Windows, Chip, W>,
             (&H, &mut G),

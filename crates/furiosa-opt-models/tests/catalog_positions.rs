@@ -15,9 +15,10 @@ use furiosa_opt_models::load::Checkpoint;
 use furiosa_opt_models::models::decoder::Attention;
 use furiosa_opt_models::models::decoder::attention::gemma4::{self, full};
 use furiosa_opt_models::modules::{attention, language, transformer};
+use furiosa_opt_models::ops::attention::SplitHeads;
 use furiosa_opt_models::ops::normalization::Spread;
 use furiosa_opt_models::ops::rotary::{PairFrequencies, Rotation};
-use furiosa_opt_models::tensor::axis::{self, Lanes, Single};
+use furiosa_opt_models::tensor::axis::{self, Single};
 use furiosa_opt_models::tensor::live::Live;
 use furiosa_opt_models::tensor::memory::Hbm;
 use furiosa_opt_models::tensor::parallel::Chip;
@@ -59,17 +60,8 @@ type Catalog = gemma4::Catalog<gemma4::Quantized, bf16, Hbm>;
 type Qkv = <Catalog as FullLayers>::Qkv;
 type Position = <Catalog as FullLayers>::Position;
 
-/// `Group` heads of each key/value head on every live row, as attention reads them.
-type HeadRows<Group> = Live<
-    DmTensor<
-        bf16,
-        Chip,
-        m![1 # 2],
-        m![Rows % ({ Symbol<Lanes<Rows>> }) # 8, Heads # 8, 1 # 4],
-        m![{ m![Rows / ({ Symbol<Lanes<Rows>> }), Group] }, Head],
-    >,
-    Rows,
->;
+/// `Group` heads of each key/value head on every live row, as the projections' split leaves them.
+type HeadRows<Group> = Live<SplitHeads<Rows, Heads, Group, Head>, Rows>;
 
 type QueryRows = m![Rows, Heads, Groups, Head];
 type KeyRows = m![Rows, Heads, Head];

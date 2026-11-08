@@ -31,8 +31,8 @@ use crate::modules::feedforward::glu::Glu;
 use crate::modules::parallel::RowParallel;
 use crate::modules::residual::{Residual, Sum};
 use crate::modules::transformer::SandwichNorm;
-use crate::ops::attention::Heads;
 use crate::ops::attention::gqa::{Attended, Pages};
+use crate::ops::attention::{Heads, SplitHeads};
 use crate::ops::index::scatter::Store;
 use crate::ops::linear::Grouped;
 use crate::ops::normalization::{self, RmsNorm, RowMajor, Spread};
@@ -49,16 +49,20 @@ use furiosa_opt_std::prelude::*;
 type Context<P, R, Windows, Past> =
     attention::Context<P, HbmTensor<i32, Chip, m![R]>, Pages<R, Windows, Chip, Past>>;
 
-/// The query heads of group `A` on `R` rows, as attention reads them.
-type QueryHeads<A, R> = Heads<
+/// The query heads of group `A` on `R` rows, as their projection's split leaves them.
+type QueryHeads<A, R> = SplitHeads<
     R,
     <A as decoder::Attention>::Heads,
     <A as decoder::Attention>::Groups,
     <A as decoder::Attention>::Head,
 >;
 
-/// The key or value heads of group `A` on `R` rows.
+/// The key or value heads of group `A` on `R` rows, as their projection's split leaves them.
 type KeyHeads<A, R> =
+    SplitHeads<R, <A as decoder::Attention>::Heads, Single, <A as decoder::Attention>::Head>;
+
+/// The key or value heads of group `A` on `R` rows, as the cache's write takes them.
+type CacheHeads<A, R> =
     Heads<R, <A as decoder::Attention>::Heads, Single, <A as decoder::Attention>::Head>;
 
 /// What attention gives of group `A` on `R` rows.
@@ -208,7 +212,7 @@ where
             (
                 &'r mut Pool<A>,
                 &'o (&'s HbmTensor<i32, Chip, m![R]>, &'l Scales<A>),
-                (&'k Live<KeyHeads<A, R>, R>, &'k Live<KeyHeads<A, R>, R>),
+                (&'k Live<CacheHeads<A, R>, R>, &'k Live<CacheHeads<A, R>, R>),
             ),
             (),
             &'d mut (),
