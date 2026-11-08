@@ -2,8 +2,8 @@ use crate::tensor::mapping;
 use core::borrow::Borrow;
 use core::marker::PhantomData;
 
-use crate::Op;
 use crate::specialize::contraction::{self, BAND, Routing};
+use crate::{Boundary, Op};
 use furiosa_opt_std::prelude;
 use furiosa_opt_std::prelude::*;
 
@@ -696,21 +696,65 @@ where
         device: &mut Device,
         (live, input, group): (Live<PhantomData<Rows>, Rows>, V, Group),
     ) -> Self::Output {
+        self.forward(device, (live, input, group, (&(), &mut ())))
+    }
+}
+
+/// The same rows, `boundary` running on its state once their staging and the first slab's
+/// restoration are issued: its transfers queue behind theirs and land while the passes run.
+impl<'b, 's, In, Out, Code, Rows, V, U, W, Group, H, G>
+    Op<(
+        Live<PhantomData<Rows>, Rows>,
+        V,
+        Group,
+        Boundary<'b, 's, H, G>,
+    )> for Affine<W, ()>
+where
+    In: AxisName,
+    Out: AxisName,
+    Code: Scalar,
+    Rows: AxisName,
+    V: Source<Chips = m![1]>,
+    U: Source<Chips = m![1]>,
+    W: Slabs<In = In, Out = Out, Stored = Code>,
+    Group: Fn(usize) -> U,
+    H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()>,
+{
+    type Output = Result<In, Out, Code, Rows>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (live, input, group, boundary): (
+            Live<PhantomData<Rows>, Rows>,
+            V,
+            Group,
+            Boundary<'b, 's, H, G>,
+        ),
+    ) -> Self::Output {
         if live.groups::<axis::Lanes<Rows>>().1 == <Groups<Rows> as M>::SIZE {
-            return Contraction::<In, Out, Code>::resident(device, &self.weight, input, |_, _| ());
+            let (boundary, state) = boundary;
+            let restored = |device: &mut Device, slab| {
+                if slab == 0 {
+                    crate::Module::forward(boundary, device, (), &mut (), &mut *state);
+                }
+            };
+            return Contraction::<In, Out, Code>::resident(device, &self.weight, input, restored);
         }
-        self.grouped(device, (live, input, group))
+        self.grouped(device, (live, input, group), boundary)
     }
 }
 
 impl<W> Affine<W, ()> {
     /// The live lane groups of `input`'s rows, each staged from where `group` reads it and
-    /// contracted alone against every slab: the projection of rows of which fewer than every row
-    /// group are live.
-    pub(crate) fn grouped<In, Out, Code, Rows, V, U, Group>(
+    /// contracted alone against every slab, `boundary` running on its state once the staging and
+    /// the first slab's restoration are issued: the projection of rows of which fewer than every
+    /// row group are live.
+    pub(crate) fn grouped<In, Out, Code, Rows, V, U, Group, H, G>(
         &self,
         device: &mut Device,
         (live, input, group): (Live<PhantomData<Rows>, Rows>, V, Group),
+        (boundary, state): Boundary<'_, '_, H, G>,
     ) -> Result<In, Out, Code, Rows>
     where
         In: AxisName,
@@ -721,6 +765,7 @@ impl<W> Affine<W, ()> {
         U: Source<Chips = m![1]>,
         W: Slabs<In = In, Out = Out, Stored = Code>,
         Group: Fn(usize) -> U,
+        H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()>,
     {
         let (first, count) = live.groups::<axis::Lanes<Rows>>();
         /// The lane groups the live rows touch, each copied from where `group` reads it into its
@@ -781,6 +826,9 @@ impl<W> Affine<W, ()> {
         #[unroll]
         for slab in 0..<Passes<In, Out, Code> as M>::SIZE {
             let weight = self.weight.slab(device, slab);
+            if slab == 0 {
+                crate::Module::forward(boundary, &mut *device, (), &mut (), &mut *state);
+            }
             for at in 0..count {
                 let group = first + at;
                 let lanes = rows.forward(&mut *device, (group, PhantomData::<axis::Lanes<Rows>>));

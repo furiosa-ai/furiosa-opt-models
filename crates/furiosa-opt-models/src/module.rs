@@ -28,6 +28,10 @@ pub trait Op<I> {
 /// state runs the next step, and the state types refuse any other order at compile time.
 pub struct Begin<T>(pub T);
 
+/// A module an op runs once on its state, at a point of the op's choosing, so that the module's
+/// transfers issue there.
+pub(crate) type Boundary<'b, 's, H, G> = (&'b H, &'s mut G);
+
 /// Every op is a module: it ignores the env and holds the empty state.
 impl<T: Op<I>, I, E> Module<I, E, &mut ()> for T {
     type Output = T::Output;

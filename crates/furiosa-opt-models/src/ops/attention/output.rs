@@ -1,5 +1,4 @@
 use super::{geometry, gqa};
-use crate::Op;
 use crate::ops::linear::{self, Groups, Linear};
 use crate::ops::normalization::{self, Spread};
 use crate::ops::vector::Zip;
@@ -8,6 +7,7 @@ use crate::tensor::form::BlockScaled;
 use crate::tensor::form::nvfp4::{Held, Late, Scale, Scales};
 use crate::tensor::memory::Memory;
 use crate::tensor::{axis::Lanes, live::Live, mapping::Rows as Layout, parallel::Chip};
+use crate::{Boundary, Op};
 use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
 use std::borrow::Borrow;
@@ -259,7 +259,7 @@ where
             // SAFETY: Width and Hidden name the same coordinates and cells in this branch.
             return live.with(unsafe { result.reshape() });
         }
-        project(self, device, (live, rows))
+        project(self, device, (live, rows), (&(), &mut ()))
     }
 }
 
@@ -289,7 +289,7 @@ where
         input: &'x Live<gqa::Attended<Rows, KvHeads, Groups, Head>, Rows>,
     ) -> Self::Output {
         let rows = read::<QWidth, _, _, _, _>(input);
-        project(&linear::Affine::new(self, ()), device, rows)
+        project(&linear::Affine::new(self, ()), device, rows, (&(), &mut ()))
     }
 }
 
@@ -323,8 +323,51 @@ where
             &'x Live<gqa::Attended<Rows, KvHeads, Groups, Head>, Rows>,
         ),
     ) -> Self::Output {
+        self.forward(device, (landed, input, (&(), &mut ())))
+    }
+}
+
+/// The same rows through the weight as it landed, `boundary` running on its state once the rows'
+/// move into the contraction's layout and the first slab's restoration are issued: its transfers
+/// land under the passes.
+impl<
+    'x,
+    'b,
+    's,
+    Hidden: AxisName,
+    QWidth: AxisName,
+    Rows: AxisName,
+    KvHeads: AxisName,
+    Groups: AxisName,
+    Head: AxisName,
+    K,
+    V,
+    L,
+    H,
+    G,
+>
+    Op<(
+        L,
+        &'x Live<gqa::Attended<Rows, KvHeads, Groups, Head>, Rows>,
+        Boundary<'b, 's, H, G>,
+    )> for BlockScaled<QWidth, Hidden, f8e4m3, f32, m![Hidden, 1 # 8], (), Chip, K, V>
+where
+    L: linear::Slabs<Chip, In = QWidth, Out = Hidden, Stored = f8e4m3>,
+    H: for<'g, 'y> crate::Module<&'g mut G, (), &'y mut (), Output = ()>,
+{
+    type Output = Live<Spread<Hidden, Rows>, Rows>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (landed, input, boundary): (
+            L,
+            &'x Live<gqa::Attended<Rows, KvHeads, Groups, Head>, Rows>,
+            Boundary<'b, 's, H, G>,
+        ),
+    ) -> Self::Output {
         let rows = read::<QWidth, _, _, _, _>(input);
-        project(&linear::Affine::new(landed, ()), device, rows)
+        project(&linear::Affine::new(landed, ()), device, rows, boundary)
     }
 }
 
@@ -383,14 +426,16 @@ fn read<Width: AxisName, Rows: AxisName, KvHeads: AxisName, Groups: AxisName, He
 }
 
 /// Every live row's attention, read as `rows`, through `projection`'s contraction of BF16 tiles,
-/// written to the feature slices the next projection reads.
-fn project<'x, Hidden, QWidth, Rows, KvHeads, Matrix>(
+/// `boundary` running on its state once the rows' move into the contraction's layout and the first
+/// slab's restoration are issued, written to the feature slices the next projection reads.
+fn project<'x, Hidden, QWidth, Rows, KvHeads, Matrix, H, G>(
     projection: &linear::Affine<Matrix, ()>,
     device: &mut Device,
     (live, rows): (
         Live<PhantomData<Rows>, Rows>,
         Read<'x, QWidth, Rows, KvHeads>,
     ),
+    boundary: Boundary<'_, '_, H, G>,
 ) -> Live<Spread<Hidden, Rows>, Rows>
 where
     Hidden: AxisName,
@@ -398,6 +443,7 @@ where
     Rows: AxisName,
     KvHeads: AxisName,
     Matrix: linear::Slabs<Chip, In = QWidth, Out = Hidden>,
+    H: for<'g, 'y> crate::Module<&'g mut G, (), &'y mut (), Output = ()>,
 {
     let group = |at| {
         rows.clone().tile::<Layout<Rows>::Groups, 1, m![
@@ -405,7 +451,7 @@ where
             QWidth % (QWidth / KvHeads)
         ]>(at)
     };
-    let projected = projection.forward(&mut *device, (live, rows.clone(), group));
+    let projected = projection.forward(&mut *device, (live, rows.clone(), group, boundary));
     let mut output: Spread<Hidden, Rows> = DmTensor::new();
     live.cover::<Lanes<Rows>, _>(
         &mut (device, &mut output),

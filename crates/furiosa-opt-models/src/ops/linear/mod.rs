@@ -601,6 +601,7 @@ where
             (input.with(PhantomData::<Rows>), input.value(), |at| {
                 mapping::Rows::<Rows>::group(input.value().view(), at)
             }),
+            (&(), &mut ()),
         );
         mapping::Reshape::<View>::default().forward(device, input.with(projected))
     }
