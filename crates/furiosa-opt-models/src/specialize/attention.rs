@@ -166,11 +166,14 @@ pub(crate) const fn heads(shards: usize) -> usize {
     super::SLICES / (CLUSTER_LANES * shards)
 }
 
-/// Windows of a lone row its cluster's lanes hold at once, one a lane: all of its `windows` where
-/// whole rows' windows fill the lanes, else one.
+/// Windows of a lone row its cluster's cells hold at once, one a cell: all of its `windows` where
+/// whole rows' windows fill the cluster's lanes; else, where a history may span as many, its first
+/// [`LANES`], which the lanes of a head's two slots hold; else one.
 pub(crate) const fn lanes(windows: usize) -> usize {
     if windows > 1 && CLUSTER_LANES.is_multiple_of(windows) {
         windows
+    } else if windows >= LANES {
+        LANES
     } else {
         1
     }

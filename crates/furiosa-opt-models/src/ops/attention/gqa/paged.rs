@@ -1,7 +1,7 @@
 use super::partition::Geometry;
 use super::{
-    Attended, Cache, Landed, LaneWindows, Paged, WindowRow, WindowRows, WindowTiles, Windowed,
-    shard,
+    Attended, Cache, Landed, LaneTiles, LaneWindow, LaneWindows, Paged, RowTile, WindowRow,
+    WindowTiles, Windowed, shard,
 };
 use crate::ops::index::table::{BlockCounts, BlockIndex};
 use crate::specialize::attention;
@@ -68,9 +68,9 @@ type RowEntries<Rows, Windows, Chips = Chip> = HbmTensor<
 type RowLengths<Rows, Windows, Chips = Chip> =
     HbmTensor<i32, Chips, m![{ WindowRow<Rows, Windows> }, { Symbol<LaneWindows<Windows>> }]>;
 
-/// The block table and its lengths of the [`WindowRows`] rows that hold the last live row, each
-/// row's windows together where a row's windows fill its cluster's lanes ([`LaneWindows`]): the
-/// lanes of a pass that spreads its lone row, the last live one, a window a lane.
+/// The block table and its lengths of the [`RowTile`] rows that hold the last live row, each
+/// row's first [`LaneWindows`] together: the cells of a pass that spreads its lone row, the last
+/// live one, a window a cell.
 #[derive(DeviceSend)]
 pub struct RowMajor<Rows: AxisName, Windows: AxisName, Chips: M = Chip> {
     /// Byte offsets of pool blocks, per row and window.
@@ -96,28 +96,37 @@ impl<Rows: AxisName, Windows: AxisName, Chips: M> RowMajor<Rows, Windows, Chips>
             lengths: HbmTensor::new(),
         };
         if const { attention::spreads(Windows::SIZE, size_of::<D>()) } {
-            let last = (live.rows() - live.rows().min(1)) / WindowRows::<Windows>::SIZE;
-            // SAFETY: where a row's windows fill its cluster's lanes, its lane windows are all of
-            // its windows, in order.
+            let last = (live.rows() - live.rows().min(1)) / RowTile::<Rows, Windows>::SIZE;
+            // SAFETY: a row's lane windows are its first windows, in order.
             let (copy, counts) = unsafe {
                 (
-                    rows.table
-                        .view_mut()
-                        .reshape::<Chips, m![{ WindowRow<Rows, Windows> }, Windows, BlockIndex]>(),
+                    rows.table.view_mut().reshape::<Chips, m![
+                        { WindowRow<Rows, Windows> }, { LaneWindow<Windows> }, BlockIndex
+                    ]>(),
                     rows.lengths
                         .view_mut()
-                        .reshape::<Chips, m![{ WindowRow<Rows, Windows> }, Windows]>(),
+                        .reshape::<Chips, m![{ WindowRow<Rows, Windows> }, { LaneWindow<Windows> }]>(),
                 )
             };
             (table.view())
+                .tile::<LaneTiles<Windows>, 1, m![
+                    { LaneTiles<Windows> } = 1 # ({ LaneTiles<Windows> }), { LaneWindow<Windows> },
+                    Rows, BlockIndex
+                ]>(0)
                 .tile::<WindowTiles<Rows, Windows>, 1, m![
-                    Windows, { WindowTiles<Rows, Windows> } = 1 # ({ WindowTiles<Rows, Windows> }),
+                    { LaneTiles<Windows> } = 1 # ({ LaneTiles<Windows> }), { LaneWindow<Windows> },
+                    { WindowTiles<Rows, Windows> } = 1 # ({ WindowTiles<Rows, Windows> }),
                     { WindowRow<Rows, Windows> }, BlockIndex
                 ]>(last)
                 .to_hbm_view(&mut device.tdma, copy);
             (lengths.view())
+                .tile::<LaneTiles<Windows>, 1, m![
+                    { LaneTiles<Windows> } = 1 # ({ LaneTiles<Windows> }), { LaneWindow<Windows> },
+                    Rows
+                ]>(0)
                 .tile::<WindowTiles<Rows, Windows>, 1, m![
-                    Windows, { WindowTiles<Rows, Windows> } = 1 # ({ WindowTiles<Rows, Windows> }),
+                    { LaneTiles<Windows> } = 1 # ({ LaneTiles<Windows> }), { LaneWindow<Windows> },
+                    { WindowTiles<Rows, Windows> } = 1 # ({ WindowTiles<Rows, Windows> }),
                     { WindowRow<Rows, Windows> }
                 ]>(last)
                 .to_hbm_view(&mut device.tdma, counts);

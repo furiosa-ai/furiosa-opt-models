@@ -349,11 +349,13 @@ pub(crate) trait Partition: Sized {
     type Slices: M;
     type Agreed: M;
     type Merged: M;
-    /// The slices of a head's lanes and shards, which agree on a statistic where a pass spreads
-    /// one row's windows over its lanes.
+    /// The slices of a head's cells, which agree on a statistic where a pass spreads one row's
+    /// windows over its cells.
     type HeadSlices: M;
-    /// A head's one slice over its lanes, its first lane's merged slot.
+    /// A head's one cell over its cells, its first lane's merged slot.
     type FirstLane: M;
+    /// The slices named as cells, the mapping [`Self::HeadSlices`] and [`Self::FirstLane`] read.
+    type Cells: M;
     type Rows: M;
     type Groups: M;
     type Head: M;
@@ -554,13 +556,24 @@ pub(crate) trait Partition: Sized {
         )
     }
 
-    /// The attention of a lone row whose windows a pass's lanes hold, one a lane: each lane's
-    /// window terms merged over its head's lanes and shards onto the head's first lane.
+    /// The attention of a lone row whose windows a pass's cells hold, one a cell: each cell's
+    /// window terms merged over its head's cells onto the head's first lane.
     fn spread(
         device: &mut Device,
         (partial, lse): (&Partial<Self>, &Local<Self>),
     ) -> Attended<Self, Self::FirstLane> {
-        // Each of a head's lane and shard slices adds its part of the epsilon, so it is added once.
+        type Cells<'a, G, E> =
+            DmTensorView<'a, f32, Chip<G>, <G as Partition>::Cluster, <G as Partition>::Cells, E>;
+        // SAFETY: the cells name the slices in their order.
+        type Terms<G> = m![{ <G as Partition>::Rows }, { <G as Partition>::Groups }, {
+            <G as Partition>::Head
+        }];
+        type Sums<G> = m![{ <G as Partition>::Rows }, { <G as Partition>::Groups }, 1 # 8];
+        let partial: Cells<'_, Self, Terms<Self>> = unsafe { partial.view().reshape() };
+        // SAFETY: as the partial.
+        let lse: Cells<'_, Self, Sums<Self>> = unsafe { lse.view().reshape() };
+        // Each of a head's lane and shard slices adds its part of the epsilon, once each copy of its
+        // slot: a few millionths of a total that a live window keeps at one or more.
         merge::<
             Self::Key,
             m![1],
@@ -576,7 +589,7 @@ pub(crate) trait Partition: Sized {
             _,
         >(
             device,
-            (partial.view(), lse.view()),
+            (partial, lse),
             const { 1e-6f32 / (attention::CLUSTER_LANES * Self::SHARDS) as f32 },
         )
     }

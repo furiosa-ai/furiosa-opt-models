@@ -2,8 +2,9 @@ use super::shard::Partition;
 use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
 
-/// A partition's mappings: where a pass spreads one row's windows over its lanes, its statistics
-/// agree over `HeadSlices` and its attention merges onto `FirstLane`, by default its shards'.
+/// A partition's mappings: where a pass spreads one row's windows over its cells, the slices named
+/// as `Cells`, its statistics agree over `HeadSlices` and its attention merges onto `FirstLane`, by
+/// default its slices and its shards'.
 pub(crate) struct Geometry<
     Chip,
     Cluster,
@@ -18,6 +19,7 @@ pub(crate) struct Geometry<
     const SCALE: usize,
     HeadSlices = Agreed,
     FirstLane = Merged,
+    Cells = Slices,
 >(
     PhantomData<(
         Chip,
@@ -32,6 +34,7 @@ pub(crate) struct Geometry<
         Key,
         HeadSlices,
         FirstLane,
+        Cells,
     )>,
 );
 
@@ -49,6 +52,7 @@ impl<
     const SCALE: usize,
     HeadSlices: M,
     FirstLane: M,
+    Cells: M,
 > Partition
     for Geometry<
         Chip,
@@ -64,6 +68,7 @@ impl<
         SCALE,
         HeadSlices,
         FirstLane,
+        Cells,
     >
 {
     type Chip = Chip;
@@ -73,6 +78,7 @@ impl<
     type Merged = Merged;
     type HeadSlices = HeadSlices;
     type FirstLane = FirstLane;
+    type Cells = Cells;
     type Rows = Rows;
     type Groups = Groups;
     type Head = Head;
