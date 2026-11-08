@@ -850,10 +850,10 @@ where
     }
 }
 
-/// The same weight's codes landed into a place made before, so a schedule can land them a step
-/// ahead of the rows they meet and hold them across other work; its scales land when it is begun
-/// beside them.
-impl<'l, I: AxisName, O: AxisName, K, V, Y: Memory, P, S: M + 'static> Op<&'l mut Landed<I, O, P>>
+/// The same weight's codes landed into the place a schedule carries, which they hold given back,
+/// so a schedule can land them a step ahead of the rows they meet and carry them across other
+/// work; its scales land when it is begun beside them.
+impl<I: AxisName, O: AxisName, K, V, Y: Memory, P, S: M + 'static> Op<Begin<Landed<I, O, P>>>
     for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P, S>, Chip, K, V>
 where
     K: Borrow<HbmTensor<f4e2m1, Chip, Codes<I, O, P>>>,
@@ -861,11 +861,13 @@ where
     Held<Y, S>: Borrow<Scale<S>>,
     P: Ownership,
 {
-    type Output = ();
+    type Output = Landed<I, O, P>;
 
-    fn forward(&self, device: &mut Device, landed: &'l mut Landed<I, O, P>) {
+    fn forward(&self, device: &mut Device, Begin(place): Begin<Landed<I, O, P>>) -> Self::Output {
         const { Landed::<I, O, P>::TILED };
-        (self.weight.borrow().view()).to_dm_view(&mut device.tdma, landed.codes.view_mut());
+        // A tensor of their own, not a write into the codes before them, which are dead once read.
+        let codes = self.weight.borrow().to_dm(&mut device.tdma);
+        Landed { codes, ..place }
     }
 }
 

@@ -15,7 +15,7 @@
 //! - Its feed-forward's projections land their weights ahead, under work that issues no transfer:
 //!   the gate projection's codes ahead of its start, behind the down projection's output of the
 //!   layer before it and under that layer's finish and its own input norm, into the place the
-//!   decoder holds across its attention for its end, and its scales under the post-attention and
+//!   decoder carries across its attention to its end, and its scales under the post-attention and
 //!   pre-feed-forward norms, whose gains land under the output projection's passes, which issue
 //!   no transfer once their rows' move is issued; the up projection's under those norms and the
 //!   gate's passes; the down projection's under the activation and the up projection's
@@ -262,7 +262,7 @@ where
         >,
     Placement: Parallelism,
     Gate: for<'x> Module<Begin<()>, (), &'x mut (), Output = GL>
-        + for<'l, 'x> Module<&'l mut GL, (), &'x mut (), Output = ()>
+        + for<'x> Module<Begin<GL>, (), &'x mut (), Output = GL>
         + for<'l, 'x> Module<Begin<&'l GL>, (), &'x mut (), Output = GS>
         + for<'l, 'r, 'x> Module<
             ((GS, &'l GL), &'r Live<Spread<Hidden, R, Chip>, R>),
@@ -342,10 +342,10 @@ where
         )
     }
 
-    fn ahead(&self, device: &mut Device, gate_landed: &mut GL) {
+    fn ahead(&self, device: &mut Device, gate_landed: GL) -> GL {
         let Then(Sequential(_, Residual(_, Then(mlp, _), _)), _) = self;
         let Sum(Fork((Then(gate, _), _)), _) = &mlp.0;
-        gate.forward(device, (), &mut (), gate_landed);
+        gate.forward(device, (), &mut (), Begin(gate_landed))
     }
 
     fn start(
@@ -354,7 +354,7 @@ where
         call: &'c Context<P, R, Windows, Past>,
         (gain, (query, key, value)): Self::Front,
         rows: Live<Self::Rows, R>,
-        (stored, _, _): (&mut Stored<A, R>, &mut GL, &mut ()),
+        (stored, _): (&mut Stored<A, R>, &mut ()),
     ) -> Live<Self::Rows, R> {
         let Then(Sequential(Residual(_, Then(attention, _), _), _), _) = self;
         let Positioned {

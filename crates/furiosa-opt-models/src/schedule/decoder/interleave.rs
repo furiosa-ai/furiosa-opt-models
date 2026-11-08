@@ -147,20 +147,27 @@ where
                 let mut slot = $slot;
                 for at in 0..live.count::<Tl>() {
                     let tile = live.tile::<Tl>(at);
-                    let state = (&mut $places.stored, &mut ahead, &mut slot);
-                    let rows = Tokenwise(&*home, $layer).forward(&mut *device, $call, state, tile);
+                    let state = (&mut $places.stored, ahead, &mut slot);
+                    let work = Tokenwise(&*home, $layer);
+                    let (rows, landed) = work.forward(&mut *device, $call, state, tile);
+                    ahead = landed;
                     $layer.spill(&mut *device, home, rows.with(rows.value()));
                 }
             }};
         }
-        // Tile by tile, a layer's end from its attention and the next part's start.
+        // Tile by tile, a layer's end from its attention and the next part's start; `$ahead` takes
+        // what the next part landed ahead, carried by value so its value before is dead once read.
         macro_rules! edge {
-            ($layer:expr, $places:expr, $landed:expr, $work:expr, $call:expr, $state:expr) => {{
+            (
+                $layer:expr, $places:expr, $landed:expr, $work:expr, $call:expr, $state:expr
+                $(, $ahead:ident)?
+            ) => {{
                 for at in 0..live.count::<Tl>() {
                     let tile = live.tile::<Tl>(at);
                     let input = tile.with($layer.fill(&mut *device, home, tile));
                     let output = (tile.with(&$places.attended), &mut $landed);
                     let rows = $work.forward(&mut *device, $call, $state, (output, input));
+                    $(let (rows, landed) = rows; $ahead = landed;)?
                     $layer.spill(&mut *device, home, rows.with(rows.value()));
                 }
             }};
@@ -184,7 +191,7 @@ where
             true => starts!(&first[0], cx, pa, sa[0].1),
             false => starts!(&second[0], cy, pb, sb[0].1),
         }
-        let mut period_of = |group: usize, last: bool| {
+        let mut period_of = |group: usize, last: bool, mut ahead: K| {
             // The end of the last run, whose device loop ran the edges before it.
             let (mut a, mut b, mut end) = (0, 0, 0);
             #[unroll]
@@ -232,7 +239,8 @@ where
                                     landed,
                                     work,
                                     (cx, cx),
-                                    (&mut pa.stored, &mut ahead, (&mut slot, &mut following))
+                                    (&mut pa.stored, ahead, (&mut slot, &mut following)),
+                                    ahead
                                 );
                             } else {
                                 let mut following = sb[jb].1;
@@ -243,7 +251,8 @@ where
                                     landed,
                                     work,
                                     (cx, cy),
-                                    (&mut pb.stored, &mut ahead, (&mut slot, &mut following))
+                                    (&mut pb.stored, ahead, (&mut slot, &mut following)),
+                                    ahead
                                 );
                             }
                         }),
@@ -265,7 +274,8 @@ where
                                     landed,
                                     work,
                                     (cy, cx),
-                                    (&mut pa.stored, &mut ahead, (&mut slot, &mut following))
+                                    (&mut pa.stored, ahead, (&mut slot, &mut following)),
+                                    ahead
                                 );
                             } else {
                                 let mut following = sb[index + 1].1;
@@ -276,7 +286,8 @@ where
                                     landed,
                                     work,
                                     (cy, cy),
-                                    (&mut pb.stored, &mut ahead, (&mut slot, &mut following))
+                                    (&mut pb.stored, ahead, (&mut slot, &mut following)),
+                                    ahead
                                 );
                             }
                         }),
@@ -285,11 +296,12 @@ where
                 }
                 (a, b) = (na, nb);
             }
+            ahead
         };
         for group in 0..groups - 1 {
-            period_of(group, false);
+            ahead = period_of(group, false, ahead);
         }
-        period_of(groups - 1, true);
+        period_of(groups - 1, true, ahead);
     }
 }
 
