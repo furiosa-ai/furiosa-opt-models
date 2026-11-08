@@ -130,16 +130,17 @@ pub(crate) const fn streams(head: usize, groups: usize) -> bool {
 }
 
 /// Whether a pass of `rows` rows over an `envelope` lands a window while the one before it is
-/// attended: when two landings, a fold and the envelope's rows leave a quarter of DM to the layer.
+/// attended: when two landings, a fold, the envelope's attended rows and the `copies` of its query
+/// rows that data memory holds leave a quarter of DM to the layer.
 pub(crate) const fn overlaps(
     head: usize,
     groups: usize,
     keys: usize,
-    (rows, envelope): (usize, usize),
+    (rows, envelope, copies): (usize, usize, usize),
 ) -> bool {
     let landings = 2 * (rows / LANES) * KeyValue::SIZE * keys * head * size_of::<bf16>();
     let folds = 4 * (rows / LANES) * groups * head * size_of::<f32>();
-    let envelope = 2 * envelope.div_ceil(LANES) * groups * head * size_of::<bf16>();
+    let envelope = (1 + copies) * envelope.div_ceil(LANES) * groups * head * size_of::<bf16>();
     landings + folds + envelope <= 3 * super::DM / 4
 }
 

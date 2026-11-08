@@ -1059,6 +1059,9 @@ pub type Stored<Rows, KvHeads, Groups, Head> =
 /// the rows where their store left them, each pass landing its own, so that an envelope's queries
 /// never take data memory at once.
 pub(crate) trait Queries<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName> {
+    /// Copies of every row group's query rows that data memory holds while passes read them.
+    const COPIES: usize;
+
     /// Every row group's query rows on the slices of their heads' shards.
     fn whole(&self, device: &mut Device) -> Query<Rows, KvHeads, Groups, Head>;
 
@@ -1075,6 +1078,8 @@ pub(crate) trait Queries<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, He
 impl<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName>
     Queries<Rows, KvHeads, Groups, Head> for Heads<Rows, KvHeads, Groups, Head>
 {
+    const COPIES: usize = 1;
+
     fn whole(&self, device: &mut Device) -> Query<Rows, KvHeads, Groups, Head> {
         broadcast::<_, _, Groups, Head, RowGroups<Rows>, _, Shards<KvHeads>, _>(device, self.view())
     }
@@ -1102,6 +1107,8 @@ impl<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName>
 impl<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName>
     Queries<Rows, KvHeads, Groups, Head> for Stored<Rows, KvHeads, Groups, Head>
 {
+    const COPIES: usize = 0;
+
     fn whole(&self, device: &mut Device) -> Query<Rows, KvHeads, Groups, Head> {
         let heads: Heads<Rows, KvHeads, Groups, Head> = self.to_dm(&mut device.tdma);
         heads.whole(device)
@@ -1435,7 +1442,8 @@ where
                         (&landing.bias, scales.as_ref()),
                     )
                 };
-            if const { Self::overlaps::<Rows>(Rows::SIZE) } {
+            // `projected` is the one copy of the queries in data memory, whatever `Q` holds.
+            if const { Self::overlaps::<Rows>(Rows::SIZE, 1) } {
                 let mut landings = (
                     Landing::new(),
                     Landing::new(),
@@ -1560,40 +1568,51 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
     /// registers hold and whose attention its data memory holds.
     const ROWS: usize = attention::pass(Head::SIZE, Groups::SIZE, Keys::<KvHeads>::SIZE);
 
-    /// Whether a pass of `rows` rows over the envelope `Rows` lands each window while the one
-    /// before it is attended.
-    const fn overlaps<Rows: AxisName>(rows: usize) -> bool {
+    /// Whether a pass of `rows` rows over the envelope `Rows`, beside `copies` of its query rows in
+    /// data memory, lands each window while the one before it is attended.
+    const fn overlaps<Rows: AxisName>(rows: usize, copies: usize) -> bool {
         attention::overlaps(
             Head::SIZE,
             Groups::SIZE,
             Keys::<KvHeads>::SIZE,
-            (rows, Rows::SIZE),
+            (rows, Rows::SIZE, copies),
         )
     }
 
     /// Whether a pass of `N` rows over the envelope `Rows` lands the next pass's first window: only
-    /// the widest passes repeat, and only in an envelope that holds two of them.
+    /// the widest passes repeat, only in an envelope that holds two of them, and only passes wider
+    /// than a row group, which is the only pass of a call of a row group's rows: a follower issues
+    /// the boundary ahead of its windows, where it holds their landings back.
     const fn follows<Rows: AxisName, const N: usize>() -> bool {
-        N == Self::ROWS && <RowGroups<Rows> as M>::SIZE > <TileGroups<Rows, N> as AxisName>::SIZE
+        N == Self::ROWS
+            && N > attention::LANES
+            && <RowGroups<Rows> as M>::SIZE > <TileGroups<Rows, N> as AxisName>::SIZE
     }
 
     /// Whether a pass of `N` rows streams each window's keys and values from where they landed:
-    /// where it lands each window while the one before is attended, and what follows its last
-    /// window, if anything, only into a place already attended: a history of two windows at most.
-    const fn streams<Rows: AxisName, Windows: AxisName, const N: usize>() -> bool {
+    /// where it lands each window while the one before is attended, beside the copies of the query
+    /// rows `Q` keeps, and what follows its last window, if anything, only into a place already
+    /// attended: a history of two windows at most.
+    const fn streams<Rows: AxisName, Windows: AxisName, Q, const N: usize>() -> bool
+    where
+        Q: Queries<Rows, KvHeads, Groups, Head>,
+    {
         attention::streams(Head::SIZE, Groups::SIZE)
-            && Self::overlaps::<Rows>(N)
+            && Self::overlaps::<Rows>(N, Q::COPIES)
             && (!Self::follows::<Rows, N>() || Windows::SIZE <= 2)
     }
 
     /// Whether a pass of `N` rows over cells of `E` may spread its one live row: a streaming pass
     /// of one row group that lands no next pass and holds its windows' terms for one merge, whose
     /// cluster's lanes hold a row's every window of such cells.
-    const fn spreads<Rows: AxisName, Windows: AxisName, E, const N: usize>() -> bool {
+    const fn spreads<Rows: AxisName, Windows: AxisName, E, Q, const N: usize>() -> bool
+    where
+        Q: Queries<Rows, KvHeads, Groups, Head>,
+    {
         N == attention::LANES
             && Rows::SIZE >= N
             && attention::spreads(Windows::SIZE, size_of::<E>())
-            && Self::streams::<Rows, Windows, N>()
+            && Self::streams::<Rows, Windows, Q, N>()
             && !Self::follows::<Rows, N>()
             && shard::holds::<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>, Rest<Windows>>()
     }
@@ -1752,7 +1771,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     ]>(pass.tile),
                 );
             };
-        if const { Self::streams::<Rows, Windows, N>() } {
+        if const { Self::streams::<Rows, Windows, Q, N>() } {
             type Masks<Rows, KvHeads, Groups, Head, const SCALE: usize, const N: usize> =
                 shard::Masks<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>, TileRows<Rows, N>>;
             type Restored<Source, Rows, KvHeads, Head, const N: usize> =
@@ -1939,7 +1958,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 stores(device, merged, pass, attended);
             };
             if const {
-                Self::spreads::<Rows, Windows, <Source as Landed<Rows, KvHeads, Head>>::Element, N>(
+                Self::spreads::<Rows, Windows, <Source as Landed<Rows, KvHeads, Head>>::Element, Q, N>(
                 )
             } {
                 // A pass of one live row whose history spans every window holds the windows on its
@@ -1987,7 +2006,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     rows(device, tile, places, (&mut *attended, &mut *boundary));
                 }
             }
-        } else if const { Self::overlaps::<Rows>(N) } {
+        } else if const { Self::overlaps::<Rows>(N, Q::COPIES) } {
             let (mut even, mut odd) = (
                 Place::<Rows, KvHeads, Head, Source, N>::new(),
                 Landing::new(),
