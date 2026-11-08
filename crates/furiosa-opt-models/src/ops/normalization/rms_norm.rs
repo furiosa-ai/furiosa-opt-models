@@ -154,6 +154,33 @@ where
     }
 }
 
+/// The same norm begun into a place made before, so a schedule can land its gain under other work.
+impl<Width: AxisName, const EPSILON: usize, Chips: M, T>
+    Op<&mut RmsNorm<Width, EPSILON, Chips, InDm<Width, Chips>>>
+    for RmsNorm<Width, EPSILON, Chips, Weight<m![Width], Chips, T>>
+where
+    T: Borrow<HbmTensor<bf16, Chips, m![Width]>>,
+{
+    type Output = ();
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        begun: &mut RmsNorm<Width, EPSILON, Chips, InDm<Width, Chips>>,
+    ) {
+        (self.weight.tensor().view()).to_dm_view(&mut device.tdma, begun.weight.view_mut());
+    }
+}
+
+/// The place a begun norm's gain lands in, before it lands.
+impl<Width: AxisName, const EPSILON: usize, Chips: M> Default
+    for RmsNorm<Width, EPSILON, Chips, InDm<Width, Chips>>
+{
+    fn default() -> Self {
+        Self::new(DmTensor::new())
+    }
+}
+
 /// An [`RmsNorm`] of unit gain, whose checkpoint stores no weight: it multiplies by a vector of
 /// ones a load places, held as `T`, so it runs the learned norm's kernel.
 #[derive(DeviceSend, Load)]
