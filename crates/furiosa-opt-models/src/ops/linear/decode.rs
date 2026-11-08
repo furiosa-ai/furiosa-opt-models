@@ -4,6 +4,7 @@
 use crate::ops::vector::{Restore, Scaled};
 use crate::specialize::contraction;
 use crate::tensor::form::BlockScaled;
+use crate::tensor::form::fp8::Token;
 use crate::tensor::form::nvfp4::{Early, Held, Scale, Scales, W4A16};
 use crate::tensor::memory::Memory;
 use crate::tensor::{parallel::Chip, scalar};
@@ -192,16 +193,32 @@ type Inputs<In, Out> = <Tiled<In, Out> as Tiling<In, Out>>::Inputs;
 type Parts<In, Out> = <Tiled<In, Out> as Tiling<In, Out>>::Restorations;
 type Part<In, Out> = <Tiled<In, Out> as Tiling<In, Out>>::Restored;
 
+/// Where a contract meets a channel-scaled weight's row scales, and so the slices they land in.
+pub trait Rescale {
+    /// The slices that read the row scales.
+    type Slices<In: AxisName, Out: AxisName>: M;
+}
+
+/// BF16 inputs: every part's slices restore their codes by the row scales before they contract.
+impl Rescale for () {
+    type Slices<In: AxisName, Out: AxisName> = kernel::ProjectionSlices<In, Out, f8e4m3>;
+}
+
+/// Rows quantized at run time: the slices that keep the parts' sums scale them once the parts meet.
+impl Rescale for Token {
+    type Slices<In: AxisName, Out: AxisName> = kernel::Reduced<In, Out, f8e4m3>;
+}
+
 /// A channel-scaled weight under contract `C` landed in the contraction's tiling: every slab's E4M3
-/// codes and its rows' FP32 scales in data memory, the weight begun.
-pub struct Landed<In: AxisName, Out: AxisName, C = ()> {
+/// codes in data memory and its rows' FP32 scales in the slices that read them, the weight begun.
+pub struct Landed<In: AxisName, Out: AxisName, C: Rescale = ()> {
     codes: Landing<f8e4m3, In, Out, f8e4m3, m![{ Rows<In, Out> }, { Inputs<In, Out> }]>,
-    scales: Landing<f32, In, Out, f8e4m3, m![{ Rows<In, Out> }, 1 # 8]>,
+    scales: Landing<f32, In, Out, f8e4m3, m![{ Rows<In, Out> }, 1 # 8], C::Slices<In, Out>>,
     contract: PhantomData<C>,
 }
 
 /// The place a weight lands in, before it lands.
-impl<In: AxisName, Out: AxisName, C> Default for Landed<In, Out, C> {
+impl<In: AxisName, Out: AxisName, C: Rescale> Default for Landed<In, Out, C> {
     fn default() -> Self {
         Self {
             codes: DmTensor::new(),
@@ -211,7 +228,7 @@ impl<In: AxisName, Out: AxisName, C> Default for Landed<In, Out, C> {
     }
 }
 
-impl<In: AxisName, Out: AxisName, C> Landed<In, Out, C> {
+impl<In: AxisName, Out: AxisName, C: Rescale> Landed<In, Out, C> {
     /// Slab `at`'s codes as the contraction's slices hold them.
     pub(super) fn codes(
         &self,
@@ -227,7 +244,7 @@ impl<In: AxisName, Out: AxisName, C> Landed<In, Out, C> {
         Tiled::<In, Out>::landed(&self.codes, at)
     }
 
-    /// Slab `at`'s FP32 output scales, in every slice of each output block.
+    /// Slab `at`'s FP32 output scales, in the slices that read them.
     pub(super) fn scales(
         &self,
         at: usize,
@@ -236,7 +253,7 @@ impl<In: AxisName, Out: AxisName, C> Landed<In, Out, C> {
         f32,
         m![1],
         kernel::Cluster<In, Out, f8e4m3>,
-        <Tiled<In, Out> as Tiling<In, Out>>::Slices,
+        C::Slices<In, Out>,
         m![{ kernel::Slab<In, Out, f8e4m3> }, { Rows<In, Out> }, 1 # 8],
     > {
         Tiled::<In, Out>::landed(&self.scales, at)
@@ -245,7 +262,7 @@ impl<In: AxisName, Out: AxisName, C> Landed<In, Out, C> {
 
 /// The weight's codes, then its scales, one transfer each, into a place made before: a transfer
 /// into part of a slice's codes would hold every later command until the part before it lands.
-impl<In: AxisName, Out: AxisName, C, K, V> Op<&mut Landed<In, Out, C>>
+impl<In: AxisName, Out: AxisName, C: Rescale, K, V> Op<&mut Landed<In, Out, C>>
     for BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], C, Chip, K, V>
 where
     K: Borrow<HbmTensor<f8e4m3, Chip, Codes<In, Out>>>,
@@ -260,7 +277,7 @@ where
 }
 
 /// The weight begun: it lands in a place of its own.
-impl<In: AxisName, Out: AxisName, C, K, V> Op<Begin<()>>
+impl<In: AxisName, Out: AxisName, C: Rescale, K, V> Op<Begin<()>>
     for BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], C, Chip, K, V>
 where
     K: Borrow<HbmTensor<f8e4m3, Chip, Codes<In, Out>>>,

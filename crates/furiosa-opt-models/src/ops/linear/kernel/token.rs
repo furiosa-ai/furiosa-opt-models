@@ -382,7 +382,7 @@ impl<In: AxisName, Out: AxisName> Contraction<In, Out, Code> {
             .collect::<m![{ Count<Rows, B> }], m![{ Layout<Rows>::Lanes }]>()
             .to_vrf();
         // SAFETY: congruent tilings order a slice's codes and scales alike under either tiling's
-        // names; a block's scales sit in every part's slice, and the first part's keeps the sums.
+        // names; a block's scales sit in its first part's slices, which keep the sums.
         let (codes, outputs) = unsafe {
             (
                 landed.codes(slab).reshape::<

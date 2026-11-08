@@ -185,7 +185,7 @@ type Blocks<In, Out, Code> =
 type Idle<In, Out, Code> = m![
     256 / ({ Blocks<In, Out, Code> }) / ({ Slots<In, Out, Code> }) / ({ Padded<In, Out, Code> })
 ];
-type ProjectionSlices<In, Out, Code> = m![
+pub(crate) type ProjectionSlices<In, Out, Code> = m![
     Out / (Out / ({ Top<In, Out, Code> })) # ({ Padded<In, Out, Code> }),
     { Blocks<In, Out, Code> },
     1 # ({ Idle<In, Out, Code> }),
@@ -1105,15 +1105,10 @@ pub(crate) type Tiles<In, Out, Code> = m![
     In % ({ Chunk<In, Out, Code> })
 ];
 
-/// Every slab of a weight tensor on the contraction's slices, a slice keeping `E` of each slab,
-/// the slab outermost.
-pub(super) type Landing<D, In, Out, Code, E> = DmTensor<
-    D,
-    m![1],
-    Cluster<In, Out, Code>,
-    ProjectionSlices<In, Out, Code>,
-    m![{ SlabIndex<In, Out, Code> }, { E }],
->;
+/// Every slab of a weight tensor on slices `P` of the contraction, every part's unless named, a
+/// slice keeping `E` of each slab, the slab outermost.
+pub(super) type Landing<D, In, Out, Code, E, P = ProjectionSlices<In, Out, Code>> =
+    DmTensor<D, m![1], Cluster<In, Out, Code>, P, m![{ SlabIndex<In, Out, Code> }, { E }]>;
 
 /// One slab of a [`Landing`], chosen from its slabs.
 pub(super) type Slab<In, Out, Code> =
@@ -1122,10 +1117,10 @@ pub(super) type Slab<In, Out, Code> =
 impl<In: AxisName, Out: AxisName, Code: Scalar> Contraction<In, Out, Code> {
     /// Every slab of a tensor laid out as `S`, `[Out, K]` or [`Tiles`], into `landing` in one
     /// transfer, a slice keeping `E`, its rows' share of `K`, of each.
-    pub(super) fn land<D: MaterializableScalar, S: M, E: M>(
+    pub(super) fn land<D: MaterializableScalar, S: M, E: M, P: M>(
         device: &mut Device,
         tensor: &HbmTensor<D, m![1], S>,
-        landing: &mut Landing<D, In, Out, Code, E>,
+        landing: &mut Landing<D, In, Out, Code, E, P>,
     ) {
         const { Self::TILED };
         tensor
@@ -1153,17 +1148,11 @@ impl<In: AxisName, Out: AxisName, Code: Scalar> Contraction<In, Out, Code> {
     }
 
     /// Slab `at` of a tensor landed whole.
-    pub(super) fn landed<D: Scalar, E: M>(
-        landing: &Landing<D, In, Out, Code, E>,
+    pub(super) fn landed<D: Scalar, E: M, P: M>(
+        landing: &Landing<D, In, Out, Code, E, P>,
         at: usize,
-    ) -> DmTensorView<
-        '_,
-        D,
-        m![1],
-        Cluster<In, Out, Code>,
-        ProjectionSlices<In, Out, Code>,
-        m![{ Slab<In, Out, Code> }, { E }],
-    > {
+    ) -> DmTensorView<'_, D, m![1], Cluster<In, Out, Code>, P, m![{ Slab<In, Out, Code> }, { E }]>
+    {
         landing.view().tile::<SlabIndex<In, Out, Code>, 1, _>(at)
     }
 }
