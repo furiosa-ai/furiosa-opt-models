@@ -286,6 +286,9 @@ where
         input: &'x Live<DmTensor<bf16, Chips, m![1 # 2], S, m![{ P }, Head]>, R>,
     ) -> Self::Output {
         let (first, count) = input.groups::<axis::Lanes<R>>();
+        // Issued first, so the weight lands while the squares and their root compute.
+        let weight: DmTensor<bf16, Chips, m![1 # 2], S, m![Head]> =
+            self.weight.tensor().to_dm(&mut device.tdma);
         let mut mean: DmTensor<f32, Chips, m![1 # 2], S, m![{ P }, 1 # 8]> = DmTensor::new();
         Squares::<HeadLanes<P, Head>, Head, m![{ P }], m![1], EPSILON>::of(
             &mut device.main,
@@ -297,8 +300,6 @@ where
         let inverse: VrfTensor<f32, Chips, m![1 # 2], S, m![{ P }, 1 # 8]> =
             Root::<m![{ P }], m![1 # 8]>::of(&mut device.sub, mean.view(), |square| square)
                 .to_vrf();
-        let weight: DmTensor<bf16, Chips, m![1 # 2], S, m![Head]> =
-            self.weight.tensor().to_dm(&mut device.tdma);
         let weight: VrfTensor<f32, Chips, m![1 # 2], S, m![Head]> = device
             .sub
             .begin(weight.view())
