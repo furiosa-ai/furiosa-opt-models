@@ -3,6 +3,8 @@
 //! attention reads.
 //!
 //! - Live rows start anywhere in the envelope; each turns by its own envelope row's rotation.
+//! - The projections quantize each live row to E4M3 under a scale of its own, as the checkpoint
+//!   declares their inputs.
 //! - The rotated coordinates of a live row are the products of its normalized heads in FP32
 //!   rounded once; every row's other coordinates keep the normalized heads' bits.
 
@@ -184,17 +186,24 @@ fn checkpoint() -> Checkpoint {
     checkpoint
 }
 
-/// Row `row`'s first `channels` projected features on the host, rounded to BF16 once.
+/// Row `row`'s first `channels` projected features on the host, as the catalog's projections
+/// quantize their inputs: the row in E4M3 under its largest magnitude over 448 rounded once to
+/// BF16, each sum in FP64 times that scale and the channel's, rounded to BF16.
 fn project(row: usize, channels: usize) -> Vec<bf16> {
     let input: Vec<f32> = (0..Hidden::SIZE)
         .map(|column| bf16::from_f32(feature(row, column)).to_f32())
         .collect();
+    let largest = input.iter().map(|x| x.abs()).fold(0.0, f32::max);
+    let row_scale = bf16::from_f32(largest / 448.0).to_f32();
+    let codes: Vec<f64> = (input.iter())
+        .map(|x| f64::from(f8e4m3::from_f32((x / row_scale).clamp(-448.0, 448.0)).to_f32()))
+        .collect();
     (0..channels)
         .map(|channel| {
-            let dot: f32 = (input.iter().enumerate())
-                .map(|(column, x)| x * code(channel, column))
+            let dot: f64 = (codes.iter().enumerate())
+                .map(|(column, x)| x * f64::from(code(channel, column)))
                 .sum();
-            bf16::from_f32(dot * scale(channel))
+            bf16::from_f32((dot * f64::from(row_scale) * f64::from(scale(channel))) as f32)
         })
         .collect()
 }
