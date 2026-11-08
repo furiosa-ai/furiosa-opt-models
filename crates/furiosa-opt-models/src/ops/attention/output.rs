@@ -328,8 +328,9 @@ where
 }
 
 /// The same rows through the weight as it landed, `boundary` running on its state once the rows'
-/// move into the contraction's layout and the first slab's restoration are issued: its transfers
-/// land under the passes.
+/// move into the contraction's layout and the first slab's restoration are issued, on
+/// [`linear::Grouped`] state where fewer than every row group is live: its transfers land under the
+/// passes.
 impl<
     'x,
     'b,
@@ -353,7 +354,8 @@ impl<
     )> for BlockScaled<QWidth, Hidden, f8e4m3, f32, m![Hidden, 1 # 8], (), Chip, K, V>
 where
     L: linear::Slabs<Chip, In = QWidth, Out = Hidden, Stored = f8e4m3>,
-    H: for<'g, 'y> crate::Module<&'g mut G, (), &'y mut (), Output = ()>,
+    H: for<'g, 'y> crate::Module<&'g mut G, (), &'y mut (), Output = ()>
+        + for<'g, 'y> crate::Module<linear::Grouped<&'g mut G>, (), &'y mut (), Output = ()>,
 {
     type Output = Live<Spread<Hidden, Rows>, Rows>;
 
@@ -443,7 +445,8 @@ where
     Rows: AxisName,
     KvHeads: AxisName,
     Matrix: linear::Slabs<Chip, In = QWidth, Out = Hidden>,
-    H: for<'g, 'y> crate::Module<&'g mut G, (), &'y mut (), Output = ()>,
+    H: for<'g, 'y> crate::Module<&'g mut G, (), &'y mut (), Output = ()>
+        + for<'g, 'y> crate::Module<linear::Grouped<&'g mut G>, (), &'y mut (), Output = ()>,
 {
     let group = |at| {
         rows.clone().tile::<Layout<Rows>::Groups, 1, m![

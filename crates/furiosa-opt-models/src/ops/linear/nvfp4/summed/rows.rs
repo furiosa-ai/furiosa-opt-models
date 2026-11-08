@@ -893,6 +893,35 @@ where
     }
 }
 
+/// The same scales into a place made before, so a schedule can land them under other work.
+impl<'l, I: AxisName, O: AxisName, K, V, Y: Memory, P, S: M + 'static>
+    Op<&'l mut Landed<I, O, P, ()>>
+    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P, S>, Chip, K, V>
+where
+    V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O, P>>>,
+    Held<Y, S>: Borrow<Scale<S>>,
+    P: Ownership,
+{
+    type Output = ();
+
+    fn forward(&self, device: &mut Device, begun: &'l mut Landed<I, O, P, ()>) {
+        let global: &Scale<S> = self.contract.global.borrow();
+        (global.view()).to_dm_view(&mut device.tdma, begun.global.view_mut());
+        (self.weight_scale.borrow().view()).to_dm_view(&mut device.tdma, begun.blocks.view_mut());
+    }
+}
+
+/// The place a weight's scales land in beside its codes in theirs, before they land.
+impl<I: AxisName, O: AxisName, P: Ownership> Default for Landed<I, O, P, ()> {
+    fn default() -> Self {
+        Self {
+            global: DmTensor::new(),
+            blocks: DmTensor::new(),
+            codes: (),
+        }
+    }
+}
+
 /// The live rows of a launch in their feature slices through a weight under the summed contract,
 /// into where its placement `P` puts them; the projected rows keep the live rows.
 impl<'x, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P: Place<I, O, R>, S: M + 'static>

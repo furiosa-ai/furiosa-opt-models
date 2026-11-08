@@ -573,8 +573,15 @@ where
 }
 
 /// Rows of which fewer than every row group are live: a projection contracts each live lane group
-/// alone, as no register bank holds the envelope.
+/// alone, as no register bank holds the envelope, and runs its boundary on its state so wrapped.
 pub struct Grouped<T>(pub T);
+
+/// No work beside a projection of such rows either.
+impl Op<Grouped<&mut ()>> for () {
+    type Output = ();
+
+    fn forward(&self, _: &mut Device, _: Grouped<&mut ()>) {}
+}
 
 /// The live lane groups of a launch's rows in their feature slices, fewer than all, projected over
 /// the weight as it landed and split into heads where the contraction leaves them.

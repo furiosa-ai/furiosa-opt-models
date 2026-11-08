@@ -8,7 +8,7 @@ use furiosa_opt_std::prelude;
 use furiosa_opt_std::prelude::*;
 
 use crate::ops::linear::Groups;
-use crate::ops::linear::{Affine, Linear, Matrix};
+use crate::ops::linear::{Affine, Grouped, Linear, Matrix};
 use crate::ops::normalization::{self, FeatureSlices, Spread};
 use crate::tensor::axis;
 use crate::tensor::live::Live;
@@ -701,7 +701,8 @@ where
 }
 
 /// The same rows, `boundary` running on its state once their staging and the first slab's
-/// restoration are issued: its transfers queue behind theirs and land while the passes run.
+/// restoration are issued, on [`Grouped`] state where fewer than every row group is live: its
+/// transfers queue behind theirs and land while the passes run.
 impl<'b, 's, In, Out, Code, Rows, V, U, W, Group, H, G>
     Op<(
         Live<PhantomData<Rows>, Rows>,
@@ -718,7 +719,8 @@ where
     U: Source<Chips = m![1]>,
     W: Slabs<In = In, Out = Out, Stored = Code>,
     Group: Fn(usize) -> U,
-    H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()>,
+    H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()>
+        + for<'g, 'x> crate::Module<Grouped<&'g mut G>, (), &'x mut (), Output = ()>,
 {
     type Output = Result<In, Out, Code, Rows>;
 
@@ -747,9 +749,9 @@ where
 
 impl<W> Affine<W, ()> {
     /// The live lane groups of `input`'s rows, each staged from where `group` reads it and
-    /// contracted alone against every slab, `boundary` running on its state once the staging and
-    /// the first slab's restoration are issued: the projection of rows of which fewer than every
-    /// row group are live.
+    /// contracted alone against every slab, `boundary` running on its [`Grouped`] state once the
+    /// staging and the first slab's restoration are issued: the projection of rows of which fewer
+    /// than every row group are live.
     pub(crate) fn grouped<In, Out, Code, Rows, V, U, Group, H, G>(
         &self,
         device: &mut Device,
@@ -765,7 +767,7 @@ impl<W> Affine<W, ()> {
         U: Source<Chips = m![1]>,
         W: Slabs<In = In, Out = Out, Stored = Code>,
         Group: Fn(usize) -> U,
-        H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()>,
+        H: for<'g, 'x> crate::Module<Grouped<&'g mut G>, (), &'x mut (), Output = ()>,
     {
         let (first, count) = live.groups::<axis::Lanes<Rows>>();
         /// The lane groups the live rows touch, each copied from where `group` reads it into its
@@ -827,7 +829,7 @@ impl<W> Affine<W, ()> {
         for slab in 0..<Passes<In, Out, Code> as M>::SIZE {
             let weight = self.weight.slab(device, slab);
             if slab == 0 {
-                crate::Module::forward(boundary, &mut *device, (), &mut (), &mut *state);
+                crate::Module::forward(boundary, &mut *device, (), &mut (), Grouped(&mut *state));
             }
             for at in 0..count {
                 let group = first + at;
