@@ -16,8 +16,9 @@
 //!   the gate projection's codes ahead of its start, behind the down projection's output of the
 //!   layer before it and under that layer's finish and its own input norm, into the place the
 //!   decoder holds across its attention for its end, and its scales under the post-attention and
-//!   pre-feed-forward norms, whose gains land first; the up projection's under those norms and
-//!   the gate's passes; the down projection's under the activation and the up projection's
+//!   pre-feed-forward norms, whose gains land under the output projection's passes, which issue
+//!   no transfer once their rows' move is issued; the up projection's under those norms and the
+//!   gate's passes; the down projection's under the activation and the up projection's
 //!   passes; its output projection's inside its attention, after the attention's first window
 //!   lands or before its last is prepared. Its leaves hold nothing in a call, so it takes `()`.
 //! - Its tile is its envelope, so its attention hands its end the attended heads where they are,
@@ -172,7 +173,7 @@ where
             (),
             &'x mut (),
             Output = Live<Spread<Hidden, R, Chip>, R>,
-        >,
+        > + Default,
     Query: for<'x> Module<Begin<()>, (), &'x mut (), Output = QL>
         + for<'r, 'x> Module<
             (QL, Begin<Grouped<&'r Live<Spread<Hidden, R, Chip>, R>>>),
@@ -233,8 +234,19 @@ where
         + for<'l, 'x> Module<&'l mut OL, (), &'x mut (), Output = ()>,
     OL: Default,
     OP: Parallelism,
-    Named<OUTPUT, RowParallel<O, OP>>: for<'l, 'r, 'x> Module<
-            (&'l OL, &'r Live<AttendedHeads<A, R>, R>),
+    Named<OUTPUT, RowParallel<O, OP>>: for<'l, 'r, 'b, 'g, 'x> Module<
+            (
+                &'l OL,
+                &'r Live<AttendedHeads<A, R>, R>,
+                (
+                    &'b Gains<
+                        'b,
+                        Named<"post_attention_layernorm", RmsNorm<Hidden, EPSILON, NC, NP>>,
+                        Named<"pre_feedforward_layernorm", RmsNorm<Hidden, EPSILON, NC, NP>>,
+                    >,
+                    &'g mut (NB, NB),
+                ),
+            ),
             (),
             &'x mut (),
             Output = Live<Spread<Hidden, R, Chip>, R>,
@@ -448,9 +460,11 @@ where
         let Residual(_, Then(attention, post), add) = first;
         let Sum(Fork((Then(gate, activation), up)), Then(multiply, down)) = &mlp.0;
         let (landed, heads) = &*landed;
-        let projected = (attention.0.output).forward(&mut *device, (), &mut (), (landed, heads));
-        let post = post.forward(&mut *device, (), &mut (), Begin(()));
-        let norm = norm.forward(&mut *device, (), &mut (), Begin(()));
+        let mut begun = <(NB, NB)>::default();
+        let boundary = (&Gains(post, norm), &mut begun);
+        let projected =
+            (attention.0.output).forward(&mut *device, (), &mut (), (landed, heads, boundary));
+        let (post, norm) = begun;
         let gate_scales = gate.forward(&mut *device, (), &mut (), Begin(gate_landed));
         let up_landed = up.forward(&mut *device, (), &mut (), Begin(()));
         let branch = post.forward(&mut *device, (), &mut (), &projected);
@@ -499,5 +513,22 @@ where
         let branch = gain.forward(&mut *device, (), &mut (), &ready);
         let rows = add.forward(&mut *device, (), &mut (), (&attended, &branch));
         tail.forward(device, (), &mut (), &rows)
+    }
+}
+
+/// The gains a sandwich-norm layer lands while its output projection's passes run: those of its
+/// two norms after the attention, each into its place.
+struct Gains<'m, P, N>(&'m P, &'m N);
+
+impl<'m, 'p, 'x, P, N, NB> Module<&'p mut (NB, NB), (), &'x mut ()> for Gains<'m, P, N>
+where
+    P: for<'s, 'y> Module<&'s mut NB, (), &'y mut (), Output = ()>,
+    N: for<'s, 'y> Module<&'s mut NB, (), &'y mut (), Output = ()>,
+{
+    type Output = ();
+
+    fn forward(&self, device: &mut Device, _: (), _: &'x mut (), (post, norm): &'p mut (NB, NB)) {
+        self.0.forward(&mut *device, (), &mut (), post);
+        self.1.forward(device, (), &mut (), norm);
     }
 }
