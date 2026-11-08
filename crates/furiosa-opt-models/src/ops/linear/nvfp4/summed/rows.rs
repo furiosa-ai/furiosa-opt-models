@@ -1055,8 +1055,8 @@ where
     }
 }
 
-/// The live rows of `rows` into `into`'s mapping in one transfer: the lane group holding them, or
-/// the envelope when they span groups, as a transfer's setup costs about as much as all its rows.
+/// The live rows of `rows` into `into`'s mapping in one transfer, as a setup costs about as much as
+/// all the rows: the one live row, else the lane group holding them, else the envelope.
 fn transfer<R: AxisName, C: M, S: M, X: M, D: M, T: M, Y: M>(
     device: &mut Device,
     rows: Live<&DmTensor<bf16, Chip, C, S, m![R, { X }]>, R>,
@@ -1067,6 +1067,14 @@ fn transfer<R: AxisName, C: M, S: M, X: M, D: M, T: M, Y: M>(
         rows.value()
             .view()
             .to_dm_view(&mut device.tdma, into.view_mut());
+    } else if rows.rows() == 1 {
+        let row = rows.start();
+        (rows.value().view())
+            .tile::<m![R], 1, m![R = 1 # R, { X }]>(row)
+            .to_dm_view(
+                &mut device.tdma,
+                (into.view_mut()).tile::<m![R], 1, m![R = 1 #{!} R, { Y }]>(row),
+            );
     } else {
         Layout::<R>::group(rows.value().view(), first).to_dm_view(
             &mut device.tdma,
