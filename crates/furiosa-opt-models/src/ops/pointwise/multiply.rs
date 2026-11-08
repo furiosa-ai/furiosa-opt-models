@@ -170,11 +170,11 @@ pub struct Landed<W: AxisName, Chips: M>(
 );
 
 /// A scale begun for rows in feature slices: its factor written in their slices before they
-/// arrive.
+/// arrive, each slice reading a copy of its own.
 impl<W: AxisName, R: AxisName, Chips: M + 'static, F> Op<Begin<PhantomData<Spread<W, R, Chips>>>>
     for Scale<F>
 where
-    F: Borrow<HbmTensor<f32, Chips, m![1 # 8]>>,
+    F: Borrow<HbmTensor<f32, Chips, scalar::Copies>>,
 {
     type Output = Scale<Landed<W, Chips>>;
 
@@ -192,7 +192,7 @@ where
 impl<'x, W: AxisName, R: AxisName, Chips: M + 'static, F> Op<&'x Live<Spread<W, R, Chips>, R>>
     for Scale<F>
 where
-    F: Borrow<HbmTensor<f32, Chips, m![1 # 8]>>,
+    F: Borrow<HbmTensor<f32, Chips, scalar::Copies>>,
 {
     type Output = Live<Spread<W, R, Chips>, R>;
 

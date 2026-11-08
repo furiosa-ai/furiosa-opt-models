@@ -32,6 +32,7 @@ use crate::tensor::cache;
 use crate::tensor::form::Weight;
 use crate::tensor::memory::{Hbm, Memory};
 use crate::tensor::parallel::{Chip, Parallel};
+use crate::tensor::scalar::Copies;
 use crate::{Branch, Op, Sequential, Then};
 use furiosa_opt_std::prelude::*;
 use serde::Deserialize;
@@ -141,8 +142,8 @@ type Norm<W, X> = <Size<"12B"> as Geometry>::Norm<W, X>;
 /// A norm of unit gain, whose checkpoint stores no weight.
 type UnitNorm<W, X> = UnitRmsNorm<W, EPSILON, m![1], <X as Memory>::Tensor<bf16, m![1], m![W]>>;
 
-/// Multiplies rows by one FP32 value held in memory `X`.
-type Scale<X> = multiply::Scale<<X as Memory>::Tensor<f32, Chip, m![1 # 8]>>;
+/// Multiplies rows by one FP32 value held in memory `X`, a copy for each slice that reads it.
+type Scale<X> = multiply::Scale<<X as Memory>::Tensor<f32, Chip, Copies>>;
 
 /// The constants that prepare a call's rotations, write slots and paged history reads, one set
 /// a group, for calls of `R` rows and a cache of `C`.
@@ -284,14 +285,15 @@ pub struct Normalizer<X: Memory = Hbm>(Scale<X>);
 /// The multiplier a load places from the config's `hidden_size`.
 impl<'a, X: Memory> Load<&'a Checkpoint> for Normalizer<X>
 where
-    <X as Memory>::Tensor<f32, Chip, m![1 # 8]>: Load<HostTensor<f32, m![{ Chip }, { m![1 # 8] }]>>,
+    <X as Memory>::Tensor<f32, Chip, Copies>: Load<HostTensor<f32, m![{ Chip }, { Copies }]>>,
 {
     fn load(context: &mut load::Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
         context.checkpoint(from, |cx| {
             let (_, hidden) = cx.config_number(from, "hidden_size")?;
             let factor = bf16::from_f32((hidden as f32).sqrt()).to_f32();
-            let host: HostTensor<f32, m![{ Chip }, { m![1 # 8] }]> =
-                HostTensor::from_vec([factor, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+            let packet = [factor, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+            let copies = packet.repeat(<m![{ Chip }, { Copies }] as M>::SIZE / packet.len());
+            let host: HostTensor<f32, m![{ Chip }, { Copies }]> = HostTensor::from_vec(copies);
             let scale = cx.field("0", "", |cx| cx.field("0", "", |cx| Load::load(cx, host)));
             scale.map(|factor| Self(multiply::Scale(factor)))
         })
