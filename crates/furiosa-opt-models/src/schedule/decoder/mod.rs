@@ -18,12 +18,12 @@
 //! - The DMA engine serves transfers in issue order, so weights issue one part ahead of their use
 //!   and behind the small transfers of the work they overlap: the first down panel behind the
 //!   output projection's rows, the first gate/up pair behind the exchange of its partial sums,
-//!   the other down panels behind the last gate/up pair, the next layer's value and key
-//!   projections and its query projection's first half behind the down's inputs, and the second
-//!   half behind the exchange that ends the down projection. An attention's working set fills
-//!   most of data memory, so only the output projection lands during one, once its last history
-//!   is in flight. A form whose leaves land nothing ahead takes the same steps, doing nothing in
-//!   them.
+//!   the second down panel behind the last gate/up pair, the third behind the down's inputs, the
+//!   next layer's value and key projections and its query projection's first half behind it, and
+//!   the second half behind the exchange that ends the down projection. An attention's working
+//!   set fills most of data memory, so only the output projection lands during one, once its last
+//!   history is in flight. A form whose leaves land nothing ahead takes the same steps, doing
+//!   nothing in them.
 
 use crate::Begin;
 use crate::Module;
@@ -581,15 +581,15 @@ where
         let normalized = gain.forward(&mut *device, (), &mut (), &attended);
         let rows = tile.with(normalized.value());
         let begun = gate_up.forward(&mut *device, (), &mut (), Begin((ahead, rows)));
-        // The other down panels land behind the last gate/up pair, under its contractions, so the
-        // down's inputs follow them and the next part's weights land under the down projection.
+        // The second down panel lands under the last gate/up pair's contractions, the third under
+        // the first two projections: behind the down's inputs, so the product's store is not.
         let second = down.forward(&mut *device, (), &mut (), Begin(1usize));
-        let third = down.forward(&mut *device, (), &mut (), Begin(2usize));
         let projected = gate_up.forward(&mut *device, (), adapters.gate_up(), (begun, rows));
         let product = SwiGlu.forward(&mut *device, (), &mut (), tile.with(projected));
         let product = tile.with(product);
         let staged = down.forward(&mut *device, (), &mut (), Begin((product, first)));
         let landing = down.forward(&mut *device, (), &mut (), tile.with((staged, second)));
+        let third = down.forward(&mut *device, (), &mut (), Begin(2usize));
         let ready = down.forward(&mut *device, (), &mut (), (landing, third));
         Staged { ready, attended }
     }
