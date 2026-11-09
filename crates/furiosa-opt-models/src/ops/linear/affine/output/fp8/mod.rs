@@ -1,9 +1,7 @@
 //! E4M3 projection with per-row activation scales and per-channel weight scales.
 
 use super::*;
-use crate::Op;
 use crate::tensor::form::fp8::Rows;
-pub(crate) use project::Landed;
 pub(crate) use to_dm::ToDm;
 
 mod contract;
@@ -76,30 +74,4 @@ pub type Stored<Hidden, QWidth> = Affine<
     >,
     (),
 >;
-pub(crate) type Staged<Hidden, QWidth> =
-    Affine<(Weight<Hidden, QWidth>, Channels<Hidden, QWidth>), ()>;
-
-impl<Hidden: AxisName, QWidth: AxisName> Stored<Hidden, QWidth> {
-    pub(crate) fn empty() -> Staged<Hidden, QWidth> {
-        Affine::new((Weight::new(), Channels::new()), ())
-    }
-}
-
-/// The weight and its channel scales, written in the staged form the projection reads.
-impl<Hidden: AxisName, QWidth: AxisName> Op<&mut Staged<Hidden, QWidth>>
-    for Stored<Hidden, QWidth>
-{
-    type Output = ();
-
-    fn forward(&self, context: &mut Device, staged: &mut Staged<Hidden, QWidth>) {
-        let (weight, channels) = &mut staged.weight;
-        self.weight
-            .0
-            .view()
-            .to_dm_view(&mut context.tdma, weight.view_mut());
-        self.weight
-            .1
-            .view()
-            .to_dm_view(&mut context.tdma, channels.view_mut());
-    }
-}
+type Staged<Hidden, QWidth> = Affine<(Weight<Hidden, QWidth>, Channels<Hidden, QWidth>), ()>;
