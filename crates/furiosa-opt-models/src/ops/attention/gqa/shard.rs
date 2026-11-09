@@ -80,18 +80,13 @@ pub(crate) type Partial<G, Count = <G as Partition>::Rows> = DmTensor<
     }],
 >;
 
-type Summands<G> = DmTensor<
+/// The factors of a fold's two summands, the scaled running attention's (one) and the window's.
+type Shares<G> = VrfTensor<
     f32,
     Chip<G>,
     <G as Partition>::Cluster,
     <G as Partition>::Slices,
-    m![
-        { <G as Partition>::Rows },
-        { <G as Partition>::Groups },
-        { <G as Partition>::Head } / 8,
-        Summand,
-        { <G as Partition>::Head } % 8
-    ],
+    m![{ <G as Partition>::Rows }, { <G as Partition>::Groups }, Summand, 1 # 8],
 >;
 
 pub(crate) type Attended<G, Merged = <G as Partition>::Merged> = DmTensor<
@@ -1059,65 +1054,6 @@ pub(crate) trait Partition: Sized {
                     .commit_trim::<m![1 # 8]>()
                     .commit()
             };
-        let share = |device: &mut Device,
-                     shifted: &Local<Self>,
-                     divisor: &Statistics<Self>|
-         -> Statistics<Self> {
-            device
-                .main
-                .begin(shifted.view())
-                .fetch::<m![{ Self::Rows }, { Self::Groups }], m![1 # 8]>()
-                .collect::<m![{ Self::Rows }, { Self::Groups }], m![1 # 8]>()
-                .vector_init()
-                .vector_intra_slice_tag(TagMode::Zero)
-                .vector_narrow_trim::<m![1 # 4]>()
-                .vector_fp_div(divisor)
-                .vector_widen_pad::<m![1 # 8]>()
-                .vector_final()
-                .to_vrf(&mut device.sub)
-        };
-        let scaled = |device: &mut Device,
-                      term: &Partial<Self>,
-                      share: &Statistics<Self>,
-                      terms: &mut Summands<Self>,
-                      at: usize| {
-            device
-                    .main
-                    .begin(term.view())
-                    .fetch::<
-                        m![{ Self::Rows }, { Self::Groups }, { Self::Head } / 8],
-                        m![{ Self::Head } % 8],
-                    >()
-                    .collect::<
-                        m![{ Self::Rows }, { Self::Groups }, { Self::Head } / 8],
-                        m![{ Self::Head } % 8],
-                    >()
-                    .vector_init()
-                    .vector_intra_slice_tag(TagMode::Zero)
-                    .vector_narrow_split::<
-                        m![
-                            { Self::Rows },
-                            { Self::Groups },
-                            { Self::Head } / 8,
-                            { Self::Head } % 8 / 4
-                        ],
-                        m![{ Self::Head } % 4],
-                    >()
-                    .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), share)
-                    .vector_widen_concat::<
-                        m![{ Self::Rows }, { Self::Groups }, { Self::Head } / 8],
-                        m![{ Self::Head } % 8],
-                    >()
-                    .vector_final()
-                    .commit_trim::<m![{ Self::Head } % 8]>()
-                    .commit_view(terms.view_mut().tile::<m![Summand], 1, m![
-                        { Self::Rows },
-                        { Self::Groups },
-                        { Self::Head } / 8,
-                        Summand = 1 #{!} 2,
-                        { Self::Head } % 8
-                    ]>(at));
-        };
         let held: Statistics<Self> = operand::<Self, _>(device, running);
         let top: Statistics<Self> = device
             .main
@@ -1149,14 +1085,66 @@ pub(crate) trait Partition: Sized {
             .commit_trim::<m![1 # 8]>()
             .commit();
         let divisor: Statistics<Self> = operand::<Self, _>(device, &total);
-        let mut terms = Summands::<Self>::new();
-        let old_share = share(device, &old, &divisor);
-        scaled(device, carry, &old_share, &mut terms, 0);
-        let new_share = share(device, &new, &divisor);
-        scaled(device, partial, &new_share, &mut terms, 1);
+        let old_share: Statistics<Self> = device
+            .main
+            .begin(old.view())
+            .fetch::<m![{ Self::Rows }, { Self::Groups }], m![1 # 8]>()
+            .collect::<m![{ Self::Rows }, { Self::Groups }], m![1 # 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_trim::<m![1 # 4]>()
+            .vector_fp_div(&divisor)
+            .vector_widen_pad::<m![1 # 8]>()
+            .vector_final()
+            .to_vrf(&mut device.sub);
+        // The carry's last read is its own pass, so the folded attention can take its place and the
+        // running attention keeps one place over the windows a loop folds.
+        let carried: Partial<Self> = device
+            .main
+            .begin(carry.view())
+            .fetch::<
+                m![{ Self::Rows }, { Self::Groups }, { Self::Head } / 8],
+                m![{ Self::Head } % 8],
+            >()
+            .collect::<
+                m![{ Self::Rows }, { Self::Groups }, { Self::Head } / 8],
+                m![{ Self::Head } % 8],
+            >()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_split::<
+                m![
+                    { Self::Rows },
+                    { Self::Groups },
+                    { Self::Head } / 8,
+                    { Self::Head } % 8 / 4
+                ],
+                m![{ Self::Head } % 4],
+            >()
+            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &old_share)
+            .vector_widen_concat::<
+                m![{ Self::Rows }, { Self::Groups }, { Self::Head } / 8],
+                m![{ Self::Head } % 8],
+            >()
+            .vector_final()
+            .commit_trim::<m![{ Self::Head } % 8]>()
+            .commit();
+        // The total over itself is exactly one, so the scaled carry passes unchanged.
+        let shares: Shares<Self> = device
+            .main
+            .begin_interleaved::<Summand, _, _, _, _, _>(total.view(), new.view())
+            .fetch::<m![{ Self::Rows }, { Self::Groups }, Summand], m![1 # 8]>()
+            .collect::<m![{ Self::Rows }, { Self::Groups }, Summand], m![1 # 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_trim::<m![1 # 4]>()
+            .vector_fp_div(&divisor)
+            .vector_widen_pad::<m![1 # 8]>()
+            .vector_final()
+            .to_vrf(&mut device.sub);
         let folded: Partial<Self> = device
             .main
-            .begin(terms.view())
+            .begin_interleaved::<Summand, _, _, _, _, _>(carried.view(), partial.view())
             .fetch::<
                 m![{ Self::Rows }, { Self::Groups }, { Self::Head } / 8, Summand],
                 m![{ Self::Head } % 8],
@@ -1177,6 +1165,7 @@ pub(crate) trait Partition: Sized {
                 ],
                 m![{ Self::Head } % 4],
             >()
+            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &shares)
             .vector_intra_slice_reduce::<
                 Summand,
                 m![{ Self::Rows }, { Self::Groups }, { Self::Head } / 8, { Self::Head } % 8 / 4],
