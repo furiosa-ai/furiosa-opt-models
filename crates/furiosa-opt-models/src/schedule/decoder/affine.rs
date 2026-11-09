@@ -415,6 +415,9 @@ where
 /// attended and, tile by tile, its work up to the next layer's store or the head, from whose rows
 /// the selected rows' tokens are read. Generic in its env, so only the launches that run it
 /// compile it.
+// rustdoc checks this impl with the old trait solver, which cannot prove its bounds, and panics on
+// the next one (rust-lang/rust#149019), so the Rust reference leaves it out.
+#[cfg(not(doc))]
 impl<
     'm,
     'i,
@@ -567,6 +570,8 @@ where
 }
 
 /// A BF16 launch runs its catalog model by the decoder family's loops.
+// Left out of the Rust reference with the impl it runs, for the same reason.
+#[cfg(not(doc))]
 impl<'i, 'a, 's, 'b, Z, const DEPTH: usize, H, const E: usize, const C: usize, const L: usize, Env>
     Module<&'i mut launch::Input<'a, Z>, Env, launch::State<'s, 'b, Z>> for launch::Model<Z, Affine>
 where
