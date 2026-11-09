@@ -189,12 +189,12 @@ pub struct Paging<
     window: X::Tensor<i32, Chips, m![1]>,
     /// The same, on the host.
     visible: Visible,
-    /// Window `w`'s first token, negated: `-512 w` on every row.
+    /// Window `w`'s first block, negated: `-32 w` on every row.
     starts: X::Tensor<i32, Chips, m![Windows, { Packets<Rows> }]>,
     /// Window `w`'s first table row in bytes: `128 w` on every row.
     rows: X::Tensor<i32, Chips, m![Windows, { Packets<Rows> }]>,
-    /// Zero on every row: a past-live row's history length.
-    zeros: X::Tensor<i32, Chips, m![Rows]>,
+    /// Window `w`'s first token, `512 w`, a window a flit.
+    firsts: PerWindow<X, Windows, Chips>,
     /// The middle of each window slot, `t + 1/2`, on every row.
     slots: X::Tensor<f32, Chips, m![Rows, Cache]>,
     shape: PhantomData<fn() -> (Heads, Head, D, Layer)>,
@@ -250,7 +250,8 @@ where
     X::Tensor<i32, Chips, m![1]>: Load<HostTensor<i32, m![{ Chips }, { m![1] }]>>,
     X::Tensor<i32, Chips, m![Windows, { Packets<Rows> }]>:
         Load<HostTensor<i32, m![{ Chips }, { m![Windows, { Packets<Rows> }] }]>>,
-    X::Tensor<i32, Chips, m![Rows]>: Load<HostTensor<i32, m![{ Chips }, { m![Rows] }]>>,
+    X::Tensor<i32, Chips, m![Windows, 1 # 8]>:
+        Load<HostTensor<i32, m![{ Chips }, { m![Windows, 1 # 8] }]>>,
     X::Tensor<f32, Chips, m![Rows, Cache]>:
         Load<HostTensor<f32, m![{ Chips }, { m![Rows, Cache] }]>>,
 {
@@ -283,7 +284,14 @@ where
         let visible = Visible(window);
         let window = vec![window as i32; Chips::SIZE];
         let block = (BlockIndex::SIZE * size_of::<i32>()) as i32;
-        let zeros = vec![0; Rows::SIZE * Chips::SIZE];
+        let firsts = (0..Windows::SIZE * 8).map(|at| {
+            if at % 8 == 0 {
+                (at / 8 * Cache::SIZE) as i32
+            } else {
+                0
+            }
+        });
+        let firsts = firsts.collect::<Vec<_>>().repeat(Chips::SIZE);
         let slots =
             (0..Chips::SIZE * Rows::SIZE * Cache::SIZE).map(|at| (at % Cache::SIZE) as f32 + 0.5);
         Ok(Self {
@@ -296,14 +304,14 @@ where
             })?,
             visible,
             starts: cx.field("starts", "starts", |cx| {
-                let starts = windows(&|w| -((w * Cache::SIZE) as i32));
+                let starts = windows(&|w| -((w * BlockIndex::SIZE) as i32));
                 Load::load(cx, HostTensor::from_vec(starts))
             })?,
             rows: cx.field("rows", "rows", |cx| {
                 Load::load(cx, HostTensor::from_vec(windows(&|w| w as i32 * block)))
             })?,
-            zeros: cx.field("zeros", "zeros", |cx| {
-                Load::load(cx, HostTensor::from_vec(zeros))
+            firsts: cx.field("firsts", "firsts", |cx| {
+                Load::load(cx, HostTensor::from_vec(firsts))
             })?,
             slots: cx.field("slots", "slots", |cx| {
                 Load::load(cx, HostTensor::from_vec(slots))
@@ -363,7 +371,7 @@ where
     X::Tensor<i32, Chips, m![1]>: Load<&'a Y::Tensor<i32, Chips, m![1]>>,
     X::Tensor<i32, Chips, m![Windows, { Packets<Rows> }]>:
         Load<&'a Y::Tensor<i32, Chips, m![Windows, { Packets<Rows> }]>>,
-    X::Tensor<i32, Chips, m![Rows]>: Load<&'a Y::Tensor<i32, Chips, m![Rows]>>,
+    X::Tensor<i32, Chips, m![Windows, 1 # 8]>: Load<&'a Y::Tensor<i32, Chips, m![Windows, 1 # 8]>>,
     X::Tensor<f32, Chips, m![Rows, Cache]>: Load<&'a Y::Tensor<f32, Chips, m![Rows, Cache]>>,
 {
     fn load(
@@ -382,7 +390,7 @@ where
             visible: from.visible,
             starts: context.field("starts", "starts", |cx| Load::load(cx, &from.starts))?,
             rows: context.field("rows", "rows", |cx| Load::load(cx, &from.rows))?,
-            zeros: context.field("zeros", "zeros", |cx| Load::load(cx, &from.zeros))?,
+            firsts: context.field("firsts", "firsts", |cx| Load::load(cx, &from.firsts))?,
             slots: context.field("slots", "slots", |cx| Load::load(cx, &from.slots))?,
             shape: PhantomData,
         })
@@ -561,7 +569,7 @@ where
             ),
             write: table::writes::<Rows, _>(
                 device,
-                &logical.slots,
+                &logical,
                 const { Blocks::<Heads, Head, D, Chips>::ROW_STRIDE },
             ),
             read: work.read::<Rows>(),
@@ -602,7 +610,7 @@ where
     X::Tensor<i32, Chips, m![1]>: Borrow<Value<Chips>>,
     X::Tensor<i32, Chips, m![Windows, { Packets<Rows> }]>:
         Borrow<HbmTensor<i32, Chips, m![Windows, { Packets<Rows> }]>>,
-    X::Tensor<i32, Chips, m![Rows]>: Borrow<HbmTensor<i32, Chips, m![Rows]>>,
+    X::Tensor<i32, Chips, m![Windows, 1 # 8]>: Borrow<HbmTensor<i32, Chips, m![Windows, 1 # 8]>>,
     X::Tensor<f32, Chips, m![Rows, Cache]>: Borrow<HbmTensor<f32, Chips, m![Rows, Cache]>>,
 {
     type Output = Context<
@@ -621,16 +629,19 @@ where
             (&Logical<Rows, Chips>, &History<G, B, K, Chips>),
         ),
     ) -> Self::Output {
-        let (starts, frequencies) = (self.starts.borrow(), self.frequencies.borrow());
-        let length = table::live(device, self.zeros.borrow(), tiles, &logical.lengths);
-        let extents = Extents::new(device, (self.window.borrow(), starts), &length);
+        let frequencies = self.frequencies.borrow();
+        let extents = Extents::new(
+            device,
+            (self.window.borrow(), self.starts.borrow()),
+            (logical, tiles),
+        );
         let blocks = extents.table(
             device,
             (self.rows.borrow(), &history.blocks),
-            &logical.tables,
+            logical,
             const { Blocks::<Heads, Head, D, Chips>::BLOCK_STRIDE },
         );
-        let bias = extents.bias(device, (starts, self.slots.borrow()));
+        let bias = extents.bias(device, (self.firsts.borrow(), self.slots.borrow()));
         // Copied here, once a step, so no layer writes the memory its gathers read their entries
         // from: that write would sync the cores ahead of each gather.
         let rows = RowMajor::new::<D>(device, (&blocks, &extents.counts), tiles);
@@ -643,7 +654,7 @@ where
                 device,
                 (&history.blocks, self.slots.borrow()),
                 (
-                    &logical.tables,
+                    logical,
                     const {
                         (
                             Blocks::<Heads, Head, D, Chips>::BLOCK_STRIDE,
@@ -654,7 +665,14 @@ where
                 &mut offsets,
             );
         }
-        let counts = extents.wrapped(device);
+        let counts = extents.wrapped(device, logical);
+        // Before the rotation, so the rows of `logical` leave data memory before the paging's last
+        // passes: where the owners after the paging land depends on what is still held there.
+        let write = table::writes::<Rows, _>(
+            device,
+            logical,
+            const { Blocks::<Heads, Head, D, Chips>::ROW_STRIDE },
+        );
         let positions =
             table::positions::<Rows, Rotated, _>(device, frequencies, &logical.positions);
         Context {
@@ -664,11 +682,7 @@ where
                 &mut (),
                 (frequencies, &positions),
             ),
-            write: table::writes::<Rows, _>(
-                device,
-                &logical.slots,
-                const { Blocks::<Heads, Head, D, Chips>::ROW_STRIDE },
-            ),
+            write,
             read: Pages {
                 table: blocks,
                 lengths: extents.counts,
@@ -687,6 +701,9 @@ where
         }
     }
 }
+
+/// One I32 a window in memory `X`, a window a flit.
+type PerWindow<X, Windows, Chips> = <X as Memory>::Tensor<i32, Chips, m![Windows, 1 # 8]>;
 
 /// A rotation's constants in memory `X`, a copy for each of `Rows` rows.
 type RowCoefficients<X, Rows, Rotated, Chips> =
@@ -839,7 +856,7 @@ mod tests {
             chips(device, &paging.window).await,
             chips(device, &paging.starts).await,
             chips(device, &paging.rows).await,
-            chips(device, &paging.zeros).await,
+            chips(device, &paging.firsts).await,
             chips(device, &paging.slots).await,
         ]
     }

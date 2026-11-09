@@ -63,16 +63,6 @@ pub type Stream<'l, S = stage::Tag, D = i32, Stash = Fresh, Chips = Chip> = Vect
     { stage::VeOrder::IntraFirst },
 >;
 
-/// Copy the one I32 element a view selects into a scalar of its own.
-pub(crate) fn read<Chips: M, E: M>(
-    device: &mut Device,
-    input: HbmTensorView<'_, i32, Chips, E>,
-) -> Value<Chips> {
-    let mut output = Value::new();
-    input.to_hbm_view(&mut device.tdma, output.view_mut());
-    output
-}
-
 /// Stage a scalar as an eight-cell DM packet for vector arithmetic.
 pub(crate) fn packet<Chips: M>(device: &mut Device, input: &Value<Chips>) -> Packet<i32, Chips> {
     let packed: HbmTensor<i32, Chips, m![1 # 8]> = input.to_hbm(&mut device.tdma);
