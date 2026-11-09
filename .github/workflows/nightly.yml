@@ -33,7 +33,7 @@ jobs:
       fail-fast: false
       matrix:
         framework: [vllm, sglang]
-    runs-on: arc-runner-benchmark-rngd4
+    runs-on: furiosa-opt-models-rngd4-runner
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
