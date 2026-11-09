@@ -617,6 +617,7 @@ pub mod form {
     use crate::ops::swiglu;
     use crate::tensor;
     use crate::tensor::form::fp8::Block;
+    use crate::tensor::form::fp8::Cancelled;
     use crate::tensor::form::fp8::Scales;
     use crate::tensor::form::nvfp4::{self, Early, Late, W4A4, W4A16};
     use crate::tensor::parallel::Chip;
@@ -725,19 +726,12 @@ pub mod form {
                 X::Tensor<f32, Chips, Scales<In, Out>>,
             >;
 
-        /// Each run of heads spread over the slices, the queries' and keys' with their heads'
-        /// squared scales, the values' with their heads' scales; every leaf in HBM, whatever `X`.
-        type Query<Hidden: AxisName, Heads: AxisName, Head: AxisName, X: Memory> = linear::Affine<
-            query::fp8::Weights<Hidden, Heads, Head, query::fp8::HeadSquares<Heads>>,
-            (),
-        >;
-        type Key<Hidden: AxisName, Heads: AxisName, Head: AxisName, X: Memory> = linear::Affine<
-            (
-                query::fp8::Weights<Hidden, Heads, Head, query::fp8::HeadSquares<Heads>>,
-                (),
-            ),
-            (),
-        >;
+        /// Each run of heads spread over the slices, the values' with their heads' scales (the head
+        /// norms cancel the queries' and keys'); every leaf in HBM, whatever `X`.
+        type Query<Hidden: AxisName, Heads: AxisName, Head: AxisName, X: Memory> =
+            linear::Affine<query::fp8::Weights<Hidden, Heads, Head, Cancelled>, ()>;
+        type Key<Hidden: AxisName, Heads: AxisName, Head: AxisName, X: Memory> =
+            linear::Affine<(query::fp8::Weights<Hidden, Heads, Head, Cancelled>, ()), ()>;
         type Value<Hidden: AxisName, Heads: AxisName, Head: AxisName, X: Memory> = linear::Affine<
             query::fp8::Weights<Hidden, Heads, Head, query::fp8::HeadScales<Heads, Head>>,
             (),

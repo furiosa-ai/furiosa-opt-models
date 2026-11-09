@@ -81,17 +81,15 @@ where
     }
 }
 
-impl<T: View<N>, const N: usize> View<N> for fp8::Squares<T> {
-    type Storage = T::Storage;
-    type Layer = fp8::Squares<T::Layer>;
+impl<const N: usize> View<N> for fp8::Cancelled {
+    type Storage = ();
+    type Layer = Self;
 
-    fn view(storage: &Self::Storage, layer: usize) -> Self::Layer {
-        fp8::Squares(T::view(storage, layer))
+    fn view(_: &(), _: usize) -> Self {
+        Self
     }
 
-    fn stack(layers: [Self; N], context: &mut Context<'_>) -> Self::Storage {
-        T::stack(layers.map(|layer| layer.0), context)
-    }
+    fn stack(_: [Self; N], _: &mut Context<'_>) {}
 }
 
 /// A part with no parameters, such as a key projection's absent head scales.
