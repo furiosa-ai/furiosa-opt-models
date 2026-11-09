@@ -3,7 +3,6 @@
 use super::{Chunk, Cluster, FeatureSlices, Lines, Spread, Tile, TilePart, TileParts, TileRows};
 use crate::Op;
 use crate::load::{Checkpoint, Context, Load, LoadError};
-use crate::modules::generic::schedule::{self, IntoStream, RowWise};
 use crate::tensor::form::Weight;
 use crate::tensor::{axis::Single, live::Live, scalar};
 use core::borrow::Borrow;
@@ -782,19 +781,6 @@ where
         .to_vrf();
     Scale::<SpreadLanes<Width, m![Rows]>>::of(&mut device.main, input.view(), &inverse, gain)
         .commit()
-}
-
-/// A norm streams one `forward` a tile.
-impl<'m, 's, U: schedule::Stream, E, S, Width: AxisName, const EPSILON: usize, Chips: M, Parameter>
-    IntoStream<U, E, &'s mut S> for &'m RmsNorm<Width, EPSILON, Chips, Parameter>
-where
-    RowWise<'s, &'m RmsNorm<Width, EPSILON, Chips, Parameter>, E, S, U>: schedule::Stream,
-{
-    type Stream = RowWise<'s, &'m RmsNorm<Width, EPSILON, Chips, Parameter>, E, S, U>;
-
-    fn into_stream(self, env: E, state: &'s mut S, upstream: U) -> Self::Stream {
-        RowWise::new(self, env, state, upstream)
-    }
 }
 
 #[cfg(test)]

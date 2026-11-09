@@ -122,40 +122,34 @@ A model's weights are the leaves of its tree.
 - **Tying is decided by type.** A size's geometry type fixes whether its head ties to its embedding, and the config must agree, so an untied fine-tune of a tied size is another size type. A tied leaf shares its target's HBM.
 - **Updates write in place.** An [`Update`](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/crates/furiosa-opt-models/src/load/update.rs) writes new weights into a loaded tree as their chunks arrive, keeping its structure and ties. If a write fails after the device took it, the tree's values are unknown until it loads again.
 
-## Streaming execution
+## Execution order
 
-`forward` computes a module's whole output before the next module starts.
-The streaming form runs the same tree a tile, a group of rows, at a time.
-A tile moves on as soon as it is computed, and a module that waits for input can do work that needs none, such as moving its next weights to DM.
+`forward` runs a module's whole output before the next module starts.
+A decoder runs instead in the order its family's schedule writes, kept in [`schedule/`](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/crates/furiosa-opt-models/src/schedule/decoder/mod.rs) apart from the tree and its leaves: a leaf computes, the schedule says when.
 
-Each module streams as a node that the next module polls, like a `futures::Stream` with the device in the place of the task context.
-A node polls its own input only when it needs another tile, and it keeps its progress in its fields, so a module streams without a coroutine.
-`Scheduled<M>` polls a model's root this way until it is done, and computes what `M::forward` computes.
-[`schedule.rs`](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/crates/furiosa-opt-models/src/modules/generic/schedule.rs) states the poll contract.
+Attention is a decoder's only step that reads other tokens' rows, so a launch's row tiles meet only there.
+`Decoder` runs the loops: the first layer's stores over the embedded tiles, then each layer's attention once and, tile by tile, the work up to the next layer's store or the head.
+That work is a `Tokenwise`: the end of one part, a layer after its attention or the embedded rows, then the start of the next, a layer up to its attention's store or the final norm.
+A layer shape is cut at its attention, and its weights' landings are placed, only in its `Cut` impl, whose steps the `Tokenwise` impls run.
 
-| Module | Streams as |
-| --- | --- |
-| A leaf whose output row depends only on its input row | `RowWise`: one `forward` per tile |
-| A leaf whose output row reads other rows, such as attention | `CrossRow`: stores every input tile, runs one `forward`, then gives the output tile by tile |
-| `Sequential`, `Then` | The second child's node over the first's |
-| `Residual` | Feeds each normalized tile to its branch, and adds the branch's output tile to the input tile |
-| A rolled `Layers` | Two live layers; the one that finishes restarts as the layer two ahead, so one copy of a layer's code serves any layer count |
-
-- **A rolled stack needs each layer to take its whole input before it gives its first tile,** as a layer with attention does. A device body cannot stop at run time, so a layer that gives a tile earlier passes it on out of order instead of failing.
-- **`CrossRow` writes its result to a tensor and gives it tile by tile,** because the device cannot select a value that appears at a poll it picks at run time.
+- **The order is written, not derived.** A schedule is one `forward` of plain loops, so the scheduler gets the order a reader sees. Polled streams kept the order in node state, and the device compile spent minutes on its branches.
+- **A weight lands one part ahead of its use, never during an attention.** A paged attention's fold fills most of data memory: an MLP weight live there is refused at allocation. The next layer's projections land between this layer's MLP steps, the output projection's while the attention's last history is in flight.
+- **A device loop cannot carry a struct whose fields it also reads apart.** A period loop that carries a staging struct and reads the struct's own stored rows is refused with `Loop inputs/outputs contain duplicate tensor indices`; keep the rows in a place of their own.
+- **A capture-free closure is not a value on the device.** Passing one is refused with `unsupported aggregate constant`; split the step around the work instead.
+- **A non-generic caller of device-only code fails the host build.** Host codegen monomorphizes tile sizes the device compile never reaches and fails their const checks; keep a root's `Module` impl generic in its env, so only the launches that run it compile it.
 
 ## The model registry
 
 [The registry](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/crates/furiosa-opt-engine/src/registry.rs) names every upstream architecture once, under its model family, with the decoders its checkpoints load as, or none.
 Of the decoders a name lists, the one whose size serves the checkpoint loads; choosing it reads the config and the tensor names, never a weight.
 A refused name fails as `Unsupported` and an unknown one as `InvalidData`, so an error tells a model the stack does not serve yet from a name that does not exist.
-A load returns the chosen decoder as a `decoder::Served`, one object whatever its model, so the registry is a plain table and dispatches nothing; what a model computes stays in its family's code and its engine decoder.
+A load returns the chosen decoder as a `decoder::Served`, one object whatever its model, so the registry is a plain table and dispatches nothing; what a model computes stays in its family's code.
 
 ## On the host
 
 The engine runs a loaded tree through a `Function`, which binds a borrowed tree to its compiled entry.
 A `Function` is an `AsyncModule`, the host counterpart of `Module`: its call returns once the device accepted the launch, and its output stays a device tensor.
-A decoder's call sequences its launches; Qwen3's causal model launches its base model, then its greedy head on the rows its requests keep.
+A decoder's call is one launch of its root: Qwen3's causal model runs its base model's loops, then its greedy head on the rows its requests keep.
 [Architecture](../design/architecture.md#4-engine-host-composition) states the engine's guarantees.
 
 To write an operation that has no kernel yet, see [Writing a kernel](kernel.md).

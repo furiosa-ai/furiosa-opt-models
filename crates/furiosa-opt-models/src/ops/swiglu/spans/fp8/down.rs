@@ -1,6 +1,6 @@
 use super::*;
+use crate::Begin;
 use crate::Op;
-use crate::modules::generic::schedule::Begin;
 use crate::ops::normalization::span;
 use crate::tensor::axis;
 use crate::tensor::live::Live;
@@ -265,7 +265,7 @@ type Landed<H, I, Rows> = (
     Scale<H, I, Rows>,
 );
 
-/// What a tile's product leaves the down projection between the node's two steps, all of it in
+/// What a tile's product leaves the down projection between its two steps, all of it in
 /// HBM but the first down panel: the product of at most two waves as it is, of more waves its
 /// three quantized panels and their row scales.
 pub struct Staging<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName> {

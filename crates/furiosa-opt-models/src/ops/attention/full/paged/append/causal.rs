@@ -1,5 +1,5 @@
 use super::*;
-use crate::modules::generic::schedule::Begin;
+use crate::Begin;
 use crate::{Module, Op};
 
 /// Seeds a group's state from its own fresh keys under the block's causal mask.

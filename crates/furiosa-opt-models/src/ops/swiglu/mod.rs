@@ -2,15 +2,14 @@
 //! the SiLU of the gate to BF16 before the up half multiplies it.
 //!
 //! - Rows in HBM run the projections over rows and their SwiGLU in turn.
-//! - A span's rows on chip run three stages its weight forms implement: the gate/up projections,
-//!   the SwiGLU, and the down projection, which takes its product in two steps (staged, then
-//!   projected). The span stream ([`spans`]) runs the same stages, a tile's gate/up weights
-//!   staged ahead of it and its two halves on two polls.
+//! - A span's rows on chip run three stages its weight forms ([`spans`]) implement: the gate/up
+//!   projections, the SwiGLU, and the down projection, which takes its product in two steps
+//!   (staged, then projected). A schedule may land a tile's gate/up weights ahead of it.
 
 use furiosa_opt_std::prelude::*;
 
+use crate::Begin;
 use crate::load::{Checkpoint, Children, Context, Load, LoadError};
-use crate::modules::generic::schedule::Begin;
 use crate::ops::normalization::span::Owned;
 use crate::ops::pointwise::SwiGlu;
 use crate::tensor::form::Projections;
@@ -150,7 +149,7 @@ where
     }
 }
 
-/// A span's rows on chip: the stages the span stream runs, one after another.
+/// A span's rows on chip: the three stages, one after another.
 impl<'x, H, I, Rows, Capacity, F, D, A, G, P, C, Env>
     Module<&'x Live<Owned<H, Rows>, Capacity>, Env, &mut ()> for Mlp<H, I, F, D>
 where
