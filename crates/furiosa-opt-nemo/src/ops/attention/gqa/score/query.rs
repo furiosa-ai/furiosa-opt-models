@@ -6,21 +6,21 @@ pub trait Mapping: super::Mapping {
     type Span: M;
 }
 
-type Sums<S: Mapping> = m![
-    { S::Pair },
-    { S::Span } / 16,
-    { S::RowGroup },
-    { S::Groups },
-    { S::Keys } % 16 / 8
+type Sums<S> = m![
+    { <S as Mapping>::Pair },
+    { <S as Mapping>::Span } / 16,
+    { <S as Mapping>::RowGroup },
+    { <S as super::Mapping>::Groups },
+    { <S as super::Mapping>::Keys } % 16 / 8
 ];
-type Stream<S: Mapping, D: AxisName> = m![
-    { S::Pair },
-    { S::Span } / 16,
-    { S::RowGroup },
-    { S::Groups },
+type Stream<S, D> = m![
+    { <S as Mapping>::Pair },
+    { <S as Mapping>::Span } / 16,
+    { <S as Mapping>::RowGroup },
+    { <S as super::Mapping>::Groups },
     D / 16
 ];
-type Products<'d, B: M, C: M, L: M, S: Mapping> = VectorTensor<
+type Products<'d, B, C, L, S> = VectorTensor<
     'd,
     { Tu::Main },
     stage::Narrow,
@@ -28,8 +28,8 @@ type Products<'d, B: M, C: M, L: M, S: Mapping> = VectorTensor<
     B,
     C,
     L,
-    m![{ Sums<S> }, { S::Rows } % 2, { S::Keys } % 8 / 4],
-    m![{ S::Keys } % 4],
+    m![{ Sums<S> }, { <S as super::Mapping>::Rows } % 2, { <S as super::Mapping>::Keys } % 8 / 4],
+    m![{ <S as super::Mapping>::Keys } % 4],
     Fresh,
     { stage::VeOrder::IntraFirst },
     stage::Standalone,

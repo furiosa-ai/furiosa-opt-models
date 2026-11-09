@@ -36,7 +36,6 @@ pub type Input = HbmTensor<
         Hidden % 16
     ],
 >;
-pub type Weight = HbmTensor<bf16, Chips, m![Hidden]>;
 
 /// Each row's inverse RMS, replicated over its feature partitions; `EPSILON` holds FP32 bits.
 fn inverse<const EPSILON: usize>(device: &mut Device, input: &Values) -> Inverse {
@@ -141,50 +140,6 @@ pub mod eight {
     /// The gain landed in every row slice, once for all the waves a layer normalizes.
     pub type Landed = DmTensor<bf16, Chips, Cluster, Slices, m![Hidden % 160]>;
     pub type Normalized<D> = DmTensor<D, Chips, Cluster, Slices, m![Rows % 8, Hidden % 160]>;
-
-    /// Each row's inverse RMS, replicated over its feature partitions.
-    fn inverse(
-        device: &mut Device,
-        input: &Values,
-    ) -> VrfTensor<f32, Chips, Cluster, Slices, m![Rows % 8, 1 # 8]> {
-        let variance: DmTensor<f32, Chips, Cluster, Reduced, m![Rows % 8, 1 # 8]> = device
-            .main
-            .begin(input.view())
-            .fetch::<m![Rows % 8, Hidden % 160 / 8], m![Hidden % 8]>()
-            .fetch_cast::<f32>()
-            .collect::<m![Rows % 8, Hidden % 160 / 8], m![Hidden % 8]>()
-            .vector_init()
-            .vector_intra_slice_tag(TagMode::Zero)
-            .vector_narrow_split::<m![Rows % 8, Hidden % 160 / 4], m![Hidden % 4]>()
-            .vector_stash()
-            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), Stash)
-            .vector_intra_slice_reduce::<Hidden, m![Rows % 8], m![1 # 4]>(
-                IntraSliceReduceOpF32::Add,
-            )
-            .vector_fp_div(5120.0_f32)
-            .vector_widen_pad::<m![1 # 8]>()
-            .vector_clip(ClipBinaryOpF32::Add, 1e-5_f32 / 32.0)
-            .vector_inter_slice_reduce::<Reduced, m![Rows % 8]>(InterSliceReduceOpF32::Add)
-            .vector_final()
-            .commit_trim::<m![1 # 8]>()
-            .commit();
-        // SAFETY: all feature partitions carry the same reduced row scalar in wire order.
-        let variance: DmTensor<f32, Chips, Cluster, Slices, m![Rows % 8, 1 # 8]> =
-            unsafe { variance.reshape() };
-        device
-            .main
-            .begin(variance.view())
-            .fetch::<m![Rows % 8], m![1 # 2]>()
-            .collect::<m![Rows % 8], m![1 # 8]>()
-            .vector_init()
-            .vector_intra_slice_tag(TagMode::Zero)
-            .vector_narrow_trim::<m![1 # 4]>()
-            .vector_fp_unary(FpUnaryOp::Sqrt)
-            .vector_fp_div_with_mode(BinaryArgMode::Mode10, 1.0_f32)
-            .vector_widen_pad::<m![1 # 8]>()
-            .vector_final()
-            .to_vrf::<m![Rows % 8, 1 # 8]>(&mut device.sub)
-    }
 
     /// RMS-normalizes one wave, applies the gain and rounds straight to FP8 by `scale`.
     pub fn quantize(

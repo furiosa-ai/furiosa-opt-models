@@ -24,10 +24,3 @@ impl<S: M, Chips: M> Weight<S, Chips> {
         self.tensor
     }
 }
-
-/// A parameter a checkpoint may omit: `()` when absent, the tensor itself when present.
-pub trait Optional<T> {}
-
-impl<D: Scalar, Chips: M, S: M> Optional<HbmTensor<D, Chips, S>> for () {}
-
-impl<D: Scalar, Chips: M, S: M> Optional<HbmTensor<D, Chips, S>> for HbmTensor<D, Chips, S> {}

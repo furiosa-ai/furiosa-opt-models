@@ -62,8 +62,6 @@ type HalfSums = m![
 ];
 pub type HalfValues = DmTensor<f32, Chips, Cluster, Slices, m![Rows % 32, Vocabulary % 128]>;
 
-/// Hidden-tile-major, so each 256-feature tile lands as one contiguous read.
-pub type Weights = HbmTensor<bf16, Chips, m![Hidden / 256, Vocabulary, Hidden % 256]>;
 /// One 64-row group's logits of this chip's vocabulary shard.
 pub type Logits = DmTensor<bf16, Chips, Cluster, Slices, m![Rows, Vocabulary % 128]>;
 

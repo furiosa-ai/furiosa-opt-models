@@ -8,47 +8,6 @@ use furiosa_opt_std::prelude::*;
 axes![Term = 2];
 
 impl AllReduce<Parallel<2>> {
-    /// Select each destination rank's absolute partition after the peer permutation.
-    pub(crate) fn scatter<
-        S: Space,
-        D: MaterializableScalar,
-        Chips: M,
-        C: M,
-        L: M,
-        E: M,
-        I: M,
-        O: M,
-    >(
-        &self,
-        device: &mut Device,
-        input: Dm<
-            S,
-            (
-                DmTensorView<'_, D, Chips, C, L, E>,
-                DmTensorViewMut<'_, D, Chips, C, L, O>,
-                DmTensorViewMut<'_, D, Chips, C, L, O>,
-            ),
-        >,
-    ) -> Dm<S, ()> {
-        const { assert!(Chips::SIZE == 2 && I::SIZE == 2) };
-        input
-            .value
-            .0
-            .clone()
-            .chip_shuffle([1, 0])
-            .chip_slice::<I, O>([0, 1])
-            .to_dm_view(&mut device.tdma, input.value.1);
-        input
-            .value
-            .0
-            .chip_slice::<I, O>([0, 1])
-            .to_dm_view(&mut device.tdma, input.value.2);
-        Dm {
-            tiles: input.tiles,
-            value: (),
-        }
-    }
-
     /// Keep the FP32 sum unrounded for the projection's retained scale completion.
     pub(crate) fn sum<'d, 'x, S: Space, Chips: M, C: M, L: M, E: M, T: M, P: M>(
         &self,

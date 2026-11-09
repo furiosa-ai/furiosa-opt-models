@@ -1,8 +1,6 @@
 use furiosa_opt_std::prelude::*;
 
-use crate::View;
 use crate::ops::layout::axes::{Parallel, Parallelism};
-use crate::ops::linear::Affine;
 
 /// TP2 head pairs, with 128 features per head and inputs grouped in blocks of 80.
 pub trait Layout: Clone + std::fmt::Debug + 'static {
@@ -35,7 +33,6 @@ pub type Stored<L> = m![
 ];
 pub type Weight<L> = m![Panel, { Stored<L> }];
 pub type Factors = m![Factor, 1 # 8];
-pub type Packed<L> = Affine<Parameters<L>, ()>;
 
 /// Panel p contains local heads 2g+p; factors 0/1 restore the shared input and Q weight.
 #[derive(DeviceSend)]
@@ -69,19 +66,5 @@ impl<L: Layout> Parameters<L> {
                 })
             })
             .collect()
-    }
-}
-
-impl<L: Layout, const N: usize> View<N> for Parameters<L> {
-    type Storage = (
-        <HbmTensor<f8e4m3, Chips, Weight<L>> as View<N>>::Storage,
-        <HbmTensor<f32, Chips, Factors> as View<N>>::Storage,
-    );
-
-    fn view(storage: &Self::Storage, layer: usize) -> Self {
-        Self {
-            weight: View::<N>::view(&storage.0, layer),
-            factors: View::<N>::view(&storage.1, layer),
-        }
     }
 }

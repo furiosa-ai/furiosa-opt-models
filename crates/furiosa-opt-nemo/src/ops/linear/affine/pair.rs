@@ -1,8 +1,6 @@
 use furiosa_opt_std::prelude::*;
 
-use crate::View;
 use crate::ops::layout::axes::{Parallel, Parallelism};
-use crate::ops::linear::Affine;
 
 /// TP2 output shards, interleaving each 64-output key block with its value block.
 pub trait Layout: Clone + std::fmt::Debug + 'static {
@@ -31,7 +29,6 @@ pub type Scale<L> = m![
     { O<L> } / 512, { O<L> } % 512 / 128, { O<L> } % 128 / 64 = 1 # 2,
     { O<L> } % 64 / 32, 16, 1 # 8
 ];
-pub type Packed<L, const ROLE: usize> = Affine<Parameters<L, ROLE>, ()>;
 
 /// Each leaf exposes only its own weight and factor regions of the shared read-only pair.
 #[derive(DeviceSend)]
@@ -86,19 +83,5 @@ impl<L: Layout, const ROLE: usize> Parameters<L, ROLE> {
                 stored.into_buf()
             })
             .collect()
-    }
-}
-
-impl<L: Layout, const ROLE: usize, const N: usize> View<N> for Parameters<L, ROLE> {
-    type Storage = (
-        <HbmTensor<f8e4m3, Chips, Stored<L>> as View<N>>::Storage,
-        <HbmTensor<f32, Chips, Factors<L>> as View<N>>::Storage,
-    );
-
-    fn view(storage: &Self::Storage, layer: usize) -> Self {
-        Self::new(
-            View::<N>::view(&storage.0, layer),
-            View::<N>::view(&storage.1, layer),
-        )
     }
 }

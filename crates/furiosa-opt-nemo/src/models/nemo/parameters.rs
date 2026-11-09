@@ -4,7 +4,7 @@
 use super::serving::{
     Chips, Hidden, head::Vocabulary, mlp, output, qkv, scale, stack::Depth, step,
 };
-use crate::ops::linear::output::packed::{self, Layout};
+use crate::ops::linear::output::packed::Layout;
 use furiosa_opt_std::prelude::*;
 mod binding;
 
@@ -33,9 +33,6 @@ impl Layout for Output {
         { Symbol<Self::Input> } % 8
     ];
 }
-
-/// The O weight's two output halves, as `packed::Parameters` lays a rank's out.
-pub type OutputParameters = packed::Parameters<Output>;
 
 #[derive(Clone, Debug)]
 pub struct Query;

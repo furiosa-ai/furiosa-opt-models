@@ -54,7 +54,6 @@ type Half = m![
     Hidden % 8,
     Width % 8
 ];
-pub type Input = HbmTensor<bf16, Chips, m![Rows, Width]>;
 pub type Partial = DmTensor<bf16, Chips, Cluster, Reduced, m![{ PartialTime }, { Lanes }]>;
 axes![Wave = 8];
 type Space = crate::compose::Tile<Rows, Wave>;
@@ -94,29 +93,6 @@ const _: () = {
     assert!(Reduced::SIZE == 256);
     assert!(2 * Stored::SIZE == 3 * Hidden::SIZE * Width::SIZE);
 };
-
-/// The `Stored` position of O value (absolute `hidden` output, absolute head `feature`) on every
-/// chip that holds it: its hidden half's chip and its heads' chip, the same slot on both.
-pub fn places(hidden: usize, feature: usize) -> ([usize; 2], usize) {
-    let (half, owner) = (hidden / 2560, feature / 2048);
-    let (h, w) = (hidden % 2560, feature % 2048);
-    let index = [
-        (3, half + 1 - owner),
-        (2, h % 1280 / 640),
-        (2, h % 640 / 320),
-        (2, h % 320 / 160),
-        (32, w / 64),
-        (2, h / 1280),
-        (2, h % 160 / 80),
-        (10, h % 80 / 8),
-        (8, w % 64 / 8),
-        (8, h % 8),
-        (8, w % 8),
-    ]
-    .iter()
-    .fold(0, |index, &(size, digit)| index * size + digit);
-    ([half, owner], index)
-}
 
 /// One layer's O weight and scales in data memory.
 pub struct Weight {

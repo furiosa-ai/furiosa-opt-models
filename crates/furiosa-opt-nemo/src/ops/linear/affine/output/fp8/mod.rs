@@ -76,21 +76,3 @@ pub type Output8<Hidden, QWidth> = Affine<
 >;
 pub(crate) type Staged8<Hidden, QWidth> =
     Affine<(Weight8<Hidden, QWidth>, Channels<Hidden, QWidth>), ()>;
-
-impl<Hidden: AxisName, QWidth: AxisName> Output8<Hidden, QWidth> {
-    pub(crate) fn empty() -> Staged8<Hidden, QWidth> {
-        Affine::new((Weight8::new(), Channels::new()), ())
-    }
-
-    pub(crate) fn load(&self, context: &mut Device, staged: &mut Staged8<Hidden, QWidth>) {
-        let (weight, channels) = &mut staged.weight;
-        self.weight
-            .0
-            .view()
-            .to_dm_view(&mut context.tdma, weight.view_mut());
-        self.weight
-            .1
-            .view()
-            .to_dm_view(&mut context.tdma, channels.view_mut());
-    }
-}

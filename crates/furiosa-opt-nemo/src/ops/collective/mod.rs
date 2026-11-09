@@ -11,19 +11,7 @@ use crate::{
 };
 use furiosa_opt_std::prelude::*;
 
-mod gather;
 mod resident;
-pub mod rows;
-
-/// Concatenate chip-local vectors in chip order and replicate the result on every chip.
-#[derive(DeviceSend)]
-pub struct AllGather<P, V>(PhantomData<(P, V)>);
-
-impl<P, V> Default for AllGather<P, V> {
-    fn default() -> Self {
-        Self(PhantomData)
-    }
-}
 
 axes![Two = 2];
 

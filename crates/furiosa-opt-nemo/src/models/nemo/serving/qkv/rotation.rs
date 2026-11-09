@@ -93,24 +93,3 @@ pub fn apply<B: M, C: M + 'static, S: M + 'static, T: M + 'static>(
     // SAFETY: concatenating OutputHalf × Half restores one contiguous Head per row.
     unsafe { rotated.value.reshape() }
 }
-
-/// Rotation coefficients of 64 consecutive positions starting at `position`.
-pub fn coefficients(position: u16) -> HostTensor<bf16, Stored> {
-    assert!(position <= u16::MAX - 63);
-    HostTensor::from_vec((0u16..64).flat_map(|row| {
-        (0..2).flat_map(move |output| {
-            (0..2).flat_map(move |input| {
-                (0u16..64).map(move |feature| {
-                    let angle =
-                        f32::from(position + row) / THETA.powf(f32::from(2 * feature) / 128.0);
-                    bf16::from_f32(match (output, input) {
-                        (0, 0) | (1, 1) => angle.cos(),
-                        (0, 1) => -angle.sin(),
-                        (1, 0) => angle.sin(),
-                        _ => unreachable!(),
-                    })
-                })
-            })
-        })
-    }))
-}

@@ -1,13 +1,6 @@
 //! Combinators that give each child its own part of the invocation context.
 
 use crate::{First, Identity, Module};
-use furiosa_opt_std::prelude::DeviceSend;
-
-/// Applies A, then B, each with its own part of the context.
-pub type Chain<A, B> = (A, B, First);
-
-/// Applies A and B to separate inputs, each with its own context.
-pub type ProductWithContexts<A, B> = (A, B, Identity);
 
 impl<'c, D, X, Y, Z, C, E, A, B> Module<(&mut D, (X, &'c mut (C, E)))> for (A, B, First)
 where
@@ -72,32 +65,6 @@ where
         let x = self.0.forward((&mut *device, (x, first)));
         let y = self.1.forward((device, (y, second)));
         (x, y)
-    }
-}
-
-/// Reborrow an owned intermediate for a child that does not consume it.
-#[derive(DeviceSend)]
-pub struct Borrow<M>(pub M);
-
-impl<D, X, C, O, M> Module<(&mut D, (X, C))> for Borrow<M>
-where
-    M: for<'d, 'x> Module<(&'d mut D, (&'x X, C)), Output = O>,
-{
-    type Output = O;
-
-    fn forward(&self, (device, (input, context)): (&mut D, (X, C))) -> O {
-        self.0.forward((device, (&input, context)))
-    }
-}
-
-impl<D, X, O, M> Module<(&mut D, &mut X)> for Borrow<M>
-where
-    M: for<'d, 'x> Module<(&'d mut D, &'x X), Output = O>,
-{
-    type Output = O;
-
-    fn forward(&self, (device, input): (&mut D, &mut X)) -> O {
-        self.0.forward((device, &*input))
     }
 }
 

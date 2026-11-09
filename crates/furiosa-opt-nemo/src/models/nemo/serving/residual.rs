@@ -58,15 +58,6 @@ impl<C: M, S: M, T: M, P: M> Exchanged<C, S, T, P> {
     }
 }
 
-pub fn complete<C: M, S: M, T: M, P: M>(
-    device: &mut Device,
-    partial: Values<C, S, T, P>,
-    residual: &Values<C, S, T, P>,
-) -> Values<C, S, T, P> {
-    let exchanged = exchange(device, partial);
-    finish(device, exchanged, residual)
-}
-
 /// Sends the partial to the peer rank; the sum waits only for `finish`, so work issued between
 /// the two runs while the transfer is in flight.
 pub fn exchange<C: M, S: M, T: M, P: M>(
@@ -128,8 +119,8 @@ mod tests {
             partial.to_dm(&mut device.tdma);
         let residual: DmTensor<bf16, Chips, Cluster, Slice, m![{ Time }, { Packet }]> =
             residual.to_dm(&mut device.tdma);
-        complete::<Cluster, Slice, Time, Packet>(device, partial, &residual)
-            .to_hbm(&mut device.tdma)
+        let exchanged = exchange(device, partial);
+        super::finish(device, exchanged, &residual).to_hbm(&mut device.tdma)
     }
 
     /// Both ranks round the partial sum to BF16 before adding their replicated residual.

@@ -60,7 +60,7 @@ impl<'x, H, G, D, const SCALE: usize, B: M, C: M, L: M, E: M, S: Accumulation>
     }
 }
 
-type Product<'d, B: M, C: M, L: M, T: M, P: M> = VectorTensor<
+type Product<'d, B, C, L, T, P> = VectorTensor<
     'd,
     { Tu::Main },
     stage::Narrow,

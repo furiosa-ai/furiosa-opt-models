@@ -2,9 +2,7 @@ use furiosa_opt_std::prelude::*;
 
 use crate::ops::layout::axes::Chip;
 
-mod rows;
 mod tiles;
-pub(crate) use rows::compute_rows;
 pub(crate) use tiles::{Tiles, Tiling};
 
 pub(crate) type Owned<Width, All> =

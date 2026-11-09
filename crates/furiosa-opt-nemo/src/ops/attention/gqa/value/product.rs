@@ -10,7 +10,11 @@ pub trait Partitioned: Mapping {
     type Span: M;
 }
 
-type Stream<S: Mapping> = m![{ S::Channel } / 32, { S::Keys } / 4, { S::Keys } % 4];
+type Stream<S> = m![
+    { <S as Mapping>::Channel } / 32,
+    { <S as super::Mapping>::Keys } / 4,
+    { <S as super::Mapping>::Keys } % 4
+];
 
 impl<'x, H, G, D, const SCALE: usize, B: M, C: M, L: M, J: M, E: M, S: Mapping>
     Module<(
@@ -85,31 +89,31 @@ impl<'x, H, G, D, const SCALE: usize, B: M, C: M, L: M, J: M, E: M, S: Mapping>
     }
 }
 
-type Fetch<S: Partitioned> = m![
-    { S::Row },
-    { S::Channel } / 16,
-    { S::RowGroup },
-    { S::Groups } / 2,
-    { S::Span } / 16
+type Fetch<S> = m![
+    { <S as Partitioned>::Row },
+    { <S as Mapping>::Channel } / 16,
+    { <S as Partitioned>::RowGroup },
+    { <S as super::Mapping>::Groups } / 2,
+    { <S as Partitioned>::Span } / 16
 ];
-type Sums<S: Partitioned> = m![
-    { S::Row },
-    { S::Channel } / 16,
-    { S::RowGroup },
-    { S::Groups } / 2,
-    { S::Channel } % 16 / 8
+type Sums<S> = m![
+    { <S as Partitioned>::Row },
+    { <S as Mapping>::Channel } / 16,
+    { <S as Partitioned>::RowGroup },
+    { <S as super::Mapping>::Groups } / 2,
+    { <S as Mapping>::Channel } % 16 / 8
 ];
-type Values<B: M, C: M, L: M, S: Partitioned> = TrfTensor<
+type Values<B, C, L, S> = TrfTensor<
     bf16,
     B,
     C,
     L,
-    m![{ S::Channel } % 8],
+    m![{ <S as Mapping>::Channel } % 8],
     m![
-        { S::Channel } / 16,
-        { S::Span } / 16,
-        { S::Channel } % 16 / 8,
-        { S::Keys } % 16
+        { <S as Mapping>::Channel } / 16,
+        { <S as Partitioned>::Span } / 16,
+        { <S as Mapping>::Channel } % 16 / 8,
+        { <S as super::Mapping>::Keys } % 16
     ],
 >;
 

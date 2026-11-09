@@ -47,15 +47,6 @@ impl Parallelism for Parallel<4> {
     type Local<W: AxisName> = Part<W, 4>;
 }
 
-/// `N` chips, each holding a copy of every tensor and running the whole module.
-#[derive(Clone, Debug)]
-pub struct Replicated<const N: usize>;
-
-impl<const N: usize> Parallelism for Replicated<N> {
-    type Chip = m![{ Symbol<Shard<N>> }];
-    type Local<W: AxisName> = W;
-}
-
 /// One shard's equal share of a feature axis, retaining its axis name.
 #[derive(Clone, Debug)]
 pub struct Part<W, const N: usize>(std::marker::PhantomData<W>);
@@ -73,43 +64,9 @@ impl<W: AxisName, const N: usize> AxisName for Part<W, N> {
 #[derive(Debug, Clone)]
 pub struct Rows<const N: usize>;
 
-pub type SixtyFour = Rows<64>;
-
 impl<const N: usize> AxisName for Rows<N> {
     const NAME: Ident = Ident::new("Rows");
     const SIZE: usize = N;
-}
-
-/// A batch of at most `CAP` rows from a capacity of `MAX`.
-#[derive(Clone, Debug)]
-pub struct Limit<const MAX: usize, const CAP: usize>;
-
-impl<const MAX: usize, const CAP: usize> AxisName for Limit<MAX, CAP> {
-    const NAME: Ident = Ident::new("Rows");
-
-    const SIZE: usize = {
-        assert!(MAX == 16 || MAX == 64);
-        if MAX < CAP { MAX } else { CAP }
-    };
-}
-
-/// Row tile bounded by N; a non-divisible capacity falls back to one lane group.
-#[derive(Debug, Clone)]
-pub struct Tile<R, const N: usize>(core::marker::PhantomData<R>);
-
-impl<R: AxisName, const N: usize> AxisName for Tile<R, N> {
-    const NAME: Ident = Ident::new("Tile");
-
-    const SIZE: usize = {
-        assert!(N >= 8 && N % 8 == 0);
-        if R::SIZE <= N {
-            R::SIZE
-        } else if R::SIZE % N == 0 {
-            N
-        } else {
-            Lanes::<R>::SIZE
-        }
-    };
 }
 
 /// Row lanes in a vector packet: the greatest divisor of the row count within the hardware's
@@ -132,27 +89,4 @@ impl<R: AxisName> AxisName for Lanes<R> {
 /// The row packets of an `R`-row envelope: a loop over its live rows, one packet of lanes a trip.
 impl<R: AxisName> crate::compose::Space for Lanes<R> {
     type Envelope = R;
-}
-
-/// The row tiles of an `R`-row envelope: a loop over its live rows, one tile a trip.
-impl<R: AxisName, const N: usize> crate::compose::Space for Tile<R, N> {
-    type Envelope = R;
-}
-
-/// Row tile bounded by 128; non-divisible capacities use their power-of-two divisor.
-#[derive(Clone, Debug)]
-pub(crate) struct DivisorTile<W>(std::marker::PhantomData<W>);
-
-impl<W: AxisName> AxisName for DivisorTile<W> {
-    const NAME: Ident = Ident::new("Tile");
-
-    const SIZE: usize = if W::SIZE <= 128 {
-        W::SIZE
-    } else {
-        if W::SIZE % 128 == 0 {
-            128
-        } else {
-            1 << W::SIZE.trailing_zeros()
-        }
-    };
 }

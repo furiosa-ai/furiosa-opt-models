@@ -652,42 +652,11 @@ impl Pass<'_> {
             .store(device, &self.factors.divisor, prepared, (product, wave));
     }
 
-    /// The second hidden half of an opened wave's gate/up.
-    pub fn contract_rest(
-        &self,
-        device: &mut Device,
-        opened: Opened,
-        activation: &producer::Activation,
-    ) -> Contracted {
-        let turned = self.turn(device, opened, activation);
-        self.contract_last(device, turned)
-    }
-
     /// A reloaded product relaid with its first panel's register filled.
     pub fn prefill(&self, device: &mut Device, raw: &down::Raw) -> Prefilled {
         let relaid = down::relayout(device, raw);
         let low = down::fill(device, &relaid, 0);
         Prefilled { relaid, low }
-    }
-
-    /// The down of a prefilled wave with the contracted wave `wave`'s product finished under it
-    /// and stored into `product`.
-    pub fn down_with(
-        &self,
-        device: &mut Device,
-        (Prefilled { relaid, low }, Contracted(halves)): (Prefilled, Contracted),
-        panels: &down::Panels<'_>,
-        (product, wave): (&mut Product, usize),
-    ) -> Advanced {
-        let left = down::contract(device, (panels.left, &low));
-        let high = down::fill(device, &relaid, 1);
-        let prepared = prepare(device, &self.factors, &halves);
-        let right = down::contract(device, (&panels.right, &high));
-        let sum = down::fold(device, (left, right));
-        let crossed = down::cross(device, &sum);
-        self.model
-            .store(device, &self.factors.divisor, prepared, (product, wave));
-        Advanced(crossed)
     }
 
     /// Wave `wave`'s product into `raw`, for its down in the next iteration.

@@ -158,9 +158,7 @@ impl<S: Space> Tiles<S> {
 }
 
 mod points;
-mod window;
-pub use points::{Deferred, Issued, Points, Prefetch, Prefetched, Prefetching};
-pub use window::{Bounded, Fixed, Periods, window};
+pub use points::Points;
 
 /// A value known up to a finite, positive factor `c` per row and head: an RMS norm cancels it, its
 /// epsilon then acting on the true value `q` as `q / sqrt(mean(q²) + epsilon c²)`. Only the head
@@ -172,84 +170,11 @@ impl<X> Scaled<X> {
     pub fn new(value: X) -> Self {
         Self(value)
     }
-
-    /// The value, for an approved consumer.
-    pub fn cancel(self) -> X {
-        self.0
-    }
-}
-
-/// A launch value in HBM that a loop reads on chip: [`Fill::fill`] lands the rows of one tile `T`
-/// where the value enters the loop.
-pub trait Fill<D, T> {
-    /// The tile's rows, on chip.
-    type Rows;
-    fn fill(&self, context: &mut D, tile: T) -> Self::Rows;
-}
-
-/// A launch value in HBM that a loop writes from chip: [`Spill::spill`] stores the rows `R` of
-/// one tile `T` where they leave the loop.
-pub trait Spill<D, R, T> {
-    fn spill(&mut self, context: &mut D, rows: R, tile: T);
-}
-
-/// The tiles of an iteration space that cover a launch's live rows: a loop of [`Tiling::count`]
-/// trips, trip `index` on [`Tiling::get`]`(index)`.
-pub trait Tiling: Copy {
-    type Tile;
-    fn count(self) -> usize;
-    fn get(self, index: usize) -> Self::Tile;
-}
-
-impl<S: Space> Tiling for Tiles<S> {
-    type Tile = (usize, Self);
-
-    fn count(self) -> usize {
-        self.count()
-    }
-
-    fn get(self, index: usize) -> Self::Tile {
-        (index, self.tile(index))
-    }
-}
-
-/// One loop over `tiles`: each trip runs the modules fused into it on one tile, so the values
-/// between them stay on chip.
-pub fn fuse<D, I: Tiling, T>(
-    context: &mut D,
-    (mut state, tiles): (T, I),
-    mut trip: impl FnMut(&mut D, T, I::Tile) -> T,
-) -> T {
-    for index in 0..tiles.count() {
-        state = trip(context, state, tiles.get(index));
-    }
-    state
-}
-
-/// A part of the step that a launch reads once: a read of launch metadata holds the command issue
-/// until the DMA queue drains, so each part is read at the launch's start, or at the stage boundary
-/// where its binding wants that drain, and its value handed on.
-/// It is not `Clone`: a part read twice does not compile.
-pub struct Once<T>(T);
-
-impl<T> Once<T> {
-    pub fn new(part: T) -> Self {
-        Self(part)
-    }
-
-    pub fn read<V>(self, read: impl FnOnce(T) -> V) -> V {
-        read(self.0)
-    }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-
-    /// A step's count, to upload.
-    pub(crate) fn count(value: usize) -> HostTensor<i32, m![1]> {
-        HostTensor::from_vec([i32::try_from(value).expect("counts fit I32")])
-    }
 
     axes![Eight = 8, SixtyFour = 64];
 
@@ -334,39 +259,5 @@ pub(crate) mod tests {
             );
             assert_eq!(tiles.count(), rows.div_ceil(8), "{rows} rows");
         }
-    }
-
-    /// Trips of `SIZE` rows over `rows` live rows, each whole but the last.
-    #[derive(Clone, Copy)]
-    struct Trips(usize);
-
-    impl Tiling for Trips {
-        type Tile = (usize, usize);
-
-        fn count(self) -> usize {
-            self.0.div_ceil(4)
-        }
-
-        fn get(self, index: usize) -> (usize, usize) {
-            (4 * index, (self.0 - 4 * index).min(4))
-        }
-    }
-
-    /// A fused loop runs every module of a trip on its tile before the next trip starts.
-    #[test]
-    fn fuse_runs_each_trip_on_its_tile() {
-        let trace = fuse(
-            &mut (),
-            (Vec::new(), Trips(6)),
-            |_, mut trace: Vec<_>, (start, rows)| {
-                trace.push(("norm", start, rows));
-                trace.push(("add", start, rows));
-                trace
-            },
-        );
-        assert_eq!(
-            trace,
-            [("norm", 0, 4), ("add", 0, 4), ("norm", 4, 2), ("add", 4, 2)]
-        );
     }
 }

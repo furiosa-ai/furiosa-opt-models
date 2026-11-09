@@ -8,10 +8,10 @@ pub trait Mapping: completion::Mapping {
     type Entry: AxisName;
 }
 
-type Terms<'x, B, C, L, H, G, S: Mapping> =
-    DmTensorView<'x, f32, B, C, L, m![H, G, { S::Entries }, 1 # 8]>;
-type Values<'x, B, C, L, H, G, D, S: Mapping> =
-    DmTensorView<'x, f32, B, C, L, m![H, G, { S::Entries }, D]>;
+type Terms<'x, B, C, L, H, G, S> =
+    DmTensorView<'x, f32, B, C, L, m![H, G, { <S as Mapping>::Entries }, 1 # 8]>;
+type Values<'x, B, C, L, H, G, D, S> =
+    DmTensorView<'x, f32, B, C, L, m![H, G, { <S as Mapping>::Entries }, D]>;
 
 impl<'x, H: AxisName, G: AxisName, D: AxisName, const SCALE: usize, B: M, C: M, L: M, S: Mapping>
     Module<(

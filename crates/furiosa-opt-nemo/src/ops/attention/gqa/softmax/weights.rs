@@ -1,7 +1,7 @@
 use super::*;
 use crate::compose::Space;
 
-type Scores<'d, B: M, C: M, L: M, T: M, P: M> = VectorTensor<
+type Scores<'d, B, C, L, T, P> = VectorTensor<
     'd,
     { Tu::Main },
     stage::Narrow,
@@ -44,7 +44,7 @@ impl<'d, 'x, H, G, D, const SCALE: usize, B: M, C: M, L: M, T: M, P: M, E: M, S:
     }
 }
 
-type Weights<'d, B: M, C: M, L: M, T: M, P: M> = VectorTensor<
+type Weights<'d, B, C, L, T, P> = VectorTensor<
     'd,
     { Tu::Main },
     stage::Widen,

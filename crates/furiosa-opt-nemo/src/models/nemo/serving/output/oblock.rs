@@ -126,62 +126,6 @@ const _: () = {
     assert!(2 * Stored::SIZE == 3 * Width::SIZE * Hidden::SIZE);
 };
 
-/// The `Stored` position of O value (absolute `hidden` output, absolute head `feature`) on every
-/// chip that holds it: its hidden half's chip and its heads' chip, the same slot on both.
-pub fn places(hidden: usize, feature: usize) -> ([usize; 2], usize) {
-    let (half, owner) = (hidden / 2560, feature / 2048);
-    let (h, w) = (hidden % 2560, feature % 2048);
-    let index = [
-        (3, half + 1 - owner),
-        (2, h % 1280 / 640),
-        (2, h % 640 / 320),
-        (2, h % 320 / 160),
-        (32, w / 64),
-        (2, h / 1280),
-        (2, h % 160 / 80),
-        (10, h % 80 / 8),
-        (8, w % 64 / 8),
-        (8, h % 8),
-        (8, w % 8),
-    ]
-    .iter()
-    .fold(0, |index, &(size, digit)| index * size + digit);
-    ([half, owner], index)
-}
-
-/// Packs both chips' TP2 O shards (`output::Stored` of decode before, chip `s` holding its heads'
-/// 2,048 features by all 5,120 hidden rows) into each chip's `Stored`.
-pub fn pack<T: Copy + Default>(shards: [&[T]; 2]) -> [Vec<T>; 2] {
-    // TP2 order: [Hidden / 2560, Hidden % 2560 / 80, Width / 256, Hidden % 8, Width % 256 / 32,
-    // Hidden % 80 / 8, Width % 32].
-    let place = |index: usize| {
-        let (w32, rest) = (index % 32, index / 32);
-        let (h80, rest) = (rest % 10, rest / 10);
-        let (w256, rest) = (rest % 8, rest / 8);
-        let (h8, rest) = (rest % 8, rest / 8);
-        let (w, rest) = (rest % 8, rest / 8);
-        let (group, half) = (rest % 32, rest / 32);
-        (
-            2560 * half + 80 * group + 8 * h80 + h8,
-            256 * w + 32 * w256 + w32,
-        )
-    };
-    let mut stored = [
-        vec![T::default(); Stored::SIZE],
-        vec![T::default(); Stored::SIZE],
-    ];
-    for (rank, shard) in shards.iter().enumerate() {
-        for (at, &value) in shard[..Hidden::SIZE * Width::SIZE].iter().enumerate() {
-            let (hidden, width) = place(at);
-            let (chips, index) = places(hidden, rank * 2048 + width);
-            for chip in chips {
-                stored[chip][index] = value;
-            }
-        }
-    }
-    stored
-}
-
 /// Chip `rank`'s window of layer `index`'s O copy (slots `rank ..`) into `landed`, one 20-KiB
 /// run a slice.
 fn land_parts(

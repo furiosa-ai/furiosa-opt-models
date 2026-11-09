@@ -9,60 +9,6 @@ pub(crate) struct Counted<'a, Hidden: AxisName, G: Group, Heads: AxisName> {
 
 type Pairs<G, Heads, Head> = Output<G, Heads, Head, <G as Group>::Copies, m![Heads % (Heads / 8)]>;
 
-impl<Hidden: AxisName, Heads: AxisName, Head: AxisName>
-    Affine<
-        (
-            Stored<Hidden, Heads, Head>,
-            HbmTensor<f32, Chip, m![Heads, Head]>,
-        ),
-        (),
-    >
-{
-    /// The weight, landed where the resident projection reads it.
-    pub(crate) fn land_weight(&self, context: &mut Device) -> Weight<Hidden, Heads, Head> {
-        self.weight.0.to_dm(&mut context.tdma)
-    }
-
-    /// Each head's scales, landed beside the weight.
-    pub(crate) fn land_scale(&self, context: &mut Device) -> ValueScale<Hidden, Heads, Head> {
-        self.weight.1.to_dm(&mut context.tdma)
-    }
-}
-
-impl<Hidden: AxisName, Heads: AxisName, Head: AxisName>
-    Affine<(Weight<Hidden, Heads, Head>, ValueScale<Hidden, Heads, Head>), ()>
-{
-    pub(crate) fn stage<G: Group>(
-        &self,
-        context: &mut Device,
-    ) -> Affine<(&Weight<Hidden, Heads, Head>, HeadScale<G, Heads, Head>), ()> {
-        Affine::new(
-            (
-                &self.weight.0,
-                head_scale::<Hidden, G, Heads, Head>(context, &self.weight.1),
-            ),
-            (),
-        )
-    }
-}
-
-fn head_scale<Hidden: AxisName, G: Group, Heads: AxisName, Head: AxisName>(
-    context: &mut Device,
-    scale: &ValueScale<Hidden, Heads, Head>,
-) -> HeadScale<G, Heads, Head> {
-    // SAFETY: both partitions hold a head's scales in every slice of its head digits.
-    let scale = unsafe {
-        scale.view().reshape::<Chip, Cluster<Heads>, Reduced<G, Heads, <G as Group>::Copies>,
-            m![Heads % (Heads / 8), Head]>()
-    };
-    context
-        .sub
-        .begin(scale)
-        .fetch::<m![Heads % (Heads / 8), Head / 8], m![Head % 8]>()
-        .collect::<m![Heads % (Heads / 8), Head / 8], m![Head % 8]>()
-        .to_vrf()
-}
-
 impl<Hidden: AxisName, Head: AxisName, Heads: AxisName, G: Group, W>
     Module<(&mut Device, Counted<'_, Hidden, G, Heads>)>
     for Affine<(W, HeadScale<G, Heads, Head>), ()>

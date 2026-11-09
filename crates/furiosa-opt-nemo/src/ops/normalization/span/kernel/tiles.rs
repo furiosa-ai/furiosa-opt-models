@@ -16,11 +16,6 @@ pub(crate) trait Tiling {
     const LAST: usize;
     const EPSILON: usize;
 
-    fn finish<C: M, P: M, T: M, E: M>(
-        context: &mut Device,
-        input: Inputs<'_, C, P, T, E>,
-    ) -> DmTensor<bf16, Chip, C, P, m![{ T }, { E }]>;
-
     fn finish_live<C: M, P: M, T: M, E: M>(
         context: &mut Device,
         input: Inputs<'_, C, P, T, E>,
@@ -41,29 +36,6 @@ impl<const CAPACITY: usize, const LAST: usize, const EPSILON: usize> Tiling
     const CAPACITY: usize = CAPACITY;
     const LAST: usize = LAST;
     const EPSILON: usize = EPSILON;
-
-    fn finish<C: M, P: M, T: M, E: M>(
-        context: &mut Device,
-        input: Inputs<'_, C, P, T, E>,
-    ) -> DmTensor<bf16, Chip, C, P, m![{ T }, { E }]> {
-        let mut output = DmTensor::new();
-        if const { whole::<T, E>() } > 0 {
-            #[unroll]
-            for tile in 0..const { whole::<T, E>() } {
-                apply::<C, P, T, E, CAPACITY>(
-                    context,
-                    input,
-                    (&mut output, tile * const { capacity::<E>() }),
-                );
-            }
-        }
-        apply::<C, P, T, E, LAST>(
-            context,
-            input,
-            (&mut output, const { whole::<T, E>() * capacity::<E>() }),
-        );
-        output
-    }
 
     fn finish_live<C: M, P: M, T: M, E: M>(
         context: &mut Device,
@@ -146,19 +118,6 @@ fn tile<'l, C: M, P: M, T: M, E: M, const LEN: usize>(
         .vector_final()
         .cast::<bf16, m![{ E } % 8 # 16]>()
         .commit_trim::<m![{ E } % 8]>()
-}
-
-fn apply<C: M, P: M, T: M, E: M, const LEN: usize>(
-    context: &mut Device,
-    input: Inputs<'_, C, P, T, E>,
-    output: (&mut DmTensor<bf16, Chip, C, P, m![{ T }, { E }]>, usize),
-) {
-    tile::<C, P, T, E, LEN>(context, input, output.1).commit_view(
-        output
-            .0
-            .view_mut()
-            .tile::<T, LEN, m![{ T } = { LEN } #{!} ({ T } / 1), { E }]>(output.1),
-    );
 }
 
 /// Normalize a counted tile without committing rows past `rows`.

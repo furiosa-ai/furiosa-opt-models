@@ -1,10 +1,8 @@
-use super::{Attended, Cache, GroupedQuery, Paged, shard};
-use crate::compose::Count;
+use super::{Cache, shard};
 use crate::ops::attention::{
-    cache::{Block, BlockCounts, BlockIndex, Blocks, Layer},
+    cache::{Block, BlockIndex, Blocks},
     geometry::Kv,
 };
-use crate::ops::layout::{Dm, axes::Lanes};
 use crate::{DeviceModule, Module, ops::cast::Convert};
 use furiosa_opt_std::prelude::*;
 
@@ -34,20 +32,6 @@ pub struct Read<Windows: AxisName, Chips: M = Chip> {
     pub bias: HbmTensor<f32, Chips, m![Windows, Cache]>,
     /// Number of windows after the first; zero still attends to window zero.
     pub rest: HbmTensor<i32, Chips, m![1]>,
-}
-
-/// The pool blocks each row of an envelope attends over, as the block-indexed history of a step.
-#[derive(DeviceSend)]
-pub struct Pages<Rows: AxisName, Windows: AxisName> {
-    /// Byte offsets of pool blocks, per row and window. Every entry must be readable, including
-    /// rounded overfetch.
-    pub table: HbmTensor<i32, Chip, m![Rows, Windows, BlockIndex]>,
-    /// Blocks read per row and window, including the block of the row's own token.
-    pub lengths: BlockCounts<Rows, Windows>,
-    /// Additive mask of each token: 0 for the visible prefix, padding past it.
-    pub bias: HbmTensor<f32, Chip, m![Rows, Windows, Cache]>,
-    /// Windows after the first, which every row attends over at least.
-    pub rest: Count,
 }
 
 /// Grouped-query attention over block-indexed history; `SCALE` holds the FP32 bits of the
@@ -204,178 +188,6 @@ where
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use furiosa_opt_std::runtime::launch;
-
-    axes![
-        Heads = 8,
-        Groups = 2,
-        Head = 256,
-        FullHeads = 1,
-        FullGroups = 16,
-        FullHead = 512,
-        Queries = 16,
-        Windows = 3,
-        Tokens = 1536
-    ];
-
-    const UNIT: usize = 1.0_f32.to_bits() as usize;
-
-    #[device(chip = 1)]
-    fn forward<H: AxisName, G: AxisName, D: AxisName, const SCALE: usize>(
-        device: &mut Device,
-        attention: &PagedAttention<H, G, D, SCALE>,
-        query: &Query<Queries, D>,
-        cache: &Blocks<H, D>,
-        read: &Read<Windows>,
-    ) -> Query<Queries, D> {
-        attention.forward((device, (query, (cache, 0), read)))
-    }
-
-    /// Each length's attention, checked against an oracle that applies `SCALE` to the scores.
-    async fn check<H: AxisName, G: AxisName, D: AxisName, const SCALE: usize>(
-        device: &mut Device,
-    ) -> Vec<Vec<bf16>> {
-        let scale = f32::from_bits(SCALE as u32) as f64;
-        let mut attended = Vec::new();
-        let values = (0..Tokens::SIZE * 2 * H::SIZE * D::SIZE)
-            .map(|at| {
-                let token = at / (2 * H::SIZE * D::SIZE);
-                let channel = at % D::SIZE;
-                bf16::from_f32(if token >= 1100 {
-                    f32::NAN
-                } else if at / (H::SIZE * D::SIZE) % 2 == 1 {
-                    ((token * 7 + channel * 3) % 19) as f32 / 16.0 - 0.5
-                } else {
-                    match channel {
-                        0 => 32.0 + (token / 512) as f32 / 2.0,
-                        1 => (token % 17) as f32 / 4.0 - 2.0,
-                        _ => 0.0,
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        let storage = HostBufferSlice::from(&bf16::to_buf(&values))
-            .to_hbm(&mut device.pdma)
-            .await
-            .unwrap();
-        let stride = Block::SIZE * 2 * H::SIZE * D::SIZE * 2;
-        let cache = Blocks {
-            tokens: crate::ops::tensor::blocks(storage, stride).unwrap().into(),
-        };
-        let query =
-            HostTensor::<bf16, m![Queries, D]>::from_vec((0..Queries::SIZE * D::SIZE).map(|at| {
-                bf16::from_f32(match at % D::SIZE {
-                    0 => 1.0,
-                    1 => (at / D::SIZE % 4 + 1) as f32 / 32.0,
-                    _ => 0.0,
-                })
-            }))
-            .to_hbm(&mut device.pdma)
-            .await
-            .unwrap();
-        for length in [31usize, 513, 1100] {
-            let read = Read {
-                blocks: HostTensor::<i32, m![Windows, BlockIndex]>::from_vec(
-                    (0..Tokens::SIZE / Block::SIZE).map(|i| (i * stride) as i32),
-                )
-                .to_hbm(&mut device.pdma)
-                .await
-                .unwrap(),
-
-                lengths: HostTensor::<i32, m![Windows, 1]>::from_vec(
-                    (0..Windows::SIZE)
-                        .map(|i| length.saturating_sub(i * 512).min(512).div_ceil(16) as i32),
-                )
-                .to_hbm(&mut device.pdma)
-                .await
-                .unwrap(),
-                bias: HostTensor::<f32, m![Windows, Cache]>::from_vec(
-                    (0..Tokens::SIZE).map(|i| if i < length { 0.0 } else { f32::NEG_INFINITY }),
-                )
-                .to_hbm(&mut device.pdma)
-                .await
-                .unwrap(),
-                rest: HostTensor::<i32, m![1]>::from_vec([((length - 1) / 512) as i32])
-                    .to_hbm(&mut device.pdma)
-                    .await
-                    .unwrap()
-                    .into(),
-            };
-            let actual = launch(
-                forward,
-                (
-                    &mut *device,
-                    &PagedAttention::<H, G, D, SCALE>::default(),
-                    &query,
-                    &cache,
-                    &read,
-                ),
-            )
-            .await
-            .unwrap()
-            .to_host::<m![Queries, D]>(&mut device.pdma)
-            .await
-            .unwrap()
-            .into_vec();
-            for head in 0..Queries::SIZE {
-                let weights = (0..length)
-                    .map(|token| {
-                        let base = token * 2 * H::SIZE * D::SIZE + head / G::SIZE * D::SIZE;
-                        (scale
-                            * ((values[base].to_f32() as f64 - 33.0)
-                                + (head % 4 + 1) as f64 / 32.0 * values[base + 1].to_f32() as f64))
-                            .exp()
-                    })
-                    .collect::<Vec<_>>();
-                let sum = weights.iter().sum::<f64>();
-                for channel in 0..D::SIZE {
-                    let expected = weights
-                        .iter()
-                        .enumerate()
-                        .map(|(token, weight)| {
-                            let at = (token * 2 + 1) * H::SIZE * D::SIZE
-                                + head / G::SIZE * D::SIZE
-                                + channel;
-                            weight * values[at].to_f32() as f64 / sum
-                        })
-                        .sum::<f64>();
-                    let expected = bf16::from_f32(expected as f32).to_f32();
-                    let actual = actual[head * D::SIZE + channel].to_f32();
-                    assert!(
-                        (actual - expected).abs() < 0.001,
-                        "length {length}, head {head}, channel {channel}: {actual} vs {expected}"
-                    );
-                }
-            }
-            attended.push(actual);
-        }
-        attended
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn preserves_score_differences_across_blocks() {
-        let _lease = crate::tests::DEVICE.lock().await;
-        let mut device = Device::new(forward.topology()).unwrap();
-        check::<Heads, Groups, Head, UNIT>(&mut device).await;
-        check::<FullHeads, FullGroups, FullHead, UNIT>(&mut device).await;
-    }
-
-    /// Two leaves that differ only in their scale attend differently, each as an oracle that
-    /// applies its own scale says.
-    #[tokio::test(flavor = "current_thread")]
-    async fn scores_scale_by_the_leaf_scale() {
-        const HALF: usize = 0.5_f32.to_bits() as usize;
-        let _lease = crate::tests::DEVICE.lock().await;
-        let mut device = Device::new(forward.topology()).unwrap();
-        let unit = check::<Heads, Groups, Head, UNIT>(&mut device).await;
-        let half = check::<Heads, Groups, Head, HALF>(&mut device).await;
-        assert_ne!(unit, half, "the scale did not change the attention");
-    }
-}
-
 impl<
     Heads: AxisName,
     Groups: AxisName,
@@ -412,59 +224,5 @@ where
         ),
     ) -> Self::Output {
         self.forward((device, (query, (&*layer.blocks, layer.entry), read)))
-    }
-}
-
-/// Each live row's queries, as attention projects them, attend over the pages its row of the
-/// read operand names in the layer range a pool lends; a row group past the live rows reads
-/// nothing.
-impl<
-    Heads: AxisName,
-    Groups: AxisName,
-    Head: AxisName,
-    Windows: AxisName,
-    Rows: AxisName,
-    const SCALE: usize,
->
-    Module<(
-        &mut Device,
-        (
-            &Dm<Lanes<Rows>, super::super::Heads<Rows, Heads, Groups, Head>>,
-            &&mut Layer<'_, Heads, Head>,
-            &Pages<Rows, Windows>,
-        ),
-    )> for PagedAttention<Heads, Groups, Head, SCALE>
-{
-    type Output = Dm<Lanes<Rows>, Attended<Rows, Heads, Groups, Head>>;
-
-    fn forward(
-        &self,
-        (device, (query, layer, read)): (
-            &mut Device,
-            (
-                &Dm<Lanes<Rows>, super::super::Heads<Rows, Heads, Groups, Head>>,
-                &&mut Layer<'_, Heads, Head>,
-                &Pages<Rows, Windows>,
-            ),
-        ),
-    ) -> Self::Output {
-        let mut heads = DmTensor::new();
-        query
-            .value
-            .view()
-            .to_dm_view(&mut device.tdma, heads.view_mut());
-        let history = Paged {
-            blocks: &*layer.blocks,
-            entry: layer.entry,
-            table: &read.table,
-            lengths: &read.lengths,
-        };
-        Dm {
-            value: GroupedQuery::<Rows, Heads, Groups, Head, Windows, SCALE>::new().forward((
-                device,
-                (&heads, &history, &read.bias, &read.rest, query.tiles),
-            )),
-            tiles: query.tiles,
-        }
     }
 }

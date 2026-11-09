@@ -1,9 +1,7 @@
 use furiosa_opt_std::prelude::*;
 
-use crate::View;
 use crate::ops::layout::axes::Parallel;
 use crate::ops::layout::axes::Parallelism;
-use crate::ops::linear::Affine;
 
 /// A half-matrix's physical mapping, covering every local output and input exactly once.
 pub trait Layout {
@@ -17,7 +15,6 @@ type Chips = <Parallel<2> as Parallelism>::Chip;
 type Half<L> = <L as Layout>::Half;
 pub type Stored<L> = m![Slot, { Half<L> }];
 pub type Factors = m![Factor, 1 # 8];
-pub type Packed<L> = Affine<Parameters<L>, ()>;
 
 /// Slot `h-c+1` holds half `h` by owner `c` on chips `h` and `c`; factors 0/1 restore input/weight.
 #[derive(DeviceSend)]
@@ -62,19 +59,5 @@ impl<L: Layout> Parameters<L> {
             }
         }
         packed
-    }
-}
-
-impl<L: Layout, const N: usize> View<N> for Parameters<L> {
-    type Storage = (
-        <HbmTensor<f8e4m3, Chips, Stored<L>> as View<N>>::Storage,
-        <HbmTensor<f32, Chips, Factors> as View<N>>::Storage,
-    );
-
-    fn view(storage: &Self::Storage, layer: usize) -> Self {
-        Self {
-            weight: View::<N>::view(&storage.0, layer),
-            factors: View::<N>::view(&storage.1, layer),
-        }
     }
 }

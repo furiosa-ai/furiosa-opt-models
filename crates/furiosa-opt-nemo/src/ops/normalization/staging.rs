@@ -3,7 +3,7 @@
 use furiosa_opt_std::prelude::*;
 
 use super::RmsNorm;
-use crate::compose::{Once, Space};
+use crate::compose::Space;
 use crate::ops::layout::Dm;
 
 mod completion;
@@ -19,18 +19,6 @@ pub struct Total<V>(V);
 pub struct Local;
 pub struct Cluster;
 pub struct Chip;
-
-impl<'a, W: AxisName, const E: usize, C: M, Shape: M>
-    Once<&'a RmsNorm<W, E, C, crate::ops::weight::Weight<Shape, C>>>
-{
-    /// Consume this gain binding; callers must not recreate it for the same layer in a launch.
-    pub fn stage<Cl: M, S: M, L: M>(
-        self,
-        device: &mut Device,
-    ) -> RmsNorm<W, E, C, DmTensor<bf16, C, Cl, S, L>> {
-        self.read(|norm| norm).stage(device)
-    }
-}
 
 /// The statistic carries the exact norm and residual that produced it, not a caller-chosen pair.
 pub struct Statistics<'a, N, I, V> {

@@ -7,16 +7,6 @@ use furiosa_opt_std::prelude::*;
 /// One I32 row index or position, a copy on each chip of `Chips`.
 pub type Value<Chips = Chip> = HbmTensor<i32, Chips, m![1]>;
 
-/// Copy the one I32 element a view selects into a scalar of its own.
-pub(in crate::ops) fn read<Chips: M, E: M>(
-    device: &mut Device,
-    input: HbmTensorView<'_, i32, Chips, E>,
-) -> Value<Chips> {
-    let mut output = Value::new();
-    input.to_hbm_view(&mut device.tdma, output.view_mut());
-    output
-}
-
 /// Scalar repeated over the eight cells of a vector packet in both clusters and 256 slices.
 pub type Packet<D = i32, Chips = Chip> = DmTensor<D, Chips, Cluster, Slices, m![1 # 8]>;
 

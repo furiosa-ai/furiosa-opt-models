@@ -35,23 +35,6 @@ pub type Stored = m![
     Hidden % 8
 ];
 
-/// The position of gate / up value (`intermediate` of a chip's 7,168, `hidden`) in `Stored`.
-pub fn index(intermediate: usize, hidden: usize) -> usize {
-    let (i, h) = (intermediate, hidden);
-    [
-        (2, i % 3584 / 1792),
-        (2, i / 3584),
-        (4, i % 1792 / 448),
-        (8, i % 448 / 56),
-        (64, h / 80),
-        (7, i % 56 / 8),
-        (10, h % 80 / 8),
-        (8, i % 8),
-        (8, h % 8),
-    ]
-    .iter()
-    .fold(0, |index, &(size, digit)| index * size + digit)
-}
 /// One hidden half of the gate (branch 0) and up (branch 1) weights in the contraction's layout,
 /// so one command contracts both against a register.
 pub type GateUp =
@@ -106,12 +89,6 @@ impl Weight<'_> {
             }
             None => self.land_into(device, (half, landed)),
         }
-    }
-
-    pub fn land(&self, device: &mut Device, half: usize) -> Landed {
-        let mut landed = Landed(Raw::new());
-        self.land_into(device, (half, &mut landed));
-        landed
     }
 
     /// `land` into a weight allocated before the transfer is issued.

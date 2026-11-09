@@ -3,19 +3,27 @@ use crate::Module;
 use crate::ops::layout::Dm;
 use furiosa_opt_std::prelude::*;
 
-type Local<'x, B, C, L, S: Mapping> =
-    DmTensorView<'x, f32, B, C, L, m![{ S::Rows }, { S::Groups }, 1 # 8]>;
-type Target<'x, B, C, L, S: Mapping> =
-    DmTensorViewMut<'x, f32, B, C, L, m![{ S::Rows }, { S::Groups }, 1 # 8]>;
-type Operand<B, C, L, S: Mapping> = VrfTensor<f32, B, C, L, m![{ S::Rows }, { S::Groups }, 1 # 8]>;
-type Peak<B, C, L, S: Mapping> = DmTensor<f32, B, C, L, m![{ S::Rows }, { S::Groups }, 1 # 8]>;
+type Local<'x, B, C, L, S> =
+    DmTensorView<'x, f32, B, C, L, m![{ <S as Mapping>::Rows }, { <S as Mapping>::Groups }, 1 # 8]>;
+type Target<'x, B, C, L, S> = DmTensorViewMut<
+    'x,
+    f32,
+    B,
+    C,
+    L,
+    m![{ <S as Mapping>::Rows }, { <S as Mapping>::Groups }, 1 # 8],
+>;
+type Operand<B, C, L, S> =
+    VrfTensor<f32, B, C, L, m![{ <S as Mapping>::Rows }, { <S as Mapping>::Groups }, 1 # 8]>;
+type Peak<B, C, L, S> =
+    DmTensor<f32, B, C, L, m![{ <S as Mapping>::Rows }, { <S as Mapping>::Groups }, 1 # 8]>;
 
 axes![Term = 2];
 
-type Cells<'x, B, C, L, E, S: Mapping> =
-    DmTensorView<'x, f32, B, C, L, m![{ S::Rows }, { S::Groups }, E]>;
-type CellsMut<'x, B, C, L, E, S: Mapping> =
-    DmTensorViewMut<'x, f32, B, C, L, m![{ S::Rows }, { S::Groups }, E]>;
+type Cells<'x, B, C, L, E, S> =
+    DmTensorView<'x, f32, B, C, L, m![{ <S as Mapping>::Rows }, { <S as Mapping>::Groups }, E]>;
+type CellsMut<'x, B, C, L, E, S> =
+    DmTensorViewMut<'x, f32, B, C, L, m![{ <S as Mapping>::Rows }, { <S as Mapping>::Groups }, E]>;
 
 impl<'x, H, G, D, const SCALE: usize, B: M, C: M, L: M, S: Mapping>
     Module<(

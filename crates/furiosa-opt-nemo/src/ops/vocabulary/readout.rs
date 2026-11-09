@@ -1,5 +1,4 @@
 use crate::ops::layout::axes::{Parallel, Parallelism};
-use crate::ops::linear::Affine;
 use furiosa_opt_std::prelude::*;
 use std::{io, marker::PhantomData};
 
@@ -19,14 +18,6 @@ impl<L: Layout> AxisName for Local<L> {
 }
 
 pub type Chips = <Parallel<2> as Parallelism>::Chip;
-type Hidden<L> = Symbol<<L as Layout>::Hidden>;
-pub type Stored<L> = m![{ Hidden<L> } / 256, { Symbol<Local<L>> }, { Hidden<L> } % 256];
-pub type Packed<L> = Affine<Parameters<L>, [HbmTensor<bf16, Chips, m![{ Symbol<Local<L>> }]>; 0]>;
-
-#[derive(DeviceSend)]
-pub struct Parameters<L: Layout> {
-    pub weight: HbmTensor<bf16, Chips, Stored<L>>,
-}
 
 #[derive(DeviceSend)]
 pub struct Sampling<L: Layout, C: M = Chips> {

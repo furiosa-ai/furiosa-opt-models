@@ -3,8 +3,8 @@ use crate::Module;
 use crate::ops::layout::Dm;
 use furiosa_opt_std::prelude::*;
 
-type Tags<'x, B, C, L, H, G, S: reduction::Mapping> =
-    &'x VrfTensor<i4, B, C, L, m![H, G, { S::Entries }, 1 # 8]>;
+type Tags<'x, B, C, L, H, G, S> =
+    &'x VrfTensor<i4, B, C, L, m![H, G, { <S as reduction::Mapping>::Entries }, 1 # 8]>;
 type Peak<'x, B, C, L, H, G> = &'x VrfTensor<f32, B, C, L, m![H, G, 1 # 8]>;
 const CLEARED: TagGuard =
     TagGuard::matches([BitReq::Zero, BitReq::Ignore, BitReq::Ignore, BitReq::Ignore]);

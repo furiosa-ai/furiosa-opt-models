@@ -1,8 +1,6 @@
 use furiosa_opt_std::prelude::*;
 
-use crate::View;
 use crate::ops::layout::axes::{Parallel, Parallelism};
-use crate::ops::linear::Affine;
 
 pub mod down;
 pub mod gate;
@@ -23,8 +21,6 @@ pub trait Layout: Clone + std::fmt::Debug + 'static {
         weight.to_vec()
     }
 }
-
-pub type Packed<L, const ROLE: usize> = Affine<Parameters<L, ROLE>, ()>;
 
 /// Each projection owns its coefficients and exposes its two factors from one shared row.
 #[derive(DeviceSend)]
@@ -58,19 +54,5 @@ impl<L: Layout, const ROLE: usize> Parameters<L, ROLE> {
         let mut stored = Tensor::<f8e4m3, m![{ Chips }, { L::Stored }]>::zero();
         stored.view_mut().transpose(source.view(), true);
         stored.into_buf()
-    }
-}
-
-impl<L: Layout, const ROLE: usize, const N: usize> View<N> for Parameters<L, ROLE> {
-    type Storage = (
-        <HbmTensor<f8e4m3, Chips, L::Stored> as View<N>>::Storage,
-        <HbmTensor<f32, Chips, Factors> as View<N>>::Storage,
-    );
-
-    fn view(storage: &Self::Storage, layer: usize) -> Self {
-        Self::new(
-            View::<N>::view(&storage.0, layer),
-            View::<N>::view(&storage.1, layer),
-        )
     }
 }

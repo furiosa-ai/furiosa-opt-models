@@ -1,4 +1,4 @@
-//! The `Module` trait every model piece implements, and its device-call aliases.
+//! The `Module` trait every model piece implements, and its device-call alias.
 
 use furiosa_opt_std::prelude::Device;
 
@@ -15,12 +15,6 @@ pub trait Module<Input> {
 
 /// A module callable with any device borrow and the declared operands.
 pub trait DeviceModule<Input> = for<'d> Module<(&'d mut Device, Input)>;
-
-/// A device module over one borrowed operand.
-pub trait Unary<Input> = for<'a> DeviceModule<&'a Input>;
-
-/// A device module over two independently borrowed operands.
-pub trait Binary<Left, Right> = for<'a, 'b> DeviceModule<(&'a Left, &'b Right)>;
 
 impl<I, M: Module<I> + ?Sized> Module<I> for &M {
     type Output = M::Output;

@@ -23,7 +23,6 @@ pub type Activation<B> = DmTensor<f8e4m3, B, Cluster, Slice, m![Rows, Hidden % 8
 pub type Weight<B> = DmTensor<f8e4m3, B, Cluster, Slice, m![{ Lanes }, { Elements }]>;
 pub type Stored = m![{ Cluster }, { Slice }, { Lanes }, { Elements }];
 pub type Register<B> = TrfTensor<f8e4m3, B, Cluster, Slice, Lanes, Elements>;
-pub type Values<B> = DmTensor<bf16, B, Cluster, Reduced, m![Rows % 4, Out % 32 / 8, Out % 8]>;
 
 /// A weight panel's register, from the panel's [`Weight`] or a one-panel view of a wider tensor.
 pub fn fill<B: M, E: M>(

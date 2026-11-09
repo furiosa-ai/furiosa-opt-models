@@ -131,24 +131,6 @@ pub struct Projection<'a> {
     pub index: usize,
 }
 
-/// The position of down value (`hidden`, `k` of a chip's 8,192 padded features) in `Stored`.
-pub fn index(hidden: usize, k: usize) -> usize {
-    let h = hidden;
-    [
-        (4, h / 1280),
-        (2, h % 1280 / 640),
-        (2, h % 640 / 320),
-        (2, k / 4096),
-        (2, k % 4096 / 2048),
-        (8, k % 2048 / 256),
-        (4, h % 320 / 80),
-        (80, h % 80),
-        (256, k % 256),
-    ]
-    .iter()
-    .fold(0, |index, &(size, digit)| index * size + digit)
-}
-
 impl Projection<'_> {
     /// K panel `side` (the 2,048 features `Intermediate % 4096 / 2048` of each cluster), one DMA.
     fn panel(&self, device: &mut Device, side: usize) -> Weight {

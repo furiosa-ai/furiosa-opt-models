@@ -44,23 +44,3 @@ pub(crate) struct Project<'a, Hidden: AxisName, QWidth: AxisName, Capacity: Axis
     pub points: P,
     pub live: (usize, usize),
 }
-
-pub(crate) struct Load<'a, Hidden: AxisName, QWidth: AxisName>(
-    pub &'a fp8::Output8<Hidden, QWidth>,
-    pub &'a mut fp8::Staged8<Hidden, QWidth>,
-);
-
-impl<Hidden: AxisName, QWidth: AxisName> Points<Device> for Load<'_, Hidden, QWidth> {
-    type Next = Self;
-    type Output = ();
-
-    fn at(self, _: &mut Device) -> Self {
-        self
-    }
-
-    fn between(&mut self, context: &mut Device) {
-        self.0.load(context, self.1);
-    }
-
-    fn finish(self, _: &mut Device) {}
-}
