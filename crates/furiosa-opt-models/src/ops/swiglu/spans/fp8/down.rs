@@ -345,14 +345,16 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
 type Channels<Hidden, Intermediate> =
     DmTensor<f32, Chip, Cluster<Intermediate>, m![Hidden / 16], m![Hidden % 16]>;
 
-/// A staged product's down projection with its three weight panels, their inputs in panel order and
-/// its channel scales landed: what is left is compute and the exchange of the row halves.
-pub struct Ready<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName> {
-    weights: (
-        Down<Hidden, Intermediate>,
-        Down<Hidden, Intermediate>,
-        Down<Hidden, Intermediate>,
-    ),
+/// A staged product's down projection with its weight panels, the third as `W`, their inputs in
+/// panel order and its channel scales landed: once the third has, what is left is compute and the
+/// exchange of the row halves.
+pub struct Ready<
+    Hidden: AxisName,
+    Intermediate: AxisName,
+    Rows: AxisName,
+    W = Down<Hidden, Intermediate>,
+> {
+    weights: (Down<Hidden, Intermediate>, Down<Hidden, Intermediate>, W),
     inputs: (
         Landed<Hidden, Intermediate, Rows>,
         Landed<Hidden, Intermediate, Rows>,
@@ -362,7 +364,7 @@ pub struct Ready<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName> {
 }
 
 /// The down projection of a staged product, its second and third down panels landing between its
-/// first panels' work.
+/// first panels' work, and its row halves summed once exchanged.
 impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>
     Op<Live<Staging<Hidden, Intermediate, Rows>, Capacity>> for DownWeights<Hidden, Intermediate>
 {
@@ -394,29 +396,30 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
         let input2 = landed(&mut *context, stored, (2, &h2), (live, rows));
         let third = |context: &mut Device| self.forward(context, Begin(2));
         let inputs = (input0, input1, input2);
-        projected(
-            context,
+        let exchange = projected(
+            &mut *context,
             ((first, second), third),
             (inputs, channels),
             (live, rows),
-        )
+        );
+        exchange.summed(context)
     }
 }
 
-/// A staged product's down panels' inputs and channel scales landed, its later two weight panels
-/// landed beforehand.
+/// A staged product's down panels' inputs and channel scales landed, its second weight panel
+/// landed beforehand and its third still to land.
 impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>
     Op<
         Live<
             (
                 Staging<Hidden, Intermediate, Rows>,
-                (Down<Hidden, Intermediate>, Down<Hidden, Intermediate>),
+                Down<Hidden, Intermediate>,
             ),
             Capacity,
         >,
     > for DownWeights<Hidden, Intermediate>
 {
-    type Output = Ready<Hidden, Intermediate, Rows>;
+    type Output = Ready<Hidden, Intermediate, Rows, ()>;
 
     fn forward(
         &self,
@@ -424,14 +427,14 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
         staged: Live<
             (
                 Staging<Hidden, Intermediate, Rows>,
-                (Down<Hidden, Intermediate>, Down<Hidden, Intermediate>),
+                Down<Hidden, Intermediate>,
             ),
             Capacity,
         >,
     ) -> Self::Output {
         const { assert!(<m![{ Out<Intermediate> } / 64]>::SIZE == Panels::SIZE) };
         let (live, rows) = (staged.count::<axis::Rows<128>>(), staged.rows());
-        let (staging, (second, third)) = staged.into_value();
+        let (staging, second) = staged.into_value();
         let Staging {
             products,
             panels: (h0, h1, h2),
@@ -449,6 +452,36 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
             landed(&mut *context, stored, (2, &h2), (live, rows)),
         );
         Ready {
+            weights: (first, second, ()),
+            inputs,
+            channels,
+        }
+    }
+}
+
+/// A down projection whose inputs landed, with its third weight panel, landed behind them.
+impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>
+    Op<(
+        Ready<Hidden, Intermediate, Rows, ()>,
+        Down<Hidden, Intermediate>,
+    )> for DownWeights<Hidden, Intermediate>
+{
+    type Output = Ready<Hidden, Intermediate, Rows>;
+
+    fn forward(
+        &self,
+        _: &mut Device,
+        (ready, third): (
+            Ready<Hidden, Intermediate, Rows, ()>,
+            Down<Hidden, Intermediate>,
+        ),
+    ) -> Self::Output {
+        let Ready {
+            weights: (first, second, ()),
+            inputs,
+            channels,
+        } = ready;
+        Ready {
             weights: (first, second, third),
             inputs,
             channels,
@@ -456,16 +489,18 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
     }
 }
 
-/// The down projection of a staged product whose weights and inputs landed.
+/// The down projection of a staged product whose weights and inputs landed, up to the exchange of
+/// its row halves.
 impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>
-    Op<Live<Ready<Hidden, Intermediate, Rows>, Capacity>> for DownWeights<Hidden, Intermediate>
+    Op<Begin<Live<Ready<Hidden, Intermediate, Rows>, Capacity>>>
+    for DownWeights<Hidden, Intermediate>
 {
-    type Output = Owned<Hidden, Rows>;
+    type Output = Exchange<Hidden, Intermediate, Rows>;
 
     fn forward(
         &self,
         context: &mut Device,
-        ready: Live<Ready<Hidden, Intermediate, Rows>, Capacity>,
+        Begin(ready): Begin<Live<Ready<Hidden, Intermediate, Rows>, Capacity>>,
     ) -> Self::Output {
         let (live, rows) = (ready.count::<axis::Rows<128>>(), ready.rows());
         let Ready {
@@ -480,6 +515,128 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
             (inputs, channels),
             (live, rows),
         )
+    }
+}
+
+/// An exchange's row halves summed: the span's rows.
+impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName>
+    Op<Live<Exchange<Hidden, Intermediate, Rows>, Capacity>> for DownWeights<Hidden, Intermediate>
+{
+    type Output = Owned<Hidden, Rows>;
+
+    fn forward(
+        &self,
+        context: &mut Device,
+        exchange: Live<Exchange<Hidden, Intermediate, Rows>, Capacity>,
+    ) -> Self::Output {
+        exchange.into_value().summed(context)
+    }
+}
+
+/// A cluster half's first eight rows of a span's sums in each slice of their features.
+type Eight<Hidden, Intermediate, Rows> = DmTensor<
+    bf16,
+    Chip,
+    Cluster<Intermediate>,
+    m![Hidden / 16],
+    m![Rows % (Rows / 2) = 8, Hidden % 16],
+>;
+
+/// A cluster half's rows of a span's sums in each slice of their features.
+type Half<Hidden, Intermediate, Rows> = DmTensor<
+    bf16,
+    Chip,
+    Cluster<Intermediate>,
+    m![Hidden / 16],
+    m![Rows % (Rows / 2), Hidden % 16],
+>;
+
+/// A down projection's summed partial sums for the first `rows` rows of a span, each cluster's row
+/// half of them sent to the other cluster: the first eight rows of each half when the span holds
+/// no more, into the first tensor of `sent`, else every row, into the second.
+pub struct Exchange<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName> {
+    partial: Partial<Hidden, Intermediate, Rows>,
+    sent: (
+        Eight<Hidden, Intermediate, Rows>,
+        Half<Hidden, Intermediate, Rows>,
+    ),
+    rows: usize,
+}
+
+impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>
+    Exchange<Hidden, Intermediate, Rows>
+{
+    /// The sums of the first `rows` rows of a span, each cluster's row half sent to the other.
+    fn new(
+        context: &mut Device,
+        partial: Partial<Hidden, Intermediate, Rows>,
+        rows: usize,
+    ) -> Self {
+        let mut exchange = Self {
+            partial,
+            sent: (DmTensor::new(), DmTensor::new()),
+            rows,
+        };
+        if rows <= 8 {
+            let send = exchange.eight(context, &[1, 0]);
+            let sent = exchange.sent.0.view_mut();
+            send.view()
+                .cluster_swap()
+                .to_dm_view(&mut context.tdma, sent);
+        } else {
+            let send = exchange.half(context, &[1, 0]);
+            let sent = exchange.sent.1.view_mut();
+            send.view()
+                .cluster_swap()
+                .to_dm_view(&mut context.tdma, sent);
+        }
+        exchange
+    }
+
+    /// The span's rows: each cluster's own row half of the sums added to the half the other sent.
+    fn summed(self, context: &mut Device) -> Owned<Hidden, Rows> {
+        let mut result: Half<Hidden, Intermediate, Rows> = DmTensor::new();
+        if self.rows <= 8 {
+            let own = self.eight(context, &[0, 1]);
+            Add::of::<m![Rows % (Rows / 2) = 8, Hidden % 16 / 8], m![1], m![Hidden % 8], Term, _, _, _, _>(&mut *context, (&own, &self.sent.0)).commit_prefix::<m![Rows % (Rows / 2) = 8], _, _>(result.view_mut().tile::<m![Rows % (Rows / 2)], 8,
+                    m![Rows % (Rows / 2) = 8 #{!} (Rows / 2), Hidden % 16]>(0), self.rows);
+        } else {
+            let own = self.half(context, &[0, 1]);
+            let reach = span::reach::<Rows>(self.rows);
+            Add::of::<
+                m![Rows % (Rows / 2) / 8],
+                m![Rows % 8, Hidden % 16 / 8],
+                m![Hidden % 8],
+                Term,
+                _,
+                _,
+                _,
+                _,
+            >(&mut *context, (&own, &self.sent.1))
+            .commit_prefix::<m![Rows % (Rows / 2) / 8], _, _>(result.view_mut(), reach.div_ceil(8));
+        }
+        // SAFETY: extraction and exchange give cluster c the complete sum for row half c.
+        unsafe { result.reshape() }
+    }
+
+    /// Each cluster's half of the first eight rows of the sums, from the cluster `indices` names.
+    fn eight(&self, context: &mut Device, indices: &[usize]) -> Eight<Hidden, Intermediate, Rows> {
+        self.partial.view().tile::<m![Rows % (Rows / 2)], 8,
+            m![Rows / (Rows / 2), Rows % (Rows / 2) = 8 # (Rows / 2), Hidden % 16]>(0)
+            .asymmetric_cluster_slice::<
+                m![Rows / (Rows / 2)],
+                m![Rows % (Rows / 2) = 8, Hidden % 16],
+            >(&mut context.sub, indices)
+    }
+
+    /// Each cluster's half of every row of the sums, from the cluster `indices` names.
+    fn half(&self, context: &mut Device, indices: &[usize]) -> Half<Hidden, Intermediate, Rows> {
+        self.partial
+            .view()
+            .asymmetric_cluster_slice::<m![Rows / (Rows / 2)], m![Rows % (Rows / 2), Hidden % 16]>(
+                &mut context.sub,
+                indices,
+            )
     }
 }
 
@@ -544,7 +701,7 @@ fn landed<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>(
 /// The down projection of a staged product from its first two weight panels, the third taken
 /// from `third` once the first panel's work is issued, and its landed `inputs`: each panel
 /// quantized, projected and rescaled in turn, the panels' sums added, and each cluster's row half
-/// of the sums exchanged into the span's rows.
+/// of the sums sent to the other cluster.
 #[allow(clippy::too_many_lines)]
 fn projected<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>(
     context: &mut Device,
@@ -561,7 +718,7 @@ fn projected<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>(
         Channels<Hidden, Intermediate>,
     ),
     (live, rows): (usize, usize),
-) -> Owned<Hidden, Rows> {
+) -> Exchange<Hidden, Intermediate, Rows> {
     let channels: ChannelScales<Hidden, Intermediate> = context
         .sub
         .begin(down.view())
@@ -611,50 +768,5 @@ fn projected<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>(
     let sums = add(context, (&d0, &d1));
     let d2 = project(context, (&third, input2));
     let partial = add(context, (&sums, &d2));
-    let mut result: DmTensor<
-        bf16,
-        Chip,
-        Cluster<Intermediate>,
-        m![Hidden / 16],
-        m![Rows % (Rows / 2), Hidden % 16],
-    > = DmTensor::new();
-    if rows <= 8 {
-        let live_rows = || {
-            partial.view().tile::<m![Rows % (Rows / 2)], 8,
-                m![Rows / (Rows / 2), Rows % (Rows / 2) = 8 # (Rows / 2), Hidden % 16]>(0)
-        };
-        let half = |context: &mut Device, indices| {
-            live_rows().asymmetric_cluster_slice::<
-                    m![Rows / (Rows / 2)],
-                    m![Rows % (Rows / 2) = 8, Hidden % 16],
-                >(&mut context.sub, indices)
-        };
-        let (send, own) = (half(context, &[1, 0]), half(context, &[0, 1]));
-        let exchanged = send.view().cluster_swap().to_dm(&mut context.tdma);
-        Add::of::<m![Rows % (Rows / 2) = 8, Hidden % 16 / 8], m![1], m![Hidden % 8], Term, _, _, _, _>(&mut *context, (&own, &exchanged)).commit_prefix::<m![Rows % (Rows / 2) = 8], _, _>(result.view_mut().tile::<m![Rows % (Rows / 2)], 8,
-                m![Rows % (Rows / 2) = 8 #{!} (Rows / 2), Hidden % 16]>(0), rows);
-    } else {
-        let half = |context: &mut Device, indices| {
-            partial.view().asymmetric_cluster_slice::<
-                    m![Rows / (Rows / 2)],
-                    m![Rows % (Rows / 2), Hidden % 16],
-                >(&mut context.sub, indices)
-        };
-        let (send, own) = (half(context, &[1, 0]), half(context, &[0, 1]));
-        let exchanged = send.view().cluster_swap().to_dm(&mut context.tdma);
-        let reach = span::reach::<Rows>(rows);
-        Add::of::<
-            m![Rows % (Rows / 2) / 8],
-            m![Rows % 8, Hidden % 16 / 8],
-            m![Hidden % 8],
-            Term,
-            _,
-            _,
-            _,
-            _,
-        >(&mut *context, (&own, &exchanged))
-        .commit_prefix::<m![Rows % (Rows / 2) / 8], _, _>(result.view_mut(), reach.div_ceil(8));
-    }
-    // SAFETY: extraction and exchange give cluster c the complete sum for row half c.
-    unsafe { result.reshape() }
+    Exchange::new(context, partial, rows)
 }

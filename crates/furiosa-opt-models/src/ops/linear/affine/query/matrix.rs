@@ -146,14 +146,32 @@ type Selection<All, K> = HbmTensor<bf16, Chip, m![All, K]>;
 
 /// The dense query projection lands nothing before its rows arrive: the contraction reads each
 /// period's weight slabs from HBM, so no live layer holds BF16 weights in DM.
-impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, Env> Module<Begin<()>, Env, &mut ()>
+impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, Env> Module<Begin<Begin<()>>, Env, &mut ()>
+    for Affine<Dense<Hidden, Heads, Head>, ()>
+{
+    type Output = Begin<Affine<Flat<Hidden, Heads, Head>, ()>>;
+
+    fn forward(&self, _: &mut Device, _: Env, _: &mut (), _: Begin<Begin<()>>) -> Self::Output {
+        // SAFETY: the landed form that holds the alias keeps the weight it reads, heads in HBM order.
+        Begin(Affine::new(unsafe { self.weight.view().alias() }, ()))
+    }
+}
+
+/// Nor in the second step of its landing.
+impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, Env>
+    Module<Begin<Affine<Flat<Hidden, Heads, Head>, ()>>, Env, &mut ()>
     for Affine<Dense<Hidden, Heads, Head>, ()>
 {
     type Output = Affine<Flat<Hidden, Heads, Head>, ()>;
 
-    fn forward(&self, _: &mut Device, _: Env, _: &mut (), _: Begin<()>) -> Self::Output {
-        // SAFETY: the landed form that holds the alias keeps the weight it reads, heads in HBM order.
-        Affine::new(unsafe { self.weight.view().alias() }, ())
+    fn forward(
+        &self,
+        _: &mut Device,
+        _: Env,
+        _: &mut (),
+        Begin(landed): Begin<Affine<Flat<Hidden, Heads, Head>, ()>>,
+    ) -> Self::Output {
+        landed
     }
 }
 
@@ -171,13 +189,31 @@ impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, Env> Module<Begin<()>, E
 
 /// Nor does the channel-scaled query projection: the contraction restores each period's weight
 /// slabs from their codes where they are stored.
-impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, Env> Module<Begin<()>, Env, &mut ()>
+impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, Env> Module<Begin<Begin<()>>, Env, &mut ()>
+    for ChannelScaled<Hidden, Heads, Head>
+{
+    type Output = Begin<Affine<Coded<Hidden, Heads, Head>, ()>>;
+
+    fn forward(&self, _: &mut Device, _: Env, _: &mut (), _: Begin<Begin<()>>) -> Self::Output {
+        Begin(Affine::new(self.held().clone(), ()))
+    }
+}
+
+/// Nor in the second step of its landing.
+impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, Env>
+    Module<Begin<Affine<Coded<Hidden, Heads, Head>, ()>>, Env, &mut ()>
     for ChannelScaled<Hidden, Heads, Head>
 {
     type Output = Affine<Coded<Hidden, Heads, Head>, ()>;
 
-    fn forward(&self, _: &mut Device, _: Env, _: &mut (), _: Begin<()>) -> Self::Output {
-        Affine::new(self.held().clone(), ())
+    fn forward(
+        &self,
+        _: &mut Device,
+        _: Env,
+        _: &mut (),
+        Begin(landed): Begin<Affine<Coded<Hidden, Heads, Head>, ()>>,
+    ) -> Self::Output {
+        landed
     }
 }
 

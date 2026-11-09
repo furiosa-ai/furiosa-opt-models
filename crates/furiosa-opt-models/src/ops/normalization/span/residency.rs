@@ -51,7 +51,8 @@ impl<Hidden: AxisName, Capacity: AxisName, Chips: M + 'static> Fill<Device, Live
     }
 }
 
-/// A span's rows back to their place; a span's single wave moves alone.
+/// A span's rows back to their place: as the fill lands them, a launch of at most eight rows, or a
+/// span's single wave, moves alone.
 impl<'r, Hidden: AxisName, Capacity: AxisName, Chips: M + 'static>
     Spill<Device, &'r Owned<Hidden, Span, Chips>, Live<(), Capacity>>
     for HbmTensor<bf16, Chips, Blocked<Hidden, Capacity>>
@@ -67,20 +68,26 @@ impl<'r, Hidden: AxisName, Capacity: AxisName, Chips: M + 'static>
             m![{ Part<Hidden> }, Capacity = { Span::SIZE } #{!} Capacity, { Offset<Hidden> }]>(
                 live.start(),
             );
-        if live.count::<Tile>() == 1 {
-            // SAFETY: the same row digits split the tiled span into consecutive cluster halves.
-            let halves = unsafe {
-                span.reshape::<Chips, m![{ Part<Hidden> },
-                    Span / (Span / 2) #{!} (Capacity / (Span / 2)), Span % (Span / 2),
-                    { Offset<Hidden> }]>()
-            };
+        // SAFETY: the same row digits split the tiled span into consecutive cluster halves.
+        let halves = unsafe {
+            span.reshape::<Chips, m![{ Part<Hidden> },
+                Span / (Span / 2) #{!} (Capacity / (Span / 2)), Span % (Span / 2),
+                { Offset<Hidden> }]>()
+        };
+        if live.rows() <= 8 {
+            rows.view().tile::<m![Span % (Span / 2)], 8,
+                m![Span % (Span / 2) = 8 # (Span / 2), { Offset<Hidden> }]>(0)
+                .to_hbm_view(&mut context.tdma, halves.tile::<m![Span % (Span / 2)], 8,
+                    m![{ Part<Hidden> }, Span / (Span / 2) #{!} (Capacity / (Span / 2)),
+                        Span % (Span / 2) = 8 #{!} (Span / 2), { Offset<Hidden> }]>(0));
+        } else if live.count::<Tile>() == 1 {
             rows.view().tile::<m![Span % (Span / 2)], 128,
                 m![Span % (Span / 2) = 128 # (Span / 2), { Offset<Hidden> }]>(0)
                 .to_hbm_view(&mut context.tdma, halves.tile::<m![Span % (Span / 2)], 128,
                     m![{ Part<Hidden> }, Span / (Span / 2) #{!} (Capacity / (Span / 2)),
                         Span % (Span / 2) = 128 #{!} (Span / 2), { Offset<Hidden> }]>(0));
         } else {
-            rows.view().to_hbm_view(&mut context.tdma, span);
+            rows.view().to_hbm_view(&mut context.tdma, halves);
         }
     }
 }
