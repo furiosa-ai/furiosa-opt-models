@@ -74,9 +74,16 @@ def available(runner: Runner) -> int:
     # A cache layer addresses its pages by I32 byte offsets.
     max_blocks = min((2**31) // layer.page_size_bytes for layer in spec.values())
     match model:
-        case Decoder():
-            blocks = min(max(0, memory) // block_bytes, max_blocks)
+        case Decoder(model=loaded) if loaded is not None:
+            # Each layer holds its group's scratch pages past its blocks.
+            cache = loaded.cache
+            groups = [(cache.pools[group.pool].bytes, group) for group in cache.groups]
+            memory -= sum(page * group.scratch * len(group.layers) for page, group in groups)
+            limit = min((2**31) // page - group.scratch for page, group in groups)
+            blocks = min(max(0, memory) // block_bytes, limit)
             return runner.selection.capacity(blocks) * block_bytes
+        case Decoder():
+            raise RuntimeError(RELEASED)
         case Media():
             return max(0, min(memory, max_blocks * block_bytes))
         case _:

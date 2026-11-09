@@ -58,8 +58,8 @@ class Location:
 @dataclass(frozen=True, slots=True)
 class Decoder:
     """A loaded decoder, where its checkpoint is and the options it loads with, the device it runs
-    on, the vocabulary its token IDs index, and the block format and layers of its paged cache
-    group."""
+    on, the vocabulary its token IDs index, and the block format, layers and scratch pages of its
+    paged cache group."""
 
     # None while SGLang's memory saver released the weights.
     model: engine.Decoder | None
@@ -72,6 +72,7 @@ class Decoder:
     vocabulary: int
     pool: engine.decoder.Pool
     layers: range
+    scratch: int
 
     @classmethod
     def load(
@@ -99,7 +100,15 @@ class Decoder:
             case [engine.decoder.Group(kind=engine.decoder.Kind.Paged(), window=None) as group]:
                 pool = loaded.cache.pools[group.pool]
                 return cls(
-                    loaded, copy, checkpoint, options, device, vocabulary, pool, group.layers
+                    loaded,
+                    copy,
+                    checkpoint,
+                    options,
+                    device,
+                    vocabulary,
+                    pool,
+                    group.layers,
+                    group.scratch,
                 )
             case _:
                 raise NotImplementedError("the plugin pages only one full-history attention group")
@@ -118,7 +127,14 @@ class Decoder:
 
     def blocks(self, memory: int, *others: Decoder) -> int:
         """Cache blocks that `memory` bytes a chip hold for this decoder and `others`, which number
-        their blocks alike, within the I32 byte offsets a layer addresses its blocks by."""
+        their blocks alike, beside each layer's scratch pages, within the I32 byte offsets a layer
+        addresses its pages by."""
         decoders = (self, *others)
         page = sum(decoder.pool.bytes * len(decoder.layers) for decoder in decoders)
-        return min(max(0, memory) // page, *(2**31 // decoder.pool.bytes for decoder in decoders))
+        scratch = sum(
+            decoder.pool.bytes * decoder.scratch * len(decoder.layers) for decoder in decoders
+        )
+        return min(
+            max(0, memory - scratch) // page,
+            *(2**31 // decoder.pool.bytes - decoder.scratch for decoder in decoders),
+        )

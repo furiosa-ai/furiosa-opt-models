@@ -375,6 +375,13 @@ impl Group {
     fn window(&self) -> Option<usize> {
         self.0.window
     }
+
+    /// Pages each layer holds past the blocks a request names, which only the decoder's calls
+    /// address.
+    #[getter]
+    fn scratch(&self) -> usize {
+        self.0.scratch
+    }
 }
 
 /// What the blocks of a group hold.

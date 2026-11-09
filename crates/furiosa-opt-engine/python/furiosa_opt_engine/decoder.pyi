@@ -132,6 +132,12 @@ class Group:
         r"""
         Positions a row attends back to in a sliding window; `None` attends the whole history.
         """
+    @property
+    def scratch(self) -> builtins.int:
+        r"""
+        Pages each layer holds past the blocks a request names, which only the decoder's calls
+        address.
+        """
 
 @typing_extensions.disjoint_base
 class Kind:
