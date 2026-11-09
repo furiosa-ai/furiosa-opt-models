@@ -29,7 +29,7 @@ pub type StoredScales<I, O> = m![
 ];
 // Storage retains seven contiguous 32-feature stripes. Two adjacent stripes
 // form one 64-feature contraction panel, with no checkpoint padding or repack.
-axes![Wide = 64, Tail = 32];
+axes![Wide = 64, Tail = 32, Panel = 4];
 pub(super) type Partition<I, O> = m![O / 512, I % (I / 2) / 224];
 type Weight<I, O, D, K> =
     DmTensor<D, Chip, Cluster<I>, Partition<I, O>, m![{ Symbol<K> } / 32, O % 512, I % 32]>;
@@ -60,8 +60,8 @@ type RestoredLanes<I, O, R, K, const W: usize> = TrfTensor<
     m![R % 8],
     m![R % {W} / 16, { Symbol<K> } / 32, I % 32 / 16, R % 16 / 8, I % 16],
 >;
-type Partial<I, O, R, const W: usize> =
-    DmTensor<f32, Chip, Cluster<I>, m![O / 16], m![R % { W }, O % 16]>;
+// Retain all four FP32 panel results until the final ordered reduction.
+type Partials<I, O, R> = DmTensor<f32, Chip, Cluster<I>, m![O / 16], m![R, Panel, O % 16]>;
 type Accum<I, O, R> = DmTensor<f32, Chip, Cluster<I>, m![O / 16], m![R, O % 16]>;
 
 impl<I: AxisName, O: AxisName> Down<I, O> {
@@ -241,17 +241,15 @@ impl<I: AxisName, O: AxisName> Down<I, O> {
         }
     }
 
-    fn panel<R: AxisName, K: AxisName, const W: usize, const ADD: bool>(
+    fn panel<R: AxisName, K: AxisName, const W: usize, const P: usize>(
         device: &mut Device,
         weight: &Packed<I, O, K>,
         input: &Activation<I, O, R, K>,
-        previous: Option<&Accum<I, O, R>>,
-        output: &mut Accum<I, O, R>,
+        output: &mut Partials<I, O, R>,
         rows: usize,
     ) {
         let groups = rows.div_ceil(16);
         let mut current = Self::lanes::<R, K, W>(device, input, 0, groups);
-        let mut part = Partial::<I, O, R, W>::new();
         // Keep the accumulator views statically indexed. Runtime-indexed views
         // failed the A16 MLP-to-QKV transition when next-layer preparation was
         // live. Static waves preserve the overlap without copies or snapshots.
@@ -269,24 +267,10 @@ impl<I: AxisName, O: AxisName> Down<I, O> {
                 let live = groups - W / 16 * wave;
                 let target = output
                     .view_mut()
-                    .tile::<m![R / { W }], 1, m![R / {W} = 1 #{!} (R / {W}),R % {W},O % 16]>(wave);
-                if ADD {
-                    Self::contract::<R, K, W, _>(device, weight, &current, part.view_mut(), live);
-                    let old = previous
-                        .unwrap()
-                        .view()
-                        .tile::<m![R / { W }], 1, m![R / {W} = 1 # (R / {W}),R % {W},O % 16]>(wave)
-                        .unpad::<m![R % { W }, O % 16]>();
-                    super::sum_into::<_, _, m![R % { W }], m![O % 16], m![R % { W } / 8], _, _>(
-                        device,
-                        old,
-                        part.view(),
-                        target,
-                        live * 2,
-                    );
-                } else {
-                    Self::contract::<R, K, W, _>(device, weight, &current, target, live);
-                }
+                    .tile::<m![Panel], 1, m![R, Panel = 1 #{!} 4, O % 16]>(P)
+                    .tile::<m![R / { W }], 1,
+                        m![R / {W} = 1 #{!} (R / {W}), R % {W}, Panel = 1 #{!} 4, O % 16]>(wave);
+                Self::contract::<R, K, W, _>(device, weight, &current, target, live);
                 current = next;
             }
         }
@@ -301,11 +285,11 @@ impl<I: AxisName, O: AxisName> Down<I, O> {
         next: N,
     ) -> (Owned<O, R>, N::Output) {
         let (first, second) = first;
-        let mut b0 = Accum::new();
+        let mut partials = Partials::new();
         let input0 = Self::land::<R, Wide, 2>(device, product, 0, rows);
         let tail = self.load::<Tail, 1>(device, 6);
         let mut next = next.at(device);
-        Self::panel::<R, Wide, W, false>(device, &first, &input0, None, &mut b0, rows);
+        Self::panel::<R, Wide, W, 0>(device, &first, &input0, &mut partials, rows);
         // Fetch panel 2 during down 0, after gate/up buffers have been released.
         // This bounds SRAM while retaining O-weight reuse across spans.
         let third = self.stage(device, 2);
@@ -313,20 +297,18 @@ impl<I: AxisName, O: AxisName> Down<I, O> {
         let input1 = Self::land::<R, Wide, 2>(device, product, 2, rows);
         next.between(device);
         let next = next.at(device);
-        let mut b1 = Accum::new();
-        Self::panel::<R, Wide, W, true>(device, &second, &input1, Some(&b0), &mut b1, rows);
+        Self::panel::<R, Wide, W, 1>(device, &second, &input1, &mut partials, rows);
         let input2 = Self::land::<R, Wide, 2>(device, product, 4, rows);
-        let mut b2 = Accum::new();
-        Self::panel::<R, Wide, W, true>(device, &third, &input2, Some(&b1), &mut b2, rows);
+        Self::panel::<R, Wide, W, 2>(device, &third, &input2, &mut partials, rows);
         let input3 = Self::land::<R, Tail, 1>(device, product, 6, rows);
-        let mut b3 = Accum::new();
-        Self::panel::<R, Tail, W, true>(device, &tail, &input3, Some(&b2), &mut b3, rows);
+        Self::panel::<R, Tail, W, 3>(device, &tail, &input3, &mut partials, rows);
+        let sums = Self::sum_panels(device, &partials, rows);
         let output = if rows <= 16 {
-            self.finish::<R, 16>(device, &b3)
+            self.finish::<R, 16>(device, &sums)
         } else if rows <= 128 {
-            self.finish::<R, 128>(device, &b3)
+            self.finish::<R, 128>(device, &sums)
         } else {
-            self.finish::<R, 256>(device, &b3)
+            self.finish::<R, 256>(device, &sums)
         };
         (output, next.finish(device))
     }
@@ -378,17 +360,15 @@ impl<I: AxisName, O: AxisName> Down<I, O> {
         }
     }
 
-    fn panel_restored<R: AxisName, K: AxisName, const W: usize, const ADD: bool>(
+    fn panel_restored<R: AxisName, K: AxisName, const W: usize, const P: usize>(
         device: &mut Device,
         weight: &Weight<I, O, bf16, K>,
         input: &Activation<I, O, R, K>,
-        previous: Option<&Accum<I, O, R>>,
-        output: &mut Accum<I, O, R>,
+        output: &mut Partials<I, O, R>,
         rows: usize,
     ) {
         let groups = rows.div_ceil(16);
         let mut current = Self::lanes_restored::<R, K, W>(device, input, 0, groups);
-        let mut part = Partial::<I, O, R, W>::new();
         // Keep the accumulator views statically indexed. Runtime-indexed views
         // failed the A16 MLP-to-QKV transition when next-layer preparation was
         // live. Static waves preserve the overlap without copies or snapshots.
@@ -406,30 +386,10 @@ impl<I: AxisName, O: AxisName> Down<I, O> {
                 let live = groups - W / 16 * wave;
                 let target = output
                     .view_mut()
-                    .tile::<m![R / { W }], 1, m![R / {W} = 1 #{!} (R / {W}),R % {W},O % 16]>(wave);
-                if ADD {
-                    Self::contract_restored::<R, K, W, _>(
-                        device,
-                        weight,
-                        &current,
-                        part.view_mut(),
-                        live,
-                    );
-                    let old = previous
-                        .unwrap()
-                        .view()
-                        .tile::<m![R / { W }], 1, m![R / {W} = 1 # (R / {W}),R % {W},O % 16]>(wave)
-                        .unpad::<m![R % { W }, O % 16]>();
-                    super::sum_into::<_, _, m![R % { W }], m![O % 16], m![R % { W } / 8], _, _>(
-                        device,
-                        old,
-                        part.view(),
-                        target,
-                        live * 2,
-                    );
-                } else {
-                    Self::contract_restored::<R, K, W, _>(device, weight, &current, target, live);
-                }
+                    .tile::<m![Panel], 1, m![R, Panel = 1 #{!} 4, O % 16]>(P)
+                    .tile::<m![R / { W }], 1,
+                        m![R / {W} = 1 #{!} (R / {W}), R % {W}, Panel = 1 #{!} 4, O % 16]>(wave);
+                Self::contract_restored::<R, K, W, _>(device, weight, &current, target, live);
                 current = next;
             }
         }
@@ -445,11 +405,11 @@ impl<I: AxisName, O: AxisName> Down<I, O> {
     ) -> (Owned<O, R>, N::Output) {
         let (first, second) = first;
         let first = Self::restore(device, first);
-        let mut b0 = Accum::new();
+        let mut partials = Partials::new();
         let input0 = Self::land::<R, Wide, 2>(device, product, 0, rows);
         let tail = self.load::<Tail, 1>(device, 6);
         let mut next = next.at(device);
-        Self::panel_restored::<R, Wide, W, false>(device, &first, &input0, None, &mut b0, rows);
+        Self::panel_restored::<R, Wide, W, 0>(device, &first, &input0, &mut partials, rows);
         // Fetch panel 2 during down 0, after gate/up buffers have been released.
         // This bounds SRAM while retaining O-weight reuse across spans.
         let third = self.stage(device, 2);
@@ -458,31 +418,48 @@ impl<I: AxisName, O: AxisName> Down<I, O> {
         let second = Self::restore(device, second);
         next.between(device);
         let next = next.at(device);
-        let mut b1 = Accum::new();
-        Self::panel_restored::<R, Wide, W, true>(
-            device,
-            &second,
-            &input1,
-            Some(&b0),
-            &mut b1,
-            rows,
-        );
+        Self::panel_restored::<R, Wide, W, 1>(device, &second, &input1, &mut partials, rows);
         let input2 = Self::land::<R, Wide, 2>(device, product, 4, rows);
         let third = Self::restore(device, third);
-        let mut b2 = Accum::new();
-        Self::panel_restored::<R, Wide, W, true>(device, &third, &input2, Some(&b1), &mut b2, rows);
+        Self::panel_restored::<R, Wide, W, 2>(device, &third, &input2, &mut partials, rows);
         let input3 = Self::land::<R, Tail, 1>(device, product, 6, rows);
         let tail = block::restore(device, tail.0, tail.1);
-        let mut b3 = Accum::new();
-        Self::panel_restored::<R, Tail, W, true>(device, &tail, &input3, Some(&b2), &mut b3, rows);
+        Self::panel_restored::<R, Tail, W, 3>(device, &tail, &input3, &mut partials, rows);
+        let sums = Self::sum_panels(device, &partials, rows);
         let output = if rows <= 16 {
-            self.finish::<R, 16>(device, &b3)
+            self.finish::<R, 16>(device, &sums)
         } else if rows <= 128 {
-            self.finish::<R, 128>(device, &b3)
+            self.finish::<R, 128>(device, &sums)
         } else {
-            self.finish::<R, 256>(device, &b3)
+            self.finish::<R, 256>(device, &sums)
         };
         (output, next.finish(device))
+    }
+
+    /// Sum panels in contraction order without intermediate DM read/add/write passes.
+    /// Only the 16-row prefix written by every panel may be consumed.
+    fn sum_panels<R: AxisName>(
+        device: &mut Device,
+        partials: &Partials<I, O, R>,
+        rows: usize,
+    ) -> Accum<I, O, R> {
+        let mut sums = Accum::new();
+        device
+            .main
+            .begin(partials.view())
+            .fetch::<m![R, Panel, O % 16 / 8], m![O % 8]>()
+            .collect::<m![R, Panel, O % 16 / 8], m![O % 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_split::<m![R, Panel, O % 16 / 4], m![O % 4]>()
+            .vector_intra_slice_reduce::<Panel, m![R, O % 16 / 4], m![O % 4]>(
+                IntraSliceReduceOpF32::Add,
+            )
+            .vector_widen_concat::<m![R, O % 16 / 8], m![O % 8]>()
+            .vector_final()
+            .commit_trim::<m![O % 8]>()
+            .commit_prefix::<m![R / 16], _, _>(sums.view_mut(), rows.div_ceil(16));
+        sums
     }
 
     fn finish<R: AxisName, const N: usize>(
