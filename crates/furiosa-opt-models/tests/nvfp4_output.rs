@@ -47,27 +47,18 @@ async fn streams_output_in_eight_and_32_row_passes() {
         scales,
     };
     let input = input::<Hidden>(&mut device).await;
-    let original = input
-        .to_host::<m![Rows, Hidden]>(&mut device.pdma)
-        .await
-        .unwrap()
-        .into_vec();
+    let original = fixtures::read::<_, m![Rows, Hidden]>(&mut device.pdma, &input).await;
     for rows in [
         1, 4, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 63, 64, 65, 95, 96, 97, 127, 128, 129, 159, 160,
         161, 200, 255, 256, 257, 497, 511, 512,
     ] {
         let mut padded = original.clone();
         padded[rows * Hidden::SIZE..].fill(bf16::from_f32(f32::NAN));
-        let input = HostTensor::<bf16, m![Rows, Hidden]>::from_vec(padded.clone())
-            .to_hbm(&mut device.pdma)
-            .await
-            .unwrap();
+        let input =
+            fixtures::upload::<bf16, m![Rows, Hidden]>(&mut device.pdma, padded.clone()).await;
         let mut window = vec![bf16::from_f32(f32::NAN); Rows::SIZE * Hidden::SIZE];
         window.extend(padded);
-        let window = HostTensor::<bf16, m![Reach, Hidden]>::from_vec(window)
-            .to_hbm(&mut device.pdma)
-            .await
-            .unwrap();
+        let window = fixtures::upload::<bf16, m![Reach, Hidden]>(&mut device.pdma, window).await;
         let count = count(&mut device, rows).await;
         let started = std::time::Instant::now();
         let result = launch(project_output, (&mut device, &projection, &count, &input))
@@ -82,38 +73,32 @@ async fn streams_output_in_eight_and_32_row_passes() {
     }
     // Dense contributions exercise every input partition and every packet sum.
     // BF16 activation 6 × restored weight 1/8 × 4096 × weight tensor factor.
-    projection.weight =
-        HostTensor::<
-            f4e2m1,
-            furiosa_opt_models::ops::linear::nvfp4::tiled::output::Stored<Hidden, OutputWidth>,
-        >::from_vec(vec![f4e2m1::from_bits(2); Hidden::SIZE * OutputWidth::SIZE])
-        .to_hbm(&mut device.pdma)
-        .await
-        .unwrap();
-    projection.weight_scale = HostTensor::<
+    projection.weight = fixtures::upload::<
+        f4e2m1,
+        furiosa_opt_models::ops::linear::nvfp4::tiled::output::Stored<Hidden, OutputWidth>,
+    >(
+        &mut device.pdma,
+        vec![f4e2m1::from_bits(2); Hidden::SIZE * OutputWidth::SIZE],
+    )
+    .await;
+    projection.weight_scale = fixtures::upload::<
         f8e4m3,
         furiosa_opt_models::ops::linear::nvfp4::tiled::output::StoredScales<Hidden, OutputWidth>,
-    >::from_vec(vec![
-        f8e4m3::from_f32(0.125);
-        Hidden::SIZE * OutputWidth::SIZE / 16
-    ])
-    .to_hbm(&mut device.pdma)
-    .await
-    .unwrap();
-    let input = HostTensor::<bf16, m![Rows, Hidden]>::from_vec(vec![
-        bf16::from_f32(6.0);
-        Rows::SIZE * Hidden::SIZE
-    ])
-    .to_hbm(&mut device.pdma)
-    .await
-    .unwrap();
+    >(
+        &mut device.pdma,
+        vec![f8e4m3::from_f32(0.125); Hidden::SIZE * OutputWidth::SIZE / 16],
+    )
+    .await;
+    let input = fixtures::upload::<bf16, m![Rows, Hidden]>(
+        &mut device.pdma,
+        vec![bf16::from_f32(6.0); Rows::SIZE * Hidden::SIZE],
+    )
+    .await;
     // Non-power-of-two and negative factors exercise scaling after the complete
     // FP32 inter-slice sum, including all four compact activation waves.
     for (rows, factor) in [(1, 0.125_f32), (512, 0.125), (1, 0.1337), (512, -0.1337)] {
-        projection.scales.output = HostTensor::<f32, m![1 # 8]>::from_vec(vec![factor; 8])
-            .to_hbm(&mut device.pdma)
-            .await
-            .unwrap();
+        projection.scales.output =
+            fixtures::upload::<f32, m![1 # 8]>(&mut device.pdma, vec![factor; 8]).await;
         let count = count(&mut device, rows).await;
         let result = launch(project_output, (&mut device, &projection, &count, &input))
             .await
@@ -132,10 +117,8 @@ async fn streams_output_in_eight_and_32_row_passes() {
     // The two input halves nearly cancel: +/-1536 plus a 0.125..0.5 residual.
     // Rounding cluster partials to BF16 before exchange would erase that residual.
     let factor = 0.1337_f32;
-    projection.scales.output = HostTensor::<f32, m![1 # 8]>::from_vec(vec![factor; 8])
-        .to_hbm(&mut device.pdma)
-        .await
-        .unwrap();
+    projection.scales.output =
+        fixtures::upload::<f32, m![1 # 8]>(&mut device.pdma, vec![factor; 8]).await;
     let mut cancellation = Vec::with_capacity(Rows::SIZE * Hidden::SIZE);
     for row in 0..Rows::SIZE {
         let sign = if row % 2 == 0 { 1.0 } else { -1.0 };
@@ -144,10 +127,7 @@ async fn streams_output_in_eight_and_32_row_passes() {
         values[0] += sign * (row % 4 + 1) as f32;
         cancellation.extend(values.into_iter().map(bf16::from_f32));
     }
-    let input = HostTensor::<bf16, m![Rows, Hidden]>::from_vec(cancellation)
-        .to_hbm(&mut device.pdma)
-        .await
-        .unwrap();
+    let input = fixtures::upload::<bf16, m![Rows, Hidden]>(&mut device.pdma, cancellation).await;
     for rows in [1, 16, 129, 257, 512] {
         let count = count(&mut device, rows).await;
         let result = launch(project_output, (&mut device, &projection, &count, &input))
@@ -198,29 +178,23 @@ async fn streams_output_in_eight_and_32_row_passes() {
             )
         })
         .collect();
-    projection.weight = HostTensor::<
+    projection.weight = fixtures::upload::<
         f4e2m1,
         furiosa_opt_models::ops::linear::nvfp4::tiled::output::Stored<Hidden, OutputWidth>,
-    >::from_vec(OutputProjection::<Hidden, OutputWidth>::reorder::<1, _>(
-        &codes,
-    ))
-    .to_hbm(&mut device.pdma)
-    .await
-    .unwrap();
-    projection.weight_scale = HostTensor::<
+    >(
+        &mut device.pdma,
+        OutputProjection::<Hidden, OutputWidth>::reorder::<1, _>(&codes),
+    )
+    .await;
+    projection.weight_scale = fixtures::upload::<
         f8e4m3,
         furiosa_opt_models::ops::linear::nvfp4::tiled::output::StoredScales<Hidden, OutputWidth>,
-    >::from_vec(OutputProjection::<Hidden, OutputWidth>::reorder::<
-        16,
-        _,
-    >(&scales))
-    .to_hbm(&mut device.pdma)
-    .await
-    .unwrap();
-    let input = HostTensor::<bf16, m![Rows, Hidden]>::from_vec(inputs.clone())
-        .to_hbm(&mut device.pdma)
-        .await
-        .unwrap();
+    >(
+        &mut device.pdma,
+        OutputProjection::<Hidden, OutputWidth>::reorder::<16, _>(&scales),
+    )
+    .await;
+    let input = fixtures::upload::<bf16, m![Rows, Hidden]>(&mut device.pdma, inputs.clone()).await;
     // Check both sides of the direct/restored boundary and retain the full launch.
     for rows in [8, 9, 16, 17, 32, 33, 65, 129, 200, 257, Rows::SIZE] {
         let count = count(&mut device, rows).await;

@@ -104,16 +104,9 @@ async fn resident_q_and_kv_match_scalar_w4a16() {
     let mut qn = projection::<OutputWidth>(&mut device).await;
     let kn = projection::<KvWidth>(&mut device).await;
     let mut vn = projection::<KvWidth>(&mut device).await;
-    vn.scales.output = HostTensor::<f32, m![1 # 8]>::from_vec(vec![-0.5; 8])
-        .to_hbm(&mut device.pdma)
-        .await
-        .unwrap();
+    vn.scales.output = fixtures::upload::<f32, m![1 # 8]>(&mut device.pdma, vec![-0.5; 8]).await;
     let input = input::<Hidden>(&mut device).await;
-    let original = input
-        .to_host::<m![Rows, Hidden]>(&mut device.pdma)
-        .await
-        .unwrap()
-        .into_vec();
+    let original = fixtures::read::<_, m![Rows, Hidden]>(&mut device.pdma, &input).await;
     for rows in [
         1, 4, 8, 9, 16, 17, 23, 24, 25, 31, 32, 33, 63, 64, 65, 71, 72, 73, 127, 128, 129, 247,
         248, 249, 255, 256, 257, 263, 264, 265, 271, 272, 273, 287, 288, 289, 319, 320, 321, 383,
@@ -121,10 +114,7 @@ async fn resident_q_and_kv_match_scalar_w4a16() {
     ] {
         let mut padded = original.clone();
         padded[rows * Hidden::SIZE..].fill(bf16::from_f32(f32::NAN));
-        let input = HostTensor::<bf16, m![Rows, Hidden]>::from_vec(padded)
-            .to_hbm(&mut device.pdma)
-            .await
-            .unwrap();
+        let input = fixtures::upload::<bf16, m![Rows, Hidden]>(&mut device.pdma, padded).await;
         let count = count(&mut device, rows).await;
         let out = launch(query, (&mut device, &q, &count, &input))
             .await
@@ -135,16 +125,8 @@ async fn resident_q_and_kv_match_scalar_w4a16() {
         let (qo, ko, vo) = launch(shared, (&mut device, &qn, &kn, &vn, &count, &input))
             .await
             .unwrap();
-        let kh = ko
-            .to_host::<m![Rows, KvWidth]>(&mut device.pdma)
-            .await
-            .unwrap()
-            .into_vec();
-        let vh = vo
-            .to_host::<m![Rows, KvWidth]>(&mut device.pdma)
-            .await
-            .unwrap()
-            .into_vec();
+        let kh = fixtures::read::<_, m![Rows, KvWidth]>(&mut device.pdma, &ko).await;
+        let vh = fixtures::read::<_, m![Rows, KvWidth]>(&mut device.pdma, &vo).await;
         assert!(
             kh.iter()
                 .zip(&vh)
@@ -158,40 +140,31 @@ async fn resident_q_and_kv_match_scalar_w4a16() {
     // Dense nonzero operands exercise accumulation through every hidden slab.
     // Codes=1, block scale=1/8, BF16 input=6.
     // Each of 4096 products is 0.75; weight tensor factor=1/2 => 1536.
-    q.weight = HostTensor::<f4e2m1, panels::Stored<Hidden, OutputWidth>>::from_vec(
+    q.weight = fixtures::upload::<f4e2m1, panels::Stored<Hidden, OutputWidth>>(
+        &mut device.pdma,
         vec![f4e2m1::from_bits(2); Hidden::SIZE * OutputWidth::SIZE],
     )
-    .to_hbm(&mut device.pdma)
-    .await
-    .unwrap();
-    q.weight_scale =
-        HostTensor::<f8e4m3, panels::StoredScales<Hidden, OutputWidth>>::from_vec(vec![
-        f8e4m3::from_f32(0.125);
-        Hidden::SIZE * OutputWidth::SIZE / 16
-    ])
-        .to_hbm(&mut device.pdma)
-        .await
-        .unwrap();
-    qn.weight = HostTensor::<f4e2m1, qkv::Stored<Hidden, OutputWidth>>::from_vec(
+    .await;
+    q.weight_scale = fixtures::upload::<f8e4m3, panels::StoredScales<Hidden, OutputWidth>>(
+        &mut device.pdma,
+        vec![f8e4m3::from_f32(0.125); Hidden::SIZE * OutputWidth::SIZE / 16],
+    )
+    .await;
+    qn.weight = fixtures::upload::<f4e2m1, qkv::Stored<Hidden, OutputWidth>>(
+        &mut device.pdma,
         vec![f4e2m1::from_bits(2); Hidden::SIZE * OutputWidth::SIZE],
     )
-    .to_hbm(&mut device.pdma)
-    .await
-    .unwrap();
-    qn.weight_scale = HostTensor::<f8e4m3, qkv::StoredScales<Hidden, OutputWidth>>::from_vec(vec![
-        f8e4m3::from_f32(0.125);
-        Hidden::SIZE * OutputWidth::SIZE / 16
-    ])
-    .to_hbm(&mut device.pdma)
-    .await
-    .unwrap();
-    let input = HostTensor::<bf16, m![Rows, Hidden]>::from_vec(vec![
-        bf16::from_f32(6.0);
-        Rows::SIZE * Hidden::SIZE
-    ])
-    .to_hbm(&mut device.pdma)
-    .await
-    .unwrap();
+    .await;
+    qn.weight_scale = fixtures::upload::<f8e4m3, qkv::StoredScales<Hidden, OutputWidth>>(
+        &mut device.pdma,
+        vec![f8e4m3::from_f32(0.125); Hidden::SIZE * OutputWidth::SIZE / 16],
+    )
+    .await;
+    let input = fixtures::upload::<bf16, m![Rows, Hidden]>(
+        &mut device.pdma,
+        vec![bf16::from_f32(6.0); Rows::SIZE * Hidden::SIZE],
+    )
+    .await;
     let count = count(&mut device, 1).await;
     let out = launch(query, (&mut device, &q, &count, &input))
         .await
@@ -208,11 +181,7 @@ async fn resident_q_and_kv_match_scalar_w4a16() {
     let (shared_q, _, _) = launch(shared, (&mut device, &qn, &kn, &vn, &count, &input))
         .await
         .unwrap();
-    let shared_q = shared_q
-        .to_host::<m![Rows, OutputWidth]>(&mut device.pdma)
-        .await
-        .unwrap()
-        .into_vec();
+    let shared_q = fixtures::read::<_, m![Rows, OutputWidth]>(&mut device.pdma, &shared_q).await;
     assert!(
         shared_q[..OutputWidth::SIZE]
             .iter()
@@ -224,36 +193,29 @@ async fn resident_q_and_kv_match_scalar_w4a16() {
     // do not treat this case as an exact mathematical oracle.
     let saved_factor = qn.scales.output;
     let saved_baseline_factor = q.scales.output;
-    q.scales.output = HostTensor::<f32, m![1 # 8]>::from_vec(vec![f32::from_bits(1 << 19); 8])
-        .to_hbm(&mut device.pdma)
-        .await
-        .unwrap();
-    qn.scales.output = HostTensor::<f32, m![1 # 8]>::from_vec(vec![
+    q.scales.output =
+        fixtures::upload::<f32, m![1 # 8]>(&mut device.pdma, vec![f32::from_bits(1 << 19); 8])
+            .await;
+    qn.scales.output = fixtures::upload::<f32, m![1 # 8]>(
+        &mut device.pdma,
+        vec![
         f32::from_bits(1 << 19); // Exactly 2^-130.
         8
-    ])
-    .to_hbm(&mut device.pdma)
-    .await
-    .unwrap();
-    let large_input =
-        HostTensor::<bf16, m![Rows, Hidden]>::from_vec(vec![
-            bf16::from_f32(2.0_f32.powi(100));
-            Rows::SIZE * Hidden::SIZE
-        ])
-        .to_hbm(&mut device.pdma)
-        .await
-        .unwrap();
+    ],
+    )
+    .await;
+    let large_input = fixtures::upload::<bf16, m![Rows, Hidden]>(
+        &mut device.pdma,
+        vec![bf16::from_f32(2.0_f32.powi(100)); Rows::SIZE * Hidden::SIZE],
+    )
+    .await;
     let mut subnormal_failures = Vec::new();
     for rows in [1, 32, 33] {
         let count = fixtures::count(&mut device, rows).await;
         let (projected, _, _) = launch(shared, (&mut device, &qn, &kn, &vn, &count, &large_input))
             .await
             .unwrap();
-        let values = projected
-            .to_host::<m![Rows, OutputWidth]>(&mut device.pdma)
-            .await
-            .unwrap()
-            .into_vec();
+        let values = fixtures::read::<_, m![Rows, OutputWidth]>(&mut device.pdma, &projected).await;
         let baseline = launch(query, (&mut device, &q, &count, &large_input))
             .await
             .unwrap()
@@ -299,10 +261,8 @@ async fn resident_q_and_kv_match_scalar_w4a16() {
     // a small normal factor also checks that a representable nonzero result survives.
     // The FP64 oracle uses the stored FP32 factor and permits final BF16 rounding.
     for factor in [1.3_f32, -0.7, 2.0_f32.powi(-120)] {
-        qn.scales.output = HostTensor::<f32, m![1 # 8]>::from_vec(vec![factor; 8])
-            .to_hbm(&mut device.pdma)
-            .await
-            .unwrap();
+        qn.scales.output =
+            fixtures::upload::<f32, m![1 # 8]>(&mut device.pdma, vec![factor; 8]).await;
         let expected = 3072.0_f64 * factor as f64;
         let rounded = bf16::from_f32(expected as f32);
         assert_ne!(rounded.to_f32(), 0.0);
@@ -313,11 +273,7 @@ async fn resident_q_and_kv_match_scalar_w4a16() {
             let (q, _, _) = launch(shared, (&mut device, &qn, &kn, &vn, &count, &input))
                 .await
                 .unwrap();
-            let values = q
-                .to_host::<m![Rows, OutputWidth]>(&mut device.pdma)
-                .await
-                .unwrap()
-                .into_vec();
+            let values = fixtures::read::<_, m![Rows, OutputWidth]>(&mut device.pdma, &q).await;
             for (index, value) in values.iter().take(rows * OutputWidth::SIZE).enumerate() {
                 let actual = value.to_f32() as f64;
                 assert!(
@@ -349,31 +305,23 @@ async fn resident_q_and_kv_match_scalar_w4a16() {
             )
         })
         .collect();
-    qn.weight = HostTensor::<f4e2m1, qkv::Stored<Hidden, OutputWidth>>::from_vec(QkvProjection::<
-        Hidden,
-        OutputWidth,
-    >::reorder::<1, _>(
-        &codes
-    ))
-    .to_hbm(&mut device.pdma)
-    .await
-    .unwrap();
-    qn.weight_scale =
-        HostTensor::<f8e4m3, qkv::StoredScales<Hidden, OutputWidth>>::from_vec(QkvProjection::<
-            Hidden,
-            OutputWidth,
-        >::reorder::<16, _>(
-            &scales
-        ))
-        .to_hbm(&mut device.pdma)
-        .await
-        .unwrap();
+    qn.weight = fixtures::upload::<f4e2m1, qkv::Stored<Hidden, OutputWidth>>(
+        &mut device.pdma,
+        QkvProjection::<Hidden, OutputWidth>::reorder::<1, _>(&codes),
+    )
+    .await;
+    qn.weight_scale = fixtures::upload::<f8e4m3, qkv::StoredScales<Hidden, OutputWidth>>(
+        &mut device.pdma,
+        QkvProjection::<Hidden, OutputWidth>::reorder::<16, _>(&scales),
+    )
+    .await;
     // Distinct row values detect reuse of the first operand in a prefetched tail.
     for rows in [
         1, 4, 7, 8, 9, 15, 16, 17, 24, 32, 33, 129, 200, 256, 257, 264, 265, 288, 289, 320, 321,
         383, 384, 385, 511, 512,
     ] {
-        let input = HostTensor::<bf16, m![Rows, Hidden]>::from_vec(
+        let input = fixtures::upload::<bf16, m![Rows, Hidden]>(
+            &mut device.pdma,
             (0..Rows::SIZE * Hidden::SIZE).map(|i| {
                 let row = i / Hidden::SIZE;
                 bf16::from_f32(if row < rows {
@@ -383,18 +331,12 @@ async fn resident_q_and_kv_match_scalar_w4a16() {
                 })
             }),
         )
-        .to_hbm(&mut device.pdma)
-        .await
-        .unwrap();
+        .await;
         let count = fixtures::count(&mut device, rows).await;
         let (q, _, _) = launch(shared, (&mut device, &qn, &kn, &vn, &count, &input))
             .await
             .unwrap();
-        let values = q
-            .to_host::<m![Rows, OutputWidth]>(&mut device.pdma)
-            .await
-            .unwrap()
-            .into_vec();
+        let values = fixtures::read::<_, m![Rows, OutputWidth]>(&mut device.pdma, &q).await;
         for (i, value) in values.iter().take(rows * OutputWidth::SIZE).enumerate() {
             let expected = (if i % OutputWidth::SIZE % 2 == 0 {
                 -320.0

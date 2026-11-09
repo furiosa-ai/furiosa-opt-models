@@ -111,10 +111,7 @@ async fn fused_mlp_matches_scalar_w4a16_with_poisoned_padding() {
     )
     .await;
     // Distinct weight tensor factors detect swapped gate/up paths.
-    scales.output = HostTensor::<f32, m![1 # 8]>::from_vec(vec![0.25; 8])
-        .to_hbm(&mut device.pdma)
-        .await
-        .unwrap();
+    scales.output = fixtures::upload::<f32, m![1 # 8]>(&mut device.pdma, vec![0.25; 8]).await;
     let up = Panels {
         weight,
         weight_scale,
@@ -141,16 +138,17 @@ async fn fused_mlp_matches_scalar_w4a16_with_poisoned_padding() {
     for rows in [
         1, 4, 8, 9, 16, 17, 32, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512,
     ] {
-        let input = HostTensor::<bf16, m![Rows, Hidden]>::from_vec((0..512 * 4096).map(|at| {
-            bf16::from_f32(if at / 4096 < rows {
-                input(at / 4096, at % 4096)
-            } else {
-                f32::NAN
-            })
-        }))
-        .to_hbm(&mut device.pdma)
-        .await
-        .unwrap();
+        let input = fixtures::upload::<bf16, m![Rows, Hidden]>(
+            &mut device.pdma,
+            (0..512 * 4096).map(|at| {
+                bf16::from_f32(if at / 4096 < rows {
+                    input(at / 4096, at % 4096)
+                } else {
+                    f32::NAN
+                })
+            }),
+        )
+        .await;
         let count = fixtures::count(&mut device, rows).await;
         let output = launch(fused, (&mut device, &mlp, &count, &input))
             .await
@@ -186,24 +184,23 @@ async fn fused_mlp_matches_scalar_w4a16_with_poisoned_padding() {
             value: furiosa_opt_models::load::Named(projection(&mut device).await),
         };
         let norm = Norm::new(Weight::new(
-            HostTensor::<bf16, m![Hidden]>::from_vec(vec![bf16::from_f32(1.0); 4096])
-                .to_hbm(&mut device.pdma)
-                .await
-                .unwrap(),
+            fixtures::upload::<bf16, m![Hidden]>(&mut device.pdma, vec![bf16::from_f32(1.0); 4096])
+                .await,
         ));
         for rows in [
             1, 4, 8, 9, 16, 17, 32, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512,
         ] {
-            let input = HostTensor::<bf16, m![Rows, Hidden]>::from_vec((0..512 * 4096).map(|at| {
-                bf16::from_f32(if at / 4096 < rows {
-                    input(at / 4096, at % 4096)
-                } else {
-                    f32::NAN
-                })
-            }))
-            .to_hbm(&mut device.pdma)
-            .await
-            .unwrap();
+            let input = fixtures::upload::<bf16, m![Rows, Hidden]>(
+                &mut device.pdma,
+                (0..512 * 4096).map(|at| {
+                    bf16::from_f32(if at / 4096 < rows {
+                        input(at / 4096, at % 4096)
+                    } else {
+                        f32::NAN
+                    })
+                }),
+            )
+            .await;
             let count = fixtures::count(&mut device, rows).await;
             let output = launch(transition, (&mut device, &mlp, &norm, &qkv, &count, &input))
                 .await
@@ -363,19 +360,14 @@ async fn dense_weights<I: AxisName, O: AxisName, W: M, B: M>(
         })
         .collect::<Vec<_>>();
     (
-        HostTensor::<f4e2m1, W>::from_vec(reorder_weight(&codes))
-            .to_hbm(&mut device.pdma)
-            .await
-            .unwrap(),
-        HostTensor::<f8e4m3, B>::from_vec(reorder_scale(&scales))
-            .to_hbm(&mut device.pdma)
-            .await
-            .unwrap(),
+        fixtures::upload::<f4e2m1, W>(&mut device.pdma, reorder_weight(&codes)).await,
+        fixtures::upload::<f8e4m3, B>(&mut device.pdma, reorder_scale(&scales)).await,
         furiosa_opt_models::ops::linear::nvfp4::tiled::Scales {
-            output: HostTensor::<f32, m![1 # 8]>::from_vec(vec![DENSE_FACTORS[projection]; 8])
-                .to_hbm(&mut device.pdma)
-                .await
-                .unwrap(),
+            output: fixtures::upload::<f32, m![1 # 8]>(
+                &mut device.pdma,
+                vec![DENSE_FACTORS[projection]; 8],
+            )
+            .await,
         },
     )
 }
@@ -427,16 +419,17 @@ async fn fused_mlp_matches_dense_block_dots_with_cancellation_and_poisoned_paddi
     let expected: [[f32; 16]; 4] = std::array::from_fn(dense_reference);
     // Cover both hybrid cutovers and the large-path wave boundary with dense blocks.
     for rows in [8, 9, 16, 17, 129] {
-        let input = HostTensor::<bf16, m![Rows, Hidden]>::from_vec((0..512 * 4096).map(|at| {
-            bf16::from_f32(if at / 4096 < rows {
-                dense_input(at / 4096, at % 4096)
-            } else {
-                f32::NAN
-            })
-        }))
-        .to_hbm(&mut device.pdma)
-        .await
-        .unwrap();
+        let input = fixtures::upload::<bf16, m![Rows, Hidden]>(
+            &mut device.pdma,
+            (0..512 * 4096).map(|at| {
+                bf16::from_f32(if at / 4096 < rows {
+                    dense_input(at / 4096, at % 4096)
+                } else {
+                    f32::NAN
+                })
+            }),
+        )
+        .await;
         let count = fixtures::count(&mut device, rows).await;
         let output = launch(fused, (&mut device, &mlp, &count, &input))
             .await

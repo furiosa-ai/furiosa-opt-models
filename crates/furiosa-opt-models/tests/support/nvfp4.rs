@@ -13,11 +13,26 @@ axes![
     Rows = 512
 ];
 
-async fn scalar(device: &mut Device, value: f32) -> Scale {
-    HostTensor::<f32, m![1 # 8]>::from_vec(vec![value; 8])
-        .to_hbm(&mut device.pdma)
+/// Keep test setup explicit while sharing the repeated transfer/error handling.
+pub async fn upload<D: MaterializableScalar, Shape: M>(
+    pdma: &mut DmaContext<{ Dma::Pcie }>,
+    values: impl IntoIterator<Item = D>,
+) -> HbmTensor<D, m![1], Shape> {
+    HostTensor::<D, Shape>::from_vec(values)
+        .to_hbm(pdma)
         .await
         .unwrap()
+}
+
+pub async fn read<D: MaterializableScalar, Shape: M>(
+    pdma: &mut DmaContext<{ Dma::Pcie }>,
+    tensor: &HbmTensor<D, m![1], Shape>,
+) -> Vec<D> {
+    tensor.to_host::<Shape>(pdma).await.unwrap().into_vec()
+}
+
+async fn scalar(device: &mut Device, value: f32) -> Scale {
+    upload::<f32, m![1 # 8]>(&mut device.pdma, vec![value; 8]).await
 }
 
 fn feature<I: AxisName>(output: usize, term: usize) -> usize {
@@ -81,20 +96,18 @@ pub async fn weights_with<I: AxisName, O: AxisName, W: M, B: M>(
         }
     }
     (
-        HostTensor::<f4e2m1, W>::from_vec(pack_weight(&codes))
-            .to_hbm(&mut device.pdma)
-            .await
-            .unwrap(),
-        HostTensor::<f8e4m3, B>::from_vec(pack_scale(
-            &(0..O::SIZE * I::SIZE / 16)
-                .map(|at| {
-                    f8e4m3::from_f32(block_scale(at / (I::SIZE / 16), at % (I::SIZE / 16) * 16))
-                })
-                .collect::<Vec<_>>(),
-        ))
-        .to_hbm(&mut device.pdma)
-        .await
-        .unwrap(),
+        upload::<f4e2m1, W>(&mut device.pdma, pack_weight(&codes)).await,
+        upload::<f8e4m3, B>(
+            &mut device.pdma,
+            pack_scale(
+                &(0..O::SIZE * I::SIZE / 16)
+                    .map(|at| {
+                        f8e4m3::from_f32(block_scale(at / (I::SIZE / 16), at % (I::SIZE / 16) * 16))
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        )
+        .await,
         // Only weight_scale_2=.5 applies; fractional inputs detect unwanted A4 quantization.
         Scales {
             output: scalar(device, 0.5).await,
@@ -103,19 +116,15 @@ pub async fn weights_with<I: AxisName, O: AxisName, W: M, B: M>(
 }
 
 pub async fn input<I: AxisName>(device: &mut Device) -> HbmTensor<bf16, m![1], m![Rows, I]> {
-    HostTensor::<bf16, m![Rows, I]>::from_vec(
+    upload::<bf16, m![Rows, I]>(
+        &mut device.pdma,
         (0..Rows::SIZE * I::SIZE).map(|at| bf16::from_f32(value(at / I::SIZE, at % I::SIZE))),
     )
-    .to_hbm(&mut device.pdma)
     .await
-    .unwrap()
 }
 
 pub async fn count(device: &mut Device, rows: usize) -> Count {
-    HostTensor::<i32, m![1]>::from_vec(vec![rows as i32])
-        .to_hbm(&mut device.pdma)
-        .await
-        .unwrap()
+    upload::<i32, m![1]>(&mut device.pdma, vec![rows as i32]).await
 }
 
 pub async fn check<I: AxisName, O: AxisName>(
@@ -123,11 +132,7 @@ pub async fn check<I: AxisName, O: AxisName>(
     output: HbmTensor<bf16, m![1], m![Rows, O]>,
     rows: usize,
 ) {
-    let values = output
-        .to_host::<m![Rows, O]>(&mut device.pdma)
-        .await
-        .unwrap()
-        .into_vec();
+    let values = read::<_, m![Rows, O]>(&mut device.pdma, &output).await;
     for (index, found) in values.into_iter().take(rows * O::SIZE).enumerate() {
         let (row, output) = (index / O::SIZE, index % O::SIZE);
         let expected = bf16::from_f32(
