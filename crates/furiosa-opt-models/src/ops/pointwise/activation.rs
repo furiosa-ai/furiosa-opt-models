@@ -436,7 +436,7 @@ impl<Factor> Softcap<Factor> {
         Factor: Borrow<HbmTensor<f32, Chips, m![1 # 8]>>,
     {
         type Placed<Hidden, V, Chips> =
-            DmTensor<f32, Chips, stream::Cluster<V>, stream::Reduced<Hidden, V>, m![1 # 8]>;
+            DmTensor<f32, Chips, stream::Cluster<Hidden, V>, stream::Reduced<Hidden, V>, m![1 # 8]>;
         let inverse: Placed<Hidden, V, Chips> = self.inverse.borrow().to_dm(&mut device.tdma);
         let bound: Placed<Hidden, V, Chips> = self.bound.borrow().to_dm(&mut device.tdma);
         Softcap {
@@ -483,7 +483,7 @@ impl<H: AxisName, V: AxisName, R: AxisName, Chips: M + 'static> Op<&stream::Logi
 
 /// One FP32 scalar in every slice of a vocabulary pass's logits.
 type Register<Hidden, V, Chips> =
-    VrfTensor<f32, Chips, stream::Cluster<V>, stream::Reduced<Hidden, V>, m![1 # 8]>;
+    VrfTensor<f32, Chips, stream::Cluster<Hidden, V>, stream::Reduced<Hidden, V>, m![1 # 8]>;
 
 /// `x * sigmoid(x)` of every row of one launch in feature slices, in FP32, rounded to BF16 once;
 /// the result keeps their live rows.

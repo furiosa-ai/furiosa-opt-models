@@ -1,7 +1,9 @@
 //! A projection onto more outputs than data memory holds, such as a vocabulary: each slice keeps
-//! one pass of its block of weight rows at a time, and each pass issues the next pass's weights
-//! before its own contraction, so the weights stream under the compute.
+//! one pass of its weight rows at a time, and each pass issues the next pass's weights before its
+//! own contraction, so the weights stream under the compute.
 //!
+//! - A pass takes the next run of the vocabulary's rows, each slice consecutive rows of it, so the
+//!   slices' runs lie side by side in the table and a pass's landing reads one region of it.
 //! - A pass's logits, each plus its bias, go to a consumer while the pass is live: a function the
 //!   caller passes, such as one taking argmax's candidates, or the rows' scores in HBM.
 //! - Every row of the input's envelope is projected. Logits for a function stage the rows' lanes
@@ -56,17 +58,45 @@ type Feature<Hidden> = Symbol<normalization::Chunk<Hidden>>;
 
 /// The slices sharing one row's contraction, `Hidden / chunk`.
 type Parts<Hidden> = m![Hidden / ({ Chunk<Hidden> })];
-/// The vocabulary rows one slice writes over every pass, `V * parts / 512`: its block of the
-/// rows, `PassRows` a pass, since the blocks fill the `256 / parts` slots of both clusters.
+/// The vocabulary rows one slice writes over every pass, `V * parts / 512`, `PassRows` a pass,
+/// since the slices' rows fill the `256 / parts` slots of both clusters.
 pub(crate) type Block<Hidden, V> = m![(V, { Parts<Hidden> }) / 512];
-/// The passes a slice's block takes.
+/// The passes a slice's rows take.
 pub(crate) type Passes<Hidden, V> = m![{ Block<Hidden, V> } / ({ PassRows<Hidden, V> })];
 
-pub(crate) type Cluster<V> = m![V / (V / 2)];
-type Slice<Hidden, V> =
-    m![V % (V / 2) / ({ Block<Hidden, V> }), 1 # ({ m![1] }), { Parts<Hidden> }];
+/// The vocabulary rows of one pass, `V / passes`: a run of consecutive rows, half in each cluster.
+#[derive(Clone, Debug)]
+pub struct Span<Hidden, V>(PhantomData<(Hidden, V)>);
+
+impl<Hidden: AxisName, V: AxisName> AxisName for Span<Hidden, V> {
+    const NAME: Ident = Ident::new("Span");
+
+    const SIZE: usize = V::SIZE / <Passes<Hidden, V> as M>::SIZE;
+}
+
+/// A cluster's half of a pass's rows.
+#[derive(Clone, Debug)]
+pub struct Half<Hidden, V>(PhantomData<(Hidden, V)>);
+
+impl<Hidden: AxisName, V: AxisName> AxisName for Half<Hidden, V> {
+    const NAME: Ident = Ident::new("Half");
+
+    const SIZE: usize = <Span<Hidden, V> as AxisName>::SIZE / 2;
+}
+
+type Spanned<Hidden, V> = Symbol<Span<Hidden, V>>;
+pub(crate) type Halved<Hidden, V> = Symbol<Half<Hidden, V>>;
+
+/// The pass that holds a vocabulary row.
+pub(crate) type PassIndex<Hidden, V> = m![V / ({ Spanned<Hidden, V> })];
+pub(crate) type Cluster<Hidden, V> = m![V % ({ Spanned<Hidden, V> }) / ({ Halved<Hidden, V> })];
+type Slice<Hidden, V> = m![
+    V % ({ Halved<Hidden, V> }) / ({ PassRows<Hidden, V> }),
+    1 # ({ m![1] }),
+    { Parts<Hidden> }
+];
 pub(crate) type Reduced<Hidden, V> = m![
-    V % (V / 2) / ({ Block<Hidden, V> }),
+    V % ({ Halved<Hidden, V> }) / ({ PassRows<Hidden, V> }),
     1 # ({ m![1] }),
     { m![1 # ({ Parts<Hidden> })] }
 ];
@@ -79,7 +109,7 @@ type PaddedGroups = m![17];
 pub(crate) type Logits<Hidden, V, Rows, Chips = Chip> = DmTensor<
     f32,
     Chips,
-    Cluster<V>,
+    Cluster<Hidden, V>,
     Reduced<Hidden, V>,
     m![
         V % ({ PassRows<Hidden, V> }),
@@ -91,7 +121,7 @@ pub(crate) type Logits<Hidden, V, Rows, Chips = Chip> = DmTensor<
 type Weights<Chips, Hidden, V> = DmTensor<
     bf16,
     Chips,
-    Cluster<V>,
+    Cluster<Hidden, V>,
     Slice<Hidden, V>,
     m![
         V % ({ PassRows<Hidden, V> }),
@@ -127,18 +157,12 @@ pub trait Table<Chips: M + 'static> {
     ) -> HbmTensor<bf16, Chips, m![R, { Symbol<Self::Hidden> }]>;
 }
 
-type PassIndex<Hidden, V> = m![V % ({ Block<Hidden, V> }) / ({ PassRows<Hidden, V> })];
-
 impl<Hidden: AxisName, V: AxisName, Chips: M + 'static> Table<Chips>
     for HbmTensor<bf16, Chips, m![V, Hidden]>
 {
     type Hidden = Hidden;
     type Vocabulary = V;
-    type Pass = m![
-        V / ({ Block<Hidden, V> }),
-        V % ({ PassRows<Hidden, V> }) # ({ Block<Hidden, V> }),
-        Hidden
-    ];
+    type Pass = m![V % ({ Spanned<Hidden, V> }) # ({ m![V] }), Hidden];
 
     fn pass(&self, at: usize) -> HbmTensorView<'_, bf16, Chips, Self::Pass> {
         self.view().tile::<PassIndex<Hidden, V>, 1, Self::Pass>(at)
@@ -163,8 +187,7 @@ impl<Hidden: AxisName, V: AxisName, Chips: M + 'static> Table<Chips>
     type Vocabulary = V;
     type Pass = m![
         { Parts<Hidden> },
-        V / ({ Block<Hidden, V> }),
-        V % ({ PassRows<Hidden, V> }) # ({ Block<Hidden, V> }),
+        V % ({ Spanned<Hidden, V> }) # ({ m![V] }),
         Hidden % ({ Chunk<Hidden> })
     ];
 
@@ -230,7 +253,7 @@ impl<S: M, T: Table<Chips>, Chips: M + 'static> Table<Chips> for Weight<S, Chips
 type Lanes<Chips, Hidden, V, Rows, Count> = TrfTensor<
     bf16,
     Chips,
-    Cluster<V>,
+    Cluster<Hidden, V>,
     Slice<Hidden, V>,
     m![{ Layout<Rows>::Lanes }],
     m![{ Count }, Hidden % ({ Chunk<Hidden> })],
@@ -239,22 +262,17 @@ type Lanes<Chips, Hidden, V, Rows, Count> = TrfTensor<
 /// A tile of at most 32 rows, the most lanes a transposition of the logits takes.
 type RowTile<Rows> = Symbol<Tile<Rows, 32>>;
 
-/// One per-vocabulary vector, every pass of each slice's block resident at once.
+/// One per-vocabulary vector, every pass of each slice's rows resident at once.
 pub(crate) type Columns<Hidden, V, D, Chips = Chip> = DmTensor<
     D,
     Chips,
-    Cluster<V>,
+    Cluster<Hidden, V>,
     Reduced<Hidden, V>,
-    m![
-        V % ({ Block<Hidden, V> }) / ({ PassRows<Hidden, V> }),
-        V % ({ PassRows<Hidden, V> })
-    ],
+    m![{ PassIndex<Hidden, V> }, V % ({ PassRows<Hidden, V> })],
 >;
 /// One pass of a resident per-vocabulary vector.
-pub(crate) type Column<Hidden, V> = m![
-    1 # (V % ({ Block<Hidden, V> }) / ({ PassRows<Hidden, V> })),
-    V % ({ PassRows<Hidden, V> })
-];
+pub(crate) type Column<Hidden, V> =
+    m![1 # ({ PassIndex<Hidden, V> }), V % ({ PassRows<Hidden, V> })];
 
 /// Every row's logits into `push` with their pass, pass by pass while each pass is live.
 impl<Hidden, V, Rows, T, Offset, Push, Chips: M + 'static> Op<(&Spread<Hidden, Rows, Chips>, Push)>
@@ -325,7 +343,7 @@ where
                 let logits: DmTensor<
                     f32,
                     Chips,
-                    Cluster<V>,
+                    Cluster<Hidden, V>,
                     Reduced<Hidden, V>,
                     m![Rows % ({ RowTile<Rows> }), V % ({ PassRows<Hidden, V> })],
                 > = biased(&mut *device, (weight, &lanes, bias), pass, |sums| {
@@ -344,18 +362,16 @@ where
                     &mut device.tdma,
                     scores
                         .view_mut()
-                        .tile::<m![V % ({ Block<Hidden, V> }) / ({ PassRows<Hidden, V> })], 1, m![
+                        .tile::<PassIndex<Hidden, V>, 1, m![
                             Rows,
-                            V / ({ Block<Hidden, V> }),
                             1 #{!} ({ Passes<Hidden, V> }),
-                            V % ({ PassRows<Hidden, V> })
+                            V % ({ Spanned<Hidden, V> })
                         ]>(pass)
                         .tile::<m![Rows / ({ RowTile<Rows> })], 1, m![
                             1 #{!} (Rows / ({ RowTile<Rows> })),
                             Rows % ({ RowTile<Rows> }),
-                            V / ({ Block<Hidden, V> }),
                             1 #{!} ({ Passes<Hidden, V> }),
-                            V % ({ PassRows<Hidden, V> })
+                            V % ({ Spanned<Hidden, V> })
                         ]>(tile),
                 );
             }
@@ -449,7 +465,7 @@ fn biased<Hidden: AxisName, V: AxisName, Rows: AxisName, Count: M, T, Chips: M +
             { Tu::Main },
             f32,
             Chips,
-            Cluster<V>,
+            Cluster<Hidden, V>,
             Reduced<Hidden, V>,
             m![V % ({ PassRows<Hidden, V> }), { Count }],
             m![{ Layout<Rows>::Lanes } # 8],
@@ -459,18 +475,14 @@ fn biased<Hidden: AxisName, V: AxisName, Rows: AxisName, Count: M, T, Chips: M +
     let bias: VrfTensor<
         f32,
         Chips,
-        Cluster<V>,
+        Cluster<Hidden, V>,
         Reduced<Hidden, V>,
         m![V % ({ PassRows<Hidden, V> })],
     > = device
         .sub
         .begin(
             bias.view()
-                .tile::<
-                    m![V % ({ Block<Hidden, V> }) / ({ PassRows<Hidden, V> })],
-                    1,
-                    Column<Hidden, V>,
-                >(at),
+                .tile::<PassIndex<Hidden, V>, 1, Column<Hidden, V>>(at),
         )
         .fetch::<m![V % ({ PassRows<Hidden, V> }) / 8], m![V % 8]>()
         .collect::<m![V % ({ PassRows<Hidden, V> }) / 8], m![V % 8]>()
@@ -513,7 +525,8 @@ fn stage<
     type Slices<Hidden, V> = Slice<Hidden, V>;
     if const { Hidden::SIZE == 16 * 256 } {
         // Every slice holds sixteen features in both clusters, preserving the source addresses.
-        let input = unsafe { input.reshape::<Chips, Cluster<V>, m![Hidden / 16], Element>() };
+        let input =
+            unsafe { input.reshape::<Chips, Cluster<Hidden, V>, m![Hidden / 16], Element>() };
         device
             .sub
             .begin(input)
@@ -535,11 +548,12 @@ fn stage<
     } else if const { Hidden::SIZE > 16 * 256 } {
         // A slice holds several switch packets, delivered with other slices' parts innermost, so
         // the parts are written in DM before their lanes fill in feature order.
-        let input = unsafe { input.reshape::<Chips, Cluster<V>, FeatureSlices<Hidden>, Element>() };
+        let input =
+            unsafe { input.reshape::<Chips, Cluster<Hidden, V>, FeatureSlices<Hidden>, Element>() };
         let mut staged: DmTensor<
             bf16,
             Chips,
-            Cluster<V>,
+            Cluster<Hidden, V>,
             Slices<Hidden, V>,
             m![{ Count }, { Layout<Rows>::Lanes }, Hidden % ({ C<Hidden> })],
         > = DmTensor::new();
@@ -581,7 +595,8 @@ fn stage<
             .to_trf()
     } else {
         // Both physical clusters already hold every row; only the logical cluster axis changes.
-        let input = unsafe { input.reshape::<Chips, Cluster<V>, m![Hidden / 16 # 256], Element>() };
+        let input =
+            unsafe { input.reshape::<Chips, Cluster<Hidden, V>, m![Hidden / 16 # 256], Element>() };
         device
             .sub
             .begin(input)

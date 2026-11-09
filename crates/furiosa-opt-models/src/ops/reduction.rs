@@ -3,7 +3,9 @@
 use crate::Op;
 use crate::load::{Checkpoint, Context, Load, LoadError};
 use crate::ops::linear::Groups;
-use crate::ops::linear::stream::{self, Block, Column, Columns, Logits, PassRows, ToDm};
+use crate::ops::linear::stream::{
+    self, Column, Columns, Halved, Logits, PassIndex, PassRows, ToDm,
+};
 use crate::ops::pointwise;
 use crate::tensor::mapping::Rows as Layout;
 use crate::tensor::{axis::Single, mapping::BroadcastClusters as Cluster, parallel::Chip, scalar};
@@ -237,7 +239,6 @@ impl<Rows: AxisName> AxisName for Selection<Rows> {
 }
 
 type P<Hidden, V> = m![V % ({ PassRows<Hidden, V> })];
-type Index<Hidden, V> = m![V % ({ Block<Hidden, V> }) / ({ PassRows<Hidden, V> })];
 type Lanes<Rows> = m![{ Layout<Rows>::Lanes } # 8];
 type Half<Rows> = m![{ Layout<Rows>::Lanes } # 8 % 4];
 type Times<Rows> = m![{ Groups<Rows> }, { Layout<Rows>::Lanes } # 8 / 4];
@@ -249,25 +250,25 @@ const SCALE: f32 = 1.0e38;
 type Batches<Rows> = m![{ Groups<Rows> } / 8];
 
 /// Each row's `Count` summaries in every slice of `Slices`.
-type Summaries<Chips, D, V, Count, Slices, Rows> = DmTensor<
+type Summaries<Chips, D, Hidden, V, Count, Slices, Rows> = DmTensor<
     D,
     Chips,
-    stream::Cluster<V>,
+    stream::Cluster<Hidden, V>,
     Slices,
     m![{ Count }, { Groups<Rows> }, { Lanes<Rows> }],
 >;
 /// Each row's one summary in every slice of `Slices`.
-type Summary<Chips, D, V, Slices, Rows> =
-    DmTensor<D, Chips, stream::Cluster<V>, Slices, m![{ Groups<Rows> }, { Lanes<Rows> }]>;
+type Summary<Chips, D, Hidden, V, Slices, Rows> =
+    DmTensor<D, Chips, stream::Cluster<Hidden, V>, Slices, m![{ Groups<Rows> }, { Lanes<Rows> }]>;
 type Stored<Chips, D, Hidden, V, Rows> =
-    Summaries<Chips, D, V, Index<Hidden, V>, stream::Reduced<Hidden, V>, Rows>;
+    Summaries<Chips, D, Hidden, V, PassIndex<Hidden, V>, stream::Reduced<Hidden, V>, Rows>;
 /// One cluster's vocabulary groups.
-type Blocks<Hidden, V> = m![V % (V / 2) / ({ Block<Hidden, V> })];
+type Blocks<Hidden, V> = m![V % ({ Halved<Hidden, V> }) / ({ PassRows<Hidden, V> })];
 
 /// Every group's row summaries, in one slice of each cluster.
 type Gathered<Chips, D, Hidden, V, Rows> =
-    Summaries<Chips, D, V, Blocks<Hidden, V>, m![1 # 256], Rows>;
-type Global<Chips, D, V, Rows> = Summary<Chips, D, V, m![1 # 256], Rows>;
+    Summaries<Chips, D, Hidden, V, Blocks<Hidden, V>, m![1 # 256], Rows>;
+type Global<Chips, D, Hidden, V, Rows> = Summary<Chips, D, Hidden, V, m![1 # 256], Rows>;
 
 /// Each row's maximum and the rank of its first token in every pass of a vocabulary projection, as
 /// the projection's passes push them; the argmax that made them selects among them.
@@ -292,18 +293,18 @@ impl<Hidden: AxisName, V: AxisName, Rows: AxisName, Chips: M + 'static>
         let iota = candidates
             .indices
             .view()
-            .tile::<Index<Hidden, V>, 1, Column<Hidden, V>>(at);
+            .tile::<PassIndex<Hidden, V>, 1, Column<Hidden, V>>(at);
         // Two lane halves remain in the reduction, of an eight-slot accumulator; the tensor unit
         // commits both summaries to their pass's slots, leaving DMA to the weight stream.
-        Maximum::<V, P<Hidden, V>, Rows>::of(&mut context.main, logits.view())
-            .commit_view(candidates.maximum.view_mut().tile::<Index<Hidden, V>, 1,
-                m![1 #{!} ({ Index<Hidden, V> }), { Groups<Rows> }, { Lanes<Rows> }],
+        Maximum::<Hidden, V, P<Hidden, V>, Rows>::of(&mut context.main, logits.view())
+            .commit_view(candidates.maximum.view_mut().tile::<PassIndex<Hidden, V>, 1,
+                m![1 #{!} ({ PassIndex<Hidden, V> }), { Groups<Rows> }, { Lanes<Rows> }],
             >(at));
         let maximum: VrfTensor<
-            f32, Chips, stream::Cluster<V>, stream::Reduced<Hidden, V>,
+            f32, Chips, stream::Cluster<Hidden, V>, stream::Reduced<Hidden, V>,
             m![{ Groups<Rows> }, { Lanes<Rows> }],
-        > = context.sub.begin(candidates.maximum.view().tile::<Index<Hidden, V>, 1,
-            m![1 # ({ Index<Hidden, V> }), { Groups<Rows> }, { Lanes<Rows> }],
+        > = context.sub.begin(candidates.maximum.view().tile::<PassIndex<Hidden, V>, 1,
+            m![1 # ({ PassIndex<Hidden, V> }), { Groups<Rows> }, { Lanes<Rows> }],
         >(at))
             .fetch::<Groups<Rows>, Lanes<Rows>>()
             .collect::<Groups<Rows>, Lanes<Rows>>()
@@ -312,7 +313,7 @@ impl<Hidden: AxisName, V: AxisName, Rows: AxisName, Chips: M + 'static>
         let numbers: DmTensor<
             f32,
             Chips,
-            stream::Cluster<V>,
+            stream::Cluster<Hidden, V>,
             stream::Reduced<Hidden, V>,
             P<Hidden, V>,
         > = context
@@ -329,7 +330,7 @@ impl<Hidden: AxisName, V: AxisName, Rows: AxisName, Chips: M + 'static>
         let numbers: VrfTensor<
             f32,
             Chips,
-            stream::Cluster<V>,
+            stream::Cluster<Hidden, V>,
             stream::Reduced<Hidden, V>,
             P<Hidden, V>,
         > = context
@@ -358,8 +359,8 @@ impl<Hidden: AxisName, V: AxisName, Rows: AxisName, Chips: M + 'static>
             .vector_fp_to_fxp(31)
             .vector_final()
             .commit_trim::<Lanes<Rows>>()
-            .commit_view(candidates.rank.view_mut().tile::<Index<Hidden, V>, 1,
-                m![1 #{!} ({ Index<Hidden, V> }), { Groups<Rows> }, { Lanes<Rows> }],
+            .commit_view(candidates.rank.view_mut().tile::<PassIndex<Hidden, V>, 1,
+                m![1 #{!} ({ PassIndex<Hidden, V> }), { Groups<Rows> }, { Lanes<Rows> }],
             >(at));
     }
 }
@@ -391,14 +392,18 @@ impl<Hidden: AxisName, V: AxisName, Rows: AxisName, Chips: M + 'static>
     ) -> Self::Output {
         // Tensor-unit operations run on one live slice per vocabulary group, where each group
         // settles its maximum and rank; tensor DMA gathers the summaries to fold per cluster.
-        let local: Summary<Chips, f32, V, stream::Reduced<Hidden, V>, Rows> =
-            Maximum::<V, Index<Hidden, V>, Rows>::of(&mut context.main, candidates.maximum.view())
-                .commit();
-        let rank = Ranks::<V, Index<Hidden, V>, stream::Reduced<Hidden, V>, Rows>(PhantomData)
-            .forward(
-                &mut *context,
-                (&candidates.rank, &candidates.maximum, &local),
-            );
+        let local: Summary<Chips, f32, Hidden, V, stream::Reduced<Hidden, V>, Rows> =
+            Maximum::<Hidden, V, PassIndex<Hidden, V>, Rows>::of(
+                &mut context.main,
+                candidates.maximum.view(),
+            )
+            .commit();
+        let rank =
+            Ranks::<Hidden, V, PassIndex<Hidden, V>, stream::Reduced<Hidden, V>, Rows>(PhantomData)
+                .forward(
+                    &mut *context,
+                    (&candidates.rank, &candidates.maximum, &local),
+                );
         // The groups' maxima and ranks move to one slice of each cluster.
         let mut maxima: Gathered<Chips, f32, Hidden, V, Rows> = DmTensor::new();
         local
@@ -406,14 +411,15 @@ impl<Hidden: AxisName, V: AxisName, Rows: AxisName, Chips: M + 'static>
             .to_dm_view(&mut context.tdma, maxima.view_mut());
         let mut ranks: Gathered<Chips, i32, Hidden, V, Rows> = DmTensor::new();
         rank.view().to_dm_view(&mut context.tdma, ranks.view_mut());
-        let maximum: Global<Chips, f32, V, Rows> =
-            Maximum::<V, Blocks<Hidden, V>, Rows>::of(&mut context.main, maxima.view()).commit();
-        let other: Global<Chips, f32, V, Rows> =
+        let maximum: Global<Chips, f32, Hidden, V, Rows> =
+            Maximum::<Hidden, V, Blocks<Hidden, V>, Rows>::of(&mut context.main, maxima.view())
+                .commit();
+        let other: Global<Chips, f32, Hidden, V, Rows> =
             maximum.view().cluster_swap().to_dm(&mut context.tdma);
         let other: VrfTensor<
             f32,
             Chips,
-            stream::Cluster<V>,
+            stream::Cluster<Hidden, V>,
             m![1 # 256],
             m![{ Groups<Rows> }, { Lanes<Rows> }],
         > = context
@@ -422,7 +428,7 @@ impl<Hidden: AxisName, V: AxisName, Rows: AxisName, Chips: M + 'static>
             .fetch::<Groups<Rows>, Lanes<Rows>>()
             .collect::<Groups<Rows>, Lanes<Rows>>()
             .to_vrf();
-        let maximum: Global<Chips, f32, V, Rows> = context
+        let maximum: Global<Chips, f32, Hidden, V, Rows> = context
             .main
             .begin(maximum.view())
             .fetch::<Groups<Rows>, Lanes<Rows>>()
@@ -433,14 +439,14 @@ impl<Hidden: AxisName, V: AxisName, Rows: AxisName, Chips: M + 'static>
             .vector_final()
             .commit_trim::<Lanes<Rows>>()
             .commit();
-        let rank = Ranks::<V, Blocks<Hidden, V>, m![1 # 256], Rows>(PhantomData)
+        let rank = Ranks::<Hidden, V, Blocks<Hidden, V>, m![1 # 256], Rows>(PhantomData)
             .forward(&mut *context, (&ranks, &maxima, &maximum));
-        let other: Global<Chips, i32, V, Rows> =
+        let other: Global<Chips, i32, Hidden, V, Rows> =
             rank.view().cluster_swap().to_dm(&mut context.tdma);
         let other: VrfTensor<
             i32,
             Chips,
-            stream::Cluster<V>,
+            stream::Cluster<Hidden, V>,
             m![1 # 256],
             m![{ Groups<Rows> }, { Lanes<Rows> }],
         > = context
@@ -449,7 +455,7 @@ impl<Hidden: AxisName, V: AxisName, Rows: AxisName, Chips: M + 'static>
             .fetch::<Groups<Rows>, Lanes<Rows>>()
             .collect::<Groups<Rows>, Lanes<Rows>>()
             .to_vrf();
-        let rank: Global<Chips, i32, V, Rows> = context
+        let rank: Global<Chips, i32, Hidden, V, Rows> = context
             .main
             .begin(rank.view())
             .fetch::<Groups<Rows>, Lanes<Rows>>()
@@ -460,7 +466,7 @@ impl<Hidden: AxisName, V: AxisName, Rows: AxisName, Chips: M + 'static>
             .vector_final()
             .commit_trim::<Lanes<Rows>>()
             .commit();
-        let token: Global<Chips, i32, V, Rows> = context
+        let token: Global<Chips, i32, Hidden, V, Rows> = context
             .main
             .begin(rank.view())
             .fetch::<Groups<Rows>, Lanes<Rows>>()
@@ -475,20 +481,24 @@ impl<Hidden: AxisName, V: AxisName, Rows: AxisName, Chips: M + 'static>
             .vector_final()
             .commit_trim::<Lanes<Rows>>()
             .commit();
-        Chosen::<V, Rows>(PhantomData).forward(context, token)
+        Chosen::<Hidden, V, Rows>(PhantomData).forward(context, token)
     }
 }
 
 /// Each row's token as the head returns it: one row moves into its padded slot, more rows already
 /// sit in the cells the head returns.
-struct Chosen<V, Rows>(PhantomData<(V, Rows)>);
+struct Chosen<Hidden, V, Rows>(PhantomData<(Hidden, V, Rows)>);
 
-impl<V: AxisName, Rows: AxisName, Chips: M + 'static> Op<Global<Chips, i32, V, Rows>>
-    for Chosen<V, Rows>
+impl<Hidden: AxisName, V: AxisName, Rows: AxisName, Chips: M + 'static>
+    Op<Global<Chips, i32, Hidden, V, Rows>> for Chosen<Hidden, V, Rows>
 {
     type Output = Selected<Rows, Chips>;
 
-    fn forward(&self, context: &mut Device, token: Global<Chips, i32, V, Rows>) -> Self::Output {
+    fn forward(
+        &self,
+        context: &mut Device,
+        token: Global<Chips, i32, Hidden, V, Rows>,
+    ) -> Self::Output {
         if const { Rows::SIZE == 1 } {
             // SAFETY: both clusters hold the same tokens after the symmetric swap.
             let token: DmTensor<
@@ -511,18 +521,18 @@ impl<V: AxisName, Rows: AxisName, Chips: M + 'static> Op<Global<Chips, i32, V, R
 }
 
 /// Each row's maximum over its `Count` summaries in each slice, ready to commit.
-struct Maximum<V, Count, Rows>(PhantomData<(V, Count, Rows)>);
+struct Maximum<Hidden, V, Count, Rows>(PhantomData<(Hidden, V, Count, Rows)>);
 
-impl<V: AxisName, Count: M, Rows: AxisName> Maximum<V, Count, Rows> {
+impl<Hidden: AxisName, V: AxisName, Count: M, Rows: AxisName> Maximum<Hidden, V, Count, Rows> {
     fn of<'l, Slices: M, E: M, Chips: M + 'static>(
         main: &'l mut TuContext<{ Tu::Main }>,
-        summaries: DmTensorView<'l, f32, Chips, stream::Cluster<V>, Slices, E>,
+        summaries: DmTensorView<'l, f32, Chips, stream::Cluster<Hidden, V>, Slices, E>,
     ) -> CommitTrimTensor<
         'l,
         { Tu::Main },
         f32,
         Chips,
-        stream::Cluster<V>,
+        stream::Cluster<Hidden, V>,
         Slices,
         Groups<Rows>,
         Lanes<Rows>,
@@ -545,29 +555,29 @@ impl<V: AxisName, Count: M, Rows: AxisName> Maximum<V, Count, Rows> {
 
 /// Each row's largest rank among its `Count` summaries that tie its maximum, in every slice of
 /// `Slices`.
-struct Ranks<V, Count, Slices, Rows>(PhantomData<(V, Count, Slices, Rows)>);
+struct Ranks<Hidden, V, Count, Slices, Rows>(PhantomData<(Hidden, V, Count, Slices, Rows)>);
 
 /// The ranks and maxima of each row's summaries, and the row's maximum.
-type Tied<'a, Chips, V, Count, Slices, Rows> = (
-    &'a Summaries<Chips, i32, V, Count, Slices, Rows>,
-    &'a Summaries<Chips, f32, V, Count, Slices, Rows>,
-    &'a Summary<Chips, f32, V, Slices, Rows>,
+type Tied<'a, Chips, Hidden, V, Count, Slices, Rows> = (
+    &'a Summaries<Chips, i32, Hidden, V, Count, Slices, Rows>,
+    &'a Summaries<Chips, f32, Hidden, V, Count, Slices, Rows>,
+    &'a Summary<Chips, f32, Hidden, V, Slices, Rows>,
 );
 
-impl<'a, V: AxisName, Count: M, Slices: M, Rows: AxisName, Chips: M + 'static>
-    Op<Tied<'a, Chips, V, Count, Slices, Rows>> for Ranks<V, Count, Slices, Rows>
+impl<'a, Hidden: AxisName, V: AxisName, Count: M, Slices: M, Rows: AxisName, Chips: M + 'static>
+    Op<Tied<'a, Chips, Hidden, V, Count, Slices, Rows>> for Ranks<Hidden, V, Count, Slices, Rows>
 {
-    type Output = Summary<Chips, i32, V, Slices, Rows>;
+    type Output = Summary<Chips, i32, Hidden, V, Slices, Rows>;
 
     fn forward(
         &self,
         context: &mut Device,
-        (ranks, maxima, maximum): Tied<'a, Chips, V, Count, Slices, Rows>,
+        (ranks, maxima, maximum): Tied<'a, Chips, Hidden, V, Count, Slices, Rows>,
     ) -> Self::Output {
         let maximum: VrfTensor<
             f32,
             Chips,
-            stream::Cluster<V>,
+            stream::Cluster<Hidden, V>,
             Slices,
             m![{ Groups<Rows> }, { Lanes<Rows> }],
         > = context
@@ -576,7 +586,7 @@ impl<'a, V: AxisName, Count: M, Slices: M, Rows: AxisName, Chips: M + 'static>
             .fetch::<Groups<Rows>, Lanes<Rows>>()
             .collect::<Groups<Rows>, Lanes<Rows>>()
             .to_vrf();
-        let shifted: Summaries<Chips, f32, V, Count, Slices, Rows> = context
+        let shifted: Summaries<Chips, f32, Hidden, V, Count, Slices, Rows> = context
             .main
             .begin(maxima.view())
             .fetch::<m![{ Count }, { Groups<Rows> }], Lanes<Rows>>()
@@ -589,12 +599,12 @@ impl<'a, V: AxisName, Count: M, Slices: M, Rows: AxisName, Chips: M + 'static>
             .vector_final()
             .commit_trim::<Lanes<Rows>>()
             .commit();
-        let mut rank: Summary<Chips, i32, V, Slices, Rows> = DmTensor::new();
+        let mut rank: Summary<Chips, i32, Hidden, V, Slices, Rows> = DmTensor::new();
         if const { Rows::SIZE <= 64 } {
             let ranks: VrfTensor<
                 i32,
                 Chips,
-                stream::Cluster<V>,
+                stream::Cluster<Hidden, V>,
                 Slices,
                 m![{ Groups<Rows> }, { Count }, { Lanes<Rows> }],
             > = context
@@ -622,7 +632,7 @@ impl<'a, V: AxisName, Count: M, Slices: M, Rows: AxisName, Chips: M + 'static>
         } else {
             #[unroll]
             for batch in 0..<Batches<Rows> as M>::SIZE {
-                let ranks: VrfTensor<i32, Chips, stream::Cluster<V>, Slices,
+                let ranks: VrfTensor<i32, Chips, stream::Cluster<Hidden, V>, Slices,
                     m![{ Batch<Rows> }, { Count }, { Lanes<Rows> }]> =
                 context.sub.begin(ranks.view().tile::<Batches<Rows>, 1,
                     m![{ Count }, 1 # ({ Batches<Rows> }), { Batch<Rows> }, { Lanes<Rows> }],
