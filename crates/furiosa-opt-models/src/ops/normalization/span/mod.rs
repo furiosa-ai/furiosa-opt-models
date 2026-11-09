@@ -140,68 +140,6 @@ where
     }
 }
 
-pub(crate) struct Tile<'i, 'o, Width: AxisName, Rows: M> {
-    pub(crate) input: DmTensorView<
-        'i,
-        bf16,
-        Chip,
-        super::Cluster,
-        super::FeatureSlices<Width>,
-        m![{ Rows }, { Offset<Width> }],
-    >,
-    pub(crate) output: DmTensorViewMut<
-        'o,
-        bf16,
-        Chip,
-        super::Cluster,
-        super::FeatureSlices<Width>,
-        m![{ Rows }, { Offset<Width> }],
-    >,
-}
-
-impl<'i, 'o, Width: AxisName, R: AxisName> Tile<'i, 'o, Width, m![Span % R]> {
-    /// Wave `index` of `R` rows of a span, normalized into `rows`.
-    pub(crate) fn of(
-        span: &'i super::Spread<Width, Span>,
-        index: usize,
-        rows: &'o mut super::Spread<Width, R>,
-    ) -> Self {
-        const { assert!(R::SIZE > 0 && Span::SIZE.is_multiple_of(R::SIZE)) };
-        // SAFETY: R divides Span; the view renames the same rows without moving coordinates.
-        let output = unsafe {
-            rows.view_mut()
-                .reshape::<
-                    Chip,
-                    super::Cluster,
-                    super::FeatureSlices<Width>,
-                    m![Span % R, { Offset<Width> }],
-                >()
-        };
-        Self {
-            input: span
-                .view()
-                .tile::<m![Span / R], 1, m![
-                    Span / R = 1 # (Span / R), Span % R, { Offset<Width> }
-                ]>(index)
-                .unpad::<m![Span % R, { Offset<Width> }]>(),
-            output,
-        }
-    }
-}
-
-impl<Width: AxisName, Rows: M, const EPSILON: usize, Parameter> Op<Tile<'_, '_, Width, Rows>>
-    for super::RmsNorm<Width, EPSILON, Chip, Parameter>
-where
-    Parameter: super::Learned<Width, Chip>,
-{
-    type Output = ();
-
-    fn forward(&self, context: &mut Device, input: Tile<'_, '_, Width, Rows>) {
-        self.normalized::<Rows, _>(context, input.input)
-            .commit_view(input.output);
-    }
-}
-
 /// A cluster's half of a span normalized into `output` in tiles of `CAPACITY` rows, then a last one
 /// of `LAST` rows; each tile's rows past the live ones keep stale values.
 fn tiles<Width: AxisName, const CAPACITY: usize, const LAST: usize>(
@@ -290,16 +228,6 @@ mod tests {
         {
         }
         accepts::<RmsNorm<Width, EPSILON, Chip, Scale<Width, Span>>>();
-    }
-
-    #[test]
-    fn accepts_tile_views_and_gain_in_dm() {
-        fn accepts<N>()
-        where
-            N: for<'d, 'i, 'o> Module<Tile<'i, 'o, Width, m![128]>, (), &'d mut (), Output = ()>,
-        {
-        }
-        accepts::<RmsNorm<Width, EPSILON, Chip, super::super::InDm<Width>>>();
     }
 
     /// A span's live rows normalized, then added to themselves as a layer's residual adds them.
