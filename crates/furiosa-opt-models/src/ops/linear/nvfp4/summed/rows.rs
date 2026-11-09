@@ -2,8 +2,10 @@
 //! consecutive output rows over one part of the inputs, as the late contract's rows do, and the
 //! codes meet the rows unrestored, a lane group of eight rows at a time.
 //!
-//! - A weight begun lands its tensor scale, block scales and codes, one transfer each, before any
-//!   rows arrive, so a schedule can land it under earlier work.
+//! - A weight begun lands its codes and its scales, one transfer each, before any rows arrive, so a
+//!   schedule can land it under earlier work. HBM holds a slice's block scales and the tensor
+//!   scale's packet after them as one run, landed as one place the block scales and the FP32
+//!   tensor scale are each read from.
 //! - A lane group fills half of the tensor registers through the switch ring once and meets every
 //!   pass there; a pass covers the most rows whose FP32 block scales fit the vector registers, and
 //!   loads them there from E4M3 as it begins. The next group fills the other half under the passes
@@ -37,18 +39,20 @@
 //!   reduce scatters them, each chunk's sums onto its own feature slice, and the clusters swap
 //!   their partial sums there instead.
 
+use crate::load::{Context, Load, LoadError};
 use crate::ops::linear::kernel::Rounding;
 use crate::ops::normalization::{self, FeatureSlices, Spread};
 use crate::ops::pointwise::Kept;
 use crate::ops::vector::Restore;
 use crate::specialize::{PACKET, SLICES, TRF, VRF, contraction};
 use crate::tensor::form::BlockScaled;
-use crate::tensor::form::nvfp4::{Exchanged, Features, Held, Scale, Scales, Summed, W4A16};
+use crate::tensor::form::nvfp4::{self, BlockScales, Exchanged, Features, Scales, Summed, W4A16};
 use crate::tensor::memory::Memory;
-use crate::tensor::{axis::Lanes, live::Live, mapping::Rows as Layout, parallel::Chip, scalar};
+use crate::tensor::{axis::Lanes, live::Live, mapping::Rows as Layout, parallel::Chip};
 use crate::{Begin, Op};
 use core::{borrow::Borrow, marker::PhantomData};
 use furiosa_opt_std::prelude::*;
+use furiosa_opt_std::runtime::HostBuffer;
 
 /// Inputs of a row one slice holds: the share of the fewest power-of-two parts whose eight rows fill
 /// at most half of a slice's tensor registers, so a lane group fills beside the one in use.
@@ -216,8 +220,74 @@ type Packed<I, O, P> = m![{ Coded<I, O, P> } # ({ Symbol<Bursts<Coded<I, O, P>, 
 pub type Codes<I, O, P> = m![O / ({ Owner<I, O, P> }), I / ({ Width<I> }), { Packed<I, O, P> }];
 
 /// A weight's E4M3 block scales in HBM as the slices that sum them hold them, a slice's run padded
-/// to whole packets.
-pub type Blocks<I, O, P> = m![O / ({ Owner<I, O, P> }), I / ({ Width<I> }), { Padded<I, O, P> }];
+/// to whole packets and followed by the packet whose first lane is the FP32 tensor scale: one run
+/// a slice, which one transfer lands.
+pub type Blocks<I, O, P> = m![O / ({ Owner<I, O, P> }), I / ({ Width<I> }), { Lead<I, O, P> }];
+
+/// Bytes of a data-memory packet.
+#[derive(Clone, Debug)]
+pub struct Bytes;
+
+impl AxisName for Bytes {
+    const NAME: Ident = Ident::new("Bytes");
+    const SIZE: usize = PACKET;
+}
+
+/// FP32 eight-lane groups of a packet.
+#[derive(Clone, Debug)]
+struct Groups;
+
+impl AxisName for Groups {
+    const NAME: Ident = Ident::new("Groups");
+    const SIZE: usize = PACKET / (8 * 4);
+}
+
+/// Packets of a slice's scales: its block scales', then the tensor scale's last, an odd number of
+/// them as [`Bursts`] keeps a run's, so that the slices' runs start alternately in the HBM's two
+/// stacks: a landing of short runs of an even count is slower by about a third.
+#[derive(Clone, Debug)]
+pub struct Leading<I, O, P>(PhantomData<(I, O, P)>);
+
+impl<I: AxisName, O: AxisName, P: Ownership> AxisName for Leading<I, O, P> {
+    const NAME: Ident = Ident::new("Leading");
+    const SIZE: usize = (Bursts::<Scaled<I, O, P>, f8e4m3>::SIZE / PACKET + 1) | 1;
+}
+
+/// A slice's scales as bytes: its [`Padded`] block scales, then the tensor scale's packet.
+type Lead<I, O, P> = m![{ Symbol<Leading<I, O, P>> }, { Symbol<Bytes> }];
+
+/// A weight's block scales beside its tensor scale, laid out as [`lead`] lays them out.
+impl<I: AxisName, O: AxisName, P: Ownership> Load<(BlockScales<I, O>, nvfp4::Global)>
+    for HbmTensor<f8e4m3, Chip, Blocks<I, O, P>>
+{
+    fn load(
+        context: &mut Context<'_>,
+        (blocks, global): (BlockScales<I, O>, nvfp4::Global),
+    ) -> Result<Self, LoadError> {
+        <Self as Load<_>>::load(context, lead::<I, O, P>(blocks, global))
+    }
+}
+
+/// The same, written into `into`'s storage.
+impl<'t, I: AxisName, O: AxisName, P: Ownership>
+    Load<(
+        &'t mut HbmTensor<f8e4m3, Chip, Blocks<I, O, P>>,
+        (BlockScales<I, O>, nvfp4::Global),
+    )> for &'t mut HbmTensor<f8e4m3, Chip, Blocks<I, O, P>>
+{
+    fn load(
+        context: &mut Context<'_>,
+        (into, (blocks, global)): (
+            &'t mut HbmTensor<f8e4m3, Chip, Blocks<I, O, P>>,
+            (BlockScales<I, O>, nvfp4::Global),
+        ),
+    ) -> Result<Self, LoadError> {
+        <&mut HbmTensor<f8e4m3, Chip, Blocks<I, O, P>> as Load<_>>::load(
+            context,
+            (into, lead::<I, O, P>(blocks, global)),
+        )
+    }
+}
 
 /// A slice's passes over its rows, and the rows of one pass.
 type Tiles<I, O, P> = m![O % ({ Owner<I, O, P> }) / ({ Tall<I, O, P> })];
@@ -362,8 +432,7 @@ impl<H: AxisName, I: AxisName> AxisName for Piece<H, I> {
 /// begun. Its codes are `C`: its own, borrowed from where a schedule landed them ahead, or none
 /// while they wait there.
 pub struct Landed<I: AxisName, O: AxisName, P: Ownership, C = InDm<I, O, P>> {
-    global: DmTensor<f32, Chip, Cluster<I, O, P>, Owners<I, O, P>, m![1 # 8]>,
-    blocks: DmTensor<f8e4m3, Chip, Cluster<I, O, P>, Owners<I, O, P>, Padded<I, O, P>>,
+    scales: DmTensor<f8e4m3, Chip, Cluster<I, O, P>, Owners<I, O, P>, Lead<I, O, P>>,
     codes: C,
 }
 
@@ -374,8 +443,7 @@ type InDm<I, O, P> = DmTensor<f4e2m1, Chip, Cluster<I, O, P>, Owners<I, O, P>, P
 impl<I: AxisName, O: AxisName, P: Ownership> Default for Landed<I, O, P> {
     fn default() -> Self {
         Self {
-            global: DmTensor::new(),
-            blocks: DmTensor::new(),
+            scales: DmTensor::new(),
             codes: DmTensor::new(),
         }
     }
@@ -404,9 +472,8 @@ impl<I: AxisName, O: AxisName, P: Ownership> Landed<I, O, P> {
         )
     };
 
-    /// The weight's tensor scale, block scales and codes, in that order, one transfer each: a
-    /// transfer into part of an owner would hold every later command until the part before it
-    /// lands.
+    /// The weight's scales, then its codes, one transfer each: a transfer into part of an owner
+    /// would hold every later command until the part before it lands.
     fn land<Y: Memory, S: M + 'static, K, V>(
         device: &mut Device,
         weight: &BlockScaled<
@@ -424,16 +491,62 @@ impl<I: AxisName, O: AxisName, P: Ownership> Landed<I, O, P> {
     where
         K: Borrow<HbmTensor<f4e2m1, Chip, Codes<I, O, P>>>,
         V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O, P>>>,
-        Held<Y, S>: Borrow<Scale<S>>,
     {
         const { Self::TILED };
-        let global: &Scale<S> = weight.contract.global.borrow();
         Self {
-            global: global.to_dm(&mut device.tdma),
-            blocks: weight.weight_scale.borrow().to_dm(&mut device.tdma),
+            scales: weight.weight_scale.borrow().to_dm(&mut device.tdma),
             codes: weight.weight.borrow().to_dm(&mut device.tdma),
         }
     }
+}
+
+impl<I: AxisName, O: AxisName, P: Ownership, C> Landed<I, O, P, C> {
+    /// The block scales, the first packets of the scales' place.
+    fn blocks(
+        &self,
+    ) -> DmTensorView<'_, f8e4m3, Chip, Cluster<I, O, P>, Owners<I, O, P>, Padded<I, O, P>> {
+        // SAFETY: the block scales are the place's first bytes, in their order.
+        unsafe {
+            self.scales
+                .view()
+                .reshape::<Chip, Cluster<I, O, P>, Owners<I, O, P>, m![
+                    { Padded<I, O, P> } # ({ Symbol<ScaleBytes<I, O, P>> })
+                ]>()
+                .unpad::<Padded<I, O, P>>()
+        }
+    }
+
+    /// The tensor scale in the vector registers, from the first lane of the place's last packet.
+    fn global(&self, device: &mut Device) -> Global<I, O, P> {
+        type At<I, O, P> = Symbol<Leading<I, O, P>>;
+        // SAFETY: a packet's FP32 cells are its bytes four at a time.
+        let packet = unsafe {
+            self.scales
+                .view()
+                .reinterpret::<f32, m![{ At<I, O, P> }, { Symbol<Groups> }, 1 # 8]>()
+                .tile::<m![{ At<I, O, P> }], 1, m![
+                    { At<I, O, P> } = 1 # ({ At<I, O, P> }), { Symbol<Groups> }, 1 # 8
+                ]>(Leading::<I, O, P>::SIZE - 1)
+                .unpad::<m![{ Symbol<Groups> }, 1 # 8]>()
+                .tile::<m![{ Symbol<Groups> }], 1, m![
+                    { Symbol<Groups> } = 1 # ({ Symbol<Groups> }), 1 # 8
+                ]>(0)
+                .unpad::<m![1 # 8]>()
+        };
+        (device.sub.begin(packet))
+            .fetch::<m![1], m![1 # 8]>()
+            .collect::<m![1], m![1 # 8]>()
+            .to_vrf()
+    }
+}
+
+/// Bytes of a slice's scales, [`Lead`].
+#[derive(Clone, Debug)]
+struct ScaleBytes<I, O, P>(PhantomData<(I, O, P)>);
+
+impl<I: AxisName, O: AxisName, P: Ownership> AxisName for ScaleBytes<I, O, P> {
+    const NAME: Ident = Ident::new("ScaleBytes");
+    const SIZE: usize = Leading::<I, O, P>::SIZE * PACKET;
 }
 
 impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I, O, P, C> {
@@ -447,7 +560,7 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
     where
         P::Sum: Rounding,
     {
-        let global = scalar::register(device, &self.global);
+        let global = self.global(device);
         let mut projected = S::new();
         let (first, count) = input.groups::<Lanes<R>>();
         let rows = input.value();
@@ -692,8 +805,7 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
         device
             .sub
             .begin(
-                self.blocks
-                    .view()
+                self.blocks()
                     .unpad::<Scaled<I, O, P>>()
                     .tile::<Tiles<I, O, P>, 1, m![
                         { Elements<I, O, P> } # ({ Owner<I, O, P> }), { Part<I> } / 16
@@ -1055,7 +1167,6 @@ impl<I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, S: M + 'static>
 where
     K: Borrow<HbmTensor<f4e2m1, Chip, Codes<I, O, Features>>>,
     V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O, Features>>>,
-    Held<Y, S>: Borrow<Scale<S>>,
 {
     type Output = HbmTensor<bf16, Chip, m![R, O]>;
 
@@ -1077,7 +1188,6 @@ impl<I: AxisName, O: AxisName, K, V, Y: Memory, P, S: M + 'static> Op<Begin<()>>
 where
     K: Borrow<HbmTensor<f4e2m1, Chip, Codes<I, O, P>>>,
     V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O, P>>>,
-    Held<Y, S>: Borrow<Scale<S>>,
     P: Ownership,
 {
     type Output = Landed<I, O, P>;
@@ -1095,7 +1205,6 @@ impl<I: AxisName, O: AxisName, K, V, Y: Memory, P, S: M + 'static> Op<Begin<Land
 where
     K: Borrow<HbmTensor<f4e2m1, Chip, Codes<I, O, P>>>,
     V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O, P>>>,
-    Held<Y, S>: Borrow<Scale<S>>,
     P: Ownership,
 {
     type Output = Landed<I, O, P>;
@@ -1108,23 +1217,19 @@ where
     }
 }
 
-/// The same weight begun beside its codes landed in a place: its tensor scale and block scales,
-/// one transfer each.
+/// The same weight begun beside its codes landed in a place: its scales, in one transfer.
 impl<'l, I: AxisName, O: AxisName, K, V, Y: Memory, P, S: M + 'static>
     Op<Begin<&'l Landed<I, O, P>>>
     for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P, S>, Chip, K, V>
 where
     V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O, P>>>,
-    Held<Y, S>: Borrow<Scale<S>>,
     P: Ownership,
 {
     type Output = Landed<I, O, P, ()>;
 
     fn forward(&self, device: &mut Device, _: Begin<&'l Landed<I, O, P>>) -> Self::Output {
-        let global: &Scale<S> = self.contract.global.borrow();
         Landed {
-            global: global.to_dm(&mut device.tdma),
-            blocks: self.weight_scale.borrow().to_dm(&mut device.tdma),
+            scales: self.weight_scale.borrow().to_dm(&mut device.tdma),
             codes: (),
         }
     }
@@ -1136,15 +1241,12 @@ impl<'l, I: AxisName, O: AxisName, K, V, Y: Memory, P, S: M + 'static>
     for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P, S>, Chip, K, V>
 where
     V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O, P>>>,
-    Held<Y, S>: Borrow<Scale<S>>,
     P: Ownership,
 {
     type Output = ();
 
     fn forward(&self, device: &mut Device, begun: &'l mut Landed<I, O, P, ()>) {
-        let global: &Scale<S> = self.contract.global.borrow();
-        (global.view()).to_dm_view(&mut device.tdma, begun.global.view_mut());
-        (self.weight_scale.borrow().view()).to_dm_view(&mut device.tdma, begun.blocks.view_mut());
+        (self.weight_scale.borrow().view()).to_dm_view(&mut device.tdma, begun.scales.view_mut());
     }
 }
 
@@ -1152,8 +1254,7 @@ where
 impl<I: AxisName, O: AxisName, P: Ownership> Default for Landed<I, O, P, ()> {
     fn default() -> Self {
         Self {
-            global: DmTensor::new(),
-            blocks: DmTensor::new(),
+            scales: DmTensor::new(),
             codes: (),
         }
     }
@@ -1175,10 +1276,9 @@ where
         Begin(scales): Begin<Landed<I, O, P, ()>>,
     ) -> Self::Output {
         const { Landed::<I, O, P>::TILED };
-        let Landed { global, blocks, .. } = scales;
+        let Landed { scales, .. } = scales;
         Landed {
-            global,
-            blocks,
+            scales,
             codes: self.weight.borrow().to_dm(&mut device.tdma),
         }
     }
@@ -1192,7 +1292,6 @@ impl<'x, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P: Place<I, O, 
 where
     K: Borrow<HbmTensor<f4e2m1, Chip, Codes<I, O, P>>>,
     V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O, P>>>,
-    Held<Y, S>: Borrow<Scale<S>>,
 {
     type Output = Live<P::Rows, R>;
 
@@ -1247,10 +1346,8 @@ impl<
             &'x Live<Spread<I, R>, R>,
         ),
     ) -> Self::Output {
-        let Landed { global, blocks, .. } = scales;
         let landed = Landed {
-            global,
-            blocks,
+            scales: scales.scales,
             codes: &place.codes,
         };
         let projected = landed.project(device, input);
@@ -1266,7 +1363,6 @@ impl<'x, H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P,
 where
     K: Borrow<HbmTensor<f4e2m1, Chip, Codes<I, O, P>>>,
     V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O, P>>>,
-    Held<Y, S>: Borrow<Scale<S>>,
     P: Place<I, O, R>,
 {
     type Output = Live<P::Rows, R>;
@@ -1357,7 +1453,6 @@ impl<'x, H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, S:
 where
     K: Borrow<HbmTensor<f4e2m1, Chip, Codes<I, O, Exchanged>>>,
     V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O, Exchanged>>>,
-    Held<Y, S>: Borrow<Scale<S>>,
 {
     type Output = Live<Spread<O, R>, R>;
 
@@ -2169,6 +2264,34 @@ fn switch_piece<H: AxisName, I: AxisName, O: AxisName, R: AxisName, P: Ownership
         ]>(piece));
 }
 
+/// A weight's block scales and tensor scale on host as HBM holds them, [`Blocks`]: each slice's
+/// rows of block scales over its part, padded to whole packets, then the tensor scale's packet
+/// last.
+pub fn lead<I: AxisName, O: AxisName, P: Ownership>(
+    blocks: BlockScales<I, O>,
+    global: nvfp4::Global,
+) -> HostTensor<f8e4m3, m![{ Chip }, { Blocks<I, O, P> }]> {
+    let blocks: Vec<u8> = blocks.into_buffer().into();
+    let mut packet: Vec<u8> = global.into_buffer().into();
+    packet.resize(PACKET, 0);
+    let (owned, part, row) = (Owned::<I, O, P>::SIZE, Chunk::<I>::SIZE / 16, I::SIZE / 16);
+    let run = (Leading::<I, O, P>::SIZE - 1) * PACKET;
+    let mut lead = Vec::with_capacity(<m![{ Chip }, { Blocks<I, O, P> }] as M>::SIZE);
+    for chip in blocks.chunks_exact(O::SIZE * row) {
+        for first in (0..O::SIZE).step_by(owned) {
+            for at in (0..row).step_by(part) {
+                let start = lead.len();
+                for output in first..first + owned {
+                    lead.extend_from_slice(&chip[output * row + at..][..part]);
+                }
+                lead.resize(start + run, 0);
+                lead.extend_from_slice(&packet);
+            }
+        }
+    }
+    HostTensor::try_from(HostBuffer::from_vec(lead)).expect("a run for each slice of every chip")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2232,6 +2355,8 @@ mod tests {
             .map(|u| f8e4m3::from_f32((8.0 + 440.0 * u) as f32))
             .collect();
         let global = 2f32.powi(14) * 1.37;
+        let tensor_scale =
+            || HostTensor::<f32, m![1 # 8]>::from_vec([global, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         let row: Vec<bf16> = uniform(r * i, 6)
             .map(|u| bf16::from_f32((4.0 * u - 2.0) as f32))
             .collect();
@@ -2254,18 +2379,16 @@ mod tests {
                 .to_hbm(pdma)
                 .await
                 .unwrap(),
-            weight_scale: HostTensor::<f8e4m3, Scales<Intermediate, Hidden>>::from_vec(scales)
-                .to_hbm(pdma)
-                .await
-                .unwrap(),
+            weight_scale: lead::<Intermediate, Hidden, Exchanged>(
+                HostTensor::from_vec(scales),
+                tensor_scale(),
+            )
+            .to_hbm(pdma)
+            .await
+            .unwrap(),
             contract: Summed {
                 input: W4A16,
-                global: HostTensor::<f32, m![1 # 8]>::from_vec([
-                    global, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                ])
-                .to_hbm(pdma)
-                .await
-                .unwrap(),
+                global: tensor_scale().to_hbm(pdma).await.unwrap(),
                 place: PhantomData,
             },
             shape: PhantomData,

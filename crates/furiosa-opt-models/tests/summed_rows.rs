@@ -16,7 +16,7 @@
 
 use furiosa_opt_models::Op;
 use furiosa_opt_models::models::decoder::attention::gemma4;
-use furiosa_opt_models::models::decoder::form::summed::{Blocks, Codes, Ownership};
+use furiosa_opt_models::models::decoder::form::summed::{Blocks, Codes, Ownership, lead};
 use furiosa_opt_models::ops::normalization::Spread;
 use furiosa_opt_models::ops::pointwise::Kept;
 use furiosa_opt_models::tensor::form::BlockScaled;
@@ -131,9 +131,12 @@ async fn weight<I: AxisName, O: AxisName, P: Ownership>(
             .to_hbm(pdma)
             .await)
             .unwrap(),
-        weight_scale: (HostTensor::<f8e4m3, Scales<I, O>>::from_vec(scales)
-            .to_hbm(pdma)
-            .await)
+        weight_scale: (lead::<I, O, P>(
+            HostTensor::<f8e4m3, m![{ Chip }, { Scales<I, O> }]>::from_vec(scales),
+            HostTensor::<f32, m![1 # 8]>::from_vec(global),
+        )
+        .to_hbm(pdma)
+        .await)
             .unwrap(),
         contract: Summed {
             input: W4A16,

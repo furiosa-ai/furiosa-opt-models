@@ -1494,6 +1494,32 @@ impl Drawn {
         }
     }
 
+    /// The weights on the device under the summed contract, laid out as the catalog's summed form
+    /// lays them out: the block scales beside the tensor scale.
+    async fn summed<I: AxisName, O: AxisName>(&self, device: &mut Device) -> Summing<I, O> {
+        let global = || {
+            HostTensor::<f32, m![1 # 8]>::from_vec([self.global, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        };
+        let scales =
+            HostTensor::<f8e4m3, m![{ Chip }, { Scales<I, O> }]>::from_vec(self.scales.clone());
+        BlockScaled {
+            weight: HostTensor::<f4e2m1, m![O, I]>::from_vec(self.codes.clone())
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap(),
+            weight_scale: summed::lead::<I, O, Features>(scales, global())
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap(),
+            contract: Summed {
+                input: W4A16,
+                global: global().to_hbm(&mut device.pdma).await.unwrap(),
+                place: core::marker::PhantomData,
+            },
+            shape: core::marker::PhantomData,
+        }
+    }
+
     /// Every row's outputs in FP64: `sum_k code_k scale_k x_k / global`.
     fn exact<I: AxisName, O: AxisName>(&self) -> Vec<f64> {
         let (i, o) = (I::SIZE, O::SIZE);
@@ -1596,13 +1622,7 @@ where
 {
     let drawn = Drawn::new::<I, O>(seed);
     let exact = drawn.exact::<I, O>();
-    let summed: Summing<I, O> = drawn
-        .coded(device, |global| Summed {
-            input: W4A16,
-            global,
-            place: core::marker::PhantomData,
-        })
-        .await;
+    let summed: Summing<I, O> = drawn.summed(device).await;
     let early: Nvfp4<I, O, Early<W4A16>> = drawn
         .coded(device, |global| Early {
             input: W4A16,
@@ -1676,12 +1696,7 @@ async fn feed_forward_profile() {
             global,
         })
         .await,
-        up.coded(&mut device, |global| Summed {
-            input: W4A16,
-            global,
-            place: core::marker::PhantomData,
-        })
-        .await,
+        up.summed(&mut device).await,
     );
     let down_proj: (
         Nvfp4<Intermediate, Hidden, Early<W4A16>>,
@@ -1692,12 +1707,7 @@ async fn feed_forward_profile() {
             global,
         })
         .await,
-        down.coded(&mut device, |global| Summed {
-            input: W4A16,
-            global,
-            place: core::marker::PhantomData,
-        })
-        .await,
+        down.summed(&mut device).await,
     );
     for live in list("PERIOD_PROFILE_ROWS", "1,8,9,64") {
         let rows = (

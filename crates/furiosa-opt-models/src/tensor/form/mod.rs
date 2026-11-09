@@ -374,7 +374,7 @@ where
     nvfp4::Late<A, X>: Load<&'a Checkpoint>,
 {
     fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
-        context.checkpoint(from, |cx| Self::read(from, cx, "weight"))
+        context.checkpoint(from, |cx| Self::read(from, cx, "weight", |blocks| blocks))
     }
 }
 
@@ -389,7 +389,9 @@ where
     nvfp4::Early<A, X>: Load<&'a Checkpoint>,
 {
     fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
-        context.checkpoint(from, |cx| Self::read(from, cx, "weight_packed"))
+        context.checkpoint(from, |cx| {
+            Self::read(from, cx, "weight_packed", |blocks| blocks)
+        })
     }
 }
 
@@ -412,7 +414,7 @@ where
             &'s Checkpoint,
         ),
     ) -> Result<Self, LoadError> {
-        context.checkpoint(from, |cx| into.update(from, cx, "weight"))?;
+        context.checkpoint(from, |cx| into.update(from, cx, "weight", |blocks| blocks))?;
         Ok(into)
     }
 }
@@ -434,23 +436,29 @@ where
             &'s Checkpoint,
         ),
     ) -> Result<Self, LoadError> {
-        context.checkpoint(from, |cx| into.update(from, cx, "weight_packed"))?;
+        context.checkpoint(from, |cx| {
+            into.update(from, cx, "weight_packed", |blocks| blocks)
+        })?;
         Ok(into)
     }
 }
 
 /// An NVFP4 weight of a compressed-tensors checkpoint: its packed E2M1 codes under
 /// `weight_packed`, its E4M3 block scales under `weight_scale`, and its tensor scale read by the
-/// experimental summed contract.
+/// experimental summed contract; the block scales' leaf takes the tensor scale beside them, as
+/// HBM holds the two together.
 impl<'a, In: AxisName, Out: AxisName, A, X: Memory, P, S: M + 'static, W, T> Load<&'a Checkpoint>
     for Nvfp4<In, Out, nvfp4::Summed<A, X, P, S>, W, T>
 where
     W: Load<HostTensor<f4e2m1, m![{ Chip }, { m![Out, In] }]>>,
-    T: Load<nvfp4::BlockScales<In, Out>>,
+    T: Load<(nvfp4::BlockScales<In, Out>, nvfp4::Global)>,
     nvfp4::Summed<A, X, P, S>: Load<&'a Checkpoint>,
 {
     fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
-        context.checkpoint(from, |cx| Self::read(from, cx, "weight_packed"))
+        context.checkpoint(from, |cx| {
+            let global = nvfp4::global(from, cx)?;
+            Self::read(from, cx, "weight_packed", |blocks| (blocks, global))
+        })
     }
 }
 
@@ -461,7 +469,7 @@ impl<'t, 's, In: AxisName, Out: AxisName, A, X: Memory, P, S: M + 'static, W, T>
     )> for &'t mut Nvfp4<In, Out, nvfp4::Summed<A, X, P, S>, W, T>
 where
     for<'u> &'u mut W: Load<(&'u mut W, Codes<In, Out>)>,
-    for<'u> &'u mut T: Load<(&'u mut T, nvfp4::BlockScales<In, Out>)>,
+    for<'u> &'u mut T: Load<(&'u mut T, (nvfp4::BlockScales<In, Out>, nvfp4::Global))>,
     for<'u> &'u mut nvfp4::Summed<A, X, P, S>:
         Load<(&'u mut nvfp4::Summed<A, X, P, S>, &'s Checkpoint)>,
 {
@@ -472,7 +480,10 @@ where
             &'s Checkpoint,
         ),
     ) -> Result<Self, LoadError> {
-        context.checkpoint(from, |cx| into.update(from, cx, "weight_packed"))?;
+        context.checkpoint(from, |cx| {
+            let global = nvfp4::global(from, cx)?;
+            into.update(from, cx, "weight_packed", |blocks| (blocks, global))
+        })?;
         Ok(into)
     }
 }
@@ -487,14 +498,15 @@ type Codes<In, Out> = HostTensor<f4e2m1, m![{ Chip }, { m![Out, In] }]>;
 impl<In: AxisName, Out: AxisName, C, W, T> Nvfp4<In, Out, C, W, T> {
     /// The codes under `codes`, the block scales and the contract, absent names reported
     /// together.
-    fn read<'a>(
+    fn read<'a, H>(
         from: &'a Checkpoint,
         context: &mut Context<'_>,
         codes: &str,
+        scales: impl FnOnce(nvfp4::BlockScales<In, Out>) -> H,
     ) -> Result<Self, LoadError>
     where
         W: Load<Codes<In, Out>>,
-        T: Load<nvfp4::BlockScales<In, Out>>,
+        T: Load<H>,
         C: Load<&'a Checkpoint>,
     {
         let mut children = Children::default();
@@ -504,8 +516,8 @@ impl<In: AxisName, Out: AxisName, C, W, T> Nvfp4<In, Out, C, W, T> {
         });
         let weight = children.ask(weight)?;
         let scale = context.field("weight_scale", "weight_scale", |cx| {
-            let scales = nvfp4::block_scales::<In, Out, Chip>(from, cx)?;
-            T::load(cx, scales)
+            let blocks = nvfp4::block_scales::<In, Out, Chip>(from, cx)?;
+            T::load(cx, scales(blocks))
         });
         let scale = children.ask(scale)?;
         let contract = children.ask(context.field("contract", "", |cx| C::load(cx, from)))?;
@@ -515,15 +527,16 @@ impl<In: AxisName, Out: AxisName, C, W, T> Nvfp4<In, Out, C, W, T> {
 
     /// The codes under `codes` and the block scales, each written once it arrived, then the
     /// contract's leaves in place.
-    fn update<'s>(
+    fn update<'s, H>(
         &mut self,
         from: &'s Checkpoint,
         context: &mut Context<'_>,
         codes: &str,
+        scales: impl FnOnce(nvfp4::BlockScales<In, Out>) -> H,
     ) -> Result<(), LoadError>
     where
         for<'u> &'u mut W: Load<(&'u mut W, Codes<In, Out>)>,
-        for<'u> &'u mut T: Load<(&'u mut T, nvfp4::BlockScales<In, Out>)>,
+        for<'u> &'u mut T: Load<(&'u mut T, H)>,
         for<'u> &'u mut C: Load<(&'u mut C, &'s Checkpoint)>,
     {
         context.field("weight", codes, |cx| {
@@ -535,7 +548,9 @@ impl<In: AxisName, Out: AxisName, C, W, T> Nvfp4<In, Out, C, W, T> {
         context.field("weight_scale", "weight_scale", |cx| {
             cx.rule(
                 |cx| nvfp4::block_scales::<In, Out, Chip>(from, cx),
-                |cx, host| <&mut T as Load<_>>::load(cx, (&mut self.weight_scale, host)).map(drop),
+                |cx, host| {
+                    <&mut T as Load<_>>::load(cx, (&mut self.weight_scale, scales(host))).map(drop)
+                },
             )
         })?;
         context

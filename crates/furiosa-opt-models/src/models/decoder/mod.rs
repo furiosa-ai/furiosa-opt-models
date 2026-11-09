@@ -707,13 +707,15 @@ pub mod form {
     /// [`Nvfp4`]'s weights under the experimental summed contract: a row's FP32 sum divides by the
     /// global scale, so no coefficient rounds to BF16. Opt in by naming it in place of [`Nvfp4`].
     /// A launch's projected rows end where `P` places them, as [`Summed`] reads it. HBM holds the
-    /// codes and block scales as the slices that sum them hold them, and the global scale as
-    /// [`Copies`](crate::tensor::scalar::Copies); a load lays them out so.
+    /// codes and block scales as the slices that sum them hold them, each slice's block scales
+    /// followed by the global scale's packet ([`summed::lead`]), so one transfer lands both, and
+    /// the contract's global scale as [`Copies`](crate::tensor::scalar::Copies); a load lays them
+    /// out so.
     pub struct Nvfp4Summed<P = Features>(PhantomData<P>);
 
     /// How HBM holds [`Nvfp4Summed`]'s codes and block scales.
     pub mod summed {
-        pub use crate::ops::linear::nvfp4::summed::rows::{Blocks, Codes, Ownership};
+        pub use crate::ops::linear::nvfp4::summed::rows::{Blocks, Codes, Ownership, lead};
     }
 
     /// FP4 weights with per-16 FP8 block scales under a late FP32 tensor scale, whose inputs enter

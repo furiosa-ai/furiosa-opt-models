@@ -31,7 +31,10 @@ pub type Held<X, S = m![1 # 8]> = <X as Memory>::Tensor<f32, Chip, S>;
 pub type Scales<In, Out> = m![Out, In / 16];
 
 /// The host value of a weight's [`Scales`] on every chip of `C`.
-pub(crate) type BlockScales<In, Out, C = Chip> = HostTensor<f8e4m3, m![{ C }, { Scales<In, Out> }]>;
+pub type BlockScales<In, Out, C = Chip> = HostTensor<f8e4m3, m![{ C }, { Scales<In, Out> }]>;
+
+/// The host value of a weight's tensor scale: its FP32 value in the first lane of a packet.
+pub type Global = HostTensor<f32, m![1 # 8]>;
 
 /// Each restored coefficient divided by the tensor scale before its one BF16 rounding, inputs in
 /// form `A`: a compressed-tensors checkpoint's `weight_global_scale`.
@@ -229,6 +232,13 @@ pub(crate) fn codes<C: M + 'static, S: M + 'static>(
             name,
             reason: error.to_string(),
         }
+    })
+}
+
+/// The tensor scale beside the context's name, `weight_global_scale`, on host.
+pub(crate) fn global(from: &Checkpoint, context: &mut Context<'_>) -> Result<Global, LoadError> {
+    context.field("global", "weight_global_scale", |cx| {
+        from.host::<f32, m![1 # 8], m![1 # 8]>(cx)
     })
 }
 
