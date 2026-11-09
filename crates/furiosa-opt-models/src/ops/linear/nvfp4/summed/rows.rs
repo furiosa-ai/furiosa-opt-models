@@ -1159,6 +1159,31 @@ impl<I: AxisName, O: AxisName, P: Ownership> Default for Landed<I, O, P, ()> {
     }
 }
 
+/// The same weight begun beside its scales, which a schedule landed into a place before: its codes,
+/// one transfer, behind no scale of its own.
+impl<I: AxisName, O: AxisName, K, V, Y: Memory, P, S: M + 'static> Op<Begin<Landed<I, O, P, ()>>>
+    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P, S>, Chip, K, V>
+where
+    K: Borrow<HbmTensor<f4e2m1, Chip, Codes<I, O, P>>>,
+    P: Ownership,
+{
+    type Output = Landed<I, O, P>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        Begin(scales): Begin<Landed<I, O, P, ()>>,
+    ) -> Self::Output {
+        const { Landed::<I, O, P>::TILED };
+        let Landed { global, blocks, .. } = scales;
+        Landed {
+            global,
+            blocks,
+            codes: self.weight.borrow().to_dm(&mut device.tdma),
+        }
+    }
+}
+
 /// The live rows of a launch in their feature slices through a weight under the summed contract,
 /// into where its placement `P` puts them; the projected rows keep the live rows.
 impl<'x, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P: Place<I, O, R>, S: M + 'static>

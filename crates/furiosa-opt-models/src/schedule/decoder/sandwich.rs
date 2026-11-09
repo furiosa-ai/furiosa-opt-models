@@ -15,14 +15,14 @@
 //! - Its feed-forward's projections land their weights ahead, under work that issues no transfer:
 //!   the gate projection's codes ahead of its start, behind the down projection's output of the
 //!   layer before it and under that layer's finish and its own input norm, into the place the
-//!   decoder carries across its attention to its end, and its scales, behind the post-attention
-//!   and pre-feed-forward norms' gains, under the output projection's passes, which issue no
-//!   transfer once their rows' move is issued, or, with every row group live, under those norms
-//!   behind the projection's output, as passes over every row group read data memory at full
-//!   rate; the up projection's under those norms and the gate's passes; the down projection's
-//!   under the activation and the up projection's passes; its output projection's inside its
-//!   attention, after the attention's first window lands or before its last is prepared. Its
-//!   leaves hold nothing in a call, so it takes `()`.
+//!   decoder carries across its attention to its end, and its scales and the down projection's,
+//!   behind the post-attention and pre-feed-forward norms' gains, under the output projection's
+//!   passes, which issue no transfer once their rows' move is issued, or, with every row group
+//!   live, under those norms behind the projection's output, as passes over every row group read
+//!   data memory at full rate; the up projection's under those norms and the gate's passes; the
+//!   down projection's codes under the activation and the up projection's passes, behind none of
+//!   its scales; its output projection's inside its attention, after the attention's first window
+//!   lands or before its last is prepared. Its leaves hold nothing in a call, so it takes `()`.
 //! - Its tile is its envelope, so its attention hands its end the attended heads where they are,
 //!   with the landed output projection, and writes no HBM place.
 
@@ -82,8 +82,9 @@ type AttendedHeads<A, R> = Attended<
 /// and value projections land as `QL`, `KL`, `VL` and give `QO`, `KO` and the value heads, which
 /// the head norms leave as `NQ`, `NK`; its output projection lands as `OL` in its attention. Its
 /// norms land their gains as `NB`. Its gated feed-forward's gate, up and down projections land as
-/// `GL`, `UL`, `DL` and give `GO`, `UO` and the rows; the activation gives `AO` of the gate's, the
-/// product `MO`, with which the down projection begins as `DR`. Its tail lands its factor as `TB`.
+/// `GL`, `UL`, `DL` and give `GO`, `UO` and the rows, the gate's and the down's scales landing
+/// before them as `GS`, `DS`; the activation gives `AO` of the gate's, the product `MO`, with which
+/// the down projection begins as `DR`. Its tail lands its factor as `TB`.
 impl<
     'c,
     A,
@@ -131,6 +132,7 @@ impl<
     UL,
     UO,
     MO,
+    DS,
     DL,
     DR,
     Add,
@@ -249,8 +251,9 @@ where
                             Named<"pre_feedforward_layernorm", RmsNorm<Hidden, EPSILON, NC, NP>>,
                         >,
                         Named<"gate_proj", Gate>,
+                        Down,
                     >,
-                    &'g mut ((NB, NB), GS),
+                    &'g mut ((NB, NB), (GS, DS)),
                 ),
             ),
             (),
@@ -284,7 +287,11 @@ where
         + for<'r, 'x> Module<(UL, &'r Live<Spread<Hidden, R, Chip>, R>), (), &'x mut (), Output = UO>,
     Multiply: for<'g, 'u, 'x> Module<(&'g AO, &'u UO), (), &'x mut (), Output = MO>,
     Down: for<'x> Module<Begin<()>, (), &'x mut (), Output = DL>
+        + for<'l, 'x> Module<Begin<&'l DL>, (), &'x mut (), Output = DS>
+        + for<'l, 'x> Module<&'l mut DS, (), &'x mut (), Output = ()>
+        + for<'x> Module<Begin<DS>, (), &'x mut (), Output = DL>
         + for<'x> Module<Begin<(DL, MO)>, (), &'x mut (), Output = DR>,
+    DS: Default,
     RowParallel<Down, Placement>:
         for<'x> Module<DR, (), &'x mut (), Output = Live<Spread<Hidden, R, Chip>, R>>,
     Tail: for<'x> Module<Begin<PhantomData<Spread<Hidden, R, Chip>>>, (), &'x mut (), Output = TB>,
@@ -472,13 +479,15 @@ where
         let Residual(_, Then(attention, post), add) = first;
         let Sum(Fork((Then(gate, activation), up)), Then(multiply, down)) = &mlp.0;
         let (landed, heads) = &*landed;
-        let mut begun = <((NB, NB), GS)>::default();
-        let boundary = (&Landings(Gains(post, norm), gate), &mut begun);
+        let down = &down.0.operation;
+        let mut begun = <((NB, NB), (GS, DS))>::default();
+        let boundary = (&Landings(Gains(post, norm), gate, down), &mut begun);
         let projected =
             (attention.0.output).forward(&mut *device, (), &mut (), (landed, heads, boundary));
-        let ((post, norm), mut gate_scales) = begun;
+        let ((post, norm), (mut gate_scales, mut down_scales)) = begun;
         if projected.groups::<Lanes<R>>().1 == <Layout<R>::Groups as M>::SIZE {
             gate.forward(&mut *device, (), &mut (), &mut gate_scales);
+            down.forward(&mut *device, (), &mut (), &mut down_scales);
         }
         let up_landed = up.forward(&mut *device, (), &mut (), Begin(()));
         let branch = post.forward(&mut *device, (), &mut (), &projected);
@@ -486,13 +495,13 @@ where
         let normalized = norm.forward(&mut *device, (), &mut (), &residual);
         let begun = (gate_scales, gate_landed);
         let gated = gate.forward(&mut *device, (), &mut (), (begun, &normalized));
-        let down_landed = (down.0.operation).forward(&mut *device, (), &mut (), Begin(()));
+        let down_landed = down.forward(&mut *device, (), &mut (), Begin(down_scales));
         let activated = activation.forward(&mut *device, (), &mut (), &gated);
         let upped = up.forward(&mut *device, (), &mut (), (up_landed, &normalized));
         let product = multiply.forward(&mut *device, (), &mut (), (&activated, &upped));
         let begun = Begin((down_landed, product));
         Staged {
-            ready: (down.0.operation).forward(&mut *device, (), &mut (), begun),
+            ready: down.forward(&mut *device, (), &mut (), begun),
             attended: residual,
         }
     }
@@ -548,12 +557,12 @@ where
 }
 
 /// What a sandwich-norm layer lands under its output projection's passes, each into its place: its
-/// norms' gains, then its gate projection's scales where fewer than every row group is live.
-struct Landings<'m, N, W>(N, &'m W);
+/// norms' gains, then the gate's and the down's scales where fewer than every row group is live.
+struct Landings<'m, N, W, D>(N, &'m W, &'m D);
 
 /// Every row group live: the gains alone, as passes over every row group read data memory at full
 /// rate and the scales' writes would slow them; those land behind the projection's output.
-impl<'m, 'p, 'x, N, W, G, S> Module<&'p mut (G, S), (), &'x mut ()> for Landings<'m, N, W>
+impl<'m, 'p, 'x, N, W, D, G, S> Module<&'p mut (G, S), (), &'x mut ()> for Landings<'m, N, W, D>
 where
     N: for<'s, 'y> Module<&'s mut G, (), &'y mut (), Output = ()>,
 {
@@ -565,10 +574,12 @@ where
 }
 
 /// Fewer than every row group live: the gains, then the scales.
-impl<'m, 'p, 'x, N, W, G, S> Module<Grouped<&'p mut (G, S)>, (), &'x mut ()> for Landings<'m, N, W>
+impl<'m, 'p, 'x, N, W, D, G, S, T> Module<Grouped<&'p mut (G, (S, T))>, (), &'x mut ()>
+    for Landings<'m, N, W, D>
 where
     N: for<'s, 'y> Module<&'s mut G, (), &'y mut (), Output = ()>,
     W: for<'s, 'y> Module<&'s mut S, (), &'y mut (), Output = ()>,
+    D: for<'s, 'y> Module<&'s mut T, (), &'y mut (), Output = ()>,
 {
     type Output = ();
 
@@ -577,9 +588,10 @@ where
         device: &mut Device,
         _: (),
         _: &'x mut (),
-        Grouped((gains, scales)): Grouped<&'p mut (G, S)>,
+        Grouped((gains, (gate, down))): Grouped<&'p mut (G, (S, T))>,
     ) {
         self.0.forward(&mut *device, (), &mut (), gains);
-        self.1.forward(device, (), &mut (), scales);
+        self.1.forward(&mut *device, (), &mut (), gate);
+        self.2.forward(device, (), &mut (), down);
     }
 }
