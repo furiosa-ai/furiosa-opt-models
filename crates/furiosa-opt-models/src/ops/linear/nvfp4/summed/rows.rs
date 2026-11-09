@@ -32,6 +32,9 @@
 //!   projection kept where they lie, each cluster its own half, with no transfer first (from three
 //!   live groups each cluster lays its half in its feature slices once); one transfer gathers both
 //!   clusters' FP32 partial sums into the output's feature slices, and a pass adds them there.
+//!   Over a decoded weight an owner's feature chunks are as many as its parts, so the inter-slice
+//!   reduce scatters them, each chunk's sums onto its own feature slice, and the clusters swap
+//!   their partial sums there instead.
 
 use crate::ops::linear::kernel::Rounding;
 use crate::ops::normalization::{self, FeatureSlices, Spread};
@@ -378,11 +381,13 @@ impl<I: AxisName, O: AxisName, P: Ownership> Default for Landed<I, O, P> {
 
 impl<I: AxisName, O: AxisName, P: Ownership> Landed<I, O, P> {
     /// The slices hold the weight: whole parts of its inputs, each owner's run of outputs whole
-    /// in the passes, the owners and parts filling every slice.
+    /// in the passes, the owners and parts filling every slice; where the clusters halve the
+    /// inputs, an owner's feature chunks are as many as its parts, each its share of every pass.
     const TILED: () = {
         let halves = if P::HALVES_INPUTS { 2 } else { 1 };
         let parts = I::SIZE / Chunk::<I>::SIZE / halves;
         let owners = outputs::<O, P>() / Owned::<I, O, P>::SIZE;
+        let chunk = normalization::Chunk::<O>::SIZE;
         assert!(
             I::SIZE.is_multiple_of(halves * Chunk::<I>::SIZE)
                 && Chunk::<I>::SIZE.is_multiple_of(128)
@@ -393,6 +398,10 @@ impl<I: AxisName, O: AxisName, P: Ownership> Landed<I, O, P> {
                     == SLICES
                 && Owned::<I, O, P>::SIZE.is_multiple_of(Height::<I, O, P>::SIZE)
                 && Height::<I, O, P>::SIZE.is_multiple_of(4)
+                && (!P::HALVES_INPUTS
+                    || (Owned::<I, O, P>::SIZE == parts * chunk
+                        && Height::<I, O, P>::SIZE.is_multiple_of(parts)
+                        && chunk.is_multiple_of(Height::<I, O, P>::SIZE / parts)))
         )
     };
 
@@ -430,17 +439,17 @@ impl<I: AxisName, O: AxisName, P: Ownership> Landed<I, O, P> {
 
 impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I, O, P, C> {
     /// Every live row's outputs `bf16(sum_b scale_b (sum_{k in b} code_k x_k) / global)`, a lane
-    /// group at a time, each in the slices that sum it.
-    fn project<R: AxisName, X: Stage<I, O, R, P>>(
+    /// group at a time, each in the slices that sum it, as `S` holds them.
+    fn project<R: AxisName, X: Stage<I, O, R, P>, S: Sums<I, O, R, P>>(
         &self,
         device: &mut Device,
         input: &Live<X, R>,
-    ) -> Summing<I, O, R, P>
+    ) -> S
     where
         P::Sum: Rounding,
     {
         let global = scalar::register(device, &self.global);
-        let mut projected = Summing::<I, O, R, P>::new();
+        let mut projected = S::new();
         let (first, count) = input.groups::<Lanes<R>>();
         let rows = input.value();
         let dense = decoded::<R>(count);
@@ -459,7 +468,7 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
         if const { X::PARTS == 0 || X::PARTS >= <Tiles<I, O, P> as M>::SIZE } {
             for _ in 0..whole.min(1) {
                 let summed = |device: &mut Device, lanes: &Registers<I, O, Lane<R>, P>, at| {
-                    self.pass::<R, Split>(device, (lanes, &global), at, &mut projected);
+                    self.pass::<R, Split>(device, (lanes, &global), at, projected.summed());
                 };
                 // The last group's parts come beside the passes of the whole groups' last.
                 let beside = |device: &mut Device, part, staged: &mut _| {
@@ -484,12 +493,17 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
                 }
                 let lanes = rows.front(device, last, &staged);
                 for tile in 0..tiles {
-                    self.pass::<R, Trim>(device, (&lanes, &global), (last, tile), &mut projected);
+                    self.pass::<R, Trim>(
+                        device,
+                        (&lanes, &global),
+                        (last, tile),
+                        projected.summed(),
+                    );
                 }
             }
         } else {
             let summed = |device: &mut Device, lanes: &Registers<I, O, Lane<R>, P>, at| {
-                self.pass::<R, Split>(device, (lanes, &global), at, &mut projected);
+                self.pass::<R, Split>(device, (lanes, &global), at, projected.summed());
             };
             Self::meet(device, (rows, &mut staged), (first, whole), (summed, alone));
             for _ in 0..front {
@@ -497,7 +511,12 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
                 rows.switch_front(device, last, &mut staged);
                 let lanes = rows.front(device, last, &staged);
                 for tile in 0..tiles {
-                    self.pass::<R, Trim>(device, (&lanes, &global), (last, tile), &mut projected);
+                    self.pass::<R, Trim>(
+                        device,
+                        (&lanes, &global),
+                        (last, tile),
+                        projected.summed(),
+                    );
                 }
             }
         }
@@ -506,19 +525,23 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
                 let weights = self.decode(device);
                 let mut met = |device: &mut Device, lanes: &Switching<I, O, R, P>, group| {
                     for tile in 0..tiles {
-                        let operands = (lanes, (&weights, &global));
-                        Self::decoded_pass(device, operands, (group, tile), &mut projected);
+                        projected.decoded(device, (lanes, (&weights, &global)), (group, tile));
                     }
                 };
                 // Pairs of groups, the second in the TRF's other half, so a switch runs beside the
-                // passes before it; an even count's last pair switches its second again.
+                // passes before it; an even count's last pair has no group to switch beside its own.
                 let mut held = rows.switched(device, first);
-                for pair in 0..count / 2 {
+                for pair in 0..(count - 1) / 2 {
                     let group = first + 2 * pair;
                     let next = rows.switched(device, group + 1);
                     met(device, &held, group);
-                    held = rows.switched(device, (group + 2).min(last));
+                    held = rows.switched(device, group + 2);
                     met(device, &next, group + 1);
+                }
+                for _ in 0..1 - count % 2 {
+                    let next = rows.switched(device, last);
+                    met(device, &held, last - 1);
+                    met(device, &next, last);
                 }
                 for _ in 0..count % 2 {
                     met(device, &held, last);
@@ -667,57 +690,6 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
         weights
     }
 
-    /// Pass `tile` of lane group `group` over weights that carry their block scales: the
-    /// contraction adds a row's blocks, the vector engine divides each sum by the tensor scale.
-    fn decoded_pass<R: AxisName>(
-        device: &mut Device,
-        (lanes, (weights, global)): (
-            &Switching<I, O, R, P>,
-            (&Decoded<I, O, P>, &Global<I, O, P>),
-        ),
-        (group, tile): (usize, usize),
-        projected: &mut Summing<I, O, R, P>,
-    ) where
-        P::Sum: Rounding,
-    {
-        let sums = device
-            .main
-            .begin(weights.view().tile::<Tiles<I, O, P>, 1, m![
-                { Elements<I, O, P> } # ({ Owner<I, O, P> }), { Switched<I> }
-            ]>(tile))
-            .fetch::<m![{ Elements<I, O, P> }, { Packets<I> }], m![I % 16]>()
-            .collect::<m![{ Elements<I, O, P> }, { Packets<I> }], m![I % 16]>()
-            .contract_outer::<m![{ Elements<I, O, P> }, { Packets<I> }, 1], m![I % 16], _, _, _>(
-                lanes,
-            )
-            .contract_packet::<m![1]>()
-            .contract_time::<m![{ Elements<I, O, P> }, 1]>()
-            .contract_lane::<m![{ Elements<I, O, P> }, 1], m![{ Lane<R> } # 8]>(LaneMode::Interleaved)
-            .vector_init()
-            .vector_intra_slice_tag(TagMode::Zero)
-            .vector_narrow_split::<
-                m![{ Elements<I, O, P> }, 1, { Lane<R> } # 8 / 4],
-                m![{ Lane<R> } # 8 % 4],
-            >()
-            .vector_fp_div(global)
-            .vector_widen_concat::<m![{ Elements<I, O, P> }, 1], m![{ Lane<R> } # 8]>()
-            .vector_inter_slice_reduce::<Reduced<I, O, P>, m![{ Elements<I, O, P> }, 1]>(
-                InterSliceReduceOpF32::Add,
-            )
-            .vector_final();
-        <P::Sum as Rounding>::round::<
-            _,
-            _,
-            _,
-            _,
-            Lane<R>,
-            m![{ <P::Sum as Rounding>::Packets<Elements<I, O, P>> }, 1, { Lane<R> }],
-            <P::Sum as Rounding>::Packet<O>,
-            _,
-        >(sums)
-        .commit_view(<Split as Fold<I, O, R, P>>::sums(projected, (group, tile)));
-    }
-
     /// The block scales of pass `tile`'s rows in the vector registers, widened to FP32 as they load.
     fn scaling(&self, device: &mut Device, tile: usize) -> Scaling<I, O, P> {
         device
@@ -864,6 +836,166 @@ impl<I: AxisName, O: AxisName, R: AxisName, P: Ownership> Fold<I, O, R, P> for T
                 O % ({ Owner<I, O, P> })
             ]>(0)
             .tile::<Tiles<I, O, P>, 1, Self::Rows>(tile)
+    }
+}
+
+/// What a lane group's pass over a decoded weight reads: the group in the TRF, the weights, which
+/// carry their block scales, and the tensor scale.
+type Operands<'a, I, O, R, P> = (
+    &'a Switching<I, O, R, P>,
+    (&'a Decoded<I, O, P>, &'a Global<I, O, P>),
+);
+
+/// A pass's sums of rows `T` over a decoded weight, every lane of a group, each divided by the
+/// tensor scale: the stream the inter-slice reduce takes.
+type Divided<'l, I, O, R, P, T> = VectorWidenTensor<
+    'l,
+    { Tu::Main },
+    f32,
+    Chip,
+    Cluster<I, O, P>,
+    Owners<I, O, P>,
+    m![{ T }, 1],
+    m![{ Lane<R> } # 8],
+    Fresh,
+    { stage::VeOrder::IntraFirst },
+>;
+
+/// What a projection's passes sum a launch's rows into: the summed passes' sums on the owners'
+/// reduced slices, and the sums of the passes over a decoded weight where the placement lands them.
+trait Sums<I: AxisName, O: AxisName, R: AxisName, P: Ownership> {
+    fn new() -> Self;
+    /// Where the summed passes write.
+    fn summed(&mut self) -> &mut Summing<I, O, R, P>;
+    /// Pass `tile` of lane group `group` over the decoded weights.
+    fn decoded(
+        &mut self,
+        device: &mut Device,
+        operands: Operands<'_, I, O, R, P>,
+        at: (usize, usize),
+    );
+
+    /// Rows `T` of a lane group's pass `at` over the decoded weights, the tile `W` of each slice's
+    /// rows at index `X`: the contraction adds a row's blocks, the vector engine divides each sum by
+    /// the tensor scale.
+    fn divided<'l, T: M, X: M, W: M>(
+        device: &'l mut Device,
+        (lanes, (weights, global)): Operands<'l, I, O, R, P>,
+        at: usize,
+    ) -> Divided<'l, I, O, R, P, T> {
+        device
+            .main
+            .begin(weights.view().tile::<X, 1, W>(at))
+            .fetch::<m![{ T }, { Packets<I> }], m![I % 16]>()
+            .collect::<m![{ T }, { Packets<I> }], m![I % 16]>()
+            .contract_outer::<m![{ T }, { Packets<I> }, 1], m![I % 16], _, _, _>(lanes)
+            .contract_packet::<m![1]>()
+            .contract_time::<m![{ T }, 1]>()
+            .contract_lane::<m![{ T }, 1], m![{ Lane<R> } # 8]>(LaneMode::Interleaved)
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_split::<m![{ T }, 1, { Lane<R> } # 8 / 4], m![{ Lane<R> } # 8 % 4]>()
+            .vector_fp_div(global)
+            .vector_widen_concat::<m![{ T }, 1], m![{ Lane<R> } # 8]>()
+    }
+}
+
+/// The decoded passes' sums where the summed passes leave theirs, an owner's on the first slice of
+/// its parts.
+impl<I: AxisName, O: AxisName, R: AxisName, P: Ownership> Sums<I, O, R, P> for Summing<I, O, R, P>
+where
+    P::Sum: Rounding,
+{
+    fn new() -> Self {
+        DmTensor::new()
+    }
+
+    fn summed(&mut self) -> &mut Summing<I, O, R, P> {
+        self
+    }
+
+    fn decoded(
+        &mut self,
+        device: &mut Device,
+        operands: Operands<'_, I, O, R, P>,
+        (group, tile): (usize, usize),
+    ) {
+        type Tile<I, O, P> = m![{ Elements<I, O, P> } # ({ Owner<I, O, P> }), { Switched<I> }];
+        let sums = <Self as Sums<I, O, R, P>>::divided::<
+            Elements<I, O, P>,
+            Tiles<I, O, P>,
+            Tile<I, O, P>,
+        >(device, operands, tile)
+        .vector_inter_slice_reduce::<Reduced<I, O, P>, m![{ Elements<I, O, P> }, 1]>(
+            InterSliceReduceOpF32::Add,
+        )
+        .vector_final();
+        <P::Sum as Rounding>::round::<
+            _,
+            _,
+            _,
+            _,
+            Lane<R>,
+            m![{ <P::Sum as Rounding>::Packets<Elements<I, O, P>> }, 1, { Lane<R> }],
+            <P::Sum as Rounding>::Packet<O>,
+            _,
+        >(sums)
+        .commit_view(<Split as Fold<I, O, R, P>>::sums(self, (group, tile)));
+    }
+}
+
+/// The summed passes' sums on each owner's first part slice, the decoded passes' scattered over
+/// its parts: the reduce lands each of the owner's chunks on its own feature slice.
+impl<I: AxisName, O: AxisName, R: AxisName> Sums<I, O, R, Exchanged>
+    for (Summing<I, O, R, Exchanged>, Scattered<I, O, R>)
+{
+    fn new() -> Self {
+        (DmTensor::new(), DmTensor::new())
+    }
+
+    fn summed(&mut self) -> &mut Summing<I, O, R, Exchanged> {
+        &mut self.0
+    }
+
+    fn decoded(
+        &mut self,
+        device: &mut Device,
+        operands: Operands<'_, I, O, R, Exchanged>,
+        (group, share): (usize, usize),
+    ) {
+        type Each<I, O> = Symbol<Share<I, O>>;
+        type Tile<I, O> = m![
+            O % ({ Owner<I, O, Exchanged> }) / ({ Feature<O> }),
+            O % ({ Each<I, O> }) # ({ Feature<O> }),
+            { Switched<I> }
+        ];
+        let sums =
+            <Self as Sums<I, O, R, Exchanged>>::divided::<Shared<I, O>, Shares<I, O>, Tile<I, O>>(
+                device, operands, share,
+            )
+            .vector_inter_slice_reduce::<Scatter<I, O>, m![O % ({ Each<I, O> }), 1]>(
+                InterSliceReduceOpF32::Add,
+            )
+            .vector_final();
+        <f32 as Rounding>::round::<
+            _,
+            _,
+            _,
+            _,
+            Lane<R>,
+            m![{ <f32 as Rounding>::Packets<m![O % ({ Each<I, O> })]> }, 1, { Lane<R> }],
+            <f32 as Rounding>::Packet<O>,
+            _,
+        >(sums)
+        .commit_view(
+            (self.1.view_mut())
+                .tile::<Layout<R>::Groups, 1, Layout<R>::GroupMut<m![O % ({ Feature<O> })]>>(group)
+                .tile::<Shares<I, O>, 1, m![
+                    { Layout<R>::SelectedMut },
+                    { Lane<R> },
+                    O % ({ Each<I, O> }) #{!} ({ Feature<O> })
+                ]>(share),
+        );
     }
 }
 
@@ -1317,6 +1449,39 @@ type Terms<O, R> = DmTensor<
     FeatureSlices<O>,
     m![R, Term, O % ({ Feature<O> })],
 >;
+
+/// Rows of each feature chunk an owner holds that one pass over a decoded weight sums, when the
+/// reduce scatters the owner's chunks over its parts: the pass's rows shared evenly among them.
+#[derive(Clone, Debug)]
+struct Share<I, O>(PhantomData<(I, O)>);
+
+impl<I: AxisName, O: AxisName> AxisName for Share<I, O> {
+    const NAME: Ident = Ident::new("Share");
+    const SIZE: usize = Height::<I, O, Exchanged>::SIZE * normalization::Chunk::<O>::SIZE
+        / Owned::<I, O, Exchanged>::SIZE;
+}
+
+/// Which share of each chunk a scattering pass sums.
+type Shares<I, O> = m![O % ({ Feature<O> }) / ({ Symbol<Share<I, O>> })];
+
+/// A scattering pass's rows: one share of each of an owner's feature chunks.
+type Shared<I, O> = m![
+    O % ({ Owner<I, O, Exchanged> }) / ({ Feature<O> }),
+    O % ({ Symbol<Share<I, O>> })
+];
+
+/// The slices a projection that halves its inputs scatters an owner's sums over: the slices of
+/// its parts, each the feature slice of one of its chunks.
+type Scatter<I, O> = m![
+    O / (O / ({ Top<I, O, Exchanged> })) # ({ Slots<I, O, Exchanged> }),
+    O % (O / ({ Top<I, O, Exchanged> })) / ({ Owner<I, O, Exchanged> }),
+    O % ({ Owner<I, O, Exchanged> }) / ({ Feature<O> })
+];
+
+/// A launch's FP32 partial sums over a cluster's half of the inputs, scattered over each owner's
+/// parts.
+type Scattered<I, O, R> =
+    DmTensor<f32, Chip, InputCluster<I>, Scatter<I, O>, m![R, O % ({ Feature<O> })]>;
 
 /// The live rows of `rows` into `into`'s mapping in one transfer, as a setup costs about as much as
 /// all the rows: the one live row, else the lane group holding them, else the envelope.
@@ -1822,24 +1987,30 @@ fn halve<H: AxisName, I: AxisName, R: AxisName>(
     spread
 }
 
-/// The FP32 partial sums of each cluster's half of the inputs `rows` holds, gathered into the
-/// output's feature slices of both clusters in one transfer and added there, each output rounded
-/// once to BF16.
+/// The FP32 partial sums of each cluster's half of the inputs `rows` holds, added in the output's
+/// feature slices of both clusters, each output rounded once to BF16: the clusters swap the sums
+/// the passes over a decoded weight scattered there, else one transfer gathers both there.
 fn exchange<I: AxisName, O: AxisName, R: AxisName>(
     device: &mut Device,
-    rows: Live<Summing<I, O, R, Exchanged>, R>,
+    rows: Live<(Summing<I, O, R, Exchanged>, Scattered<I, O, R>), R>,
 ) -> Live<Spread<O, R>, R> {
     let live = rows.with(());
-    // SAFETY: each cluster summed its own half of the inputs, so its index names the term.
-    let partial: Partials<I, O, R> = unsafe { rows.into_value().reshape() };
-    let mut terms = Terms::<O, R>::new();
-    transfer(device, live.with(&partial), &mut terms);
+    let (summed, scattered) = rows.into_value();
     let mut sums = Spread::<O, R>::new();
     let (first, count) = live.groups::<Lanes<R>>();
-    if count > 1 {
+    if decoded::<R>(count) > 0 {
+        let other: Scattered<I, O, R> = scattered.view().cluster_swap().to_dm(&mut device.tdma);
+        // SAFETY: both clusters add the same two terms into their own copy of every row, an
+        // owner's chunks on their feature slices; only the logical cluster and slice axes change.
+        let into = unsafe {
+            (sums.view_mut()).reshape::<Chip, InputCluster<I>, Scatter<I, O>, m![
+                R,
+                O % ({ Feature<O> })
+            ]>()
+        };
         device
             .main
-            .begin(terms.view())
+            .begin_interleaved::<Term, _, _, _, _, _>(scattered.view(), other.view())
             .fetch::<m![R, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
             .collect::<m![R, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
             .vector_init()
@@ -1848,41 +2019,62 @@ fn exchange<I: AxisName, O: AxisName, R: AxisName>(
             .vector_final()
             .cast::<bf16, m![O % 8 # 16]>()
             .commit_trim::<m![O % 8]>()
-            .commit_view(sums.view_mut());
-    } else if live.rows() == 1 {
-        let row = live.start();
-        device
-            .main
-            .begin((terms.view()).tile::<m![R], 1, m![R = 1 # R, Term, O % ({ Feature<O> })]>(row))
-            .fetch::<m![Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
-            .collect::<m![Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
-            .vector_init()
-            .vector_intra_slice_unzip::<Term, m![O % ({ Feature<O> }) / 8]>()
-            .vector_clip_zip(ClipBinaryOpF32::Add)
-            .vector_final()
-            .cast::<bf16, m![O % 8 # 16]>()
-            .commit_trim::<m![O % 8]>()
-            .commit_view(
-                (sums.view_mut()).tile::<m![R], 1, m![R = 1 #{!} R, O % ({ Feature<O> })]>(row),
-            );
+            .commit_view(into);
     } else {
-        device
-            .main
-            .begin(Layout::<R>::group(terms.view(), first))
-            .fetch::<m![{ Lane<R> }, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
-            .collect::<m![{ Lane<R> }, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
-            .vector_init()
-            .vector_intra_slice_unzip::<Term, m![{ Lane<R> }, O % ({ Feature<O> }) / 8]>()
-            .vector_clip_zip(ClipBinaryOpF32::Add)
-            .vector_final()
-            .cast::<bf16, m![O % 8 # 16]>()
-            .commit_trim::<m![O % 8]>()
-            .commit_view(
-                (sums.view_mut())
-                    .tile::<Layout<R>::Groups, 1, Layout<R>::GroupMut<m![O % ({ Feature<O> })]>>(
-                        first,
-                    ),
-            );
+        // SAFETY: each cluster summed its own half of the inputs, so its index names the term.
+        let partial: Partials<I, O, R> = unsafe { summed.reshape() };
+        let mut terms = Terms::<O, R>::new();
+        transfer(device, live.with(&partial), &mut terms);
+        if count > 1 {
+            device
+                .main
+                .begin(terms.view())
+                .fetch::<m![R, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+                .collect::<m![R, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+                .vector_init()
+                .vector_intra_slice_unzip::<Term, m![R, O % ({ Feature<O> }) / 8]>()
+                .vector_clip_zip(ClipBinaryOpF32::Add)
+                .vector_final()
+                .cast::<bf16, m![O % 8 # 16]>()
+                .commit_trim::<m![O % 8]>()
+                .commit_view(sums.view_mut());
+        } else if live.rows() == 1 {
+            let row = live.start();
+            device
+                .main
+                .begin(
+                    (terms.view()).tile::<m![R], 1, m![R = 1 # R, Term, O % ({ Feature<O> })]>(row),
+                )
+                .fetch::<m![Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+                .collect::<m![Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+                .vector_init()
+                .vector_intra_slice_unzip::<Term, m![O % ({ Feature<O> }) / 8]>()
+                .vector_clip_zip(ClipBinaryOpF32::Add)
+                .vector_final()
+                .cast::<bf16, m![O % 8 # 16]>()
+                .commit_trim::<m![O % 8]>()
+                .commit_view(
+                    (sums.view_mut()).tile::<m![R], 1, m![R = 1 #{!} R, O % ({ Feature<O> })]>(row),
+                );
+        } else {
+            device
+                .main
+                .begin(Layout::<R>::group(terms.view(), first))
+                .fetch::<m![{ Lane<R> }, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+                .collect::<m![{ Lane<R> }, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+                .vector_init()
+                .vector_intra_slice_unzip::<Term, m![{ Lane<R> }, O % ({ Feature<O> }) / 8]>()
+                .vector_clip_zip(ClipBinaryOpF32::Add)
+                .vector_final()
+                .cast::<bf16, m![O % 8 # 16]>()
+                .commit_trim::<m![O % 8]>()
+                .commit_view(
+                    (sums.view_mut())
+                        .tile::<Layout<R>::Groups, 1, Layout<R>::GroupMut<m![O % ({ Feature<O> })]>>(
+                            first,
+                        ),
+                );
+        }
     }
     live.with(sums)
 }
