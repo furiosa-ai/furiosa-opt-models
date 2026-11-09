@@ -114,6 +114,18 @@ jobs:
           compression-level: 0
           retention-days: 1
 
+  # A skipped matrix job reports one status under its unexpanded name, which no required status
+  # matches, so a run that builds nothing reports each package's status here.
+  unbuilt:
+    if: ${{ !inputs.build }}
+    name: ${{ matrix.package }}
+    strategy:
+      matrix:
+        package: [models, engine]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ matrix.package }} is not built on a ${{ github.event_name }} run"
+
   # The wheel builds the engine's extension module, a build of its own, so it runs beside the
   # tests' build rather than after it.
   wheel:
