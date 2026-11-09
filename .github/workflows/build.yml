@@ -49,6 +49,7 @@ jobs:
       matrix:
         include:
           - {package: models, cache: kernels, packages: -p furiosa-opt-models}
+          - {package: nemo, cache: nemo, packages: -p furiosa-opt-nemo}
           # The engine's job also builds its binding's tests, which reach the kernels it serves.
           - {package: engine, cache: serving, packages: -p furiosa-opt-engine -p furiosa-opt-python}
     runs-on: aks-kr-xlarge-m
