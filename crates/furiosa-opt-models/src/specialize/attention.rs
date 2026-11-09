@@ -97,8 +97,8 @@ pub(crate) const fn channels(head: usize, keys: usize) -> usize {
     width
 }
 
-/// Rows one pass of windowed attention attends at most: 32, or fewer so a slice's tensor registers
-/// hold the `keys` keys of `head` BF16 channels it scores for each row group of the pass, its
+/// Rows a slice attends in one pass of windowed attention at most: 32, or fewer so its tensor
+/// registers hold the `keys` keys of `head` BF16 channels it scores for each of its row groups, its
 /// vector registers the mask and the bias of those scores, `groups` query groups a row, and one
 /// data memory page the FP32 attention of those groups, of which a window's fold keeps four.
 pub(crate) const fn pass(head: usize, groups: usize, keys: usize) -> usize {
@@ -111,6 +111,12 @@ pub(crate) const fn pass(head: usize, groups: usize, keys: usize) -> usize {
     }
     assert!(rows >= LANES, "a pass attends a whole row group");
     rows
+}
+
+/// The copies of a head's slot, of `copies`, that a pass of `groups` row groups fills, a row group
+/// a copy; each of its slices holds the rest of its row groups.
+pub(crate) const fn slots(groups: usize, copies: usize) -> usize {
+    if groups < copies { groups } else { copies }
 }
 
 /// Whether a history of `windows` windows holds every window's softmax terms until one merge

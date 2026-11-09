@@ -21,7 +21,8 @@ axes![
     Cache = 512, // tokens one attention window holds; histories and block tables tile by it
 ];
 
-/// The shards of `Count` row groups, every group of the envelope unless one is named.
+/// The shards of `Count` row groups a slice on the head slots `Slot`, every group of the envelope
+/// on the heads' own slots unless named.
 pub(crate) type Partition<
     Rows,
     KvHeads,
@@ -29,12 +30,13 @@ pub(crate) type Partition<
     Head,
     const SCALE: usize,
     Count = RowGroups<Rows>,
+    Slot = HeadSlot<KvHeads>,
 > = partition::Geometry<
     Chip,
     Cluster<Rows>,
-    CacheSlices<Rows, KvHeads>,
-    Agreed<Rows, KvHeads>,
-    Merged<Rows, KvHeads>,
+    CacheSlices<Rows, KvHeads, Slot>,
+    Agreed<Rows, KvHeads, Slot>,
+    MergedSlices<Rows, KvHeads, Slot>,
     Count,
     m![Groups],
     m![Head],
@@ -101,8 +103,47 @@ impl<KvHeads: AxisName> AxisName for ShardPairs<KvHeads> {
 type ShardKeys<KvHeads> = m![Cache % ({ Symbol<Keys<KvHeads>> })];
 
 /// The shards of the row groups of one `N`-row tile, which one pass attends.
-type TileShards<Rows, KvHeads, Groups, Head, const SCALE: usize, const N: usize> =
-    Partition<Rows, KvHeads, Groups, Head, SCALE, TileRows<Rows, N>>;
+type TileShards<Rows, KvHeads, Groups, Head, const SCALE: usize, const N: usize> = Partition<
+    Rows,
+    KvHeads,
+    Groups,
+    Head,
+    SCALE,
+    SliceRows<Rows, KvHeads, N>,
+    TileSlot<Rows, KvHeads, N>,
+>;
+
+/// The row groups of an `N`-row tile of `Rows` that the copies of a head's slot hold, one a copy:
+/// as many as both have, so the slots past a layer's heads attend rows of their own.
+#[derive(Clone, Debug)]
+pub(crate) struct SlotRows<Rows, KvHeads, const N: usize>(PhantomData<(Rows, KvHeads)>);
+
+impl<Rows: AxisName, KvHeads: AxisName, const N: usize> AxisName for SlotRows<Rows, KvHeads, N> {
+    const NAME: Ident = Ident::new("SlotRows");
+    const SIZE: usize = attention::slots(TileGroups::<Rows, N>::SIZE, HeadCopies::<KvHeads>::SIZE);
+}
+
+/// The slots of each of [`SlotRows`]' row groups: its heads' slots and those past them.
+#[derive(Clone, Debug)]
+pub(crate) struct SlotHeads<Rows, KvHeads, const N: usize>(PhantomData<(Rows, KvHeads)>);
+
+impl<Rows: AxisName, KvHeads: AxisName, const N: usize> AxisName for SlotHeads<Rows, KvHeads, N> {
+    const NAME: Ident = Ident::new("SlotHeads");
+    const SIZE: usize = HeadSlots::<KvHeads>::SIZE / SlotRows::<Rows, KvHeads, N>::SIZE;
+}
+
+/// The heads' slots, the slots past them empty.
+type HeadSlot<KvHeads> = m![KvHeads # ({ Symbol<HeadSlots<KvHeads>> })];
+
+/// The slots of an `N`-row tile's row groups: [`SlotRows`] of them, each over its heads' slots.
+type TileSlot<Rows, KvHeads, const N: usize> = m![
+    { TileRows<Rows, N> } % ({ Symbol<SlotRows<Rows, KvHeads, N>> }),
+    KvHeads # ({ Symbol<SlotHeads<Rows, KvHeads, N>> })
+];
+
+/// The row groups of an `N`-row tile that each slice holds.
+type SliceRows<Rows, KvHeads, const N: usize> =
+    m![{ TileRows<Rows, N> } / ({ Symbol<SlotRows<Rows, KvHeads, N>> })];
 
 /// Windows a history may span after the first, which the bounded loop carries: the peeled first
 /// window is why the loop's envelope is one short of a history's.
@@ -118,26 +159,27 @@ impl<Windows: AxisName> AxisName for Rest<Windows> {
 pub(super) type Cluster<Rows> = m![{ Layout<Rows>::Lanes } # 8 / 4];
 
 /// A head's shards are consecutive slices so the inter-slice reducer can combine them; each of
-/// its four row lanes holds shards of its own.
-type CacheSlices<Rows, KvHeads> = m![
-    KvHeads # ({ Symbol<HeadSlots<KvHeads>> }),
+/// its four row lanes holds shards of its own, in each of its slots `Slot`.
+type CacheSlices<Rows, KvHeads, Slot = HeadSlot<KvHeads>> = m![
+    { Slot },
     { Layout<Rows>::Lanes } # 8 % 4,
     Cache / ({ Symbol<Keys<KvHeads>> })
 ];
 
 /// All shard slices of a head hold a copy of the same reduced statistic.
-type Agreed<Rows, KvHeads> = m![
-    KvHeads # ({ Symbol<HeadSlots<KvHeads>> }),
+type Agreed<Rows, KvHeads, Slot = HeadSlot<KvHeads>> = m![
+    { Slot },
     { Layout<Rows>::Lanes } # 8 % 4,
     { Symbol<Shards<KvHeads>> }
 ];
 
+/// One slice per row and head slot holds the merged attention.
+type MergedSlices<Rows, KvHeads, Slot> =
+    m![{ Slot }, { Layout<Rows>::Lanes } # 8 % 4, 1 # ({ Symbol<Shards<KvHeads>> })];
+
 /// One slice per row and head holds the merged attention, `Heads` naming the head.
-pub(super) type Merged<Rows, KvHeads, Heads = m![KvHeads]> = m![
-    { Heads } # ({ Symbol<HeadSlots<KvHeads>> }),
-    { Layout<Rows>::Lanes } # 8 % 4,
-    1 # ({ Symbol<Shards<KvHeads>> })
-];
+pub(super) type Merged<Rows, KvHeads, Heads = m![KvHeads]> =
+    MergedSlices<Rows, KvHeads, m![{ Heads } # ({ Symbol<HeadSlots<KvHeads>> })]>;
 
 /// The consecutive shards of a head one ring carries its query rows over: all of them, or
 /// [`attention::RING`] where a head has more.
@@ -162,9 +204,10 @@ impl<KvHeads: AxisName> AxisName for RingKeys<KvHeads> {
     const SIZE: usize = Keys::<KvHeads>::SIZE * Ring::<KvHeads>::SIZE;
 }
 
-/// The first slice of each [`Ring`] of a head's shards, where a pass's query rows land.
-type RingHeads<Rows, KvHeads> = m![
-    KvHeads # ({ Symbol<HeadSlots<KvHeads>> }),
+/// The first slice of each [`Ring`] of a head's shards in its slots `Slot`, where a pass's query
+/// rows land.
+type RingHeads<Rows, KvHeads, Slot = HeadSlot<KvHeads>> = m![
+    { Slot },
     { Layout<Rows>::Lanes } # 8 % 4,
     Cache / ({ Symbol<RingKeys<KvHeads>> }),
     1 # ({ Symbol<Ring<KvHeads>> })
@@ -344,17 +387,18 @@ pub(super) type Envelope<Rows, KvHeads, Head, Windows> =
 
 /// One chunk as the gather writes it, needing no repartition: each table entry's token block on its
 /// shard and its heads over their slices, the cells of [`ChunkView`], each a `D` the pool holds.
-type InDm<Rows, KvHeads, Head, Count = RowGroups<Rows>, D = bf16> = DmTensor<
-    D,
-    Chip,
-    Cluster<Rows>,
-    m![
-        KvHeads # ({ Symbol<HeadSlots<KvHeads>> }),
-        { Layout<Rows>::Lanes } # 8 % 4,
-        BlockIndex / ({ Symbol<ShardBlocks<KvHeads>> })
-    ],
-    m![{ Count }, KeyValue, BlockIndex % ({ Symbol<ShardBlocks<KvHeads>> }), Block, Head],
->;
+type InDm<Rows, KvHeads, Head, Count = RowGroups<Rows>, D = bf16, Slot = HeadSlot<KvHeads>> =
+    DmTensor<
+        D,
+        Chip,
+        Cluster<Rows>,
+        m![
+            { Slot },
+            { Layout<Rows>::Lanes } # 8 % 4,
+            BlockIndex / ({ Symbol<ShardBlocks<KvHeads>> })
+        ],
+        m![{ Count }, KeyValue, BlockIndex % ({ Symbol<ShardBlocks<KvHeads>> }), Block, Head],
+    >;
 
 /// One chunk's entries of a step's table, the only shape a gather takes an index in: a window's
 /// tile of the table, whose rows lie together.
@@ -393,34 +437,57 @@ pub(crate) struct Wraps;
 
 /// The cache rows a step reads, a shard's whole rows of one head per slice, each row its token's
 /// key and value; `Count` row groups of them, as attention reads a landing's cells.
-type ChunkView<'a, Rows, KvHeads, Head, Count, D = bf16> = DmTensorView<
+type ChunkView<'a, Rows, KvHeads, Head, Count, D = bf16, Slot = HeadSlot<KvHeads>> = DmTensorView<
     'a,
     D,
     Chip,
     Cluster<Rows>,
-    CacheSlices<Rows, KvHeads>,
+    CacheSlices<Rows, KvHeads, Slot>,
     m![{ Count }, KeyValue, { ShardKeys<KvHeads> }, Head],
 >;
 
 /// The same cells as a landing writes a copy of a chunk into them.
-type ChunkViewMut<'a, Rows, KvHeads, Head, Count, D = bf16> = DmTensorViewMut<
+type ChunkViewMut<'a, Rows, KvHeads, Head, Count, D = bf16, Slot = HeadSlot<KvHeads>> =
+    DmTensorViewMut<
+        'a,
+        D,
+        Chip,
+        Cluster<Rows>,
+        CacheSlices<Rows, KvHeads, Slot>,
+        m![{ Count }, KeyValue, { ShardKeys<KvHeads> }, Head],
+    >;
+
+/// The cells of `D` an `N`-row tile's window lands in, as its pass holds its row groups.
+type TileCells<Rows, KvHeads, Head, const N: usize, D = bf16> =
+    InDm<Rows, KvHeads, Head, SliceRows<Rows, KvHeads, N>, D, TileSlot<Rows, KvHeads, N>>;
+
+/// The same cells as a landing writes a copy of a chunk into them.
+type TileChunkMut<'a, Rows, KvHeads, Head, const N: usize, D = bf16> = ChunkViewMut<
     'a,
+    Rows,
+    KvHeads,
+    Head,
+    SliceRows<Rows, KvHeads, N>,
     D,
-    Chip,
-    Cluster<Rows>,
-    CacheSlices<Rows, KvHeads>,
-    m![{ Count }, KeyValue, { ShardKeys<KvHeads> }, Head],
+    TileSlot<Rows, KvHeads, N>,
 >;
 
 /// One window as it lands, its cells of `D` and its bias: two alternate, so a window lands while
 /// the one before it is attended.
-struct Landing<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Count: M, D: Scalar = bf16> {
-    cells: InDm<Rows, KvHeads, Head, Count, D>,
-    bias: Bias<Rows, KvHeads, Count>,
+struct Landing<
+    Rows: AxisName,
+    KvHeads: AxisName,
+    Head: AxisName,
+    Count: M,
+    D: Scalar = bf16,
+    Slot: M = HeadSlot<KvHeads>,
+> {
+    cells: InDm<Rows, KvHeads, Head, Count, D, Slot>,
+    bias: Bias<Rows, KvHeads, Count, Slot>,
 }
 
-impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Count: M, D: Scalar>
-    Landing<Rows, KvHeads, Head, Count, D>
+impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Count: M, D: Scalar, Slot: M>
+    Landing<Rows, KvHeads, Head, Count, D, Slot>
 {
     fn new() -> Self {
         Self {
@@ -430,6 +497,12 @@ impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Count: M, D: Scalar>
     }
 }
 
+/// Rows a slice holds in a pass of `rows` rows over heads of `KvHeads`: the pass's, less those its
+/// heads' slot copies take.
+const fn slice_rows<KvHeads: AxisName>(rows: usize) -> usize {
+    rows / attention::slots(rows.div_ceil(attention::LANES), HeadCopies::<KvHeads>::SIZE)
+}
+
 /// Whether a cluster's cells, a head's lanes in each copy of its slot, hold a lone row's
 /// [`LaneWindows`] of a history of `Windows`, one a cell.
 const fn held<KvHeads: AxisName, Windows: AxisName>() -> bool {
@@ -437,9 +510,9 @@ const fn held<KvHeads: AxisName, Windows: AxisName>() -> bool {
 }
 
 /// The cells of `cells` as attention reads a chunk.
-fn chunk<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Count: M, D: Scalar>(
-    cells: &InDm<Rows, KvHeads, Head, Count, D>,
-) -> ChunkView<'_, Rows, KvHeads, Head, Count, D> {
+fn chunk<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Count: M, D: Scalar, Slot: M>(
+    cells: &InDm<Rows, KvHeads, Head, Count, D, Slot>,
+) -> ChunkView<'_, Rows, KvHeads, Head, Count, D, Slot> {
     // SAFETY: a shard's blocks are its consecutive slots, so both nests name the same cells in the
     // same order.
     unsafe { cells.view().reshape() }
@@ -454,89 +527,82 @@ pub(crate) trait Landed<Rows: AxisName, KvHeads: AxisName, Head: AxisName> {
     type Element: shard::Value;
     /// Where a window's keys, and its values where it streams them, of `Count` row groups widen to
     /// BF16: nothing for BF16 cells.
-    type Restored<Count: M>;
+    type Restored<Count: M, Slot: M>;
 
     /// A place to widen a window's keys and values of `Count` row groups into.
-    fn place<Count: M>() -> Self::Restored<Count>;
+    fn place<Count: M, Slot: M>() -> Self::Restored<Count, Slot>;
 
     /// The window landed in `cells` as the key fill reads it, its keys widened into `place`
     /// first where they are codes; only its keys' half is read.
-    fn keys<'c, Count: M>(
+    fn keys<'c, Count: M, Slot: M>(
         &self,
         device: &mut Device,
-        cells: &'c InDm<Rows, KvHeads, Head, Count, Self::Element>,
-        place: &'c mut Self::Restored<Count>,
-    ) -> ChunkView<'c, Rows, KvHeads, Head, Count>;
+        cells: &'c InDm<Rows, KvHeads, Head, Count, Self::Element, Slot>,
+        place: &'c mut Self::Restored<Count, Slot>,
+    ) -> ChunkView<'c, Rows, KvHeads, Head, Count, bf16, Slot>;
 
     /// The window landed in `cells` as its weighted sum streams it, its values widened into `place`
     /// first where they are codes; only its values' half is read.
-    fn values<'c, Count: M>(
+    fn values<'c, Count: M, Slot: M>(
         &self,
         device: &mut Device,
-        cells: &'c InDm<Rows, KvHeads, Head, Count, Self::Element>,
-        place: &'c mut Self::Restored<Count>,
-    ) -> ChunkView<'c, Rows, KvHeads, Head, Count>;
+        cells: &'c InDm<Rows, KvHeads, Head, Count, Self::Element, Slot>,
+        place: &'c mut Self::Restored<Count, Slot>,
+    ) -> ChunkView<'c, Rows, KvHeads, Head, Count, bf16, Slot>;
 
     /// The same, once [`Self::keys`] widened them.
-    fn widened<'c, Count: M>(
-        cells: &'c InDm<Rows, KvHeads, Head, Count, Self::Element>,
-        place: &'c Self::Restored<Count>,
-    ) -> ChunkView<'c, Rows, KvHeads, Head, Count>;
+    fn widened<'c, Count: M, Slot: M>(
+        cells: &'c InDm<Rows, KvHeads, Head, Count, Self::Element, Slot>,
+        place: &'c Self::Restored<Count, Slot>,
+    ) -> ChunkView<'c, Rows, KvHeads, Head, Count, bf16, Slot>;
 
     /// The scales of a window's codes in the registers of partition `G`, none for BF16 cells.
     fn scales<G>(&self, device: &mut Device) -> Option<shard::Scales<G>>
     where
-        G: shard::Partition<
-                Chip = Chip,
-                Cluster = Cluster<Rows>,
-                Slices = CacheSlices<Rows, KvHeads>,
-            >;
+        G: shard::Partition<Chip = Chip, Cluster = Cluster<Rows>>;
 }
 
-/// The cells a window of `Count` row groups of `Source`'s history lands in.
-type Cells<Source, Rows, KvHeads, Head, Count = RowGroups<Rows>> =
-    InDm<Rows, KvHeads, Head, Count, <Source as Landed<Rows, KvHeads, Head>>::Element>;
+/// The cells a window of `Count` row groups a slice on the head slots `Slot` of `Source`'s
+/// history lands in.
+type Cells<Source, Rows, KvHeads, Head, Count = RowGroups<Rows>, Slot = HeadSlot<KvHeads>> =
+    InDm<Rows, KvHeads, Head, Count, <Source as Landed<Rows, KvHeads, Head>>::Element, Slot>;
 
 /// A history in BF16 is read as it landed.
 macro_rules! landed_as_is {
     () => {
         type Element = bf16;
-        type Restored<Count: M> = ();
+        type Restored<Count: M, Slot: M> = ();
 
-        fn place<Count: M>() {}
+        fn place<Count: M, Slot: M>() {}
 
-        fn keys<'c, Count: M>(
+        fn keys<'c, Count: M, Slot: M>(
             &self,
             _: &mut Device,
-            cells: &'c InDm<Rows, KvHeads, Head, Count>,
+            cells: &'c InDm<Rows, KvHeads, Head, Count, bf16, Slot>,
             _: &'c mut (),
-        ) -> ChunkView<'c, Rows, KvHeads, Head, Count> {
+        ) -> ChunkView<'c, Rows, KvHeads, Head, Count, bf16, Slot> {
             chunk(cells)
         }
 
-        fn values<'c, Count: M>(
+        fn values<'c, Count: M, Slot: M>(
             &self,
             _: &mut Device,
-            cells: &'c InDm<Rows, KvHeads, Head, Count>,
+            cells: &'c InDm<Rows, KvHeads, Head, Count, bf16, Slot>,
             _: &'c mut (),
-        ) -> ChunkView<'c, Rows, KvHeads, Head, Count> {
+        ) -> ChunkView<'c, Rows, KvHeads, Head, Count, bf16, Slot> {
             chunk(cells)
         }
 
-        fn widened<'c, Count: M>(
-            cells: &'c InDm<Rows, KvHeads, Head, Count>,
+        fn widened<'c, Count: M, Slot: M>(
+            cells: &'c InDm<Rows, KvHeads, Head, Count, bf16, Slot>,
             _: &'c (),
-        ) -> ChunkView<'c, Rows, KvHeads, Head, Count> {
+        ) -> ChunkView<'c, Rows, KvHeads, Head, Count, bf16, Slot> {
             chunk(cells)
         }
 
         fn scales<G>(&self, _: &mut Device) -> Option<shard::Scales<G>>
         where
-            G: shard::Partition<
-                    Chip = Chip,
-                    Cluster = Cluster<Rows>,
-                    Slices = CacheSlices<Rows, KvHeads>,
-                >,
+            G: shard::Partition<Chip = Chip, Cluster = Cluster<Rows>>,
         {
             None
         }
@@ -560,46 +626,42 @@ impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName, W>
     for Paged<'_, Rows, KvHeads, Head, Windows, f8e4m3, cache::Landed, W>
 {
     type Element = f8e4m3;
-    type Restored<Count: M> = InDm<Rows, KvHeads, Head, Count>;
+    type Restored<Count: M, Slot: M> = InDm<Rows, KvHeads, Head, Count, bf16, Slot>;
 
-    fn place<Count: M>() -> InDm<Rows, KvHeads, Head, Count> {
+    fn place<Count: M, Slot: M>() -> InDm<Rows, KvHeads, Head, Count, bf16, Slot> {
         DmTensor::new()
     }
 
     /// Each key code widened to BF16, exactly, in one pass without the vector stage.
-    fn keys<'c, Count: M>(
+    fn keys<'c, Count: M, Slot: M>(
         &self,
         device: &mut Device,
-        cells: &'c InDm<Rows, KvHeads, Head, Count, f8e4m3>,
-        place: &'c mut InDm<Rows, KvHeads, Head, Count>,
-    ) -> ChunkView<'c, Rows, KvHeads, Head, Count> {
+        cells: &'c InDm<Rows, KvHeads, Head, Count, f8e4m3, Slot>,
+        place: &'c mut InDm<Rows, KvHeads, Head, Count, bf16, Slot>,
+    ) -> ChunkView<'c, Rows, KvHeads, Head, Count, bf16, Slot> {
         widen(device, cells, place, 0)
     }
 
     /// Each value code widened to BF16 as [`Self::keys`] widens the keys.
-    fn values<'c, Count: M>(
+    fn values<'c, Count: M, Slot: M>(
         &self,
         device: &mut Device,
-        cells: &'c InDm<Rows, KvHeads, Head, Count, f8e4m3>,
-        place: &'c mut InDm<Rows, KvHeads, Head, Count>,
-    ) -> ChunkView<'c, Rows, KvHeads, Head, Count> {
+        cells: &'c InDm<Rows, KvHeads, Head, Count, f8e4m3, Slot>,
+        place: &'c mut InDm<Rows, KvHeads, Head, Count, bf16, Slot>,
+    ) -> ChunkView<'c, Rows, KvHeads, Head, Count, bf16, Slot> {
         widen(device, cells, place, 1)
     }
 
-    fn widened<'c, Count: M>(
-        _: &'c InDm<Rows, KvHeads, Head, Count, f8e4m3>,
-        place: &'c InDm<Rows, KvHeads, Head, Count>,
-    ) -> ChunkView<'c, Rows, KvHeads, Head, Count> {
+    fn widened<'c, Count: M, Slot: M>(
+        _: &'c InDm<Rows, KvHeads, Head, Count, f8e4m3, Slot>,
+        place: &'c InDm<Rows, KvHeads, Head, Count, bf16, Slot>,
+    ) -> ChunkView<'c, Rows, KvHeads, Head, Count, bf16, Slot> {
         chunk(place)
     }
 
     fn scales<G>(&self, device: &mut Device) -> Option<shard::Scales<G>>
     where
-        G: shard::Partition<
-                Chip = Chip,
-                Cluster = Cluster<Rows>,
-                Slices = CacheSlices<Rows, KvHeads>,
-            >,
+        G: shard::Partition<Chip = Chip, Cluster = Cluster<Rows>>,
     {
         let (key, value) = (self.scales).registers(device);
         Some(shard::Scales(key, value))
@@ -630,8 +692,8 @@ impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName, E>
 }
 
 /// A history carried outright holds every window whole: nothing wraps.
-impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName, E, X, Count: M>
-    crate::Module<(Wraps, X), E, &mut InDm<Rows, KvHeads, Head, Count>>
+impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName, E, X, Count: M, Slot: M>
+    crate::Module<(Wraps, X), E, &mut InDm<Rows, KvHeads, Head, Count, bf16, Slot>>
     for Envelope<Rows, KvHeads, Head, Windows>
 {
     type Output = ();
@@ -640,7 +702,7 @@ impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName, E, X,
         &self,
         _: &mut Device,
         _: E,
-        _: &mut InDm<Rows, KvHeads, Head, Count>,
+        _: &mut InDm<Rows, KvHeads, Head, Count, bf16, Slot>,
         _: (Wraps, X),
     ) {
     }
@@ -648,7 +710,7 @@ impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName, E, X,
 
 /// Window `at` of the row groups of `pass` alone.
 impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName, E, const N: usize>
-    crate::Module<(usize, Pass<N>), E, &mut InDm<Rows, KvHeads, Head, TileRows<Rows, N>>>
+    crate::Module<(usize, Pass<N>), E, &mut TileCells<Rows, KvHeads, Head, N>>
     for Envelope<Rows, KvHeads, Head, Windows>
 {
     type Output = ();
@@ -657,12 +719,11 @@ impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName, E, co
         &self,
         device: &mut Device,
         _: E,
-        cells: &mut InDm<Rows, KvHeads, Head, TileRows<Rows, N>>,
+        cells: &mut TileCells<Rows, KvHeads, Head, N>,
         (at, pass): (usize, Pass<N>),
     ) {
         // SAFETY: as in `Landing::chunk`.
-        let chunk: ChunkViewMut<'_, Rows, KvHeads, Head, TileRows<Rows, N>> =
-            unsafe { cells.view_mut().reshape() };
+        let chunk: TileChunkMut<'_, Rows, KvHeads, Head, N> = unsafe { cells.view_mut().reshape() };
         self.view()
             .tile::<m![Windows], 1, m![Rows, Windows = 1 # Windows, Cache, KeyValue, KvHeads, Head]>(at)
             .tile::<Tiles<Rows, N>, 1, m![
@@ -675,11 +736,8 @@ impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName, E, co
 
 /// Every window of the one live row of `pass`, a lane a window.
 impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName, E, const N: usize>
-    crate::Module<
-        Pass<N, { Spread::Windows }>,
-        E,
-        &mut InDm<Rows, KvHeads, Head, TileRows<Rows, N>>,
-    > for Envelope<Rows, KvHeads, Head, Windows>
+    crate::Module<Pass<N, { Spread::Windows }>, E, &mut TileCells<Rows, KvHeads, Head, N>>
+    for Envelope<Rows, KvHeads, Head, Windows>
 {
     type Output = ();
 
@@ -687,7 +745,7 @@ impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName, E, co
         &self,
         device: &mut Device,
         _: E,
-        cells: &mut InDm<Rows, KvHeads, Head, TileRows<Rows, N>>,
+        cells: &mut TileCells<Rows, KvHeads, Head, N>,
         pass: Pass<N, { Spread::Windows }>,
     ) {
         type RowCells<Rows, Windows, KvHeads, Head> = HbmTensor<
@@ -713,8 +771,7 @@ impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName, E, co
             rows.reshape()
         };
         // SAFETY: as in `Landing::chunk`.
-        let chunk: ChunkViewMut<'_, Rows, KvHeads, Head, TileRows<Rows, N>> =
-            unsafe { cells.view_mut().reshape() };
+        let chunk: TileChunkMut<'_, Rows, KvHeads, Head, N> = unsafe { cells.view_mut().reshape() };
         lanes.view().to_dm_view(&mut device.tdma, chunk);
     }
 }
@@ -733,11 +790,11 @@ impl<
     /// `lengths`: `SHARED`, in one plan up to the longest count, for a tile whose rows are all live;
     /// else each row its own, so a row past the live ones reads none. Cells past a count stay
     /// unspecified, for the bias to mask.
-    fn land<E: M, L: M, Count: M, const SHARED: bool>(
+    fn land<E: M, L: M, Count: M, Slot: M, const SHARED: bool>(
         &self,
         device: &mut Device,
         (entries, lengths): (&HbmTensor<i32, Chip, E>, &HbmTensor<i32, Chip, L>),
-        chunk: &mut InDm<Rows, KvHeads, Head, Count, D>,
+        chunk: &mut InDm<Rows, KvHeads, Head, Count, D, Slot>,
     ) {
         // The plan is one expression a branch: one bound to a name loses its slice table.
         if const { SHARED } {
@@ -797,10 +854,10 @@ impl<
         };
         let whole = live.rows() / Rows::SIZE;
         for _ in 0..whole {
-            self.land::<_, _, _, true>(device, (&entries, &lengths), cells);
+            self.land::<_, _, _, _, true>(device, (&entries, &lengths), cells);
         }
         for _ in 0..1 - whole {
-            self.land::<_, _, _, false>(device, (&entries, &lengths), cells);
+            self.land::<_, _, _, _, false>(device, (&entries, &lengths), cells);
         }
     }
 }
@@ -817,7 +874,7 @@ impl<
     W,
     E,
     const N: usize,
-> crate::Module<(usize, Pass<N>), E, &mut InDm<Rows, KvHeads, Head, TileRows<Rows, N>, D>>
+> crate::Module<(usize, Pass<N>), E, &mut TileCells<Rows, KvHeads, Head, N, D>>
     for Paged<'_, Rows, KvHeads, Head, Windows, D, R, W>
 {
     type Output = ();
@@ -826,7 +883,7 @@ impl<
         &self,
         device: &mut Device,
         _: E,
-        cells: &mut InDm<Rows, KvHeads, Head, TileRows<Rows, N>, D>,
+        cells: &mut TileCells<Rows, KvHeads, Head, N, D>,
         (at, pass): (usize, Pass<N>),
     ) {
         type Lengths<Rows, const N: usize> =
@@ -850,14 +907,16 @@ impl<
                     .alias(),
             )
         };
-        // An envelope of fewer rows than the tile never fills it.
-        if const { Rows::SIZE >= N } {
-            for _ in 0..pass.rows / N {
-                self.land::<_, _, _, true>(device, (&entries, &lengths), cells);
+        // A tile whose slices' rows are all live lands in one plan, the rows past them reading on the
+        // engines of their slot copies, which hold no others. A smaller envelope never fills it.
+        let each = slice_rows::<KvHeads>(N);
+        if const { Rows::SIZE >= slice_rows::<KvHeads>(N) } {
+            for _ in 0..(pass.rows / each).min(1) {
+                self.land::<_, _, _, _, true>(device, (&entries, &lengths), cells);
             }
         }
-        for _ in 0..1 - pass.rows / N {
-            self.land::<_, _, _, false>(device, (&entries, &lengths), cells);
+        for _ in 0..1 - (pass.rows / each).min(1) {
+            self.land::<_, _, _, _, false>(device, (&entries, &lengths), cells);
         }
     }
 }
@@ -874,12 +933,8 @@ impl<
     W,
     E,
     const N: usize,
->
-    crate::Module<
-        Pass<N, { Spread::Windows }>,
-        E,
-        &mut InDm<Rows, KvHeads, Head, TileRows<Rows, N>, D>,
-    > for Paged<'_, Rows, KvHeads, Head, Windows, D, R, W>
+> crate::Module<Pass<N, { Spread::Windows }>, E, &mut TileCells<Rows, KvHeads, Head, N, D>>
+    for Paged<'_, Rows, KvHeads, Head, Windows, D, R, W>
 {
     type Output = ();
 
@@ -887,7 +942,7 @@ impl<
         &self,
         device: &mut Device,
         _: E,
-        cells: &mut InDm<Rows, KvHeads, Head, TileRows<Rows, N>, D>,
+        cells: &mut TileCells<Rows, KvHeads, Head, N, D>,
         _: Pass<N, { Spread::Windows }>,
     ) {
         type Lengths<Rows, const N: usize> =
@@ -908,7 +963,7 @@ impl<
                 let counts: RowLengths<Rows, Windows> = self.rows.lengths.view().alias();
                 (entries.reshape(), counts.reshape())
             };
-            self.land::<_, _, _, false>(device, (&entries, &lengths), cells);
+            self.land::<_, _, _, _, false>(device, (&entries, &lengths), cells);
         } else if const { held::<KvHeads, Windows>() } {
             type Entries<Rows, Windows> = HbmTensor<
                 i32,
@@ -930,8 +985,8 @@ impl<
                 cells.view_mut().reshape::<Chip, m![{ WindowRow<Rows, Windows> }], m![
                     { LaneWindow<Windows> }, KvHeads, BlockIndex / ({ Symbol<ShardBlocks<KvHeads>> })
                 ], m![
-                    { TileRows<Rows, N> }, KeyValue, BlockIndex % ({ Symbol<ShardBlocks<KvHeads>> }),
-                    Block, Head
+                    { SliceRows<Rows, KvHeads, N> }, KeyValue,
+                    BlockIndex % ({ Symbol<ShardBlocks<KvHeads>> }), Block, Head
                 ]>()
             };
             self.blocks
@@ -955,7 +1010,8 @@ impl<
     E,
     X,
     Count: M,
-> crate::Module<(Wraps, X), E, &mut InDm<Rows, KvHeads, Head, Count, D>>
+    Slot: M,
+> crate::Module<(Wraps, X), E, &mut InDm<Rows, KvHeads, Head, Count, D, Slot>>
     for Paged<'_, Rows, KvHeads, Head, Windows, D, R>
 {
     type Output = ();
@@ -964,7 +1020,7 @@ impl<
         &self,
         _: &mut Device,
         _: E,
-        _: &mut InDm<Rows, KvHeads, Head, Count, D>,
+        _: &mut InDm<Rows, KvHeads, Head, Count, D, Slot>,
         _: (Wraps, X),
     ) {
     }
@@ -983,11 +1039,11 @@ impl<
     /// Gathers the token rows `offsets` names into the head of `cells`, its first two blocks, each
     /// row's up to its count in `counts`: a row's tokens past its last window take the slots
     /// before its lowest visible token there.
-    fn wraps<E: M, L: M, Count: M>(
+    fn wraps<E: M, L: M, Count: M, Slot: M>(
         &self,
         device: &mut Device,
         (offsets, counts): (&HbmTensor<i32, Chip, E>, &HbmTensor<i32, Chip, L>),
-        cells: &mut InDm<Rows, KvHeads, Head, Count, D>,
+        cells: &mut InDm<Rows, KvHeads, Head, Count, D, Slot>,
     ) {
         // A shard of two blocks or more holds the head; else it spans the first two shards.
         if const { ShardBlocks::<KvHeads>::SIZE >= 2 } {
@@ -1001,7 +1057,7 @@ impl<
                     cells
                         .view_mut()
                         .slice_tile::<m![BlockIndex / ({ Symbol<ShardBlocks<KvHeads>> })], 1, m![
-                            KvHeads # ({ Symbol<HeadSlots<KvHeads>> }),
+                            { Slot },
                             { Layout<Rows>::Lanes } # 8 % 4,
                             BlockIndex / ({ Symbol<ShardBlocks<KvHeads>> })
                                 = 1 #{!} ({ Symbol<Shards<KvHeads>> })
@@ -1030,7 +1086,7 @@ impl<
                             m![BlockIndex / ({ Symbol<ShardBlocks<KvHeads>> }) / 2],
                             1,
                             m![
-                                KvHeads # ({ Symbol<HeadSlots<KvHeads>> }),
+                                { Slot },
                                 { Layout<Rows>::Lanes } # 8 % 4,
                                 BlockIndex / ({ Symbol<ShardBlocks<KvHeads>> }) / 2
                                     = 1 #{!} ({ Symbol<ShardPairs<KvHeads>> }),
@@ -1083,7 +1139,7 @@ impl<
     R,
     E,
     const N: usize,
-> crate::Module<(Wraps, Pass<N>), E, &mut InDm<Rows, KvHeads, Head, TileRows<Rows, N>, D>>
+> crate::Module<(Wraps, Pass<N>), E, &mut TileCells<Rows, KvHeads, Head, N, D>>
     for Paged<'l, Rows, KvHeads, Head, Windows, D, R, (&'l Wrap<Rows>, usize)>
 {
     type Output = ();
@@ -1092,7 +1148,7 @@ impl<
         &self,
         device: &mut Device,
         _: E,
-        cells: &mut InDm<Rows, KvHeads, Head, TileRows<Rows, N>, D>,
+        cells: &mut TileCells<Rows, KvHeads, Head, N, D>,
         (_, pass): (Wraps, Pass<N>),
     ) {
         type Offsets<Rows, const N: usize> = HbmTensor<
@@ -1131,8 +1187,18 @@ impl<
 type Half<Count, KvHeads, Head> = m![{ Count }, KeyValue = 1 # 2, { ShardKeys<KvHeads> }, Head];
 
 /// The query rows of the head a slice owns, for `Count` row groups.
-type Query<Rows, KvHeads, Groups, Head, Count = RowGroups<Rows>> =
-    DmTensor<bf16, Chip, Cluster<Rows>, CacheSlices<Rows, KvHeads>, m![{ Count }, Groups, Head]>;
+type Query<Rows, KvHeads, Groups, Head, Count = RowGroups<Rows>, Slot = HeadSlot<KvHeads>> =
+    DmTensor<
+        bf16,
+        Chip,
+        Cluster<Rows>,
+        CacheSlices<Rows, KvHeads, Slot>,
+        m![{ Count }, Groups, Head],
+    >;
+
+/// The query rows of an `N`-row tile, as its pass holds its row groups.
+type TileQuery<Rows, KvHeads, Groups, Head, const N: usize> =
+    Query<Rows, KvHeads, Groups, Head, SliceRows<Rows, KvHeads, N>, TileSlot<Rows, KvHeads, N>>;
 
 /// One query per row and KV head, ready for its local shards to consume.
 pub type Heads<Rows, KvHeads, Groups, Head> = DmTensor<
@@ -1163,7 +1229,7 @@ pub(crate) trait Queries<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, He
         &self,
         device: &mut Device,
         pass: Pass<N, S>,
-    ) -> Query<Rows, KvHeads, Groups, Head, TileRows<Rows, N>>;
+    ) -> TileQuery<Rows, KvHeads, Groups, Head, N>;
 }
 
 /// The copy in data memory: a pass reads its row groups where they lie.
@@ -1173,14 +1239,17 @@ impl<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName>
     const COPIES: usize = 1;
 
     fn whole(&self, device: &mut Device) -> Query<Rows, KvHeads, Groups, Head> {
-        broadcast::<_, _, Groups, Head, RowGroups<Rows>, _, Shards<KvHeads>, _>(device, self.view())
+        broadcast::<_, _, Groups, Head, RowGroups<Rows>, HeadSlot<KvHeads>, _, Shards<KvHeads>, _>(
+            device,
+            self.view(),
+        )
     }
 
     fn pass<const N: usize, const S: Spread>(
         &self,
         device: &mut Device,
         pass: Pass<N, S>,
-    ) -> Query<Rows, KvHeads, Groups, Head, TileRows<Rows, N>> {
+    ) -> TileQuery<Rows, KvHeads, Groups, Head, N> {
         // The lanes of a pass spreading one row's windows read that row by DMA, from where the
         // rows lie in HBM.
         if const { matches!(S, Spread::Windows) } {
@@ -1190,7 +1259,41 @@ impl<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName>
         let rows = self.view().tile::<Tiles<Rows, N>, 1, m![
             { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), { TileRows<Rows, N> }, Groups, Head
         ]>(pass.tile);
-        broadcast::<_, _, Groups, Head, TileRows<Rows, N>, _, Shards<KvHeads>, _>(device, rows)
+        type Count<Rows, KvHeads, const N: usize> = SliceRows<Rows, KvHeads, N>;
+        type Slot<Rows, KvHeads, const N: usize> = TileSlot<Rows, KvHeads, N>;
+        // A ring round a slot's shards cannot reach the other slots: the rows of those land first.
+        if const { SlotRows::<Rows, KvHeads, N>::SIZE > 1 } {
+            let mut heads = DmTensor::<
+                bf16,
+                Chip,
+                Cluster<Rows>,
+                RingHeads<Rows, KvHeads, Slot<Rows, KvHeads, N>>,
+                m![{ Count<Rows, KvHeads, N> }, Groups, Head],
+            >::new();
+            rows.to_dm_view(&mut device.tdma, heads.view_mut());
+            return broadcast::<
+                _,
+                _,
+                Groups,
+                Head,
+                Count<Rows, KvHeads, N>,
+                Slot<Rows, KvHeads, N>,
+                _,
+                Ring<KvHeads>,
+                _,
+            >(device, heads.view());
+        }
+        broadcast::<
+            _,
+            _,
+            Groups,
+            Head,
+            Count<Rows, KvHeads, N>,
+            Slot<Rows, KvHeads, N>,
+            _,
+            Shards<KvHeads>,
+            _,
+        >(device, rows)
     }
 }
 
@@ -1210,13 +1313,13 @@ impl<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName>
         &self,
         device: &mut Device,
         pass: Pass<N, S>,
-    ) -> Query<Rows, KvHeads, Groups, Head, TileRows<Rows, N>> {
+    ) -> TileQuery<Rows, KvHeads, Groups, Head, N> {
         let mut rows = DmTensor::<
             bf16,
             Chip,
             Cluster<Rows>,
-            RingHeads<Rows, KvHeads>,
-            m![{ TileRows<Rows, N> }, Groups, Head],
+            RingHeads<Rows, KvHeads, TileSlot<Rows, KvHeads, N>>,
+            m![{ SliceRows<Rows, KvHeads, N> }, Groups, Head],
         >::new();
         if const { matches!(S, Spread::Rows) } {
             (self.view())
@@ -1245,37 +1348,49 @@ impl<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName>
             let cells = unsafe {
                 rows.view_mut()
                     .reshape::<Chip, Cluster<Rows>, RingCells<Rows, KvHeads>, m![
-                        { TileRows<Rows, N> }, Groups, Head
+                        { SliceRows<Rows, KvHeads, N> }, Groups, Head
                     ]>()
             };
             // Every cell reads the live row: its windows' cells, and the cells of rows past it,
             // which their bias masks.
             live.view().to_dm_view(&mut device.tdma, cells);
         }
-        broadcast::<_, _, Groups, Head, TileRows<Rows, N>, _, Ring<KvHeads>, _>(device, rows.view())
+        broadcast::<
+            _,
+            _,
+            Groups,
+            Head,
+            SliceRows<Rows, KvHeads, N>,
+            TileSlot<Rows, KvHeads, N>,
+            _,
+            Ring<KvHeads>,
+            _,
+        >(device, rows.view())
     }
 }
 
 /// `Count` row groups' query rows from the first slice of each ring of `R` consecutive shards of
-/// their heads, as `Slices` holds them, to every shard slice of their heads, round the rings.
+/// their heads, as `Slices` holds them, to every shard slice of their heads in `Slot`, round the
+/// rings.
 fn broadcast<
     Rows: AxisName,
     KvHeads: AxisName,
     Groups: AxisName,
     Head: AxisName,
     Count: M,
+    Slot: M,
     Slices: M,
     R: AxisName,
     E: M,
 >(
     device: &mut Device,
     rows: DmTensorView<'_, bf16, Chip, Cluster<Rows>, Slices, E>,
-) -> Query<Rows, KvHeads, Groups, Head, Count> {
+) -> Query<Rows, KvHeads, Groups, Head, Count, Slot> {
     device
         .sub
         .begin(rows)
         .fetch::<m![{ Count }, Groups, Head / 16], m![Head % 16]>()
-        .switch::<CacheSlices<Rows, KvHeads>, m![{ Count }, Groups, Head / 16]>(
+        .switch::<CacheSlices<Rows, KvHeads, Slot>, m![{ Count }, Groups, Head / 16]>(
             SwitchConfig::CustomBroadcast { ring_size: R::SIZE },
         )
         .collect::<m![{ Count }, Groups, Head / 16], m![Head % 16]>()
@@ -1285,11 +1400,11 @@ fn broadcast<
 
 /// Each shard's bias of its slots, once a row: the masks read it once a query group, as a register
 /// operand repeats only a single flit and these are eight flits wide.
-type Bias<Rows, KvHeads, Count = RowGroups<Rows>> = DmTensor<
+type Bias<Rows, KvHeads, Count = RowGroups<Rows>, Slot = HeadSlot<KvHeads>> = DmTensor<
     f32,
     Chip,
     Cluster<Rows>,
-    CacheSlices<Rows, KvHeads>,
+    CacheSlices<Rows, KvHeads, Slot>,
     m![{ Count }, { ShardKeys<KvHeads> }],
 >;
 
@@ -1342,15 +1457,36 @@ where
         > + for<'c> crate::Module<
             (usize, Pass<32>),
             (),
-            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 32>>,
+            &'c mut Cells<
+                Source,
+                Rows,
+                KvHeads,
+                Head,
+                SliceRows<Rows, KvHeads, 32>,
+                TileSlot<Rows, KvHeads, 32>,
+            >,
         > + for<'c> crate::Module<
             (usize, Pass<16>),
             (),
-            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 16>>,
+            &'c mut Cells<
+                Source,
+                Rows,
+                KvHeads,
+                Head,
+                SliceRows<Rows, KvHeads, 16>,
+                TileSlot<Rows, KvHeads, 16>,
+            >,
         > + for<'c> crate::Module<
             (usize, Pass<8>),
             (),
-            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 8>>,
+            &'c mut Cells<
+                Source,
+                Rows,
+                KvHeads,
+                Head,
+                SliceRows<Rows, KvHeads, 8>,
+                TileSlot<Rows, KvHeads, 8>,
+            >,
         > + for<'c> crate::Module<
             (Wraps, Live<(), Rows>),
             (),
@@ -1358,27 +1494,69 @@ where
         > + for<'c> crate::Module<
             (Wraps, Pass<32>),
             (),
-            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 32>>,
+            &'c mut Cells<
+                Source,
+                Rows,
+                KvHeads,
+                Head,
+                SliceRows<Rows, KvHeads, 32>,
+                TileSlot<Rows, KvHeads, 32>,
+            >,
         > + for<'c> crate::Module<
             (Wraps, Pass<16>),
             (),
-            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 16>>,
+            &'c mut Cells<
+                Source,
+                Rows,
+                KvHeads,
+                Head,
+                SliceRows<Rows, KvHeads, 16>,
+                TileSlot<Rows, KvHeads, 16>,
+            >,
         > + for<'c> crate::Module<
             (Wraps, Pass<8>),
             (),
-            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 8>>,
+            &'c mut Cells<
+                Source,
+                Rows,
+                KvHeads,
+                Head,
+                SliceRows<Rows, KvHeads, 8>,
+                TileSlot<Rows, KvHeads, 8>,
+            >,
         > + for<'c> crate::Module<
             Pass<32, { Spread::Windows }>,
             (),
-            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 32>>,
+            &'c mut Cells<
+                Source,
+                Rows,
+                KvHeads,
+                Head,
+                SliceRows<Rows, KvHeads, 32>,
+                TileSlot<Rows, KvHeads, 32>,
+            >,
         > + for<'c> crate::Module<
             Pass<16, { Spread::Windows }>,
             (),
-            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 16>>,
+            &'c mut Cells<
+                Source,
+                Rows,
+                KvHeads,
+                Head,
+                SliceRows<Rows, KvHeads, 16>,
+                TileSlot<Rows, KvHeads, 16>,
+            >,
         > + for<'c> crate::Module<
             Pass<8, { Spread::Windows }>,
             (),
-            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 8>>,
+            &'c mut Cells<
+                Source,
+                Rows,
+                KvHeads,
+                Head,
+                SliceRows<Rows, KvHeads, 8>,
+                TileSlot<Rows, KvHeads, 8>,
+            >,
         >,
 {
     type Output = Attended<Rows, KvHeads, Groups, Head>;
@@ -1418,15 +1596,36 @@ where
         > + for<'c> crate::Module<
             (usize, Pass<32>),
             (),
-            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 32>>,
+            &'c mut Cells<
+                Source,
+                Rows,
+                KvHeads,
+                Head,
+                SliceRows<Rows, KvHeads, 32>,
+                TileSlot<Rows, KvHeads, 32>,
+            >,
         > + for<'c> crate::Module<
             (usize, Pass<16>),
             (),
-            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 16>>,
+            &'c mut Cells<
+                Source,
+                Rows,
+                KvHeads,
+                Head,
+                SliceRows<Rows, KvHeads, 16>,
+                TileSlot<Rows, KvHeads, 16>,
+            >,
         > + for<'c> crate::Module<
             (usize, Pass<8>),
             (),
-            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 8>>,
+            &'c mut Cells<
+                Source,
+                Rows,
+                KvHeads,
+                Head,
+                SliceRows<Rows, KvHeads, 8>,
+                TileSlot<Rows, KvHeads, 8>,
+            >,
         > + for<'c> crate::Module<
             (Wraps, Live<(), Rows>),
             (),
@@ -1434,27 +1633,69 @@ where
         > + for<'c> crate::Module<
             (Wraps, Pass<32>),
             (),
-            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 32>>,
+            &'c mut Cells<
+                Source,
+                Rows,
+                KvHeads,
+                Head,
+                SliceRows<Rows, KvHeads, 32>,
+                TileSlot<Rows, KvHeads, 32>,
+            >,
         > + for<'c> crate::Module<
             (Wraps, Pass<16>),
             (),
-            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 16>>,
+            &'c mut Cells<
+                Source,
+                Rows,
+                KvHeads,
+                Head,
+                SliceRows<Rows, KvHeads, 16>,
+                TileSlot<Rows, KvHeads, 16>,
+            >,
         > + for<'c> crate::Module<
             (Wraps, Pass<8>),
             (),
-            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 8>>,
+            &'c mut Cells<
+                Source,
+                Rows,
+                KvHeads,
+                Head,
+                SliceRows<Rows, KvHeads, 8>,
+                TileSlot<Rows, KvHeads, 8>,
+            >,
         > + for<'c> crate::Module<
             Pass<32, { Spread::Windows }>,
             (),
-            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 32>>,
+            &'c mut Cells<
+                Source,
+                Rows,
+                KvHeads,
+                Head,
+                SliceRows<Rows, KvHeads, 32>,
+                TileSlot<Rows, KvHeads, 32>,
+            >,
         > + for<'c> crate::Module<
             Pass<16, { Spread::Windows }>,
             (),
-            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 16>>,
+            &'c mut Cells<
+                Source,
+                Rows,
+                KvHeads,
+                Head,
+                SliceRows<Rows, KvHeads, 16>,
+                TileSlot<Rows, KvHeads, 16>,
+            >,
         > + for<'c> crate::Module<
             Pass<8, { Spread::Windows }>,
             (),
-            &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, 8>>,
+            &'c mut Cells<
+                Source,
+                Rows,
+                KvHeads,
+                Head,
+                SliceRows<Rows, KvHeads, 8>,
+                TileSlot<Rows, KvHeads, 8>,
+            >,
         >,
     H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()>,
 {
@@ -1477,7 +1718,8 @@ where
                 crate::Module::forward(boundary, &mut *device, (), &mut (), &mut *state);
             }
         };
-        if const { Self::ROWS == 32 } && live.count::<Lanes<Rows>>() == <RowGroups<Rows> as M>::SIZE
+        if const { Self::SLICE_ROWS == 32 }
+            && live.count::<Lanes<Rows>>() == <RowGroups<Rows> as M>::SIZE
         {
             let projected = query.whole(device);
             let rest = rest.extent::<m![{ Symbol<Rest<Windows>> }]>();
@@ -1493,7 +1735,10 @@ where
                 <Source as Landed<Rows, KvHeads, Head>>::Element,
             >;
             type Restored<Source, Rows, KvHeads, Head> =
-                <Source as Landed<Rows, KvHeads, Head>>::Restored<RowGroups<Rows>>;
+                <Source as Landed<Rows, KvHeads, Head>>::Restored<
+                    RowGroups<Rows>,
+                    HeadSlot<KvHeads>,
+                >;
             let mut lands =
                 |device: &mut Device,
                  at: usize,
@@ -1606,7 +1851,7 @@ where
             <TileGroups<Rows, 32> as AxisName>::SIZE,
             <TileGroups<Rows, 16> as AxisName>::SIZE,
         );
-        if const { Self::ROWS == 32 } {
+        if const { Self::SLICE_ROWS == 32 } {
             let (wides, halves) = (groups / wide, groups % wide / half);
             self.passes::<_, _, _, _, _, 32>(
                 device,
@@ -1634,7 +1879,17 @@ where
                 (&mut once, times),
                 &mut attended,
             );
-        } else if const { Self::ROWS == 16 } {
+        } else if const { <SlotRows<Rows, KvHeads, 16> as AxisName>::SIZE > 1 } {
+            // The copies of a head's slot attend a 16-row pass's row groups at an 8-row pass's cost,
+            // so a pass's dead row groups cost nothing: the rows past the last whole tile join one.
+            self.passes::<_, _, _, _, _, 16>(
+                device,
+                inputs,
+                (0, groups.div_ceil(half), live),
+                (&mut once, 1),
+                &mut attended,
+            );
+        } else if const { Self::SLICE_ROWS == 16 } {
             let halves = groups / half;
             self.passes::<_, _, _, _, _, 16>(
                 device,
@@ -1670,12 +1925,18 @@ where
 impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
     Windowed<KvHeads, Groups, Head, SCALE>
 {
-    /// Rows a pass attends at most: 32, 16 or 8, the most whose keys and score masks a slice's
-    /// registers hold and whose attention its data memory holds.
-    const ROWS: usize = attention::pass(Head::SIZE, Groups::SIZE, Keys::<KvHeads>::SIZE);
+    /// Rows a slice attends in a pass at most: 32, 16 or 8, the most whose keys and score masks
+    /// its registers hold and whose attention its data memory holds.
+    const SLICE_ROWS: usize = attention::pass(Head::SIZE, Groups::SIZE, Keys::<KvHeads>::SIZE);
 
-    /// Whether a pass of `rows` rows over the envelope `Rows`, beside `copies` of its query rows in
-    /// data memory, lands each window while the one before it is attended.
+    /// Rows a pass attends at most: a slice's in each copy of a head's slot, 32 at most.
+    const ROWS: usize = {
+        let rows = Self::SLICE_ROWS * HeadCopies::<KvHeads>::SIZE;
+        if rows < 32 { rows } else { 32 }
+    };
+
+    /// Whether a pass whose slices hold `rows` rows each over the envelope `Rows`, beside `copies`
+    /// of its query rows in data memory, lands each window while the one before it is attended.
     const fn overlaps<Rows: AxisName>(rows: usize, copies: usize) -> bool {
         attention::overlaps(
             Head::SIZE,
@@ -1686,12 +1947,12 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
     }
 
     /// Whether a pass of `N` rows over the envelope `Rows` lands the next pass's first window: only
-    /// the widest passes repeat, only in an envelope that holds two of them, and only passes wider
-    /// than a row group, which is the only pass of a call of a row group's rows: a follower issues
-    /// the boundary ahead of its windows, where it holds their landings back.
+    /// the widest passes repeat, only in an envelope that holds two of them, and only passes whose
+    /// slices hold more than a row group, as a pass of one a slice may be a call's only pass: a
+    /// follower issues the boundary ahead of its windows, where it holds their landings back.
     const fn follows<Rows: AxisName, const N: usize>() -> bool {
         N == Self::ROWS
-            && N > attention::LANES
+            && slice_rows::<KvHeads>(N) > attention::LANES
             && <RowGroups<Rows> as M>::SIZE > <TileGroups<Rows, N> as AxisName>::SIZE
     }
 
@@ -1704,19 +1965,19 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
         Q: Queries<Rows, KvHeads, Groups, Head>,
     {
         attention::streams(Head::SIZE, Groups::SIZE)
-            && Self::overlaps::<Rows>(N, Q::COPIES)
+            && Self::overlaps::<Rows>(slice_rows::<KvHeads>(N), Q::COPIES)
             && (!Self::follows::<Rows, N>() || Windows::SIZE <= 2)
     }
 
     /// Whether a pass of `N` rows over cells of `E` may spread its one live row: a pass of one row
-    /// group that lands no next pass, whose cluster's cells hold a row's lane windows of such cells,
-    /// and that holds its windows' terms for one merge where it streams them, else lands each window
-    /// while the one before it is attended.
+    /// group a slice that lands no next pass, whose cluster's cells hold a row's lane windows of
+    /// such cells, and that holds its windows' terms for one merge where it streams them, else
+    /// lands each window while the one before it is attended.
     const fn spreads<Rows: AxisName, Windows: AxisName, E, Q, const N: usize>() -> bool
     where
         Q: Queries<Rows, KvHeads, Groups, Head>,
     {
-        N == attention::LANES
+        slice_rows::<KvHeads>(N) == attention::LANES
             && Rows::SIZE >= N
             && attention::spreads(Windows::SIZE, size_of::<E>())
             && held::<KvHeads, Windows>()
@@ -1724,7 +1985,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
             && if Self::streams::<Rows, Windows, Q, N>() {
                 shard::holds::<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>, Rest<Windows>>()
             } else {
-                Self::overlaps::<Rows>(N, Q::COPIES)
+                Self::overlaps::<Rows>(slice_rows::<KvHeads>(N), Q::COPIES)
             }
     }
 
@@ -1750,15 +2011,36 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
             + for<'c> crate::Module<
                 (usize, Pass<N>),
                 (),
-                &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, N>>,
+                &'c mut Cells<
+                    Source,
+                    Rows,
+                    KvHeads,
+                    Head,
+                    SliceRows<Rows, KvHeads, N>,
+                    TileSlot<Rows, KvHeads, N>,
+                >,
             > + for<'c> crate::Module<
                 (Wraps, Pass<N>),
                 (),
-                &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, N>>,
+                &'c mut Cells<
+                    Source,
+                    Rows,
+                    KvHeads,
+                    Head,
+                    SliceRows<Rows, KvHeads, N>,
+                    TileSlot<Rows, KvHeads, N>,
+                >,
             > + for<'c> crate::Module<
                 Pass<N, { Spread::Windows }>,
                 (),
-                &'c mut Cells<Source, Rows, KvHeads, Head, TileRows<Rows, N>>,
+                &'c mut Cells<
+                    Source,
+                    Rows,
+                    KvHeads,
+                    Head,
+                    SliceRows<Rows, KvHeads, N>,
+                    TileSlot<Rows, KvHeads, N>,
+                >,
             >,
         Q: Queries<Rows, KvHeads, Groups, Head>,
     {
@@ -1766,13 +2048,20 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
             Rows,
             KvHeads,
             Head,
-            TileRows<Rows, N>,
+            SliceRows<Rows, KvHeads, N>,
             <Source as Landed<Rows, KvHeads, Head>>::Element,
+            TileSlot<Rows, KvHeads, N>,
         >;
         type Transposed<Rows, KvHeads, Groups, Head, const SCALE: usize, const N: usize> =
-            shard::Transposed<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>, TileRows<Rows, N>>;
+            shard::Transposed<
+                TileShards<Rows, KvHeads, Groups, Head, SCALE, N>,
+                SliceRows<Rows, KvHeads, N>,
+            >;
         type Registers<Rows, KvHeads, Groups, Head, const SCALE: usize, const N: usize> =
-            shard::Registers<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>, TileRows<Rows, N>>;
+            shard::Registers<
+                TileShards<Rows, KvHeads, Groups, Head, SCALE, N>,
+                SliceRows<Rows, KvHeads, N>,
+            >;
         // The bias goes first: a transfer issued after the gather may wait for it to finish.
         let lands = |device: &mut Device,
                      (at, pass): (usize, Pass<N>),
@@ -1821,7 +2110,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                             // SAFETY: as the cells' landing names them, a row a cluster.
                             unsafe {
                                 landing.bias.view_mut().reshape::<Chip, m![{ WindowRow<Rows, Windows> }], Slots<Windows, KvHeads>, m![
-                                    { TileRows<Rows, N> }, { ShardKeys<KvHeads> }
+                                    { SliceRows<Rows, KvHeads, N> }, { ShardKeys<KvHeads> }
                                 ]>()
                             }
                             .cluster_tile::<
@@ -1882,20 +2171,21 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                         landing: &Place<Rows, KvHeads, Head, Source, N>,
                         values: &mut Transposed<Rows, KvHeads, Groups, Head, SCALE, N>|
          -> Registers<Rows, KvHeads, Groups, Head, SCALE, N> {
-            let mut restored = Source::place::<TileRows<Rows, N>>();
+            let mut restored =
+                Source::place::<SliceRows<Rows, KvHeads, N>, TileSlot<Rows, KvHeads, N>>();
             let keys = history
                 .keys(device, &landing.cells, &mut restored)
-                .tile::<m![KeyValue], 1, Half<TileRows<Rows, N>, KvHeads, Head>>(0);
+                .tile::<m![KeyValue], 1, Half<SliceRows<Rows, KvHeads, N>, KvHeads, Head>>(0);
             let registers =
                 <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::fill::<
-                    TileRows<Rows, N>,
+                    SliceRows<Rows, KvHeads, N>,
                     _,
                     _,
                 >(device, keys, landing.bias.view());
             let values_half = chunk(&landing.cells)
-                .tile::<m![KeyValue], 1, Half<TileRows<Rows, N>, KvHeads, Head>>(1);
+                .tile::<m![KeyValue], 1, Half<SliceRows<Rows, KvHeads, N>, KvHeads, Head>>(1);
             <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::transpose::<
-                TileRows<Rows, N>,
+                SliceRows<Rows, KvHeads, N>,
                 _,
                 _,
                 _,
@@ -1904,7 +2194,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
         };
         let attends =
             |device: &mut Device,
-             projected: &Query<Rows, KvHeads, Groups, Head, TileRows<Rows, N>>,
+             projected: &TileQuery<Rows, KvHeads, Groups, Head, N>,
              registers: Registers<Rows, KvHeads, Groups, Head, SCALE, N>,
              values: &Transposed<Rows, KvHeads, Groups, Head, SCALE, N>| {
                 let mut partial =
@@ -1913,7 +2203,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     shard::Local::<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>>::new();
                 let scales = history.scales(device);
                 <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::attend::<
-                    TileRows<Rows, N>,
+                    SliceRows<Rows, KvHeads, N>,
                     _,
                     _,
                     _,
@@ -1941,13 +2231,19 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
             };
         if const { Self::streams::<Rows, Windows, Q, N>() } {
             type Masks<Rows, KvHeads, Groups, Head, const SCALE: usize, const N: usize> =
-                shard::Masks<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>, TileRows<Rows, N>>;
+                shard::Masks<
+                    TileShards<Rows, KvHeads, Groups, Head, SCALE, N>,
+                    SliceRows<Rows, KvHeads, N>,
+                >;
             type Restored<Source, Rows, KvHeads, Head, const N: usize> =
-                <Source as Landed<Rows, KvHeads, Head>>::Restored<TileRows<Rows, N>>;
+                <Source as Landed<Rows, KvHeads, Head>>::Restored<
+                    SliceRows<Rows, KvHeads, N>,
+                    TileSlot<Rows, KvHeads, N>,
+                >;
             type Station<Rows, KvHeads, Groups, Head, const SCALE: usize, const N: usize> =
                 shard::Stationary<
                     TileShards<Rows, KvHeads, Groups, Head, SCALE, N>,
-                    TileRows<Rows, N>,
+                    SliceRows<Rows, KvHeads, N>,
                 >;
             type Prepared<
                 'a,
@@ -1981,10 +2277,11 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
             ) {
                 let masks =
                     <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::mask::<
-                        TileRows<Rows, N>,
+                        SliceRows<Rows, KvHeads, N>,
                         _,
                     >(device, landing.bias.view());
-                let mut restored = Source::place::<TileRows<Rows, N>>();
+                let mut restored =
+                    Source::place::<SliceRows<Rows, KvHeads, N>, TileSlot<Rows, KvHeads, N>>();
                 history.keys(device, &landing.cells, &mut restored);
                 (masks, restored)
             };
@@ -2008,13 +2305,13 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 let scales =
                     history.scales::<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>>(device);
                 let key = Source::widened(&landing.cells, &restored).tile::<m![KeyValue], 1, Half<
-                    TileRows<Rows, N>,
+                    SliceRows<Rows, KvHeads, N>,
                     KvHeads,
                     Head,
                 >>(0);
                 let (weight, total) =
                     <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::score::<
-                        TileRows<Rows, N>,
+                        SliceRows<Rows, KvHeads, N>,
                         _,
                         _,
                     >(
@@ -2029,9 +2326,9 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     );
                 let value = history
                     .values(device, &landing.cells, &mut restored)
-                    .tile::<m![KeyValue], 1, Half<TileRows<Rows, N>, KvHeads, Head>>(1);
+                    .tile::<m![KeyValue], 1, Half<SliceRows<Rows, KvHeads, N>, KvHeads, Head>>(1);
                 <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::weigh::<
-                    TileRows<Rows, N>,
+                    SliceRows<Rows, KvHeads, N>,
                     _,
                     _,
                 >(
@@ -2074,7 +2371,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 wraps(device, pass, even);
                 let query =
                     <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::station::<
-                        TileRows<Rows, N>,
+                        SliceRows<Rows, KvHeads, N>,
                         _,
                     >(device, projected.view());
                 let mut land =
@@ -2143,14 +2440,14 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     wraps(device, pass, &mut even);
                     let query =
                         <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::station::<
-                            TileRows<Rows, N>,
+                            SliceRows<Rows, KvHeads, N>,
                             _,
                         >(device, projected.view());
                     boundary(device, times);
                     let window = prepares(device, &even, &mut nothing);
                     let (partial, lse) = scores(device, &query, (&even, window));
                     // Each lane takes its cluster's first: the live row's attention on its own lane,
-                    // a copy on the lanes of rows past it, which no row reads.
+                    // a copy on the lanes of rows past it in its row group, which no row reads.
                     <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::spread(
                         device,
                         (&partial, &lse),
@@ -2158,10 +2455,9 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     .view()
                     .to_dm_view(
                         &mut device.tdma,
-                        attended.view_mut().tile::<Tiles<Rows, N>, 1, m![
-                            { Tiles<Rows, N> } = 1 #{!} ({ Tiles<Rows, N> }),
-                            { TileRows<Rows, N> }, Groups, Head
-                        ]>(pass.tile),
+                        attended.view_mut().tile::<RowGroups<Rows>, 1, m![
+                            { RowGroups<Rows> } = 1 #{!} ({ RowGroups<Rows> }), Groups, Head
+                        ]>(pass.tile * N / attention::LANES),
                     );
                 }
                 for tile in 0..count - lone {
@@ -2174,7 +2470,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     rows(device, tile, places, (&mut *attended, &mut *boundary));
                 }
             }
-        } else if const { Self::overlaps::<Rows>(N, Q::COPIES) } {
+        } else if const { Self::overlaps::<Rows>(slice_rows::<KvHeads>(N), Q::COPIES) } {
             let (mut even, mut odd) = (
                 Place::<Rows, KvHeads, Head, Source, N>::new(),
                 Landing::new(),
@@ -2293,7 +2589,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     let registers = prepares(device, &even, &mut values);
                     let (partial, lse) = attends(device, &projected, registers, &values);
                     // Each lane takes its cluster's first: the live row's attention on its own lane,
-                    // a copy on the lanes of rows past it, which no row reads.
+                    // a copy on the lanes of rows past it in its row group, which no row reads.
                     <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::spread(
                         device,
                         (&partial, &lse),
@@ -2301,10 +2597,9 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     .view()
                     .to_dm_view(
                         &mut device.tdma,
-                        attended.view_mut().tile::<Tiles<Rows, N>, 1, m![
-                            { Tiles<Rows, N> } = 1 #{!} ({ Tiles<Rows, N> }),
-                            { TileRows<Rows, N> }, Groups, Head
-                        ]>(pass.tile),
+                        attended.view_mut().tile::<RowGroups<Rows>, 1, m![
+                            { RowGroups<Rows> } = 1 #{!} ({ RowGroups<Rows> }), Groups, Head
+                        ]>(pass.tile * N / attention::LANES),
                     );
                 }
                 for tile in 0..count - lone {
@@ -2357,16 +2652,16 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
 
 /// The codes of `cells`' half `half` (0 the keys, 1 the values) widened to BF16 into the same half
 /// of `place`, exactly, in one pass without the vector stage: the cells as attention reads them.
-fn widen<'c, Rows: AxisName, KvHeads: AxisName, Head: AxisName, Count: M>(
+fn widen<'c, Rows: AxisName, KvHeads: AxisName, Head: AxisName, Count: M, Slot: M>(
     device: &mut Device,
-    cells: &'c InDm<Rows, KvHeads, Head, Count, f8e4m3>,
-    place: &'c mut InDm<Rows, KvHeads, Head, Count>,
+    cells: &'c InDm<Rows, KvHeads, Head, Count, f8e4m3, Slot>,
+    place: &'c mut InDm<Rows, KvHeads, Head, Count, bf16, Slot>,
     half: usize,
-) -> ChunkView<'c, Rows, KvHeads, Head, Count> {
+) -> ChunkView<'c, Rows, KvHeads, Head, Count, bf16, Slot> {
     type Time<Count, KvHeads, Head, const N: usize> =
         m![{ Count }, { ShardKeys<KvHeads> }, Head / { N }];
     // SAFETY: as in `chunk`.
-    let widened: ChunkViewMut<'_, Rows, KvHeads, Head, Count> =
+    let widened: ChunkViewMut<'_, Rows, KvHeads, Head, Count, bf16, Slot> =
         unsafe { place.view_mut().reshape() };
     device
         .main
