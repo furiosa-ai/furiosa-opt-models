@@ -28,14 +28,18 @@
 //!   features a slice, and its lane groups stage from there; rows whose runs cannot tile both
 //!   clusters' slices that way move to the feature slices first. A projection begun with such
 //!   rows issues their landing alone, so a schedule can issue later transfers behind it.
+//! - A projection whose clusters halve its inputs ([`Exchanged`]) reads rows another summed
+//!   projection kept where they lie, each cluster its own half, with no transfer first (from three
+//!   live groups each cluster lays its half in its feature slices once); one transfer gathers both
+//!   clusters' FP32 partial sums into the output's feature slices, and a pass adds them there.
 
-use crate::ops::linear::kernel::Rounded;
+use crate::ops::linear::kernel::Rounding;
 use crate::ops::normalization::{self, FeatureSlices, Spread};
 use crate::ops::pointwise::Kept;
 use crate::ops::vector::Restore;
 use crate::specialize::{PACKET, SLICES, TRF, VRF, contraction};
 use crate::tensor::form::BlockScaled;
-use crate::tensor::form::nvfp4::{Features, Held, Scale, Scales, Summed, W4A16};
+use crate::tensor::form::nvfp4::{Exchanged, Features, Held, Scale, Scales, Summed, W4A16};
 use crate::tensor::memory::Memory;
 use crate::tensor::{axis::Lanes, live::Live, mapping::Rows as Layout, parallel::Chip, scalar};
 use crate::{Begin, Op};
@@ -58,8 +62,8 @@ impl<I: AxisName> AxisName for Chunk<I> {
     };
 }
 
-/// Output rows one slice owns: its cluster's half of the outputs over the cluster's owners, in whole
-/// feature chunks of them when the placement `P` moves the rows to the feature slices.
+/// Output rows one slice owns: its cluster's outputs over the cluster's owners, in whole feature
+/// chunks of them when the placement `P` moves the rows to the feature slices.
 #[derive(Clone, Debug)]
 pub struct Owned<I, O, P>(PhantomData<(I, O, P)>);
 
@@ -71,7 +75,13 @@ impl<I: AxisName, O: AxisName, P: Ownership> AxisName for Owned<I, O, P> {
         } else {
             1
         };
-        contraction::owned(O::SIZE, I::SIZE / Chunk::<I>::SIZE, grain)
+        let parts = I::SIZE / Chunk::<I>::SIZE;
+        // `owned` shares half of the outputs it is given among the seats of its parts.
+        if P::HALVES_INPUTS {
+            contraction::owned(2 * O::SIZE, parts / 2, grain)
+        } else {
+            contraction::owned(O::SIZE, parts, grain)
+        }
     };
 }
 
@@ -82,7 +92,7 @@ pub struct TopDigit<I, O, P>(PhantomData<(I, O, P)>);
 
 impl<I: AxisName, O: AxisName, P: Ownership> AxisName for TopDigit<I, O, P> {
     const NAME: Ident = Ident::new("TopDigit");
-    const SIZE: usize = contraction::odd(O::SIZE / 2 / Owned::<I, O, P>::SIZE);
+    const SIZE: usize = contraction::odd(outputs::<O, P>() / Owned::<I, O, P>::SIZE);
 }
 
 /// Owner slots the top digit takes: its next power of two.
@@ -118,19 +128,37 @@ type Owner<I, O, P> = Symbol<Owned<I, O, P>>;
 type Top<I, O, P> = Symbol<TopDigit<I, O, P>>;
 type Slots<I, O, P> = Symbol<TopSlots<I, O, P>>;
 type Tall<I, O, P> = Symbol<Height<I, O, P>>;
+type Cluster<I, O, P> = <P as Ownership>::Cluster<I, O>;
+type Owners<I, O, P> = <P as Ownership>::Owners<I, O>;
+type Reduced<I, O, P> = <P as Ownership>::Reduced<I, O>;
+
 /// Each top digit's first half of the outputs in cluster 0, its second in cluster 1.
-type Cluster<I, O, P> = m![O % (O / ({ Top<I, O, P> })) / ((O / ({ Top<I, O, P> })) / 2)];
-/// A slice owns consecutive output rows over one part of the inputs; the parts of a row's owners
-/// are adjacent, innermost, for the inter-slice reducer.
-type Owners<I, O, P> = m![
+type OutputCluster<I, O, P> = m![O % (O / ({ Top<I, O, P> })) / ((O / ({ Top<I, O, P> })) / 2)];
+/// A slice owns consecutive output rows of its cluster's half over one part of the inputs; the
+/// parts of a row's owners are adjacent, innermost, for the inter-slice reducer.
+type OutputOwners<I, O, P> = m![
     O / (O / ({ Top<I, O, P> })) # ({ Slots<I, O, P> }),
     O % ((O / ({ Top<I, O, P> })) / 2) / ({ Owner<I, O, P> }),
     I / ({ Width<I> })
 ];
-type Reduced<I, O, P> = m![
+type OutputReduced<I, O, P> = m![
     O / (O / ({ Top<I, O, P> })) # ({ Slots<I, O, P> }),
     O % ((O / ({ Top<I, O, P> })) / 2) / ({ Owner<I, O, P> }),
     1 # (I / ({ Width<I> }))
+];
+
+/// The first half of the inputs in cluster 0, the second in cluster 1.
+type InputCluster<I> = m![I / (I / 2)];
+/// A slice owns consecutive output rows over one part of its cluster's half of the inputs.
+type InputOwners<I, O, P> = m![
+    O / (O / ({ Top<I, O, P> })) # ({ Slots<I, O, P> }),
+    O % (O / ({ Top<I, O, P> })) / ({ Owner<I, O, P> }),
+    I % (I / 2) / ({ Width<I> })
+];
+type InputReduced<I, O, P> = m![
+    O / (O / ({ Top<I, O, P> })) # ({ Slots<I, O, P> }),
+    O % (O / ({ Top<I, O, P> })) / ({ Owner<I, O, P> }),
+    1 # (I / 2 / ({ Width<I> }))
 ];
 /// A slice's part of a row's inputs.
 type Part<I> = m![I % ({ Width<I> })];
@@ -194,11 +222,15 @@ type Lane<R> = m![{ Layout<R>::Lanes }];
 /// The first four lanes of a lane group.
 type Front<R> = m![{ Lane<R> } % 4];
 
-/// A launch's rows as the passes of a projection of `I` inputs into `O` outputs sum them: each
-/// cluster its half of every top digit's outputs, each owner slice its consecutive outputs of every
-/// row.
-type Summing<I, O, R, P> =
-    DmTensor<bf16, Chip, Cluster<I, O, P>, Reduced<I, O, P>, m![R, O % ({ Owner<I, O, P> })]>;
+/// A launch's rows as the passes of a projection of `I` inputs into `O` outputs sum them, each
+/// owner slice its consecutive outputs of every row over its cluster's inputs.
+type Summing<I, O, R, P> = DmTensor<
+    <P as Ownership>::Sum,
+    Chip,
+    Cluster<I, O, P>,
+    Reduced<I, O, P>,
+    m![R, O % ({ Owner<I, O, P> })],
+>;
 
 /// The rows of a lane group's lanes `L` in the tensor registers of every slice of a projection of
 /// `I` inputs into `O` outputs, each slice the group's inputs in its part.
@@ -230,6 +262,71 @@ type Staging<I, O, R, P> =
 type Both<H, I, R> =
     DmTensor<bf16, Chip, normalization::Cluster, Runs<H, I>, m![R, I % ({ Owner<H, I, Kept> })]>;
 type Runs<H, I> = m![I / (I / 2), I % (I / 2) / ({ Owner<H, I, Kept> })];
+
+/// Rows in the feature slices of each cluster's half of the features: a slice's run of every row,
+/// in the cluster whose passes read that half, the runs of a part of a weight's inputs on slices
+/// of their own.
+type HalfSpread<I, R> = DmTensor<
+    bf16,
+    Chip,
+    InputCluster<I>,
+    m![
+        I % (I / 2) / ({ Width<I> }),
+        I % ({ Width<I> }) / ({ Feature<I> }) # ({ Symbol<Seats<I>> })
+    ],
+    m![R, I % ({ Feature<I> })],
+>;
+
+/// A part of a cluster's half of a projection's inputs, and an input within its part, as axes of
+/// their own: the runs and the feature chunks a regroup moves between cut a part differently, so a
+/// transfer keeps each side's coordinates of a part consecutive only with the parts named apart.
+#[derive(Clone, Debug)]
+struct Section<I>(PhantomData<I>);
+
+impl<I: AxisName> AxisName for Section<I> {
+    const NAME: Ident = Ident::new("Section");
+    const SIZE: usize = I::SIZE / 2 / Chunk::<I>::SIZE;
+}
+
+/// An input within its part of a cluster's half of a projection's inputs: see [`Section`].
+#[derive(Clone, Debug)]
+struct Within<I>(PhantomData<I>);
+
+impl<I: AxisName> AxisName for Within<I> {
+    const NAME: Ident = Ident::new("Within");
+    const SIZE: usize = Chunk::<I>::SIZE;
+}
+
+/// Slices each part of a cluster's half of the inputs takes in [`HalfSpread`]: an equal share of
+/// the cluster, so that no part's runs straddle the slices of two processing elements, which a
+/// transfer splits.
+#[derive(Clone, Debug)]
+pub struct Seats<I>(PhantomData<I>);
+
+impl<I: AxisName> AxisName for Seats<I> {
+    const NAME: Ident = Ident::new("Seats");
+    const SIZE: usize = SLICES / (I::SIZE / 2 / Chunk::<I>::SIZE);
+}
+
+/// Rows a summed projection of `H` inputs into `I` outputs kept, each cluster the half of `I` its
+/// passes summed, and the same rows in each cluster's half of the feature slices, written from
+/// three live lane groups for the passes over a decoded weight.
+type Halved<H, I, R> = (Summing<H, I, R, Kept>, HalfSpread<I, R>);
+
+/// The slices of the rows a summed projection of `H` inputs into `I` outputs kept, in a cluster
+/// that holds a half of `I`: an owner's run on the first slice of its parts.
+type HalfRuns<H, I> = m![I % (I / 2) / ({ Owner<H, I, Kept> }), 1 # (H / ({ Width<H> }))];
+
+/// The rows a summed projection of `H` inputs into `I` outputs kept, as the clusters of a
+/// projection that halves its inputs name them.
+type HalfKept<'k, H, I, R> = DmTensorView<
+    'k,
+    bf16,
+    Chip,
+    InputCluster<I>,
+    HalfRuns<H, I>,
+    m![R, I % ({ Owner<H, I, Kept> })],
+>;
 
 /// Whether [`Both`] holds the rows a projection of `H` inputs into `I` outputs summed: the runs of
 /// both halves fit a cluster's slices and a part of `I` inputs is whole runs.
@@ -283,13 +380,15 @@ impl<I: AxisName, O: AxisName, P: Ownership> Landed<I, O, P> {
     /// The slices hold the weight: whole parts of its inputs, each owner's run of outputs whole
     /// in the passes, the owners and parts filling every slice.
     const TILED: () = {
-        let parts = I::SIZE / Chunk::<I>::SIZE;
-        let owners = O::SIZE / 2 / Owned::<I, O, P>::SIZE;
+        let halves = if P::HALVES_INPUTS { 2 } else { 1 };
+        let parts = I::SIZE / Chunk::<I>::SIZE / halves;
+        let owners = outputs::<O, P>() / Owned::<I, O, P>::SIZE;
         assert!(
-            I::SIZE.is_multiple_of(Chunk::<I>::SIZE)
+            I::SIZE.is_multiple_of(halves * Chunk::<I>::SIZE)
                 && Chunk::<I>::SIZE.is_multiple_of(128)
                 && SLICES.is_multiple_of(parts)
-                && O::SIZE.is_multiple_of(2 * Owned::<I, O, P>::SIZE)
+                && outputs::<O, P>().is_multiple_of(Owned::<I, O, P>::SIZE)
+                && O::SIZE.is_multiple_of(outputs::<O, P>())
                 && TopSlots::<I, O, P>::SIZE * (owners / TopDigit::<I, O, P>::SIZE) * parts
                     == SLICES
                 && Owned::<I, O, P>::SIZE.is_multiple_of(Height::<I, O, P>::SIZE)
@@ -336,19 +435,15 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
         &self,
         device: &mut Device,
         input: &Live<X, R>,
-    ) -> Summing<I, O, R, P> {
+    ) -> Summing<I, O, R, P>
+    where
+        P::Sum: Rounding,
+    {
         let global = scalar::register(device, &self.global);
         let mut projected = Summing::<I, O, R, P>::new();
         let (first, count) = input.groups::<Lanes<R>>();
         let rows = input.value();
-        // One from three live groups, counted by arithmetic (a device cannot cast a comparison to a
-        // count) in a form the compiler bounds by one, so the loop over it frees what it read.
-        let groups = R::SIZE / Lanes::<R>::SIZE;
-        let dense = if const { R::SIZE / Lanes::<R>::SIZE >= 3 } {
-            (count + groups - 3) / groups
-        } else {
-            0
-        };
+        let dense = decoded::<R>(count);
         // The summed passes' last group folds its first four lanes alone when its live rows end
         // there: one group or none.
         let front = if const { Lanes::<R>::SIZE == 8 } {
@@ -417,12 +512,12 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
                 };
                 // Pairs of groups, the second in the TRF's other half, so a switch runs beside the
                 // passes before it; an even count's last pair switches its second again.
-                let mut held = switched(device, rows, first);
+                let mut held = rows.switched(device, first);
                 for pair in 0..count / 2 {
                     let group = first + 2 * pair;
-                    let next = switched(device, rows, group + 1);
+                    let next = rows.switched(device, group + 1);
                     met(device, &held, group);
-                    held = switched(device, rows, (group + 2).min(last));
+                    held = rows.switched(device, (group + 2).min(last));
                     met(device, &next, group + 1);
                 }
                 for _ in 0..count % 2 {
@@ -495,7 +590,9 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
         (lanes, global): (&Registers<I, O, F::Filled, P>, &Global<I, O, P>),
         (group, tile): (usize, usize),
         projected: &mut Summing<I, O, R, P>,
-    ) {
+    ) where
+        P::Sum: Rounding,
+    {
         let scale = self.scaling(device, tile);
         let sums = device
             .main
@@ -524,15 +621,14 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
                 InterSliceReduceOpF32::Add,
             )
             .vector_final();
-        Rounded::rounded::<
-            bf16,
+        <P::Sum as Rounding>::round::<
             _,
             _,
             _,
             _,
             F::Filled,
-            m![{ Elements<I, O, P> } / 4, 1, { F::Filled }],
-            m![O % 4],
+            m![{ <P::Sum as Rounding>::Packets<Elements<I, O, P>> }, 1, { F::Filled }],
+            <P::Sum as Rounding>::Packet<O>,
             _,
         >(sums)
         .commit_view(F::sums(projected, (group, tile)));
@@ -581,7 +677,9 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
         ),
         (group, tile): (usize, usize),
         projected: &mut Summing<I, O, R, P>,
-    ) {
+    ) where
+        P::Sum: Rounding,
+    {
         let sums = device
             .main
             .begin(weights.view().tile::<Tiles<I, O, P>, 1, m![
@@ -607,15 +705,14 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
                 InterSliceReduceOpF32::Add,
             )
             .vector_final();
-        Rounded::rounded::<
-            bf16,
+        <P::Sum as Rounding>::round::<
             _,
             _,
             _,
             _,
             Lane<R>,
-            m![{ Elements<I, O, P> } / 4, 1, { Lane<R> }],
-            m![O % 4],
+            m![{ <P::Sum as Rounding>::Packets<Elements<I, O, P>> }, 1, { Lane<R> }],
+            <P::Sum as Rounding>::Packet<O>,
             _,
         >(sums)
         .commit_view(<Split as Fold<I, O, R, P>>::sums(projected, (group, tile)));
@@ -659,7 +756,7 @@ trait Fold<I: AxisName, O: AxisName, R: AxisName, P: Ownership> {
     fn sums(
         projected: &mut Summing<I, O, R, P>,
         at: (usize, usize),
-    ) -> DmTensorViewMut<'_, bf16, Chip, Cluster<I, O, P>, Reduced<I, O, P>, Self::Rows>;
+    ) -> DmTensorViewMut<'_, P::Sum, Chip, Cluster<I, O, P>, Reduced<I, O, P>, Self::Rows>;
 }
 
 /// A pass's block sums leaving the lane folder, lanes `L` a packet of eight.
@@ -722,7 +819,7 @@ impl<I: AxisName, O: AxisName, R: AxisName, P: Ownership> Fold<I, O, R, P> for S
     fn sums(
         projected: &mut Summing<I, O, R, P>,
         (group, tile): (usize, usize),
-    ) -> DmTensorViewMut<'_, bf16, Chip, Cluster<I, O, P>, Reduced<I, O, P>, Self::Rows> {
+    ) -> DmTensorViewMut<'_, P::Sum, Chip, Cluster<I, O, P>, Reduced<I, O, P>, Self::Rows> {
         projected
             .view_mut()
             .tile::<Layout<R>::Groups, 1, Layout<R>::GroupMut<m![O % ({ Owner<I, O, P> })]>>(group)
@@ -757,7 +854,7 @@ impl<I: AxisName, O: AxisName, R: AxisName, P: Ownership> Fold<I, O, R, P> for T
     fn sums(
         projected: &mut Summing<I, O, R, P>,
         (group, tile): (usize, usize),
-    ) -> DmTensorViewMut<'_, bf16, Chip, Cluster<I, O, P>, Reduced<I, O, P>, Self::Rows> {
+    ) -> DmTensorViewMut<'_, P::Sum, Chip, Cluster<I, O, P>, Reduced<I, O, P>, Self::Rows> {
         projected
             .view_mut()
             .tile::<Layout<R>::Groups, 1, Layout<R>::GroupMut<m![O % ({ Owner<I, O, P> })]>>(group)
@@ -770,24 +867,58 @@ impl<I: AxisName, O: AxisName, R: AxisName, P: Ownership> Fold<I, O, R, P> for T
     }
 }
 
-/// How a placement has a projection's slices own its outputs: in whole feature chunks of them when
-/// its rows move to the feature slices, so the move takes whole chunks; else as the passes split them.
+/// How a placement has a projection's clusters and slices share its work: each cluster sums every
+/// input into its half of the outputs, or its half of the inputs into every output; the owners hold
+/// whole feature chunks of the outputs when the rows move to the feature slices, so the move takes
+/// whole chunks, else as the passes split them.
 pub trait Ownership: Clone + core::fmt::Debug + 'static {
     /// Whether the owners hold whole feature chunks of the outputs.
     const CHUNKED: bool;
+    /// Whether each cluster sums its half of the inputs into every output, so that the clusters'
+    /// partial sums meet in an exchange.
+    const HALVES_INPUTS: bool;
+    /// The cluster each part of the weight lies in.
+    type Cluster<I: AxisName, O: AxisName>: M;
+    /// The slice each owner's part of the inputs lies in.
+    type Owners<I: AxisName, O: AxisName>: M;
+    /// The slice an owner's sums land in once its parts meet.
+    type Reduced<I: AxisName, O: AxisName>: M;
+    /// What a pass stores its FP32 sums as.
+    type Sum: MaterializableScalar;
 }
 
 impl Ownership for Features {
     const CHUNKED: bool = true;
+    const HALVES_INPUTS: bool = false;
+    type Cluster<I: AxisName, O: AxisName> = OutputCluster<I, O, Self>;
+    type Owners<I: AxisName, O: AxisName> = OutputOwners<I, O, Self>;
+    type Reduced<I: AxisName, O: AxisName> = OutputReduced<I, O, Self>;
+    type Sum = bf16;
 }
 
 impl Ownership for Kept {
     const CHUNKED: bool = false;
+    const HALVES_INPUTS: bool = false;
+    type Cluster<I: AxisName, O: AxisName> = OutputCluster<I, O, Self>;
+    type Owners<I: AxisName, O: AxisName> = OutputOwners<I, O, Self>;
+    type Reduced<I: AxisName, O: AxisName> = OutputReduced<I, O, Self>;
+    type Sum = bf16;
 }
 
-/// Where a projection's rows end once its passes summed them: the rows `place` gives of `R` rows
-/// projected from `I` inputs into `O` outputs.
-pub trait Place<I: AxisName, O: AxisName, R: AxisName>: Ownership + Sized {
+/// The FP32 partial sums of each cluster's half of the inputs; their exchange adds them in FP32 and
+/// rounds each output once.
+impl Ownership for Exchanged {
+    const CHUNKED: bool = true;
+    const HALVES_INPUTS: bool = true;
+    type Cluster<I: AxisName, O: AxisName> = InputCluster<I>;
+    type Owners<I: AxisName, O: AxisName> = InputOwners<I, O, Self>;
+    type Reduced<I: AxisName, O: AxisName> = InputReduced<I, O, Self>;
+    type Sum = f32;
+}
+
+/// Where a projection's rows end once its passes summed them in BF16, each cluster its half of the
+/// outputs: the rows `place` gives of `R` rows projected from `I` inputs into `O` outputs.
+pub trait Place<I: AxisName, O: AxisName, R: AxisName>: Ownership<Sum = bf16> + Sized {
     type Rows;
     fn place(device: &mut Device, rows: Live<Summing<I, O, R, Self>, R>) -> Live<Self::Rows, R>;
 }
@@ -1035,8 +1166,9 @@ where
         (landed, input): (Landed<I, O, P>, &'x Live<Kept<Summing<H, I, R, Kept>>, R>),
     ) -> Self::Output {
         if const { fits_both::<H, I>() } {
-            let begun = self.forward(&mut *device, Begin((landed, input)));
-            self.forward(device, begun)
+            let mut both = Both::<H, I, R>::new();
+            transfer(device, input.with(&input.value().0), &mut both);
+            self.forward(device, (landed, input.with(both)))
         } else {
             let mut spread = Spread::<I, R>::new();
             transfer(device, input.with(&input.value().0), &mut spread);
@@ -1047,18 +1179,18 @@ where
 
 /// The same rows begun with the weight as it landed: one transfer lands them in both clusters as
 /// they lie, so a schedule can issue it ahead of other transfers; given back, they project.
-impl<'x, H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P, S: M + 'static>
-    Op<Begin<(Landed<I, O, P>, &'x Live<Kept<Summing<H, I, R, Kept>>, R>)>>
+impl<H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P, S: M + 'static>
+    Op<Begin<(Landed<I, O, P>, Live<Kept<Summing<H, I, R, Kept>>, R>)>>
     for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P, S>, Chip, K, V>
 where
-    P: Ownership,
+    P: Place<I, O, R>,
 {
     type Output = (Landed<I, O, P>, Live<Both<H, I, R>, R>);
 
     fn forward(
         &self,
         device: &mut Device,
-        Begin((landed, input)): Begin<(Landed<I, O, P>, &'x Live<Kept<Summing<H, I, R, Kept>>, R>)>,
+        Begin((landed, input)): Begin<(Landed<I, O, P>, Live<Kept<Summing<H, I, R, Kept>>, R>)>,
     ) -> Self::Output {
         const { assert!(fits_both::<H, I>()) };
         let mut both = Both::<H, I, R>::new();
@@ -1086,12 +1218,112 @@ where
     }
 }
 
+/// The live rows a summed projection of `H` inputs kept, through a weight whose clusters halve
+/// its inputs: each cluster's passes read the half its cluster holds, where it lies.
+impl<'x, H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, S: M + 'static>
+    Op<&'x Live<Kept<Summing<H, I, R, Kept>>, R>>
+    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, Exchanged, S>, Chip, K, V>
+where
+    K: Borrow<HbmTensor<f4e2m1, Chip, Codes<I, O, Exchanged>>>,
+    V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O, Exchanged>>>,
+    Held<Y, S>: Borrow<Scale<S>>,
+{
+    type Output = Live<Spread<O, R>, R>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        input: &'x Live<Kept<Summing<H, I, R, Kept>>, R>,
+    ) -> Self::Output {
+        let landed = self.forward(&mut *device, Begin(()));
+        let kept = &input.value().0;
+        let spread = halve(&mut *device, input.with(kept));
+        let partial = landed.project(
+            &mut *device,
+            &input.with(Halves {
+                kept,
+                spread: &spread,
+            }),
+        );
+        exchange(device, input.with(partial))
+    }
+}
+
+/// The same rows begun with the weight as it landed: they stay where they lie; from three live
+/// lane groups one transfer a cluster, issued now so a schedule can issue later transfers behind
+/// it, also lays its half in its feature slices for the passes over the decoded weight.
+impl<H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, S: M + 'static>
+    Op<
+        Begin<(
+            Landed<I, O, Exchanged>,
+            Live<Kept<Summing<H, I, R, Kept>>, R>,
+        )>,
+    >
+    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, Exchanged, S>, Chip, K, V>
+{
+    type Output = (Landed<I, O, Exchanged>, Live<Halved<H, I, R>, R>);
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        Begin((landed, input)): Begin<(
+            Landed<I, O, Exchanged>,
+            Live<Kept<Summing<H, I, R, Kept>>, R>,
+        )>,
+    ) -> Self::Output {
+        let live = input.with(());
+        let Kept(kept) = input.into_value();
+        let spread = halve(device, live.with(&kept));
+        (landed, live.with((kept, spread)))
+    }
+}
+
+/// Rows kept in halves through the weight as it landed.
+impl<H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, S: M + 'static>
+    Op<(Landed<I, O, Exchanged>, Live<Halved<H, I, R>, R>)>
+    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, Exchanged, S>, Chip, K, V>
+{
+    type Output = Live<Spread<O, R>, R>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (landed, rows): (Landed<I, O, Exchanged>, Live<Halved<H, I, R>, R>),
+    ) -> Self::Output {
+        let (kept, spread) = rows.value();
+        let partial = landed.project(&mut *device, &rows.with(Halves { kept, spread }));
+        exchange(device, rows.with(partial))
+    }
+}
+
+axes![Term = 2];
+
+/// The FP32 partial sums a projection that halves its `I` inputs leaves in each cluster's reduced
+/// slices, the cluster's index naming the term its half of the inputs gives.
+type Partials<I, O, R> = DmTensor<
+    f32,
+    Chip,
+    m![Term],
+    Reduced<I, O, Exchanged>,
+    m![R, O % ({ Owner<I, O, Exchanged> })],
+>;
+
+/// Both clusters' FP32 partial sums of every row in the output's feature slices of both clusters,
+/// the term of each cluster's half of the inputs beside the other's.
+type Terms<O, R> = DmTensor<
+    f32,
+    Chip,
+    normalization::Cluster,
+    FeatureSlices<O>,
+    m![R, Term, O % ({ Feature<O> })],
+>;
+
 /// The live rows of `rows` into `into`'s mapping in one transfer, as a setup costs about as much as
 /// all the rows: the one live row, else the lane group holding them, else the envelope.
-fn transfer<R: AxisName, C: M, S: M, X: M, D: M, T: M, Y: M>(
+fn transfer<V: Scalar, R: AxisName, C: M, S: M, X: M, D: M, T: M, Y: M>(
     device: &mut Device,
-    rows: Live<&DmTensor<bf16, Chip, C, S, m![R, { X }]>, R>,
-    into: &mut DmTensor<bf16, Chip, D, T, m![R, { Y }]>,
+    rows: Live<&DmTensor<V, Chip, C, S, m![R, { X }]>, R>,
+    into: &mut DmTensor<V, Chip, D, T, m![R, { Y }]>,
 ) {
     let (first, count) = rows.groups::<Lanes<R>>();
     if count > 1 {
@@ -1120,6 +1352,8 @@ fn transfer<R: AxisName, C: M, S: M, X: M, D: M, T: M, Y: M>(
 trait Stage<I: AxisName, O: AxisName, R: AxisName, P: Ownership> {
     /// The parts the switch can write a group in, none when it fills the TRF itself.
     const PARTS: usize;
+    /// The rows in feature slices the passes over the decoded weights switch from.
+    type Dense: Dense<I, O, R, P>;
 
     fn staged() -> Staging<I, O, R, P>;
     fn switch(&self, device: &mut Device, group: usize, staged: &mut Staging<I, O, R, P>);
@@ -1140,13 +1374,19 @@ trait Stage<I: AxisName, O: AxisName, R: AxisName, P: Ownership> {
         staged: &Staging<I, O, R, P>,
     ) -> Registers<I, O, Front<R>, P>;
     /// The rows, three lane groups or more of them live, in their feature slices for `dense`.
-    fn densely(&self, device: &mut Device, dense: impl FnOnce(&mut Device, &Spread<I, R>));
+    fn densely(&self, device: &mut Device, dense: impl FnOnce(&mut Device, &Self::Dense));
+}
+
+/// Rows in feature slices whose lane groups switch straight into the TRF, in [`Switched`] order.
+trait Dense<I: AxisName, O: AxisName, R: AxisName, P: Ownership> {
+    fn switched(&self, device: &mut Device, group: usize) -> Switching<I, O, R, P>;
 }
 
 /// Rows in their feature slices: the switch ring takes each feature slice's inputs to the slices
 /// that hold them, straight into the TRF where a slice holds one packet of a row.
-impl<I: AxisName, O: AxisName, R: AxisName, P: Ownership> Stage<I, O, R, P> for Spread<I, R> {
+impl<I: AxisName, O: AxisName, R: AxisName, P: Place<I, O, R>> Stage<I, O, R, P> for Spread<I, R> {
     const PARTS: usize = if I::SIZE <= 16 * 256 { 0 } else { 1 };
+    type Dense = Self;
 
     fn staged() -> Staging<I, O, R, P> {
         DmTensor::new()
@@ -1208,7 +1448,7 @@ impl<I: AxisName, O: AxisName, R: AxisName, P: Ownership> Stage<I, O, R, P> for 
                     I % ({ Width<I> }) / ({ Feature<I> })
                 ], m![I % 16]>()
                 .commit_trim::<m![I % 16]>()
-                .commit_view(staged_front(staged));
+                .commit_view(staged_front::<I, O, R, P>(staged));
         }
     }
 
@@ -1218,7 +1458,7 @@ impl<I: AxisName, O: AxisName, R: AxisName, P: Ownership> Stage<I, O, R, P> for 
         (group, _): (usize, usize),
         staged: &mut Staging<I, O, R, P>,
     ) {
-        self.switch(device, group, staged);
+        <Self as Stage<I, O, R, P>>::switch(self, device, group, staged);
     }
 
     fn fill(
@@ -1245,7 +1485,7 @@ impl<I: AxisName, O: AxisName, R: AxisName, P: Ownership> Stage<I, O, R, P> for 
                 .collect::<m![{ Lane<R> }, { Part<I> } / 16], m![I % 16]>()
                 .to_trf()
         } else {
-            filled(device, staged)
+            filled::<I, O, R, P>(device, staged)
         }
     }
 
@@ -1276,11 +1516,11 @@ impl<I: AxisName, O: AxisName, R: AxisName, P: Ownership> Stage<I, O, R, P> for 
                 .collect::<m![{ Front<R> }, { Part<I> } / 16], m![I % 16]>()
                 .to_trf()
         } else {
-            filled_front(device, staged)
+            filled_front::<I, O, R, P>(device, staged)
         }
     }
 
-    fn densely(&self, device: &mut Device, dense: impl FnOnce(&mut Device, &Spread<I, R>)) {
+    fn densely(&self, device: &mut Device, dense: impl FnOnce(&mut Device, &Self::Dense)) {
         dense(device, self);
     }
 }
@@ -1288,75 +1528,30 @@ impl<I: AxisName, O: AxisName, R: AxisName, P: Ownership> Stage<I, O, R, P> for 
 /// Rows a summed projection of `H` inputs kept, in both clusters: the switch ring takes each
 /// owner's run, a piece at a time, to the slices whose part holds it, all pieces at once or one a
 /// part, and the parts are written in DM before the lanes fill in input order.
-impl<H: AxisName, I: AxisName, O: AxisName, R: AxisName, P: Ownership> Stage<I, O, R, P>
+impl<H: AxisName, I: AxisName, O: AxisName, R: AxisName, P: Place<I, O, R>> Stage<I, O, R, P>
     for Both<H, I, R>
 {
     const PARTS: usize = Owned::<H, I, Kept>::SIZE / Piece::<H, I>::SIZE;
+    type Dense = Spread<I, R>;
 
     fn staged() -> Staging<I, O, R, P> {
         DmTensor::new()
     }
 
     fn switch(&self, device: &mut Device, group: usize, staged: &mut Staging<I, O, R, P>) {
-        type Run<H, I> = Symbol<Piece<H, I>>;
-        type Group<H, I, R> = Layout<R>::Elements<m![I % ({ Owner<H, I, Kept> })]>;
-        const { assert!(fits_both::<H, I>()) };
-        // SAFETY: both physical clusters hold every row; only the logical cluster axis changes.
-        let input = unsafe {
-            Layout::<R>::group(self.view(), group)
-                .reshape::<Chip, Cluster<I, O, P>, Runs<H, I>, Group<H, I, R>>()
-        };
-        device
-            .sub
-            .begin(input)
-            .fetch::<m![{ Lane<R> }, I % ({ Owner<H, I, Kept> }) / ({ Run<H, I> })], m![
-                I % ({ Run<H, I> })
-            ]>()
-            .switch::<Owners<I, O, P>, m![
-                { Lane<R> },
-                I % ({ Owner<H, I, Kept> }) / ({ Run<H, I> }),
-                I % ({ Width<I> }) / ({ Owner<H, I, Kept> })
-            ]>(SwitchConfig::CustomBroadcast { ring_size: 256 })
-            .collect::<m![
-                { Lane<R> },
-                I % ({ Owner<H, I, Kept> }) / ({ Run<H, I> }),
-                I % ({ Width<I> }) / ({ Owner<H, I, Kept> })
-            ], m![I % ({ Run<H, I> }) # 16]>()
-            .commit_trim::<m![I % ({ Run<H, I> })]>()
-            .commit_view(staged.view_mut());
+        switch_runs::<H, I, O, R, P, Runs<H, I>>(
+            device,
+            both_runs::<H, I, O, R, P>(self, group),
+            staged,
+        );
     }
 
     fn switch_front(&self, device: &mut Device, group: usize, staged: &mut Staging<I, O, R, P>) {
-        type Run<H, I> = Symbol<Piece<H, I>>;
-        type Group<H, I, R> = Layout<R>::Elements<m![I % ({ Owner<H, I, Kept> })]>;
-        const { assert!(fits_both::<H, I>()) };
-        // SAFETY: as in `switch`.
-        let input = unsafe {
-            Layout::<R>::group(self.view(), group)
-                .reshape::<Chip, Cluster<I, O, P>, Runs<H, I>, Group<H, I, R>>()
-        };
-        device
-            .sub
-            .begin(input.tile::<m![{ Lane<R> } / 4], 1, m![
-                { Layout<R>::Selected },
-                { Lane<R> } % 4 # ({ Symbol<Lanes<R>> }),
-                I % ({ Owner<H, I, Kept> })
-            ]>(0))
-            .fetch::<m![{ Front<R> }, I % ({ Owner<H, I, Kept> }) / ({ Run<H, I> })], m![
-                I % ({ Run<H, I> })
-            ]>()
-            .switch::<Owners<I, O, P>, m![
-                { Front<R> },
-                I % ({ Owner<H, I, Kept> }) / ({ Run<H, I> }),
-                I % ({ Width<I> }) / ({ Owner<H, I, Kept> })
-            ]>(SwitchConfig::CustomBroadcast { ring_size: 256 })
-            .collect::<m![
-                { Front<R> },
-                I % ({ Owner<H, I, Kept> }) / ({ Run<H, I> }),
-                I % ({ Width<I> }) / ({ Owner<H, I, Kept> })
-            ], m![I % ({ Run<H, I> }) # 16]>()
-            .commit_trim::<m![I % ({ Run<H, I> })]>()
-            .commit_view(staged_front(staged));
+        switch_front_runs::<H, I, O, R, P, Runs<H, I>>(
+            device,
+            both_runs::<H, I, O, R, P>(self, group),
+            staged,
+        );
     }
 
     fn part(
@@ -1365,35 +1560,11 @@ impl<H: AxisName, I: AxisName, O: AxisName, R: AxisName, P: Ownership> Stage<I, 
         (group, piece): (usize, usize),
         staged: &mut Staging<I, O, R, P>,
     ) {
-        type Run<H, I> = Symbol<Piece<H, I>>;
-        type Pieces<H, I> = m![I % ({ Owner<H, I, Kept> }) / ({ Run<H, I> })];
-        type Group<H, I, R> = Layout<R>::Elements<m![I % ({ Owner<H, I, Kept> })]>;
-        const { assert!(fits_both::<H, I>()) };
-        // SAFETY: as above, only the logical cluster axis changes.
-        let input = unsafe {
-            Layout::<R>::group(self.view(), group)
-                .reshape::<Chip, Cluster<I, O, P>, Runs<H, I>, Group<H, I, R>>()
-        };
-        device
-            .sub
-            .begin(input.tile::<Pieces<H, I>, 1, m![
-                { Layout<R>::Selected },
-                { Lane<R> },
-                I % ({ Run<H, I> }) # ({ Owner<H, I, Kept> })
-            ]>(piece))
-            .fetch::<Lane<R>, m![I % ({ Run<H, I> })]>()
-            .switch::<Owners<I, O, P>, m![{ Lane<R> }, I % ({ Width<I> }) / ({ Owner<H, I, Kept> })]>(
-                SwitchConfig::CustomBroadcast { ring_size: 256 },
-            )
-            .collect::<m![{ Lane<R> }, I % ({ Width<I> }) / ({ Owner<H, I, Kept> })], m![
-                I % ({ Run<H, I> }) # 16
-            ]>()
-            .commit_trim::<m![I % ({ Run<H, I> })]>()
-            .commit_view(staged.view_mut().tile::<Pieces<H, I>, 1, m![
-                { Lane<R> },
-                I % ({ Width<I> }) / ({ Owner<H, I, Kept> }),
-                I % ({ Run<H, I> }) #{!} ({ Owner<H, I, Kept> })
-            ]>(piece));
+        switch_piece::<H, I, O, R, P, Runs<H, I>>(
+            device,
+            (both_runs::<H, I, O, R, P>(self, group), piece),
+            staged,
+        );
     }
 
     fn fill(
@@ -1402,7 +1573,7 @@ impl<H: AxisName, I: AxisName, O: AxisName, R: AxisName, P: Ownership> Stage<I, 
         _: usize,
         staged: &Staging<I, O, R, P>,
     ) -> Registers<I, O, Lane<R>, P> {
-        filled(device, staged)
+        filled::<I, O, R, P>(device, staged)
     }
 
     fn front(
@@ -1411,10 +1582,10 @@ impl<H: AxisName, I: AxisName, O: AxisName, R: AxisName, P: Ownership> Stage<I, 
         _: usize,
         staged: &Staging<I, O, R, P>,
     ) -> Registers<I, O, Front<R>, P> {
-        filled_front(device, staged)
+        filled_front::<I, O, R, P>(device, staged)
     }
 
-    fn densely(&self, device: &mut Device, dense: impl FnOnce(&mut Device, &Spread<I, R>)) {
+    fn densely(&self, device: &mut Device, dense: impl FnOnce(&mut Device, &Self::Dense)) {
         // Live rows spanning three groups or more move as the whole envelope, as in `transfer`.
         let mut spread = Spread::<I, R>::new();
         self.view().to_dm_view(&mut device.tdma, spread.view_mut());
@@ -1422,27 +1593,132 @@ impl<H: AxisName, I: AxisName, O: AxisName, R: AxisName, P: Ownership> Stage<I, 
     }
 }
 
-/// Lane group `group` of rows in their feature slices straight into the TRF, in [`Switched`] order.
-fn switched<I: AxisName, O: AxisName, R: AxisName, P: Ownership>(
-    device: &mut Device,
-    rows: &Spread<I, R>,
-    group: usize,
-) -> Switching<I, O, R, P> {
-    type Group<I, R> = Layout<R>::Elements<m![I % ({ Feature<I> })]>;
-    // SAFETY: both physical clusters hold every row; only the logical cluster axis changes.
-    let input = unsafe {
-        Layout::<R>::group(rows.view(), group)
-            .reshape::<Chip, Cluster<I, O, P>, FeatureSlices<I>, Group<I, R>>()
-    };
-    device
-        .sub
-        .begin(input)
-        .fetch::<m![{ Lane<R> }, I % ({ Feature<I> }) / 16], m![I % 16]>()
-        .switch::<Owners<I, O, P>, m![{ Lane<R> }, { Packets<I> }]>(SwitchConfig::CustomBroadcast {
-            ring_size: 256,
-        })
-        .collect::<m![{ Lane<R> }, { Packets<I> }], m![I % 16]>()
-        .to_trf()
+/// [`Halved`] rows as the passes of a projection that halves its inputs read them: each cluster
+/// switches its own half's runs, a piece at a time, to the slices whose part holds them, as rows in
+/// both clusters switch, with no transfer first.
+struct Halves<'k, H: AxisName, I: AxisName, R: AxisName> {
+    kept: &'k Summing<H, I, R, Kept>,
+    spread: &'k HalfSpread<I, R>,
+}
+
+impl<'k, H: AxisName, I: AxisName, R: AxisName> Halves<'k, H, I, R> {
+    /// Lane group `group` of the kept rows, as the cluster whose passes read its half names it.
+    fn runs<O: AxisName>(
+        &self,
+        group: usize,
+    ) -> RunGroup<'k, H, I, O, R, Exchanged, HalfRuns<H, I>> {
+        Layout::<R>::group(halved(self.kept), group)
+    }
+}
+
+impl<H: AxisName, I: AxisName, O: AxisName, R: AxisName> Stage<I, O, R, Exchanged>
+    for Halves<'_, H, I, R>
+{
+    const PARTS: usize = Owned::<H, I, Kept>::SIZE / Piece::<H, I>::SIZE;
+    type Dense = HalfSpread<I, R>;
+
+    fn staged() -> Staging<I, O, R, Exchanged> {
+        DmTensor::new()
+    }
+
+    fn switch(&self, device: &mut Device, group: usize, staged: &mut Staging<I, O, R, Exchanged>) {
+        type Slices<H, I> = HalfRuns<H, I>;
+        switch_runs::<H, I, O, R, Exchanged, Slices<H, I>>(device, self.runs::<O>(group), staged);
+    }
+
+    fn switch_front(
+        &self,
+        device: &mut Device,
+        group: usize,
+        staged: &mut Staging<I, O, R, Exchanged>,
+    ) {
+        type Slices<H, I> = HalfRuns<H, I>;
+        switch_front_runs::<H, I, O, R, Exchanged, Slices<H, I>>(
+            device,
+            self.runs::<O>(group),
+            staged,
+        );
+    }
+
+    fn part(
+        &self,
+        device: &mut Device,
+        (group, piece): (usize, usize),
+        staged: &mut Staging<I, O, R, Exchanged>,
+    ) {
+        type Slices<H, I> = HalfRuns<H, I>;
+        let input = (self.runs::<O>(group), piece);
+        switch_piece::<H, I, O, R, Exchanged, Slices<H, I>>(device, input, staged);
+    }
+
+    fn fill(
+        &self,
+        device: &mut Device,
+        _: usize,
+        staged: &Staging<I, O, R, Exchanged>,
+    ) -> Registers<I, O, Lane<R>, Exchanged> {
+        filled::<I, O, R, Exchanged>(device, staged)
+    }
+
+    fn front(
+        &self,
+        device: &mut Device,
+        _: usize,
+        staged: &Staging<I, O, R, Exchanged>,
+    ) -> Registers<I, O, Front<R>, Exchanged> {
+        filled_front::<I, O, R, Exchanged>(device, staged)
+    }
+
+    fn densely(&self, device: &mut Device, dense: impl FnOnce(&mut Device, &Self::Dense)) {
+        dense(device, self.spread);
+    }
+}
+
+/// A lane group of the rows a summed projection of `H` inputs into `I` outputs kept, an owner's
+/// run a slice of slices `S`, in the cluster whose passes read them.
+type RunGroup<'v, H, I, O, R, P, S> = DmTensorView<
+    'v,
+    bf16,
+    Chip,
+    Cluster<I, O, P>,
+    S,
+    Layout<R>::Elements<m![I % ({ Owner<H, I, Kept> })]>,
+>;
+
+/// Rows in both clusters' feature slices.
+impl<I: AxisName, O: AxisName, R: AxisName, P: Place<I, O, R>> Dense<I, O, R, P> for Spread<I, R> {
+    fn switched(&self, device: &mut Device, group: usize) -> Switching<I, O, R, P> {
+        type Group<I, R> = Layout<R>::Elements<m![I % ({ Feature<I> })]>;
+        // SAFETY: both physical clusters hold every row; only the logical cluster axis changes.
+        let input = unsafe {
+            Layout::<R>::group(self.view(), group)
+                .reshape::<Chip, Cluster<I, O, P>, FeatureSlices<I>, Group<I, R>>()
+        };
+        device
+            .sub
+            .begin(input)
+            .fetch::<m![{ Lane<R> }, I % ({ Feature<I> }) / 16], m![I % 16]>()
+            .switch::<Owners<I, O, P>, m![{ Lane<R> }, { Packets<I> }]>(
+                SwitchConfig::CustomBroadcast { ring_size: 256 },
+            )
+            .collect::<m![{ Lane<R> }, { Packets<I> }], m![I % 16]>()
+            .to_trf()
+    }
+}
+
+/// Rows in the feature slices of each cluster's half of the features, the half its passes read.
+impl<I: AxisName, O: AxisName, R: AxisName> Dense<I, O, R, Exchanged> for HalfSpread<I, R> {
+    fn switched(&self, device: &mut Device, group: usize) -> Switching<I, O, R, Exchanged> {
+        device
+            .sub
+            .begin(Layout::<R>::group(self.view(), group))
+            .fetch::<m![{ Lane<R> }, I % ({ Feature<I> }) / 16], m![I % 16]>()
+            .switch::<Owners<I, O, Exchanged>, m![{ Lane<R> }, { Packets<I> }]>(
+                SwitchConfig::CustomBroadcast { ring_size: 256 },
+            )
+            .collect::<m![{ Lane<R> }, { Packets<I> }], m![I % 16]>()
+            .to_trf()
+    }
 }
 
 /// A lane group's staged rows into the TRF, in input order.
@@ -1486,4 +1762,372 @@ fn filled_front<I: AxisName, O: AxisName, R: AxisName, P: Ownership>(
         .fetch::<m![{ Front<R> }, { Part<I> } / 16], m![I % 16]>()
         .collect::<m![{ Front<R> }, { Part<I> } / 16], m![I % 16]>()
         .to_trf()
+}
+
+/// The outputs each cluster sums: every one when the clusters halve the inputs, else half of them.
+const fn outputs<O: AxisName, P: Ownership>() -> usize {
+    if P::HALVES_INPUTS {
+        O::SIZE
+    } else {
+        O::SIZE / 2
+    }
+}
+
+/// The kept rows `kept` holds, in the clusters whose passes read their halves.
+fn halved<H: AxisName, I: AxisName, R: AxisName>(
+    kept: &Summing<H, I, R, Kept>,
+) -> HalfKept<'_, H, I, R> {
+    const { assert!(halves::<H, I>()) };
+    // SAFETY: the kept rows' cluster is the top digit of `I`, which names the halves the clusters
+    // read; the slices drop only the unit top digit a single owner block leaves.
+    unsafe { kept.view().reshape() }
+}
+
+/// Whether the rows a summed projection of `H` inputs kept lie in the halves of its `I` outputs a
+/// projection that halves its inputs reads: each cluster one contiguous half, a part whole runs.
+const fn halves<H: AxisName, I: AxisName>() -> bool {
+    TopDigit::<H, I, Kept>::SIZE == 1
+        && I::SIZE.is_multiple_of(2 * Chunk::<I>::SIZE)
+        && Chunk::<I>::SIZE.is_multiple_of(Owned::<H, I, Kept>::SIZE)
+}
+
+/// Each cluster's half of the rows `kept` holds, laid in its half of the feature slices in one
+/// transfer when three lane groups or more are live, as the passes over a decoded weight read them.
+fn halve<H: AxisName, I: AxisName, R: AxisName>(
+    device: &mut Device,
+    kept: Live<&Summing<H, I, R, Kept>, R>,
+) -> HalfSpread<I, R> {
+    type Which<I> = Symbol<Section<I>>;
+    type At<I> = Symbol<Within<I>>;
+    let mut spread = HalfSpread::<I, R>::new();
+    for _ in 0..decoded::<R>(kept.groups::<Lanes<R>>().1) {
+        // SAFETY: both name the same cells in the same order: an input of a half is its part's
+        // index times a part's width plus its place in the part.
+        let (from, into) = unsafe {
+            (
+                halved(*kept.value()).reshape::<Chip, InputCluster<I>, m![
+                    { Which<I> },
+                    { At<I> } / ({ Owner<H, I, Kept> }),
+                    1 # (H / ({ Width<H> }))
+                ], m![R, { At<I> } % ({ Owner<H, I, Kept> })]>(
+                ),
+                spread.view_mut().reshape::<Chip, InputCluster<I>, m![
+                    { Which<I> },
+                    { At<I> } / ({ Feature<I> }) # ({ Symbol<Seats<I>> })
+                ], m![R, { At<I> } % ({ Feature<I> })]>(),
+            )
+        };
+        from.to_dm_view(&mut device.tdma, into);
+    }
+    spread
+}
+
+/// The FP32 partial sums of each cluster's half of the inputs `rows` holds, gathered into the
+/// output's feature slices of both clusters in one transfer and added there, each output rounded
+/// once to BF16.
+fn exchange<I: AxisName, O: AxisName, R: AxisName>(
+    device: &mut Device,
+    rows: Live<Summing<I, O, R, Exchanged>, R>,
+) -> Live<Spread<O, R>, R> {
+    let live = rows.with(());
+    // SAFETY: each cluster summed its own half of the inputs, so its index names the term.
+    let partial: Partials<I, O, R> = unsafe { rows.into_value().reshape() };
+    let mut terms = Terms::<O, R>::new();
+    transfer(device, live.with(&partial), &mut terms);
+    let mut sums = Spread::<O, R>::new();
+    let (first, count) = live.groups::<Lanes<R>>();
+    if count > 1 {
+        device
+            .main
+            .begin(terms.view())
+            .fetch::<m![R, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+            .collect::<m![R, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+            .vector_init()
+            .vector_intra_slice_unzip::<Term, m![R, O % ({ Feature<O> }) / 8]>()
+            .vector_clip_zip(ClipBinaryOpF32::Add)
+            .vector_final()
+            .cast::<bf16, m![O % 8 # 16]>()
+            .commit_trim::<m![O % 8]>()
+            .commit_view(sums.view_mut());
+    } else if live.rows() == 1 {
+        let row = live.start();
+        device
+            .main
+            .begin((terms.view()).tile::<m![R], 1, m![R = 1 # R, Term, O % ({ Feature<O> })]>(row))
+            .fetch::<m![Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+            .collect::<m![Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+            .vector_init()
+            .vector_intra_slice_unzip::<Term, m![O % ({ Feature<O> }) / 8]>()
+            .vector_clip_zip(ClipBinaryOpF32::Add)
+            .vector_final()
+            .cast::<bf16, m![O % 8 # 16]>()
+            .commit_trim::<m![O % 8]>()
+            .commit_view(
+                (sums.view_mut()).tile::<m![R], 1, m![R = 1 #{!} R, O % ({ Feature<O> })]>(row),
+            );
+    } else {
+        device
+            .main
+            .begin(Layout::<R>::group(terms.view(), first))
+            .fetch::<m![{ Lane<R> }, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+            .collect::<m![{ Lane<R> }, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+            .vector_init()
+            .vector_intra_slice_unzip::<Term, m![{ Lane<R> }, O % ({ Feature<O> }) / 8]>()
+            .vector_clip_zip(ClipBinaryOpF32::Add)
+            .vector_final()
+            .cast::<bf16, m![O % 8 # 16]>()
+            .commit_trim::<m![O % 8]>()
+            .commit_view(
+                (sums.view_mut())
+                    .tile::<Layout<R>::Groups, 1, Layout<R>::GroupMut<m![O % ({ Feature<O> })]>>(
+                        first,
+                    ),
+            );
+    }
+    live.with(sums)
+}
+
+/// Whether `count` live lane groups of `R` rows meet a decoded weight: one from three groups,
+/// counted by arithmetic (a device cannot cast a comparison to a count) in a form the compiler
+/// bounds by one, so the loop over it frees what it read.
+fn decoded<R: AxisName>(count: usize) -> usize {
+    let groups = R::SIZE / Lanes::<R>::SIZE;
+    if const { R::SIZE / Lanes::<R>::SIZE >= 3 } {
+        (count + groups - 3) / groups
+    } else {
+        0
+    }
+}
+
+/// Lane group `group` of rows in both clusters, as the cluster whose passes read them names it.
+fn both_runs<H: AxisName, I: AxisName, O: AxisName, R: AxisName, P: Ownership>(
+    rows: &Both<H, I, R>,
+    group: usize,
+) -> RunGroup<'_, H, I, O, R, P, Runs<H, I>> {
+    const { assert!(fits_both::<H, I>()) };
+    // SAFETY: both physical clusters hold every row; only the logical cluster axis changes.
+    unsafe { Layout::<R>::group(rows.view(), group).reshape() }
+}
+
+/// A lane group's runs into the staging of the slices whose part holds each, a piece of every run
+/// at a time.
+fn switch_runs<H: AxisName, I: AxisName, O: AxisName, R: AxisName, P: Ownership, S: M>(
+    device: &mut Device,
+    input: RunGroup<'_, H, I, O, R, P, S>,
+    staged: &mut Staging<I, O, R, P>,
+) {
+    type Run<H, I> = Symbol<Piece<H, I>>;
+    device
+        .sub
+        .begin(input)
+        .fetch::<m![{ Lane<R> }, I % ({ Owner<H, I, Kept> }) / ({ Run<H, I> })], m![
+            I % ({ Run<H, I> })
+        ]>()
+        .switch::<Owners<I, O, P>, m![
+            { Lane<R> },
+            I % ({ Owner<H, I, Kept> }) / ({ Run<H, I> }),
+            I % ({ Width<I> }) / ({ Owner<H, I, Kept> })
+        ]>(SwitchConfig::CustomBroadcast { ring_size: 256 })
+        .collect::<m![
+            { Lane<R> },
+            I % ({ Owner<H, I, Kept> }) / ({ Run<H, I> }),
+            I % ({ Width<I> }) / ({ Owner<H, I, Kept> })
+        ], m![I % ({ Run<H, I> }) # 16]>()
+        .commit_trim::<m![I % ({ Run<H, I> })]>()
+        .commit_view(staged.view_mut());
+}
+
+/// The first four lanes of a lane group's runs alone, as `switch_runs` switches every lane.
+fn switch_front_runs<H: AxisName, I: AxisName, O: AxisName, R: AxisName, P: Ownership, S: M>(
+    device: &mut Device,
+    input: RunGroup<'_, H, I, O, R, P, S>,
+    staged: &mut Staging<I, O, R, P>,
+) {
+    type Run<H, I> = Symbol<Piece<H, I>>;
+    device
+        .sub
+        .begin(input.tile::<m![{ Lane<R> } / 4], 1, m![
+            { Layout<R>::Selected },
+            { Lane<R> } % 4 # ({ Symbol<Lanes<R>> }),
+            I % ({ Owner<H, I, Kept> })
+        ]>(0))
+        .fetch::<m![{ Front<R> }, I % ({ Owner<H, I, Kept> }) / ({ Run<H, I> })], m![
+            I % ({ Run<H, I> })
+        ]>()
+        .switch::<Owners<I, O, P>, m![
+            { Front<R> },
+            I % ({ Owner<H, I, Kept> }) / ({ Run<H, I> }),
+            I % ({ Width<I> }) / ({ Owner<H, I, Kept> })
+        ]>(SwitchConfig::CustomBroadcast { ring_size: 256 })
+        .collect::<m![
+            { Front<R> },
+            I % ({ Owner<H, I, Kept> }) / ({ Run<H, I> }),
+            I % ({ Width<I> }) / ({ Owner<H, I, Kept> })
+        ], m![I % ({ Run<H, I> }) # 16]>()
+        .commit_trim::<m![I % ({ Run<H, I> })]>()
+        .commit_view(staged_front::<I, O, R, P>(staged));
+}
+
+/// Piece `piece` of every run of a lane group into its place in the staging.
+fn switch_piece<H: AxisName, I: AxisName, O: AxisName, R: AxisName, P: Ownership, S: M>(
+    device: &mut Device,
+    (input, piece): (RunGroup<'_, H, I, O, R, P, S>, usize),
+    staged: &mut Staging<I, O, R, P>,
+) {
+    type Run<H, I> = Symbol<Piece<H, I>>;
+    type Pieces<H, I> = m![I % ({ Owner<H, I, Kept> }) / ({ Run<H, I> })];
+    device
+        .sub
+        .begin(input.tile::<Pieces<H, I>, 1, m![
+            { Layout<R>::Selected },
+            { Lane<R> },
+            I % ({ Run<H, I> }) # ({ Owner<H, I, Kept> })
+        ]>(piece))
+        .fetch::<Lane<R>, m![I % ({ Run<H, I> })]>()
+        .switch::<Owners<I, O, P>, m![{ Lane<R> }, I % ({ Width<I> }) / ({ Owner<H, I, Kept> })]>(
+            SwitchConfig::CustomBroadcast { ring_size: 256 },
+        )
+        .collect::<m![{ Lane<R> }, I % ({ Width<I> }) / ({ Owner<H, I, Kept> })], m![
+            I % ({ Run<H, I> }) # 16
+        ]>()
+        .commit_trim::<m![I % ({ Run<H, I> })]>()
+        .commit_view(staged.view_mut().tile::<Pieces<H, I>, 1, m![
+            { Lane<R> },
+            I % ({ Width<I> }) / ({ Owner<H, I, Kept> }),
+            I % ({ Run<H, I> }) #{!} ({ Owner<H, I, Kept> })
+        ]>(piece));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::decoder::attention::gemma4::{Hidden, Intermediate, Rows};
+    use crate::tensor::memory::Hbm;
+    use crate::tensor::scalar::{Copies, Value};
+    use crate::tests::DEVICE;
+    use furiosa_opt_std::runtime::launch;
+
+    /// Gemma 4's down projection under the summed contract, its clusters halving its inputs.
+    type Down = BlockScaled<
+        Intermediate,
+        Hidden,
+        f4e2m1,
+        f8e4m3,
+        Scales<Intermediate, Hidden>,
+        Summed<W4A16, Hbm, Exchanged, Copies>,
+        Chip,
+        HbmTensor<f4e2m1, Chip, Codes<Intermediate, Hidden, Exchanged>>,
+        HbmTensor<f8e4m3, Chip, Blocks<Intermediate, Hidden, Exchanged>>,
+    >;
+
+    /// The live rows `start` and `rows` name, landed from HBM rows where Gemma 4's gate and up
+    /// projections keep their outputs, through `down`, back to HBM rows.
+    #[device(chip = 1)]
+    fn projected(
+        device: &mut Device,
+        down: &Down,
+        input: &HbmTensor<bf16, Chip, m![Rows, Intermediate]>,
+        (start, rows): (&Value, &Value),
+    ) -> HbmTensor<bf16, Chip, m![Rows, Hidden]> {
+        let live =
+            Live::<(), Rows>::all().subrange(start.extent::<m![Rows]>(), rows.extent::<m![Rows]>());
+        let kept: Summing<Hidden, Intermediate, Rows, Kept> = input.to_dm(&mut device.tdma);
+        let output = Op::forward(down, &mut *device, &live.with(Kept(kept)));
+        output.value().to_hbm(&mut device.tdma)
+    }
+
+    /// Uniform values in `[0, 1)` from a xorshift state.
+    fn uniform(count: usize, mut state: u64) -> impl Iterator<Item = f64> {
+        (0..count).map(move |_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        })
+    }
+
+    /// Each live row's outputs within one BF16 rounding of its FP64 product plus `2^-9` of its
+    /// outputs' RMS, the FP32 sums' error, at one row, a lane group, a group and a row, three
+    /// groups and the envelope: the exchange rounds each output once, as the other placements do.
+    #[tokio::test(flavor = "current_thread")]
+    async fn exchanges_rows_within_one_rounding() {
+        let _lease = DEVICE.lock().await;
+        let mut device = Device::new(projected.topology()).unwrap();
+        let (i, o, r) = (Intermediate::SIZE, Hidden::SIZE, Rows::SIZE);
+        let codes: Vec<f4e2m1> = uniform(o * i, 4)
+            .map(|u| f4e2m1::from_bits((u * 16.0) as u8))
+            .collect();
+        let scales: Vec<f8e4m3> = uniform(o * i / 16, 5)
+            .map(|u| f8e4m3::from_f32((8.0 + 440.0 * u) as f32))
+            .collect();
+        let global = 2f32.powi(14) * 1.37;
+        let row: Vec<bf16> = uniform(r * i, 6)
+            .map(|u| bf16::from_f32((4.0 * u - 2.0) as f32))
+            .collect();
+        let exact: Vec<f64> = (0..r * o)
+            .map(|at| {
+                let (line, output) = (at / o, at % o);
+                (0..i)
+                    .map(|input| {
+                        let weight = f64::from(codes[output * i + input].to_f32())
+                            * f64::from(scales[(output * i + input) / 16].to_f32())
+                            / f64::from(global);
+                        weight * f64::from(f32::from(row[line * i + input]))
+                    })
+                    .sum()
+            })
+            .collect();
+        let pdma = &mut device.pdma;
+        let down: Down = BlockScaled {
+            weight: HostTensor::<f4e2m1, m![Hidden, Intermediate]>::from_vec(codes)
+                .to_hbm(pdma)
+                .await
+                .unwrap(),
+            weight_scale: HostTensor::<f8e4m3, Scales<Intermediate, Hidden>>::from_vec(scales)
+                .to_hbm(pdma)
+                .await
+                .unwrap(),
+            contract: Summed {
+                input: W4A16,
+                global: HostTensor::<f32, m![1 # 8]>::from_vec([
+                    global, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                ])
+                .to_hbm(pdma)
+                .await
+                .unwrap(),
+                place: PhantomData,
+            },
+            shape: PhantomData,
+        };
+        let input = HostTensor::<bf16, m![Rows, Intermediate]>::from_vec(row)
+            .to_hbm(pdma)
+            .await
+            .unwrap();
+        let count = |value: usize| HostTensor::<i32, m![1]>::from_vec([value as i32]);
+        for (start, live) in [(0, 1), (0, 8), (3, 6), (0, 9), (7, 17), (0, 64)] {
+            let first = count(start).to_hbm(&mut device.pdma).await.unwrap();
+            let rows = count(live).to_hbm(&mut device.pdma).await.unwrap();
+            let output = launch(projected, (&mut device, &down, &input, (&first, &rows)))
+                .await
+                .unwrap()
+                .to_host::<m![Rows, Hidden]>(&mut device.pdma)
+                .await
+                .unwrap()
+                .into_vec();
+            let mut worst = 0f64;
+            for line in start..start + live {
+                let want = &exact[line * o..(line + 1) * o];
+                let rms = (want.iter().map(|e| e * e).sum::<f64>() / o as f64).sqrt();
+                for (got, want) in output[line * o..(line + 1) * o].iter().zip(want) {
+                    let error = (f64::from(f32::from(*got)) - want).abs();
+                    worst = worst.max(error / (want.abs() / 256.0 + rms / 512.0));
+                }
+            }
+            println!("rows {start}+{live}: worst {worst:.3} of the bound");
+            assert!(
+                worst <= 1.0,
+                "rows {start}+{live}: an output is {worst} of the bound away"
+            );
+        }
+    }
 }

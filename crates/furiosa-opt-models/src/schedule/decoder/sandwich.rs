@@ -284,7 +284,7 @@ where
         + for<'r, 'x> Module<(UL, &'r Live<Spread<Hidden, R, Chip>, R>), (), &'x mut (), Output = UO>,
     Multiply: for<'g, 'u, 'x> Module<(&'g AO, &'u UO), (), &'x mut (), Output = MO>,
     Down: for<'x> Module<Begin<()>, (), &'x mut (), Output = DL>
-        + for<'r, 'x> Module<Begin<(DL, &'r MO)>, (), &'x mut (), Output = DR>,
+        + for<'x> Module<Begin<(DL, MO)>, (), &'x mut (), Output = DR>,
     RowParallel<Down, Placement>:
         for<'x> Module<DR, (), &'x mut (), Output = Live<Spread<Hidden, R, Chip>, R>>,
     Tail: for<'x> Module<Begin<PhantomData<Spread<Hidden, R, Chip>>>, (), &'x mut (), Output = TB>,
@@ -486,7 +486,7 @@ where
         let activated = activation.forward(&mut *device, (), &mut (), &gated);
         let upped = up.forward(&mut *device, (), &mut (), (up_landed, &normalized));
         let product = multiply.forward(&mut *device, (), &mut (), (&activated, &upped));
-        let begun = Begin((down_landed, &product));
+        let begun = Begin((down_landed, product));
         Staged {
             ready: (down.0.operation).forward(&mut *device, (), &mut (), begun),
             attended: residual,

@@ -4,9 +4,10 @@
 //! over the decoded weights, whose sums add a row's products in another order.
 //!
 //! - Into the intermediate width from feature-slice rows, a lane group's switch straight into the
-//!   tensor registers; back from feature-slice rows, a group switched whole into DM first; and
-//!   back from the rows the first projection kept, a group's parts switched under the passes of
-//!   the group before.
+//!   tensor registers; back from feature-slice rows, a group switched whole into DM first; back
+//!   from the rows the first projection kept, a group's parts switched under the passes of the
+//!   group before; and back from those rows where they lie, each cluster summing its half of them
+//!   and the two clusters' partial sums exchanged.
 //! - At Gemma 4's widths and at a SwiGLU decoder's, whose owners and passes divide differently, so
 //!   its kept rows stage a group at a time.
 
@@ -19,7 +20,7 @@ use furiosa_opt_models::models::decoder::form::summed::{Blocks, Codes, Ownership
 use furiosa_opt_models::ops::normalization::Spread;
 use furiosa_opt_models::ops::pointwise::Kept;
 use furiosa_opt_models::tensor::form::BlockScaled;
-use furiosa_opt_models::tensor::form::nvfp4::{Features, Scales, Summed, W4A16};
+use furiosa_opt_models::tensor::form::nvfp4::{Exchanged, Features, Scales, Summed, W4A16};
 use furiosa_opt_models::tensor::live::Live;
 use furiosa_opt_models::tensor::memory::Hbm;
 use furiosa_opt_models::tensor::parallel::Chip;
@@ -76,17 +77,17 @@ where
     output.value().to_hbm(&mut device.tdma)
 }
 
-/// The live rows through `gate`, kept as `K` where its passes summed them, then through `down`.
+/// The live rows through `gate`, kept as `K` where its passes summed them, then through `down`,
+/// whose rows end where `P` places them.
 #[device(chip = 1)]
-fn chained<H: AxisName, I: AxisName, K>(
+fn chained<H: AxisName, I: AxisName, K, P: Ownership>(
     device: &mut Device,
-    (gate, down): (&Nvfp4<H, I, Kept>, &Nvfp4<I, H, Features>),
+    (gate, down): (&Nvfp4<H, I, Kept>, &Nvfp4<I, H, P>),
     (input, (start, rows)): (&HbmTensor<bf16, Chip, m![Rows, H]>, (&Value, &Value)),
 ) -> HbmTensor<bf16, Chip, m![Rows, H]>
 where
     Nvfp4<H, I, Kept>: DeviceSend + for<'x> Op<&'x Live<Spread<H, Rows, Chip>, Rows>, Output = K>,
-    Nvfp4<I, H, Features>:
-        DeviceSend + for<'k> Op<&'k K, Output = Live<Spread<H, Rows, Chip>, Rows>>,
+    Nvfp4<I, H, P>: DeviceSend + for<'k> Op<&'k K, Output = Live<Spread<H, Rows, Chip>, Rows>>,
 {
     let live =
         Live::<(), Rows>::all().subrange(start.extent::<m![Rows]>(), rows.extent::<m![Rows]>());
@@ -186,7 +187,7 @@ const CASES: &[(usize, usize)] = &[
 ];
 
 /// Each live row of every case at widths `$hidden` and `$intermediate` gives the outputs one form's
-/// envelope gives it, in each of the three ways a projection stages its rows: the whole envelope in
+/// envelope gives it, in each of the four ways a projection stages its rows: the whole envelope in
 /// one launch, or every row from launches of one lane group.
 macro_rules! envelope {
     ($device:expr, $hidden:ident, $intermediate:ident) => {{
@@ -194,7 +195,8 @@ macro_rules! envelope {
         let up = weight::<$hidden, $intermediate, Features>(device, 1).await;
         let gate = weight::<$hidden, $intermediate, Kept>(device, 1).await;
         let down = weight::<$intermediate, $hidden, Features>(device, 4).await;
-        let mut envelopes: [[Vec<bf16>; 3]; 2] = Default::default();
+        let exchanged = weight::<$intermediate, $hidden, Exchanged>(device, 4).await;
+        let mut envelopes: [[Vec<bf16>; 4]; 2] = Default::default();
         let groups = (0..Rows::SIZE / 8).map(|group| (8 * group, 8));
         let launches = [(0, Rows::SIZE)].into_iter().chain(groups);
         for (at, (start, live)) in launches.chain(CASES.iter().copied()).enumerate() {
@@ -210,7 +212,7 @@ macro_rules! envelope {
                 .to_hbm(&mut device.pdma)
                 .await
                 .unwrap();
-            let forms: [(Vec<bf16>, usize); 3] = [
+            let forms: [(Vec<bf16>, usize); 4] = [
                 (
                     launch(
                         projected,
@@ -250,6 +252,23 @@ macro_rules! envelope {
                     .into_vec(),
                     $hidden::SIZE,
                 ),
+                (
+                    launch(
+                        chained,
+                        (
+                            &mut *device,
+                            (&gate, &exchanged),
+                            (&narrow, (&first, &counted)),
+                        ),
+                    )
+                    .await
+                    .unwrap()
+                    .to_host::<m![Rows, $hidden]>(&mut device.pdma)
+                    .await
+                    .unwrap()
+                    .into_vec(),
+                    $hidden::SIZE,
+                ),
             ];
             for (form, (found, width)) in forms.into_iter().enumerate() {
                 let rows = start * width..(start + live) * width;
@@ -261,7 +280,7 @@ macro_rules! envelope {
                     envelope[rows.clone()].copy_from_slice(&found[rows]);
                 } else {
                     // A launch's rows take one form, so one envelope gives all of them.
-                    let differs = |envelope: &[Vec<bf16>; 3]| {
+                    let differs = |envelope: &[Vec<bf16>; 4]| {
                         rows.clone()
                             .find(|&at| found[at].to_bits() != envelope[form][at].to_bits())
                     };
@@ -288,7 +307,7 @@ macro_rules! envelope {
     }};
 }
 
-/// Each live row of every case gives the outputs one form's envelope gives it, in each of the three
+/// Each live row of every case gives the outputs one form's envelope gives it, in each of the four
 /// ways a projection stages its rows, at Gemma 4's widths and at a SwiGLU decoder's.
 #[tokio::test(flavor = "current_thread")]
 async fn projects_each_live_row_as_the_envelope() {
@@ -364,6 +383,7 @@ async fn rows_profile() {
     let up = weight::<Hidden, Intermediate, Features>(&mut device, 1).await;
     let gate = weight::<Hidden, Intermediate, Kept>(&mut device, 1).await;
     let down = weight::<Intermediate, Hidden, Features>(&mut device, 4).await;
+    let exchanged = weight::<Intermediate, Hidden, Exchanged>(&mut device, 4).await;
     for live in list("ROWS_PROFILE_ROWS", "1,4,5,8,9,64") {
         let first = count(0).to_hbm(&mut device.pdma).await.unwrap();
         let counted = count(live).to_hbm(&mut device.pdma).await.unwrap();
@@ -420,6 +440,12 @@ async fn rows_profile() {
             "chained",
             chained,
             (&gate, &down),
+            (&narrow, (&first, &counted))
+        );
+        profile!(
+            "exchanged",
+            chained,
+            (&gate, &exchanged),
             (&narrow, (&first, &counted))
         );
     }

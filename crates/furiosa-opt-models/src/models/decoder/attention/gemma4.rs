@@ -30,6 +30,7 @@ use crate::ops::reduction::Argmax;
 use crate::tensor::axis;
 use crate::tensor::cache;
 use crate::tensor::form::Weight;
+use crate::tensor::form::nvfp4::Exchanged;
 use crate::tensor::memory::{Hbm, Memory};
 use crate::tensor::parallel::{Chip, Parallel};
 use crate::tensor::scalar::Copies;
@@ -181,8 +182,9 @@ axes![
 /// FP8 per-channel attention projections and an NVFP4 feed-forward, as the published checkpoint
 /// stores them; the query, key and value rows quantize per row at run time as it declares, and the
 /// feed-forward's FP32 sums divide by its tensor scale, so no coefficient rounds. The gate and up
-/// rows stay where their passes summed them, for the activation, the product and the down
-/// projection to read there.
+/// rows stay where their passes summed them, each cluster its half, for the activation, the
+/// product and the down projection to read there; the down projection's clusters each sum their
+/// half and exchange the partial sums.
 pub type Quantized = decoder::Projections<
     form::TokenScaled,
     form::TokenScaled,
@@ -190,7 +192,7 @@ pub type Quantized = decoder::Projections<
     form::ChannelScaled,
     form::Nvfp4Summed<Kept>,
     form::Nvfp4Summed<Kept>,
-    form::Nvfp4Summed,
+    form::Nvfp4Summed<Exchanged>,
 >;
 
 /// Sliding attention geometry: 256-wide heads and two cache windows.

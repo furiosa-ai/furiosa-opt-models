@@ -50,9 +50,9 @@ pub struct Early<A, X: Memory = Hbm> {
 /// way differs from [`Early`]'s in the rounding of each coefficient, which it leaves out. The order
 /// the sum adds a row's blocks follows how many rows a launch holds, so a row's outputs may change
 /// in their last bits with the rows beside it. A launch's projected rows end where `P` places
-/// them: in the feature slices ([`Features`]), or kept where their passes summed them for
-/// elementwise steps and a next summed projection to read there. HBM holds the tensor scale laid
-/// out as `S`, a [`Scale`]'s.
+/// them: in the feature slices ([`Features`]), there from both clusters' partial sums
+/// ([`Exchanged`]), or kept where their passes summed them for elementwise steps and a next summed
+/// projection to read there. HBM holds the tensor scale laid out as `S`, a [`Scale`]'s.
 #[derive(DeviceSend, Load)]
 pub struct Summed<A, X: Memory = Hbm, P = Features, S: M + 'static = m![1 # 8]> {
     /// The form inputs enter the contraction in.
@@ -69,6 +69,12 @@ pub struct Summed<A, X: Memory = Hbm, P = Features, S: M + 'static = m![1 # 8]> 
 /// A launch's projected rows in the output's feature slices, where every reader takes them.
 #[derive(Clone, Debug)]
 pub struct Features;
+
+/// A launch's projected rows in the output's feature slices, each cluster's partial sums over its
+/// half of the inputs exchanged and added there: rows a projection kept split over the clusters
+/// project where they lie.
+#[derive(Clone, Debug)]
+pub struct Exchanged;
 
 /// The reduced FP32 sum times the tensor scales once, inputs in form `A`.
 #[derive(DeviceSend, Load)]
