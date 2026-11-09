@@ -37,21 +37,30 @@ runs:
         targets: aarch64-unknown-none,aarch64-unknown-none-softfloat
     - if: steps.assets.outputs.compiler != 'true' && steps.assets.outputs.sdk == 'true'
       uses: ./.github/actions/toolchain
-    # A pin bump moves to the tip of furiosa-opt-preview's default branch, so CI installs the compiler
-    # with the install guide's command. The compiler release caches it per pin, so a later tip does
-    # not reach a pin installed earlier.
+    # The compiler release caches the compiler under the pin's name, so CI installs the pin's own
+    # release: the pin's manifest names it by version, and that version's tag must be the pin.
     - if: steps.assets.outputs.compiler != 'true'
       shell: bash
       run: |
+        manifest="$RUNNER_TEMP/compiler-manifest"
+        mkdir -p "$manifest"
+        gh api -H 'Accept: application/vnd.github.raw+json' \
+          "repos/$PREVIEW/contents/cargo-furiosa-opt/Cargo.toml?ref=$REVISION" > "$manifest/Cargo.toml"
+        version="$(python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["package"]["version"])' < "$manifest/Cargo.toml")"
+        tag="$(gh api "repos/$PREVIEW/git/ref/tags/v$version" --jq .object.sha)"
+        if [ "$tag" != "$REVISION" ]; then
+          echo "::error::$PREVIEW's tag v$version is $tag, not the pin $REVISION"
+          exit 1
+        fi
         binstall="${CARGO_HOME:-$HOME/.cargo}/bin/cargo-binstall"
         [ -x "$binstall" ] || curl -L --proto '=https' --tlsv1.2 -sSf \
           https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
-        "$binstall" --no-confirm --root "$RUNNER_TEMP/compiler" \
-          --git https://github.com/furiosa-ai/furiosa-opt-preview cargo-furiosa-opt
+        "$binstall" --no-confirm --root "$RUNNER_TEMP/compiler" --manifest-path "$manifest" cargo-furiosa-opt
         tar -I 'gzip -1' -cf "$RUNNER_TEMP/$REVISION.tar.gz" -C "$RUNNER_TEMP/compiler" bin
         gh release upload compiler "$RUNNER_TEMP/$REVISION.tar.gz" --clobber
       env:
         REVISION: ${{ steps.pin.outputs.revision }}
+        PREVIEW: furiosa-ai/furiosa-opt-preview
     - if: steps.assets.outputs.sdk != 'true'
       shell: bash
       run: |
