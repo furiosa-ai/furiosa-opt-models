@@ -76,30 +76,49 @@ impl<Query, Key, Rows> RotaryEmbedding<Query, Key, Rows> {
     }
 }
 
-/// The query and key heads on clusters `C`, the coefficient rows of their positions and the live
-/// rows.
-pub type Input<'a, Slice, Query, Key, Rows, Head, C = Cluster> = (
+/// Slices that hold a lane's key rows where slices `Query` hold the same lane's query rows, so the
+/// coefficients a rotation lands on the query rows' slices serve the keys.
+///
+/// # Safety
+///
+/// Each slice of `Self` that holds a key row of a lane is a slice on which `Query` holds a query row
+/// of that lane.
+pub(crate) unsafe trait Within<Query: M>: M {}
+
+/// The query heads on slices `Slice` and the key heads on slices `KeySlice` within them, both on
+/// clusters `C`, the coefficient rows of their positions and the live rows.
+pub type Input<'a, Slice, KeySlice, Query, Key, Rows, Head, C = Cluster> = (
     &'a DmTensor<bf16, Chip, C, Slice, m![{ RowGroups<Rows, Query> }, Head]>,
-    &'a DmTensor<bf16, Chip, C, Slice, m![{ RowGroups<Rows, Key> }, Head]>,
+    &'a DmTensor<bf16, Chip, C, KeySlice, m![{ RowGroups<Rows, Key> }, Head]>,
     &'a HbmTensor<bf16, Chip, m![Rows, Head]>,
     &'a HbmTensor<bf16, Chip, m![Rows, Head]>,
     Live<(), Rows>,
 );
 
-impl<'a, C: M, Slice: M, Query: AxisName, Key: AxisName, Rows: AxisName, Head: AxisName>
-    crate::Op<Input<'a, Slice, Query, Key, Rows, Head, C>> for RotaryEmbedding<Query, Key, Rows>
+impl<'a, C, Slice, KeySlice, Query, Key, Rows, Head>
+    crate::Op<Input<'a, Slice, KeySlice, Query, Key, Rows, Head, C>>
+    for RotaryEmbedding<Query, Key, Rows>
+where
+    C: M,
+    Slice: M,
+    KeySlice: Within<Slice>,
+    Query: AxisName,
+    Key: AxisName,
+    Rows: AxisName,
+    Head: AxisName,
 {
     type Output = (
         DmTensor<bf16, Chip, C, Slice, m![{ RowGroups<Rows, Query> }, Head]>,
-        DmTensor<bf16, Chip, C, Slice, m![{ RowGroups<Rows, Key> }, Head]>,
+        DmTensor<bf16, Chip, C, KeySlice, m![{ RowGroups<Rows, Key> }, Head]>,
     );
 
     /// Every row group in shared passes when every group holds a live row; otherwise each group
-    /// the live rows touch alone, and a group outside them is not rotated.
+    /// the live rows touch alone, and a group outside them is not rotated. The coefficients land
+    /// once, on every slice of the queries' lanes, and the keys read them where they lie.
     fn forward(
         &self,
         device: &mut Device,
-        (query, key, low, high, live): Input<'a, Slice, Query, Key, Rows, Head, C>,
+        (query, key, low, high, live): Input<'a, Slice, KeySlice, Query, Key, Rows, Head, C>,
     ) -> Self::Output {
         let table = |device: &mut Device,
                      table: &HbmTensor<bf16, Chip, m![Rows, Head]>|
@@ -125,7 +144,7 @@ impl<'a, C: M, Slice: M, Query: AxisName, Key: AxisName, Rows: AxisName, Head: A
             bf16,
             Chip,
             C,
-            Slice,
+            KeySlice,
             m![{ Groups<Rows> }, Key, OutputHalf, { Symbol<Row<Head>> }],
         > = DmTensor::new();
         // SAFETY: each head's two halves remain consecutive within the same row and slice.
@@ -140,9 +159,14 @@ impl<'a, C: M, Slice: M, Query: AxisName, Key: AxisName, Rows: AxisName, Head: A
                 >()
         };
         let key = unsafe {
-            key.view()
-                .reshape::<Chip, C, Slice, m![{ Groups<Rows> }, Key, Half, { Symbol<Row<Head>> }]>()
+            key.view().reshape::<
+                Chip,
+                C,
+                KeySlice,
+                m![{ Groups<Rows> }, Key, Half, { Symbol<Row<Head>> }],
+            >()
         };
+
         let (first, count) = live.groups::<Lanes<Rows>>();
         if count == <Groups<Rows> as M>::SIZE {
             #[unroll]
@@ -176,6 +200,13 @@ impl<'a, C: M, Slice: M, Query: AxisName, Key: AxisName, Rows: AxisName, Head: A
                         &high,
                     ),
                 );
+                // SAFETY: the tables land on every slice of the queries' lanes, and each key slice
+                // is one of its lane's query slices (`Within`), so it holds the lane's coefficients.
+                let low: Coefficient<KeySlice, TileRows<Rows, Head>, Row<Head>, C> =
+                    unsafe { low.reshape() };
+                // SAFETY: as for the low half.
+                let high: Coefficient<KeySlice, TileRows<Rows, Head>, Row<Head>, C> =
+                    unsafe { high.reshape() };
                 RotateRows::<TileRows<Rows, Head>, m![Key], Row<Head>>(PhantomData).forward(
                     device,
                     (
@@ -220,6 +251,10 @@ impl<'a, C: M, Slice: M, Query: AxisName, Key: AxisName, Rows: AxisName, Head: A
                         &high,
                     ),
                 );
+                // SAFETY: as for every row group above.
+                let low: Coefficient<KeySlice, m![1], Row<Head>, C> = unsafe { low.reshape() };
+                // SAFETY: as for every row group above.
+                let high: Coefficient<KeySlice, m![1], Row<Head>, C> = unsafe { high.reshape() };
                 RotateRows::<m![1], m![Key], Row<Head>>(PhantomData).forward(
                     device,
                     (
@@ -1331,12 +1366,13 @@ type HeadRows<Rows, Slice, Group, Head, C = Cluster> =
     Live<HeadValues<Rows, Slice, Group, Head, C>, Rows>;
 
 /// Each live row's query and key rotated by its own row of the rotation, over the first
-/// `Rotated / 2` coordinates of each head half; the other coordinates keep their values.
-impl<Head, Rotated, Rows, C, Slice, Query, Key>
+/// `Rotated / 2` coordinates of each head half; the other coordinates keep their values. The keys
+/// lie on slices `KeySlice` within the queries' `Slice`.
+impl<Head, Rotated, Rows, C, Slice, KeySlice, Query, Key>
     crate::Op<(
         (
             HeadRows<Rows, Slice, Query, Head, C>,
-            HeadRows<Rows, Slice, Key, Head, C>,
+            HeadRows<Rows, KeySlice, Key, Head, C>,
         ),
         &Rotation<Rotated, Chip, Rows>,
     )> for Rotary<Head, Rotated, bf16, Chip>
@@ -1346,12 +1382,13 @@ where
     Rows: AxisName,
     C: M,
     Slice: M,
+    KeySlice: Within<Slice>,
     Query: AxisName,
     Key: AxisName,
 {
     type Output = (
         HeadRows<Rows, Slice, Query, Head, C>,
-        HeadRows<Rows, Slice, Key, Head, C>,
+        HeadRows<Rows, KeySlice, Key, Head, C>,
     );
 
     fn forward(
@@ -1360,7 +1397,7 @@ where
         ((query, key), rotation): (
             (
                 HeadRows<Rows, Slice, Query, Head, C>,
-                HeadRows<Rows, Slice, Key, Head, C>,
+                HeadRows<Rows, KeySlice, Key, Head, C>,
             ),
             &Rotation<Rotated, Chip, Rows>,
         ),
@@ -1368,7 +1405,7 @@ where
         let live = query.with(());
         let rotate = |device: &mut Device,
                       query: &HeadValues<Rows, Slice, Query, Rotated, C>,
-                      key: &HeadValues<Rows, Slice, Key, Rotated, C>| {
+                      key: &HeadValues<Rows, KeySlice, Key, Rotated, C>| {
             RotaryEmbedding::<Query, Key, Rows>::new()
                 .forward(device, (query, key, &rotation.low, &rotation.high, live))
         };

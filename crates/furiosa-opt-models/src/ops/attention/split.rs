@@ -438,23 +438,23 @@ impl<Width: AxisName, Heads: AxisName, Groups: AxisName, Head: AxisName, Rows: A
     }
 }
 
-type HeadFeatures<Width, Heads> = m![Width % (Width / ({ Symbol<Heads> }))];
+type HeadFeatures<Width, Head> = m![Width % ({ Symbol<Head> })];
 
 type Clusters<Heads> = Symbol<HeadClusters<Heads>>;
 
 /// [`SplitHeads`] holding a head-major row's `Width` features before they are named as heads:
-/// each KV head is the features' top digit, the cluster its top digit when the KV heads pair up.
-type Unsplit<'h, Rows, Width, Heads> = DmTensorViewMut<
+/// the cluster is the features' top digit when the KV heads pair up, and each `Head` features
+/// within a cluster take a slice of their own.
+type Unsplit<'h, Rows, Width, Heads, Head> = DmTensorViewMut<
     'h,
     bf16,
     Chip,
     m![Width / (Width / ({ Clusters<Heads> })) # 2],
     m![
         { Layout<Rows>::Lanes } # 8,
-        Width % (Width / ({ Clusters<Heads> })) / (Width / ({ Symbol<Heads> })) # 8,
-        1 # 4
+        Width % (Width / ({ Clusters<Heads> })) / ({ Symbol<Head> }) # 32
     ],
-    m![{ linear::Groups<Rows> }, { HeadFeatures<Width, Heads> }],
+    m![{ linear::Groups<Rows> }, { HeadFeatures<Width, Head> }],
 >;
 
 /// The rows a projection of one head kind leaves where its contraction computes them, as `Heads`
@@ -478,28 +478,34 @@ where
         device: &mut Device,
         input: Live<linear::Projected<In, Width, Code, Rows>, Rows>,
     ) -> Self::Output {
-        const { assert!(Width::SIZE == Heads::SIZE * Groups::SIZE * Head::SIZE) };
+        const {
+            assert!(Width::SIZE == Heads::SIZE * Groups::SIZE * Head::SIZE);
+            assert!(
+                Heads::SIZE / HeadClusters::<Heads>::SIZE * Groups::SIZE <= 32,
+                "a lane's slices of a cluster hold at most 32 head rows"
+            );
+        };
         let mut heads: SplitHeads<Rows, Heads, Groups, Head> = DmTensor::new();
         let (first, count) = input.groups::<crate::tensor::axis::Lanes<Rows>>();
         if count < <linear::Groups<Rows> as M>::SIZE {
             for at in 0..count {
                 let group = first + at;
                 // SAFETY: as for every row group below.
-                let unsplit: Unsplit<'_, Rows, Width, Heads> =
+                let unsplit: Unsplit<'_, Rows, Width, Heads, Head> =
                     unsafe { heads.view_mut().reshape() };
                 linear::Linear::<In, Width>::group(input.value(), group).to_dm_view(
                     &mut device.tdma,
                     unsplit.tile::<
                         linear::Groups<Rows>,
                         1,
-                        m![{ Layout<Rows>::SelectedMut }, { HeadFeatures<Width, Heads> }],
+                        m![{ Layout<Rows>::SelectedMut }, { HeadFeatures<Width, Head> }],
                     >(group),
                 );
             }
             return input.with(heads);
         }
         // SAFETY: the features are head-major within every row. Relabeling preserves cells.
-        let unsplit: Unsplit<'_, Rows, Width, Heads> = unsafe { heads.view_mut().reshape() };
+        let unsplit: Unsplit<'_, Rows, Width, Heads, Head> = unsafe { heads.view_mut().reshape() };
         (input.value().view()).to_dm_view(&mut device.tdma, unsplit);
         input.with(heads)
     }

@@ -302,9 +302,9 @@ type TileMajor<R, Heads, Groups, Head> = HbmTensor<
     ],
 >;
 
-/// The query heads of each row of `R` as attention projects them, on clusters `C` and slices `S`.
-type Queries<R, C, S, Groups, Head> =
-    DmTensor<bf16, Chip, C, S, m![{ attention::RowGroups<R, Groups> }, Head]>;
+/// The query heads of each row as attention projects them, on clusters `C` and slices `S`, each
+/// slice holding the head rows `P`.
+type Queries<C, S, P, Head> = DmTensor<bf16, Chip, C, S, m![{ P }, Head]>;
 
 impl<R: AxisName> AxisName for Sinked<R> {
     const NAME: Ident = Ident::new("Rows");
@@ -321,6 +321,7 @@ impl<
     Head: AxisName,
     C: M,
     S: M,
+    P: M,
     Scale: Copy + Into<f32>,
     Waves: AxisName,
     W: AxisName,
@@ -328,7 +329,7 @@ impl<
 >
     Module<
         (
-            &Live<Queries<R, C, S, Groups, Head>, R>,
+            &Live<Queries<C, S, P, Head>, R>,
             &Blocks<Heads, Head>,
             &Context<'_, Sequences, Heads, Groups, Head, Waves, W, R>,
         ),
@@ -344,7 +345,7 @@ impl<
         env: Env,
         _: &mut (),
         (query, pool, work): (
-            &Live<Queries<R, C, S, Groups, Head>, R>,
+            &Live<Queries<C, S, P, Head>, R>,
             &Blocks<Heads, Head>,
             &Context<'_, Sequences, Heads, Groups, Head, Waves, W, R>,
         ),
