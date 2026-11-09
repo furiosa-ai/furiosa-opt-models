@@ -100,6 +100,45 @@ where
     }
 }
 
+impl<Capacity: AxisName> Selected<Capacity> {
+    /// The rows of span `tile` of the selected ones among a launch's normalized rows `hidden`, in
+    /// order, as rows in HBM; rows past the selected ones are unspecified.
+    pub(super) fn span<Width: AxisName>(
+        &self,
+        context: &mut Device,
+        hidden: &HbmTensor<bf16, Chip, Blocked<Width, Capacity>>,
+        tile: Live<(), Capacity>,
+    ) -> HbmTensor<bf16, Chip, m![Span, Width]> {
+        let selection = Selection {
+            hidden,
+            rows: &self.rows,
+        };
+        let rows = selection.fill(&mut *context, tile);
+        crate::Op::forward(&Store, &mut *context, &rows)
+    }
+
+    /// The hidden values of the selected rows among a launch's normalized rows `hidden`, in
+    /// order, into the first rows of `rows`; called once the rows' last effect is issued.
+    pub(crate) fn hidden<Width: AxisName>(
+        &self,
+        context: &mut Device,
+        hidden: &HbmTensor<bf16, Chip, Blocked<Width, Capacity>>,
+        rows: &mut HbmTensor<bf16, Chip, m![Capacity, Width]>,
+    ) {
+        let chosen = Live::<(), Capacity>::read(&self.live);
+        for index in 0..chosen.count::<Span>() {
+            let tile = chosen.tile::<Span>(index);
+            let span = self.span(&mut *context, hidden, tile);
+            span.view().to_hbm_view(
+                &mut context.tdma,
+                rows.view_mut().tile::<m![Capacity], { Span::SIZE }, m![
+                    Capacity = { Span::SIZE } #{!} Capacity, Width
+                ]>(tile.start()),
+            );
+        }
+    }
+}
+
 impl<Width: AxisName, V: AxisName, W, B, I> Tree<Width, V, W, B, I>
 where
     W: Borrow<HbmTensor<bf16, Chip, m![V, Width]>>,

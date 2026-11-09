@@ -8,6 +8,7 @@
 //!   its views of the layers; every later call borrows them, one call at a time.
 
 use super::Decoder;
+use furiosa_opt_models::ops::attention::full::paged::Tiling;
 use furiosa_opt_std::prelude::{Device, HbmBuffer};
 use std::any::Any;
 use std::io;
@@ -59,9 +60,9 @@ pub enum Kind {
 }
 
 impl CacheSpec {
-    /// The cache the calls of `model` read.
+    /// The cache the calls of `model` read, however their rows' attention is tiled.
     pub fn of<D: Decoder>(model: &D) -> Self {
-        model.limits().cache
+        model.limits(Tiling::default()).cache
     }
 
     /// Bytes of each layer's storage of `blocks` blocks, group by group. Refuses no blocks, a

@@ -3,7 +3,8 @@
 //! rows it returns.
 //!
 //! - A one-row request is a work item over its history in the pool; any other request is a prompt
-//!   chunk over its cached history and its own rows.
+//!   chunk over its cached history and its own rows, or under a fixed tiling each of its rows a
+//!   work item of its own, so a row's values do not depend on how its prompt splits across calls.
 //! - Slots and chunk tables are pool byte offsets, selected rows blocked hidden-row byte offsets.
 
 use super::Batch;
@@ -17,7 +18,7 @@ use std::{io, ops::Range};
 // ponytail: the readout's selection could take row indices and convert them itself.
 const ROW_BYTES: usize = 16 * size_of::<bf16>();
 
-/// Block IDs a work item reads in one run: a one-row request's table is padded to whole runs.
+/// Block IDs a work item reads in one run: an item row's request's table is padded to whole runs.
 const RUN: usize = 16;
 
 /// One request's appended rows in a call: its call rows, the positions cached before them and the
@@ -29,26 +30,27 @@ pub(super) struct Appended {
 }
 
 /// A launch's rows as the host plans them, at the capacities of `Capacity` rows, `Reach` written
-/// rows and the chunk plan's chunks.
+/// rows and the chunk plan's chunks, each over at most `W` windows of history.
 #[derive(Debug)]
-struct Plans {
+struct Plans<W> {
     /// Each row's position; a padding row keeps its index.
     positions: Vec<i32>,
     /// The pool byte offset each live row's keys and values are written to.
     slots: Vec<i32>,
-    /// Each one-row request's segment: its row, one row, its cached positions, the index of its
+    /// Each item row's segment: its row, one row, its cached positions, the index of its request's
     /// first block ID in `history` and its block count.
     decode: Vec<[i32; FIELDS]>,
-    /// The one-row requests' block IDs, each padded to whole runs with its last.
+    /// The item rows' requests' block IDs, each request's padded to whole runs with its last.
     history: Vec<i32>,
-    chunks: chunks::Plan,
+    chunks: chunks::Plan<W>,
     /// The blocked hidden-row byte offset of each row the launch returns, in order.
     selected: Vec<i32>,
 }
 
-impl Plans {
+impl<W: AxisName> Plans<W> {
     /// The launch of `appended`, in call row order, returning the call rows `kept`, for the cache
-    /// blocks of `KvHeads` heads of `Head` features; refuses what the launch cannot hold.
+    /// blocks of `KvHeads` heads of `Head` features, tiled as `tiling` says; refuses what the
+    /// launch cannot hold.
     fn new<
         Capacity: AxisName,
         Reach: AxisName,
@@ -58,6 +60,7 @@ impl Plans {
     >(
         appended: &[Appended],
         kept: &[usize],
+        tiling: Tiling,
     ) -> io::Result<Self> {
         let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
         let int =
@@ -86,16 +89,18 @@ impl Plans {
                 plans.positions[row] = int(position)?;
                 plans.slots[row] = int((block * Block::SIZE + position % Block::SIZE) * slot)?;
             }
-            if request.rows.len() == 1 {
+            if request.rows.len() == 1 || tiling == Tiling::Fixed {
                 let ids = (request.blocks.iter()).map(|&id| int(id as usize));
                 let start = plans.history.len();
-                plans.decode.push([
-                    int(request.rows.start)?,
-                    1,
-                    int(request.cached)?,
-                    int(start)?,
-                    int(request.blocks.len())?,
-                ]);
+                for (row, position) in request.rows.clone().zip(request.cached..) {
+                    plans.decode.push([
+                        int(row)?,
+                        1,
+                        int(position)?,
+                        int(start)?,
+                        int((position + 1).div_ceil(Block::SIZE))?,
+                    ]);
+                }
                 plans.history.extend(ids.collect::<io::Result<Vec<_>>>()?);
                 let last = plans.history[plans.history.len() - 1];
                 let end = start + request.blocks.len().next_multiple_of(RUN);
@@ -135,10 +140,10 @@ impl Plans {
 
 impl<A> Batch<'_, A> {
     /// The arrays a launch's attention front reads, in the order its operands bind them: positions,
-    /// write slots, the work items of `KvHeads` heads grouped `G` of `Head` features in `WAVES`,
-    /// the prompt chunks, the count of selected rows and the selected rows of cache group `group`;
-    /// each as the values the launch uses and all its words. Refuses a call the launch cannot hold
-    /// before anything moves.
+    /// write slots, the work items of `KvHeads` heads grouped `G` of `Head` features in `Waves`,
+    /// the prompt chunks over at most `W` windows, the count of selected rows and the selected rows
+    /// of cache group `group`; each as the values the launch uses and all its words. Its rows
+    /// attend tiled as `tiling` says. Refuses a call the launch cannot hold before anything moves.
     pub fn operands<
         Capacity: AxisName,
         Reach: AxisName,
@@ -146,22 +151,20 @@ impl<A> Batch<'_, A> {
         KvHeads: AxisName,
         G: AxisName,
         Head: AxisName,
-        const WAVES: usize,
+        Waves: AxisName,
+        W: AxisName,
     >(
         &self,
         group: usize,
+        tiling: Tiling,
     ) -> io::Result<Vec<(Vec<i32>, usize)>> {
-        let plans = Plans::new::<Capacity, Reach, Sequences, KvHeads, Head>(
+        let plans = Plans::<W>::new::<Capacity, Reach, Sequences, KvHeads, Head>(
             &self.appended[group],
             &self.kept,
+            tiling,
         )?;
-        // A step attends its prompt chunks apart from their history, so no tiling makes it batch
-        // invariant.
-        let items = Plan::new::<KvHeads, G, Head, WAVES, Reach>(
-            &plans.decode,
-            &plans.history,
-            Tiling::Adaptive,
-        );
+        let items =
+            Plan::new::<KvHeads, G, Head, Waves, Reach>(&plans.decode, &plans.history, tiling);
         let items = (items.reads()).map(|(values, words)| (values.to_vec(), words));
         let mut selected = plans.selected.clone();
         selected.resize(Capacity::SIZE, 0);
@@ -194,15 +197,21 @@ mod tests {
         Reach = 128,
         Sequences = 2,
         KvHeads = 8,
-        Head = 128
+        Head = 128,
+        Windows = 80
     ];
 
     const SLOT: i32 = Blocks::<KvHeads, Head>::ROW_STRIDE;
     const BYTES: i32 = Blocks::<KvHeads, Head>::BLOCK_STRIDE;
     const ROW: i32 = ROW_BYTES as i32;
 
-    /// The plans of requests `(rows, cached, blocks)` in call row order, keeping `kept`.
-    fn plan(requests: &[(Range<usize>, usize, &[u32])], kept: &[usize]) -> io::Result<Plans> {
+    /// The plans of requests `(rows, cached, blocks)` in call row order, keeping `kept`, tiled
+    /// as `tiling` says.
+    fn tiled(
+        requests: &[(Range<usize>, usize, &[u32])],
+        kept: &[usize],
+        tiling: Tiling,
+    ) -> io::Result<Plans<Windows>> {
         let appended: Vec<_> = (requests.iter())
             .map(|(rows, cached, blocks)| Appended {
                 rows: rows.clone(),
@@ -210,7 +219,15 @@ mod tests {
                 blocks: blocks.to_vec(),
             })
             .collect();
-        Plans::new::<Capacity, Reach, Sequences, KvHeads, Head>(&appended, kept)
+        Plans::new::<Capacity, Reach, Sequences, KvHeads, Head>(&appended, kept, tiling)
+    }
+
+    /// The plans of requests `(rows, cached, blocks)` in call row order, keeping `kept`.
+    fn plan(
+        requests: &[(Range<usize>, usize, &[u32])],
+        kept: &[usize],
+    ) -> io::Result<Plans<Windows>> {
+        tiled(requests, kept, Tiling::Adaptive)
     }
 
     /// One-row requests attend as items from row 0, each writing its next slot; a prompt request
@@ -252,6 +269,23 @@ mod tests {
                 .all(|&h| h == 40)
         );
         assert_eq!(plans.selected, [0, ROW, 21 * ROW]);
+        Ok(())
+    }
+
+    /// Under a fixed tiling every row of every request is an item over its request's blocks, in
+    /// call row order, and no prompt chunk is planned.
+    #[test]
+    fn plans_every_row_an_item_under_a_fixed_tiling() -> io::Result<()> {
+        let requests = [(0..1, 30, &[4, 5][..]), (1..4, 15, &[1, 2][..])];
+        let plans = tiled(&requests, &[0, 3], Tiling::Fixed)?;
+        let rows = [
+            [0, 1, 30, 0, 2],
+            [1, 1, 15, 16, 1],
+            [2, 1, 16, 16, 2],
+            [3, 1, 17, 16, 2],
+        ];
+        assert_eq!((plans.decode, plans.chunks.count), (rows.to_vec(), 0));
+        assert_eq!(plans.positions[..4], [30, 15, 16, 17]);
         Ok(())
     }
 

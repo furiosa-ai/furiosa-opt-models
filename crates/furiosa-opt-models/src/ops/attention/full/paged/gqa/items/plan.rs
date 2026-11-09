@@ -42,14 +42,8 @@ pub struct Plan {
 
 impl Plan {
     /// The items of decode rows `segments`, block IDs `ids` padded to whole runs, tiled as `tiling`
-    /// says in `WAVES` wide waves; `Reach` holds the rows as group tiles, the last [`SINKS`] sinks.
-    pub fn new<
-        KvHeads: AxisName,
-        G: AxisName,
-        Head: AxisName,
-        const WAVES: usize,
-        Reach: AxisName,
-    >(
+    /// says in `Waves` wide waves; `Reach` holds the rows as group tiles, the last [`SINKS`] sinks.
+    pub fn new<KvHeads: AxisName, G: AxisName, Head: AxisName, Waves: AxisName, Reach: AxisName>(
         segments: &[[i32; FIELDS]],
         ids: &[i32],
         tiling: Tiling,
@@ -71,9 +65,8 @@ impl Plan {
             .iter()
             .partition(|row| keys(row).is_ok_and(|keys| keys <= SHORT));
         let packs = tiling == Tiling::Fixed || {
-            let alone = wide::plan::Plan::waves::<Waves<WAVES>>(&tiled.iter().collect::<Vec<_>>());
-            packed::plan::Plan::waves(&packed) + wide::plan::Plan::waves::<Waves<WAVES>>(&wide)
-                < alone
+            let alone = wide::plan::Plan::waves::<Waves>(&tiled.iter().collect::<Vec<_>>());
+            packed::plan::Plan::waves(&packed) + wide::plan::Plan::waves::<Waves>(&wide) < alone
         };
         let (packed, wide) = match packs {
             true => (packed, wide),
@@ -84,7 +77,7 @@ impl Plan {
             packed: packed::plan::Plan::new::<KvHeads, GroupTile<G>, Head, Tiled<Reach, G>>(
                 &packed, ids, tiling,
             ),
-            wide: wide::plan::Plan::new::<KvHeads, GroupTile<G>, Head, Waves<WAVES>, Tiled<Reach, G>>(
+            wide: wide::plan::Plan::new::<KvHeads, GroupTile<G>, Head, Waves, Tiled<Reach, G>>(
                 &wide, ids, tiling,
             ),
         }
@@ -130,7 +123,7 @@ mod tests {
             .map(|(row, &keys)| [row, 1, keys - 1, 0, keys.div_ceil(16)].map(|field| field as i32))
             .collect();
         let ids = vec![1; 1 << 18];
-        let plan = Plan::new::<Heads, G, Head, WAVES, Rows<1280>>(&segments, &ids, tiling);
+        let plan = Plan::new::<Heads, G, Head, Waves<WAVES>, Rows<1280>>(&segments, &ids, tiling);
         let leading = |at: usize| plan.reads().nth(at).map_or(0, |(read, _)| read[0]);
         [leading(1), leading(1 + packed::plan::ARRAYS)]
     }

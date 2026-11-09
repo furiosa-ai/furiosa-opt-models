@@ -9,8 +9,10 @@ use crate::ops::index::scatter::Store;
 use crate::ops::linear::affine::{self, COLUMNS, Weights};
 use crate::ops::linear::stream::{Columns, ToDm};
 use crate::ops::linear::{Affine, Bias, Biased};
-use crate::ops::normalization::Spread;
+use crate::ops::normalization::span::Span;
+use crate::ops::normalization::{Blocked, Spread};
 use crate::ops::reduction::{self, Argmax};
+use crate::tensor::live::Live;
 use crate::tensor::{axis::Tile, parallel::Chip};
 use crate::{Module, Then};
 use furiosa_opt_std::prelude::*;
@@ -452,6 +454,32 @@ where
 /// [`COLUMNS`] labels, whose scores of a row are its dot products with them.
 #[derive(DeviceSend)]
 pub struct Classifier<H: AxisName>(Affine<Weights<H>, Bias>);
+
+impl<H: AxisName> Classifier<H> {
+    /// The scores of the rows `selected` names among a launch's normalized rows `hidden`, label
+    /// columns first, into the first rows of `scores`; called once the rows' last effect is issued.
+    pub(crate) fn read<Capacity: AxisName>(
+        &self,
+        context: &mut Device,
+        hidden: &HbmTensor<bf16, Chip, Blocked<H, Capacity>>,
+        selected: &Selected<Capacity>,
+        scores: &mut HbmTensor<f32, Chip, m![Capacity, { Symbol<affine::Columns> }]>,
+    ) {
+        let chosen = Live::<(), Capacity>::read(&selected.live);
+        for index in 0..chosen.count::<Span>() {
+            let tile = chosen.tile::<Span>(index);
+            let rows = selected.span(&mut *context, hidden, tile);
+            let mut span = HbmTensor::<f32, Chip, m![Span, { Symbol<affine::Columns> }]>::new();
+            crate::Op::forward(&self.0, &mut *context, (&rows, &mut span));
+            span.view().to_hbm_view(
+                &mut context.tdma,
+                scores.view_mut().tile::<m![Capacity], { Span::SIZE }, m![
+                    Capacity = { Span::SIZE } #{!} Capacity, { Symbol<affine::Columns> }
+                ]>(tile.start()),
+            );
+        }
+    }
+}
 
 /// The scores of the gathered rows, label columns first.
 impl<X: MaterializableScalar + FetchCast<f32>, H: AxisName, R: AxisName>

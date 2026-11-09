@@ -1,9 +1,11 @@
-//! The BF16 forms of the span MLP's weights: the packed gate/up and the down projections run on a
-//! span's live rows a band at a time, through HBM, where their SwiGLU runs over rows.
+//! The dense forms of the span MLP's weights, BF16 coefficients or E4M3 codes the contraction
+//! restores by their rows' scales: the packed gate/up and the down projections run on a span's live
+//! rows a band at a time, through HBM, where their SwiGLU runs over rows.
 
 use crate::Module;
 use crate::modules::generic::schedule::Begin;
-use crate::ops::linear::Linear;
+use crate::modules::lora;
+use crate::ops::linear::{Affine, Linear, Matrix};
 use crate::ops::normalization::span::Owned;
 use crate::ops::pointwise::SwiGlu;
 use crate::ops::swiglu::GateUp;
@@ -18,8 +20,10 @@ type Lines<Rows, Width> = HbmTensor<bf16, Chip, m![Rows, Width]>;
 type Grouped<Rows, Width> = HbmTensor<bf16, Chip, m![Rows / 8, Width / 16, Rows % 8, Width % 16]>;
 
 /// The packed gate/up weights need nothing landed before a span's rows arrive.
-impl<Hidden: AxisName, Intermediate: AxisName, Env> Module<Begin<()>, Env, &mut ()>
-    for Linear<Hidden, GateUp<Intermediate>, Chip>
+impl<Hidden: AxisName, Intermediate: AxisName, T, Env> Module<Begin<()>, Env, &mut ()>
+    for Linear<Hidden, GateUp<Intermediate>, Chip, T>
+where
+    T: Matrix<In = Hidden, Out = GateUp<Intermediate>>,
 {
     type Output = ();
 
@@ -27,9 +31,15 @@ impl<Hidden: AxisName, Intermediate: AxisName, Env> Module<Begin<()>, Env, &mut 
 }
 
 /// The packed gate/up projection of a span's live rows, which move to HBM for it.
-impl<'t, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName, Env: Copy>
+impl<'t, Hidden, Intermediate, Rows, Capacity, T, Env: Copy>
     Module<((), Live<&'t Owned<Hidden, Rows>, Capacity>), Env, &mut ()>
-    for Linear<Hidden, GateUp<Intermediate>, Chip>
+    for Linear<Hidden, GateUp<Intermediate>, Chip, T>
+where
+    Hidden: AxisName,
+    Intermediate: AxisName,
+    Rows: AxisName,
+    Capacity: AxisName,
+    T: Matrix<In = Hidden, Out = GateUp<Intermediate>>,
 {
     type Output = Lines<Rows, GateUp<Intermediate>>;
 
@@ -60,6 +70,64 @@ impl<'t, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: Axi
     }
 }
 
+/// The packed gate/up projection of a span's live rows plus each adapter's update of them.
+impl<'s, 'a, 't, Hidden, Intermediate, Rows, Capacity, Env, A, B, K, const N: usize>
+    Module<
+        ((), Live<&'t Owned<Hidden, Rows>, Capacity>),
+        Env,
+        &'s mut lora::Adapters<'a, lora::Term<A, B>, HbmTensor<bf16, Chip, m![Capacity, K]>, N>,
+    > for Linear<Hidden, GateUp<Intermediate>, Chip>
+where
+    Hidden: AxisName,
+    Intermediate: AxisName,
+    Rows: AxisName,
+    Capacity: AxisName,
+    Env: Copy,
+    K: AxisName,
+    Affine<A, ()>: for<'i, 'o> crate::Op<
+            (
+                Live<(), Rows>,
+                &'i Grouped<Rows, Hidden>,
+                &'o mut HbmTensor<bf16, Chip, m![Rows, K]>,
+            ),
+            Output = (),
+        >,
+    Affine<B, ()>: for<'r, 'o> crate::Op<
+            (
+                Live<(), Rows>,
+                &'r HbmTensor<bf16, Chip, m![Rows, K]>,
+                &'o mut Lines<Rows, GateUp<Intermediate>>,
+            ),
+            Output = (),
+        >,
+{
+    type Output = Lines<Rows, GateUp<Intermediate>>;
+
+    fn forward(
+        &self,
+        context: &mut Device,
+        env: Env,
+        adapters: &'s mut lora::Adapters<
+            'a,
+            lora::Term<A, B>,
+            HbmTensor<bf16, Chip, m![Capacity, K]>,
+            N,
+        >,
+        ((), normalized): ((), Live<&'t Owned<Hidden, Rows>, Capacity>),
+    ) -> Lines<Rows, GateUp<Intermediate>> {
+        let mut grouped = Grouped::<Rows, Hidden>::new();
+        normalized
+            .value()
+            .view()
+            .to_hbm_view(&mut context.tdma, grouped.view_mut());
+        let live = Live::all().subrange(0, normalized.rows());
+        let mut lines = Lines::new();
+        self.affine
+            .forward(&mut *context, env, &mut (), (live, &grouped, &mut lines));
+        adapters.add(context, live, &grouped, normalized.start(), lines)
+    }
+}
+
 /// `bf16(bf16(silu(gate)) * up)` of a span's gate/up rows in HBM.
 impl<Intermediate: AxisName, Rows: AxisName, Capacity: AxisName, Env: Copy>
     Module<Live<Lines<Rows, GateUp<Intermediate>>, Capacity>, Env, &mut ()> for SwiGlu
@@ -78,9 +146,15 @@ impl<Intermediate: AxisName, Rows: AxisName, Capacity: AxisName, Env: Copy>
 }
 
 /// The product, already in HBM, waits there for the down projection.
-impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName, Env>
+impl<Hidden, Intermediate, Rows, Capacity, T, Env>
     Module<Begin<Live<Lines<Rows, Intermediate>, Capacity>>, Env, &mut ()>
-    for Linear<Intermediate, Hidden, Chip>
+    for Linear<Intermediate, Hidden, Chip, T>
+where
+    Hidden: AxisName,
+    Intermediate: AxisName,
+    Rows: AxisName,
+    Capacity: AxisName,
+    T: Matrix<In = Intermediate, Out = Hidden>,
 {
     type Output = Lines<Rows, Intermediate>;
 
@@ -97,8 +171,10 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
 
 /// The dense down projection lands no weight panel ahead of its product: the contraction reads its
 /// slabs from HBM.
-impl<Hidden: AxisName, Intermediate: AxisName, Env> Module<Begin<usize>, Env, &mut ()>
-    for Linear<Intermediate, Hidden, Chip>
+impl<Hidden: AxisName, Intermediate: AxisName, T, Env> Module<Begin<usize>, Env, &mut ()>
+    for Linear<Intermediate, Hidden, Chip, T>
+where
+    T: Matrix<In = Intermediate, Out = Hidden>,
 {
     type Output = ();
 
@@ -106,9 +182,15 @@ impl<Hidden: AxisName, Intermediate: AxisName, Env> Module<Begin<usize>, Env, &m
 }
 
 /// The product, already in HBM, waits there for the down projection, no panel landed for it.
-impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName, Env>
+impl<Hidden, Intermediate, Rows, Capacity, T, Env>
     Module<Begin<(Live<Lines<Rows, Intermediate>, Capacity>, ())>, Env, &mut ()>
-    for Linear<Intermediate, Hidden, Chip>
+    for Linear<Intermediate, Hidden, Chip, T>
+where
+    Hidden: AxisName,
+    Intermediate: AxisName,
+    Rows: AxisName,
+    Capacity: AxisName,
+    T: Matrix<In = Intermediate, Out = Hidden>,
 {
     type Output = Lines<Rows, Intermediate>;
 
@@ -124,9 +206,15 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
 }
 
 /// Nor does any of its input land before it projects: the product is the down projection's input.
-impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName, Env>
+impl<Hidden, Intermediate, Rows, Capacity, T, Env>
     Module<Live<(Lines<Rows, Intermediate>, ((), ())), Capacity>, Env, &mut ()>
-    for Linear<Intermediate, Hidden, Chip>
+    for Linear<Intermediate, Hidden, Chip, T>
+where
+    Hidden: AxisName,
+    Intermediate: AxisName,
+    Rows: AxisName,
+    Capacity: AxisName,
+    T: Matrix<In = Intermediate, Out = Hidden>,
 {
     type Output = Lines<Rows, Intermediate>;
 
@@ -141,10 +229,75 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
     }
 }
 
+/// The down projection of a span's live product rows plus each adapter's update of them, landed
+/// back on chip as the span's rows.
+impl<'s, 'a, Hidden, Intermediate, Rows, Capacity, Env, A, B, K, const N: usize>
+    Module<
+        Live<Lines<Rows, Intermediate>, Capacity>,
+        Env,
+        &'s mut lora::Adapters<'a, lora::Term<A, B>, HbmTensor<bf16, Chip, m![Capacity, K]>, N>,
+    > for Linear<Intermediate, Hidden, Chip>
+where
+    Hidden: AxisName,
+    Intermediate: AxisName,
+    Rows: AxisName,
+    Capacity: AxisName,
+    Env: Copy,
+    K: AxisName,
+    Affine<A, ()>: for<'i, 'o> crate::Op<
+            (
+                Live<(), Rows>,
+                &'i Lines<Rows, Intermediate>,
+                &'o mut HbmTensor<bf16, Chip, m![Rows, K]>,
+            ),
+            Output = (),
+        >,
+    Affine<B, ()>: for<'r, 'o> crate::Op<
+            (
+                Live<(), Rows>,
+                &'r HbmTensor<bf16, Chip, m![Rows, K]>,
+                &'o mut Lines<Rows, Hidden>,
+            ),
+            Output = (),
+        >,
+{
+    type Output = Owned<Hidden, Rows>;
+
+    fn forward(
+        &self,
+        context: &mut Device,
+        env: Env,
+        adapters: &'s mut lora::Adapters<
+            'a,
+            lora::Term<A, B>,
+            HbmTensor<bf16, Chip, m![Capacity, K]>,
+            N,
+        >,
+        product: Live<Lines<Rows, Intermediate>, Capacity>,
+    ) -> Owned<Hidden, Rows> {
+        let live = Live::all().subrange(0, product.rows());
+        let mut projected = Lines::<Rows, Hidden>::new();
+        self.affine.forward(
+            &mut *context,
+            env,
+            &mut (),
+            (live, product.value(), &mut projected),
+        );
+        let projected = adapters.add(context, live, product.value(), product.start(), projected);
+        projected.to_dm(&mut context.tdma)
+    }
+}
+
 /// The down projection of a span's live product rows, landed back on chip as the span's rows.
-impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisName, Env: Copy>
+impl<Hidden, Intermediate, Rows, Capacity, T, Env: Copy>
     Module<Live<Lines<Rows, Intermediate>, Capacity>, Env, &mut ()>
-    for Linear<Intermediate, Hidden, Chip>
+    for Linear<Intermediate, Hidden, Chip, T>
+where
+    Hidden: AxisName,
+    Intermediate: AxisName,
+    Rows: AxisName,
+    Capacity: AxisName,
+    T: Matrix<In = Intermediate, Out = Hidden>,
 {
     type Output = Owned<Hidden, Rows>;
 

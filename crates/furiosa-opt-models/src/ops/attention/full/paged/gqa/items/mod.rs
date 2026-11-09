@@ -27,7 +27,7 @@ mod wide;
 
 /// The `N` waves a domain's items are compiled for.
 #[derive(Clone, Debug)]
-pub(crate) struct Waves<const N: usize>;
+pub struct Waves<const N: usize>;
 
 impl<const N: usize> AxisName for Waves<N> {
     const NAME: Ident = Ident::new("Waves");
@@ -74,12 +74,12 @@ impl<R: AxisName, G: AxisName> AxisName for Tiled<R, G> {
 }
 
 /// A launch's decode rows as items of its two domains, planned on the host: the rows, and each
-/// domain's launch counts and tables, `WAVES` wide waves. [`Plan`] makes the arrays.
+/// domain's launch counts and tables, `Waves` wide waves. [`Plan`] makes the arrays.
 #[derive(DeviceSend)]
-pub struct Items<KvHeads: AxisName, G: AxisName, Head: AxisName, const WAVES: usize> {
+pub struct Items<KvHeads: AxisName, G: AxisName, Head: AxisName, Waves: AxisName> {
     rows: Value,
     packed: packed::Packed<KvHeads, Head>,
-    wide: wide::Wide<KvHeads, Head, Waves<WAVES>>,
+    wide: wide::Wide<KvHeads, Head, Waves>,
     groups: PhantomData<G>,
 }
 
@@ -90,8 +90,8 @@ pub(crate) struct Shape {
     wide: wide::Shape,
 }
 
-impl<KvHeads: AxisName, G: AxisName, Head: AxisName, const WAVES: usize>
-    Items<KvHeads, G, Head, WAVES>
+impl<KvHeads: AxisName, G: AxisName, Head: AxisName, Waves: AxisName>
+    Items<KvHeads, G, Head, Waves>
 {
     /// The items whose arrays [`Plan::reads`] lists, as `next` names each in turn.
     pub fn bind(mut next: impl FnMut() -> io::Result<HbmBuffer>) -> io::Result<Self> {
@@ -106,7 +106,7 @@ impl<KvHeads: AxisName, G: AxisName, Head: AxisName, const WAVES: usize>
     /// Bytes of each HBM allocation a layer's items make: every wide item's f32 output, and its
     /// log-sum-exp.
     pub(crate) const SCRATCH: [usize; 2] =
-        wide::Wide::<KvHeads, Head, Waves<WAVES>>::scratch::<GroupTile<G>>();
+        wide::Wide::<KvHeads, Head, Waves>::scratch::<GroupTile<G>>();
 
     /// The rows the items attend, from row 0.
     pub(crate) fn rows(&self) -> &Value {
@@ -149,7 +149,7 @@ impl<
     KvHeads: AxisName,
     Groups: AxisName,
     Head: AxisName,
-    const WAVES: usize,
+    Waves: AxisName,
     Rows: AxisName,
     Q: AxisName,
     H,
@@ -160,7 +160,7 @@ impl<
         (
             &HeadRows<Rows, KvHeads, Q, Head>,
             (
-                &Items<KvHeads, Groups, Head, WAVES>,
+                &Items<KvHeads, Groups, Head, Waves>,
                 Shape,
                 (&Gather, &Blocks<KvHeads, Head>),
             ),
@@ -183,7 +183,7 @@ where
         (query, (items, shape, pool), attended, (boundary, state)): (
             &HeadRows<Rows, KvHeads, Q, Head>,
             (
-                &Items<KvHeads, Groups, Head, WAVES>,
+                &Items<KvHeads, Groups, Head, Waves>,
                 Shape,
                 (&Gather, &Blocks<KvHeads, Head>),
             ),
@@ -289,7 +289,7 @@ pub(crate) mod tests {
     fn attend_items<H: AxisName, G: AxisName, const WAVES: usize>(
         device: &mut Device,
         query: &Queries<H, G>,
-        items: &Items<H, G, Head, WAVES>,
+        items: &Items<H, G, Head, Waves<WAVES>>,
         layers: &Value,
         pool: &mut Pool<H>,
         attended: &mut Queries<H, G>,
@@ -436,7 +436,7 @@ pub(crate) mod tests {
             let last = firsts[history] + blocks(history) - 1;
             ids.extend((0..used.next_multiple_of(16)).map(|b| (last - b.min(used - 1)) as i32));
         }
-        Plan::new::<H, G, Head, WAVES, R>(&segments, &ids, tiling)
+        Plan::new::<H, G, Head, Waves<WAVES>, R>(&segments, &ids, tiling)
     }
 
     /// The largest distance of row `row`'s attention over its `length` keys for `H` KV heads of `G`
@@ -666,7 +666,7 @@ pub(crate) mod tests {
         let layers = count(2).to_hbm(&mut device.pdma).await.unwrap();
         let plan = plan::<H, G, WAVES, Reach>(rows.iter().copied(), firsts, tiling);
         let mut buffers = place(device, plan.reads()).await;
-        let items: Items<H, G, Head, WAVES> =
+        let items: Items<H, G, Head, Waves<WAVES>> =
             Items::bind(|| Ok(buffers.next().expect("an array a buffer"))).unwrap();
         let unwritten_rows = vec![bf16::from_f32(UNWRITTEN); Reach::SIZE * stride::<H, G>()];
         let mut attended: Queries<H, G> =

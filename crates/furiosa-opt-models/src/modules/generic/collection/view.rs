@@ -9,8 +9,8 @@ use crate::ops::normalization::RmsNorm;
 use crate::ops::pointwise::add::Add;
 use crate::ops::rotary::{self, SplitHalf, group::Table};
 use crate::ops::swiglu::{Down, Mlp};
-use crate::tensor::form::Weight;
 use crate::tensor::form::fp8;
+use crate::tensor::form::{BlockScaled, Weight};
 use crate::tensor::parallel::Chip;
 use crate::tensor::scalar::F32;
 use crate::{First, Sequential};
@@ -42,6 +42,42 @@ impl<In, Out, W: View<N>, S: View<N>, const N: usize> View<N> for fp8::Rows<In, 
     fn stack(layers: [Self; N], context: &mut Context<'_>) -> Self::Storage {
         let (w, s) = unzip(layers.map(|layer| (layer.0, layer.1)));
         (W::stack(w, context), S::stack(s, context))
+    }
+}
+
+impl<In, Out, E, S, B, C, Chips, W, T, const N: usize> View<N>
+    for BlockScaled<In, Out, E, S, B, C, Chips, W, T>
+where
+    In: AxisName,
+    Out: AxisName,
+    E: Scalar,
+    S: Scalar,
+    B: M,
+    C: View<N>,
+    Chips: M,
+    W: View<N>,
+    T: View<N>,
+{
+    type Storage = (W::Storage, T::Storage, C::Storage);
+    type Layer = BlockScaled<In, Out, E, S, B, C::Layer, Chips, W::Layer, T::Layer>;
+
+    fn view(storage: &Self::Storage, layer: usize) -> Self::Layer {
+        BlockScaled {
+            weight: W::view(&storage.0, layer),
+            weight_scale: T::view(&storage.1, layer),
+            contract: C::view(&storage.2, layer),
+            shape: PhantomData,
+        }
+    }
+
+    fn stack(layers: [Self; N], context: &mut Context<'_>) -> Self::Storage {
+        let parts = layers.map(|layer| (layer.weight, layer.weight_scale, layer.contract));
+        let (w, t, c) = unzip3(parts);
+        (
+            W::stack(w, context),
+            T::stack(t, context),
+            C::stack(c, context),
+        )
     }
 }
 
