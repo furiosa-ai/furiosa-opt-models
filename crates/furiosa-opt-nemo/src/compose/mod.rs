@@ -6,11 +6,8 @@
 //! - A leaf takes the [`Tiles`] of its own iteration [`Space`] and derives every loop count from
 //!   them, so a row past `n` costs no trip and takes no effect. For example, 9 live rows of a
 //!   64-row envelope are two tiles of 8 rows: one whole, one holding a single row.
-//! - A launch value in HBM moves on chip where it enters a loop ([`Fill`]) and back where it
-//!   leaves it ([`Spill`]); the binding implements each move for its layouts.
-//! - Beyond the moves the composer only orders: it fuses modules into one loop over a space
-//!   ([`fuse`]), rotates a loop ([`window`]), issues other modules' transfers at a running module's
-//!   points ([`Points`], [`Deferred`]), and reads each part of the step once ([`Once`]).
+//! - Past the count, the only composition here is [`Points`]: other modules' transfers issue at a
+//!   running module's points, in the order the host reaches them.
 
 use crate::ops::layout::axes::Chip;
 use furiosa_opt_std::prelude::*;
