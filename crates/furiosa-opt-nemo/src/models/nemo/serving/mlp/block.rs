@@ -214,12 +214,13 @@ pub fn fill(device: &mut Device, activation: &Activation) -> Register {
         .to_trf()
 }
 
-/// One half's contraction against a filled block, scaled (and for the gate, SiLU) in its pass.
+/// One half's contraction against a filled block, scaled (and for the gate, SiLU) in its pass and
+/// rounded to BF16, as the TP2 body rounds its gate and up.
 fn contract(
     device: &mut Device,
     (weight, input): (&Weight, &Register),
     (scale, factor, silu): (&scale::Scales<Chips>, usize, bool),
-) -> Values<f32> {
+) -> Values<bf16> {
     let scales = scale::Epilogue {
         input: scale.get::<Cluster, Reduced>(device, factor),
         weight: scale.get::<Cluster, Reduced>(device, factor + 1),
@@ -241,40 +242,44 @@ fn contract(
             .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Fma), Stash)
             .vector_widen_concat::<Time, Packet>()
             .vector_final()
+            .cast::<bf16, m![{ Packet } # 16]>()
             .commit_trim::<Packet>()
             .commit()
     } else {
         value
             .vector_widen_concat::<Time, Packet>()
             .vector_final()
+            .cast::<bf16, m![{ Packet } # 16]>()
             .commit_trim::<Packet>()
             .commit()
     }
 }
 
-/// SiLU(gate) · up of one half, divided by the down input scale and rounded once to E4M3.
+/// SiLU(gate) · up of one half rounded to BF16, then divided by the down input scale and rounded to
+/// E4M3, as the TP2 body quantizes its product.
 fn multiply(
     device: &mut Device,
     scales: &scale::Scales<Chips>,
-    (gate, up): (&Values<f32>, &Values<f32>),
+    (gate, up): (&Values<bf16>, &Values<bf16>),
 ) -> Values<f8e4m3> {
     axes![Term = 2];
     let divisor = crate::ops::linear::Affine::new((), scales.get::<Cluster, Reduced>(device, 4));
-    device
+    let product: Values<bf16> = device
         .main
         .begin_interleaved::<Term, _, _, _, _, _>(gate.view(), up.view())
         .fetch::<m![{ Time }, Term], Packet>()
+        .fetch_cast::<f32>()
         .collect::<m![{ Time }, Term], Packet>()
         .vector_init()
         .vector_intra_slice_unzip::<Term, Time>()
         .vector_narrow_split::<m![{ Time }, { Packet } / 4], m![{ Packet } % 4]>()
         .vector_fp_zip(FpBinaryOp::MulF(FpMulAlu::Mul0))
-        .vector_fp_div(divisor.input_scale())
         .vector_widen_concat::<Time, Packet>()
         .vector_final()
-        .cast::<f8e4m3, m![{ Packet } # 32]>()
+        .cast::<bf16, m![{ Packet } # 16]>()
         .commit_trim::<Packet>()
-        .commit()
+        .commit();
+    scale::quantize::<Cluster, Reduced, Time, Packet, Chips>(device, &product, &divisor)
 }
 
 /// A half's product with each row's features innermost, eight to a run, for the down's stream.
@@ -294,7 +299,7 @@ pub fn up(
     device: &mut Device,
     (staged, scales): (&Staged, &scale::Scales<Chips>),
     (filled, half): (&Register, usize),
-) -> Values<f32> {
+) -> Values<bf16> {
     contract(device, (&staged.up[half], filled), (scales, 2, false))
 }
 
@@ -303,7 +308,7 @@ pub fn gate(
     device: &mut Device,
     (staged, scales): (&Staged, &scale::Scales<Chips>),
     (filled, half): (&Register, usize),
-) -> Values<f32> {
+) -> Values<bf16> {
     contract(device, (&staged.gate[half], filled), (scales, 0, true))
 }
 
@@ -311,7 +316,7 @@ pub fn gate(
 pub fn finish(
     device: &mut Device,
     scales: &scale::Scales<Chips>,
-    (gate, up): (Values<f32>, Values<f32>),
+    (gate, up): (Values<bf16>, Values<bf16>),
     (product, block, half): (&mut Product, usize, usize),
 ) {
     let value = multiply(device, scales, (&gate, &up));
