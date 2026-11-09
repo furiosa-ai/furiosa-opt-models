@@ -3,8 +3,8 @@
 //! them, the history in pages of the layer's cache.
 //!
 //! - Its front lands the input norm's gain and the query, key and value projections' weights; its
-//!   start runs the input norm and the positioned query/key/value stage over them, and stores the
-//!   heads.
+//!   start runs the input norm and the positioned query/key/value stage over them, stores the
+//!   heads and lands the cache's scales behind them.
 //! - Its end runs the output projection, the post-attention norm, the attention residual, the
 //!   pre-feed-forward norm and the feed-forward up to the down projection begun with its input,
 //!   whose landing it issues; its update the down projection, behind the layer's tail's factor,
@@ -375,7 +375,6 @@ where
             positions,
         } = &attention.0.qkv;
         let normalized = gain.forward(&mut *device, (), &mut (), &rows);
-        (attention.0.cache.write).forward(&mut *device, (), &mut (), &mut stored.scales);
         let input = &normalized;
         // The query projection keeps the rows it staged for the key and value projections: every
         // row group live, in the tensor registers; else what its form stages for the live groups.
@@ -413,7 +412,9 @@ where
         let positioned = ((query, key), &call.positions);
         let (query, key) = positions.forward(&mut *device, (), &mut (), positioned);
         let Stored {
-            queries, retained, ..
+            queries,
+            retained,
+            scales,
         } = stored;
         let tdma = &mut device.tdma;
         query.value().view().to_hbm_view(tdma, queries.view_mut());
@@ -422,6 +423,9 @@ where
             .value()
             .view()
             .to_hbm_view(tdma, retained.1.view_mut());
+        // The attention reads the cache's scales first: behind the stores they neither queue ahead
+        // of the projections' moves nor land beside a pass over the heads' slices, slowing it.
+        (attention.0.cache.write).forward(device, (), &mut (), scales);
         rows
     }
 
