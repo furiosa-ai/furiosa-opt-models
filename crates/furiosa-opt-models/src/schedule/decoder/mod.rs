@@ -26,7 +26,7 @@ use crate::Begin;
 use crate::Module;
 use crate::load::Named;
 use crate::models::decoder::Form;
-use crate::models::decoder::attention::qwen3::{self, LmHead, QueryHeads, fp8};
+use crate::models::decoder::attention::qwen3::{self, QueryHeads, fp8};
 use crate::models::decoder::attention::{
     ForCausalLM, ForSequenceClassification, Geometry, Head, KvHeads, Qwen2Layer,
 };
