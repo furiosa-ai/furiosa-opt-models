@@ -32,6 +32,16 @@ pub struct Begin<T>(pub T);
 /// transfers issue there.
 pub(crate) type Boundary<'b, 's, H, G> = (&'b H, &'s mut G);
 
+/// A boundary's work that waits for no transfer, which an op that offers it runs once on the
+/// boundary's state `G` where its tensor units would wait for a transfer of its own.
+pub(crate) trait Under<G> {
+    /// Whether the boundary has any, so an op runs nothing there for one that has none.
+    const WORK: bool = false;
+
+    /// The work on the boundary's `state`.
+    fn under(&self, _: &mut Device, _: &mut G) {}
+}
+
 /// Every op is a module: it ignores the env and holds the empty state.
 impl<T: Op<I>, I, E> Module<I, E, &mut ()> for T {
     type Output = T::Output;
@@ -65,3 +75,6 @@ impl<E> Module<&mut (), E, &mut ()> for () {
 
     fn forward(&self, _: &mut Device, _: E, _: &mut (), _: &mut ()) {}
 }
+
+/// Nor under a transfer.
+impl Under<()> for () {}

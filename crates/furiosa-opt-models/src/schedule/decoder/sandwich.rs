@@ -23,6 +23,11 @@
 //!   down projection's codes under the activation and the up projection's passes, behind none of
 //!   its scales; its output projection's inside its attention, after the attention's first window
 //!   lands or before its last is prepared. Its leaves hold nothing in a call, so it takes `()`.
+//! - Where its attention's widest pass streams its windows and leaves room beside them and the
+//!   gate projection's codes, the first tiles of the gate's weight that fit decode inside the
+//!   attention, under its first window's landing, where the tensor units wait for it, for a call
+//!   whose passes decode the weight; its scales then land a second time beside the codes, ahead;
+//!   the rest of the tiles decode once the rows reach the gate.
 //! - Its tile is its envelope, so its attention hands its end the attended heads where they are,
 //!   with the landed output projection, and writes no HBM place.
 
@@ -34,16 +39,17 @@ use crate::modules::feedforward::glu::Glu;
 use crate::modules::parallel::RowParallel;
 use crate::modules::residual::{Residual, Sum};
 use crate::modules::transformer::SandwichNorm;
-use crate::ops::attention::gqa::{Attended, Pages};
+use crate::ops::attention::gqa::{Attended, Keys, Pages, Queries};
 use crate::ops::attention::{Heads, SplitHeads};
 use crate::ops::index::scatter::Store;
 use crate::ops::linear::Grouped;
+use crate::ops::linear::nvfp4::Decodes;
 use crate::ops::normalization::{self, RmsNorm, RowMajor, Spread};
 use crate::tensor::axis::{Lanes, Single};
 use crate::tensor::live::Live;
 use crate::tensor::mapping::Rows as Layout;
 use crate::tensor::parallel::{Chip, Parallelism};
-use crate::{Begin, Fork, Module, Sequential, Then};
+use crate::{Begin, Fork, Module, Sequential, Then, Under, specialize};
 use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
 
@@ -223,12 +229,25 @@ where
             &'d mut (),
             Output = (),
         >,
-    Attend: for<'q, 'b, 's, 'h, 'o, 'l, 'x> Module<
+    Attend: for<'q, 'b, 's, 'h, 'o, 'i, 'l, 'x> Module<
             (
                 Live<&'q QueryRows<A, R>, R>,
                 (&'b Pool<A>, &'s Scales<A>),
                 &'h Pages<R, Windows, Chip, Past>,
-                (&'o O, &'l mut OL),
+                (&'o Inside<'i, O, ()>, &'l mut (OL, ())),
+            ),
+            (),
+            &'x mut (),
+            Output = Live<AttendedHeads<A, R>, R>,
+        > + for<'q, 'b, 's, 'h, 'o, 'i, 'l, 'x> Module<
+            (
+                Live<&'q QueryRows<A, R>, R>,
+                (&'b Pool<A>, &'s Scales<A>),
+                &'h Pages<R, Windows, Chip, Past>,
+                (
+                    &'o Inside<'i, O, Decode<'i, Named<"gate_proj", Gate>, GL, R>>,
+                    &'l mut (OL, Ahead<A, GL, R>),
+                ),
             ),
             (),
             &'x mut (),
@@ -279,8 +298,22 @@ where
             (),
             &'x mut (),
             Output = GO,
+        > + for<'l, 'x> Module<(&'l mut GL, Live<(), R>), (), &'x mut (), Output = ()>
+        + for<'l, 'd, 'x> Module<
+            (&'l GL, Live<(), R>, &'d mut Ahead<A, GL, R>),
+            (),
+            &'x mut (),
+            Output = (),
+        > + for<'l, 'r, 'x> Module<
+            (
+                ((GS, &'l GL), Option<&'l Ahead<A, GL, R>>),
+                &'r Live<Spread<Hidden, R, Chip>, R>,
+            ),
+            (),
+            &'x mut (),
+            Output = GO,
         >,
-    GL: Default,
+    GL: Default + Decodes,
     GS: Default,
     Activation: for<'r, 'x> Module<&'r GO, (), &'x mut (), Output = AO>,
     Up: for<'x> Module<Begin<()>, (), &'x mut (), Output = UL>
@@ -308,7 +341,7 @@ where
     type Reach = R;
     type Home = HbmTensor<bf16, Chip, RowMajor<Hidden, R>>;
     type Front = (NB, (QL, KL, VL));
-    type Landed = (OL, Live<AttendedHeads<A, R>, R>);
+    type Landed = (OL, Live<AttendedHeads<A, R>, R>, Option<Ahead<A, GL, R>>);
     type Ahead = GL;
     type Staged = Staged<DR, Live<Self::Rows, R>>;
     type Updated = Staged<(Live<Self::Rows, R>, NB, TB), Live<Self::Rows, R>>;
@@ -357,10 +390,14 @@ where
         )
     }
 
-    fn ahead(&self, device: &mut Device, gate_landed: GL) -> GL {
+    fn ahead(&self, device: &mut Device, tile: Live<(), R>, gate_landed: GL) -> GL {
         let Then(Sequential(_, Residual(_, Then(mlp, _), _)), _) = self;
         let Sum(Fork((Then(gate, _), _)), _) = &mlp.0;
-        gate.forward(device, (), &mut (), Begin(gate_landed))
+        let mut landed = gate.forward(&mut *device, (), &mut (), Begin(gate_landed));
+        if const { decodes_inside::<A, GL, R>() } {
+            gate.forward(device, (), &mut (), (&mut landed, tile));
+        }
+        landed
     }
 
     fn start(
@@ -443,14 +480,17 @@ where
         call: &'c Context<P, R, Windows, Past>,
         (pool, live): (&mut &mut Pool<A>, Live<(), R>),
         places: &mut Places<A, R>,
+        gate_landed: &GL,
     ) -> Self::Landed {
-        let Then(Sequential(Residual(_, Then(attention, _), _), _), _) = self;
+        let Then(Sequential(Residual(_, Then(attention, _), _), Residual(_, Then(mlp, _), _)), _) =
+            self;
         let Attention {
             cache,
             attend,
             output,
             ..
         } = &attention.0;
+        let Sum(Fork((Then(gate, _), _)), _) = &mlp.0;
         let Places { stored, .. } = places;
         let write = (&call.write, &stored.scales);
         let operands = (&write, &call.read);
@@ -459,12 +499,23 @@ where
             (cache, operands),
             (pool, &*stored, live),
             |device, pool| {
-                let mut landed = OL::default();
-                let boundary = (&output.0.operation, &mut landed);
+                if const { decodes_inside::<A, GL, R>() } {
+                    let mut landed = (OL::default(), Ahead::<A, GL, R>::default());
+                    let inside = Inside(&output.0.operation, Decode(gate, gate_landed, live));
+                    let boundary = (&inside, &mut landed);
+                    let blocks = (pool, &stored.scales);
+                    let input = (live.with(&stored.queries), blocks, &call.read, boundary);
+                    let rows = attend.forward(&mut *device, (), &mut (), input);
+                    let (landed, decoded) = landed;
+                    return (landed, rows, Some(decoded));
+                }
+                let mut landed = (OL::default(), ());
+                let inside = Inside(&output.0.operation, ());
+                let boundary = (&inside, &mut landed);
                 let blocks = (pool, &stored.scales);
                 let input = (live.with(&stored.queries), blocks, &call.read, boundary);
                 let rows = attend.forward(&mut *device, (), &mut (), input);
-                (landed, rows)
+                (landed.0, rows, None)
             },
         )
     }
@@ -479,7 +530,7 @@ where
         let Then(Sequential(first, Residual(norm, Then(mlp, _), _)), _) = self;
         let Residual(_, Then(attention, post), add) = first;
         let Sum(Fork((Then(gate, activation), up)), Then(multiply, down)) = &mlp.0;
-        let (landed, heads) = &*landed;
+        let (landed, heads, decoded) = &*landed;
         let down = &down.0.operation;
         let mut begun = <((NB, NB), (GS, DS))>::default();
         let boundary = (&Landings(Gains(post, norm), gate, down), &mut begun);
@@ -495,7 +546,12 @@ where
         let residual = add.forward(&mut *device, (), &mut (), (&input, &branch));
         let normalized = norm.forward(&mut *device, (), &mut (), &residual);
         let begun = (gate_scales, gate_landed);
-        let gated = gate.forward(&mut *device, (), &mut (), (begun, &normalized));
+        let gated = if const { decodes_inside::<A, GL, R>() } {
+            let begun = (begun, decoded.as_ref());
+            gate.forward(&mut *device, (), &mut (), (begun, &normalized))
+        } else {
+            gate.forward(&mut *device, (), &mut (), (begun, &normalized))
+        };
         let down_landed = down.forward(&mut *device, (), &mut (), Begin(down_scales));
         let activated = activation.forward(&mut *device, (), &mut (), &gated);
         let upped = up.forward(&mut *device, (), &mut (), (up_landed, &normalized));
@@ -594,5 +650,97 @@ where
         self.0.forward(&mut *device, (), &mut (), gains);
         self.1.forward(&mut *device, (), &mut (), gate);
         self.2.forward(device, (), &mut (), down);
+    }
+}
+
+/// The place the tiles of the gate projection's weight `GL` that decode in the attention of group
+/// `A` over the rows `R` decode into.
+type Ahead<A, GL, R> = <GL as Decodes>::Decoded<Beside<A, GL, R>>;
+
+/// Tiles of the gate projection's weight `L` that decode inside the attention of group `A` over
+/// the rows `R`: the most that its widest pass, which streams its windows, leaves room for beside
+/// the codes they decode from, which lie there across the attention; none where no pass streams.
+pub(super) struct Beside<A, L, R>(PhantomData<(A, L, R)>);
+
+impl<A, L, R> Clone for Beside<A, L, R> {
+    fn clone(&self) -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<A, L, R> core::fmt::Debug for Beside<A, L, R> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("Beside")
+    }
+}
+
+impl<A: decoder::Attention, L: Decodes, R: AxisName> AxisName for Beside<A, L, R> {
+    const NAME: Ident = Ident::new("Beside");
+    const SIZE: usize = {
+        let keys = Keys::<A::Heads>::SIZE;
+        let (head, groups) = (A::Head::SIZE, A::Groups::SIZE);
+        let copies = <QueryRows<A, R> as Queries<R, A::Heads, A::Groups, A::Head>>::COPIES;
+        let pass = (
+            specialize::attention::pass(head, groups, keys),
+            R::SIZE,
+            copies,
+        );
+        let mut tiles = L::TILES;
+        while tiles > 0 {
+            let bytes = (size_of::<A::Cache>(), L::LANDED + tiles * L::TILE);
+            if specialize::attention::beside(head, groups, keys, pass, bytes) {
+                break;
+            }
+            tiles -= 1;
+        }
+        tiles
+    };
+}
+
+/// Whether tiles of the gate projection's weight `L` decode inside the attention of group `A` over
+/// the rows `R`.
+const fn decodes_inside<A: decoder::Attention, L: Decodes, R: AxisName>() -> bool {
+    Beside::<A, L, R>::SIZE > 0
+}
+
+/// What a sandwich-norm layer runs inside its attention: its output projection `O`'s landing at
+/// the attention's boundary, and `U` under its first window's landing.
+struct Inside<'m, O, U>(&'m O, U);
+
+/// At the attention's boundary: the output projection's landing.
+impl<'m, 'p, 'x, O, U, OL, D> Module<&'p mut (OL, D), (), &'x mut ()> for Inside<'m, O, U>
+where
+    O: for<'s, 'y> Module<&'s mut OL, (), &'y mut (), Output = ()>,
+{
+    type Output = ();
+
+    fn forward(&self, device: &mut Device, _: (), _: &'x mut (), (landed, _): &'p mut (OL, D)) {
+        self.0.forward(device, (), &mut (), landed);
+    }
+}
+
+/// Under its first window's landing: what `U` runs there.
+impl<'m, O, U: Under<D>, OL, D> Under<(OL, D)> for Inside<'m, O, U> {
+    const WORK: bool = U::WORK;
+
+    fn under(&self, device: &mut Device, (_, state): &mut (OL, D)) {
+        self.1.under(device, state);
+    }
+}
+
+/// The gate projection `W`'s decode of the first tiles of the weight `L` it landed ahead, for the
+/// live rows `R`.
+struct Decode<'m, W, L, R>(&'m W, &'m L, Live<(), R>);
+
+impl<'m, W, L, R: AxisName, D> Under<D> for Decode<'m, W, L, R>
+where
+    W: for<'s, 'y> Module<(&'m L, Live<(), R>, &'s mut D), (), &'y mut (), Output = ()>,
+    Live<(), R>: Copy,
+{
+    const WORK: bool = true;
+
+    fn under(&self, device: &mut Device, decoded: &mut D) {
+        self.0
+            .forward(device, (), &mut (), (self.1, self.2, decoded));
     }
 }

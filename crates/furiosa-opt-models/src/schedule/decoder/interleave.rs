@@ -226,7 +226,7 @@ where
                             let index = group * counts[0] + a + step;
                             let layer = &first[index];
                             let attend = (&mut sa[index].0, live);
-                            let mut landed = layer.attend(&mut *device, cx, attend, pa);
+                            let mut landed = layer.attend(&mut *device, cx, attend, pa, &ahead);
                             let mut slot = sa[index].1;
                             if wraps && last {
                                 let work = Tokenwise(layer, norm);
@@ -261,7 +261,7 @@ where
                             let index = group * counts[1] + b + step;
                             let layer = &second[index];
                             let attend = (&mut sb[index].0, live);
-                            let mut landed = layer.attend(&mut *device, cy, attend, pb);
+                            let mut landed = layer.attend(&mut *device, cy, attend, pb, &ahead);
                             let mut slot = sb[index].1;
                             if wraps && last {
                                 let work = Tokenwise(layer, norm);

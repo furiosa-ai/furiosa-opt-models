@@ -142,12 +142,36 @@ pub(crate) const fn overlaps(
     head: usize,
     groups: usize,
     keys: usize,
-    (rows, envelope, copies): (usize, usize, usize),
+    pass: (usize, usize, usize),
 ) -> bool {
-    let landings = 2 * (rows / LANES) * KeyValue::SIZE * keys * head * size_of::<bf16>();
+    held(head, groups, keys, pass, size_of::<bf16>()) <= 3 * super::DM / 4
+}
+
+/// Whether such a pass, streaming windows of `element`-byte codes, leaves `bytes` of data memory
+/// beside what it holds within the three quarters [`overlaps`] gives attention.
+pub(crate) const fn beside(
+    head: usize,
+    groups: usize,
+    keys: usize,
+    pass: (usize, usize, usize),
+    (element, bytes): (usize, usize),
+) -> bool {
+    streams(head, groups) && held(head, groups, keys, pass, element) + bytes <= 3 * super::DM / 4
+}
+
+/// Data memory such a pass holds with windows of `element`-byte codes: two landings, a fold, the
+/// envelope's attended rows and the copies of its query rows.
+const fn held(
+    head: usize,
+    groups: usize,
+    keys: usize,
+    (rows, envelope, copies): (usize, usize, usize),
+    element: usize,
+) -> usize {
+    let landings = 2 * (rows / LANES) * KeyValue::SIZE * keys * head * element;
     let folds = 4 * (rows / LANES) * groups * head * size_of::<f32>();
     let envelope = (1 + copies) * envelope.div_ceil(LANES) * groups * head * size_of::<bf16>();
-    landings + folds + envelope <= 3 * super::DM / 4
+    landings + folds + envelope
 }
 
 /// Shards a window of `keys` keys splits into, one a slice: as many as a cluster's slices hold

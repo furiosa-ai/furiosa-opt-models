@@ -16,6 +16,8 @@ use crate::tensor::form::nvfp4::{Held, Late, Scale, Scales, W4A4, W4A16};
 use crate::tensor::memory::Memory;
 use core::borrow::Borrow;
 
+pub(crate) use summed::rows::Decodes;
+
 mod rows;
 pub(crate) mod summed;
 

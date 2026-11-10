@@ -191,14 +191,63 @@ type Packets<I> = m![I % ({ Feature<I> }) / 16, I % ({ Width<I> }) / ({ Feature<
 /// A part's inputs in the order the switch delivers them from the feature slices.
 type Switched<I> = m![{ Packets<I> }, I % 16];
 
-/// A slice's weights in BF16, each code times its block scale, its inputs in [`Switched`] order.
-type Decoded<I, O, P> = DmTensor<
-    bf16,
-    Chip,
-    Cluster<I, O, P>,
-    Owners<I, O, P>,
-    m![O % ({ Owner<I, O, P> }), { Switched<I> }],
->;
+/// A slice's weights in BF16, each code times its block scale, of its rows `T` (all of them by
+/// default), each row's inputs in [`Switched`] order.
+type Weights<I, O, P, T = m![O % ({ Owner<I, O, P> })]> =
+    DmTensor<bf16, Chip, Cluster<I, O, P>, Owners<I, O, P>, m![{ T }, { Switched<I> }]>;
+
+/// The rows of `N` of a slice's tiles in a place of their own, a tile's rows inner.
+type Tiled<I, O, P, N> = m![{ Symbol<N> }, { Elements<I, O, P> }];
+
+/// A view of a place of a slice's weights in BF16, its cells `E`.
+type WeightsMut<'v, I, O, P, E> =
+    DmTensorViewMut<'v, bf16, Chip, Cluster<I, O, P>, Owners<I, O, P>, E>;
+
+/// A slice's tiles past its first `N`.
+#[derive(Clone, Debug)]
+struct Past<I, O, P, N>(PhantomData<(I, O, P, N)>);
+
+/// The tiles of a slice's weights past its first `N`, in a place of their own.
+type Tail<I, O, P, N> = Weights<I, O, P, Tiled<I, O, P, Past<I, O, P, N>>>;
+
+impl<I: AxisName, O: AxisName, P: Ownership, N: AxisName> AxisName for Past<I, O, P, N> {
+    const NAME: Ident = Ident::new("Past");
+    const SIZE: usize = <Tiles<I, O, P> as M>::SIZE - N::SIZE;
+}
+
+/// The first `N` of a weight's tiles decoded ahead of the rows they meet, as the passes over a
+/// decoded weight read them: written from three live lane groups, which those passes meet, else
+/// never.
+pub struct Decoded<I: AxisName, O: AxisName, P: Ownership, N: AxisName>(
+    Weights<I, O, P, Tiled<I, O, P, N>>,
+);
+
+/// The place the tiles decode into, before they decode.
+impl<I: AxisName, O: AxisName, P: Ownership, N: AxisName> Default for Decoded<I, O, P, N> {
+    fn default() -> Self {
+        Self(DmTensor::new())
+    }
+}
+
+/// A weight landed in a place, whose first tiles a schedule can decode ahead of the rows they meet.
+pub(crate) trait Decodes: 'static {
+    /// The place its first `N` tiles decode into.
+    type Decoded<N: AxisName>: Default;
+    /// Tiles of a slice's weight, a pass's rows each.
+    const TILES: usize;
+    /// The data memory a slice holds of one tile decoded.
+    const TILE: usize;
+    /// The data memory a slice holds of the weight landed, its codes and its scales.
+    const LANDED: usize;
+}
+
+impl<I: AxisName, O: AxisName, P: Ownership> Decodes for Landed<I, O, P> {
+    type Decoded<N: AxisName> = Decoded<I, O, P, N>;
+    const TILES: usize = <Tiles<I, O, P> as M>::SIZE;
+    const TILE: usize = <m![{ Elements<I, O, P> }, { Switched<I> }] as M>::SIZE * size_of::<bf16>();
+    // Two 4-bit codes a byte.
+    const LANDED: usize = <Packed<I, O, P> as M>::SIZE / 2 + <Lead<I, O, P> as M>::SIZE;
+}
 
 /// Values of a slice's run of `R` values of `D` in whole packets, an odd number of them, so that
 /// the slices' runs start alternately in the HBM's two stacks.
@@ -310,6 +359,10 @@ type Summing<I, O, R, P> = DmTensor<
     Reduced<I, O, P>,
     m![R, O % ({ Owner<I, O, P> })],
 >;
+
+/// A view of the slices' sums of a projection's rows, its cells `E`, where the passes sum them.
+type SumsMut<'v, I, O, P, E> =
+    DmTensorViewMut<'v, <P as Ownership>::Sum, Chip, Cluster<I, O, P>, Reduced<I, O, P>, E>;
 
 /// The rows of a lane group's lanes `L` in the tensor registers of every slice of a projection of
 /// `I` inputs into `O` outputs, each slice the group's inputs in its part.
@@ -661,14 +714,17 @@ impl<I: AxisName, O: AxisName, P: Ownership> AxisName for ScaleBytes<I, O, P> {
 
 impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I, O, P, C> {
     /// Every live row's outputs `bf16(sum_b scale_b (sum_{k in b} code_k x_k) / global)`, a lane
-    /// group at a time, each in the slices that sum it, as `S` holds them.
-    fn project<R: AxisName, X: Stage<I, O, R, P>, S: Sums<I, O, R, P>>(
+    /// group at a time, each in the slices that sum it, as `S` holds them; the passes over a
+    /// decoded weight meet what a schedule decoded `ahead` beside the rest decoded now.
+    fn project<R: AxisName, X: Stage<I, O, R, P>, S: Sums<I, O, R, P>, A: Ahead<I, O, P>>(
         &self,
         device: &mut Device,
         input: &Live<X, R>,
+        ahead: A,
     ) -> S
     where
         P::Sum: Rounding,
+        A::Places: Weighs<I, O, R, P, S>,
     {
         let global = self.global(device);
         let mut projected = S::new();
@@ -744,13 +800,13 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
         }
         for _ in 0..dense {
             rows.densely(device, |device, rows| {
-                let weights = self.decode(device);
+                let places = ahead.places(self, device);
                 // A pair's switch follows the pass before it and takes a step a row for each packet
                 // a feature slice holds: shorter than the pass only where a slice holds one.
                 if const { normalization::Chunk::<I>::SIZE == 16 } {
                     let mut met = |device: &mut Device, group| {
                         let lanes = rows.switched::<Two>(device, group);
-                        projected.decoded::<Two>(device, (&lanes, (&weights, &global)), group);
+                        places.pass::<Two>(device, (&mut projected, group), (&lanes, &global));
                     };
                     for pair in 0..count / 2 {
                         met(device, first + 2 * pair);
@@ -760,7 +816,7 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
                     }
                 } else {
                     let mut met = |device: &mut Device, lanes: &Holding<I, O, R, P, One>, group| {
-                        projected.decoded::<One>(device, (lanes, (&weights, &global)), group);
+                        places.pass::<One>(device, (&mut projected, group), (lanes, &global));
                     };
                     // Pairs of groups, the second in the TRF's other half, so a switch runs beside
                     // the pass before it; an even count's last pair has none beside its own.
@@ -892,37 +948,67 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
         .commit_view(F::sums(projected, (group, tile)));
     }
 
-    /// The weights in BF16, each code times its block scale, a pass's rows at a time, each row's
-    /// inputs written in [`Switched`] order.
-    fn decode(&self, device: &mut Device) -> Decoded<I, O, P> {
-        let mut weights = Decoded::<I, O, P>::new();
+    /// The weights in BF16 into `weights`, each code times its block scale, a pass's rows at a
+    /// time, each row's inputs written in [`Switched`] order.
+    fn decode(&self, device: &mut Device, weights: &mut Weights<I, O, P>) {
         for tile in 0..<Tiles<I, O, P> as M>::SIZE {
-            let scale = self.scaling(device, tile);
-            device
-                .main
-                .begin(
-                    (self.codes.borrow().view())
-                        .unpad::<Coded<I, O, P>>()
-                        .tile::<Tiles<I, O, P>, 1, m![
-                            { Elements<I, O, P> } # ({ Owner<I, O, P> }), { Part<I> }
-                        ]>(tile),
-                )
-                .fetch::<m![{ Elements<I, O, P> }, { Part<I> } / 64], m![I % 64]>()
-                .fetch_table_lookup::<bf16>()
-                .fetch_cast::<f32>()
-                .collect::<m![{ Elements<I, O, P> }, { Part<I> } / 8], m![I % 8]>()
-                .vector_init()
-                .vector_intra_slice_tag(TagMode::Zero)
-                .vector_narrow_split::<m![{ Elements<I, O, P> }, { Part<I> } / 4], m![I % 4]>()
-                .vector_restore::<m![{ Elements<I, O, P> }, { Part<I> } / 8], m![I % 8], _, _>(
-                    &scale,
-                    |values| values,
-                )
-                .commit_view(weights.view_mut().tile::<Tiles<I, O, P>, 1, m![
+            let place = &mut *weights;
+            self.unpack(device, tile, move || {
+                place.view_mut().tile::<Tiles<I, O, P>, 1, m![
                     { Elements<I, O, P> } #{!} ({ Owner<I, O, P> }), { Switched<I> }
-                ]>(tile));
+                ]>(tile)
+            });
         }
-        weights
+    }
+
+    /// The `N` tiles from tile `from` on into the place `weights` holds them in, as `decode` writes
+    /// a tile.
+    fn decode_tiles<N: AxisName>(
+        &self,
+        device: &mut Device,
+        from: usize,
+        weights: &mut Weights<I, O, P, Tiled<I, O, P, N>>,
+    ) {
+        for tile in 0..N::SIZE {
+            let place = &mut *weights;
+            self.unpack(device, from + tile, move || {
+                place.view_mut().tile::<m![{ Symbol<N> }], 1, m![
+                    { Symbol<N> } = 1 #{!} ({ Symbol<N> }), { Elements<I, O, P> }, { Switched<I> }
+                ]>(tile)
+            });
+        }
+    }
+
+    /// Pass `tile`'s rows in BF16 into the view `into` gives once they stream, each code times its
+    /// block scale.
+    fn unpack<'w, E: M>(
+        &self,
+        device: &mut Device,
+        tile: usize,
+        into: impl FnOnce() -> WeightsMut<'w, I, O, P, E>,
+    ) {
+        let scale = self.scaling(device, tile);
+        device
+            .main
+            .begin(
+                (self.codes.borrow().view())
+                    .unpad::<Coded<I, O, P>>()
+                    .tile::<Tiles<I, O, P>, 1, m![
+                        { Elements<I, O, P> } # ({ Owner<I, O, P> }), { Part<I> }
+                    ]>(tile),
+            )
+            .fetch::<m![{ Elements<I, O, P> }, { Part<I> } / 64], m![I % 64]>()
+            .fetch_table_lookup::<bf16>()
+            .fetch_cast::<f32>()
+            .collect::<m![{ Elements<I, O, P> }, { Part<I> } / 8], m![I % 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_split::<m![{ Elements<I, O, P> }, { Part<I> } / 4], m![I % 4]>()
+            .vector_restore::<m![{ Elements<I, O, P> }, { Part<I> } / 8], m![I % 8], _, _>(
+                &scale,
+                |values| values,
+            )
+            .commit_view(into());
     }
 
     /// The block scales of pass `tile`'s rows in the vector registers, widened to FP32 as they load.
@@ -1073,11 +1159,15 @@ impl<I: AxisName, O: AxisName, R: AxisName, P: Ownership> Fold<I, O, R, P> for T
     }
 }
 
-/// What a pass over a decoded weight reads: its lane groups `G` in the TRF, the weights, which
-/// carry their block scales, and the tensor scale.
-type Operands<'a, I, O, R, P, G> = (
+/// What a pass over a decoded weight meets besides the weights: its lane groups `G` in the TRF and
+/// the tensor scale.
+type Meeting<'a, I, O, R, P, G> = (&'a Holding<I, O, R, P, G>, &'a Global<I, O, P>);
+
+/// What a pass over a decoded weight reads: its lane groups `G` in the TRF, the weights of its rows
+/// `T`, which carry their block scales, and the tensor scale.
+type Operands<'a, I, O, R, P, G, T = m![O % ({ Owner<I, O, P> })]> = (
     &'a Holding<I, O, R, P, G>,
-    (&'a Decoded<I, O, P>, &'a Global<I, O, P>),
+    (&'a Weights<I, O, P, T>, &'a Global<I, O, P>),
 );
 
 /// A pass's sums of rows `T` over a decoded weight, every lane of its groups `G`, each divided by
@@ -1112,9 +1202,9 @@ trait Sums<I: AxisName, O: AxisName, R: AxisName, P: Ownership> {
     /// A pass of lane groups `G` over every row of the decoded weights, each slice's rows read as
     /// `T`: the contraction adds a row's blocks, the vector engine divides each sum by the tensor
     /// scale.
-    fn divided<'l, T: M, G: Held<R>>(
+    fn divided<'l, T: M, G: Held<R>, W: M>(
         device: &'l mut Device,
-        (lanes, (weights, global)): Operands<'l, I, O, R, P, G>,
+        (lanes, (weights, global)): Operands<'l, I, O, R, P, G, W>,
     ) -> Divided<'l, I, O, R, P, T, G> {
         device
             .main
@@ -1156,23 +1246,9 @@ where
         operands: Operands<'_, I, O, R, P, G>,
         group: usize,
     ) {
-        type Run<I, O, P> = m![O % ({ Owner<I, O, P> })];
-        let sums = <Self as Sums<I, O, R, P>>::divided::<Run<I, O, P>, G>(device, operands)
-            .vector_inter_slice_reduce::<Reduced<I, O, P>, m![{ Run<I, O, P> }, { G::Groups }]>(
-                InterSliceReduceOpF32::Add,
-            )
-            .vector_final();
-        <P::Sum as Rounding>::round::<
-            _,
-            _,
-            _,
-            _,
-            Lane<R>,
-            m![{ <P::Sum as Rounding>::Packets<Run<I, O, P>> }, { G::Groups }, { Lane<R> }],
-            <P::Sum as Rounding>::Packet<O>,
-            _,
-        >(sums)
-        .commit_view(G::rows_mut(self.view_mut(), group));
+        weigh::<I, O, R, P, G, m![O % ({ Owner<I, O, P> })], _>(device, operands, move || {
+            G::rows_mut(self.view_mut(), group)
+        });
     }
 }
 
@@ -1199,11 +1275,13 @@ impl<I: AxisName, O: AxisName, R: AxisName> Sums<I, O, R, Exchanged>
             O % ({ Owner<I, O, Exchanged> }) / ({ Feature<O> }),
             O % ({ Feature<O> })
         ];
-        let sums = <Self as Sums<I, O, R, Exchanged>>::divided::<Chunks<I, O>, G>(device, operands)
-            .vector_inter_slice_reduce::<Scatter<I, O>, m![O % ({ Feature<O> }), { G::Groups }]>(
-                InterSliceReduceOpF32::Add,
-            )
-            .vector_final();
+        let sums = <Self as Sums<I, O, R, Exchanged>>::divided::<Chunks<I, O>, G, _>(
+            device, operands,
+        )
+        .vector_inter_slice_reduce::<Scatter<I, O>, m![O % ({ Feature<O> }), { G::Groups }]>(
+            InterSliceReduceOpF32::Add,
+        )
+        .vector_final();
         <f32 as Rounding>::round::<
             _,
             _,
@@ -1219,6 +1297,153 @@ impl<I: AxisName, O: AxisName, R: AxisName> Sums<I, O, R, Exchanged>
             _,
         >(sums)
         .commit_view(G::rows_mut(self.1.view_mut(), group));
+    }
+}
+
+/// What the passes over a decoded weight meet of it besides what decodes once the rows arrive:
+/// nothing (`()`), or the first tiles where a schedule decoded them ahead.
+trait Ahead<I: AxisName, O: AxisName, P: Ownership>: Copy {
+    /// The places the passes meet.
+    type Places;
+
+    /// The places, the tiles not decoded ahead decoded now.
+    fn places<C: Borrow<InDm<I, O, P>>>(
+        self,
+        landed: &Landed<I, O, P, C>,
+        device: &mut Device,
+    ) -> Self::Places;
+}
+
+/// The whole weight decodes now.
+impl<I: AxisName, O: AxisName, P: Ownership> Ahead<I, O, P> for () {
+    type Places = Weights<I, O, P>;
+
+    fn places<C: Borrow<InDm<I, O, P>>>(
+        self,
+        landed: &Landed<I, O, P, C>,
+        device: &mut Device,
+    ) -> Weights<I, O, P> {
+        let mut weights = Weights::<I, O, P>::new();
+        landed.decode(device, &mut weights);
+        weights
+    }
+}
+
+/// The first `N` tiles where a schedule decoded them, the tiles past them now; else the whole
+/// weight now.
+impl<'d, I: AxisName, O: AxisName, P: Ownership, N: AxisName> Ahead<I, O, P>
+    for Option<&'d Decoded<I, O, P, N>>
+{
+    type Places = Places<'d, I, O, P, N>;
+
+    fn places<C: Borrow<InDm<I, O, P>>>(
+        self,
+        landed: &Landed<I, O, P, C>,
+        device: &mut Device,
+    ) -> Self::Places {
+        match self {
+            None => Places::Now(().places(landed, device)),
+            Some(ahead) => {
+                let mut past = Tail::<I, O, P, N>::new();
+                landed.decode_tiles(device, N::SIZE, &mut past);
+                Places::Ahead(ahead, past)
+            }
+        }
+    }
+}
+
+/// The places of a decoded weight the passes meet: all of it decoded now, or its first `N` tiles
+/// decoded ahead beside the tiles past them decoded now.
+enum Places<'d, I: AxisName, O: AxisName, P: Ownership, N: AxisName> {
+    /// The whole weight, decoded now.
+    Now(Weights<I, O, P>),
+    /// The first `N` tiles where a schedule decoded them, and the tiles past them decoded now.
+    Ahead(&'d Decoded<I, O, P, N>, Tail<I, O, P, N>),
+}
+
+/// A decoded weight's places a pass of lane groups meets, its sums into `S`.
+trait Weighs<I: AxisName, O: AxisName, R: AxisName, P: Ownership, S> {
+    /// The pass of lane groups `G` from `group` on over every row the places hold, into `sums`.
+    fn pass<G: Held<R>>(
+        &self,
+        device: &mut Device,
+        into: (&mut S, usize),
+        lanes: Meeting<'_, I, O, R, P, G>,
+    );
+}
+
+/// The whole weight in one place: one pass over its rows.
+impl<I: AxisName, O: AxisName, R: AxisName, P: Ownership, S: Sums<I, O, R, P>> Weighs<I, O, R, P, S>
+    for Weights<I, O, P>
+{
+    fn pass<G: Held<R>>(
+        &self,
+        device: &mut Device,
+        (sums, group): (&mut S, usize),
+        (lanes, global): Meeting<'_, I, O, R, P, G>,
+    ) {
+        sums.decoded::<G>(device, (lanes, (self, global)), group);
+    }
+}
+
+/// The tiles in two places: a pass over each, its sums into the rows of those tiles.
+impl<I: AxisName, O: AxisName, R: AxisName, P: Ownership, N: AxisName>
+    Weighs<I, O, R, P, Summing<I, O, R, P>> for Places<'_, I, O, P, N>
+where
+    P::Sum: Rounding,
+{
+    fn pass<G: Held<R>>(
+        &self,
+        device: &mut Device,
+        (sums, group): (&mut Summing<I, O, R, P>, usize),
+        (lanes, global): Meeting<'_, I, O, R, P, G>,
+    ) {
+        type Rows<I, O, P, N> = m![{ Symbol<N> } #{!} ({ Tiles<I, O, P> }), { Elements<I, O, P> }];
+        match self {
+            Places::Now(weights) => weights.pass::<G>(device, (sums, group), (lanes, global)),
+            Places::Ahead(Decoded(first), past) => {
+                let place = &mut *sums;
+                let operands = (lanes, (first, global));
+                weigh::<I, O, R, P, G, Tiled<I, O, P, N>, _>(device, operands, move || {
+                    // SAFETY: each row's first `N` tiles relabelled as an axis of their own, the
+                    // tiles past them out of reach: the same cells.
+                    let rows = unsafe {
+                        (place.view_mut()).reshape::<
+                            Chip,
+                            Cluster<I, O, P>,
+                            Reduced<I, O, P>,
+                            m![R, { Rows<I, O, P, N> }],
+                        >()
+                    };
+                    G::rows_mut(rows, group)
+                });
+                if const { Past::<I, O, P, N>::SIZE > 0 } {
+                    let operands = (lanes, (past, global));
+                    weigh::<I, O, R, P, G, Tiled<I, O, P, Past<I, O, P, N>>, _>(
+                        device,
+                        operands,
+                        move || {
+                            let at = sums.view_mut().tile::<Tiles<I, O, P>, 1, m![
+                                R,
+                                { Tiles<I, O, P> } = 1 #{!} ({ Tiles<I, O, P> }),
+                                { Elements<I, O, P> }
+                            ]>(N::SIZE);
+                            // SAFETY: each row's tiles from tile `N` on relabelled as the first
+                            // ones are; they end where the row does.
+                            let rows = unsafe {
+                                at.reshape::<
+                                    Chip,
+                                    Cluster<I, O, P>,
+                                    Reduced<I, O, P>,
+                                    m![R, { Rows<I, O, P, Past<I, O, P, N>> }],
+                                >()
+                            };
+                            G::rows_mut(rows, group)
+                        },
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1354,6 +1579,25 @@ where
     }
 }
 
+/// The same scales beside the codes in their place for a call of the live rows `R` whose passes
+/// decode the weight, so a schedule can decode its first tiles before the rows arrive; else none.
+impl<'l, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P, S: M + 'static>
+    Op<(&'l mut Landed<I, O, P>, Live<(), R>)>
+    for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P, S>, Chip, K, V>
+where
+    V: Borrow<HbmTensor<f8e4m3, Chip, Blocks<I, O, P>>>,
+    P: Ownership,
+{
+    type Output = ();
+
+    fn forward(&self, device: &mut Device, (landed, live): (&'l mut Landed<I, O, P>, Live<(), R>)) {
+        for _ in 0..decoded::<R>(live.groups::<Lanes<R>>().1) {
+            (self.weight_scale.borrow().view())
+                .to_dm_view(&mut device.tdma, landed.scales.view_mut());
+        }
+    }
+}
+
 /// The same weight begun beside its codes landed in a place: its scales, in one transfer.
 impl<'l, I: AxisName, O: AxisName, K, V, Y: Memory, P, S: M + 'static>
     Op<Begin<&'l Landed<I, O, P>>>
@@ -1450,8 +1694,37 @@ impl<'x, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P: Place<I, O, 
         device: &mut Device,
         (landed, input): (Landed<I, O, P>, &'x Live<Spread<I, R>, R>),
     ) -> Self::Output {
-        let projected = landed.project(device, input);
+        let projected = landed.project(device, input, ());
         P::place(device, input.with(projected))
+    }
+}
+
+/// The same weight landed in a place, its first `N` tiles decoded into `decoded` ahead of the
+/// live rows `R`: from three live lane groups, as the passes over a decoded weight then meet them.
+impl<'l, 'd, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, P, S: M + 'static, N>
+    Op<(
+        &'l Landed<I, O, P>,
+        Live<(), R>,
+        &'d mut Decoded<I, O, P, N>,
+    )> for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P, S>, Chip, K, V>
+where
+    P: Ownership,
+    N: AxisName,
+{
+    type Output = ();
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (landed, live, Decoded(weights)): (
+            &'l Landed<I, O, P>,
+            Live<(), R>,
+            &'d mut Decoded<I, O, P, N>,
+        ),
+    ) {
+        for _ in 0..decoded::<R>(live.groups::<Lanes<R>>().1) {
+            landed.decode_tiles(device, 0, weights);
+        }
     }
 }
 
@@ -1487,7 +1760,52 @@ impl<
             scales: scales.scales,
             codes: &place.codes,
         };
-        let projected = landed.project(device, input);
+        let projected = landed.project(device, input, ());
+        P::place(device, input.with(projected))
+    }
+}
+
+/// The same rows, the passes over a decoded weight meeting its first `N` tiles in `decoded` where
+/// a schedule decoded them ahead beside the rest decoded now, else the whole weight decoded now.
+impl<
+    'l,
+    'x,
+    I: AxisName,
+    O: AxisName,
+    R: AxisName,
+    K,
+    V,
+    Y: Memory,
+    P: Place<I, O, R>,
+    S: M + 'static,
+    N: AxisName,
+>
+    Op<(
+        (
+            (Landed<I, O, P, ()>, &'l Landed<I, O, P>),
+            Option<&'l Decoded<I, O, P, N>>,
+        ),
+        &'x Live<Spread<I, R>, R>,
+    )> for BlockScaled<I, O, f4e2m1, f8e4m3, Scales<I, O>, Summed<W4A16, Y, P, S>, Chip, K, V>
+{
+    type Output = Live<P::Rows, R>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (((scales, place), decoded), input): (
+            (
+                (Landed<I, O, P, ()>, &'l Landed<I, O, P>),
+                Option<&'l Decoded<I, O, P, N>>,
+            ),
+            &'x Live<Spread<I, R>, R>,
+        ),
+    ) -> Self::Output {
+        let landed = Landed {
+            scales: scales.scales,
+            codes: &place.codes,
+        };
+        let projected = landed.project(device, input, decoded);
         P::place(device, input.with(projected))
     }
 }
@@ -1577,7 +1895,7 @@ where
         device: &mut Device,
         (landed, rows): (Landed<I, O, P>, Live<Both<H, I, R>, R>),
     ) -> Self::Output {
-        let projected = landed.project(device, &rows);
+        let projected = landed.project(device, &rows, ());
         P::place(device, rows.with(projected))
     }
 }
@@ -1607,6 +1925,7 @@ where
                 kept,
                 spread: &spread,
             }),
+            (),
         );
         exchange(device, input.with(partial))
     }
@@ -1654,7 +1973,7 @@ impl<H: AxisName, I: AxisName, O: AxisName, R: AxisName, K, V, Y: Memory, S: M +
         (landed, rows): (Landed<I, O, Exchanged>, Live<Halved<H, I, R>, R>),
     ) -> Self::Output {
         let (kept, spread) = rows.value();
-        let partial = landed.project(&mut *device, &rows.with(Halves { kept, spread }));
+        let partial = landed.project(&mut *device, &rows.with(Halves { kept, spread }), ());
         exchange(device, rows.with(partial))
     }
 }
@@ -1707,6 +2026,34 @@ type Alike<'t, O, E> = DmTensorView<'t, f32, Chip, normalization::Cluster, Featu
 /// The FP32 sums of each cluster's half of the inputs, its cluster's index naming the term: `E` a
 /// slice's outputs of a row.
 type TermRows<S, R, E> = DmTensor<f32, Chip, m![Term], S, m![R, { E }]>;
+
+/// A pass of lane groups `G` over a place of a decoded weight's rows `T`, its sums on each owner's
+/// first part slice into the view `into` gives once they round, which holds those rows of the
+/// groups' lanes.
+fn weigh<'s, I: AxisName, O: AxisName, R: AxisName, P: Ownership, G: Held<R>, T: M, E: M>(
+    device: &mut Device,
+    operands: Operands<'_, I, O, R, P, G, T>,
+    into: impl FnOnce() -> SumsMut<'s, I, O, P, E>,
+) where
+    P::Sum: Rounding,
+{
+    let sums = <Summing<I, O, R, P> as Sums<I, O, R, P>>::divided::<T, G, T>(device, operands)
+        .vector_inter_slice_reduce::<Reduced<I, O, P>, m![{ T }, { G::Groups }]>(
+            InterSliceReduceOpF32::Add,
+        )
+        .vector_final();
+    <P::Sum as Rounding>::round::<
+        _,
+        _,
+        _,
+        _,
+        Lane<R>,
+        m![{ <P::Sum as Rounding>::Packets<T> }, { G::Groups }, { Lane<R> }],
+        <P::Sum as Rounding>::Packet<O>,
+        _,
+    >(sums)
+    .commit_view(into());
+}
 
 /// The live rows of `rows` into `into`'s mapping in one transfer, as a setup costs about as much as
 /// all the rows: the one live row, else the lane group holding them, else the envelope.

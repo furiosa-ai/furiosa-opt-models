@@ -264,9 +264,15 @@ trait Cut<A: decoder::Attention, C, T> {
     /// Its front landed for the rows of `tile`.
     fn front(&self, device: &mut Device, tile: Live<(), Self::Envelope>) -> Self::Front;
 
-    /// What its end reads landed into `ahead`, given back, behind the transfer that hands the layer
-    /// before it its MLP's output, so that layer's residual and this one's input norm run under it.
-    fn ahead(&self, _: &mut Device, ahead: Self::Ahead) -> Self::Ahead {
+    /// What its end reads landed into `ahead` for the rows of `tile`, given back, behind the
+    /// transfer that hands the layer before it its MLP's output, so that layer's residual and this
+    /// one's input norm run under it.
+    fn ahead(
+        &self,
+        _: &mut Device,
+        _: Live<(), Self::Envelope>,
+        ahead: Self::Ahead,
+    ) -> Self::Ahead {
         ahead
     }
 
@@ -283,13 +289,15 @@ trait Cut<A: decoder::Attention, C, T> {
     ) -> Live<Self::Rows, Self::Envelope>;
 
     /// Its attention over the `live` rows its `places` stored, into what they attend, over its
-    /// `pool`; its output projection landed at the attention's boundary.
+    /// `pool`; its output projection landed at the attention's boundary, and what its end reads of
+    /// what its start landed `ahead` prepared under the attention's first window.
     fn attend(
         &self,
         device: &mut Device,
         call: C,
         pool: (&mut &mut Pool<A>, Live<(), Self::Envelope>),
         places: &mut Places<A, Self::Reach>,
+        ahead: &Self::Ahead,
     ) -> Self::Landed;
 
     /// A tile through it from its attention to its MLP's second step, given a tile `output` of its
@@ -549,6 +557,7 @@ where
         call: Launched<'c, 'a, Z>,
         (pool, live): (&mut &mut Pool<Z>, Live<(), Capacity<Z>>),
         places: &mut Places<Z, Reach<Z>>,
+        _: &(),
     ) -> OL {
         let Sequential(Residual(_, attention, _), _) = self;
         let Attention {
@@ -820,7 +829,7 @@ where
         let Self(home, layer) = *self;
         let front = layer.front(device, tile);
         let rows = tile.with(layer.fill(&mut *device, home, tile));
-        let ahead = layer.ahead(&mut *device, ahead);
+        let ahead = layer.ahead(&mut *device, tile, ahead);
         (
             layer.start(device, call, front, rows, (stored, adapters)),
             ahead,
@@ -862,7 +871,7 @@ where
         let staged = layer.end(device, (output, &ahead), input, adapters);
         let front = next.front(device, tile);
         let updated = layer.update(device, staged, adapters);
-        let ahead = next.ahead(&mut *device, ahead);
+        let ahead = next.ahead(&mut *device, tile, ahead);
         let rows = layer.finish(device, updated, adapters);
         (
             next.start(device, call, front, rows, (stored, following)),
@@ -989,7 +998,7 @@ where
         for index in 0..DEPTH - 1 {
             let (layer, next) = (layers.layer(index), layers.layer(index + 1));
             let pool = (&mut slots[index].0.1, live);
-            let mut projecting = layer.attend(&mut *device, call, pool, &mut places);
+            let mut projecting = layer.attend(&mut *device, call, pool, &mut places, &());
             let (mut adapters, mut following) = (slots[index].1, slots[index + 1].1);
             // In place, so the loop carries one state: a tile overwrites only its own rows, read
             // just before, and the attention has read every store.
@@ -1006,7 +1015,7 @@ where
         }
         let last = layers.layer(DEPTH - 1);
         let pool = (&mut slots[DEPTH - 1].0.1, live);
-        let mut projecting = last.attend(&mut *device, call, pool, &mut places);
+        let mut projecting = last.attend(&mut *device, call, pool, &mut places, &());
         let mut adapters = slots[DEPTH - 1].1;
         let mut head: Rows<Z> = HbmTensor::new();
         for span in 0..spans {

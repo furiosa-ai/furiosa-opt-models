@@ -17,8 +17,8 @@ extern crate self as furiosa_opt_models;
 
 pub mod load;
 mod module;
-pub(crate) use module::Boundary;
 pub use module::{Begin, Module, Op};
+pub(crate) use module::{Boundary, Under};
 pub(crate) use modules::generic::Order;
 pub use modules::generic::{
     Branch, Each, First, Fork, Identity, Interleave, Layers, Repeat, Rolled, Sequential, Slot,

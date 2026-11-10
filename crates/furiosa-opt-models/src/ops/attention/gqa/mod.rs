@@ -1,5 +1,5 @@
-use crate::Op;
 use crate::tensor::{axis::Lanes, live::Live, mapping::Rows as Layout};
+use crate::{Op, Under};
 use furiosa_opt_std::prelude::*;
 
 use super::{Attention, Chip, KeyValue, TileGroups};
@@ -1559,9 +1559,10 @@ where
     }
 }
 
-/// The same history attended, `boundary` running on its state once in the first pass: before its
-/// last window is prepared where no next pass may land under it, else after its first window
-/// lands.
+/// The same history attended, `boundary` running on its state once in the first pass: its work
+/// under a transfer once its first window's landing is issued, ahead of what waits for it; the
+/// rest before its last window is prepared where no next pass may land under it, else after its
+/// first window lands.
 impl<
     'a,
     Rows: AxisName,
@@ -1686,7 +1687,7 @@ where
                 TileSlot<Rows, KvHeads, 8>,
             >,
         >,
-    H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()>,
+    H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()> + Under<G>,
 {
     type Output = Attended<Rows, KvHeads, Groups, Head>;
 
@@ -1702,11 +1703,7 @@ where
         ),
     ) -> Self::Output {
         // The pass that runs first takes the boundary once, the others none.
-        let mut once = |device: &mut Device, times: usize| {
-            for _ in 0..times {
-                crate::Module::forward(boundary, &mut *device, (), &mut (), &mut *state);
-            }
-        };
+        let mut once = (boundary, state);
         if const { Self::SLICE_ROWS == 32 }
             && live.count::<Lanes<Rows>>() == <RowGroups<Rows> as M>::SIZE
         {
@@ -1790,6 +1787,9 @@ where
                     Transposed::<Rows, KvHeads, Groups, Head, SCALE>::new(),
                 );
                 lands(device, 0, &mut landings.0);
+                if const { H::WORK } {
+                    once.under(device, 1);
+                }
                 wraps(device, &mut landings.0);
                 return <Partition<Rows, KvHeads, Groups, Head, SCALE> as shard::Partition>::overlapped::<
                     _,
@@ -1802,11 +1802,14 @@ where
                     rest,
                     (&mut landings.0, &mut landings.1, &mut landings.2),
                     (&mut lands, prepares, attends),
-                    (|device| once(device, 1), |_, _, _| ()),
+                    (|device| once.boundary(device, 1), |_, _, _| ()),
                 );
             }
             let mut landed = Landing::new();
             lands(device, 0, &mut landed);
+            if const { H::WORK } {
+                once.under(device, 1);
+            }
             wraps(device, &mut landed);
             return <Partition<Rows, KvHeads, Groups, Head, SCALE> as shard::Partition>::windows::<
                 _,
@@ -1827,7 +1830,7 @@ where
                         attends(device, (&landing, restored), &values)
                     },
                 ),
-                |device| once(device, 1),
+                |device| once.boundary(device, 1),
             );
         }
         let rest = rest.extent::<m![{ Symbol<Rest<Windows>> }]>();
@@ -1906,8 +1909,45 @@ where
             );
         }
         // Without a live row no pass runs, so the boundary runs alone.
-        once(device, 1 - groups.min(1));
+        if const { H::WORK } {
+            once.under(device, 1 - groups.min(1));
+        }
+        once.boundary(device, 1 - groups.min(1));
         attended
+    }
+}
+
+/// What the first pass runs of an attention's boundary: its work under a transfer, where it has
+/// any, once its first window's landing is issued; the rest where the pass's windows leave room for
+/// its transfers.
+trait Hooks {
+    /// Whether the boundary has work under a transfer.
+    const UNDER: bool;
+
+    /// The boundary's work under a transfer, `times` times.
+    fn under(&mut self, device: &mut Device, times: usize);
+
+    /// The rest of the boundary's work, `times` times.
+    fn boundary(&mut self, device: &mut Device, times: usize);
+}
+
+/// A boundary on its state.
+impl<H, G> Hooks for (&H, &mut G)
+where
+    H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()> + Under<G>,
+{
+    const UNDER: bool = H::WORK;
+
+    fn under(&mut self, device: &mut Device, times: usize) {
+        for _ in 0..times {
+            self.0.under(&mut *device, &mut *self.1);
+        }
+    }
+
+    fn boundary(&mut self, device: &mut Device, times: usize) {
+        for _ in 0..times {
+            crate::Module::forward(self.0, &mut *device, (), &mut (), &mut *self.1);
+        }
     }
 }
 
@@ -1995,7 +2035,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
         (boundary, times): (&mut B, usize),
         attended: &mut Attended<Rows, KvHeads, Groups, Head>,
     ) where
-        B: FnMut(&mut Device, usize),
+        B: Hooks,
         Source: Landed<Rows, KvHeads, Head>
             + for<'c> crate::Module<
                 (usize, Pass<N>),
@@ -2339,6 +2379,11 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 } else {
                     lands(device, (0, pass), even);
                 }
+                if const { B::UNDER } {
+                    for _ in 0..1 - tile.min(1) {
+                        boundary.under(device, times);
+                    }
+                }
                 wraps(device, pass, even);
                 let query =
                     <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::station::<
@@ -2357,7 +2402,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                      _: &()| scores(device, &query, window);
                 let boundary = |device: &mut Device| {
                     for _ in 0..1 - tile.min(1) {
-                        boundary(device, times);
+                        boundary.boundary(device, times);
                     }
                 };
                 // The next pass's first window, into the place of this pass's first, which its
@@ -2406,6 +2451,9 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     let spread = pass.windows();
                     let projected = query.pass(device, spread);
                     lands_spread(device, spread, &mut even);
+                    if const { B::UNDER } {
+                        boundary.under(device, times);
+                    }
                     // Lane `l` takes row `l`'s tokens past its last window: the live row's into the
                     // place of its first window, none from the rows past it.
                     wraps(device, pass, &mut even);
@@ -2414,7 +2462,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                             SliceRows<Rows, KvHeads, N>,
                             _,
                         >(device, projected.view());
-                    boundary(device, times);
+                    boundary.boundary(device, times);
                     let window = prepares(device, &even, &mut nothing);
                     let (partial, lse) = scores(device, &query, (&even, window));
                     // Each lane takes its cluster's first: the live row's attention on its own lane,
@@ -2488,6 +2536,11 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 } else {
                     lands(device, (0, pass), &mut *even);
                 }
+                if const { B::UNDER } {
+                    for _ in 0..1 - tile.min(1) {
+                        boundary.under(device, times);
+                    }
+                }
                 // Behind the first window, whichever pass landed it, and ahead of every attention
                 // of the pass, so none waits for it.
                 wraps(device, pass, &mut *even);
@@ -2518,7 +2571,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 };
                 let boundary = |device: &mut Device| {
                     for _ in 0..1 - tile.min(1) {
-                        boundary(device, times);
+                        boundary.boundary(device, times);
                     }
                 };
                 let places = (&mut *even, &mut *odd, &mut *values);
@@ -2555,8 +2608,11 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     let spread = pass.windows();
                     let projected = query.pass(device, spread);
                     lands_spread(device, spread, &mut even);
+                    if const { B::UNDER } {
+                        boundary.under(device, times);
+                    }
                     wraps(device, pass, &mut even);
-                    boundary(device, times);
+                    boundary.boundary(device, times);
                     let registers = prepares(device, &even, &mut values);
                     let (partial, lse) = attends(device, &projected, registers, &values);
                     // Each lane takes its cluster's first: the live row's attention on its own lane,
@@ -2589,6 +2645,11 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 let projected = projects(device, pass);
                 let mut landed = Landing::new();
                 lands(device, (0, pass), &mut landed);
+                if const { B::UNDER } {
+                    for _ in 0..1 - tile.min(1) {
+                        boundary.under(device, times);
+                    }
+                }
                 wraps(device, pass, &mut landed);
                 let merged = <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::windows::<
                     _,
@@ -2611,7 +2672,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     ),
                     |device: &mut Device| {
                         for _ in 0..1 - tile.min(1) {
-                            boundary(device, times);
+                            boundary.boundary(device, times);
                         }
                     },
                 );

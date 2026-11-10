@@ -544,7 +544,7 @@ impl<
         (&H, &mut G),
     )> for Windowed<Heads, Groups, Head, SCALE>
 where
-    H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()>,
+    H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()> + crate::Under<G>,
 {
     type Output = Live<Attended<Rows, Heads, Groups, Head>, Rows>;
 
@@ -602,7 +602,7 @@ impl<
 where
     for<'l> Paged<'l, Rows, Heads, Head, Windows, D, S, (&'l Wrap<Rows>, usize)>:
         Landed<Rows, Heads, Head, Element = D>,
-    H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()>,
+    H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()> + crate::Under<G>,
 {
     type Output = Live<Attended<Rows, Heads, Groups, Head>, Rows>;
 
