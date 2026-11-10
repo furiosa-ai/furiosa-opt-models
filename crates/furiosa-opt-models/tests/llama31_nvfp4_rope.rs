@@ -13,7 +13,13 @@ axes![Head = 128, Position = 8193];
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "opens a device"]
 async fn loads_llama3_scaled_rotation_coefficients() {
-    let config = serde_json::from_str(include_str!("fixtures/llama_nvfp4_config.json")).unwrap();
+    let config = serde_json::json!({
+        "max_position_embeddings": 131072, "rope_theta": 500000.0,
+        "rope_scaling": {
+            "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0, "original_max_position_embeddings": 8192,
+        },
+    });
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = Checkpoint::new(directory.path(), Some(config)).unwrap();
     let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
