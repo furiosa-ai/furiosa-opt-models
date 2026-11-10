@@ -19,7 +19,6 @@ pub(crate) type WaveOutput<O, R> =
 pub type Output<O, R> = HbmTensor<bf16, Chip, m![R, O]>;
 
 pub type Stored<H, O> = m![O / (O / 8), H / 64, O % (O / 8), H % 64];
-pub type Bytes<H, O> = m![O / (O / 8), H / 64, O % (O / 8), H % 64 / 2];
 pub type StoredScales<H, O> = m![O / (O / 8), H / 64, O % (O / 8), H % 64 / 16];
 
 /// Packed checkpoint tensors, reordered once on the host into contraction slices.

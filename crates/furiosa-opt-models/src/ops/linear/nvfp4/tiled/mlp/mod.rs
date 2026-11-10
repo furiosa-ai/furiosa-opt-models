@@ -2,6 +2,7 @@
 //! W4A16 arithmetic retains per-16 weight block scales and FP32 sums.
 
 use super::{block, panels::Panels};
+use crate::modules::generic::collection::View;
 use crate::ops::linear::nvfp4::tiled::prefetch::Points;
 use crate::ops::normalization::span::Owned;
 use crate::tensor::parallel::Chip;
@@ -21,35 +22,22 @@ pub struct Mlp<H: AxisName, I: AxisName> {
     pub up_proj: Panels<H, I>,
     pub down_proj: Down<I, H>,
 }
-impl<H: AxisName, I: AxisName, const N: usize> crate::modules::generic::collection::View<N>
-    for Mlp<H, I>
-{
-    type Storage = (
-        <Panels<H, I> as crate::modules::generic::collection::View<N>>::Storage,
-        <Panels<H, I> as crate::modules::generic::collection::View<N>>::Storage,
-        <Down<I, H> as crate::modules::generic::collection::View<N>>::Storage,
-    );
+impl<H: AxisName, I: AxisName, const N: usize> View<N> for Mlp<H, I> {
+    type Storage = <(Panels<H, I>, (Panels<H, I>, Down<I, H>)) as View<N>>::Storage;
     type Layer = Self;
     fn view(storage: &Self::Storage, layer: usize) -> Self {
-        use crate::modules::generic::collection::View;
+        let (gate_proj, (up_proj, down_proj)) =
+            <(Panels<H, I>, (Panels<H, I>, Down<I, H>)) as View<N>>::view(storage, layer);
         Self {
-            gate_proj: <Panels<H, I> as View<N>>::view(&storage.0, layer),
-            up_proj: <Panels<H, I> as View<N>>::view(&storage.1, layer),
-            down_proj: <Down<I, H> as View<N>>::view(&storage.2, layer),
+            gate_proj,
+            up_proj,
+            down_proj,
         }
     }
     fn stack(layers: [Self; N], cx: &mut crate::load::Context<'_>) -> Self::Storage {
-        use crate::modules::generic::collection::View;
-        let (mut gate, mut up, mut down) = (Vec::new(), Vec::new(), Vec::new());
-        for layer in layers {
-            gate.push(layer.gate_proj);
-            up.push(layer.up_proj);
-            down.push(layer.down_proj);
-        }
-        (
-            <Panels<H, I> as View<N>>::stack(gate.try_into().ok().unwrap(), cx),
-            <Panels<H, I> as View<N>>::stack(up.try_into().ok().unwrap(), cx),
-            <Down<I, H> as View<N>>::stack(down.try_into().ok().unwrap(), cx),
+        <(Panels<H, I>, (Panels<H, I>, Down<I, H>)) as View<N>>::stack(
+            layers.map(|layer| (layer.gate_proj, (layer.up_proj, layer.down_proj))),
+            cx,
         )
     }
 }
