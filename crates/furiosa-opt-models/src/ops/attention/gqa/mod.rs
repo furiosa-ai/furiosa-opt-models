@@ -1397,6 +1397,15 @@ type Bias<Rows, KvHeads, Count = RowGroups<Rows>, Slot = HeadSlot<KvHeads>> = Dm
     m![{ Count }, { ShardKeys<KvHeads> }],
 >;
 
+/// [`Bias`] of every `N`-row tile and window of an envelope, as passes over the tiles read it.
+type Biases<Rows, KvHeads, Windows, const N: usize> = DmTensor<
+    f32,
+    Chip,
+    Cluster<Rows>,
+    CacheSlices<Rows, KvHeads, TileSlot<Rows, KvHeads, N>>,
+    m![{ Tiles<Rows, N> }, Windows, { SliceRows<Rows, KvHeads, N> }, { ShardKeys<KvHeads> }],
+>;
+
 pub(super) type Local<Rows, KvHeads, Groups, Head, const SCALE: usize> =
     shard::Local<Partition<Rows, KvHeads, Groups, Head, SCALE>, RowGroups<Rows>>;
 
@@ -1801,7 +1810,11 @@ where
                     device,
                     rest,
                     (&mut landings.0, &mut landings.1, &mut landings.2),
-                    (&mut lands, prepares, attends),
+                    (
+                        &mut lands,
+                        |device, (_, landing), values| prepares(device, landing, values),
+                        attends,
+                    ),
                     (|device| once.boundary(device, 1), |_, _, _| ()),
                 );
             }
@@ -1998,6 +2011,16 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
             && (!Self::follows::<Rows, N>() || Windows::SIZE <= 2)
     }
 
+    /// Whether passes of `N` rows hold every tile's bias of the envelope, landed once before the
+    /// first, instead of each window's beside its cells: passes that repeat over the envelope and
+    /// stream their windows, whose histories span two windows at most.
+    const fn holds_bias<Rows: AxisName, Windows: AxisName, Q, const N: usize>() -> bool
+    where
+        Q: Queries<Rows, KvHeads, Groups, Head>,
+    {
+        Self::streams::<Rows, Windows, Q, N>() && Self::follows::<Rows, N>()
+    }
+
     /// Whether a pass of `N` rows over cells of `E` may spread its one live row: a pass of one row
     /// group a slice that lands no next pass, whose cluster's cells hold a row's lane windows of
     /// such cells, and that holds its windows' terms for one merge where it streams them, else
@@ -2095,13 +2118,15 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
         let lands = |device: &mut Device,
                      (at, pass): (usize, Pass<N>),
                      landing: &mut Place<Rows, KvHeads, Head, Source, N>| {
-            bias.view()
-                .tile::<m![Windows], 1, m![Rows, Windows = 1 # Windows, Cache]>(at)
-                .tile::<Tiles<Rows, N>, 1, m![
-                    { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), { TileRows<Rows, N> },
-                    { Layout<Rows>::Lanes }, Windows = 1 # Windows, Cache
-                ]>(pass.tile)
-                .to_dm_view(&mut device.tdma, landing.bias.view_mut());
+            if const { !Self::holds_bias::<Rows, Windows, Q, N>() } {
+                bias.view()
+                    .tile::<m![Windows], 1, m![Rows, Windows = 1 # Windows, Cache]>(at)
+                    .tile::<Tiles<Rows, N>, 1, m![
+                        { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), { TileRows<Rows, N> },
+                        { Layout<Rows>::Lanes }, Windows = 1 # Windows, Cache
+                    ]>(pass.tile)
+                    .to_dm_view(&mut device.tdma, landing.bias.view_mut());
+            }
             crate::Module::forward(history, &mut *device, (), &mut landing.cells, (at, pass));
         };
         // A pass spreading its live row's windows lands them at once, bias first.
@@ -2287,16 +2312,53 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 &'a mut Place<Rows, KvHeads, Head, Source, N>,
                 &'a mut (),
             );
+            type Unprepared<'a, Source, Rows, KvHeads, Head, Windows, const N: usize> = (
+                Pass<N>,
+                usize,
+                &'a Place<Rows, KvHeads, Head, Source, N>,
+                &'a Biases<Rows, KvHeads, Windows, N>,
+            );
+            type Shared<'a, Rows, KvHeads, Groups, Head, Windows, B, const N: usize> = (
+                &'a mut Attended<Rows, KvHeads, Groups, Head>,
+                &'a mut B,
+                &'a Biases<Rows, KvHeads, Windows, N>,
+            );
+            let mut biases = Biases::<Rows, KvHeads, Windows, N>::new();
             // A window's keys and values stream from where they landed, so preparing it builds only
             // its masks.
             let prepares = |device: &mut Device,
-                            landing: &Place<Rows, KvHeads, Head, Source, N>,
+                            (pass, at, landing, biases): Unprepared<
+                '_,
+                Source,
+                Rows,
+                KvHeads,
+                Head,
+                Windows,
+                N,
+            >,
                             _: &mut ()|
              -> Masks<Rows, KvHeads, Groups, Head, SCALE, N> {
-                <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::mask::<
-                    SliceRows<Rows, KvHeads, N>,
-                    _,
-                >(device, landing.bias.view())
+                if const { Self::holds_bias::<Rows, Windows, Q, N>() } {
+                    let bias = biases
+                        .view()
+                        .tile::<Tiles<Rows, N>, 1, m![
+                            { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), Windows,
+                            { SliceRows<Rows, KvHeads, N> }, { ShardKeys<KvHeads> }
+                        ]>(pass.tile)
+                        .tile::<m![Windows], 1, m![
+                            { Tiles<Rows, N> } = 1 # ({ Tiles<Rows, N> }), Windows = 1 # Windows,
+                            { SliceRows<Rows, KvHeads, N> }, { ShardKeys<KvHeads> }
+                        ]>(at);
+                    <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::mask::<
+                        SliceRows<Rows, KvHeads, N>,
+                        _,
+                    >(device, bias)
+                } else {
+                    <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::mask::<
+                        SliceRows<Rows, KvHeads, N>,
+                        _,
+                    >(device, landing.bias.view())
+                }
             };
             // A window's attention of the query rows on station.
             let scores = |device: &mut Device,
@@ -2363,10 +2425,16 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
             let rows = |device: &mut Device,
                         tile: usize,
                         (even, odd, nothing): Places<'_, Source, Rows, KvHeads, Head, N>,
-                        (attended, boundary): (
-                &mut Attended<Rows, KvHeads, Groups, Head>,
-                &mut B,
-            )| {
+                        (attended, boundary, biases): Shared<
+                '_,
+                Rows,
+                KvHeads,
+                Groups,
+                Head,
+                Windows,
+                B,
+                N,
+            >| {
                 let pass = Pass::<N>::of(first + tile, live);
                 // The query rows go ahead of the first window, which would hold them back in the
                 // transfer queue, so they are spread while the window's landing is issued.
@@ -2418,7 +2486,12 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                         }
                     };
                 let places = (even, odd, nothing);
-                let steps = (&mut land, &prepares, &mut attend);
+                let prepare = |device: &mut Device,
+                               (at, landing): (usize, &Place<Rows, KvHeads, Head, Source, N>),
+                               nothing: &mut ()| {
+                    prepares(device, (pass, at, landing, biases), nothing)
+                };
+                let steps = (&mut land, prepare, &mut attend);
                 let merged = if const { Self::follows::<Rows, N>() } {
                     <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::overlapped::<
                         _,
@@ -2463,7 +2536,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                             _,
                         >(device, projected.view());
                     boundary.boundary(device, times);
-                    let window = prepares(device, &even, &mut nothing);
+                    let window = prepares(device, (pass, 0, &even, &biases), &mut nothing);
                     let (partial, lse) = scores(device, &query, (&even, window));
                     // Each lane takes its cluster's first: the live row's attention on its own lane,
                     // a copy on the lanes of rows past it in its row group, which no row reads.
@@ -2481,12 +2554,47 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 }
                 for tile in 0..count - lone {
                     let places = (&mut even, &mut odd, &mut nothing);
-                    rows(device, tile, places, (&mut *attended, &mut *boundary));
+                    rows(
+                        device,
+                        tile,
+                        places,
+                        (&mut *attended, &mut *boundary, &biases),
+                    );
+                }
+            } else if const { Self::holds_bias::<Rows, Windows, Q, N>() } {
+                // The passes run with the bias they hold, so without a pass nothing lands or waits;
+                // a transfer a window the histories span, as the paging leaves later ones unwritten.
+                for _ in 0..count.min(1) {
+                    for at in 0..rest + 1 {
+                        bias.view()
+                            .tile::<m![Windows], 1, m![Rows, Windows = 1 # Windows, Cache]>(at)
+                            .to_dm_view(
+                                &mut device.tdma,
+                                biases.view_mut().tile::<m![Windows], 1, m![
+                                    { Tiles<Rows, N> }, Windows = 1 #{!} Windows,
+                                    { SliceRows<Rows, KvHeads, N> }, { ShardKeys<KvHeads> }
+                                ]>(at),
+                            );
+                    }
+                    for tile in 0..count {
+                        let places = (&mut even, &mut odd, &mut nothing);
+                        rows(
+                            device,
+                            tile,
+                            places,
+                            (&mut *attended, &mut *boundary, &biases),
+                        );
+                    }
                 }
             } else {
                 for tile in 0..count {
                     let places = (&mut even, &mut odd, &mut nothing);
-                    rows(device, tile, places, (&mut *attended, &mut *boundary));
+                    rows(
+                        device,
+                        tile,
+                        places,
+                        (&mut *attended, &mut *boundary, &biases),
+                    );
                 }
             }
         } else if const { Self::overlaps::<Rows>(slice_rows::<KvHeads>(N), Q::COPIES) } {
@@ -2575,7 +2683,13 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     }
                 };
                 let places = (&mut *even, &mut *odd, &mut *values);
-                let steps = (&mut land, &prepares, &mut attend);
+                let prepare =
+                    |device: &mut Device,
+                     (_, landing): (usize, &Place<Rows, KvHeads, Head, Source, N>),
+                     values: &mut Transposed<Rows, KvHeads, Groups, Head, SCALE, N>| {
+                        prepares(device, landing, values)
+                    };
+                let steps = (&mut land, prepare, &mut attend);
                 let merged = if const { Self::follows::<Rows, N>() } {
                     <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::overlapped::<
                         _,

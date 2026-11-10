@@ -411,8 +411,8 @@ pub(crate) trait Partition: Sized {
     }
 
     /// [`Self::windows`] landing windows alternately in two places, `rest` (at most `Rest`) after
-    /// the first, which is in `even` already; `prepare` runs before the next lands: its page mapping
-    /// waits for every transfer.
+    /// the first, which is in `even` already; `prepare` takes a window's index and place and runs
+    /// before the next lands: its page mapping waits for every transfer.
     ///
     /// With `FOLLOW`, `follow` lands window `at` into `even`, or past the last window what follows
     /// it, once the last window is prepared: `attend` must then read only what `prepare` returned,
@@ -430,7 +430,7 @@ pub(crate) trait Partition: Sized {
         places: (&mut P, &mut P, &mut V),
         steps: (
             impl FnMut(&mut Device, usize, &mut P),
-            impl FnMut(&mut Device, &P, &mut V) -> F,
+            impl FnMut(&mut Device, (usize, &P), &mut V) -> F,
             impl FnMut(&mut Device, (&P, F), &V) -> (Partial<Self>, Local<Self>),
         ),
         hooks: (
@@ -482,7 +482,7 @@ pub(crate) trait Partition: Sized {
         (even, odd, values): (&mut P, &mut P, &mut V),
         (mut land, mut prepare, mut attend): (
             impl FnMut(&mut Device, usize, &mut P),
-            impl FnMut(&mut Device, &P, &mut V) -> F,
+            impl FnMut(&mut Device, (usize, &P), &mut V) -> F,
             impl FnMut(&mut Device, (&P, F), &V) -> (Partial<Self>, Local<Self>),
         ),
         (mut boundary, mut follow): (
@@ -498,7 +498,7 @@ pub(crate) trait Partition: Sized {
         } else {
             boundary(device);
         }
-        let window = prepare(device, even, values);
+        let window = prepare(device, (0, even), values);
         if const { Rest::SIZE > 0 } {
             for _ in 0..rest.min(1) {
                 land(device, 1, odd);
@@ -515,7 +515,7 @@ pub(crate) trait Partition: Sized {
                         boundary(device);
                     }
                 }
-                let window = prepare(device, odd, values);
+                let window = prepare(device, (2 * pair + 1, odd), values);
                 if const { FOLLOW } {
                     follow(device, 2 * pair + 2, even);
                 } else if const { Rest::SIZE > 1 } {
@@ -532,7 +532,7 @@ pub(crate) trait Partition: Sized {
                                 boundary(device);
                             }
                         }
-                        let window = prepare(device, even, values);
+                        let window = prepare(device, (2 * pair + 2, even), values);
                         if const { Rest::SIZE > 2 } {
                             for _ in 0..((after - 1) / 2).min(1) {
                                 land(device, 2 * pair + 3, odd);
