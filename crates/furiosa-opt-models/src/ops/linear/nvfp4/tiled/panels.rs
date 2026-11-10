@@ -1,17 +1,16 @@
 //! Activation-stationary NVFP4 projections. A 1024-feature panel is split over eight
 //! input slices and reused by the four 128-token waves of a 512-row span.
-use super::{Scales as Factors, block};
+use super::block;
 use crate::Op;
+use crate::modules::generic::collection::View;
+use crate::ops::linear::nvfp4::tiled::Weights;
 use crate::tensor::{live::Live, parallel::Chip};
 use furiosa_opt_std::prelude::*;
 
 #[derive(DeviceSend, crate::load::Load)]
-#[load(tree)]
 pub struct Panels<I: AxisName, O: AxisName> {
-    pub weight: HbmTensor<f4e2m1, Chip, Stored<I, O>>,
-    pub weight_scale: HbmTensor<f8e4m3, Chip, StoredScales<I, O>>,
     #[load(rename = "")]
-    pub scales: Factors,
+    pub weights: Weights<I, O, Stored<I, O>, StoredScales<I, O>>,
 }
 
 pub type Stored<I, O> = m![
@@ -58,6 +57,7 @@ axes![Terms = 2];
 impl<I: AxisName, O: AxisName> Panels<I, O> {
     /// Canonical [output, input / PACK] values into contiguous per-slice panels.
     /// PACK is 2 for packed codes and 16 for block scales (1 for scalar test codes).
+    #[cfg(test)]
     pub fn reorder<const PACK: usize, T: Copy>(values: &[T]) -> Vec<T> {
         assert_eq!(values.len(), O::SIZE * I::SIZE / PACK);
         let mut result = Vec::with_capacity(values.len());
@@ -76,11 +76,11 @@ impl<I: AxisName, O: AxisName> Panels<I, O> {
 
     pub(crate) fn load(&self, device: &mut Device, panel: usize) -> Packed<I, O> {
         (
-            self.weight
+            self.weights.weight
                 .view()
                 .tile::<m![I / 1024], 1, m![I / 1024 = 1 # (I / 1024), O / (O / 64), I % 1024 / 128, O % (O / 64), I % 128]>(panel)
                 .to_dm(&mut device.tdma),
-            self.weight_scale
+            self.weights.weight_scale.tensor
                 .view()
                 .tile::<m![I / 1024], 1, m![I / 1024 = 1 # (I / 1024), O / (O / 64), I % 1024 / 128, O % (O / 64), I % 128 / 16]>(panel)
                 .to_dm(&mut device.tdma),
@@ -122,14 +122,14 @@ impl<I: AxisName, O: AxisName> Panels<I, O> {
             Cluster<O>,
             Slices<I, O>,
             m![I / 1024, O % (O / 64), I % 128],
-        > = self.weight.to_dm(&mut device.tdma);
+        > = self.weights.weight.to_dm(&mut device.tdma);
         let scales: DmTensor<
             f8e4m3,
             Chip,
             Cluster<O>,
             Slices<I, O>,
             m![I / 1024, O % (O / 64), I % 128 / 16],
-        > = self.weight_scale.to_dm(&mut device.tdma);
+        > = self.weights.weight_scale.tensor.to_dm(&mut device.tdma);
         (codes, scales)
     }
 
@@ -239,7 +239,7 @@ impl<I: AxisName, O: AxisName> Panels<I, O> {
             sums.view()
                 .tile::<m![R / 128], 1, m![R / 128 = 1 # (R / 128), R % 16, O % (O / 64)]>(wave)
                 .to_dm_view(&mut device.tdma, partial.view_mut());
-            let values = block::finish(device, &self.scales, partial);
+            let values = block::finish(device, &self.weights.contract, partial);
             values.view().to_hbm_view(
                 &mut device.tdma,
                 output
@@ -263,12 +263,30 @@ impl<I: AxisName, O: AxisName, R: AxisName> Op<(Live<(), R>, &Rows<R, I>)> for P
     }
 }
 
-loading!(Panels);
+impl<I: AxisName, O: AxisName, const N: usize> View<N> for Panels<I, O> {
+    type Storage = <Weights<I, O, Stored<I, O>, StoredScales<I, O>> as View<N>>::Storage;
+    type Layer = Self;
+    fn view(storage: &Self::Storage, layer: usize) -> Self {
+        Self {
+            weights: <Weights<I, O, Stored<I, O>, StoredScales<I, O>> as View<N>>::view(
+                storage, layer,
+            ),
+        }
+    }
+    fn stack(layers: [Self; N], cx: &mut crate::load::Context<'_>) -> Self::Storage {
+        <Weights<I, O, Stored<I, O>, StoredScales<I, O>> as View<N>>::stack(
+            layers.map(|layer| layer.weights),
+            cx,
+        )
+    }
+}
 
 #[cfg(test)]
 mod tests {
+    use crate::ops::linear::nvfp4::tiled::Blocks;
     use crate::ops::linear::nvfp4::tiled::panels::Panels;
     use crate::ops::linear::nvfp4::tiled::tests as fixtures;
+    use crate::tensor::form::BlockScaled;
     use crate::{
         Op,
         tensor::{live::Live, scalar::Value as Count},
@@ -300,9 +318,7 @@ mod tests {
         )
         .await;
         let projection = Panels {
-            weight,
-            weight_scale,
-            scales,
+            weights: BlockScaled::new(weight, Blocks::new(weight_scale), scales),
         };
         let input = input::<Hidden>(&mut device).await;
         for rows in [129] {

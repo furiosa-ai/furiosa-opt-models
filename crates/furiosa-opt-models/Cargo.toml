@@ -31,8 +31,6 @@ tokio = { version = "1", features = ["macros", "rt", "sync"] }
 [features]
 # Checkpoints edited tensor by tensor, for the tests of crates that load them.
 test-support = []
-# Device diagnostics use production projection and prefetch paths.
-kernel-diagnostics = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(backend, values("npu"))'] }

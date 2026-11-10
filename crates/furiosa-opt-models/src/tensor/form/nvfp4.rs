@@ -247,19 +247,16 @@ where
 
 /// The packed E2M1 codes at the context's name, two a byte as stored (`[out, in / 2]` U8), on
 /// every chip of `C`.
-pub(crate) fn codes<C: M + 'static, S: M + 'static>(
+pub(crate) fn codes<C: M + 'static, In: AxisName, Out: AxisName>(
     from: &Checkpoint,
     context: &mut Context<'_>,
-) -> Result<HostTensor<f4e2m1, m![{ C }, { S }]>, LoadError> {
+) -> Result<HostTensor<f4e2m1, m![{ C }, { m![Out, In] }]>, LoadError> {
     let (name, view) = context.tensor(from)?;
-    let elements = <S as M>::SIZE;
-    let rows = view.shape().first().copied().unwrap_or(0);
-    if view.dtype() != Dtype::U8 || view.shape().len() != 2 || 2 * view.data().len() != elements {
+    let (rows, bytes) = (Out::SIZE, In::SIZE / 2);
+    if view.dtype() != Dtype::U8 || view.shape() != [rows, bytes] {
         return Err(LoadError::InvalidData {
             name,
-            reason: format!(
-                "expected {elements} packed E2M1 codes in {rows} U8 rows, two codes a byte"
-            ),
+            reason: format!("expected U8 [{rows}, {bytes}], two E2M1 codes a byte"),
         });
     }
     HostTensor::try_from(HostBuffer::from_vec(view.data().repeat(C::SIZE))).map_err(|error| {
@@ -352,18 +349,18 @@ mod tests {
         let stored_as = |dtype, shape: &[usize], bytes: usize| {
             let bytes = (0..bytes).map(|byte| byte as u8).collect();
             let tensors = [("weight", dtype, shape, bytes)];
-            read(&tensors, "weight", codes::<m![1], m![Outputs, Inputs]>)
+            read(&tensors, "weight", codes::<m![1], Inputs, Outputs>)
         };
         let stored = stored_as(Dtype::U8, &[2, 16], 32).unwrap();
         let expected: Vec<u8> = (0..32).collect();
         assert_eq!(Vec::<u8>::from(stored.into_buffer()), expected);
-        for (dtype, shape, bytes, rows) in [
-            (Dtype::I8, &[2, 16][..], 32, 2),
-            (Dtype::U8, &[1, 2, 16][..], 32, 1),
-            (Dtype::U8, &[2, 8][..], 16, 2),
+        for (dtype, shape, bytes) in [
+            (Dtype::I8, &[2, 16][..], 32),
+            (Dtype::U8, &[1, 2, 16][..], 32),
+            (Dtype::U8, &[2, 8][..], 16),
+            (Dtype::U8, &[4, 8][..], 32),
         ] {
-            let reason =
-                format!("expected 64 packed E2M1 codes in {rows} U8 rows, two codes a byte");
+            let reason = "expected U8 [2, 16], two E2M1 codes a byte".to_owned();
             let refused = ("weight".to_owned(), reason);
             assert_eq!(
                 invalid(stored_as(dtype, shape, bytes)),
@@ -372,7 +369,7 @@ mod tests {
             );
         }
         assert_eq!(
-            missing(read(&[], "weight", codes::<m![1], m![Outputs, Inputs]>)),
+            missing(read(&[], "weight", codes::<m![1], Inputs, Outputs>)),
             ["weight"]
         );
     }

@@ -367,8 +367,26 @@ pub(super) fn sweep<H: AxisName, I: AxisName, R: AxisName>(
     let u3 = up.load(device, 3);
     let down1 = down.stage(device, 1);
     let g3 = restore(device, g3);
-    let (g, first) = last(device, &input, &g3, &b2, 0, &gate.scales, first, rows);
+    let (g, first) = last(
+        device,
+        &input,
+        &g3,
+        &b2,
+        0,
+        &gate.weights.contract,
+        first,
+        rows,
+    );
     let u3 = restore(device, u3);
-    let (u, _) = last(device, &input, &u3, &b2, 1, &up.scales, first, rows);
+    let (u, _) = last(
+        device,
+        &input,
+        &u3,
+        &b2,
+        1,
+        &up.weights.contract,
+        first,
+        rows,
+    );
     (g, u, (down0, down1))
 }

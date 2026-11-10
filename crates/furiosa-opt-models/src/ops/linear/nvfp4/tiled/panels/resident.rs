@@ -241,9 +241,12 @@ pub(crate) fn consume_qkv<H: AxisName, Q: AxisName, K: AxisName, R: AxisName, F>
     const {
         assert!(H::SIZE == 4096 && Q::SIZE == 4096 && K::SIZE == 1024 && R::SIZE == 512);
     }
-    let fq = block::scalar::<QkvCluster, Reduced<R>>(device, &projections.0.scales.output);
-    let fk = block::scalar::<QkvCluster, Reduced<R>>(device, &projections.1.scales.output);
-    let fv = block::scalar::<QkvCluster, Reduced<R>>(device, &projections.2.scales.output);
+    let fq =
+        block::scalar::<QkvCluster, Reduced<R>>(device, &projections.0.weights.contract.output);
+    let fk =
+        block::scalar::<QkvCluster, Reduced<R>>(device, &projections.1.weights.contract.output);
+    let fv =
+        block::scalar::<QkvCluster, Reduced<R>>(device, &projections.2.weights.contract.output);
     for wave in 0..rows.div_ceil(128) {
         let groups = rows.div_ceil(64) - (2 * wave).min(rows.div_ceil(64));
         let l0 = lanes(device, input, 0, wave, rows);
@@ -396,9 +399,9 @@ fn compact_qkv<H: AxisName, Q: AxisName, K: AxisName, R: AxisName, const W: usiz
     let q = tile::add(device, s2.0.view(), p3.0.view());
     let k = tile::add(device, s2.1.view(), p3.1.view());
     let v = tile::add(device, s2.2.view(), p3.2.view());
-    let q = block::finish(device, &projections.0.scales, q);
-    let k = block::finish(device, &projections.1.scales, k);
-    let v = block::finish(device, &projections.2.scales, v);
+    let q = block::finish(device, &projections.0.weights.contract, q);
+    let k = block::finish(device, &projections.1.weights.contract, k);
+    let v = block::finish(device, &projections.2.weights.contract, v);
     let q = land::<Q, R, W>(device, q);
     let k = land::<K, R, W>(device, k);
     let v = land::<K, R, W>(device, v);

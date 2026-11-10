@@ -2,8 +2,10 @@
 //! 64 input slices per cluster. Paired waves fill a 32-KiB TRF operand, with
 //! the next pair or final single wave prefetched into a separate TRF half.
 //! Direct launches use 16/32-row tiles; larger launches restore BF16 weights once.
+use super::block;
 use super::prefetch::{Points, Stage};
-use super::{Scales, block};
+use crate::modules::generic::collection::View;
+use crate::ops::linear::nvfp4::tiled::Weights;
 use crate::ops::normalization::span::Owned;
 use crate::tensor::parallel::Chip;
 use furiosa_opt_std::prelude::*;
@@ -13,7 +15,7 @@ type Cluster<O> = m![O / (O / 2)];
 pub(crate) type WaveOutput<O, R> =
     DmTensor<bf16, Chip, Cluster<O>, m![O % (O / 2) / 128 # 16, R % 128 / 8], m![R % 8, O % 128]>;
 
-#[cfg(any(test, feature = "kernel-diagnostics"))]
+#[cfg(test)]
 pub type Output<O, R> = HbmTensor<bf16, Chip, m![R, O]>;
 
 pub type Stored<H, O> = m![O / (O / 8), H / 64, O % (O / 8), H % 64];
@@ -22,14 +24,12 @@ pub type StoredScales<H, O> = m![O / (O / 8), H / 64, O % (O / 8), H % 64 / 16];
 
 /// Packed checkpoint tensors, reordered once on the host into contraction slices.
 #[derive(DeviceSend, crate::load::Load)]
-#[load(tree)]
 pub struct QkvProjection<H: AxisName, O: AxisName> {
-    pub weight: HbmTensor<f4e2m1, Chip, Stored<H, O>>,
-    pub weight_scale: HbmTensor<f8e4m3, Chip, StoredScales<H, O>>,
     #[load(rename = "")]
-    pub scales: Scales,
+    pub weights: Weights<H, O, Stored<H, O>, StoredScales<H, O>>,
 }
 impl<H: AxisName, O: AxisName> QkvProjection<H, O> {
+    #[cfg(test)]
     pub fn reorder<const PACK: usize, T: Copy>(values: &[T]) -> Vec<T> {
         assert!(H::SIZE.is_multiple_of(64) && O::SIZE.is_multiple_of(8));
         assert!(matches!(PACK, 1 | 2 | 16));
@@ -89,7 +89,23 @@ type PackRows<R, const N: usize> = m![R % { N } / 4];
 type DirectTiles<R, const W: usize> = m![R % 128 / { W }];
 type WaveCount<R, const W: usize> = m![R % { W } / 128];
 
-loading!(QkvProjection);
+impl<H: AxisName, O: AxisName, const N: usize> View<N> for QkvProjection<H, O> {
+    type Storage = <Weights<H, O, Stored<H, O>, StoredScales<H, O>> as View<N>>::Storage;
+    type Layer = Self;
+    fn view(storage: &Self::Storage, layer: usize) -> Self {
+        Self {
+            weights: <Weights<H, O, Stored<H, O>, StoredScales<H, O>> as View<N>>::view(
+                storage, layer,
+            ),
+        }
+    }
+    fn stack(layers: [Self; N], cx: &mut crate::load::Context<'_>) -> Self::Storage {
+        <Weights<H, O, Stored<H, O>, StoredScales<H, O>> as View<N>>::stack(
+            layers.map(|layer| layer.weights),
+            cx,
+        )
+    }
+}
 
 /// Select the representation for this span. Consumption must use the same row
 /// classification (direct through DIRECT_MAX_ROWS, restored above it).
@@ -129,14 +145,18 @@ pub(crate) fn stage<H: AxisName, O: AxisName>(
         Cluster<O>,
         m![O % (O / 2) / (O / 8), H / 64],
         m![O % (O / 8), H % 64],
-    > = projection.weight.to_dm(&mut device.tdma);
+    > = projection.weights.weight.to_dm(&mut device.tdma);
     let scales: DmTensor<
         f8e4m3,
         Chip,
         Cluster<O>,
         m![O % (O / 2) / (O / 8), H / 64],
         m![O % (O / 8), H % 64 / 16],
-    > = projection.weight_scale.to_dm(&mut device.tdma);
+    > = projection
+        .weights
+        .weight_scale
+        .tensor
+        .to_dm(&mut device.tdma);
     // SAFETY: rename the same eight output owners, preserving physical order.
     unsafe { (codes.reshape(), scales.reshape()) }
 }
@@ -225,7 +245,7 @@ fn output_factor<H: AxisName, O: AxisName>(
     projection: &QkvProjection<H, O>,
 ) -> DmTensor<f32, Chip, Cl, Sl<H>, m![1 # 8]> {
     let landed: DmTensor<f32, Chip, m![2], m![1 # 256], m![1 # 8]> =
-        projection.scales.output.to_dm(&mut device.tdma);
+        projection.weights.contract.output.to_dm(&mut device.tdma);
     let factor: DmTensor<f32, Chip, m![2], m![256], m![1 # 8]> = device
         .sub
         .begin(landed.view())
@@ -293,7 +313,7 @@ fn project_restored<H: AxisName, O: AxisName, R: AxisName, const W: usize>(
     input: &Operand<H, R, W>,
     groups: usize,
 ) -> Values<O, R, W> {
-    let factor = block::scalar::<Cl, Reduced<O, R, W>>(device, &projection.scales.output);
+    let factor = block::scalar::<Cl, Reduced<O, R, W>>(device, &projection.weights.contract.output);
     let mut output = Values::new();
     let products = device
         .main
@@ -681,7 +701,7 @@ where
     next.finish(device)
 }
 
-#[cfg(any(test, feature = "kernel-diagnostics"))]
+#[cfg(test)]
 pub(crate) fn store_wave<O: AxisName, R: AxisName>(
     device: &mut Device,
     values: &WaveOutput<O, R>,
@@ -699,7 +719,9 @@ pub(crate) fn store_wave<O: AxisName, R: AxisName>(
 #[cfg(test)]
 mod tests {
     use super::{self as qkv, QkvProjection};
+    use crate::ops::linear::nvfp4::tiled::Blocks;
     use crate::ops::linear::nvfp4::tiled::tests as fixtures;
+    use crate::tensor::form::BlockScaled;
     use crate::tensor::scalar::Value as Count;
     use fixtures::*;
     use furiosa_opt_std::{prelude::*, runtime::launch};
@@ -718,7 +740,7 @@ mod tests {
         HbmTensor<bf16, m![1], m![Rows, KvWidth]>,
     ) {
         let own = input.to_dm(&mut device.tdma);
-        let (q, k, v) = crate::models::decoder::attention::llama::nvfp4::inspect_qkv_heads::<
+        let (q, k, v) = crate::ops::linear::nvfp4::tiled::heads::inspect_qkv_heads::<
             Hidden,
             OutputWidth,
             KvWidth,
@@ -743,7 +765,7 @@ mod tests {
         let qn = projection::<OutputWidth>(&mut device).await;
         let kn = projection::<KvWidth>(&mut device).await;
         let mut vn = projection::<KvWidth>(&mut device).await;
-        vn.scales.output =
+        vn.weights.contract.output =
             fixtures::upload::<f32, m![1 # 8]>(&mut device.pdma, vec![-0.5; 8]).await;
         let input = input::<Hidden>(&mut device).await;
         let original = fixtures::read::<_, m![Rows, Hidden]>(&mut device.pdma, &input).await;
@@ -800,16 +822,17 @@ mod tests {
                 )
             })
             .collect();
-        qn.weight = fixtures::upload::<f4e2m1, qkv::Stored<Hidden, OutputWidth>>(
+        qn.weights.weight = fixtures::upload::<f4e2m1, qkv::Stored<Hidden, OutputWidth>>(
             &mut device.pdma,
             QkvProjection::<Hidden, OutputWidth>::reorder::<1, _>(&codes),
         )
         .await;
-        qn.weight_scale = fixtures::upload::<f8e4m3, qkv::StoredScales<Hidden, OutputWidth>>(
-            &mut device.pdma,
-            QkvProjection::<Hidden, OutputWidth>::reorder::<16, _>(&scales),
-        )
-        .await;
+        qn.weights.weight_scale.tensor =
+            fixtures::upload::<f8e4m3, qkv::StoredScales<Hidden, OutputWidth>>(
+                &mut device.pdma,
+                QkvProjection::<Hidden, OutputWidth>::reorder::<16, _>(&scales),
+            )
+            .await;
         // Distinct row values detect reuse of the first operand in a prefetched tail.
         for rows in [32, 33, 257] {
             let input = fixtures::upload::<bf16, m![Rows, Hidden]>(
@@ -851,16 +874,17 @@ mod tests {
         let mut qn = projection::<OutputWidth>(&mut device).await;
         let kn = projection::<KvWidth>(&mut device).await;
         let vn = projection::<KvWidth>(&mut device).await;
-        qn.weight = fixtures::upload::<f4e2m1, qkv::Stored<Hidden, OutputWidth>>(
+        qn.weights.weight = fixtures::upload::<f4e2m1, qkv::Stored<Hidden, OutputWidth>>(
             &mut device.pdma,
             vec![f4e2m1::from_bits(2); Hidden::SIZE * OutputWidth::SIZE],
         )
         .await;
-        qn.weight_scale = fixtures::upload::<f8e4m3, qkv::StoredScales<Hidden, OutputWidth>>(
-            &mut device.pdma,
-            vec![f8e4m3::from_f32(0.125); Hidden::SIZE * OutputWidth::SIZE / 16],
-        )
-        .await;
+        qn.weights.weight_scale.tensor =
+            fixtures::upload::<f8e4m3, qkv::StoredScales<Hidden, OutputWidth>>(
+                &mut device.pdma,
+                vec![f8e4m3::from_f32(0.125); Hidden::SIZE * OutputWidth::SIZE / 16],
+            )
+            .await;
         let input = fixtures::upload::<bf16, m![Rows, Hidden]>(
             &mut device.pdma,
             vec![bf16::from_f32(6.0); Rows::SIZE * Hidden::SIZE],
@@ -870,7 +894,7 @@ mod tests {
         // a small normal factor also checks that a representable nonzero result survives.
         // The FP64 oracle uses the stored FP32 factor and permits final BF16 rounding.
         for factor in [1.3_f32, -0.7, 2.0_f32.powi(-120)] {
-            qn.scales.output =
+            qn.weights.contract.output =
                 fixtures::upload::<f32, m![1 # 8]>(&mut device.pdma, vec![factor; 8]).await;
             let expected = 3072.0_f64 * factor as f64;
             let rounded = bf16::from_f32(expected as f32);
@@ -901,17 +925,26 @@ mod tests {
         )
         .await;
         QkvProjection {
-            weight,
-            weight_scale,
-            scales,
+            weights: BlockScaled::new(weight, Blocks::new(weight_scale), scales),
         }
     }
 
     #[test]
     fn checkpoint_reorder_preserves_packed_weight_and_scale_coordinates() {
         fn check<const PACK: usize>() {
-            let original: Vec<_> = (0..Hidden::SIZE * KvWidth::SIZE / PACK).collect();
-            let reordered = QkvProjection::<Hidden, KvWidth>::reorder::<PACK, _>(&original);
+            let original: Vec<_> = (0..Hidden::SIZE * KvWidth::SIZE / PACK)
+                .map(|v| v as i32)
+                .collect();
+            let reordered =
+                HostTensor::<i32, m![KvWidth, Hidden / { PACK }]>::from_vec(original.clone())
+                    .into_inner()
+                    .transpose::<m![
+                        KvWidth / (KvWidth / 8),
+                        Hidden / 64,
+                        KvWidth % (KvWidth / 8),
+                        Hidden % 64 / { PACK }
+                    ]>(true)
+                    .into_vec();
             // Literal landmarks independently pin output-row, input-slice, and owner transitions.
             if PACK == 2 {
                 assert_eq!(

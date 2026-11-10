@@ -218,7 +218,9 @@ fn sum_into<C: M, S: M, Time: M, Feature: M, Prefix: M, Input: M, E: M>(
 
 #[cfg(test)]
 mod tests {
+    use crate::ops::linear::nvfp4::tiled::Blocks;
     use crate::ops::linear::nvfp4::tiled::tests as fixtures;
+    use crate::tensor::form::BlockScaled;
 
     use crate::{
         models::decoder::attention::llama::nvfp4::{Hidden, Intermediate, QWidth},
@@ -260,7 +262,8 @@ mod tests {
         count: &Count,
         input: &HbmTensor<bf16, m![1], m![Rows, Hidden]>,
     ) -> HbmTensor<bf16, m![1], m![Rows, QWidth]> {
-        use crate::models::decoder::attention::llama::nvfp4::{QWidth, inspect_transition};
+        use crate::models::decoder::attention::llama::nvfp4::QWidth;
+        use crate::schedule::decoder::nvfp4::inspect_transition;
         let rows = crate::tensor::live::Live::<(), Rows>::read(count).rows();
         let input = input.to_dm(&mut device.tdma);
         let (q, _, _) = inspect_transition(device, mlp, norm, qkv, &input, rows);
@@ -332,9 +335,7 @@ mod tests {
         )
         .await;
         let gate = Panels {
-            weight,
-            weight_scale,
-            scales,
+            weights: BlockScaled::new(weight, Blocks::new(weight_scale), scales),
         };
         let (weight, weight_scale, mut scales) = fixtures::weights::<Hidden, Intermediate, _, _>(
             &mut device,
@@ -352,9 +353,7 @@ mod tests {
         // Distinct weight tensor factors detect swapped gate/up paths.
         scales.output = fixtures::upload::<f32, m![1 # 8]>(&mut device.pdma, vec![0.25; 8]).await;
         let up = Panels {
-            weight,
-            weight_scale,
-            scales,
+            weights: BlockScaled::new(weight, Blocks::new(weight_scale), scales),
         };
         let (weight, weight_scale, scales) = fixtures::weights_with::<Intermediate, Hidden, _, _>(
             &mut device,
@@ -368,9 +367,7 @@ mod tests {
             gate_proj: gate,
             up_proj: up,
             down_proj: mlp::Down {
-                weight,
-                weight_scale,
-                scales,
+                weights: BlockScaled::new(weight, Blocks::new(weight_scale), scales),
             },
         };
         let expected = (0..512).map(reference).collect::<Vec<_>>();
@@ -439,9 +436,7 @@ mod tests {
         )
         .await;
         QkvProjection {
-            weight,
-            weight_scale,
-            scales,
+            weights: BlockScaled::new(weight, Blocks::new(weight_scale), scales),
         }
     }
 
@@ -562,9 +557,7 @@ mod tests {
         )
         .await;
         let gate_proj = Panels {
-            weight,
-            weight_scale,
-            scales,
+            weights: BlockScaled::new(weight, Blocks::new(weight_scale), scales),
         };
         let (weight, weight_scale, scales) = dense_weights::<Hidden, Intermediate, _, _>(
             &mut device,
@@ -574,9 +567,7 @@ mod tests {
         )
         .await;
         let up_proj = Panels {
-            weight,
-            weight_scale,
-            scales,
+            weights: BlockScaled::new(weight, Blocks::new(weight_scale), scales),
         };
         let (weight, weight_scale, scales) = dense_weights::<Intermediate, Hidden, _, _>(
             &mut device,
@@ -589,9 +580,7 @@ mod tests {
             gate_proj,
             up_proj,
             down_proj: mlp::Down {
-                weight,
-                weight_scale,
-                scales,
+                weights: BlockScaled::new(weight, Blocks::new(weight_scale), scales),
             },
         };
         let expected: [[f32; 16]; 4] = std::array::from_fn(dense_reference);

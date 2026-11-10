@@ -2,20 +2,19 @@
 //! keep BF16 activations in TRF and decode packed codes into 16-input dot products.
 //! Larger launches restore one BF16 weight tile per slice and reuse it across
 //! 128-row waves. Cluster partials add before tensor scaling and BF16 rounding.
-use super::{Scales as Factors, block};
+use super::block;
 use crate::Op;
+use crate::modules::generic::collection::View;
+use crate::ops::linear::nvfp4::tiled::Weights;
 use crate::ops::linear::nvfp4::tiled::prefetch::Points;
 use crate::ops::normalization::span::Owned;
 use crate::tensor::{live::Live, parallel::Chip};
 use furiosa_opt_std::prelude::*;
 
 #[derive(DeviceSend, crate::load::Load)]
-#[load(tree)]
 pub struct Output<I: AxisName, O: AxisName> {
-    pub weight: HbmTensor<f4e2m1, Chip, Stored<I, O>>,
-    pub weight_scale: HbmTensor<f8e4m3, Chip, StoredScales<I, O>>,
     #[load(rename = "")]
-    pub scales: Factors,
+    pub weights: Weights<I, O, Stored<I, O>, StoredScales<I, O>>,
 }
 pub type Stored<I, O> = m![I / (I / 2), O / 256, I % (I / 2) / 128, O % 256, I % 128];
 
@@ -54,6 +53,7 @@ impl<I: AxisName, O: AxisName> Op<&mut Staged<I, O>> for Output<I, O> {
 }
 
 impl<I: AxisName, O: AxisName> Output<I, O> {
+    #[cfg(test)]
     pub fn reorder<const PACK: usize, T: Copy>(values: &[T]) -> Vec<T> {
         assert_eq!(values.len(), O::SIZE * I::SIZE / PACK);
         let mut result = Vec::with_capacity(values.len());
@@ -152,7 +152,8 @@ impl<I: AxisName, O: AxisName> Output<I, O> {
         // Request following operands before enqueueing the output transfer. Otherwise
         // that DMA waits for this contraction and holds the prefetch behind it.
         let next = next.at(device);
-        let factor = block::scalar::<Selected<I>, Reduced<O>>(device, &self.scales.output);
+        let factor =
+            block::scalar::<Selected<I>, Reduced<O>>(device, &self.weights.contract.output);
         Self::handoff::<R, PASS>(device, &partial, &factor, output, at);
         next
     }
@@ -265,17 +266,20 @@ impl<I: AxisName, O: AxisName> Output<I, O> {
     }
 
     fn stage_into(&self, device: &mut Device, staged: &mut Staged<I, O>) {
-        self.weight
+        self.weights
+            .weight
             .view()
             .to_dm_view(&mut device.tdma, staged.0.view_mut());
-        self.weight_scale
+        self.weights
+            .weight_scale
+            .tensor
             .view()
             .to_dm_view(&mut device.tdma, staged.1.view_mut());
     }
 
     pub(crate) fn prepare(&self, device: &mut Device) -> Staged<I, O> {
-        let codes: Weight<I, O, f4e2m1> = self.weight.to_dm(&mut device.tdma);
-        let scales: Scales<I, O> = self.weight_scale.to_dm(&mut device.tdma);
+        let codes: Weight<I, O, f4e2m1> = self.weights.weight.to_dm(&mut device.tdma);
+        let scales: Scales<I, O> = self.weights.weight_scale.tensor.to_dm(&mut device.tdma);
         (codes, scales)
     }
 
@@ -322,7 +326,8 @@ impl<I: AxisName, O: AxisName> Output<I, O> {
                 .fetch::<m![O % 8, O % 256 / 8, I % 128 / 16], m![I % 16]>()
                 .collect::<m![O % 8, O % 256 / 8, I % 128 / 16], m![I % 16]>()
                 .to_trf();
-            let factor = block::scalar::<Selected<I>, Reduced<O>>(device, &self.scales.output);
+            let factor =
+                block::scalar::<Selected<I>, Reduced<O>>(device, &self.weights.contract.output);
             // Round coverage to 32 rows, then pack four such groups into a
             // 128-row pass, matching Qwen's granularity without extra launches.
             let groups = live.rows().div_ceil(32);
@@ -422,12 +427,30 @@ impl<I: AxisName, O: AxisName, R: AxisName, All: AxisName> Op<(Live<(), R>, &Row
     }
 }
 
-loading!(Output);
+impl<I: AxisName, O: AxisName, const N: usize> View<N> for Output<I, O> {
+    type Storage = <Weights<I, O, Stored<I, O>, StoredScales<I, O>> as View<N>>::Storage;
+    type Layer = Self;
+    fn view(storage: &Self::Storage, layer: usize) -> Self {
+        Self {
+            weights: <Weights<I, O, Stored<I, O>, StoredScales<I, O>> as View<N>>::view(
+                storage, layer,
+            ),
+        }
+    }
+    fn stack(layers: [Self; N], cx: &mut crate::load::Context<'_>) -> Self::Storage {
+        <Weights<I, O, Stored<I, O>, StoredScales<I, O>> as View<N>>::stack(
+            layers.map(|layer| layer.weights),
+            cx,
+        )
+    }
+}
 
 #[cfg(test)]
 mod tests {
+    use crate::ops::linear::nvfp4::tiled::Blocks;
     use crate::ops::linear::nvfp4::tiled::output::Output as OutputProjection;
     use crate::ops::linear::nvfp4::tiled::tests as fixtures;
+    use crate::tensor::form::BlockScaled;
     use crate::{
         Op,
         tensor::{live::Live, scalar::Value as Count},
@@ -468,9 +491,7 @@ mod tests {
         )
         .await;
         let projection = OutputProjection {
-            weight,
-            weight_scale,
-            scales,
+            weights: BlockScaled::new(weight, Blocks::new(weight_scale), scales),
         };
         let input = input::<Hidden>(&mut device).await;
         let original = fixtures::read::<_, m![Rows, Hidden]>(&mut device.pdma, &input).await;
@@ -521,11 +542,14 @@ mod tests {
         // Rounding cluster partials to BF16 before exchange would erase that residual.
         let factor = 0.1337_f32;
         let projection = OutputProjection {
-            weight,
-            weight_scale,
-            scales: crate::ops::linear::nvfp4::tiled::Scales {
-                output: fixtures::upload::<f32, m![1 # 8]>(&mut device.pdma, vec![factor; 8]).await,
-            },
+            weights: BlockScaled::new(
+                weight,
+                Blocks::new(weight_scale),
+                crate::ops::linear::nvfp4::tiled::Scales {
+                    output: fixtures::upload::<f32, m![1 # 8]>(&mut device.pdma, vec![factor; 8])
+                        .await,
+                },
+            ),
         };
         let mut cancellation = Vec::with_capacity(Rows::SIZE * Hidden::SIZE);
         for row in 0..Rows::SIZE {

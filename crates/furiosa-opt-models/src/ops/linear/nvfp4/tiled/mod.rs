@@ -2,193 +2,16 @@
 //! The panel layouts and transfer overlap follow internal PR #457 (d2186073c).
 
 use crate::load::{Checkpoint, Context, Load, LoadError};
-use crate::tensor::form::nvfp4::Scale;
+use crate::modules::generic::collection::View;
+use crate::tensor::{
+    form::{
+        BlockScaled,
+        nvfp4::{self, Scale},
+    },
+    parallel::Chip,
+};
 use furiosa_opt_std::prelude::*;
-
-// Each projection reads canonical checkpoint rows and lays out its packed codes and block
-// scales once, on host. The derive supplies tree borrowing; these implementations keep
-// checkpoint validation, in-place updates and stacked layer backing in the native loader.
-macro_rules! loading {
-    ($projection:ident) => {
-        impl<'a, I: AxisName, O: AxisName> crate::load::Load<&'a crate::load::Checkpoint>
-            for $projection<I, O>
-        {
-            fn load(
-                cx: &mut crate::load::Context<'_>,
-                from: &'a crate::load::Checkpoint,
-            ) -> Result<Self, crate::load::LoadError> {
-                use crate::load::{Children, Load};
-                cx.checkpoint(from, |cx| {
-                    let mut children = Children::default();
-                    let weight = children.ask(cx.field("weight", "weight", |cx| {
-                        let host = codes::<I, O>(from, cx)?;
-                        Load::load(cx, host)
-                    }))?;
-                    let weight_scale =
-                        children.ask(cx.field("weight_scale", "weight_scale", |cx| {
-                            let host = scales::<I, O>(from, cx)?;
-                            Load::load(cx, host)
-                        }))?;
-                    let factors =
-                        children.ask(cx.field("scales", "", |cx| Load::load(cx, from)))?;
-                    children.node(weight.zip(weight_scale).zip(factors)).map(
-                        |((weight, weight_scale), scales)| Self {
-                            weight,
-                            weight_scale,
-                            scales,
-                        },
-                    )
-                })
-            }
-        }
-        impl<'t, 's, I: AxisName, O: AxisName>
-            crate::load::Load<(&'t mut $projection<I, O>, &'s crate::load::Checkpoint)>
-            for &'t mut $projection<I, O>
-        {
-            fn load(
-                cx: &mut crate::load::Context<'_>,
-                (into, from): (&'t mut $projection<I, O>, &'s crate::load::Checkpoint),
-            ) -> Result<Self, crate::load::LoadError> {
-                use crate::load::Load;
-                cx.checkpoint(from, |cx| {
-                    cx.field("weight", "weight", |cx| {
-                        cx.rule(
-                            |cx| codes::<I, O>(from, cx),
-                            |cx, host| {
-                                <&mut HbmTensor<f4e2m1, Chip, Stored<I, O>> as Load<_>>::load(
-                                    cx,
-                                    (&mut into.weight, host),
-                                )
-                                .map(drop)
-                            },
-                        )
-                    })?;
-                    cx.field("weight_scale", "weight_scale", |cx| {
-                        cx.rule(
-                            |cx| scales::<I, O>(from, cx),
-                            |cx, host| {
-                                <&mut HbmTensor<f8e4m3, Chip, StoredScales<I, O>> as Load<_>>::load(
-                                    cx,
-                                    (&mut into.weight_scale, host),
-                                )
-                                .map(drop)
-                            },
-                        )
-                    })?;
-                    cx.field("scales", "", |cx| {
-                        <&mut crate::ops::linear::nvfp4::tiled::Scales as Load<_>>::load(
-                            cx,
-                            (&mut into.scales, from),
-                        )
-                    })
-                    .map(drop)
-                })?;
-                Ok(into)
-            }
-        }
-        impl<I: AxisName, O: AxisName, const N: usize> crate::modules::generic::collection::View<N>
-            for $projection<I, O>
-        {
-            type Storage = (
-                crate::modules::generic::collection::Tensor<f4e2m1, Chip, Stored<I, O>, N>,
-                crate::modules::generic::collection::Tensor<f8e4m3, Chip, StoredScales<I, O>, N>,
-                crate::modules::generic::collection::Tensor<f32, Chip, m![1 # 8], N>,
-            );
-            type Layer = Self;
-            fn view(storage: &Self::Storage, layer: usize) -> Self {
-                use crate::modules::generic::collection::View;
-                Self {
-                    weight: <HbmTensor<f4e2m1, Chip, Stored<I, O>> as View<N>>::view(
-                        &storage.0, layer,
-                    ),
-                    weight_scale: <HbmTensor<f8e4m3, Chip, StoredScales<I, O>> as View<N>>::view(
-                        &storage.1, layer,
-                    ),
-                    scales: crate::ops::linear::nvfp4::tiled::Scales {
-                        output: <crate::tensor::form::nvfp4::Scale as View<N>>::view(
-                            &storage.2, layer,
-                        ),
-                    },
-                }
-            }
-            fn stack(layers: [Self; N], cx: &mut crate::load::Context<'_>) -> Self::Storage {
-                use crate::modules::generic::collection::View;
-                let mut layers = layers.map(Some);
-                let mut weights = Vec::new();
-                let mut scales = Vec::new();
-                let mut factors = Vec::new();
-                for layer in &mut layers {
-                    let layer = layer.take().unwrap();
-                    weights.push(layer.weight);
-                    scales.push(layer.weight_scale);
-                    factors.push(layer.scales.output);
-                }
-                (
-                    <HbmTensor<f4e2m1, Chip, Stored<I, O>> as View<N>>::stack(
-                        weights.try_into().ok().unwrap(),
-                        cx,
-                    ),
-                    <HbmTensor<f8e4m3, Chip, StoredScales<I, O>> as View<N>>::stack(
-                        scales.try_into().ok().unwrap(),
-                        cx,
-                    ),
-                    <crate::tensor::form::nvfp4::Scale as View<N>>::stack(
-                        factors.try_into().ok().unwrap(),
-                        cx,
-                    ),
-                )
-            }
-        }
-        fn codes<I: AxisName, O: AxisName>(
-            from: &crate::load::Checkpoint,
-            cx: &mut crate::load::Context<'_>,
-        ) -> Result<HostTensor<f4e2m1, Stored<I, O>>, crate::load::LoadError> {
-            super_load::<I, O, f4e2m1, Stored<I, O>, 2>(from, cx, safetensors::Dtype::U8)
-        }
-        fn scales<I: AxisName, O: AxisName>(
-            from: &crate::load::Checkpoint,
-            cx: &mut crate::load::Context<'_>,
-        ) -> Result<HostTensor<f8e4m3, StoredScales<I, O>>, crate::load::LoadError> {
-            super_load::<I, O, f8e4m3, StoredScales<I, O>, 16>(
-                from,
-                cx,
-                safetensors::Dtype::F8_E4M3,
-            )
-        }
-        fn super_load<
-            I: AxisName,
-            O: AxisName,
-            D: MaterializableScalar,
-            E: M,
-            const PACK: usize,
-        >(
-            from: &crate::load::Checkpoint,
-            cx: &mut crate::load::Context<'_>,
-            dtype: safetensors::Dtype,
-        ) -> Result<HostTensor<D, E>, crate::load::LoadError> {
-            let (name, tensor) = cx.tensor(from)?;
-            let invalid = |reason| crate::load::LoadError::InvalidData {
-                name: name.clone(),
-                reason,
-            };
-            if tensor.dtype() != dtype || tensor.shape() != [O::SIZE, I::SIZE / PACK] {
-                return Err(invalid(format!(
-                    "expected {dtype:?} [{}, {}]",
-                    O::SIZE,
-                    I::SIZE / PACK
-                )));
-            }
-            if PACK == 16 && tensor.data().iter().any(|&v| v & 0x7f == 0x7f || v > 0x80) {
-                return Err(invalid(
-                    "block scales must be finite and nonnegative".into(),
-                ));
-            }
-            let bytes = $projection::<I, O>::reorder::<PACK, _>(tensor.data());
-            HostTensor::try_from(furiosa_opt_std::runtime::HostBuffer::from_vec(bytes))
-                .map_err(|error| invalid(error.to_string()))
-        }
-    };
-}
+use std::marker::PhantomData;
 
 pub(crate) mod block;
 pub(crate) mod compact;
@@ -198,6 +21,96 @@ pub mod output;
 pub mod panels;
 pub(crate) mod prefetch;
 pub mod qkv;
+
+/// The existing block-scaled form with each kernel's packed storage mapping.
+/// Canonical checkpoint tensors are transposed by the host upload, never at runtime.
+pub type Weights<I, O, W, B> = BlockScaled<
+    I,
+    O,
+    f4e2m1,
+    f8e4m3,
+    nvfp4::Scales<I, O>,
+    Scales,
+    Chip,
+    HbmTensor<f4e2m1, Chip, W>,
+    Blocks<I, O, B>,
+>;
+
+/// A scale per 16 canonical input features, uploaded into a kernel's storage mapping.
+/// The explicit source shape avoids inferring checkpoint axes from a partitioned mapping.
+#[derive(DeviceSend, Load)]
+#[load(tree)]
+pub struct Blocks<I: AxisName, O: AxisName, B: M> {
+    pub tensor: HbmTensor<f8e4m3, Chip, B>,
+    shape: PhantomData<fn() -> (I, O)>,
+}
+
+impl<I: AxisName, O: AxisName, B: M> Blocks<I, O, B> {
+    pub(crate) fn new(tensor: HbmTensor<f8e4m3, Chip, B>) -> Self {
+        Self {
+            tensor,
+            shape: PhantomData,
+        }
+    }
+}
+
+impl<'a, I: AxisName, O: AxisName, W: M + 'static, B: M + 'static> Load<&'a Checkpoint>
+    for Weights<I, O, W, B>
+{
+    fn load(cx: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
+        cx.checkpoint(from, |cx| Self::read(from, cx, "weight"))
+    }
+}
+
+impl<'t, 's, I: AxisName, O: AxisName, W: M + 'static, B: M + 'static>
+    Load<(&'t mut Weights<I, O, W, B>, &'s Checkpoint)> for &'t mut Weights<I, O, W, B>
+{
+    fn load(
+        cx: &mut Context<'_>,
+        (into, from): (&'t mut Weights<I, O, W, B>, &'s Checkpoint),
+    ) -> Result<Self, LoadError> {
+        cx.checkpoint(from, |cx| into.update(from, cx, "weight"))?;
+        Ok(into)
+    }
+}
+
+impl<'a, I: AxisName, O: AxisName, B: M + 'static> Load<&'a Checkpoint> for Blocks<I, O, B> {
+    fn load(cx: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
+        let host = block_scales::<I, O>(from, cx)?;
+        Load::load(cx, host).map(Self::new)
+    }
+}
+
+impl<'t, 's, I: AxisName, O: AxisName, B: M + 'static>
+    Load<(&'t mut Blocks<I, O, B>, &'s Checkpoint)> for &'t mut Blocks<I, O, B>
+{
+    fn load(
+        cx: &mut Context<'_>,
+        (into, from): (&'t mut Blocks<I, O, B>, &'s Checkpoint),
+    ) -> Result<Self, LoadError> {
+        cx.rule(
+            |cx| block_scales::<I, O>(from, cx),
+            |cx, host| {
+                <&mut HbmTensor<f8e4m3, Chip, B> as Load<_>>::load(cx, (&mut into.tensor, host))
+                    .map(drop)
+            },
+        )?;
+        Ok(into)
+    }
+}
+
+impl<I: AxisName, O: AxisName, B: M, const N: usize> View<N> for Blocks<I, O, B> {
+    type Storage = <HbmTensor<f8e4m3, Chip, B> as View<N>>::Storage;
+    type Layer = Self;
+    fn view(storage: &Self::Storage, layer: usize) -> Self {
+        Self::new(<HbmTensor<f8e4m3, Chip, B> as View<N>>::view(
+            storage, layer,
+        ))
+    }
+    fn stack(layers: [Self; N], cx: &mut Context<'_>) -> Self::Storage {
+        <HbmTensor<f8e4m3, Chip, B> as View<N>>::stack(layers.map(|layer| layer.tensor), cx)
+    }
+}
 
 /// Only the weight tensor scale participates in W4A16 arithmetic. Input calibration is
 /// validated when loading and discarded; activations and cached keys/values remain BF16.
@@ -236,6 +149,46 @@ impl<'t, 's> Load<(&'t mut Scales, &'s Checkpoint)> for &'t mut Scales {
     }
 }
 
+impl<const N: usize> View<N> for Scales {
+    type Storage = <Scale as View<N>>::Storage;
+    type Layer = Self;
+    fn view(storage: &Self::Storage, layer: usize) -> Self {
+        Self {
+            output: <Scale as View<N>>::view(storage, layer),
+        }
+    }
+    fn stack(layers: [Self; N], cx: &mut Context<'_>) -> Self::Storage {
+        <Scale as View<N>>::stack(layers.map(|layer| layer.output), cx)
+    }
+}
+
+fn block_scales<I: AxisName, O: AxisName>(
+    from: &Checkpoint,
+    cx: &mut Context<'_>,
+) -> Result<HostTensor<f8e4m3, m![O, I / 16]>, LoadError> {
+    let (name, tensor) = cx.tensor(from)?;
+    let invalid = |reason| LoadError::InvalidData {
+        name: name.clone(),
+        reason,
+    };
+    if tensor.dtype() != safetensors::Dtype::F8_E4M3 || tensor.shape() != [O::SIZE, I::SIZE / 16] {
+        return Err(invalid(format!(
+            "expected F8_E4M3 [{}, {}]",
+            O::SIZE,
+            I::SIZE / 16
+        )));
+    }
+    if tensor.data().iter().any(|&v| v & 0x7f == 0x7f || v > 0x80) {
+        return Err(invalid(
+            "block scales must be finite and nonnegative".into(),
+        ));
+    }
+    HostTensor::try_from(furiosa_opt_std::runtime::HostBuffer::from_vec(
+        tensor.data().to_vec(),
+    ))
+    .map_err(|error| invalid(error.to_string()))
+}
+
 fn tensor_scale(
     from: &Checkpoint,
     cx: &mut Context<'_>,
@@ -262,6 +215,60 @@ mod tests {
         Intermediate = 14336,
         Rows = 512
     ];
+
+    /// Checkpoint scales retain the canonical matrix shape and finite, nonnegative E4M3 values.
+    #[test]
+    fn reads_canonical_block_scales() {
+        use crate::load::{Checkpoint, Context, LoadError};
+        use safetensors::Dtype;
+        axes![I = 32, O = 2];
+        let read = |dtype, shape: &[usize], bytes: Vec<u8>| {
+            let mut source = Checkpoint::default();
+            source.insert("weight_scale", dtype, shape, bytes).unwrap();
+            Context::new(None).field("weight_scale", "weight_scale", |cx| {
+                super::block_scales::<I, O>(&source, cx)
+            })
+        };
+        let bytes = vec![0, 0x80, 0x38, 0x7e];
+        let loaded = read(Dtype::F8_E4M3, &[2, 2], bytes.clone()).unwrap();
+        assert_eq!(Vec::<u8>::from(loaded.into_buffer()), bytes);
+        for (dtype, shape, bytes, reason) in [
+            (
+                Dtype::U8,
+                &[2, 2][..],
+                vec![0; 4],
+                "expected F8_E4M3 [2, 2]",
+            ),
+            (
+                Dtype::F8_E4M3,
+                &[1, 4][..],
+                vec![0; 4],
+                "expected F8_E4M3 [2, 2]",
+            ),
+            (
+                Dtype::F8_E4M3,
+                &[2, 2][..],
+                vec![0x81; 4],
+                "block scales must be finite and nonnegative",
+            ),
+            (
+                Dtype::F8_E4M3,
+                &[2, 2][..],
+                vec![0x7f; 4],
+                "block scales must be finite and nonnegative",
+            ),
+        ] {
+            match read(dtype, shape, bytes).err() {
+                Some(LoadError::InvalidData {
+                    name,
+                    reason: found,
+                }) => {
+                    assert_eq!((name.as_str(), found.as_str()), ("weight_scale", reason));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
 
     /// Keep test setup explicit while sharing the repeated transfer/error handling.
     pub(super) async fn upload<D: MaterializableScalar, Shape: M>(

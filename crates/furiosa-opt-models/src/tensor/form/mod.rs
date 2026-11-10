@@ -96,7 +96,7 @@ impl<const N: usize> Projections<'_, N> {
 impl<In: AxisName, Out: AxisName, E: Scalar, S: Scalar, B: M, C, Chips: M, W, T>
     BlockScaled<In, Out, E, S, B, C, Chips, W, T>
 {
-    fn new(weight: W, weight_scale: T, contract: C) -> Self {
+    pub(crate) fn new(weight: W, weight_scale: T, contract: C) -> Self {
         Self {
             weight,
             weight_scale,
@@ -403,7 +403,7 @@ type Codes<In, Out> = HostTensor<f4e2m1, m![{ Chip }, { m![Out, In] }]>;
 impl<In: AxisName, Out: AxisName, C, W, T> Nvfp4<In, Out, C, W, T> {
     /// The codes under `codes`, the block scales and the contract, absent names reported
     /// together.
-    fn read<'a>(
+    pub(crate) fn read<'a>(
         from: &'a Checkpoint,
         context: &mut Context<'_>,
         codes: &str,
@@ -415,7 +415,7 @@ impl<In: AxisName, Out: AxisName, C, W, T> Nvfp4<In, Out, C, W, T> {
     {
         let mut children = Children::default();
         let weight = context.field("weight", codes, |cx| {
-            let codes = nvfp4::codes::<Chip, m![Out, In]>(from, cx)?;
+            let codes = nvfp4::codes::<Chip, In, Out>(from, cx)?;
             W::load(cx, codes)
         });
         let weight = children.ask(weight)?;
@@ -428,7 +428,7 @@ impl<In: AxisName, Out: AxisName, C, W, T> Nvfp4<In, Out, C, W, T> {
 
     /// The codes under `codes` written once all arrived, then the block scales and the
     /// contract's leaves in place.
-    fn update<'s>(
+    pub(crate) fn update<'s>(
         &mut self,
         from: &'s Checkpoint,
         context: &mut Context<'_>,
@@ -441,7 +441,7 @@ impl<In: AxisName, Out: AxisName, C, W, T> Nvfp4<In, Out, C, W, T> {
     {
         context.field("weight", codes, |cx| {
             cx.rule(
-                |cx| nvfp4::codes::<Chip, m![Out, In]>(from, cx),
+                |cx| nvfp4::codes::<Chip, In, Out>(from, cx),
                 |cx, host| <&mut W as Load<_>>::load(cx, (&mut self.weight, host)).map(drop),
             )
         })?;

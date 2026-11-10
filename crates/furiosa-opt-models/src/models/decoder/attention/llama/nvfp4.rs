@@ -15,13 +15,9 @@ use crate::modules::attention::Projection;
 use crate::modules::generic::collection::Stack;
 use crate::ops::attention::full;
 use crate::ops::index::{gather::Gather, scatter::Scatter};
-#[cfg(any(test, feature = "kernel-diagnostics"))]
-pub use crate::ops::linear::nvfp4::tiled::heads::inspect_qkv_heads;
 use crate::ops::linear::nvfp4::tiled::{mlp::Mlp, output::Output, qkv::QkvProjection};
 use crate::ops::rotary::Rotary;
 use crate::ops::{embedding::Embedding, normalization::RmsNorm, pointwise::add::Add};
-#[cfg(any(test, feature = "kernel-diagnostics"))]
-pub use crate::schedule::decoder::nvfp4::inspect_transition;
 use crate::specialize::attention::Decode;
 use crate::tensor::{
     axis,

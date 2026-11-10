@@ -40,11 +40,11 @@ pub(super) fn prepare<H: AxisName, I: AxisName, R: AxisName, const W: usize>(
     let g3 = single::<H, I, R, W>(device, &g3, &l3);
     let g = term(device, &s2, 0);
     let g = add(device, g.view(), g3.view());
-    let g = finish(device, &gate.scales, &g);
+    let g = finish(device, &gate.weights.contract, &g);
     let u3 = single::<H, I, R, W>(device, &u3, &l3);
     let u = term(device, &s2, 1);
     let u = add(device, u.view(), u3.view());
-    let u = finish(device, &up.scales, &u);
+    let u = finish(device, &up.weights.contract, &u);
     product::compact::<I, R, W>(device, &g, &u, product);
     (d0, d1)
 }

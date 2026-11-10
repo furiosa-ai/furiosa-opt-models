@@ -38,12 +38,12 @@ pub(super) fn prepare<H: AxisName, I: AxisName, R: AxisName, const W: usize>(
     let g3 = tile::single::<H, I, R, W, _, _, _>(device, g3.view(), &l3);
     let g = tile::term(device, &s2, 0);
     let g = tile::add(device, g.view(), g3.view());
-    let g = block::finish(device, &gate.scales, g);
+    let g = block::finish(device, &gate.weights.contract, g);
     let u3 = block::restore(device, u3.0, u3.1);
     let u3 = tile::single::<H, I, R, W, _, _, _>(device, u3.view(), &l3);
     let u = tile::term(device, &s2, 1);
     let u = tile::add(device, u.view(), u3.view());
-    let u = block::finish(device, &up.scales, u);
+    let u = block::finish(device, &up.weights.contract, u);
     product::compact::<I, R, W>(device, &g, &u, product);
     (d0, d1)
 }

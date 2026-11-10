@@ -209,7 +209,7 @@ impl<'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, Size>, Env, launch::S
 }
 
 /// Exercise the production MLP-to-next-layer prefetch before normalizing and projecting.
-#[cfg(any(test, feature = "kernel-diagnostics"))]
+#[cfg(test)]
 pub fn inspect_transition(
     device: &mut Device,
     mlp: &mlp::Mlp<Hidden, Intermediate>,

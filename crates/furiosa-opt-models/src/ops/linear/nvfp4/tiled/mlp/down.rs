@@ -1,14 +1,12 @@
 use super::*;
-use crate::ops::linear::nvfp4::tiled::Scales;
+use crate::modules::generic::collection::View;
+use crate::ops::linear::nvfp4::tiled::Weights;
 
 /// Each cluster owns half the intermediate features and accumulates full-width outputs.
 #[derive(DeviceSend, crate::load::Load)]
-#[load(tree)]
 pub struct Down<I: AxisName, O: AxisName> {
-    pub weight: HbmTensor<f4e2m1, Chip, Stored<I, O>>,
-    pub weight_scale: HbmTensor<f8e4m3, Chip, StoredScales<I, O>>,
     #[load(rename = "")]
-    pub scales: Scales,
+    pub weights: Weights<I, O, Stored<I, O>, StoredScales<I, O>>,
 }
 pub type Stored<I, O> = m![
     I % 224 / 32,
@@ -66,6 +64,7 @@ type Accum<I, O, R> = DmTensor<f32, Chip, Cluster<I>, m![O / 16], m![R, O % 16]>
 
 impl<I: AxisName, O: AxisName> Down<I, O> {
     /// Canonical rows to seven aligned 512-output × 32-input tiles per slice.
+    #[cfg(test)]
     pub fn reorder<const PACK: usize, T: Copy>(values: &[T]) -> Vec<T> {
         assert!(I::SIZE == 14336 && O::SIZE == 4096 && matches!(PACK, 1 | 2 | 16));
         assert_eq!(values.len(), O::SIZE * I::SIZE / PACK);
@@ -101,12 +100,12 @@ impl<I: AxisName, O: AxisName> Down<I, O> {
             // Land each stripe directly into its final half of the wide panel.
             let target = codes.view_mut().tile::<m![{Symbol<K>} / 32], 1,
                 m![{Symbol<K>} / 32 = 1 #{!} ({Symbol<K>} / 32), O % 512, I % 32]>(part);
-            self.weight.view().tile::<m![I % 224 / 32], 1,
+            self.weights.weight.view().tile::<m![I % 224 / 32], 1,
                 m![I % 224 / 32 = 1 # 7,I / (I / 2),O / 512,I % (I / 2) / 224,O % 512,I % 32]>(stripe + part)
                 .to_dm_view(&mut device.tdma, target);
             let target = scales.view_mut().tile::<m![{Symbol<K>} / 32], 1,
                 m![{Symbol<K>} / 32 = 1 #{!} ({Symbol<K>} / 32), O % 512, I % 32 / 16]>(part);
-            self.weight_scale.view().tile::<m![I % 224 / 32], 1,
+            self.weights.weight_scale.tensor.view().tile::<m![I % 224 / 32], 1,
                 m![I % 224 / 32 = 1 # 7,I / (I / 2),O / 512,I % (I / 2) / 224,O % 512,I % 32 / 16]>(stripe + part)
                 .to_dm_view(&mut device.tdma, target);
         }
@@ -477,7 +476,7 @@ impl<I: AxisName, O: AxisName> Down<I, O> {
         };
         let (send, own) = (half(device, &[1, 0]), half(device, &[0, 1]));
         let exchanged = send.view().cluster_swap().to_dm(&mut device.tdma);
-        let values = super::sum_scaled(device, &self.scales, &own, &exchanged);
+        let values = super::sum_scaled(device, &self.weights.contract, &own, &exchanged);
         let mut output: Owned<O, R> = DmTensor::new();
         // SAFETY: cluster c now owns row half c, with all feature halves summed.
         let values = unsafe {
@@ -511,4 +510,20 @@ impl<I: AxisName, O: AxisName> Down<I, O> {
     }
 }
 
-loading!(Down);
+impl<I: AxisName, O: AxisName, const N: usize> View<N> for Down<I, O> {
+    type Storage = <Weights<I, O, Stored<I, O>, StoredScales<I, O>> as View<N>>::Storage;
+    type Layer = Self;
+    fn view(storage: &Self::Storage, layer: usize) -> Self {
+        Self {
+            weights: <Weights<I, O, Stored<I, O>, StoredScales<I, O>> as View<N>>::view(
+                storage, layer,
+            ),
+        }
+    }
+    fn stack(layers: [Self; N], cx: &mut crate::load::Context<'_>) -> Self::Storage {
+        <Weights<I, O, Stored<I, O>, StoredScales<I, O>> as View<N>>::stack(
+            layers.map(|layer| layer.weights),
+            cx,
+        )
+    }
+}
