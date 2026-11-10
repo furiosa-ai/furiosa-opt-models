@@ -21,8 +21,12 @@
 //!   row's products in another order, so its outputs may differ in their last bits.
 //! - The decoded weight lies in the order the switch delivers a part's inputs from the feature
 //!   slices ([`Switched`]), so each group switches from there straight into the TRF, and the next
-//!   group switches into the other half beside the pass of the one before. Rows another
-//!   projection kept land in the feature slices for it first, beside the decode.
+//!   group switches into the other half beside the pass of the one before. Where a feature slice
+//!   holds one packet of a row, two groups instead fill the TRF and meet the weight in one pass,
+//!   each 64-byte packet of it one group and then the other, so the weight streams once for both;
+//!   the switch of the next two follows the pass, and an odd count's last two take the group
+//!   before again. Rows another projection kept land in the feature slices for it first, beside
+//!   the decode.
 //! - The projected rows end where the contract places them: in the output's feature slices once
 //!   the last pass ends, or [`Kept`] where the passes summed them. Rows bound for the feature
 //!   slices are owned in whole chunks of them, the owners' odd factor the top output digit, so
@@ -312,9 +316,115 @@ type Summing<I, O, R, P> = DmTensor<
 type Registers<I, O, L, P> =
     TrfTensor<bf16, Chip, Cluster<I, O, P>, Owners<I, O, P>, L, m![1, { Part<I> }]>;
 
-/// [`Registers`] of a whole lane group, its inputs in [`Switched`] order.
-type Switching<I, O, R, P> =
-    TrfTensor<bf16, Chip, Cluster<I, O, P>, Owners<I, O, P>, Lane<R>, m![1, { Switched<I> }]>;
+// One of the two consecutive lane groups a pass over a decoded weight holds.
+axes![Twin = 2];
+
+/// The lane groups of `R` rows a pass over a decoded weight holds in the TRF, a lane's row of
+/// each, and how the weight's rows stream against them.
+trait Held<R: AxisName> {
+    /// The groups' axis in the TRF, in a pass's time and in its sums.
+    type Groups: M;
+    /// The time of a pass over the weight's rows `T` of `I` inputs.
+    type Time<I: AxisName, T: M>: M;
+    /// The packet of the weight a group meets each cycle.
+    type Packet<I: AxisName>: M;
+    /// The groups' rows of `X` values from a group on, as the switch reads them.
+    type Rows<X: M>: M;
+    /// The same rows as a pass writes them.
+    type RowsMut<X: M>: M;
+
+    fn rows<'v, D: Scalar, C: M, S: M, X: M>(
+        rows: DmTensorView<'v, D, Chip, C, S, m![R, { X }]>,
+        group: usize,
+    ) -> DmTensorView<'v, D, Chip, C, S, Self::Rows<X>>;
+
+    fn rows_mut<'v, D: Scalar, C: M, S: M, X: M>(
+        rows: DmTensorViewMut<'v, D, Chip, C, S, m![R, { X }]>,
+        group: usize,
+    ) -> DmTensorViewMut<'v, D, Chip, C, S, Self::RowsMut<X>>;
+}
+
+/// One lane group, each 32-byte flit of the weight meeting it in a cycle of its own: the next
+/// group switches into the TRF's other half beside the pass.
+struct One;
+
+impl<R: AxisName> Held<R> for One {
+    type Groups = m![1];
+    type Time<I: AxisName, T: M> = m![{ T }, { Packets<I> }, 1];
+    type Packet<I: AxisName> = m![I % 16];
+    type Rows<X: M> = Layout<R>::Elements<X>;
+    type RowsMut<X: M> = Layout<R>::GroupMut<X>;
+
+    fn rows<'v, D: Scalar, C: M, S: M, X: M>(
+        rows: DmTensorView<'v, D, Chip, C, S, m![R, { X }]>,
+        group: usize,
+    ) -> DmTensorView<'v, D, Chip, C, S, Self::Rows<X>> {
+        Layout::<R>::group(rows, group)
+    }
+
+    fn rows_mut<'v, D: Scalar, C: M, S: M, X: M>(
+        rows: DmTensorViewMut<'v, D, Chip, C, S, m![R, { X }]>,
+        group: usize,
+    ) -> DmTensorViewMut<'v, D, Chip, C, S, Self::RowsMut<X>> {
+        rows.tile::<Layout<R>::Groups, 1, Self::RowsMut<X>>(group)
+    }
+}
+
+/// Two consecutive lane groups, which fill the TRF: each 64-byte packet of the weight, 32 inputs
+/// of one row, meets one group and then the other in the next cycle, so the weight streams once
+/// for both while every multiplier works.
+struct Two;
+
+impl<R: AxisName> Held<R> for Two {
+    type Groups = m![Twin];
+    type Time<I: AxisName, T: M> = m![{ T }, { Packets<I> } / 2, Twin];
+    type Packet<I: AxisName> = m![{ Packets<I> } % 2, I % 16];
+    type Rows<X: M> = m![Twin # ({ Layout<R>::Groups }), { Layout<R>::Lanes }, { X }];
+    type RowsMut<X: M> = m![Twin #{!} ({ Layout<R>::Groups }), { Layout<R>::Lanes }, { X }];
+
+    fn rows<'v, D: Scalar, C: M, S: M, X: M>(
+        rows: DmTensorView<'v, D, Chip, C, S, m![R, { X }]>,
+        group: usize,
+    ) -> DmTensorView<'v, D, Chip, C, S, Self::Rows<X>> {
+        type Tile<R, X> = m![
+            { Layout<R>::Groups } = 2 # ({ Layout<R>::Groups }),
+            { Layout<R>::Lanes },
+            { X }
+        ];
+        // SAFETY: the tile's two groups relabelled as an axis of their own: the same cells.
+        unsafe {
+            rows.tile::<Layout<R>::Groups, 2, Tile<R, X>>(group)
+                .reshape()
+        }
+    }
+
+    fn rows_mut<'v, D: Scalar, C: M, S: M, X: M>(
+        rows: DmTensorViewMut<'v, D, Chip, C, S, m![R, { X }]>,
+        group: usize,
+    ) -> DmTensorViewMut<'v, D, Chip, C, S, Self::RowsMut<X>> {
+        type Tile<R, X> = m![
+            { Layout<R>::Groups } = 2 #{!} ({ Layout<R>::Groups }),
+            { Layout<R>::Lanes },
+            { X }
+        ];
+        // SAFETY: as in `rows`.
+        unsafe {
+            rows.tile::<Layout<R>::Groups, 2, Tile<R, X>>(group)
+                .reshape()
+        }
+    }
+}
+
+/// [`Registers`] of the lane groups `G` a pass holds, inputs in [`Switched`] order: two groups'
+/// sixteen rows of a part fill at most the whole TRF, as [`Chunk`] fits eight in a half.
+type Holding<I, O, R, P, G> = TrfTensor<
+    bf16,
+    Chip,
+    Cluster<I, O, P>,
+    Owners<I, O, P>,
+    Lane<R>,
+    m![{ <G as Held<R>>::Groups }, { Switched<I> }],
+>;
 
 /// The tensor scale in the vector registers of every slice of a projection.
 type Global<I, O, P> = VrfTensor<f32, Chip, Cluster<I, O, P>, Owners<I, O, P>, m![1 # 8]>;
@@ -635,26 +745,41 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
         for _ in 0..dense {
             rows.densely(device, |device, rows| {
                 let weights = self.decode(device);
-                let mut met = |device: &mut Device, lanes: &Switching<I, O, R, P>, group| {
-                    projected.decoded(device, (lanes, (&weights, &global)), group);
-                };
-                // Pairs of groups, the second in the TRF's other half, so a switch runs beside the
-                // pass before it; an even count's last pair has no group to switch beside its own.
-                let mut held = rows.switched(device, first);
-                for pair in 0..(count - 1) / 2 {
-                    let group = first + 2 * pair;
-                    let next = rows.switched(device, group + 1);
-                    met(device, &held, group);
-                    held = rows.switched(device, group + 2);
-                    met(device, &next, group + 1);
-                }
-                for _ in 0..1 - count % 2 {
-                    let next = rows.switched(device, last);
-                    met(device, &held, last - 1);
-                    met(device, &next, last);
-                }
-                for _ in 0..count % 2 {
-                    met(device, &held, last);
+                // A pair's switch follows the pass before it and takes a step a row for each packet
+                // a feature slice holds: shorter than the pass only where a slice holds one.
+                if const { normalization::Chunk::<I>::SIZE == 16 } {
+                    let mut met = |device: &mut Device, group| {
+                        let lanes = rows.switched::<Two>(device, group);
+                        projected.decoded::<Two>(device, (&lanes, (&weights, &global)), group);
+                    };
+                    for pair in 0..count / 2 {
+                        met(device, first + 2 * pair);
+                    }
+                    for _ in 0..count % 2 {
+                        met(device, last - 1);
+                    }
+                } else {
+                    let mut met = |device: &mut Device, lanes: &Holding<I, O, R, P, One>, group| {
+                        projected.decoded::<One>(device, (lanes, (&weights, &global)), group);
+                    };
+                    // Pairs of groups, the second in the TRF's other half, so a switch runs beside
+                    // the pass before it; an even count's last pair has none beside its own.
+                    let mut held = rows.switched::<One>(device, first);
+                    for pair in 0..(count - 1) / 2 {
+                        let group = first + 2 * pair;
+                        let next = rows.switched::<One>(device, group + 1);
+                        met(device, &held, group);
+                        held = rows.switched::<One>(device, group + 2);
+                        met(device, &next, group + 1);
+                    }
+                    for _ in 0..1 - count % 2 {
+                        let next = rows.switched::<One>(device, last);
+                        met(device, &held, last - 1);
+                        met(device, &next, last);
+                    }
+                    for _ in 0..count % 2 {
+                        met(device, &held, last);
+                    }
                 }
             });
         }
@@ -948,23 +1073,23 @@ impl<I: AxisName, O: AxisName, R: AxisName, P: Ownership> Fold<I, O, R, P> for T
     }
 }
 
-/// What a lane group's pass over a decoded weight reads: the group in the TRF, the weights, which
+/// What a pass over a decoded weight reads: its lane groups `G` in the TRF, the weights, which
 /// carry their block scales, and the tensor scale.
-type Operands<'a, I, O, R, P> = (
-    &'a Switching<I, O, R, P>,
+type Operands<'a, I, O, R, P, G> = (
+    &'a Holding<I, O, R, P, G>,
     (&'a Decoded<I, O, P>, &'a Global<I, O, P>),
 );
 
-/// A pass's sums of rows `T` over a decoded weight, every lane of a group, each divided by the
-/// tensor scale: the stream the inter-slice reduce takes.
-type Divided<'l, I, O, R, P, T> = VectorWidenTensor<
+/// A pass's sums of rows `T` over a decoded weight, every lane of its groups `G`, each divided by
+/// the tensor scale: the stream the inter-slice reduce takes.
+type Divided<'l, I, O, R, P, T, G> = VectorWidenTensor<
     'l,
     { Tu::Main },
     f32,
     Chip,
     Cluster<I, O, P>,
     Owners<I, O, P>,
-    m![{ T }, 1],
+    m![{ T }, { <G as Held<R>>::Groups }],
     m![{ Lane<R> } # 8],
     Fresh,
     { stage::VeOrder::IntraFirst },
@@ -976,29 +1101,38 @@ trait Sums<I: AxisName, O: AxisName, R: AxisName, P: Ownership> {
     fn new() -> Self;
     /// Where the summed passes write.
     fn summed(&mut self) -> &mut Summing<I, O, R, P>;
-    /// Lane group `group`'s pass over the decoded weights.
-    fn decoded(&mut self, device: &mut Device, operands: Operands<'_, I, O, R, P>, group: usize);
+    /// The pass of lane groups `G` from `group` on over the decoded weights.
+    fn decoded<G: Held<R>>(
+        &mut self,
+        device: &mut Device,
+        operands: Operands<'_, I, O, R, P, G>,
+        group: usize,
+    );
 
-    /// A lane group's pass over every row of the decoded weights, each slice's rows read as `T`:
-    /// the contraction adds a row's blocks, the vector engine divides each sum by the tensor scale.
-    fn divided<'l, T: M>(
+    /// A pass of lane groups `G` over every row of the decoded weights, each slice's rows read as
+    /// `T`: the contraction adds a row's blocks, the vector engine divides each sum by the tensor
+    /// scale.
+    fn divided<'l, T: M, G: Held<R>>(
         device: &'l mut Device,
-        (lanes, (weights, global)): Operands<'l, I, O, R, P>,
-    ) -> Divided<'l, I, O, R, P, T> {
+        (lanes, (weights, global)): Operands<'l, I, O, R, P, G>,
+    ) -> Divided<'l, I, O, R, P, T, G> {
         device
             .main
             .begin(weights.view())
             .fetch::<m![{ T }, { Packets<I> }], m![I % 16]>()
             .collect::<m![{ T }, { Packets<I> }], m![I % 16]>()
-            .contract_outer::<m![{ T }, { Packets<I> }, 1], m![I % 16], _, _, _>(lanes)
+            .contract_outer::<G::Time<I, T>, G::Packet<I>, _, _, _>(lanes)
             .contract_packet::<m![1]>()
-            .contract_time::<m![{ T }, 1]>()
-            .contract_lane::<m![{ T }, 1], m![{ Lane<R> } # 8]>(LaneMode::Interleaved)
+            .contract_time::<m![{ T }, { G::Groups }]>()
+            .contract_lane::<m![{ T }, { G::Groups }], m![{ Lane<R> } # 8]>(LaneMode::Interleaved)
             .vector_init()
             .vector_intra_slice_tag(TagMode::Zero)
-            .vector_narrow_split::<m![{ T }, 1, { Lane<R> } # 8 / 4], m![{ Lane<R> } # 8 % 4]>()
+            .vector_narrow_split::<
+                m![{ T }, { G::Groups }, { Lane<R> } # 8 / 4],
+                m![{ Lane<R> } # 8 % 4],
+            >()
             .vector_fp_div(global)
-            .vector_widen_concat::<m![{ T }, 1], m![{ Lane<R> } # 8]>()
+            .vector_widen_concat::<m![{ T }, { G::Groups }], m![{ Lane<R> } # 8]>()
     }
 }
 
@@ -1016,10 +1150,15 @@ where
         self
     }
 
-    fn decoded(&mut self, device: &mut Device, operands: Operands<'_, I, O, R, P>, group: usize) {
+    fn decoded<G: Held<R>>(
+        &mut self,
+        device: &mut Device,
+        operands: Operands<'_, I, O, R, P, G>,
+        group: usize,
+    ) {
         type Run<I, O, P> = m![O % ({ Owner<I, O, P> })];
-        let sums = <Self as Sums<I, O, R, P>>::divided::<Run<I, O, P>>(device, operands)
-            .vector_inter_slice_reduce::<Reduced<I, O, P>, m![{ Run<I, O, P> }, 1]>(
+        let sums = <Self as Sums<I, O, R, P>>::divided::<Run<I, O, P>, G>(device, operands)
+            .vector_inter_slice_reduce::<Reduced<I, O, P>, m![{ Run<I, O, P> }, { G::Groups }]>(
                 InterSliceReduceOpF32::Add,
             )
             .vector_final();
@@ -1029,14 +1168,11 @@ where
             _,
             _,
             Lane<R>,
-            m![{ <P::Sum as Rounding>::Packets<Run<I, O, P>> }, 1, { Lane<R> }],
+            m![{ <P::Sum as Rounding>::Packets<Run<I, O, P>> }, { G::Groups }, { Lane<R> }],
             <P::Sum as Rounding>::Packet<O>,
             _,
         >(sums)
-        .commit_view(
-            (self.view_mut())
-                .tile::<Layout<R>::Groups, 1, Layout<R>::GroupMut<Run<I, O, P>>>(group),
-        );
+        .commit_view(G::rows_mut(self.view_mut(), group));
     }
 }
 
@@ -1053,18 +1189,18 @@ impl<I: AxisName, O: AxisName, R: AxisName> Sums<I, O, R, Exchanged>
         &mut self.0
     }
 
-    fn decoded(
+    fn decoded<G: Held<R>>(
         &mut self,
         device: &mut Device,
-        operands: Operands<'_, I, O, R, Exchanged>,
+        operands: Operands<'_, I, O, R, Exchanged, G>,
         group: usize,
     ) {
         type Chunks<I, O> = m![
             O % ({ Owner<I, O, Exchanged> }) / ({ Feature<O> }),
             O % ({ Feature<O> })
         ];
-        let sums = <Self as Sums<I, O, R, Exchanged>>::divided::<Chunks<I, O>>(device, operands)
-            .vector_inter_slice_reduce::<Scatter<I, O>, m![O % ({ Feature<O> }), 1]>(
+        let sums = <Self as Sums<I, O, R, Exchanged>>::divided::<Chunks<I, O>, G>(device, operands)
+            .vector_inter_slice_reduce::<Scatter<I, O>, m![O % ({ Feature<O> }), { G::Groups }]>(
                 InterSliceReduceOpF32::Add,
             )
             .vector_final();
@@ -1074,14 +1210,15 @@ impl<I: AxisName, O: AxisName, R: AxisName> Sums<I, O, R, Exchanged>
             _,
             _,
             Lane<R>,
-            m![{ <f32 as Rounding>::Packets<m![O % ({ Feature<O> })]> }, 1, { Lane<R> }],
+            m![
+                { <f32 as Rounding>::Packets<m![O % ({ Feature<O> })]> },
+                { G::Groups },
+                { Lane<R> }
+            ],
             <f32 as Rounding>::Packet<O>,
             _,
         >(sums)
-        .commit_view(
-            (self.1.view_mut())
-                .tile::<Layout<R>::Groups, 1, Layout<R>::GroupMut<m![O % ({ Feature<O> })]>>(group),
-        );
+        .commit_view(G::rows_mut(self.1.view_mut(), group));
     }
 }
 
@@ -1632,7 +1769,8 @@ trait Stage<I: AxisName, O: AxisName, R: AxisName, P: Ownership> {
 
 /// Rows in feature slices whose lane groups switch straight into the TRF, in [`Switched`] order.
 trait Dense<I: AxisName, O: AxisName, R: AxisName, P: Ownership> {
-    fn switched(&self, device: &mut Device, group: usize) -> Switching<I, O, R, P>;
+    /// Lane groups `G` from `group` on.
+    fn switched<G: Held<R>>(&self, device: &mut Device, group: usize) -> Holding<I, O, R, P, G>;
 }
 
 /// Rows in their feature slices: the switch ring takes each feature slice's inputs to the slices
@@ -1940,36 +2078,40 @@ type RunGroup<'v, H, I, O, R, P, S> = DmTensorView<
 
 /// Rows in both clusters' feature slices.
 impl<I: AxisName, O: AxisName, R: AxisName, P: Place<I, O, R>> Dense<I, O, R, P> for Spread<I, R> {
-    fn switched(&self, device: &mut Device, group: usize) -> Switching<I, O, R, P> {
-        type Group<I, R> = Layout<R>::Elements<m![I % ({ Feature<I> })]>;
+    fn switched<G: Held<R>>(&self, device: &mut Device, group: usize) -> Holding<I, O, R, P, G> {
+        type Row<I> = m![I % ({ Feature<I> })];
         // SAFETY: both physical clusters hold every row; only the logical cluster axis changes.
         let input = unsafe {
-            Layout::<R>::group(self.view(), group)
-                .reshape::<Chip, Cluster<I, O, P>, FeatureSlices<I>, Group<I, R>>()
+            G::rows(self.view(), group)
+                .reshape::<Chip, Cluster<I, O, P>, FeatureSlices<I>, G::Rows<Row<I>>>()
         };
         device
             .sub
             .begin(input)
-            .fetch::<m![{ Lane<R> }, I % ({ Feature<I> }) / 16], m![I % 16]>()
-            .switch::<Owners<I, O, P>, m![{ Lane<R> }, { Packets<I> }]>(
+            .fetch::<m![{ Lane<R> }, { G::Groups }, I % ({ Feature<I> }) / 16], m![I % 16]>()
+            .switch::<Owners<I, O, P>, m![{ Lane<R> }, { G::Groups }, { Packets<I> }]>(
                 SwitchConfig::CustomBroadcast { ring_size: 256 },
             )
-            .collect::<m![{ Lane<R> }, { Packets<I> }], m![I % 16]>()
+            .collect::<m![{ Lane<R> }, { G::Groups }, { Packets<I> }], m![I % 16]>()
             .to_trf()
     }
 }
 
 /// Rows in the feature slices of each cluster's half of the features, the half its passes read.
 impl<I: AxisName, O: AxisName, R: AxisName> Dense<I, O, R, Exchanged> for HalfSpread<I, R> {
-    fn switched(&self, device: &mut Device, group: usize) -> Switching<I, O, R, Exchanged> {
+    fn switched<G: Held<R>>(
+        &self,
+        device: &mut Device,
+        group: usize,
+    ) -> Holding<I, O, R, Exchanged, G> {
         device
             .sub
-            .begin(Layout::<R>::group(self.view(), group))
-            .fetch::<m![{ Lane<R> }, I % ({ Feature<I> }) / 16], m![I % 16]>()
-            .switch::<Owners<I, O, Exchanged>, m![{ Lane<R> }, { Packets<I> }]>(
+            .begin(G::rows(self.view(), group))
+            .fetch::<m![{ Lane<R> }, { G::Groups }, I % ({ Feature<I> }) / 16], m![I % 16]>()
+            .switch::<Owners<I, O, Exchanged>, m![{ Lane<R> }, { G::Groups }, { Packets<I> }]>(
                 SwitchConfig::CustomBroadcast { ring_size: 256 },
             )
-            .collect::<m![{ Lane<R> }, { Packets<I> }], m![I % 16]>()
+            .collect::<m![{ Lane<R> }, { G::Groups }, { Packets<I> }], m![I % 16]>()
             .to_trf()
     }
 }
