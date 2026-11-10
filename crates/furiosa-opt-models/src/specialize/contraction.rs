@@ -899,6 +899,42 @@ pub(crate) const fn height(owned: usize, part: usize) -> usize {
     rows
 }
 
+/// Output rows of every block one summed NVFP4 pass covers: the transpose to the output packet
+/// takes at most four, and a commit packet at least eight bytes.
+pub(crate) const SUMMED: usize = 4;
+
+/// Input parts a summed NVFP4 row splits into across slices: the fewest, a power of two, whose
+/// FP32 block scales over a pass's [`SUMMED`] rows take at most half a slice's VRF, the budget the
+/// kernel was validated at; each part holds whole [`SCALED`] runs of inputs.
+pub(crate) const fn summed_parts(input: usize) -> usize {
+    let mut parts = 1;
+    while SUMMED * (input / parts) / 16 * 4 > super::VRF / 2 {
+        parts *= 2;
+    }
+    assert!(
+        input.is_multiple_of(parts * SCALED),
+        "a summed part holds whole runs of block scales"
+    );
+    parts
+}
+
+/// Blocks of output rows each cluster of a summed NVFP4 projection keeps, every block's parts in
+/// slices of their own: the most, a power of two, that hold whole passes of rows, while a slice's
+/// block scales fit [`RESIDENT`].
+pub(crate) const fn summed_blocks(input: usize, output: usize) -> usize {
+    let parts = summed_parts(input);
+    let mut blocks = super::SLICES / parts;
+    while blocks > 0 && !output.is_multiple_of(2 * blocks * SUMMED) {
+        blocks /= 2;
+    }
+    assert!(blocks > 0, "no summed tiling fits this projection");
+    assert!(
+        output / 2 / blocks * (input / parts) / 16 <= RESIDENT,
+        "a slice's summed block scales fit its data memory"
+    );
+    blocks
+}
+
 /// Rows a cluster holds of a row tile's block: 128 when the rows come in blocks of 256, else 64.
 pub(crate) const fn half(rows: usize) -> usize {
     if rows.is_multiple_of(256) {
