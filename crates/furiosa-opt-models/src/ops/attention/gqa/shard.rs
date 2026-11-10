@@ -139,8 +139,15 @@ pub(crate) type Scale<G> =
 /// its weighted sum.
 pub(crate) struct Scales<G: Partition>(pub Scale<G>, pub Scale<G>);
 
-/// An element a window's values land in, transposed into BF16 for the weighted sum's registers.
+/// An element a window's keys and values land in: streamed as BF16 past the registers of the
+/// passes that read them, or transposed into BF16 for the weighted sum's registers.
 pub(crate) trait Value: MaterializableScalar {
+    /// `rows` streamed by the main context as BF16, `Packet` elements a step of `Time`.
+    fn stream<'l, G: Partition, K: M, Time: M, Packet: M>(
+        main: &'l mut TuContext<{ Tu::Main }>,
+        rows: DmTensorView<'l, Self, Chip<G>, G::Cluster, G::Slices, K>,
+    ) -> CollectTensor<'l, { Tu::Main }, bf16, Chip<G>, G::Cluster, G::Slices, Time, Packet>;
+
     fn transpose<G: Partition, Count: M, K: M, V: M>(
         device: &mut Device,
         value: DmTensorView<'_, Self, Chip<G>, G::Cluster, G::Slices, K>,
@@ -150,6 +157,15 @@ pub(crate) trait Value: MaterializableScalar {
 
 /// BF16 values move as they are.
 impl Value for bf16 {
+    fn stream<'l, G: Partition, K: M, Time: M, Packet: M>(
+        main: &'l mut TuContext<{ Tu::Main }>,
+        rows: DmTensorView<'l, bf16, Chip<G>, G::Cluster, G::Slices, K>,
+    ) -> CollectTensor<'l, { Tu::Main }, bf16, Chip<G>, G::Cluster, G::Slices, Time, Packet> {
+        main.begin(rows)
+            .fetch::<Time, Packet>()
+            .collect::<Time, Packet>()
+    }
+
     fn transpose<G: Partition, Count: M, K: M, V: M>(
         device: &mut Device,
         value: DmTensorView<'_, bf16, Chip<G>, G::Cluster, G::Slices, K>,
@@ -182,9 +198,19 @@ impl Value for bf16 {
     }
 }
 
-/// E4M3 codes widen to BF16 on their way to the transpose, exactly: their scale is the weighted
-/// sum's.
+/// E4M3 codes widen to BF16 on their way to the transpose or through the fetch's table, exactly:
+/// their scales are the scores' and the weighted sum's.
 impl Value for f8e4m3 {
+    fn stream<'l, G: Partition, K: M, Time: M, Packet: M>(
+        main: &'l mut TuContext<{ Tu::Main }>,
+        rows: DmTensorView<'l, f8e4m3, Chip<G>, G::Cluster, G::Slices, K>,
+    ) -> CollectTensor<'l, { Tu::Main }, bf16, Chip<G>, G::Cluster, G::Slices, Time, Packet> {
+        main.begin(rows)
+            .fetch::<Time, Packet>()
+            .fetch_table_lookup::<bf16>()
+            .collect::<Time, Packet>()
+    }
+
     fn transpose<G: Partition, Count: M, K: M, V: M>(
         device: &mut Device,
         value: DmTensorView<'_, f8e4m3, Chip<G>, G::Cluster, G::Slices, K>,
@@ -730,11 +756,11 @@ pub(crate) trait Partition: Sized {
     /// The softmax weights and their total of the scores of `query` over a window's `key` rows,
     /// which stream past it where they landed, each score kept where `masks` keep it and times the
     /// window's `scale` where its keys are codes; `lse` takes each row's log-sum-exp.
-    fn score<Count: M, K: M, L: M>(
+    fn score<Count: M, K: M, L: M, D: Value>(
         device: &mut Device,
         query: &Stationary<Self, Count>,
         (key, masks, scale): (
-            DmTensorView<'_, bf16, Chip<Self>, Self::Cluster, Self::Slices, K>,
+            DmTensorView<'_, D, Chip<Self>, Self::Cluster, Self::Slices, K>,
             &Masks<Self, Count>,
             Option<&Scale<Self>>,
         ),
@@ -742,12 +768,12 @@ pub(crate) trait Partition: Sized {
     ) -> (Slots<Self, Count>, Statistics<Self, Count>) {
         // A key's scores leave the contraction a lane a group; the transpose lays them out a group
         // a row, as the softmax reads them.
-        let scores: Slots<Self, Count, f32> = device
-            .main
-            .begin(key)
-            .fetch::<m![{ Count }, { Self::Keys }, { Self::Head } / 16], m![{ Self::Head } % 16]>()
-            .collect::<m![{ Count }, { Self::Keys }, { Self::Head } / 16], m![{ Self::Head } % 16]>(
-            )
+        let scores: Slots<Self, Count, f32> = D::stream::<
+            Self,
+            _,
+            m![{ Count }, { Self::Keys }, { Self::Head } / 16],
+            m![{ Self::Head } % 16],
+        >(&mut device.main, key)
             .contract_outer::<
                 m![{ Count }, { Self::Keys }, { Self::Head } / 32],
                 m![{ Self::Head } % 32],
@@ -783,14 +809,14 @@ pub(crate) trait Partition: Sized {
 
     /// The softmax `weight`s' sum of a window's `value` rows, which stream past them where they
     /// landed, over their `total`, each value times the window's `scale` where its values are codes.
-    fn weigh<Count: M, V: M, P: M>(
+    fn weigh<Count: M, V: M, P: M, D: Value>(
         device: &mut Device,
         (weight, total, scale): (
             &Slots<Self, Count>,
             &Statistics<Self, Count>,
             Option<&Scale<Self>>,
         ),
-        value: DmTensorView<'_, bf16, Chip<Self>, Self::Cluster, Self::Slices, V>,
+        value: DmTensorView<'_, D, Chip<Self>, Self::Cluster, Self::Slices, V>,
         partial: DmTensorViewMut<'_, f32, Chip<Self>, Self::Cluster, Self::Slices, P>,
     ) {
         let weights: TrfTensor<
@@ -807,12 +833,12 @@ pub(crate) trait Partition: Sized {
             .collect::<m![{ Self::Groups }, { Count }, { Self::Keys } / 16], m![{ Self::Keys } % 16]>(
             )
             .to_trf();
-        let sums = device
-            .main
-            .begin(value)
-            .fetch::<m![{ Count }, { Self::Keys }, { Self::Head } / 16], m![{ Self::Head } % 16]>()
-            .collect::<m![{ Count }, { Self::Keys }, { Self::Head } / 16], m![{ Self::Head } % 16]>(
-            )
+        let sums = D::stream::<
+            Self,
+            _,
+            m![{ Count }, { Self::Keys }, { Self::Head } / 16],
+            m![{ Self::Head } % 16],
+        >(&mut device.main, value)
             .contract_outer::<
                 m![{ Count }, { Self::Keys }, { Self::Head } / 32],
                 m![{ Self::Head } % 32],

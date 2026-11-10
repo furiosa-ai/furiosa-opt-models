@@ -519,31 +519,22 @@ fn chunk<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Count: M, D: Scalar,
 }
 
 /// A history as its windows land and as attention reads them: BF16 cells as they landed, or a
-/// pool's E4M3 codes, whose keys widen to BF16 once a window is prepared (which leaves the widening
-/// behind no gather in flight), whose values widen in their transpose or, where a window streams
-/// them, once it is scored, and whose scales the scores and the weighted sum take.
+/// pool's E4M3 codes, which widen to BF16 where a pass reads them and whose scales the scores and
+/// the weighted sum take. Keys that fill the registers widen once a window is prepared (behind no
+/// gather in flight), values in their transpose, and a streamed window's codes in its fetch.
 pub(crate) trait Landed<Rows: AxisName, KvHeads: AxisName, Head: AxisName> {
     /// The element a window lands in.
     type Element: shard::Value;
-    /// Where a window's keys, and its values where it streams them, of `Count` row groups widen to
-    /// BF16: nothing for BF16 cells.
+    /// Where a window's keys of `Count` row groups widen to BF16 to fill the registers: nothing
+    /// for BF16 cells.
     type Restored<Count: M, Slot: M>;
 
-    /// A place to widen a window's keys and values of `Count` row groups into.
+    /// A place to widen a window's keys of `Count` row groups into.
     fn place<Count: M, Slot: M>() -> Self::Restored<Count, Slot>;
 
     /// The window landed in `cells` as the key fill reads it, its keys widened into `place`
     /// first where they are codes; only its keys' half is read.
     fn keys<'c, Count: M, Slot: M>(
-        &self,
-        device: &mut Device,
-        cells: &'c InDm<Rows, KvHeads, Head, Count, Self::Element, Slot>,
-        place: &'c mut Self::Restored<Count, Slot>,
-    ) -> ChunkView<'c, Rows, KvHeads, Head, Count, bf16, Slot>;
-
-    /// The window landed in `cells` as its weighted sum streams it, its values widened into `place`
-    /// first where they are codes; only its values' half is read.
-    fn values<'c, Count: M, Slot: M>(
         &self,
         device: &mut Device,
         cells: &'c InDm<Rows, KvHeads, Head, Count, Self::Element, Slot>,
@@ -576,15 +567,6 @@ macro_rules! landed_as_is {
         fn place<Count: M, Slot: M>() {}
 
         fn keys<'c, Count: M, Slot: M>(
-            &self,
-            _: &mut Device,
-            cells: &'c InDm<Rows, KvHeads, Head, Count, bf16, Slot>,
-            _: &'c mut (),
-        ) -> ChunkView<'c, Rows, KvHeads, Head, Count, bf16, Slot> {
-            chunk(cells)
-        }
-
-        fn values<'c, Count: M, Slot: M>(
             &self,
             _: &mut Device,
             cells: &'c InDm<Rows, KvHeads, Head, Count, bf16, Slot>,
@@ -632,24 +614,31 @@ impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Windows: AxisName, W>
         DmTensor::new()
     }
 
-    /// Each key code widened to BF16, exactly, in one pass without the vector stage.
+    /// Each key code widened to BF16 into the keys' half of `place`, exactly, in one pass without
+    /// the vector stage.
     fn keys<'c, Count: M, Slot: M>(
         &self,
         device: &mut Device,
         cells: &'c InDm<Rows, KvHeads, Head, Count, f8e4m3, Slot>,
         place: &'c mut InDm<Rows, KvHeads, Head, Count, bf16, Slot>,
     ) -> ChunkView<'c, Rows, KvHeads, Head, Count, bf16, Slot> {
-        widen(device, cells, place, 0)
-    }
-
-    /// Each value code widened to BF16 as [`Self::keys`] widens the keys.
-    fn values<'c, Count: M, Slot: M>(
-        &self,
-        device: &mut Device,
-        cells: &'c InDm<Rows, KvHeads, Head, Count, f8e4m3, Slot>,
-        place: &'c mut InDm<Rows, KvHeads, Head, Count, bf16, Slot>,
-    ) -> ChunkView<'c, Rows, KvHeads, Head, Count, bf16, Slot> {
-        widen(device, cells, place, 1)
+        type Time<Count, KvHeads, Head, const N: usize> =
+            m![{ Count }, { ShardKeys<KvHeads> }, Head / { N }];
+        // SAFETY: as in `chunk`.
+        let widened: ChunkViewMut<'_, Rows, KvHeads, Head, Count, bf16, Slot> =
+            unsafe { place.view_mut().reshape() };
+        device
+            .main
+            .begin(chunk(cells).tile::<m![KeyValue], 1, Half<Count, KvHeads, Head>>(0))
+            .fetch::<Time<Count, KvHeads, Head, 16>, m![Head % 16]>()
+            .fetch_cast::<f32>()
+            .collect::<Time<Count, KvHeads, Head, 8>, m![Head % 8]>()
+            .cast::<bf16, m![Head % 8 # 16]>()
+            .commit_trim::<m![Head % 8]>()
+            .commit_view(widened.tile::<m![KeyValue], 1, m![
+                { Count }, KeyValue = 1 #{!} 2, { ShardKeys<KvHeads> }, Head
+            ]>(0));
+        chunk(place)
     }
 
     fn widened<'c, Count: M, Slot: M>(
@@ -2235,11 +2224,6 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     TileShards<Rows, KvHeads, Groups, Head, SCALE, N>,
                     SliceRows<Rows, KvHeads, N>,
                 >;
-            type Restored<Source, Rows, KvHeads, Head, const N: usize> =
-                <Source as Landed<Rows, KvHeads, Head>>::Restored<
-                    SliceRows<Rows, KvHeads, N>,
-                    TileSlot<Rows, KvHeads, N>,
-                >;
             type Station<Rows, KvHeads, Groups, Head, const SCALE: usize, const N: usize> =
                 shard::Stationary<
                     TileShards<Rows, KvHeads, Groups, Head, SCALE, N>,
@@ -2256,39 +2240,28 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                 const N: usize,
             > = (
                 &'a Place<Rows, KvHeads, Head, Source, N>,
-                (
-                    Masks<Rows, KvHeads, Groups, Head, SCALE, N>,
-                    Restored<Source, Rows, KvHeads, Head, N>,
-                ),
+                Masks<Rows, KvHeads, Groups, Head, SCALE, N>,
             );
             type Places<'a, Source, Rows, KvHeads, Head, const N: usize> = (
                 &'a mut Place<Rows, KvHeads, Head, Source, N>,
                 &'a mut Place<Rows, KvHeads, Head, Source, N>,
                 &'a mut (),
             );
-            // Codes widen where they landed: the keys last here, as the next window's landing is
-            // issued, and the values once scored, as Sub fills the weights.
+            // A window's keys and values stream from where they landed, so preparing it builds only
+            // its masks.
             let prepares = |device: &mut Device,
                             landing: &Place<Rows, KvHeads, Head, Source, N>,
                             _: &mut ()|
-             -> (
-                Masks<Rows, KvHeads, Groups, Head, SCALE, N>,
-                Restored<Source, Rows, KvHeads, Head, N>,
-            ) {
-                let masks =
-                    <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::mask::<
-                        SliceRows<Rows, KvHeads, N>,
-                        _,
-                    >(device, landing.bias.view());
-                let mut restored =
-                    Source::place::<SliceRows<Rows, KvHeads, N>, TileSlot<Rows, KvHeads, N>>();
-                history.keys(device, &landing.cells, &mut restored);
-                (masks, restored)
+             -> Masks<Rows, KvHeads, Groups, Head, SCALE, N> {
+                <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::mask::<
+                    SliceRows<Rows, KvHeads, N>,
+                    _,
+                >(device, landing.bias.view())
             };
             // A window's attention of the query rows on station.
             let scores = |device: &mut Device,
                           query: &Station<Rows, KvHeads, Groups, Head, SCALE, N>,
-                          (landing, (masks, mut restored)): Prepared<
+                          (landing, masks): Prepared<
                 '_,
                 Source,
                 Rows,
@@ -2304,14 +2277,12 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     shard::Local::<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>>::new();
                 let scales =
                     history.scales::<TileShards<Rows, KvHeads, Groups, Head, SCALE, N>>(device);
-                let key = Source::widened(&landing.cells, &restored).tile::<m![KeyValue], 1, Half<
-                    SliceRows<Rows, KvHeads, N>,
-                    KvHeads,
-                    Head,
-                >>(0);
+                let key = chunk(&landing.cells)
+                    .tile::<m![KeyValue], 1, Half<SliceRows<Rows, KvHeads, N>, KvHeads, Head>>(0);
                 let (weight, total) =
                     <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::score::<
                         SliceRows<Rows, KvHeads, N>,
+                        _,
                         _,
                         _,
                     >(
@@ -2324,11 +2295,11 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                         ),
                         lse.view_mut(),
                     );
-                let value = history
-                    .values(device, &landing.cells, &mut restored)
+                let value = chunk(&landing.cells)
                     .tile::<m![KeyValue], 1, Half<SliceRows<Rows, KvHeads, N>, KvHeads, Head>>(1);
                 <TileShards<Rows, KvHeads, Groups, Head, SCALE, N> as shard::Partition>::weigh::<
                     SliceRows<Rows, KvHeads, N>,
+                    _,
                     _,
                     _,
                 >(
@@ -2648,33 +2619,6 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
             }
         }
     }
-}
-
-/// The codes of `cells`' half `half` (0 the keys, 1 the values) widened to BF16 into the same half
-/// of `place`, exactly, in one pass without the vector stage: the cells as attention reads them.
-fn widen<'c, Rows: AxisName, KvHeads: AxisName, Head: AxisName, Count: M, Slot: M>(
-    device: &mut Device,
-    cells: &'c InDm<Rows, KvHeads, Head, Count, f8e4m3, Slot>,
-    place: &'c mut InDm<Rows, KvHeads, Head, Count, bf16, Slot>,
-    half: usize,
-) -> ChunkView<'c, Rows, KvHeads, Head, Count, bf16, Slot> {
-    type Time<Count, KvHeads, Head, const N: usize> =
-        m![{ Count }, { ShardKeys<KvHeads> }, Head / { N }];
-    // SAFETY: as in `chunk`.
-    let widened: ChunkViewMut<'_, Rows, KvHeads, Head, Count, bf16, Slot> =
-        unsafe { place.view_mut().reshape() };
-    device
-        .main
-        .begin(chunk(cells).tile::<m![KeyValue], 1, Half<Count, KvHeads, Head>>(half))
-        .fetch::<Time<Count, KvHeads, Head, 16>, m![Head % 16]>()
-        .fetch_cast::<f32>()
-        .collect::<Time<Count, KvHeads, Head, 8>, m![Head % 8]>()
-        .cast::<bf16, m![Head % 8 # 16]>()
-        .commit_trim::<m![Head % 8]>()
-        .commit_view(widened.tile::<m![KeyValue], 1, m![
-            { Count }, KeyValue = 1 #{!} 2, { ShardKeys<KvHeads> }, Head
-        ]>(half));
-    chunk(place)
 }
 
 /// The values of every row group of `chunk`, each a `D`, transposed into `values`, as
