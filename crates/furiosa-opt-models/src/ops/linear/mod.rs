@@ -515,9 +515,9 @@ where
     }
 }
 
-/// The rows of a launch in their feature slices, every row group of them live, begun: projected
-/// over the weight as it landed and split into heads, and kept in both register banks as its
-/// contraction read them, for every congruent projection of the same rows; both keep the rows.
+/// The rows of a launch in their feature slices, padding and all, begun: projected over the weight
+/// as it landed and split into heads, and kept in both register banks as its contraction read them,
+/// for every congruent projection of the same rows; both keep the rows.
 impl<'x, In, Out, Code, Rows, W, View, L> Op<(L, Begin<&'x Live<Spread<In, Rows>, Rows>>)>
     for Native<W, View>
 where
@@ -572,8 +572,8 @@ where
     }
 }
 
-/// Rows of which fewer than every row group are live: a projection contracts each live lane group
-/// alone, as no register bank holds the envelope, and runs its boundary on its state so wrapped.
+/// Rows a projection contracts a live lane group at a time, as no register bank holds the envelope;
+/// a boundary runs on its state so wrapped.
 pub struct Grouped<T>(pub T);
 
 /// No work beside a projection of such rows either.
@@ -583,8 +583,8 @@ impl Op<Grouped<&mut ()>> for () {
     fn forward(&self, _: &mut Device, _: Grouped<&mut ()>) {}
 }
 
-/// The live lane groups of a launch's rows in their feature slices, fewer than all, projected over
-/// the weight as it landed and split into heads where the contraction leaves them.
+/// The live lane groups of a launch's rows in their feature slices, projected over the weight as it
+/// landed and split into heads where the contraction leaves them.
 impl<'x, In, Out, Code, Rows, W, View, L> Op<(L, Grouped<&'x Live<Spread<In, Rows>, Rows>>)>
     for Native<W, View>
 where
@@ -614,8 +614,8 @@ where
     }
 }
 
-/// The live lane groups of a launch's rows, fewer than all, begun: projected as above, and
-/// nothing kept, as each congruent projection of a weight read as BF16 fills its own lanes.
+/// The live lane groups of a launch's rows, begun: projected as above, and nothing kept, as each
+/// congruent projection of a weight read as BF16 fills its own lanes.
 impl<'x, In, Out, Code, Rows, W, View, L> Op<(L, Begin<Grouped<&'x Live<Spread<In, Rows>, Rows>>>)>
     for Native<W, View>
 where
@@ -640,7 +640,7 @@ where
     }
 }
 
-/// The live lane groups of a launch's rows, fewer than all, after a projection that kept nothing.
+/// The live lane groups of a launch's rows after a projection that kept nothing.
 impl<'x, 'k, In, Out, Code, Rows, W, View, L>
     Op<(L, (Grouped<&'x Live<Spread<In, Rows>, Rows>>, &'k ()))> for Native<W, View>
 where
@@ -663,11 +663,11 @@ where
     }
 }
 
-/// The rows of a launch in their feature slices, every row group of them live, begun under the
-/// token contract: each row quantized under its own scale, each half of the envelope staged in the
-/// slices of each part and filled into its register bank while the bank before contracts,
-/// projected over the weight as it landed and split into heads; the banks are kept for every
-/// congruent projection of the same rows.
+/// The rows of a launch in their feature slices, padding and all, begun under the token contract:
+/// each row quantized under its own scale, each half of the envelope staged in the slices of each
+/// part and filled into its register bank while the bank before contracts, projected over the
+/// weight as it landed and split into heads; the banks are kept for every congruent projection of
+/// the same rows.
 impl<'x, In, Out, Rows, W, View>
     Op<(
         Landed<In, Out, Token>,
@@ -702,10 +702,10 @@ where
     }
 }
 
-/// The live lane groups of a launch's rows, fewer than all, begun under the token contract: each
-/// row quantized under its own scale and the live groups' codes staged in the slices of each part,
-/// projected over the weight as it landed a lane group at a time and split into heads; the staged
-/// rows are kept for every congruent projection of the same rows.
+/// The live lane groups of a launch's rows, begun under the token contract: each row quantized
+/// under its own scale and the live groups' codes staged in the slices of each part, projected over
+/// the weight as it landed a lane group at a time and split into heads; the staged rows are kept
+/// for every congruent projection of the same rows.
 impl<'x, In, Out, Rows, W, View>
     Op<(
         Landed<In, Out, Token>,
@@ -812,7 +812,7 @@ where
     }
 }
 
-/// The same rows through the token-scaled weight begun here: every row group live, through both
+/// The same rows through the token-scaled weight begun here: dense in the envelope, through both
 /// register banks, else a live lane group at a time; what it staged is dropped.
 impl<'x, In, Out, Rows, K, V, View> Op<&'x Live<Spread<In, Rows>, Rows>>
     for Native<fp8::TokenScaled<In, Out, K, V>, View>
@@ -832,9 +832,7 @@ where
         input: &'x Live<Spread<In, Rows>, Rows>,
     ) -> Self::Output {
         let landed = self.0.forward(&mut *device, Begin(()));
-        if input.groups::<crate::tensor::axis::Lanes<Rows>>().1
-            == <mapping::Rows<Rows>::Groups as M>::SIZE
-        {
+        if input.dense::<crate::tensor::axis::Lanes<Rows>>() {
             return self.forward(device, (landed, Begin(input))).0;
         }
         self.forward(device, (landed, Begin(Grouped(input)))).0

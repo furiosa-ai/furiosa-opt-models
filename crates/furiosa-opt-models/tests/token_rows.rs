@@ -1,9 +1,9 @@
 //! A token-scaled FP8 projection's live rows at each width Gemma 4 projects a row to: every live
 //! row quantizes to E4M3 under its own scale, its largest magnitude over the largest E4M3 value
 //! rounded once to BF16, and each of its outputs holds within one BF16 rounding of that arithmetic
-//! in FP64, wherever the launch's live rows start and end: inside one lane group, across two, and
-//! over the whole envelope, whose rows contract in halves. A row of zeros projects to zeros, and
-//! the rows outside the live ones, poison, reach no live output.
+//! in FP64, wherever the launch's live rows start and end: inside one lane group, across several,
+//! and over half the envelope or more, whose rows then contract in halves. A row of zeros projects
+//! to zeros, and the rows outside the live ones, poison, reach no live output.
 
 #![feature(register_tool)]
 #![register_tool(furiosa_opt)]
@@ -58,12 +58,24 @@ const _: fn(
 /// The smallest row scale, as the form floors it: a row of zeros quantizes to zeros.
 const FLOOR: f32 = 1e-12;
 
-/// The row of zeros: in the second lane group, so that two of the cases hold it live.
+/// The row of zeros: in the second lane group, so that several of the cases hold it live.
 const ZEROS: usize = 13;
 
-/// The live rows these cases name: none, one, the first group and one row past it, two whole
-/// groups, rows that start inside a group or cross from one into the next, and the envelope.
-const CASES: [Range<usize>; 7] = [0..0, 0..1, 0..9, 0..16, 8..10, 5..11, 0..64];
+/// The live rows these cases name: none, one, the first group and one row past it, two and three
+/// whole groups, rows that start inside a group or cross from one into the next, half the
+/// envelope, rows from inside the first group into the sixth, and the envelope.
+const CASES: [Range<usize>; 10] = [
+    0..0,
+    0..1,
+    0..9,
+    0..16,
+    0..24,
+    8..10,
+    5..11,
+    0..32,
+    3..41,
+    0..64,
+];
 
 /// The live rows `start` and `rows` name, through `weight`, from HBM rows to heads and back.
 #[device(chip = 1)]

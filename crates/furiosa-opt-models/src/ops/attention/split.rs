@@ -459,7 +459,7 @@ type Unsplit<'h, Rows, Width, Heads, Head> = DmTensorViewMut<
 
 /// The rows a projection of one head kind leaves where its contraction computes them, as `Heads`
 /// heads of `Groups` query heads each, moved straight into the head slices of each KV head's
-/// cluster: the row groups live rows touch one by one unless every group is live.
+/// cluster; live rows that lie in one row group move alone.
 impl<In, Width, Code, Heads, Groups, Head, Rows>
     Op<Live<linear::Projected<In, Width, Code, Rows>, Rows>> for Reshape<m![Heads, Groups, Head]>
 where
@@ -487,21 +487,18 @@ where
         };
         let mut heads: SplitHeads<Rows, Heads, Groups, Head> = DmTensor::new();
         let (first, count) = input.groups::<crate::tensor::axis::Lanes<Rows>>();
-        if count < <linear::Groups<Rows> as M>::SIZE {
-            for at in 0..count {
-                let group = first + at;
-                // SAFETY: as for every row group below.
-                let unsplit: Unsplit<'_, Rows, Width, Heads, Head> =
-                    unsafe { heads.view_mut().reshape() };
-                linear::Linear::<In, Width>::group(input.value(), group).to_dm_view(
-                    &mut device.tdma,
-                    unsplit.tile::<
-                        linear::Groups<Rows>,
-                        1,
-                        m![{ Layout<Rows>::SelectedMut }, { HeadFeatures<Width, Head> }],
-                    >(group),
-                );
-            }
+        if count == 1 && count < <linear::Groups<Rows> as M>::SIZE {
+            // SAFETY: as for every row group below.
+            let unsplit: Unsplit<'_, Rows, Width, Heads, Head> =
+                unsafe { heads.view_mut().reshape() };
+            linear::Linear::<In, Width>::group(input.value(), first).to_dm_view(
+                &mut device.tdma,
+                unsplit.tile::<
+                    linear::Groups<Rows>,
+                    1,
+                    m![{ Layout<Rows>::SelectedMut }, { HeadFeatures<Width, Head> }],
+                >(first),
+            );
             return input.with(heads);
         }
         // SAFETY: the features are head-major within every row. Relabeling preserves cells.

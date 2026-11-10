@@ -151,6 +151,11 @@ impl<X, R: AxisName> Live<X, R> {
         (self.start / L::SIZE, count)
     }
 
+    /// Whether the live rows touch at least half the envelope's groups of `L` rows.
+    pub fn dense<L: AxisName>(&self) -> bool {
+        2 * self.groups::<L>().1 >= R::SIZE / L::SIZE
+    }
+
     /// Runs `every` when all `R` rows are live; otherwise `whole` on each tile of `T` rows whose
     /// rows are all live, then `row` on each other live row, each row's effect issuing once.
     pub fn cover<T: AxisName, D>(

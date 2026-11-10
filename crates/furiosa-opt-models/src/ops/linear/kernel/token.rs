@@ -10,10 +10,11 @@
 //! - The codes reach the slices of every part once for all projections of the same rows, then fill
 //!   the tensor registers from data memory. A live lane group at a time rides the switch ring
 //!   ([`Tokens`]) and fills the registers for every slab: a tensor-unit pass, it does not wait for
-//!   the weights that transfers land meanwhile. Every row group live, each half of the envelope is
-//!   stored to HBM as the feature slices hold it, landed in the slices of each part of every block
-//!   and relaid row-major ([`TokenBanks`]), the second half landing while the first fills its bank
-//!   and contracts: the ring would take longer than waiting for the transfers ahead and landing.
+//!   the weights that transfers land meanwhile. Once the live rows are dense in the envelope, each
+//!   half of it, padding and all, is stored to HBM as the feature slices hold it, landed in the
+//!   slices of each part of every block and relaid row-major ([`TokenBanks`]), the second half
+//!   landing while the first fills its bank and contracts: the ring would take longer than waiting
+//!   for the transfers ahead and landing.
 //! - A part holds whole E4M3 steps, so each contraction step takes two packets.
 
 use super::*;
@@ -73,10 +74,9 @@ pub struct Tokens<In: AxisName, Out: AxisName, Rows: AxisName> {
 /// Half the envelope's rows: the rows one bank of the tensor registers holds.
 type Half<In, Out, Rows> = Batch<In, Out, Code, Rows>;
 
-/// The rows of an envelope, every row group of them live, in both banks of the tensor registers as
-/// the contraction of `In` inputs into `Out` outputs reads them, half the envelope a bank, beside
-/// each row's scale: filled once, they serve every slab of every congruent projection of the same
-/// rows.
+/// The rows of an envelope, padding and all, in both banks of the tensor registers as the
+/// contraction of `In` inputs into `Out` outputs reads them, half the envelope a bank, beside each
+/// row's scale: filled once, they serve every slab of every congruent projection of the same rows.
 pub struct TokenBanks<In: AxisName, Out: AxisName, Rows: AxisName> {
     low: Lanes<In, Out, Rows, Half<In, Out, Rows>>,
     high: Lanes<In, Out, Rows, Half<In, Out, Rows>>,
@@ -113,8 +113,8 @@ type Chosen<Rows, B> = m![Rows / B = 1 # (Rows / B), Rows % B];
 type BatchedMut<Rows, B, Inner> = m![Rows / B = 1 #{!} (Rows / B), Rows % B, { Inner }];
 
 impl<In: AxisName, Out: AxisName> Contraction<In, Out, Code> {
-    /// The live lane groups of `input`, fewer than all, each row quantized under its own scale,
-    /// their codes in the slices of each part.
+    /// The live lane groups of `input`, each row quantized under its own scale, their codes in the
+    /// slices of each part.
     pub(crate) fn tokens<Rows: AxisName>(
         device: &mut Device,
         input: &Live<Spread<In, Rows>, Rows>,
@@ -128,11 +128,11 @@ impl<In: AxisName, Out: AxisName> Contraction<In, Out, Code> {
         Tokens { codes, scales }
     }
 
-    /// Every row of `input`, every row group of it live, each quantized under its own scale,
-    /// against every slab of `landed`, each output rounded once to BF16, as [`Self::kept`]
-    /// contracts BF16 rows: the second half of the envelope lands while the first fills its bank
-    /// of the registers and contracts the first slab, and both banks stay filled for every
-    /// congruent projection of the same rows.
+    /// Every row of `input`, padding and all, each quantized under its own scale, against every
+    /// slab of `landed`, each output rounded once to BF16, as [`Self::kept`] contracts BF16 rows:
+    /// the second half of the envelope lands while the first fills its bank of the registers and
+    /// contracts the first slab, and both banks stay filled for every congruent projection of the
+    /// same rows.
     pub(crate) fn token_kept<Rows: AxisName>(
         device: &mut Device,
         landed: &Landed<In, Out, Token>,

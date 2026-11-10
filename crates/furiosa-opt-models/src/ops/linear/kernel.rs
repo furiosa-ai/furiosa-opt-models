@@ -1434,10 +1434,10 @@ impl<In: AxisName, Out: AxisName, Code: Scalar> Contraction<In, Out, Code> {
         result
     }
 
-    /// Every row of `input`, every row group of it live, against every slab of `weight`, each
-    /// output rounded once to BF16, as [`Self::resident`] contracts them: the first slab fills
-    /// each bank of the registers beside its contraction of the bank before, and both banks stay
-    /// filled for every congruent projection of the same rows.
+    /// Every row of `input`, padding and all, against every slab of `weight`, each output rounded
+    /// once to BF16, as [`Self::resident`] contracts them: the first slab fills each bank of the
+    /// registers beside its contraction of the bank before, and both banks stay filled for every
+    /// congruent projection of the same rows.
     pub(crate) fn kept<Rows: AxisName, V: Source<Chips = m![1]>, S>(
         device: &mut Device,
         weight: &S,

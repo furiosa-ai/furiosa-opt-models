@@ -383,10 +383,11 @@ where
         } = &attention.0.qkv;
         let normalized = gain.forward(&mut *device, (), &mut (), &rows);
         let input = &normalized;
-        // The query projection keeps the rows it staged for the key and value projections: every
-        // row group live, in the tensor registers; else what its form stages for the live groups.
+        // The query projection keeps the rows it staged for the key and value projections: the
+        // envelope in the tensor registers once the live rows are dense in it, as staging each
+        // live group then costs more; else what its form stages for the live groups.
         let projected = |device: &mut Device| {
-            if input.groups::<Lanes<R>>().1 == <Layout<R>::Groups as M>::SIZE {
+            if input.dense::<Lanes<R>>() {
                 let begun = (query, Begin(input));
                 let (query, banks) = (projections.query).forward(&mut *device, (), &mut (), begun);
                 return (
