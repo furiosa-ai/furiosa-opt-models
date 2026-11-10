@@ -10,10 +10,14 @@ use std::{
 
 const REPO: &str = "nvidia/Llama-3.1-8B-Instruct-NVFP4";
 const REVISION: &str = "bdb54e24298451af785c0ac63c1b485e9b7400a2";
-/// "Hello" after Llama's begin-of-text token.
-const PROMPT: [i32; 2] = [128000, 9906];
-/// ", I", from the independent PyTorch W4A16 reference for the pinned checkpoint.
-const CONTINUATION: [i32; 2] = [11, 358];
+/// "Instruct: Given a web search query, retrieve relevant passages that answer the query
+/// Query:What is the capital of China?" in Llama's tokens, after begin-of-text.
+const PROMPT: [i32; 27] = [
+    128000, 644, 1257, 25, 16644, 264, 3566, 2778, 3319, 11, 17622, 9959, 47869, 430, 4320, 279,
+    3319, 198, 2929, 25, 3923, 374, 279, 6864, 315, 5734, 30,
+];
+/// Eight greedy tokens from the independent PyTorch W4A16 reference for the pinned checkpoint.
+const CONTINUATION: [i32; 8] = [720, 12465, 1154, 512, 12465, 425, 220, 16];
 
 fn checkpoint() -> Checkpoint {
     let output = Command::new("uvx")
@@ -70,7 +74,7 @@ async fn tokens(device: &mut Device, buffer: furiosa_opt_engine::decoder::HbmTen
 }
 #[test]
 #[ignore = "opens a device and loads the pinned checkpoint"]
-fn continues_hello_with_w4a16_tokens() {
+fn continues_the_prompt_with_w4a16_tokens() {
     let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
     let model = Instance::new(
         checkpoint().load::<ForCausalLM>(&mut device).unwrap(),
@@ -81,11 +85,13 @@ fn continues_hello_with_w4a16_tokens() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        for chunk in [1, 2] {
-            let cache = Cache::new(&device, &model.limits().cache, 1).unwrap();
+        for chunk in [1, PROMPT.len()] {
+            let count = (PROMPT.len() + CONTINUATION.len()).div_ceil(16);
+            let blocks: Vec<u32> = (0..count as u32).rev().collect();
+            let cache = Cache::new(&device, &model.limits().cache, count).unwrap();
             let (mut cached, mut selected) = (0, 0);
             for ids in PROMPT.chunks(chunk) {
-                let request = request(&mut device, ids, cached, &[0]).await;
+                let request = request(&mut device, ids, cached, &blocks).await;
                 let output = model
                     .forward(&mut device, &cache, &[request], &[])
                     .await
@@ -93,17 +99,18 @@ fn continues_hello_with_w4a16_tokens() {
                 selected = tokens(&mut device, output).await[0];
                 cached += ids.len();
             }
-            assert_eq!(selected, CONTINUATION[0], "prefill chunk {chunk}");
-            let request = request(&mut device, &[selected], cached, &[0]).await;
-            let output = model
-                .forward(&mut device, &cache, &[request], &[])
-                .await
-                .unwrap();
-            assert_eq!(
-                tokens(&mut device, output).await,
-                [CONTINUATION[1]],
-                "decode after chunk {chunk}"
-            );
+            let mut got = vec![selected];
+            for _ in 1..CONTINUATION.len() {
+                let request = request(&mut device, &[selected], cached, &blocks).await;
+                let output = model
+                    .forward(&mut device, &cache, &[request], &[])
+                    .await
+                    .unwrap();
+                selected = tokens(&mut device, output).await[0];
+                got.push(selected);
+                cached += 1;
+            }
+            assert_eq!(got, CONTINUATION, "prefill chunk {chunk}");
         }
     });
 }
