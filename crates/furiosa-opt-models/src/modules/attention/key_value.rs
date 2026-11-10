@@ -5,7 +5,7 @@ use super::Context;
 use crate::Module;
 use crate::load::{self, Checkpoint, Load, LoadError};
 use crate::modules::language::Selected;
-use crate::ops::index::table::{self, BlockIndex, Derive, Extents, Fields, Logical};
+use crate::ops::index::table::{self, BlockIndex, Derive, Extents, Logical, SegmentTable};
 use crate::ops::linear::query::Tile;
 use crate::ops::rotary::{self, SplitHalf, group};
 use crate::ops::{
@@ -30,7 +30,8 @@ use std::marker::PhantomData;
 /// and selected rows, not live rows.
 #[derive(DeviceSend)]
 pub struct History<Segments: AxisName, Blocks: AxisName, Selected: AxisName, Chips: M = Chip> {
-    pub segments: HbmTensor<i32, Chips, m![Segments, Fields]>,
+    /// Each segment's words as [`table::cells`] stages them.
+    pub segments: HbmTensor<i32, Chips, SegmentTable<Segments>>,
     pub blocks: HbmTensor<i32, Chips, m![Blocks]>,
     pub selected: HbmTensor<i32, Chips, m![Selected]>,
     pub extents: HbmTensor<i32, Chips, m![3]>,
@@ -423,7 +424,7 @@ where
     D: Scalar,
     Derive<Rows, Chips, X>: for<'d, 'h> Module<
             (
-                &'h HbmTensor<i32, Chips, m![Rows, Fields]>,
+                &'h HbmTensor<i32, Chips, SegmentTable<Rows>>,
                 &'h HbmTensor<i32, Chips, m![B]>,
             ),
             Env,
@@ -518,7 +519,7 @@ where
     W: AxisName,
     Derive<Rows, Chips, X>: for<'d, 'h> Module<
             (
-                &'h HbmTensor<i32, Chips, m![Rows, Fields]>,
+                &'h HbmTensor<i32, Chips, SegmentTable<Rows>>,
                 &'h HbmTensor<i32, Chips, m![B]>,
             ),
             Env,

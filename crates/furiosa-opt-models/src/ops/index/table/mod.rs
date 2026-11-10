@@ -286,6 +286,9 @@ pub const FIELDS: usize = 5;
 axes![Fields = 5];
 const _: () = assert!(Fields::SIZE == FIELDS);
 
+/// A history's segment table of `S` segments as the derive lands it ([`cells`]).
+pub type SegmentTable<S> = m![Fields, S, 1 # 8];
+
 /// Window rows of block IDs that a flat table of `B` entries holds.
 #[derive(Clone, Debug)]
 pub struct TableRows<B>(PhantomData<B>);
@@ -918,6 +921,22 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
         }
         output
     }
+}
+
+/// The segment table of `segments` as a history stages it for `S` segments: word-major, each
+/// word in a cell of its own and zeros past them, so one transfer lands it on the rows' slices.
+pub fn cells<S: AxisName>(segments: &[[i32; FIELDS]]) -> HostTensor<i32, SegmentTable<S>> {
+    assert!(segments.len() <= S::SIZE, "the table holds every segment");
+    let cell = <m![1 # 8] as M>::SIZE;
+    let word = |at: usize| {
+        let (field, segment) = (at / cell / S::SIZE, at / cell % S::SIZE);
+        let first = at.is_multiple_of(cell);
+        segments
+            .get(segment)
+            .filter(|_| first)
+            .map_or(0, |words| words[field])
+    };
+    HostTensor::from_vec((0..<SegmentTable<S> as M>::SIZE).map(word))
 }
 
 #[cfg(test)]

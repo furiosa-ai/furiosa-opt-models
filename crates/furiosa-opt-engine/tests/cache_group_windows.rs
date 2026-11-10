@@ -181,8 +181,13 @@ fn reads<B: AxisName>(
         batch.history::<gemma4::Rows, B>((group, Table::Blocks))?;
     let window = limits.cache.groups[group].window;
     let word = |value: usize| i32::try_from(value).unwrap();
+    // The table is word-major, each word in a cell of its own.
+    let cell = |segment: usize, field: usize| {
+        segments[(field * gemma4::Rows::SIZE + segment) * <m![1 # 8] as M>::SIZE]
+    };
     let mut start = 0;
-    for (request, segment) in requests.iter().zip(segments.chunks_exact(FIELDS)) {
+    for (index, request) in requests.iter().enumerate() {
+        let segment: [i32; FIELDS] = std::array::from_fn(|field| cell(index, field));
         let rows = request.tokens.len();
         let fields = [start, rows, request.cached].map(word);
         assert_eq!(segment[..3], fields, "group {group}, row {start}");

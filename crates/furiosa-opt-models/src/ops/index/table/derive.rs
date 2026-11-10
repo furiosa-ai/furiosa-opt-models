@@ -2,8 +2,8 @@
 //! entry, derived on the device from its history's segment table and load-time coordinates.
 
 use super::{
-    CACHED, Fields, Grid, LEN, Logical, Pairs, Places, Quad, Rows, START, Segment, TABLE, pack,
-    row_operand,
+    CACHED, Fields, Grid, LEN, Logical, Pairs, Places, Quad, Rows, START, Segment, SegmentTable,
+    TABLE, pack, row_operand,
 };
 use crate::Op;
 use crate::load::{self, Checkpoint, Load, LoadError};
@@ -102,10 +102,10 @@ type Columns<R, Chips> =
     DmTensor<i32, Chips, Cluster, RowSlices<R>, m![Fields, { Symbol<Segment<R>> }, 1 # 8]>;
 
 /// Each row's logical position, write slot, visible length and table entry, from the segment
-/// table of a history and its flat table of block IDs.
+/// table of a history ([`cells`](super::cells)) and its flat table of block IDs.
 impl<R: AxisName, B: AxisName, Chips: M + 'static, X: Memory>
     Op<(
-        &HbmTensor<i32, Chips, m![R, Fields]>,
+        &HbmTensor<i32, Chips, SegmentTable<R>>,
         &HbmTensor<i32, Chips, m![B]>,
     )> for Derive<R, Chips, X>
 where
@@ -120,7 +120,7 @@ where
         &self,
         device: &mut Device,
         (segments, blocks): (
-            &HbmTensor<i32, Chips, m![R, Fields]>,
+            &HbmTensor<i32, Chips, SegmentTable<R>>,
             &HbmTensor<i32, Chips, m![B]>,
         ),
     ) -> Self::Output {
@@ -206,17 +206,14 @@ where
                 .to_dm_view(&mut device.tdma, rows.view_mut());
             rows
         };
-        // A field a flit in HBM first: a DMA into data memory moves whole eight-byte cells.
-        let mut padded: HbmTensor<i32, Chips, m![Fields, { Symbol<Segment<R>> }, 1 # 8]> =
-            HbmTensor::new();
+        let mut columns: Columns<R, Chips> = DmTensor::new();
         // SAFETY: a relabel of the segment axis, which keeps its size and order.
         unsafe {
             segments
                 .view()
-                .reshape::<Chips, m![{ Symbol<Segment<R>> }, Fields]>()
+                .reshape::<Chips, m![Fields, { Symbol<Segment<R>> }, 1 # 8]>()
         }
-        .to_hbm_view(&mut device.tdma, padded.view_mut());
-        let columns: Columns<R, Chips> = padded.to_dm(&mut device.tdma);
+        .to_dm_view(&mut device.tdma, columns.view_mut());
         let start = column(device, &columns, START);
         let len = column(device, &columns, LEN);
         let table = column(device, &columns, TABLE);

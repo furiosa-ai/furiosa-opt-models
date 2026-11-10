@@ -390,7 +390,7 @@ mod tests {
     use crate::ops::attention::Attention;
     use crate::ops::attention::Heads;
     use crate::ops::attention::gqa::{Cache, LaneWindows, Pages, RowMajor, WindowRow, Wrap};
-    use crate::ops::index::table::{BlockIndex, Fields, PADDING_BIAS};
+    use crate::ops::index::table::{self, BlockIndex, PADDING_BIAS};
     use crate::specialize::attention::{HISTORY_WAVES, Strategy, WAVES};
     use crate::tensor::axis::Rows;
     use crate::tensor::cache::{Block, Blocks};
@@ -826,16 +826,16 @@ mod tests {
         let checkpoint = Checkpoint::new(empty.path(), Some(config)).unwrap();
         let preparation: Paged<R, H, D> = checkpoint.load(device).unwrap();
         // Each row's table from a whole table row, the last ID repeated to its end.
-        let (mut segments, mut blocks) = (vec![0; R::SIZE * FIELDS], Vec::new());
+        let (mut segments, mut blocks) = (Vec::new(), Vec::new());
         for (row, (&length, table)) in lengths.iter().zip(&tables).enumerate() {
             let segment = [row, 1, length - 1, blocks.len(), table.len()];
-            segments[row * FIELDS..][..FIELDS].copy_from_slice(&segment.map(|word| word as i32));
+            segments.push(segment.map(|word| word as i32));
             let padded = table.len().next_multiple_of(BlockIndex::SIZE);
             blocks.extend((0..padded).map(|at| table[at.min(table.len() - 1)]));
         }
         blocks.resize(Table::SIZE, 0);
         let history = History {
-            segments: HostTensor::<i32, m![R, Fields]>::from_vec(segments)
+            segments: table::cells::<R>(&segments)
                 .to_hbm(&mut device.pdma)
                 .await
                 .unwrap(),
