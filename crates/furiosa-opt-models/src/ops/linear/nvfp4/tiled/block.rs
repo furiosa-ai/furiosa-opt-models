@@ -1,18 +1,13 @@
 //! Exact NVFP4 restoration shared by tiled projections. Each local feature run consists of
 //! whole 16-feature blocks; BF16 holds E2M1 code times E4M3 block scale exactly.
 use super::Scales;
+pub(crate) use crate::ops::pointwise::Flat;
 use crate::ops::vector::Restore as _;
 use crate::tensor::form::nvfp4::Scale;
 use crate::tensor::parallel::Chip;
-use core::marker::PhantomData;
+use crate::tensor::scalar;
 use furiosa_opt_std::prelude::*;
 
-#[derive(Clone, Debug)]
-pub(crate) struct Flat<E>(PhantomData<E>);
-impl<E: M + 'static> AxisName for Flat<E> {
-    const NAME: Ident = Ident::new("Flat");
-    const SIZE: usize = E::SIZE;
-}
 type Blocks<E> = m![{ Symbol<Flat<E>> } / 16];
 type Register<E, C, S> = VrfTensor<f32, Chip, C, S, Blocks<E>>;
 
@@ -27,12 +22,7 @@ pub(crate) fn scalar<C: M, S: M>(
     }
     if const { S::SIZE == 32 } {
         let landed: DmTensor<f32, Chip, C, S, m![1 # 8]> = value.to_dm(&mut device.tdma);
-        return device
-            .sub
-            .begin(landed.view())
-            .fetch::<m![1], m![1 # 8]>()
-            .collect::<m![1], m![1 # 8]>()
-            .to_vrf();
+        return scalar::register(device, &landed);
     }
     let landed: DmTensor<f32, Chip, m![2], m![1 # 256], m![1 # 8]> = value.to_dm(&mut device.tdma);
     let broadcast: VrfTensor<f32, Chip, m![2], m![256], m![1 # 8]> = device
@@ -64,11 +54,10 @@ pub(crate) fn finish<C: M, S: M, E: M + 'static>(
         .vector_init()
         .vector_intra_slice_tag(TagMode::Zero)
         .vector_narrow_split::<m![{ Symbol<Flat<E>> } / 4], m![{ Symbol<Flat<E>> } % 4]>()
-        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &factor)
-        .vector_widen_concat::<m![{ Symbol<Flat<E>> } / 8], m![{ Symbol<Flat<E>> } % 8]>()
-        .vector_final()
-        .cast::<bf16, m![{ Symbol<Flat<E>> } % 8 # 16]>()
-        .commit_trim::<m![{ Symbol<Flat<E>> } % 8]>()
+        .vector_restore::<m![{ Symbol<Flat<E>> } / 8], m![{ Symbol<Flat<E>> } % 8], _, _>(
+            &factor,
+            |stream| stream,
+        )
         .commit();
     // SAFETY: restore the original local axes after the elementwise scale and cast.
     unsafe { output.reshape() }

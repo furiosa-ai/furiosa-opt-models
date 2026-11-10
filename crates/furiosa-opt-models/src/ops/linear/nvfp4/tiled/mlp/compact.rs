@@ -1,5 +1,7 @@
 use super::super::compact as tile;
 use super::*;
+use crate::Op;
+use crate::ops::pointwise::add::Add;
 
 axes![Term = 2];
 type Partial<H, I, R, const W: usize> =
@@ -32,18 +34,18 @@ pub(super) fn prepare<H: AxisName, I: AxisName, R: AxisName, const W: usize>(
     let p1 = pair::<H, I, R, W>(device, &g1, &u1, &l1);
     let g3 = gate.load(device, 3);
     let u3 = up.load(device, 3);
-    let s1 = add(device, p0.view(), p1.view());
+    let s1 = Add.forward(device, (p0.view(), p1.view()));
     let l3 = tile::lanes(device, &input, 3);
     let p2 = pair::<H, I, R, W>(device, &g2, &u2, &l2);
     let d1 = down.stage(device, 1);
-    let s2 = add(device, s1.view(), p2.view());
+    let s2 = Add.forward(device, (s1.view(), p2.view()));
     let g3 = single::<H, I, R, W>(device, &g3, &l3);
     let g = term(device, &s2, 0);
-    let g = add(device, g.view(), g3.view());
+    let g = Add.forward(device, (g.view(), g3.view()));
     let g = finish(device, &gate.weights.contract, &g);
     let u3 = single::<H, I, R, W>(device, &u3, &l3);
     let u = term(device, &s2, 1);
-    let u = add(device, u.view(), u3.view());
+    let u = Add.forward(device, (u.view(), u3.view()));
     let u = finish(device, &up.weights.contract, &u);
     product::compact::<I, R, W>(device, &g, &u, product);
     (d0, d1)
@@ -188,31 +190,6 @@ fn pair<H: AxisName, I: AxisName, R: AxisName, const W: usize>(
                 .tile::<m![I % 224 / 112], 1, m![R % {W}, Term, I % 224 / 112 = 1 #{!} 2, I % 112]>(half));
     }
     output
-}
-
-fn add<H: AxisName, E: M + 'static>(
-    device: &mut Device,
-    left: DmTensorView<'_, f32, Chip, tile::Cluster, tile::Slices<H>, E>,
-    right: DmTensorView<'_, f32, Chip, tile::Cluster, tile::Slices<H>, E>,
-) -> DmTensor<f32, Chip, tile::Cluster, tile::Slices<H>, E> {
-    axes![Side = 2];
-    type Flat<E> = m![{Symbol<block::Flat<E>>}];
-    // SAFETY: flatten contiguous local elements without changing their input-slice owners.
-    let left = unsafe { left.reshape::<Chip, tile::Cluster, tile::Slices<H>, Flat<E>>() };
-    let right = unsafe { right.reshape::<Chip, tile::Cluster, tile::Slices<H>, Flat<E>>() };
-    let sum: DmTensor<f32, Chip, tile::Cluster, tile::Slices<H>, Flat<E>> = device
-        .main
-        .begin_interleaved::<Side, _, _, _, _, _>(left, right)
-        .fetch::<m![{Flat<E>} / 8, Side], m![{Flat<E>} % 8]>()
-        .collect::<m![{Flat<E>} / 8, Side], m![{Flat<E>} % 8]>()
-        .vector_init()
-        .vector_intra_slice_unzip::<Side, m![{Flat<E>} / 8]>()
-        .vector_clip_zip(ClipBinaryOpF32::Add)
-        .vector_final()
-        .commit_trim::<m![{Flat<E>} % 8]>()
-        .commit();
-    // SAFETY: restore the same local element axes after an elementwise sum.
-    unsafe { sum.reshape() }
 }
 
 fn term<H: AxisName, I: AxisName, R: AxisName, const W: usize>(

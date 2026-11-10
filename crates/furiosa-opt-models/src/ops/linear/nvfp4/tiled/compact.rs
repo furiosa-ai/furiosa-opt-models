@@ -1,6 +1,5 @@
 //! Eight-/sixteen-row contractions retaining the four 1024-feature input slabs.
 //! Reduction keeps one owner per eight input slices instead of distributing 64 rows.
-use super::block;
 use crate::ops::normalization::span::Owned;
 use crate::tensor::parallel::Chip;
 use furiosa_opt_std::prelude::*;
@@ -143,29 +142,6 @@ pub(super) fn pair<H: AxisName, O: AxisName, R: AxisName, const W: usize, C: M, 
         .transpose::<m![R % { W } / 8, Term, O % (O / 64) / 2, R % 8], m![O % 2 # 8]>()
         .commit_trim::<m![O % 2]>()
         .commit()
-}
-
-pub(super) fn add<E: M + 'static>(
-    device: &mut Device,
-    a: DmTensorView<'_, f32, Chip, Cluster, Reduced, E>,
-    b: DmTensorView<'_, f32, Chip, Cluster, Reduced, E>,
-) -> DmTensor<f32, Chip, Cluster, Reduced, E> {
-    axes![Side = 2];
-    type Flat<E> = m![{ Symbol<block::Flat<E>> }];
-    let a = unsafe { a.reshape::<Chip, Cluster, Reduced, Flat<E>>() };
-    let b = unsafe { b.reshape::<Chip, Cluster, Reduced, Flat<E>>() };
-    let output: DmTensor<f32, Chip, Cluster, Reduced, Flat<E>> = device
-        .main
-        .begin_interleaved::<Side, _, _, _, _, _>(a, b)
-        .fetch::<m![{Flat<E>} / 8, Side], m![{Flat<E>} % 8]>()
-        .collect::<m![{Flat<E>} / 8, Side], m![{Flat<E>} % 8]>()
-        .vector_init()
-        .vector_intra_slice_unzip::<Side, m![{Flat<E>} / 8]>()
-        .vector_clip_zip(ClipBinaryOpF32::Add)
-        .vector_final()
-        .commit_trim::<m![{Flat<E>} % 8]>()
-        .commit();
-    unsafe { output.reshape() }
 }
 
 pub(super) fn term<O: AxisName, R: AxisName, const W: usize>(

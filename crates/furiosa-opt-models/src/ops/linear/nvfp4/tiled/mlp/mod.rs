@@ -5,6 +5,7 @@ use super::{block, panels::Panels};
 use crate::modules::generic::collection::View;
 use crate::ops::linear::nvfp4::tiled::prefetch::Points;
 use crate::ops::normalization::span::Owned;
+use crate::ops::pointwise::add::Add;
 use crate::tensor::parallel::Chip;
 pub use down::Down;
 use furiosa_opt_std::prelude::*;
@@ -191,17 +192,19 @@ fn sum_into<C: M, S: M, Time: M, Feature: M, Prefix: M, Input: M, E: M>(
     live: usize,
 ) {
     axes![Side = 2];
-    device
-        .main
-        .begin_interleaved::<Side, _, _, _, _, _>(left, right)
-        .fetch::<m![{ Time }, Side, { Feature } / 8], m![{ Feature } % 8]>()
-        .collect::<m![{ Time }, Side, { Feature } / 8], m![{ Feature } % 8]>()
-        .vector_init()
-        .vector_intra_slice_unzip::<Side, m![{ Time }, { Feature } / 8]>()
-        .vector_clip_zip(ClipBinaryOpF32::Add)
-        .vector_final()
-        .commit_trim::<m![{ Feature } % 8]>()
-        .commit_prefix::<Prefix, _, _>(output, live);
+    Add::stream::<
+        f32,
+        m![{ Time }, Side, { Feature } / 8],
+        m![{ Time }, { Feature } / 8],
+        m![{ Feature } % 8],
+        Side,
+        _,
+        _,
+        _,
+        _,
+    >(device, (left, right))
+    .commit_trim::<m![{ Feature } % 8]>()
+    .commit_prefix::<Prefix, _, _>(output, live);
 }
 
 #[cfg(test)]

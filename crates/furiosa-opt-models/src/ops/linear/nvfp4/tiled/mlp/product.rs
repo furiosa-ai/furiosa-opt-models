@@ -1,4 +1,5 @@
 use super::*;
+use crate::ops::vector::{Silu as _, Zip as _};
 
 pub(super) fn multiply<C: M, S: M, Time: M, Feature: M>(
     device: &mut Device,
@@ -16,13 +17,7 @@ pub(super) fn multiply<C: M, S: M, Time: M, Feature: M>(
         .vector_init()
         .vector_intra_slice_tag(TagMode::Zero)
         .vector_narrow_split::<m![{ Time }, { Feature } / 4], m![{ Feature } % 4]>()
-        .vector_stash()
-        .vector_fp_unary(FpUnaryOp::Sigmoid)
-        .vector_fp_binary_with_mode(
-            FpBinaryOp::MulF(FpMulAlu::Mul0),
-            BinaryArgMode::Mode10,
-            Stash,
-        )
+        .vector_silu()
         .vector_widen_concat::<m![{ Time }, { Feature } / 8], m![{ Feature } % 8]>()
         .vector_final()
         .cast::<bf16, m![{Feature} % 8 # 16]>()
@@ -35,10 +30,9 @@ pub(super) fn multiply<C: M, S: M, Time: M, Feature: M>(
         .fetch_cast::<f32>()
         .collect::<m![{ Time }, Term, { Feature } / 8], m![{ Feature } % 8]>()
         .vector_init()
-        .vector_intra_slice_unzip::<Term, m![{ Time }, { Feature } / 8]>()
-        .vector_narrow_split::<m![{ Time }, { Feature } / 4], m![{ Feature } % 4]>()
-        .vector_fp_zip(FpBinaryOp::MulF(FpMulAlu::Fma))
-        .vector_widen_concat::<m![{ Time }, { Feature } / 8], m![{ Feature } % 8]>()
+        .vector_zip::<Term, m![{ Time }, { Feature } / 8], m![{ Time }, { Feature } / 4], m![{ Feature } % 4]>(
+            FpBinaryOp::MulF(FpMulAlu::Fma),
+        )
         .vector_final()
         .cast::<bf16, m![{Feature} % 8 # 16]>()
         .commit_trim::<m![{ Feature } % 8]>()
