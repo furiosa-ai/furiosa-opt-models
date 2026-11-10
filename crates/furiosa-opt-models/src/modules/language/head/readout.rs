@@ -521,4 +521,147 @@ mod tests {
             }
         }
     }
+    #[device(chip = 1)]
+    fn selected_normalized(
+        device: &mut Device,
+        head: &Head<'_>,
+        norm: &RmsNorm<Hidden>,
+        selected: &Selected<Capacity>,
+        input: &Place,
+    ) -> Tokens {
+        let mut tokens = Tokens::new();
+        head.read_normalized(device, input, selected, &mut tokens, norm);
+        tokens
+    }
+
+    #[device(chip = 1)]
+    fn selected_identity(
+        device: &mut Device,
+        head: &Head<'_>,
+        selected: &Selected<Capacity>,
+        input: &Place,
+    ) -> Tokens {
+        let mut tokens = Tokens::new();
+        head.read(device, input, selected, &mut tokens);
+        tokens
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn normalizes_selected_tiles_against_cpu_oracle() {
+        let _lease = DEVICE.lock().await;
+        let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+        // Nonuniform gain changes the winner once, and again if applied twice.
+        let gains = [2.0_f32, 1.0];
+        let pair = |row: usize| [1.0_f32, [1.5, 3.0, 0.5, 4.0][row % 4]];
+        let mut input = vec![bf16::from_f32(0.0); Capacity::SIZE * Hidden::SIZE];
+        for row in 0..Capacity::SIZE {
+            for (feature, value) in pair(row).into_iter().enumerate() {
+                input[row * Hidden::SIZE + feature] = bf16::from_f32(value);
+            }
+        }
+        let input = HostTensor::<bf16, Blocked<Hidden, Capacity>>::from_vec(blocked(
+            &input,
+            Hidden::SIZE,
+            16,
+        ))
+        .to_hbm(&mut device.pdma)
+        .await
+        .unwrap();
+        let mut weights = vec![bf16::from_f32(0.0); Padded::SIZE * Hidden::SIZE];
+        weights[FIRST * Hidden::SIZE] = bf16::from_f32(1.0);
+        weights[SECOND * Hidden::SIZE + 1] = bf16::from_f32(1.0);
+        let weights = HostTensor::<bf16, m![Padded, Hidden]>::from_vec(weights)
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap();
+        // A constant competing logit makes the RMS divisor observable to argmax.
+        let mut bias = vec![f32::MIN; Padded::SIZE];
+        bias[FIRST] = 0.0;
+        bias[SECOND] = 0.0;
+        bias[TIED] = 55.0;
+        let bias = HostTensor::<f32, m![Padded]>::from_vec(bias)
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap();
+        let ranks =
+            Argmax::<Padded>::load(&mut Context::new(&mut device), &Checkpoint::default()).unwrap();
+        let argmax = Load::load(&mut Context::new(None), &ranks).unwrap();
+        let head: Head<'_> = Greedy::new(Affine::new(&weights, &bias), argmax);
+        let mut gain = vec![bf16::from_f32(1.0); Hidden::SIZE];
+        gain[0] = bf16::from_f32(gains[0]);
+        let norm = RmsNorm::new(Weight::new(
+            HostTensor::<bf16, m![Hidden]>::from_vec(gain)
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap(),
+        ));
+        let oracle = |row: usize, times: usize| {
+            let mut values = pair(row);
+            for _ in 0..times {
+                let inv = (values.iter().map(|v| v * v).sum::<f32>() / Hidden::SIZE as f32 + 1e-6)
+                    .sqrt()
+                    .recip();
+                for i in 0..2 {
+                    values[i] = bf16::from_f32(values[i] * inv * gains[i]).to_f32();
+                }
+            }
+            [(FIRST, values[0]), (SECOND, values[1]), (TIED, 55.0)]
+                .into_iter()
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .unwrap()
+                .0 as i32
+        };
+        assert!((0..4).any(|row| oracle(row, 1) != oracle(row, 0)));
+        assert!((0..4).any(|row| oracle(row, 1) != oracle(row, 2)));
+        // Shuffled rows span both hidden-storage halves, including their exact boundary.
+        let chosen: Vec<_> = [511, 512]
+            .into_iter()
+            .chain((0..127).map(|i| (i * 37 + 11) % 1024))
+            .collect();
+        for count in [8, 64, 65, 129] {
+            let mut offsets = vec![0_i32; Capacity::SIZE];
+            for (at, &row) in chosen[..count].iter().enumerate() {
+                offsets[at] = row as i32 * 32;
+            }
+            let selected = Selected {
+                live: HostTensor::<i32, m![1]>::from_vec([count as i32])
+                    .to_hbm(&mut device.pdma)
+                    .await
+                    .unwrap(),
+                rows: HostTensor::<i32, m![Capacity]>::from_vec(offsets)
+                    .to_hbm(&mut device.pdma)
+                    .await
+                    .unwrap(),
+            };
+            let normalized_tokens = launch(
+                selected_normalized,
+                (&mut device, &head, &norm, &selected, &input),
+            )
+            .await
+            .unwrap()
+            .to_host::<m![Capacity]>(&mut device.pdma)
+            .await
+            .unwrap()
+            .into_vec();
+            let identity = launch(selected_identity, (&mut device, &head, &selected, &input))
+                .await
+                .unwrap()
+                .to_host::<m![Capacity]>(&mut device.pdma)
+                .await
+                .unwrap()
+                .into_vec();
+            for (at, &row) in chosen[..count].iter().enumerate() {
+                assert_eq!(
+                    normalized_tokens[at],
+                    oracle(row, 1),
+                    "normalized count={count} slot={at} row={row}"
+                );
+                assert_eq!(
+                    identity[at],
+                    oracle(row, 0),
+                    "identity count={count} slot={at} row={row}"
+                );
+            }
+        }
+    }
 }

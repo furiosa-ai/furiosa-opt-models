@@ -66,6 +66,8 @@ fn place<H: AxisName, Head: AxisName, Reach: AxisName>(
 }
 
 /// A span's projections and rotation, retained until the current layer attends.
+/// Start is 128-row aligned; full tiles are stored but only [start, start + rows)
+/// is valid. Attention masks padded keys and zeros padded values.
 pub(crate) fn project<
     H: AxisName,
     Q: AxisName,

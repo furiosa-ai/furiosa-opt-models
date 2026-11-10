@@ -9,6 +9,7 @@ use crate::tensor::parallel::Chip;
 use furiosa_opt_std::prelude::*;
 type Cluster<O> = m![O / (O / 2)];
 /// Heads in the layout consumed by Llama's RoPE/cache path.
+/// Only the live prefix is valid within this 128-row allocation.
 pub(crate) type WaveOutput<O, R> =
     DmTensor<bf16, Chip, Cluster<O>, m![O % (O / 2) / 128 # 16, R % 128 / 8], m![R % 8, O % 128]>;
 
@@ -43,6 +44,8 @@ impl<H: AxisName, O: AxisName> QkvProjection<H, O> {
     }
 }
 
+const DIRECT_MAX_ROWS: usize = 32;
+
 axes![Owner = 8];
 type Cl = m![Owner / 4];
 type Sl<H> = m![Owner % 4, H / 64];
@@ -60,12 +63,14 @@ impl<H: AxisName, O: AxisName> Weight<H, O> {
         }
     }
 }
+/// Select the representation for this span. Consumption must use the same row
+/// classification (direct through DIRECT_MAX_ROWS, restored above it).
 pub(crate) fn prepared<H: AxisName, O: AxisName>(
     device: &mut Device,
     packed: Staged<H, O>,
     rows: usize,
 ) -> Weight<H, O> {
-    if rows <= 32 {
+    if rows <= DIRECT_MAX_ROWS {
         Weight {
             packed,
             restored: DmTensor::new(),
@@ -331,6 +336,10 @@ fn land<O: AxisName, R: AxisName, const W: usize, const HALF: usize>(
     output
 }
 
+/// Consume 1..=512 live rows into complete 128-row scratch tiles.
+/// Each weight must come from its corresponding projection and be prepared with
+/// the same direct/restored row classification. Padding is not a valid result;
+/// attention must mask padded keys and zero padded values before consuming it.
 pub(crate) fn consume<H: AxisName, Q: AxisName, K: AxisName, R: AxisName, F>(
     device: &mut Device,
     projections: (
@@ -354,7 +363,7 @@ pub(crate) fn consume<H: AxisName, Q: AxisName, K: AxisName, R: AxisName, F>(
         stage_rows::<H, R, 8>(device, input)
     } else if rows <= 16 {
         stage_rows::<H, R, 16>(device, input)
-    } else if rows <= 32 {
+    } else if rows <= DIRECT_MAX_ROWS {
         stage_rows::<H, R, 32>(device, input)
     } else if rows <= 64 {
         stage_rows::<H, R, 64>(device, input)
@@ -363,7 +372,7 @@ pub(crate) fn consume<H: AxisName, Q: AxisName, K: AxisName, R: AxisName, F>(
     } else {
         stage_rows::<H, R, 256>(device, input)
     };
-    if rows <= 32 {
+    if rows <= DIRECT_MAX_ROWS {
         single::<H, Q, K, R, F>(device, projections, weights, &stored, 0, rows, &mut consume);
         return;
     }

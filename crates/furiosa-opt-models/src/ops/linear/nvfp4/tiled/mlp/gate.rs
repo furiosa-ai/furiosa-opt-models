@@ -23,33 +23,47 @@ type Both<I, R> =
 type Part<I, R> =
     DmTensor<f32, Chip, Cluster<I>, Slices<I, R>, m![{ LocalRows<R> }, Term, I % 224]>;
 
-fn pack_rows<H: AxisName, R: AxisName>(device: &mut Device, input: &Owned<H, R>) -> Input<H, R> {
-    let mut output = Input::new();
-    // Exchange eight 16-feature owners for eight 32-row owners on the switch.
-    // The resident DM redistribution reads contiguous 128-feature blocks from HBM.
+// Keep all eight row owners, but shorten their local row dimension before packing.
+// N is the capacity per cluster; the HBM allocation retains the full span stride.
+fn pack_rows<H: AxisName, R: AxisName, const N: usize>(
+    device: &mut Device,
+    input: &Owned<H, R>,
+) -> Input<H, R> {
+    type Local<R, const N: usize> = m![R % { N } / 8];
+    let selected = input
+        .view()
+        .tile::<m![R % 256], N, m![R % 256 = {N} # 256, H % 16]>(0)
+        .unpad::<m![R % 256 = { N }, H % 16]>();
+    // SAFETY: rename the selected local prefix; clusters and slice owners are unchanged.
+    let selected =
+        unsafe { selected.reshape::<Chip, m![R / 256], m![H / 16], m![R % { N }, H % 16]>() };
     let packed: DmTensor<
         bf16,
         Chip,
-        m![R / (R / 2)],
-        m![H / 128, R % (R / 2) / 32],
-        m![R % 32, H % 128],
+        m![R / 256],
+        m![H / 128, R % {N} / ({Local<R, N>})],
+        m![R % ({Local<R, N>}), H % 128],
     > = device
         .sub
-        .begin(input.view())
-        .fetch::<m![R % 32, R % (R / 2) / 32], m![H % 16]>()
-        .switch::<m![H / 128, R % (R / 2) / 32], m![R % 32, H % 128 / 16]>(
+        .begin(selected)
+        .fetch::<m![R % ({Local<R, N>}), R % {N} / ({Local<R, N>})], m![H % 16]>()
+        .switch::<m![H / 128, R % {N} / ({Local<R, N>})], m![R % ({Local<R, N>}), H % 128 / 16]>(
             SwitchConfig::InterTranspose {
                 slice1: 8,
                 slice0: 1,
                 time0: 1,
             },
         )
-        .collect::<m![R % 32, H % 128 / 16], m![H % 16]>()
+        .collect::<m![R % ({Local<R, N>}), H % 128 / 16], m![H % 16]>()
         .commit_trim::<m![H % 16]>()
         .commit();
-    packed
-        .view()
-        .to_hbm_view(&mut device.tdma, output.view_mut());
+    let mut output = Input::new();
+    packed.view().to_hbm_view(
+        &mut device.tdma,
+        output
+            .view_mut()
+            .tile::<m![R % 256], N, m![H / 128, R / 256, R % 256 = {N} #{!} 256, H % 128]>(0),
+    );
     output
 }
 
@@ -293,7 +307,13 @@ pub(super) fn sweep<H: AxisName, I: AxisName, R: AxisName>(
         assert!(I::SIZE / 64 == 224);
     }
     let (g0, u0, down0) = entry;
-    let packed = pack_rows(device, normalized);
+    let packed = if rows <= 64 {
+        pack_rows::<H, R, 64>(device, normalized)
+    } else if rows <= 128 {
+        pack_rows::<H, R, 128>(device, normalized)
+    } else {
+        pack_rows::<H, R, 256>(device, normalized)
+    };
     let input = if rows <= 64 {
         resident::<H, I, R, 64, 1>(device, &packed)
     } else if rows <= 128 {
