@@ -508,8 +508,10 @@ impl<Heads: AxisName, Head: AxisName, D: MaterializableScalar, Chips: M>
 /// and a later row's entry is never read.
 pub type Slots<'s, R, Chips = Chip> = (&'s HbmTensor<i32, Chips, m![R]>, Live<(), R>);
 
-/// The live rows' interleaved keys and values written in the slots their byte offsets name, all in
-/// one transfer when every row is live, else a packet at a time; no other slot changes.
+/// The live rows' interleaved keys and values written in the slots their byte offsets name: all in
+/// one transfer when every row is live, else stores of the shortest of [`store::LENGTHS`] while the
+/// live rows fill one, then a packet, then a row, at a time (only packets and rows from a start no
+/// such store divides); no other slot changes.
 impl<
     R: AxisName,
     Heads: AxisName,
@@ -536,65 +538,120 @@ impl<
             &DmTensor<D, Chips, Cluster, m![Heads, { Spread }], m![R, KeyValue, Head]>,
         ),
     ) {
-        type Payload<Heads, Spread, Head> = m![Heads, { Spread }, KeyValue, Head];
-        rows.cover::<Lanes<R>, _>(
-            &mut (device, layer),
-            (
-                |(device, layer)| {
-                    layer
-                        .tokens
-                        .scatter::<m![Block], Payload<Heads, Spread, Head>>()
-                        .by_byte_offsets(slot.view())
-                        .from_dm_view(&mut device.tdma, token.view());
-                },
-                |(device, layer), packet| {
-                    // A scatter takes its offsets as a whole tensor.
-                    let mut index: HbmTensor<i32, Chips, m![{ Layout<R>::Lanes }]> =
-                        HbmTensor::new();
-                    slot.view()
-                        .tile::<
-                            Layout<R>::Groups,
-                            1,
-                            m![{ Layout<R>::Selected }, { Layout<R>::Lanes }],
-                        >(
-                            packet,
-                        )
-                        .to_hbm_view(&mut device.tdma, index.view_mut());
-                    layer
-                        .tokens
-                        .scatter::<m![Block], Payload<Heads, Spread, Head>>()
-                        .by_byte_offsets(index.view())
-                        .from_dm_view(
-                            &mut device.tdma,
-                            token
-                                .view()
-                                .tile::<
-                                    Layout<R>::Groups,
-                                    1,
-                                    Layout<R>::Elements<m![KeyValue, Head]>,
-                                >(
-                                    packet,
-                                ),
-                        );
-                },
-                |(device, layer), row| {
-                    let mut index: HbmTensor<i32, Chips, m![1]> = HbmTensor::new();
-                    slot.view()
-                        .tile::<m![R], 1, m![R = 1 # R]>(row)
-                        .to_hbm_view(&mut device.tdma, index.view_mut());
-                    layer
-                        .tokens
-                        .scatter::<m![Block], Payload<Heads, Spread, Head>>()
-                        .by_byte_offsets(index.view())
-                        .from_dm_view(
-                            &mut device.tdma,
-                            token
-                                .view()
-                                .tile::<m![R], 1, m![R = 1 # R, KeyValue, Head]>(row),
-                        );
-                },
-            ),
-        );
+        type Short<R> = Tile<R, { store::LENGTHS[2] }>;
+        let mut tokens = Tokens { layer, slot, token };
+        let (start, live) = (rows.start(), rows.rows());
+        if live == R::SIZE {
+            tokens.every(device);
+        } else if start % Short::<R>::SIZE == 0 {
+            for tile in 0..live / Short::<R>::SIZE {
+                tokens.store::<Short<R>>(device, start / Short::<R>::SIZE + tile);
+            }
+            let first = start + live / Short::<R>::SIZE * Short::<R>::SIZE;
+            for packet in 0..live % Short::<R>::SIZE / Lanes::<R>::SIZE {
+                tokens.store::<Lanes<R>>(device, first / Lanes::<R>::SIZE + packet);
+            }
+            let first = start + live / Lanes::<R>::SIZE * Lanes::<R>::SIZE;
+            for row in 0..live % Lanes::<R>::SIZE {
+                tokens.row(device, first + row);
+            }
+        } else {
+            rows.cover::<Lanes<R>, _>(
+                &mut (device, tokens),
+                (
+                    |(device, tokens)| tokens.every(device),
+                    |(device, tokens), packet| tokens.store::<Lanes<R>>(device, packet),
+                    |(device, tokens), row| tokens.row(device, row),
+                ),
+            );
+        }
+    }
+}
+
+/// What one slot of a layer's blocks takes: a row's interleaved key and value for every head.
+type Payload<Heads, Spread, Head> = m![Heads, { Spread }, KeyValue, Head];
+
+/// Each row's key and value beside each other, on clusters `Cluster` and each head's slices.
+type Interleaved<D, Chips, Cluster, Heads, Spread, R, Head> =
+    DmTensor<D, Chips, Cluster, m![Heads, { Spread }], m![R, KeyValue, Head]>;
+
+/// A launch's tokens in DM, each row's interleaved key and value, the slot each row names, and
+/// the layer they write.
+struct Tokens<
+    'a,
+    R: AxisName,
+    Heads: AxisName,
+    Head: AxisName,
+    D: Scalar,
+    Chips: M,
+    Cluster: M,
+    Spread: M,
+> {
+    layer: &'a mut Blocks<Heads, Head, D, Chips>,
+    slot: &'a HbmTensor<i32, Chips, m![R]>,
+    token: &'a Interleaved<D, Chips, Cluster, Heads, Spread, R, Head>,
+}
+
+impl<
+    R: AxisName,
+    Heads: AxisName,
+    Head: AxisName,
+    D: MaterializableScalar,
+    Chips: M,
+    Cluster: M,
+    Spread: M,
+> Tokens<'_, R, Heads, Head, D, Chips, Cluster, Spread>
+{
+    /// Every row written, each into its slot, in one transfer.
+    fn every(&mut self, device: &mut Device) {
+        self.layer
+            .tokens
+            .scatter::<m![Block], Payload<Heads, Spread, Head>>()
+            .by_byte_offsets(self.slot.view())
+            .from_dm_view(&mut device.tdma, self.token.view());
+    }
+
+    /// Tile `at` of `B` rows written, each row into its slot. A scatter takes its offsets as a
+    /// whole tensor: the tile's, named in place.
+    fn store<B: AxisName>(&mut self, device: &mut Device, at: usize) {
+        // SAFETY: the window holds the tile's slots in row order, and nothing writes them.
+        let index: HbmTensor<i32, Chips, m![R % B]> = unsafe {
+            self.slot
+                .view()
+                .tile::<m![R / B], 1, m![R / B = 1 # (R / B), R % B]>(at)
+                .alias()
+        };
+        self.layer
+            .tokens
+            .scatter::<m![Block], Payload<Heads, Spread, Head>>()
+            .by_byte_offsets(index.view())
+            .from_dm_view(
+                &mut device.tdma,
+                self.token
+                    .view()
+                    .tile::<m![R / B], 1, m![R / B = 1 # (R / B), R % B, KeyValue, Head]>(at),
+            );
+    }
+
+    /// Row `row` written into its slot, its offset named in place as a tile's are.
+    fn row(&mut self, device: &mut Device, row: usize) {
+        // SAFETY: as for a tile, the row's slot.
+        let index: HbmTensor<i32, Chips, m![1]> = unsafe {
+            self.slot
+                .view()
+                .tile::<m![R], 1, m![R = 1 # R]>(row)
+                .alias()
+        };
+        self.layer
+            .tokens
+            .scatter::<m![Block], Payload<Heads, Spread, Head>>()
+            .by_byte_offsets(index.view())
+            .from_dm_view(
+                &mut device.tdma,
+                self.token
+                    .view()
+                    .tile::<m![R], 1, m![R = 1 # R, KeyValue, Head]>(row),
+            );
     }
 }
 
@@ -1354,7 +1411,8 @@ mod tests {
     }
 
     /// Only live rows write, at no row, one, a partial and a whole first packet, a partial second
-    /// packet, and one short of and at a whole 64-row envelope.
+    /// packet, three packets, a 32-row store alone and with a packet and a row past it, and one
+    /// short of and at a whole 64-row envelope.
     #[tokio::test(flavor = "current_thread")]
     async fn writes_only_live_rows_at_every_count() {
         let _lease = DEVICE.lock().await;
@@ -1363,7 +1421,7 @@ mod tests {
             writes_only_live_rows::<Eight>(&mut device, live).await;
         }
         writes_only_live_rows::<Sixteen>(&mut device, 9).await;
-        for live in [63, 64] {
+        for live in [24, 32, 41, 63, 64] {
             writes_only_live_rows::<SixtyFour>(&mut device, live).await;
         }
     }
