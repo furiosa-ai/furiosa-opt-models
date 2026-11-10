@@ -7,8 +7,6 @@
 //! - The vocabulary compiles as 131072 rows, `vocab_size` 128256 padded; the head's bias lowers the
 //!   padded rows.
 
-pub mod nvfp4;
-
 use std::io;
 
 use serde::Deserialize;
@@ -24,6 +22,8 @@ use crate::tensor::axis::{self, Limit};
 use crate::tensor::form::Weight;
 use crate::tensor::memory::Memory;
 use furiosa_opt_std::prelude::*;
+
+pub mod nvfp4;
 
 // 128256 rows leave each of a head's slices 4008, which split only into 167 passes of 24 rows; 131072
 // leave 4096, 16 passes of 256.

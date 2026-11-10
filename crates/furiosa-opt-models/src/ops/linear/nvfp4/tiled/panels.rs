@@ -263,4 +263,4 @@ impl<I: AxisName, O: AxisName, R: AxisName> Op<(Live<(), R>, &Rows<R, I>)> for P
     }
 }
 
-crate::ops::linear::nvfp4::tiled::loading!(Panels);
+loading!(Panels);

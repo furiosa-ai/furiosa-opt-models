@@ -511,4 +511,4 @@ impl<I: AxisName, O: AxisName> Down<I, O> {
     }
 }
 
-crate::ops::linear::nvfp4::tiled::loading!(Down);
+loading!(Down);

@@ -5,116 +5,11 @@ use crate::load::{Checkpoint, Context, Load, LoadError};
 use crate::tensor::form::nvfp4::Scale;
 use furiosa_opt_std::prelude::*;
 
-pub(crate) mod block;
-pub(crate) mod compact;
-pub(crate) mod heads;
-pub mod mlp;
-pub mod output;
-pub mod panels;
-pub(crate) mod prefetch;
-pub mod qkv;
-
-/// Only the weight tensor scale participates in W4A16 arithmetic. Input calibration is
-/// validated when loading and discarded; activations and cached keys/values remain BF16.
-#[derive(DeviceSend, Load)]
-#[load(tree)]
-pub struct Scales {
-    pub output: Scale,
-}
-
-fn tensor_scale(
-    from: &Checkpoint,
-    cx: &mut Context<'_>,
-) -> Result<HostTensor<f32, m![1 # 8]>, LoadError> {
-    let [_, output] =
-        crate::tensor::form::nvfp4::scales(from, cx, ["input_scale", "weight_scale_2"])?;
-    Ok(HostTensor::from_vec([
-        output, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    ]))
-}
-
-impl<'a> Load<&'a Checkpoint> for Scales {
-    fn load(cx: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
-        cx.checkpoint(from, |cx| {
-            let host = tensor_scale(from, cx)?;
-            Ok(Self {
-                output: cx.field("output", "", |cx| Load::load(cx, host))?,
-            })
-        })
-    }
-}
-impl<'t, 's> Load<(&'t mut Scales, &'s Checkpoint)> for &'t mut Scales {
-    fn load(
-        cx: &mut Context<'_>,
-        (into, from): (&'t mut Scales, &'s Checkpoint),
-    ) -> Result<Self, LoadError> {
-        cx.checkpoint(from, |cx| {
-            cx.rule(
-                |cx| tensor_scale(from, cx),
-                |cx, host| {
-                    cx.field("output", "", |cx| {
-                        <&mut Scale as Load<_>>::load(cx, (&mut into.output, host)).map(drop)
-                    })
-                },
-            )
-        })?;
-        Ok(into)
-    }
-}
-
 // Each projection reads canonical checkpoint rows and lays out its packed codes and block
 // scales once, on host. The derive supplies tree borrowing; these implementations keep
 // checkpoint validation, in-place updates and stacked layer backing in the native loader.
 macro_rules! loading {
     ($projection:ident) => {
-        fn codes<I: AxisName, O: AxisName>(
-            from: &crate::load::Checkpoint,
-            cx: &mut crate::load::Context<'_>,
-        ) -> Result<HostTensor<f4e2m1, Stored<I, O>>, crate::load::LoadError> {
-            super_load::<I, O, f4e2m1, Stored<I, O>, 2>(from, cx, safetensors::Dtype::U8)
-        }
-        fn scales<I: AxisName, O: AxisName>(
-            from: &crate::load::Checkpoint,
-            cx: &mut crate::load::Context<'_>,
-        ) -> Result<HostTensor<f8e4m3, StoredScales<I, O>>, crate::load::LoadError> {
-            super_load::<I, O, f8e4m3, StoredScales<I, O>, 16>(
-                from,
-                cx,
-                safetensors::Dtype::F8_E4M3,
-            )
-        }
-        fn super_load<
-            I: AxisName,
-            O: AxisName,
-            D: MaterializableScalar,
-            E: M,
-            const PACK: usize,
-        >(
-            from: &crate::load::Checkpoint,
-            cx: &mut crate::load::Context<'_>,
-            dtype: safetensors::Dtype,
-        ) -> Result<HostTensor<D, E>, crate::load::LoadError> {
-            let (name, tensor) = cx.tensor(from)?;
-            let invalid = |reason| crate::load::LoadError::InvalidData {
-                name: name.clone(),
-                reason,
-            };
-            if tensor.dtype() != dtype || tensor.shape() != [O::SIZE, I::SIZE / PACK] {
-                return Err(invalid(format!(
-                    "expected {dtype:?} [{}, {}]",
-                    O::SIZE,
-                    I::SIZE / PACK
-                )));
-            }
-            if PACK == 16 && tensor.data().iter().any(|&v| v & 0x7f == 0x7f || v > 0x80) {
-                return Err(invalid(
-                    "block scales must be finite and nonnegative".into(),
-                ));
-            }
-            let bytes = $projection::<I, O>::reorder::<PACK, _>(tensor.data());
-            HostTensor::try_from(furiosa_opt_std::runtime::HostBuffer::from_vec(bytes))
-                .map_err(|error| invalid(error.to_string()))
-        }
         impl<'a, I: AxisName, O: AxisName> crate::load::Load<&'a crate::load::Checkpoint>
             for $projection<I, O>
         {
@@ -244,6 +139,110 @@ macro_rules! loading {
                 )
             }
         }
+        fn codes<I: AxisName, O: AxisName>(
+            from: &crate::load::Checkpoint,
+            cx: &mut crate::load::Context<'_>,
+        ) -> Result<HostTensor<f4e2m1, Stored<I, O>>, crate::load::LoadError> {
+            super_load::<I, O, f4e2m1, Stored<I, O>, 2>(from, cx, safetensors::Dtype::U8)
+        }
+        fn scales<I: AxisName, O: AxisName>(
+            from: &crate::load::Checkpoint,
+            cx: &mut crate::load::Context<'_>,
+        ) -> Result<HostTensor<f8e4m3, StoredScales<I, O>>, crate::load::LoadError> {
+            super_load::<I, O, f8e4m3, StoredScales<I, O>, 16>(
+                from,
+                cx,
+                safetensors::Dtype::F8_E4M3,
+            )
+        }
+        fn super_load<
+            I: AxisName,
+            O: AxisName,
+            D: MaterializableScalar,
+            E: M,
+            const PACK: usize,
+        >(
+            from: &crate::load::Checkpoint,
+            cx: &mut crate::load::Context<'_>,
+            dtype: safetensors::Dtype,
+        ) -> Result<HostTensor<D, E>, crate::load::LoadError> {
+            let (name, tensor) = cx.tensor(from)?;
+            let invalid = |reason| crate::load::LoadError::InvalidData {
+                name: name.clone(),
+                reason,
+            };
+            if tensor.dtype() != dtype || tensor.shape() != [O::SIZE, I::SIZE / PACK] {
+                return Err(invalid(format!(
+                    "expected {dtype:?} [{}, {}]",
+                    O::SIZE,
+                    I::SIZE / PACK
+                )));
+            }
+            if PACK == 16 && tensor.data().iter().any(|&v| v & 0x7f == 0x7f || v > 0x80) {
+                return Err(invalid(
+                    "block scales must be finite and nonnegative".into(),
+                ));
+            }
+            let bytes = $projection::<I, O>::reorder::<PACK, _>(tensor.data());
+            HostTensor::try_from(furiosa_opt_std::runtime::HostBuffer::from_vec(bytes))
+                .map_err(|error| invalid(error.to_string()))
+        }
     };
 }
-pub(crate) use loading;
+
+pub(crate) mod block;
+pub(crate) mod compact;
+pub(crate) mod heads;
+pub mod mlp;
+pub mod output;
+pub mod panels;
+pub(crate) mod prefetch;
+pub mod qkv;
+
+/// Only the weight tensor scale participates in W4A16 arithmetic. Input calibration is
+/// validated when loading and discarded; activations and cached keys/values remain BF16.
+#[derive(DeviceSend, Load)]
+#[load(tree)]
+pub struct Scales {
+    pub output: Scale,
+}
+
+impl<'a> Load<&'a Checkpoint> for Scales {
+    fn load(cx: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
+        cx.checkpoint(from, |cx| {
+            let host = tensor_scale(from, cx)?;
+            Ok(Self {
+                output: cx.field("output", "", |cx| Load::load(cx, host))?,
+            })
+        })
+    }
+}
+impl<'t, 's> Load<(&'t mut Scales, &'s Checkpoint)> for &'t mut Scales {
+    fn load(
+        cx: &mut Context<'_>,
+        (into, from): (&'t mut Scales, &'s Checkpoint),
+    ) -> Result<Self, LoadError> {
+        cx.checkpoint(from, |cx| {
+            cx.rule(
+                |cx| tensor_scale(from, cx),
+                |cx, host| {
+                    cx.field("output", "", |cx| {
+                        <&mut Scale as Load<_>>::load(cx, (&mut into.output, host)).map(drop)
+                    })
+                },
+            )
+        })?;
+        Ok(into)
+    }
+}
+
+fn tensor_scale(
+    from: &Checkpoint,
+    cx: &mut Context<'_>,
+) -> Result<HostTensor<f32, m![1 # 8]>, LoadError> {
+    let [_, output] =
+        crate::tensor::form::nvfp4::scales(from, cx, ["input_scale", "weight_scale_2"])?;
+    Ok(HostTensor::from_vec([
+        output, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    ]))
+}

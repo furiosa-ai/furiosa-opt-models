@@ -4,7 +4,17 @@ use super::Scales;
 use crate::ops::vector::Restore as _;
 use crate::tensor::form::nvfp4::Scale;
 use crate::tensor::parallel::Chip;
+use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
+
+#[derive(Clone, Debug)]
+pub(crate) struct Flat<E>(PhantomData<E>);
+impl<E: M + 'static> AxisName for Flat<E> {
+    const NAME: Ident = Ident::new("Flat");
+    const SIZE: usize = E::SIZE;
+}
+type Blocks<E> = m![{ Symbol<Flat<E>> } / 16];
+type Register<E, C, S> = VrfTensor<f32, Chip, C, S, Blocks<E>>;
 
 /// Land a scale once per cluster, then broadcast on the switch ring. A direct
 /// replicated DMA issues hundreds of tiny transfers for each scalar.
@@ -63,16 +73,6 @@ pub(crate) fn finish<C: M, S: M, E: M + 'static>(
     // SAFETY: restore the original local axes after the elementwise scale and cast.
     unsafe { output.reshape() }
 }
-
-use core::marker::PhantomData;
-#[derive(Clone, Debug)]
-pub(crate) struct Flat<E>(PhantomData<E>);
-impl<E: M + 'static> AxisName for Flat<E> {
-    const NAME: Ident = Ident::new("Flat");
-    const SIZE: usize = E::SIZE;
-}
-type Blocks<E> = m![{ Symbol<Flat<E>> } / 16];
-type Register<E, C, S> = VrfTensor<f32, Chip, C, S, Blocks<E>>;
 
 pub(crate) fn restore<C: M, S: M, E: M + 'static, B: M>(
     device: &mut Device,

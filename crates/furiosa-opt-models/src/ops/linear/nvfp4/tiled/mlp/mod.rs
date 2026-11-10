@@ -5,6 +5,7 @@ use super::{block, panels::Panels};
 use crate::ops::linear::nvfp4::tiled::prefetch::Points;
 use crate::ops::normalization::span::Owned;
 use crate::tensor::parallel::Chip;
+pub use down::Down;
 use furiosa_opt_std::prelude::*;
 
 mod compact;
@@ -12,8 +13,6 @@ pub mod down;
 mod gate;
 mod product;
 mod restored_compact;
-
-pub use down::Down;
 
 /// The paired gate/up projections and partitioned down projection of a gated MLP.
 #[derive(DeviceSend, crate::load::Load)]

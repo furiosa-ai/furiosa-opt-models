@@ -22,6 +22,8 @@ type Partial<O, R> = DmTensor<f32, Chip, QkvCluster, Reduced<R>, m![{ Local<R> }
 pub(crate) type WaveOutput<O, R> =
     DmTensor<bf16, Chip, QkvCluster, Reduced<R>, m![{ Local<R> }, O % (O / 64)]>;
 
+type Triple<Q, K, R> = (Partial<Q, R>, Partial<K, R>, Partial<K, R>);
+
 fn pack_rows<H: AxisName, R: AxisName>(device: &mut Device, input: &Owned<H, R>) -> Input<H, R> {
     let mut output = Input::new();
     // Exchange eight 16-feature owners for eight 32-row owners on the switch.
@@ -261,7 +263,6 @@ pub(crate) fn consume_qkv<H: AxisName, Q: AxisName, K: AxisName, R: AxisName, F>
     }
 }
 
-type Triple<Q, K, R> = (Partial<Q, R>, Partial<K, R>, Partial<K, R>);
 fn triple<H: AxisName, Q: AxisName, K: AxisName, R: AxisName>(
     device: &mut Device,
     weights: (&Prepared<H, Q>, &Prepared<H, K>, &Prepared<H, K>),

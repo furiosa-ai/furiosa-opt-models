@@ -63,6 +63,31 @@ impl<H: AxisName, O: AxisName> Weight<H, O> {
         }
     }
 }
+type Input<H, R, const W: usize> = DmTensor<bf16, Chip, Cl, Sl<H>, m![R % { W }, H % 64]>;
+type Operand<H, R, const W: usize> =
+    TrfTensor<bf16, Chip, Cl, Sl<H>, m![R % 8], m![R % { W } / 8, H % 64]>;
+// Reduce input slices into row and output ownership, as in Qwen's QKV path.
+type RowGroups<R, const W: usize> = m![R % { W } / 8];
+type LocalWidth<O, R, const W: usize> = m![O / (512 / ({RowGroups<R, W>}))];
+type Reduced<O, R, const W: usize> =
+    m![Owner % 4, R % {W} / 8, O % (O / 8) / ({LocalWidth<O, R, W>})];
+type Values<O, R, const W: usize> =
+    DmTensor<bf16, Chip, Cl, Reduced<O, R, W>, m![R % 8, O % ({LocalWidth<O, R, W>})]>;
+
+pub(crate) type Staged<H, O> = (
+    DmTensor<f4e2m1, Chip, Cl, Sl<H>, m![O % (O / 8), H % 64]>,
+    DmTensor<f8e4m3, Chip, Cl, Sl<H>, m![O % (O / 8), H % 64 / 16]>,
+);
+
+type StoredRows<H, R> = HbmTensor<bf16, Chip, m![H / 64, R, H % 64]>;
+
+type PackRows<R, const N: usize> = m![R % { N } / 4];
+
+type DirectTiles<R, const W: usize> = m![R % 128 / { W }];
+type WaveCount<R, const W: usize> = m![R % { W } / 128];
+
+loading!(QkvProjection);
+
 /// Select the representation for this span. Consumption must use the same row
 /// classification (direct through DIRECT_MAX_ROWS, restored above it).
 pub(crate) fn prepared<H: AxisName, O: AxisName>(
@@ -91,22 +116,6 @@ pub(crate) fn prepare<H: AxisName, O: AxisName>(
     let packed = stage(device, projection);
     prepared(device, packed, rows)
 }
-type Input<H, R, const W: usize> = DmTensor<bf16, Chip, Cl, Sl<H>, m![R % { W }, H % 64]>;
-type Operand<H, R, const W: usize> =
-    TrfTensor<bf16, Chip, Cl, Sl<H>, m![R % 8], m![R % { W } / 8, H % 64]>;
-// Reduce input slices into row and output ownership, as in Qwen's QKV path.
-type RowGroups<R, const W: usize> = m![R % { W } / 8];
-type LocalWidth<O, R, const W: usize> = m![O / (512 / ({RowGroups<R, W>}))];
-type Reduced<O, R, const W: usize> =
-    m![Owner % 4, R % {W} / 8, O % (O / 8) / ({LocalWidth<O, R, W>})];
-type Values<O, R, const W: usize> =
-    DmTensor<bf16, Chip, Cl, Reduced<O, R, W>, m![R % 8, O % ({LocalWidth<O, R, W>})]>;
-
-pub(crate) type Staged<H, O> = (
-    DmTensor<f4e2m1, Chip, Cl, Sl<H>, m![O % (O / 8), H % 64]>,
-    DmTensor<f8e4m3, Chip, Cl, Sl<H>, m![O % (O / 8), H % 64 / 16]>,
-);
-
 pub(crate) fn stage<H: AxisName, O: AxisName>(
     device: &mut Device,
     projection: &QkvProjection<H, O>,
@@ -128,10 +137,6 @@ pub(crate) fn stage<H: AxisName, O: AxisName>(
     // SAFETY: rename the same eight output owners, preserving physical order.
     unsafe { (codes.reshape(), scales.reshape()) }
 }
-type StoredRows<H, R> = HbmTensor<bf16, Chip, m![H / 64, R, H % 64]>;
-
-type PackRows<R, const N: usize> = m![R % { N } / 4];
-
 fn stage_rows<H: AxisName, R: AxisName, const N: usize>(
     device: &mut Device,
     input: &Owned<H, R>,
@@ -315,9 +320,6 @@ fn project_restored<H: AxisName, O: AxisName, R: AxisName, const W: usize>(
     }
     output
 }
-
-type DirectTiles<R, const W: usize> = m![R % 128 / { W }];
-type WaveCount<R, const W: usize> = m![R % { W } / 128];
 
 fn land<O: AxisName, R: AxisName, const W: usize, const HALF: usize>(
     device: &mut Device,
@@ -693,5 +695,3 @@ pub(crate) fn store_wave<O: AxisName, R: AxisName>(
             .tile::<m![R / 128], 1, m![R / 128 = 1 #{!} (R / 128), R % 128, O]>(wave),
     );
 }
-
-crate::ops::linear::nvfp4::tiled::loading!(QkvProjection);

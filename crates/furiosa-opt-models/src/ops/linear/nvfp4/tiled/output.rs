@@ -406,8 +406,6 @@ impl<I: AxisName, O: AxisName, R: AxisName> Op<(Live<(), R>, &Rows<R, I>)> for O
     }
 }
 
-crate::ops::linear::nvfp4::tiled::loading!(Output);
-
 /// A live window of a larger launch, preserving its starting row and source stride.
 impl<I: AxisName, O: AxisName, R: AxisName, All: AxisName> Op<(Live<(), R>, &Rows<All, I>, usize)>
     for Output<I, O>
@@ -423,3 +421,5 @@ impl<I: AxisName, O: AxisName, R: AxisName, All: AxisName> Op<(Live<(), R>, &Row
             .to_hbm(&mut device.tdma)
     }
 }
+
+loading!(Output);
