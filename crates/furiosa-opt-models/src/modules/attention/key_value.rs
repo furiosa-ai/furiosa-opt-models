@@ -5,7 +5,7 @@ use super::Context;
 use crate::Module;
 use crate::load::{self, Checkpoint, Load, LoadError};
 use crate::modules::language::Selected;
-use crate::ops::index::table::{self, BlockIndex, Derive, Extents, Logical, SegmentTable};
+use crate::ops::index::table::{self, BlockIndex, Call, Derive, Extents, Logical, SegmentTable};
 use crate::ops::linear::query::Tile;
 use crate::ops::rotary::{self, SplitHalf, group};
 use crate::ops::{
@@ -151,11 +151,14 @@ impl<Rows: AxisName, A, B: AxisName, K: AxisName, Env: Copy>
         (tiles, cache): (Live<(), Rows>, &mut (A, History<Rows, B, K>)),
     ) -> Self::Output {
         let history = &cache.1;
+        let call = self
+            .derive
+            .forward(&mut *device, env, &mut (), &history.segments);
         let logical = self.derive.forward(
             &mut *device,
             env,
             &mut (),
-            (&history.segments, &history.blocks),
+            (&call, (&history.segments, &history.blocks)),
         );
         let (positions, write, read) =
             self.geometry
@@ -423,18 +426,26 @@ where
     Windows: AxisName,
     D: Scalar,
     Derive<Rows, Chips, X>: for<'d, 'h> Module<
+            &'h HbmTensor<i32, Chips, SegmentTable<Rows>>,
+            Env,
+            &'d mut (),
+            Output = Call<Rows, Chips>,
+        > + for<'d, 'c, 'h> Module<
             (
-                &'h HbmTensor<i32, Chips, SegmentTable<Rows>>,
-                &'h HbmTensor<i32, Chips, m![B]>,
+                &'c Call<Rows, Chips>,
+                (
+                    &'h HbmTensor<i32, Chips, SegmentTable<Rows>>,
+                    &'h HbmTensor<i32, Chips, m![B]>,
+                ),
             ),
             Env,
             &'d mut (),
-            Output = Logical<Rows, Chips>,
+            Output = Logical<'c, Rows, Chips>,
         >,
-    Paging<Heads, Head, Rows, Windows, D, X, Chips, Rotated, Layer>: for<'d, 'l, 'h> Module<
+    Paging<Heads, Head, Rows, Windows, D, X, Chips, Rotated, Layer>: for<'d, 'l, 'c, 'h> Module<
             (
                 Live<(), Rows>,
-                (&'l Logical<Rows, Chips>, &'h History<Rows, B, K, Chips>),
+                (&'l Logical<'c, Rows, Chips>, &'h History<Rows, B, K, Chips>),
             ),
             Env,
             &'d mut (),
@@ -459,11 +470,101 @@ where
         (tiles, cache): (Live<(), Rows>, &mut (A, History<Rows, B, K, Chips>)),
     ) -> Self::Output {
         let history = &cache.1;
+        let call = self
+            .derive
+            .forward(&mut *device, env, &mut (), &history.segments);
         let logical = self.derive.forward(
             &mut *device,
             env,
             &mut (),
-            (&history.segments, &history.blocks),
+            (&call, (&history.segments, &history.blocks)),
+        );
+        self.geometry
+            .forward(device, env, &mut (), (tiles, (&logical, history)))
+    }
+}
+
+/// The multi-row paged context of a step whose call's rows another cache group's history gave:
+/// this group's logical rows of them, then this geometry's read form.
+impl<
+    'c,
+    B: AxisName,
+    K: AxisName,
+    A,
+    Heads,
+    Head,
+    Rows,
+    Windows,
+    D,
+    X: Memory,
+    Env: Copy,
+    Chips: M + 'static,
+    Rotated: AxisName,
+    Layer,
+>
+    Module<
+        (
+            Live<(), Rows>,
+            (&'c Call<Rows, Chips>, &mut (A, History<Rows, B, K, Chips>)),
+        ),
+        Env,
+        &mut (),
+    >
+    for Preparation<Rows, Paging<Heads, Head, Rows, Windows, D, X, Chips, Rotated, Layer>, Chips, X>
+where
+    Heads: AxisName,
+    Head: AxisName,
+    Rows: AxisName,
+    Windows: AxisName,
+    D: Scalar,
+    Derive<Rows, Chips, X>: for<'d, 'h> Module<
+            (
+                &'c Call<Rows, Chips>,
+                (
+                    &'h HbmTensor<i32, Chips, SegmentTable<Rows>>,
+                    &'h HbmTensor<i32, Chips, m![B]>,
+                ),
+            ),
+            Env,
+            &'d mut (),
+            Output = Logical<'c, Rows, Chips>,
+        >,
+    Paging<Heads, Head, Rows, Windows, D, X, Chips, Rotated, Layer>: for<'d, 'l, 'h> Module<
+            (
+                Live<(), Rows>,
+                (&'l Logical<'c, Rows, Chips>, &'h History<Rows, B, K, Chips>),
+            ),
+            Env,
+            &'d mut (),
+            Output = Context<
+                Rotation<Rotated, Chips, Rows>,
+                HbmTensor<i32, Chips, m![Rows]>,
+                Pages<Rows, Windows, Chips, Counted<Rows, Chips>>,
+            >,
+        >,
+{
+    type Output = Context<
+        Rotation<Rotated, Chips, Rows>,
+        HbmTensor<i32, Chips, m![Rows]>,
+        Pages<Rows, Windows, Chips, Counted<Rows, Chips>>,
+    >;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        env: Env,
+        _: &mut (),
+        (tiles, (call, cache)): (
+            Live<(), Rows>,
+            (&'c Call<Rows, Chips>, &mut (A, History<Rows, B, K, Chips>)),
+        ),
+    ) -> Self::Output {
+        let history = &cache.1;
+        let logical = self.derive.forward(
+            &mut *device,
+            env,
+            &mut (),
+            (call, (&history.segments, &history.blocks)),
         );
         self.geometry
             .forward(device, env, &mut (), (tiles, (&logical, history)))
@@ -518,13 +619,21 @@ where
     Waves: AxisName,
     W: AxisName,
     Derive<Rows, Chips, X>: for<'d, 'h> Module<
+            &'h HbmTensor<i32, Chips, SegmentTable<Rows>>,
+            Env,
+            &'d mut (),
+            Output = Call<Rows, Chips>,
+        > + for<'d, 'c, 'h> Module<
             (
-                &'h HbmTensor<i32, Chips, SegmentTable<Rows>>,
-                &'h HbmTensor<i32, Chips, m![B]>,
+                &'c Call<Rows, Chips>,
+                (
+                    &'h HbmTensor<i32, Chips, SegmentTable<Rows>>,
+                    &'h HbmTensor<i32, Chips, m![B]>,
+                ),
             ),
             Env,
             &'d mut (),
-            Output = Logical<Rows, Chips>,
+            Output = Logical<'c, Rows, Chips>,
         >,
     X::Tensor<f32, Chips, m![Rows, Rotated]>: Borrow<HbmTensor<f32, Chips, m![Rows, Rotated]>>,
 {
@@ -551,16 +660,19 @@ where
         ),
     ) -> Self::Output {
         let (history, work) = &cache.1;
+        let call = self
+            .derive
+            .forward(&mut *device, env, &mut (), &history.segments);
         let logical = self.derive.forward(
             &mut *device,
             env,
             &mut (),
-            (&history.segments, &history.blocks),
+            (&call, (&history.segments, &history.blocks)),
         );
         let geometry = &self.geometry;
         let frequencies = geometry.frequencies.borrow();
         let positions =
-            table::positions::<Rows, Rotated, _>(device, frequencies, &logical.positions);
+            table::positions::<Rows, Rotated, _>(device, frequencies, &logical.call.positions);
         Context {
             positions: geometry.coefficients.forward(
                 &mut *device,
@@ -596,7 +708,7 @@ impl<
     Module<
         (
             Live<(), Rows>,
-            (&Logical<Rows, Chips>, &History<G, B, K, Chips>),
+            (&Logical<'_, Rows, Chips>, &History<G, B, K, Chips>),
         ),
         Env,
         &mut (),
@@ -627,7 +739,7 @@ where
         _: &mut (),
         (tiles, (logical, history)): (
             Live<(), Rows>,
-            (&Logical<Rows, Chips>, &History<G, B, K, Chips>),
+            (&Logical<'_, Rows, Chips>, &History<G, B, K, Chips>),
         ),
     ) -> Self::Output {
         let frequencies = self.frequencies.borrow();
@@ -675,7 +787,7 @@ where
             const { Blocks::<Heads, Head, D, Chips>::ROW_STRIDE },
         );
         let positions =
-            table::positions::<Rows, Rotated, _>(device, frequencies, &logical.positions);
+            table::positions::<Rows, Rotated, _>(device, frequencies, &logical.call.positions);
         Context {
             positions: self.coefficients.forward(
                 &mut *device,

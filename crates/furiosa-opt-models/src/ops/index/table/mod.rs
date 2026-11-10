@@ -14,6 +14,7 @@ use crate::tensor::{
     parallel::Chip,
 };
 pub use derive::Derive;
+use derive::Spans;
 use furiosa_opt_std::prelude::*;
 use std::marker::PhantomData;
 
@@ -144,14 +145,22 @@ pub struct History<'a, const ALIGNED: bool = true, Chips: M = Chip> {
     pub bias: &'a Slice<HbmTensor<f32, Chips, m![1]>>,
 }
 
-/// Logical meanings shared by every attention geometry of one invocation, each row's a flit in
-/// data memory, and the one-hot that packs such rows eight a flit.
-pub struct Logical<R: AxisName, Chips: M = Chip> {
+/// A call's rows, alike in every cache group of its history: each row's position and visible
+/// length a flit in data memory, which segment holds it, and the one-hot that packs such rows
+/// eight a flit.
+pub struct Call<R: AxisName, Chips: M = Chip> {
     pub positions: Rows<R, i32, Chips>,
-    pub slots: Rows<R, i32, Chips>,
     pub lengths: Rows<R, i32, Chips>,
-    pub tables: Rows<R, i32, Chips>,
+    spans: Spans<R, Chips>,
     places: DmTensor<i32, Chips, Cluster, Slices, Places<R>>,
+}
+
+/// Logical meanings shared by every attention geometry of a cache group in one invocation: the
+/// call's rows, each row's write slot and table entry in the group's table, a flit in data memory.
+pub struct Logical<'c, R: AxisName, Chips: M = Chip> {
+    pub call: &'c Call<R, Chips>,
+    pub slots: Rows<R, i32, Chips>,
+    pub tables: Rows<R, i32, Chips>,
 }
 
 pub(crate) struct Row<Chips: M = Chip> {
@@ -161,7 +170,7 @@ pub(crate) struct Row<Chips: M = Chip> {
     pub(crate) table: Value<Chips>,
 }
 
-impl<R: AxisName, Chips: M> Logical<R, Chips> {
+impl<R: AxisName, Chips: M> Logical<'_, R, Chips> {
     pub(crate) fn row(&self, device: &mut Device, row: usize) -> Row<Chips> {
         let read = |device: &mut Device, rows: &Rows<R, i32, Chips>| {
             let mut value = Value::new();
@@ -171,13 +180,15 @@ impl<R: AxisName, Chips: M> Logical<R, Chips> {
             value
         };
         Row {
-            position: read(device, &self.positions),
+            position: read(device, &self.call.positions),
             write: read(device, &self.slots),
-            length: read(device, &self.lengths),
+            length: read(device, &self.call.lengths),
             table: read(device, &self.tables),
         }
     }
+}
 
+impl<R: AxisName, Chips: M> Call<R, Chips> {
     /// Each live row's visible length, zero past the live rows.
     fn live(&self, device: &mut Device, tiles: Live<(), R>) -> Rows<R, i32, Chips> {
         let mut output: Rows<R, i32, Chips> = device
@@ -338,9 +349,9 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
     pub(crate) fn new(
         device: &mut Device,
         (window, starts): (&Value<Chips>, &HbmTensor<i32, Chips, m![W, { Packets<R> }]>),
-        (logical, tiles): (&Logical<R, Chips>, Live<(), R>),
+        (logical, tiles): (&Logical<'_, R, Chips>, Live<(), R>),
     ) -> Self {
-        let length = logical.live(device, tiles);
+        let length = logical.call.live(device, tiles);
         let window = scalar::packet(device, window);
         let ring = scalar::map(device, &window, |window| {
             window
@@ -478,7 +489,7 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
             .vector_final()
             .commit_trim::<m![1 # 8]>()
             .commit();
-        let blocks = pack(device, &logical.places, &blocks);
+        let blocks = pack(device, &logical.call.places, &blocks);
         let blocks = operand(device, &blocks);
         let starts: Table<Chips, W, R> = starts.to_dm(&mut device.tdma);
         let counts: Table<Chips, W, R> = device
@@ -523,7 +534,7 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
             &HbmTensor<i32, Chips, m![W, { Packets<R> }]>,
             &HbmTensor<i32, Chips, m![B]>,
         ),
-        logical: &Logical<R, Chips>,
+        logical: &Logical<'_, R, Chips>,
         bytes: i32,
     ) -> HbmTensor<i32, Chips, m![W, R, BlockIndex]> {
         let head: Rows<R, i32, Chips> = device
@@ -553,7 +564,7 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
             .vector_final()
             .commit_trim::<m![1 # 8]>()
             .commit();
-        let base = pack(device, &logical.places, &base);
+        let base = pack(device, &logical.call.places, &base);
         let base = operand(device, &base);
         let windows: Table<Chips, W, R> = rows.to_dm(&mut device.tdma);
         let mut output: HbmTensor<i32, Chips, m![W, R, BlockIndex]> = HbmTensor::new();
@@ -616,9 +627,9 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
     pub(crate) fn wrapped(
         &self,
         device: &mut Device,
-        logical: &Logical<R, Chips>,
+        logical: &Logical<'_, R, Chips>,
     ) -> HbmTensor<i32, Chips, m![R]> {
-        let wrapped = pack(device, &logical.places, &self.wrapped);
+        let wrapped = pack(device, &logical.call.places, &self.wrapped);
         rows(device, &wrapped)
     }
 
@@ -632,7 +643,7 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
             &HbmTensor<i32, Chips, m![B]>,
             &HbmTensor<f32, Chips, m![R, Cache]>,
         ),
-        (logical, (bytes, row)): (&Logical<R, Chips>, (i32, i32)),
+        (logical, (bytes, row)): (&Logical<'_, R, Chips>, (i32, i32)),
         offsets: &mut Wrapped<R, Chips>,
     ) {
         let ring = scalar::map(device, &self.ring, |ring| {
@@ -676,7 +687,7 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
             .vector_final()
             .commit_trim::<m![1 # 8]>()
             .commit();
-        let index = pack(device, &logical.places, &index);
+        let index = pack(device, &logical.call.places, &index);
         let index = rows(device, &index);
         // SAFETY: the flat table is whole window rows in order.
         let table = unsafe {
@@ -924,7 +935,7 @@ impl<R: AxisName, W: AxisName, Chips: M> Extents<R, W, Chips> {
 }
 
 /// The segment table of `segments` as a history stages it for `S` segments: word-major, each
-/// word in a cell of its own and zeros past them, so one transfer lands it on the rows' slices.
+/// word in a cell of its own and zeros past them, so a transfer lands a word on the rows' slices.
 pub fn cells<S: AxisName>(segments: &[[i32; FIELDS]]) -> HostTensor<i32, SegmentTable<S>> {
     assert!(segments.len() <= S::SIZE, "the table holds every segment");
     let cell = <m![1 # 8] as M>::SIZE;
@@ -1069,7 +1080,7 @@ pub(crate) fn positions<R: AxisName, E: AxisName, Chips: M>(
 /// Each row's write slot as a byte offset into its layer's blocks.
 pub(crate) fn writes<R: AxisName, Chips: M>(
     device: &mut Device,
-    logical: &Logical<R, Chips>,
+    logical: &Logical<'_, R, Chips>,
     stride: i32,
 ) -> HbmTensor<i32, Chips, m![R]> {
     let offsets: Rows<R, i32, Chips> = device
@@ -1083,7 +1094,7 @@ pub(crate) fn writes<R: AxisName, Chips: M>(
         .vector_final()
         .commit_trim::<m![1 # 8]>()
         .commit();
-    let offsets = pack(device, &logical.places, &offsets);
+    let offsets = pack(device, &logical.call.places, &offsets);
     rows(device, &offsets)
 }
 

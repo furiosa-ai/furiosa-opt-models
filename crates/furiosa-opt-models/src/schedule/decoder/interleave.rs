@@ -24,6 +24,7 @@ use crate::ops::attention::gqa::{Counted, Pages};
 use crate::ops::embedding::Ids;
 use crate::ops::index::gather::Gather;
 use crate::ops::index::scatter::Store;
+use crate::ops::index::table::Call;
 use crate::ops::linear::{self, Affine};
 use crate::ops::normalization::{RowMajor, Spread};
 use crate::ops::reduction::Argmax;
@@ -403,14 +404,20 @@ where
     Bias: Borrow<HbmTensor<f32, Chip, m![V]>>,
     I: Borrow<HbmTensor<i32, Chip, m![V]>>,
     C: Cap<Hidden, V>,
-    decoder::Paging<A, R>: for<'x> Module<
-            (Live<(), R>, &'x mut interleaved::History<R, A>),
+    decoder::Paging<A, R>: for<'x, 'c> Module<
+            (
+                Live<(), R>,
+                (&'c Call<R>, &'x mut interleaved::History<R, A>),
+            ),
             (),
             &'x mut (),
             Output = Context<A, R>,
         >,
-    decoder::Paging<B, R>: for<'x> Module<
-            (Live<(), R>, &'x mut interleaved::History<R, B>),
+    decoder::Paging<B, R>: for<'x, 'c> Module<
+            (
+                Live<(), R>,
+                (&'c Call<R>, &'x mut interleaved::History<R, B>),
+            ),
             (),
             &'x mut (),
             Output = Context<B, R>,
@@ -446,9 +453,15 @@ where
         let live = Live::<(), R>::read(&input.count);
         let (a, b, returned) = &mut input.cache;
         let rotary = &self.model.rotary_emb;
+        // Both groups' histories hold the call's rows: derived once, from the first.
+        let call = crate::Op::forward(&rotary.0.derive, &mut *device, &a.1.segments);
         let contexts = (
-            rotary.0.forward(&mut *device, (), &mut (), (live, a)),
-            rotary.1.forward(&mut *device, (), &mut (), (live, b)),
+            rotary
+                .0
+                .forward(&mut *device, (), &mut (), (live, (&call, &mut *a))),
+            rotary
+                .1
+                .forward(&mut *device, (), &mut (), (live, (&call, &mut *b))),
         );
         let Then(Backbone { embedding, body }, norm) = &self.model.body;
         let embedded = embedding.forward(&mut *device, (), &mut ((), ()), (&input.tokens, live));

@@ -2,8 +2,8 @@
 //! entry, derived on the device from its history's segment table and load-time coordinates.
 
 use super::{
-    CACHED, Fields, Grid, LEN, Logical, Pairs, Places, Quad, Rows, START, Segment, SegmentTable,
-    TABLE, pack, row_operand,
+    CACHED, Call, Fields, Grid, LEN, Logical, Pairs, Places, Quad, Rows, START, Segment,
+    SegmentTable, TABLE, pack, row_operand,
 };
 use crate::Op;
 use crate::load::{self, Checkpoint, Load, LoadError};
@@ -97,74 +97,24 @@ type Sums<R, Chips> = DmTensor<i32, Chips, Cluster, RowSlices<R>, m![1 # 8]>;
 type SegmentOperand<R, Chips> =
     VrfTensor<i32, Chips, Cluster, RowSlices<R>, m![{ Symbol<Segment<R>> }, 1 # 8]>;
 
-/// The segment table, field by field, on every row's slice.
-type Columns<R, Chips> =
-    DmTensor<i32, Chips, Cluster, RowSlices<R>, m![Fields, { Symbol<Segment<R>> }, 1 # 8]>;
+/// One word of every segment, a segment a flit, on every row's slice.
+type Column<R, Chips> =
+    DmTensor<i32, Chips, Cluster, RowSlices<R>, m![{ Symbol<Segment<R>> }, 1 # 8]>;
 
-/// Each row's logical position, write slot, visible length and table entry, from the segment
-/// table of a history ([`cells`](super::cells)) and its flat table of block IDs.
-impl<R: AxisName, B: AxisName, Chips: M + 'static, X: Memory>
-    Op<(
-        &HbmTensor<i32, Chips, SegmentTable<R>>,
-        &HbmTensor<i32, Chips, m![B]>,
-    )> for Derive<R, Chips, X>
-where
-    X::Tensor<i32, Chips, m![R, 1 # 8]>: Borrow<HbmTensor<i32, Chips, m![R, 1 # 8]>>,
-    X::Tensor<i32, Chips, Grid<R>>: Borrow<HbmTensor<i32, Chips, Grid<R>>>,
-    X::Tensor<i32, Chips, Pairs<R>>: Borrow<HbmTensor<i32, Chips, Pairs<R>>>,
-    X::Tensor<i32, Chips, Places<R>>: Borrow<HbmTensor<i32, Chips, Places<R>>>,
-{
-    type Output = Logical<R, Chips>;
+/// Where each row of a call stands against every segment: `r - start` and `r - end`, negative
+/// exactly where the segment begins or ends past `r`, so the one segment that holds `r` is the one
+/// it is past the start of and not past the end of.
+pub(super) struct Spans<R: AxisName, Chips: M> {
+    starts: Cells<R, Chips>,
+    ends: Cells<R, Chips>,
+}
 
-    fn forward(
-        &self,
-        device: &mut Device,
-        (segments, blocks): (
-            &HbmTensor<i32, Chips, SegmentTable<R>>,
-            &HbmTensor<i32, Chips, m![B]>,
-        ),
-    ) -> Self::Output {
-        let column = |device: &mut Device,
-                      columns: &Columns<R, Chips>,
-                      field: usize|
-         -> SegmentOperand<R, Chips> {
-            device
-                .sub
-                .begin(
-                    columns
-                        .view()
-                        .tile::<
-                            m![Fields],
-                            1,
-                            m![Fields = 1 # Fields, { Symbol<Segment<R>> }, 1 # 8],
-                        >(field),
-                )
-                .fetch::<m![{ Symbol<Segment<R>> }], m![1 # 8]>()
-                .collect::<m![{ Symbol<Segment<R>> }], m![1 # 8]>()
-                .to_vrf()
-        };
-        // `cells - value` for every row and segment.
-        let less = |device: &mut Device,
-                    cells: &Cells<R, Chips>,
-                    value: &SegmentOperand<R, Chips>|
-         -> Cells<R, Chips> {
-            device
-                .main
-                .begin(cells.view())
-                .fetch::<m![{ Symbol<Segment<R>> }], m![1 # 8]>()
-                .collect::<m![{ Symbol<Segment<R>> }], m![1 # 8]>()
-                .vector_init()
-                .vector_intra_slice_tag(TagMode::Zero)
-                .vector_fxp(FxpBinaryOp::SubFxp, value)
-                .vector_final()
-                .commit_trim::<m![1 # 8]>()
-                .commit()
-        };
+impl<R: AxisName, Chips: M> Spans<R, Chips> {
+    /// Each row's value of the segment that holds it, of `value`'s one a segment, a row a flit of
+    /// one slice as the steps after the grid take their rows.
+    fn select(&self, device: &mut Device, value: &SegmentOperand<R, Chips>) -> Rows<R, i32, Chips> {
         // Each row's `-sum over s of [d < 0] v_s`.
-        let masked = |device: &mut Device,
-                      d: &Cells<R, Chips>,
-                      value: &SegmentOperand<R, Chips>|
-         -> Sums<R, Chips> {
+        let masked = |device: &mut Device, d: &Cells<R, Chips>| -> Sums<R, Chips> {
             device
                 .main
                 .begin(d.view())
@@ -183,62 +133,76 @@ where
                 .commit_trim::<m![1 # 8]>()
                 .commit()
         };
-        // Each row's value of the segment that holds it, from the two masked sums, a row a flit
-        // of one slice as the steps after the grid take their rows.
-        let select = |device: &mut Device,
-                      (starts, ends): (&Sums<R, Chips>, &Sums<R, Chips>)|
-         -> Rows<R, i32, Chips> {
-            let ends = scalar::register(device, ends);
-            let selected: Sums<R, Chips> = device
+        let starts = masked(device, &self.starts);
+        let ends = masked(device, &self.ends);
+        let ends = scalar::register(device, &ends);
+        let selected: Sums<R, Chips> = device
+            .main
+            .begin(starts.view())
+            .fetch::<m![1], m![1 # 8]>()
+            .collect::<m![1], m![1 # 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_fxp(FxpBinaryOp::SubFxp, &ends)
+            .vector_final()
+            .commit_trim::<m![1 # 8]>()
+            .commit();
+        let mut rows = Rows::<R, i32, Chips>::new();
+        selected
+            .view()
+            .to_dm_view(&mut device.tdma, rows.view_mut());
+        rows
+    }
+}
+
+/// A call's rows, each row's logical position and visible length, from the segment table of
+/// any cache group's history ([`cells`](super::cells)): every group's holds the call's rows.
+impl<R: AxisName, Chips: M + 'static, X: Memory> Op<&HbmTensor<i32, Chips, SegmentTable<R>>>
+    for Derive<R, Chips, X>
+where
+    X::Tensor<i32, Chips, m![R, 1 # 8]>: Borrow<HbmTensor<i32, Chips, m![R, 1 # 8]>>,
+    X::Tensor<i32, Chips, Grid<R>>: Borrow<HbmTensor<i32, Chips, Grid<R>>>,
+    X::Tensor<i32, Chips, Places<R>>: Borrow<HbmTensor<i32, Chips, Places<R>>>,
+{
+    type Output = Call<R, Chips>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        segments: &HbmTensor<i32, Chips, SegmentTable<R>>,
+    ) -> Self::Output {
+        // `cells - value` for every row and segment.
+        let less = |device: &mut Device,
+                    cells: &Cells<R, Chips>,
+                    value: &SegmentOperand<R, Chips>|
+         -> Cells<R, Chips> {
+            device
                 .main
-                .begin(starts.view())
-                .fetch::<m![1], m![1 # 8]>()
-                .collect::<m![1], m![1 # 8]>()
+                .begin(cells.view())
+                .fetch::<m![{ Symbol<Segment<R>> }], m![1 # 8]>()
+                .collect::<m![{ Symbol<Segment<R>> }], m![1 # 8]>()
                 .vector_init()
                 .vector_intra_slice_tag(TagMode::Zero)
-                .vector_fxp(FxpBinaryOp::SubFxp, &ends)
+                .vector_fxp(FxpBinaryOp::SubFxp, value)
                 .vector_final()
                 .commit_trim::<m![1 # 8]>()
-                .commit();
-            let mut rows = Rows::<R, i32, Chips>::new();
-            selected
-                .view()
-                .to_dm_view(&mut device.tdma, rows.view_mut());
-            rows
+                .commit()
         };
-        let mut columns: Columns<R, Chips> = DmTensor::new();
-        // SAFETY: a relabel of the segment axis, which keeps its size and order.
-        unsafe {
-            segments
-                .view()
-                .reshape::<Chips, m![Fields, { Symbol<Segment<R>> }, 1 # 8]>()
-        }
-        .to_dm_view(&mut device.tdma, columns.view_mut());
-        let start = column(device, &columns, START);
-        let len = column(device, &columns, LEN);
-        let table = column(device, &columns, TABLE);
+        let start = land(device, segments, START);
+        let start = operand(device, &start);
+        let len = land(device, segments, LEN);
+        let len = operand(device, &len);
+        let cached = land(device, segments, CACHED);
         let grid: Cells<R, Chips> = self.grid.borrow().to_dm(&mut device.tdma);
-        // d = r - start and e = r - end: negative exactly where the segment begins or ends past r.
-        let d = less(device, &grid, &start);
-        let e = less(device, &d, &len);
+        let starts = less(device, &grid, &start);
+        let spans = Spans {
+            ends: less(device, &starts, &len),
+            starts,
+        };
         // The segment's position offset, cached - start.
-        let offset: DmTensor<
-            i32,
-            Chips,
-            Cluster,
-            RowSlices<R>,
-            m![{ Symbol<Segment<R>> }, 1 # 8],
-        > = device
+        let offset: Column<R, Chips> = device
             .main
-            .begin(
-                columns
-                    .view()
-                    .tile::<
-                        m![Fields],
-                        1,
-                        m![Fields = 1 # Fields, { Symbol<Segment<R>> }, 1 # 8],
-                    >(CACHED),
-            )
+            .begin(cached.view())
             .fetch::<m![{ Symbol<Segment<R>> }], m![1 # 8]>()
             .collect::<m![{ Symbol<Segment<R>> }], m![1 # 8]>()
             .vector_init()
@@ -247,26 +211,10 @@ where
             .vector_final()
             .commit_trim::<m![1 # 8]>()
             .commit();
-        let offset = device
-            .sub
-            .begin(offset.view())
-            .fetch::<m![{ Symbol<Segment<R>> }], m![1 # 8]>()
-            .collect::<m![{ Symbol<Segment<R>> }], m![1 # 8]>()
-            .to_vrf();
-        let shift = {
-            let starts = masked(device, &d, &offset);
-            let ends = masked(device, &e, &offset);
-            let shift = select(device, (&starts, &ends));
-            row_operand(device, &shift)
-        };
-        let tables = {
-            let starts = masked(device, &d, &table);
-            let ends = masked(device, &e, &table);
-            select(device, (&starts, &ends))
-        };
+        let offset = operand(device, &offset);
+        let shift = spans.select(device, &offset);
+        let shift = row_operand(device, &shift);
         let iota: Rows<R, i32, Chips> = self.iota.borrow().to_dm(&mut device.tdma);
-        let places: DmTensor<i32, Chips, Cluster, Slices, Places<R>> =
-            self.places.borrow().to_dm(&mut device.tdma);
         let positions: Rows<R, i32, Chips> = device
             .main
             .begin(iota.view())
@@ -290,12 +238,50 @@ where
             .vector_final()
             .commit_trim::<m![1 # 8]>()
             .commit();
+        Call {
+            positions,
+            lengths,
+            spans,
+            places: self.places.borrow().to_dm(&mut device.tdma),
+        }
+    }
+}
+
+/// A cache group's logical rows of `call`: each row's table entry and write slot, from the
+/// group's segment table and flat table of block IDs.
+impl<'c, R: AxisName, B: AxisName, Chips: M + 'static, X: Memory>
+    Op<(
+        &'c Call<R, Chips>,
+        (
+            &HbmTensor<i32, Chips, SegmentTable<R>>,
+            &HbmTensor<i32, Chips, m![B]>,
+        ),
+    )> for Derive<R, Chips, X>
+where
+    X::Tensor<i32, Chips, Pairs<R>>: Borrow<HbmTensor<i32, Chips, Pairs<R>>>,
+{
+    type Output = Logical<'c, R, Chips>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (call, (segments, blocks)): (
+            &'c Call<R, Chips>,
+            (
+                &HbmTensor<i32, Chips, SegmentTable<R>>,
+                &HbmTensor<i32, Chips, m![B]>,
+            ),
+        ),
+    ) -> Self::Output {
+        let table = land(device, segments, TABLE);
+        let table = operand(device, &table);
+        let tables = call.spans.select(device, &table);
         // Each row's token block, flat-table entry `e = table + position / 16`: a gather moves
         // eight-byte cells, four entries, and a weight of 16 on `e`'s lane picks it.
         let tables_operand = row_operand(device, &tables);
         let entries: Rows<R, i32, Chips> = device
             .main
-            .begin(positions.view())
+            .begin(call.positions.view())
             .fetch::<m![R], m![1 # 8]>()
             .collect::<m![R], m![1 # 8]>()
             .vector_init()
@@ -324,7 +310,7 @@ where
             .commit_trim::<m![1 # 8]>()
             .commit();
         let pairs: HbmTensor<i32, Chips, m![R]> =
-            pack(device, &places, &pairs).to_hbm(&mut device.tdma);
+            pack(device, &call.places, &pairs).to_hbm(&mut device.tdma);
         // SAFETY: the flat table holds whole window rows, a multiple of four entries.
         let blocks = unsafe { blocks.view().reshape::<Chips, m![B / 4, Quad]>() };
         let ids: DmTensor<i32, Chips, Cluster, Slices, m![R, Quad # 8]> = blocks
@@ -371,7 +357,7 @@ where
             .commit();
         let lanes: Rows<R, i32, Chips> = device
             .main
-            .begin(positions.view())
+            .begin(call.positions.view())
             .fetch::<m![R], m![1 # 8]>()
             .collect::<m![R], m![1 # 8]>()
             .vector_init()
@@ -393,11 +379,37 @@ where
             .commit_trim::<m![1 # 8]>()
             .commit();
         Logical {
-            positions,
+            call,
             slots,
-            lengths,
             tables,
-            places,
         }
     }
+}
+
+/// Word `field` of every segment of `segments` on every row's slice.
+fn land<R: AxisName, Chips: M>(
+    device: &mut Device,
+    segments: &HbmTensor<i32, Chips, SegmentTable<R>>,
+    field: usize,
+) -> Column<R, Chips> {
+    // SAFETY: a relabel of the segment axis, which keeps its size and order.
+    unsafe {
+        segments
+            .view()
+            .reshape::<Chips, m![Fields, { Symbol<Segment<R>> }, 1 # 8]>()
+    }
+    .tile::<m![Fields], 1, m![Fields = 1 # Fields, { Symbol<Segment<R>> }, 1 # 8]>(field)
+    .to_dm(&mut device.tdma)
+}
+
+fn operand<R: AxisName, Chips: M>(
+    device: &mut Device,
+    column: &Column<R, Chips>,
+) -> SegmentOperand<R, Chips> {
+    device
+        .sub
+        .begin(column.view())
+        .fetch::<m![{ Symbol<Segment<R>> }], m![1 # 8]>()
+        .collect::<m![{ Symbol<Segment<R>> }], m![1 # 8]>()
+        .to_vrf()
 }

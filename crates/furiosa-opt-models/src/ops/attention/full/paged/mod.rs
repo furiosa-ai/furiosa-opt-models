@@ -490,8 +490,9 @@ mod tests {
     ) {
         let (preparation, history) = paged;
         let tiles = Live::<(), R>::read(live);
+        let call = Op::forward(&preparation.derive, &mut *device, &history.segments);
         let blocks = (&history.segments, &history.blocks);
-        let logical = Op::forward(&preparation.derive, &mut *device, blocks);
+        let logical = Op::forward(&preparation.derive, &mut *device, (&call, blocks));
         let context = Module::forward(
             &preparation.geometry,
             &mut *device,

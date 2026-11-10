@@ -70,7 +70,7 @@ pub struct Prepare;
 
 /// The latent read form of a one-row step from its logical rows and its history's flat table of
 /// block IDs: the row's logical position and slot, its visible length and its block IDs.
-impl<R: AxisName, B: AxisName> Op<(Live<(), R>, (&Logical<R>, &HbmTensor<i32, Chip, m![B]>))>
+impl<R: AxisName, B: AxisName> Op<(Live<(), R>, (&Logical<'_, R>, &HbmTensor<i32, Chip, m![B]>))>
     for Prepare
 {
     type Output = (Slot, Slot, History<B>);
@@ -78,7 +78,7 @@ impl<R: AxisName, B: AxisName> Op<(Live<(), R>, (&Logical<R>, &HbmTensor<i32, Ch
     fn forward(
         &self,
         device: &mut Device,
-        (tiles, (logical, table)): (Live<(), R>, (&Logical<R>, &HbmTensor<i32, Chip, m![B]>)),
+        (tiles, (logical, table)): (Live<(), R>, (&Logical<'_, R>, &HbmTensor<i32, Chip, m![B]>)),
     ) -> Self::Output {
         let mut positions: HbmTensor<i32, m![1], m![{ Symbol<R> }]> = HbmTensor::new();
         let mut writes: HbmTensor<i32, m![1], m![{ Symbol<R> }]> = HbmTensor::new();
