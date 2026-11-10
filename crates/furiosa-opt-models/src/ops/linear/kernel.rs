@@ -766,24 +766,40 @@ impl<W> Affine<W, ()> {
             + for<'g, 'x> crate::Module<Grouped<&'g mut G>, (), &'x mut (), Output = ()>,
     {
         if live.groups::<axis::Lanes<Rows>>().1 == <Groups<Rows> as M>::SIZE {
-            let (boundary, state) = boundary;
-            let restored = |device: &mut Device, slab| {
-                if slab == 0 {
-                    crate::Module::forward(boundary, device, (), &mut (), &mut *state);
-                }
-            };
-            return Contraction::<In, Out, Code>::resident::<P, _, _, _, _>(
-                device,
-                &self.weight,
-                input,
-                restored,
-            );
+            return self.resident::<P, In, Out, Code, Rows, V, H, G>(device, input, boundary);
         }
         self.grouped::<P, In, Out, Code, Rows, V, U, Group, H, G>(
             device,
             (live, input, group),
             boundary,
         )
+    }
+
+    /// Every row of `input`'s envelope, padding rows and all, against every slab, each output's sum
+    /// over the parts stored once where `P` meets them, `boundary` running on its state once the
+    /// staging and the first slab's restoration are issued.
+    pub(crate) fn resident<P, In, Out, Code, Rows, V, H, G>(
+        &self,
+        device: &mut Device,
+        input: V,
+        (boundary, state): Boundary<'_, '_, H, G>,
+    ) -> P::Table<Rows, m![1]>
+    where
+        P: Meet<In, Out, Code>,
+        In: AxisName,
+        Out: AxisName,
+        Code: Scalar,
+        Rows: AxisName,
+        V: Source<Chips = m![1]>,
+        W: Slabs<In = In, Out = Out, Stored = Code>,
+        H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()>,
+    {
+        let restored = |device: &mut Device, slab| {
+            if slab == 0 {
+                crate::Module::forward(boundary, device, (), &mut (), &mut *state);
+            }
+        };
+        Contraction::<In, Out, Code>::resident::<P, _, _, _, _>(device, &self.weight, input, restored)
     }
 
     /// The live lane groups of `input`'s rows, each staged from where `group` reads it and

@@ -17,12 +17,13 @@
 //!   layer before it and under that layer's finish and its own input norm, into the place the
 //!   decoder carries across its attention to its end, and its scales and the down projection's,
 //!   behind the post-attention and pre-feed-forward norms' gains, under the output projection's
-//!   passes, which issue no transfer once their rows' move is issued, or, with every row group
-//!   live, under those norms behind the projection's output, as passes over every row group read
-//!   data memory at full rate; the up projection's under those norms and the gate's passes; the
-//!   down projection's codes under the activation and the up projection's passes, behind none of
-//!   its scales; its output projection's inside its attention, after the attention's first window
-//!   lands or before its last is prepared. Its leaves hold nothing in a call, so it takes `()`.
+//!   passes, which issue no transfer once their rows' move is issued, or, with the live rows dense
+//!   in the envelope, under those norms behind the projection's output, as passes over the
+//!   envelope read data memory at full rate; the up projection's under those norms and the gate's
+//!   passes; the down projection's codes under the activation and the up projection's passes,
+//!   behind none of its scales; its output projection's inside its attention, after the
+//!   attention's first window lands or before its last is prepared. Its leaves hold nothing in a
+//!   call, so it takes `()`.
 //! - Where its attention's widest pass streams its windows and leaves room beside them and the
 //!   gate projection's codes, the first tiles of the gate's weight that fit decode inside the
 //!   attention, under its first window's landing, where the tensor units wait for it, for a call
@@ -543,7 +544,7 @@ where
         let projected =
             (attention.0.output).forward(&mut *device, (), &mut (), (landed, heads, boundary));
         let ((post, norm), (mut gate_scales, mut down_scales)) = begun;
-        if projected.groups::<Lanes<R>>().1 == <Layout<R>::Groups as M>::SIZE {
+        if projected.dense::<Lanes<R>>() {
             gate.forward(&mut *device, (), &mut (), &mut gate_scales);
             down.forward(&mut *device, (), &mut (), &mut down_scales);
         }
@@ -620,11 +621,12 @@ where
 }
 
 /// What a sandwich-norm layer lands under its output projection's passes, each into its place: its
-/// norms' gains, then the gate's and the down's scales where fewer than every row group is live.
+/// norms' gains, then the gate's and the down's scales where the passes take a live lane group at
+/// a time.
 struct Landings<'m, N, W, D>(N, &'m W, &'m D);
 
-/// Every row group live: the gains alone, as passes over every row group read data memory at full
-/// rate and the scales' writes would slow them; those land behind the projection's output.
+/// Passes over the envelope: the gains alone, as such passes read data memory at full rate and the
+/// scales' writes would slow them; those land behind the projection's output.
 impl<'m, 'p, 'x, N, W, D, G, S> Module<&'p mut (G, S), (), &'x mut ()> for Landings<'m, N, W, D>
 where
     N: for<'s, 'y> Module<&'s mut G, (), &'y mut (), Output = ()>,
@@ -636,7 +638,7 @@ where
     }
 }
 
-/// Fewer than every row group live: the gains, then the scales.
+/// Passes a live lane group at a time: the gains, then the scales.
 impl<'m, 'p, 'x, N, W, D, G, S, T> Module<Grouped<&'p mut (G, (S, T))>, (), &'x mut ()>
     for Landings<'m, N, W, D>
 where

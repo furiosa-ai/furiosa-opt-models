@@ -440,7 +440,8 @@ where
 }
 
 /// The same rows through the weight as it landed under [`Exchanged`], `boundary` running on its
-/// state once the rows' move and the first slab's restoration are issued, as for BF16 rows.
+/// state once the rows' move and the first slab's restoration are issued, on [`linear::Grouped`]
+/// state where the live rows are not dense in the envelope.
 impl<
     'x,
     'b,
@@ -681,9 +682,11 @@ where
 }
 
 /// Every live row's attention, read as `rows`, through `projection`, which contracts each half of
-/// the inputs into its term of every output, `boundary` as [`project`] runs it: each value of a
-/// live row moves once, into its half's cluster, and the clusters' FP32 terms add in the feature
-/// slices the next projection reads, each output rounded once.
+/// the inputs into its term of every output, `boundary` running once the rows' move and the first
+/// slab's restoration are issued, on [`linear::Grouped`] state where the live rows are not dense
+/// in the envelope: each value of a live row moves once, into its half's cluster, and the
+/// clusters' FP32 terms add in the feature slices the next projection reads, each output rounded
+/// once.
 fn exchange<'x, Hidden, QWidth, Rows, KvHeads, Matrix, H, G>(
     projection: &linear::Affine<Matrix, ()>,
     device: &mut Device,
@@ -722,15 +725,16 @@ where
         );
         assert!(<normalization::Chunk<Hidden> as AxisName>::SIZE == 16);
     };
-    let sums = projection.summed::<linear::kernel::Scattered, _, _, _, _, _, _, _, _, _>(
-        &mut *device,
-        (
-            live,
-            Halving(rows.clone(), PhantomData::<Rows>),
-            group,
-            boundary,
-        ),
-    );
+    use linear::kernel::Scattered;
+    let halves = Halving(rows.clone(), PhantomData::<Rows>);
+    // The ring stages each live lane group one copy behind another, so once the live rows are
+    // dense in the envelope its form costs less, padding rows and all.
+    let sums = if live.dense::<Lanes<Rows>>() {
+        projection.resident::<Scattered, _, _, _, Rows, _, _, _>(&mut *device, halves, boundary)
+    } else {
+        let input = (live, halves, group);
+        projection.grouped::<Scattered, _, _, _, _, _, _, _, _, _>(&mut *device, input, boundary)
+    };
     // SAFETY: cluster t's sums are term t of every output, the parts of a block landing its
     // chunks of sixteen on their feature slices in order; the one slab is a unit digit.
     let partial: Partial<QWidth, Hidden, Rows> = unsafe { sums.reshape() };
