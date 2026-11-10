@@ -15,9 +15,13 @@ use crate::modules::attention::Projection;
 use crate::modules::generic::collection::Stack;
 use crate::ops::attention::full;
 use crate::ops::index::{gather::Gather, scatter::Scatter};
+#[cfg(any(test, feature = "kernel-diagnostics"))]
+pub use crate::ops::linear::nvfp4::tiled::heads::inspect_qkv_heads;
 use crate::ops::linear::nvfp4::tiled::{mlp::Mlp, output::Output, qkv::QkvProjection};
 use crate::ops::rotary::Rotary;
 use crate::ops::{embedding::Embedding, normalization::RmsNorm, pointwise::add::Add};
+#[cfg(any(test, feature = "kernel-diagnostics"))]
+pub use crate::schedule::decoder::nvfp4::inspect_transition;
 use crate::specialize::attention::Decode;
 use crate::tensor::{
     axis,
@@ -192,7 +196,98 @@ fn calibration(from: &Checkpoint, cx: &mut Context<'_>) -> Result<Calibration, L
     Ok(Calibration)
 }
 
-#[cfg(feature = "kernel-diagnostics")]
-pub use crate::ops::linear::nvfp4::tiled::heads::inspect_qkv_heads;
-#[cfg(feature = "kernel-diagnostics")]
-pub use crate::schedule::decoder::nvfp4::inspect_transition;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn config() -> Value {
+        serde_json::from_str(r#"{
+            "architectures": ["LlamaForCausalLM"], "model_type": "llama",
+            "hidden_size": 4096, "intermediate_size": 14336, "num_hidden_layers": 32,
+            "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128,
+            "vocab_size": 128256, "hidden_act": "silu", "rms_norm_eps": 1e-5,
+            "max_position_embeddings": 131072, "rope_theta": 500000.0,
+            "tie_word_embeddings": false, "attention_bias": false, "mlp_bias": false,
+            "rope_scaling": {
+                "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0, "original_max_position_embeddings": 8192
+            },
+            "quantization_config": {
+                "quant_method": "modelopt", "quant_algo": "NVFP4", "ignore": ["lm_head"],
+                "config_groups": {"group_0": {
+                    "targets": ["Linear"],
+                    "weights": {"dynamic": false, "num_bits": 4, "type": "float", "group_size": 16},
+                    "input_activations": {"dynamic": false, "num_bits": 4, "type": "float", "group_size": 16}
+                }},
+                "kv_cache_scheme": {"dynamic": false, "num_bits": 8, "type": "float"}
+            }
+        }"#).unwrap()
+    }
+
+    #[test]
+    fn admits_the_pinned_modelopt_checkpoint() {
+        let source = Checkpoint::new(tempfile::tempdir().unwrap().path(), Some(config())).unwrap();
+        assert_eq!(ForCausalLM::scope(&source).unwrap(), "");
+    }
+
+    #[test]
+    fn refuses_geometry_the_compiled_model_cannot_serve() {
+        // Shared decoder tests already cover bias, activation and rotary parsing.
+        for (field, value) in [
+            ("hidden_size", json!(2048)),
+            ("intermediate_size", json!(12288)),
+            ("num_hidden_layers", json!(36)),
+            ("num_attention_heads", json!(16)),
+            ("num_key_value_heads", json!(4)),
+            ("head_dim", json!(64)),
+            ("vocab_size", json!(128000)),
+            ("rms_norm_eps", json!(1e-6)),
+            ("tie_word_embeddings", json!(true)),
+            ("sliding_window", json!(4096)),
+        ] {
+            let mut document = config();
+            document[field] = value;
+            let error = Size::parse(&document).err().expect("unsupported geometry");
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported, "{field}: {error}");
+            let reason = error.to_string();
+            assert!(
+                reason.starts_with(&format!("{field}: found ")) && reason.contains(", compiled "),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn requires_nvfp4_projections_and_checkpoint_cache_calibration() {
+        let projections = "expected NVFP4 projections, an unquantized lm_head, and checkpoint FP8 cache calibration (served with BF16 KV)";
+        for (path, value, reason) in [
+            (
+                "/quantization_config",
+                Value::Null,
+                "expected NVFP4 quantization_config",
+            ),
+            (
+                "/quantization_config/ignore",
+                json!(["lm_head", "model.layers.0.self_attn*"]),
+                projections,
+            ),
+            (
+                "/quantization_config/kv_cache_scheme",
+                Value::Null,
+                projections,
+            ),
+        ] {
+            let mut document = config();
+            *document.pointer_mut(path).unwrap() = value;
+            let error = Size::parse(&document)
+                .err()
+                .expect("unsupported checkpoint");
+            assert_eq!(
+                (error.kind(), error.to_string()),
+                (io::ErrorKind::Unsupported, reason.into()),
+                "{path}"
+            );
+        }
+    }
+}

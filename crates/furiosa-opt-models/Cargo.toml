@@ -36,7 +36,3 @@ kernel-diagnostics = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(backend, values("npu"))'] }
-
-[[test]]
-name = "nvfp4_qkv"
-required-features = ["kernel-diagnostics"]

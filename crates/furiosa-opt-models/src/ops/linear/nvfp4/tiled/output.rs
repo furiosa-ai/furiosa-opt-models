@@ -423,3 +423,139 @@ impl<I: AxisName, O: AxisName, R: AxisName, All: AxisName> Op<(Live<(), R>, &Row
 }
 
 loading!(Output);
+
+#[cfg(test)]
+mod tests {
+    use crate::ops::linear::nvfp4::tiled::output::Output as OutputProjection;
+    use crate::ops::linear::nvfp4::tiled::tests as fixtures;
+    use crate::{
+        Op,
+        tensor::{live::Live, scalar::Value as Count},
+    };
+    use fixtures::*;
+    use furiosa_opt_std::{prelude::*, runtime::launch};
+
+    axes![Reach = 1024];
+
+    #[device(chip = 1)]
+    fn project_output(
+        device: &mut Device,
+        projection: &OutputProjection<Hidden, OutputWidth>,
+        count: &Count,
+        input: &HbmTensor<bf16, m![1], m![Rows, Hidden]>,
+    ) -> HbmTensor<bf16, m![1], m![Rows, OutputWidth]> {
+        projection.forward(device, (Live::<(), Rows>::read(count), input))
+    }
+
+    #[device(chip = 1)]
+    fn project_window(
+        device: &mut Device,
+        projection: &OutputProjection<Hidden, OutputWidth>,
+        count: &Count,
+        input: &HbmTensor<bf16, m![1], m![Reach, Hidden]>,
+    ) -> HbmTensor<bf16, m![1], m![Rows, OutputWidth]> {
+        projection.forward(device, (Live::<(), Rows>::read(count), input, 512))
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "opens a device"]
+    async fn projects_live_rows_and_selects_the_requested_span() {
+        let _lease = crate::tests::DEVICE.lock().await;
+        let mut device = Device::new(project_output.topology()).unwrap();
+        let (weight, weight_scale, scales) = weights::<Hidden, OutputWidth, _, _>(
+            &mut device,
+            OutputProjection::<Hidden, OutputWidth>::reorder::<1, _>,
+            OutputProjection::<Hidden, OutputWidth>::reorder::<16, _>,
+        )
+        .await;
+        let projection = OutputProjection {
+            weight,
+            weight_scale,
+            scales,
+        };
+        let input = input::<Hidden>(&mut device).await;
+        let original = fixtures::read::<_, m![Rows, Hidden]>(&mut device.pdma, &input).await;
+        for rows in [1, 8, 9, 16, 17, 32, 33, 129, 257, 512] {
+            let mut padded = original.clone();
+            padded[rows * Hidden::SIZE..].fill(bf16::from_f32(f32::NAN));
+            let input =
+                fixtures::upload::<bf16, m![Rows, Hidden]>(&mut device.pdma, padded.clone()).await;
+            let count = count(&mut device, rows).await;
+            let result = launch(project_output, (&mut device, &projection, &count, &input))
+                .await
+                .unwrap();
+            check::<Hidden, OutputWidth>(&mut device, result, rows).await;
+            if rows == 257 {
+                let mut window = vec![bf16::from_f32(f32::NAN); Rows::SIZE * Hidden::SIZE];
+                window.extend(padded);
+                let window =
+                    fixtures::upload::<bf16, m![Reach, Hidden]>(&mut device.pdma, window).await;
+                let result = launch(project_window, (&mut device, &projection, &count, &window))
+                    .await
+                    .unwrap();
+                check::<Hidden, OutputWidth>(&mut device, result, rows).await;
+            }
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "opens a device"]
+    async fn preserves_fp32_partials_until_the_output_is_scaled() {
+        let _lease = crate::tests::DEVICE.lock().await;
+        let mut device = Device::new(project_output.topology()).unwrap();
+        let weight = fixtures::upload::<
+            f4e2m1,
+            crate::ops::linear::nvfp4::tiled::output::Stored<Hidden, OutputWidth>,
+        >(
+            &mut device.pdma,
+            vec![f4e2m1::from_bits(2); Hidden::SIZE * OutputWidth::SIZE],
+        )
+        .await;
+        let weight_scale = fixtures::upload::<
+            f8e4m3,
+            crate::ops::linear::nvfp4::tiled::output::StoredScales<Hidden, OutputWidth>,
+        >(
+            &mut device.pdma,
+            vec![f8e4m3::from_f32(0.125); Hidden::SIZE * OutputWidth::SIZE / 16],
+        )
+        .await;
+        // The two input halves nearly cancel: +/-1536 plus a 0.125..0.5 residual.
+        // Rounding cluster partials to BF16 before exchange would erase that residual.
+        let factor = 0.1337_f32;
+        let projection = OutputProjection {
+            weight,
+            weight_scale,
+            scales: crate::ops::linear::nvfp4::tiled::Scales {
+                output: fixtures::upload::<f32, m![1 # 8]>(&mut device.pdma, vec![factor; 8]).await,
+            },
+        };
+        let mut cancellation = Vec::with_capacity(Rows::SIZE * Hidden::SIZE);
+        for row in 0..Rows::SIZE {
+            let sign = if row % 2 == 0 { 1.0 } else { -1.0 };
+            let mut values = vec![6.0 * sign; Hidden::SIZE];
+            values[Hidden::SIZE / 2..].fill(-6.0 * sign);
+            values[0] += sign * (row % 4 + 1) as f32;
+            cancellation.extend(values.into_iter().map(bf16::from_f32));
+        }
+        let input =
+            fixtures::upload::<bf16, m![Rows, Hidden]>(&mut device.pdma, cancellation).await;
+        for rows in [32, 33, 257] {
+            let count = count(&mut device, rows).await;
+            let result = launch(project_output, (&mut device, &projection, &count, &input))
+                .await
+                .unwrap()
+                .to_host::<m![Rows, OutputWidth]>(&mut device.pdma)
+                .await
+                .unwrap()
+                .into_vec();
+            for row in 0..rows {
+                let sign = if row % 2 == 0 { 1.0 } else { -1.0 };
+                let expected = bf16::from_f32(sign * (row % 4 + 1) as f32 * 0.125 * factor);
+                assert!(
+                    result[row * OutputWidth::SIZE..(row + 1) * OutputWidth::SIZE]
+                        .iter()
+                        .all(|value| *value == expected),
+                    "cancellation rows={rows}, row={row}"
+                );
+            }
+        }
+    }
+}

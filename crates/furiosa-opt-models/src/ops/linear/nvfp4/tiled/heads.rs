@@ -2,6 +2,8 @@
 //! The current layer writes its live K/V rows through the native cache stage.
 use super::qkv::{self as qkv_resident, QkvProjection, Weight};
 use crate::Op;
+#[cfg(any(test, feature = "kernel-diagnostics"))]
+use crate::models::decoder::attention::{Head, KvHeads, llama::nvfp4::QueryHeads};
 use crate::ops::normalization::span::{Owned, Span};
 use crate::ops::rotary::{
     self as rope, SplitHalf,
@@ -127,10 +129,8 @@ pub(crate) fn project<
     );
 }
 
-#[cfg(feature = "kernel-diagnostics")]
-use crate::models::decoder::attention::{Head, KvHeads, llama::nvfp4::QueryHeads};
 /// Exercise the production raw-QKV DM redistribution without RoPE or cache casts.
-#[cfg(feature = "kernel-diagnostics")]
+#[cfg(any(test, feature = "kernel-diagnostics"))]
 pub fn inspect_qkv_heads<H: AxisName, Q: AxisName, K: AxisName, R: AxisName>(
     device: &mut Device,
     projections: (

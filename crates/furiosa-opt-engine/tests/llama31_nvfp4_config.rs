@@ -1,5 +1,5 @@
 //! Registry selection for the pinned NVFP4 checkpoint, without opening a device.
-use furiosa_opt_engine::{Checkpoint, LoadOptions};
+use furiosa_opt_engine::{Checkpoint, LoadError, LoadOptions};
 use safetensors::Dtype;
 use serde_json::{Value, json};
 
@@ -42,29 +42,57 @@ fn selects_nvfp4_with_bf16_cache_from_config_alone() {
         (selected.precision(), selected.kv_cache()),
         (Dtype::U8, Dtype::BF16)
     );
-    assert!(
-        LoadOptions::new()
-            .kv_cache(Dtype::F8_E4M3)
+}
+
+#[test]
+fn refuses_unsupported_cache_and_adapter_choices() {
+    let source = source(config());
+    for (options, field, expected) in [
+        (
+            LoadOptions::new().kv_cache(Dtype::F8_E4M3),
+            "kv_cache",
+            "every implementation caches keys and values in BF16",
+        ),
+        (
+            LoadOptions::new().adapters(),
+            "adapters",
+            "the LlamaForCausalLM 8B implementation takes no adapter",
+        ),
+    ] {
+        match options
             .parse(&source)
-            .is_err()
-    );
-    assert!(LoadOptions::new().adapters().parse(&source).is_err());
+            .err()
+            .expect("unsupported load choice")
+        {
+            LoadError::Unsupported { name, reason } => {
+                assert_eq!((name.as_str(), reason.as_str()), (field, expected))
+            }
+            other => panic!("{field}: {other:?}"),
+        }
+    }
 }
 
 #[test]
 fn incompatible_nvfp4_does_not_fall_back_to_bf16() {
-    for (field, value) in [
-        ("intermediate_size", json!(12288)),
-        ("attention_bias", json!(true)),
-    ] {
-        let mut document = config();
-        document[field] = value;
-        assert!(
-            LoadOptions::new().parse(&source(document)).is_err(),
-            "{field}"
-        );
-    }
+    // One invalid geometry pins registry selection; the model parser owns field coverage.
     let mut document = config();
-    document["quantization_config"] = Value::Null;
-    assert!(LoadOptions::new().parse(&source(document)).is_err());
+    document["intermediate_size"] = json!(12288);
+    match LoadOptions::new()
+        .parse(&source(document))
+        .err()
+        .expect("no compatible implementation")
+    {
+        LoadError::InvalidData { name, reason } => {
+            assert_eq!(name, "LlamaForCausalLM");
+            assert!(
+                reason.starts_with("no implementation serves the checkpoint:"),
+                "{reason}"
+            );
+            assert!(
+                reason.contains("intermediate_size: found 12288, compiled 14336"),
+                "{reason}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
 }

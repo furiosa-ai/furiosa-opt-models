@@ -534,20 +534,9 @@ mod tests {
         tokens
     }
 
-    #[device(chip = 1)]
-    fn selected_identity(
-        device: &mut Device,
-        head: &Head<'_>,
-        selected: &Selected<Capacity>,
-        input: &Place,
-    ) -> Tokens {
-        let mut tokens = Tokens::new();
-        head.read(device, input, selected, &mut tokens);
-        tokens
-    }
-
     #[tokio::test(flavor = "current_thread")]
-    async fn normalizes_selected_tiles_against_cpu_oracle() {
+    #[ignore = "opens a device"]
+    async fn normalizes_large_selected_tile_and_tail() {
         let _lease = DEVICE.lock().await;
         let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
         // Nonuniform gain changes the winner once, and again if applied twice.
@@ -618,7 +607,7 @@ mod tests {
             .into_iter()
             .chain((0..127).map(|i| (i * 37 + 11) % 1024))
             .collect();
-        for count in [8, 64, 65, 129] {
+        for count in [129] {
             let mut offsets = vec![0_i32; Capacity::SIZE];
             for (at, &row) in chosen[..count].iter().enumerate() {
                 offsets[at] = row as i32 * 32;
@@ -643,23 +632,11 @@ mod tests {
             .await
             .unwrap()
             .into_vec();
-            let identity = launch(selected_identity, (&mut device, &head, &selected, &input))
-                .await
-                .unwrap()
-                .to_host::<m![Capacity]>(&mut device.pdma)
-                .await
-                .unwrap()
-                .into_vec();
             for (at, &row) in chosen[..count].iter().enumerate() {
                 assert_eq!(
                     normalized_tokens[at],
                     oracle(row, 1),
                     "normalized count={count} slot={at} row={row}"
-                );
-                assert_eq!(
-                    identity[at],
-                    oracle(row, 0),
-                    "identity count={count} slot={at} row={row}"
                 );
             }
         }

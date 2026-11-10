@@ -13,6 +13,9 @@ type Cluster<O> = m![O / (O / 2)];
 pub(crate) type WaveOutput<O, R> =
     DmTensor<bf16, Chip, Cluster<O>, m![O % (O / 2) / 128 # 16, R % 128 / 8], m![R % 8, O % 128]>;
 
+#[cfg(any(test, feature = "kernel-diagnostics"))]
+pub type Output<O, R> = HbmTensor<bf16, Chip, m![R, O]>;
+
 pub type Stored<H, O> = m![O / (O / 8), H / 64, O % (O / 8), H % 64];
 pub type Bytes<H, O> = m![O / (O / 8), H / 64, O % (O / 8), H % 64 / 2];
 pub type StoredScales<H, O> = m![O / (O / 8), H / 64, O % (O / 8), H % 64 / 16];
@@ -678,10 +681,7 @@ where
     next.finish(device)
 }
 
-#[cfg(feature = "kernel-diagnostics")]
-pub type Output<O, R> = HbmTensor<bf16, Chip, m![R, O]>;
-
-#[cfg(feature = "kernel-diagnostics")]
+#[cfg(any(test, feature = "kernel-diagnostics"))]
 pub(crate) fn store_wave<O: AxisName, R: AxisName>(
     device: &mut Device,
     values: &WaveOutput<O, R>,
@@ -694,4 +694,262 @@ pub(crate) fn store_wave<O: AxisName, R: AxisName>(
             .view_mut()
             .tile::<m![R / 128], 1, m![R / 128 = 1 #{!} (R / 128), R % 128, O]>(wave),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{self as qkv, QkvProjection};
+    use crate::ops::linear::nvfp4::tiled::tests as fixtures;
+    use crate::tensor::scalar::Value as Count;
+    use fixtures::*;
+    use furiosa_opt_std::{prelude::*, runtime::launch};
+    axes![KvWidth = 1024];
+    #[device(chip = 1)]
+    fn shared(
+        device: &mut Device,
+        q: &QkvProjection<Hidden, OutputWidth>,
+        k: &QkvProjection<Hidden, KvWidth>,
+        v: &QkvProjection<Hidden, KvWidth>,
+        count: &Count,
+        input: &HbmTensor<bf16, m![1], m![Rows, Hidden]>,
+    ) -> (
+        HbmTensor<bf16, m![1], m![Rows, OutputWidth]>,
+        HbmTensor<bf16, m![1], m![Rows, KvWidth]>,
+        HbmTensor<bf16, m![1], m![Rows, KvWidth]>,
+    ) {
+        let own = input.to_dm(&mut device.tdma);
+        let (q, k, v) = crate::models::decoder::attention::llama::nvfp4::inspect_qkv_heads::<
+            Hidden,
+            OutputWidth,
+            KvWidth,
+            Rows,
+        >(
+            device,
+            (q, k, v),
+            &own,
+            crate::tensor::live::Live::<(), Rows>::read(count).rows(),
+        );
+        let (mut qo, mut ko, mut vo) = (HbmTensor::new(), HbmTensor::new(), HbmTensor::new());
+        q.view().to_hbm_view(&mut device.tdma, qo.view_mut());
+        k.view().to_hbm_view(&mut device.tdma, ko.view_mut());
+        v.view().to_hbm_view(&mut device.tdma, vo.view_mut());
+        (qo, ko, vo)
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "opens a device"]
+    async fn projects_live_rows_into_qkv_heads() {
+        let _lease = crate::tests::DEVICE.lock().await;
+        let mut device = Device::new(shared.topology()).unwrap();
+        let qn = projection::<OutputWidth>(&mut device).await;
+        let kn = projection::<KvWidth>(&mut device).await;
+        let mut vn = projection::<KvWidth>(&mut device).await;
+        vn.scales.output =
+            fixtures::upload::<f32, m![1 # 8]>(&mut device.pdma, vec![-0.5; 8]).await;
+        let input = input::<Hidden>(&mut device).await;
+        let original = fixtures::read::<_, m![Rows, Hidden]>(&mut device.pdma, &input).await;
+        // DMA capacities, direct/restored cutover, paired waves, and every tail capacity.
+        for rows in [
+            1, 8, 9, 16, 17, 32, 33, 64, 65, 128, 129, 256, 257, 264, 265, 272, 273, 288, 289, 320,
+            321, 384, 385, 512,
+        ] {
+            let mut padded = original.clone();
+            padded[rows * Hidden::SIZE..].fill(bf16::from_f32(f32::NAN));
+            let input = fixtures::upload::<bf16, m![Rows, Hidden]>(&mut device.pdma, padded).await;
+            let count = count(&mut device, rows).await;
+            let (qo, ko, vo) = launch(shared, (&mut device, &qn, &kn, &vn, &count, &input))
+                .await
+                .unwrap();
+            let kh = fixtures::read::<_, m![Rows, KvWidth]>(&mut device.pdma, &ko).await;
+            let vh = fixtures::read::<_, m![Rows, KvWidth]>(&mut device.pdma, &vo).await;
+            assert!(
+                kh.iter()
+                    .zip(&vh)
+                    .take(rows * KvWidth::SIZE)
+                    .all(|(k, v)| k.to_f32() == -v.to_f32()),
+                "V must use its own output scale"
+            );
+            check::<Hidden, OutputWidth>(&mut device, qo, rows).await;
+            check::<Hidden, KvWidth>(&mut device, ko, rows).await;
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "opens a device"]
+    async fn sums_scaled_blocks_before_rounding() {
+        let _lease = crate::tests::DEVICE.lock().await;
+        let mut device = Device::new(shared.topology()).unwrap();
+        let mut qn = projection::<OutputWidth>(&mut device).await;
+        let kn = projection::<KvWidth>(&mut device).await;
+        let vn = projection::<KvWidth>(&mut device).await;
+        // Opposite-signed adjacent blocks must be scaled before their sums combine.
+        // In every 64 inputs, 16 * (.25 - .5 + 1 - 2) = -20;
+        // across 4096 inputs, with tensor factor .5, that is -640.
+        // Rotating scales by one output flips the sign, detecting owner misalignment.
+        let codes: Vec<_> = (0..Hidden::SIZE * OutputWidth::SIZE)
+            .map(|i| {
+                f4e2m1::from_bits(if (i % Hidden::SIZE / 16) % 2 == 0 {
+                    2
+                } else {
+                    10
+                })
+            })
+            .collect();
+        let scales: Vec<_> = (0..Hidden::SIZE * OutputWidth::SIZE / 16)
+            .map(|i| {
+                f8e4m3::from_f32(
+                    [0.25, 0.5, 1.0, 2.0][(i / (Hidden::SIZE / 16) + i % (Hidden::SIZE / 16)) % 4],
+                )
+            })
+            .collect();
+        qn.weight = fixtures::upload::<f4e2m1, qkv::Stored<Hidden, OutputWidth>>(
+            &mut device.pdma,
+            QkvProjection::<Hidden, OutputWidth>::reorder::<1, _>(&codes),
+        )
+        .await;
+        qn.weight_scale = fixtures::upload::<f8e4m3, qkv::StoredScales<Hidden, OutputWidth>>(
+            &mut device.pdma,
+            QkvProjection::<Hidden, OutputWidth>::reorder::<16, _>(&scales),
+        )
+        .await;
+        // Distinct row values detect reuse of the first operand in a prefetched tail.
+        for rows in [32, 33, 257] {
+            let input = fixtures::upload::<bf16, m![Rows, Hidden]>(
+                &mut device.pdma,
+                (0..Rows::SIZE * Hidden::SIZE).map(|i| {
+                    let row = i / Hidden::SIZE;
+                    bf16::from_f32(if row < rows {
+                        (row % 3 + 1) as f32 * 0.5
+                    } else {
+                        f32::NAN
+                    })
+                }),
+            )
+            .await;
+            let count = fixtures::count(&mut device, rows).await;
+            let (q, _, _) = launch(shared, (&mut device, &qn, &kn, &vn, &count, &input))
+                .await
+                .unwrap();
+            let values = fixtures::read::<_, m![Rows, OutputWidth]>(&mut device.pdma, &q).await;
+            for (i, value) in values.iter().take(rows * OutputWidth::SIZE).enumerate() {
+                let expected = (if i % OutputWidth::SIZE % 2 == 0 {
+                    -320.0
+                } else {
+                    320.0
+                }) * ((i / OutputWidth::SIZE) % 3 + 1) as f32;
+                assert_eq!(
+                    value.to_f32(),
+                    expected,
+                    "unequal scale blocks: rows={rows}, element={i}"
+                );
+            }
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "opens a device"]
+    async fn applies_the_tensor_factor_to_the_complete_dot() {
+        let _lease = crate::tests::DEVICE.lock().await;
+        let mut device = Device::new(shared.topology()).unwrap();
+        let mut qn = projection::<OutputWidth>(&mut device).await;
+        let kn = projection::<KvWidth>(&mut device).await;
+        let vn = projection::<KvWidth>(&mut device).await;
+        qn.weight = fixtures::upload::<f4e2m1, qkv::Stored<Hidden, OutputWidth>>(
+            &mut device.pdma,
+            vec![f4e2m1::from_bits(2); Hidden::SIZE * OutputWidth::SIZE],
+        )
+        .await;
+        qn.weight_scale = fixtures::upload::<f8e4m3, qkv::StoredScales<Hidden, OutputWidth>>(
+            &mut device.pdma,
+            vec![f8e4m3::from_f32(0.125); Hidden::SIZE * OutputWidth::SIZE / 16],
+        )
+        .await;
+        let input = fixtures::upload::<bf16, m![Rows, Hidden]>(
+            &mut device.pdma,
+            vec![bf16::from_f32(6.0); Rows::SIZE * Hidden::SIZE],
+        )
+        .await;
+        // Non-power-of-two factors expose scaling changes hidden by exact powers of two;
+        // a small normal factor also checks that a representable nonzero result survives.
+        // The FP64 oracle uses the stored FP32 factor and permits final BF16 rounding.
+        for factor in [1.3_f32, -0.7, 2.0_f32.powi(-120)] {
+            qn.scales.output =
+                fixtures::upload::<f32, m![1 # 8]>(&mut device.pdma, vec![factor; 8]).await;
+            let expected = 3072.0_f64 * factor as f64;
+            let rounded = bf16::from_f32(expected as f32);
+            assert_ne!(rounded.to_f32(), 0.0);
+            let ulp = 2.0_f64.powi(((rounded.to_bits() >> 7) & 255) as i32 - 127 - 7);
+            let tolerance = 0.5 * ulp + 1e-6 * expected.abs();
+            for rows in [32, 33] {
+                let count = fixtures::count(&mut device, rows).await;
+                let (q, _, _) = launch(shared, (&mut device, &qn, &kn, &vn, &count, &input))
+                    .await
+                    .unwrap();
+                let values = fixtures::read::<_, m![Rows, OutputWidth]>(&mut device.pdma, &q).await;
+                for (index, value) in values.iter().take(rows * OutputWidth::SIZE).enumerate() {
+                    let actual = value.to_f32() as f64;
+                    assert!(
+                        actual.is_finite() && (actual - expected).abs() <= tolerance,
+                        "tensor factor oracle: rows={rows} factor={factor} element={index} actual={actual} expected={expected} tolerance={tolerance}"
+                    );
+                }
+            }
+        }
+    }
+    async fn projection<O: AxisName>(device: &mut Device) -> QkvProjection<Hidden, O> {
+        let (weight, weight_scale, scales) = weights::<Hidden, O, _, _>(
+            device,
+            QkvProjection::<Hidden, O>::reorder::<1, _>,
+            QkvProjection::<Hidden, O>::reorder::<16, _>,
+        )
+        .await;
+        QkvProjection {
+            weight,
+            weight_scale,
+            scales,
+        }
+    }
+
+    #[test]
+    fn checkpoint_reorder_preserves_packed_weight_and_scale_coordinates() {
+        fn check<const PACK: usize>() {
+            let original: Vec<_> = (0..Hidden::SIZE * KvWidth::SIZE / PACK).collect();
+            let reordered = QkvProjection::<Hidden, KvWidth>::reorder::<PACK, _>(&original);
+            // Literal landmarks independently pin output-row, input-slice, and owner transitions.
+            if PACK == 2 {
+                assert_eq!(
+                    [
+                        reordered[31],
+                        reordered[32],
+                        reordered[4095],
+                        reordered[4096],
+                        reordered[262144]
+                    ],
+                    [31, 2048, 260127, 32, 262144]
+                );
+            } else {
+                assert_eq!(
+                    [
+                        reordered[3],
+                        reordered[4],
+                        reordered[511],
+                        reordered[512],
+                        reordered[32768]
+                    ],
+                    [3, 256, 32515, 4, 32768]
+                );
+            }
+
+            for owner in 0..8 {
+                for slice in 0..64 {
+                    for out in 0..128 {
+                        for column in 0..64 / PACK {
+                            let target = ((owner * 64 + slice) * 128 + out) * (64 / PACK) + column;
+                            let source = ((owner * 128 + out) * 4096 + slice * 64) / PACK + column;
+                            assert_eq!(reordered[target], original[source]);
+                        }
+                    }
+                }
+            }
+        }
+        check::<2>();
+        check::<16>();
+    }
 }

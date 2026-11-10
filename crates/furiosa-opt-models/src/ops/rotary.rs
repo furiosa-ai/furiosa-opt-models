@@ -2363,7 +2363,12 @@ pub mod group {
         use super::*;
         use crate::load::Checkpoint;
 
-        axes![Position = 4, Head = 8];
+        axes![
+            Position = 4,
+            Head = 8,
+            LlamaHead = 128,
+            LlamaPosition = 8193
+        ];
 
         /// The checkpoint of a config of `rope_theta` and `max_position_embeddings`.
         fn config(config: serde_json::Value) -> Checkpoint {
@@ -2415,6 +2420,56 @@ pub mod group {
                     assert_eq!(name, "config.json:max_position_embeddings")
                 }
                 other => panic!("{other:?} is not `InvalidData`"),
+            }
+        }
+        #[tokio::test(flavor = "current_thread")]
+        #[ignore = "opens a device"]
+        async fn loads_llama3_scaled_rotation_coefficients() {
+            let _lease = crate::tests::DEVICE.lock().await;
+            let config = serde_json::json!({
+                "max_position_embeddings": 131072, "rope_theta": 500000.0,
+                "rope_scaling": {
+                    "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+                    "high_freq_factor": 4.0, "original_max_position_embeddings": 8192,
+                },
+            });
+            let directory = tempfile::tempdir().unwrap();
+            let checkpoint = Checkpoint::new(directory.path(), Some(config)).unwrap();
+            let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+            let rotation: SplitHalf<LlamaHead, Table<LlamaPosition, super::super::Row<LlamaHead>>> =
+                checkpoint.load(&mut device).unwrap();
+            let table = rotation
+                .frequency
+                .to_host::<m![LlamaPosition, { Symbol<super::super::Row<LlamaHead>> }, OutputHalf, InputHalf]>(&mut device.pdma)
+                .await
+                .unwrap()
+                .into_vec();
+            // Published Llama 3.1 rule: preserve short wavelengths, divide long ones by eight,
+            // and interpolate between the original 8192-token context's two thresholds.
+            for position in [0, 1, 1024, 8192] {
+                for pair in 0..64 {
+                    let base = 500_000_f64.powf(-2.0 * pair as f64 / 128.0);
+                    let wavelength = std::f64::consts::TAU / base;
+                    let frequency = if wavelength < 8192.0 / 4.0 {
+                        base
+                    } else if wavelength > 8192.0 {
+                        base / 8.0
+                    } else {
+                        let smooth = (8192.0 / wavelength - 1.0) / 3.0;
+                        (1.0 - smooth) * base / 8.0 + smooth * base
+                    };
+                    let angle = f64::from(position as f32 * frequency as f32);
+                    for (cell, expected) in [angle.cos(), -angle.sin(), angle.sin(), angle.cos()]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        assert_eq!(
+                            table[(position * 64 + pair) * 4 + cell],
+                            bf16::from_f32(expected as f32),
+                            "position={position} pair={pair} cell={cell}",
+                        );
+                    }
+                }
             }
         }
     }
