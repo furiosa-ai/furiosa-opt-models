@@ -1,13 +1,15 @@
 use super::{geometry, gqa};
-use crate::ops::linear::{self, Groups, Linear};
+use crate::ops::linear::nvfp4::summed::rows as summed;
+use crate::ops::linear::{self, Groups, Half, Linear, Terms};
 use crate::ops::normalization::{self, Spread};
 use crate::ops::vector::Zip;
+use crate::specialize::contraction::{self, Routing};
 use crate::tensor::axis;
 use crate::tensor::form::BlockScaled;
-use crate::tensor::form::nvfp4::{Held, Late, Scale, Scales};
+use crate::tensor::form::nvfp4::{Exchanged, Held, Late, Scale, Scales};
 use crate::tensor::memory::Memory;
 use crate::tensor::{axis::Lanes, live::Live, mapping::Rows as Layout, parallel::Chip};
-use crate::{Boundary, Op};
+use crate::{Begin, Boundary, Op};
 use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
 use std::borrow::Borrow;
@@ -373,6 +375,114 @@ where
     }
 }
 
+/// The channel-scaled output projection of every live row's attention under [`Exchanged`]: the
+/// weight lands, then the rows project through it as below.
+impl<
+    'x,
+    Hidden: AxisName,
+    QWidth: AxisName,
+    Rows: AxisName,
+    KvHeads: AxisName,
+    Groups: AxisName,
+    Head: AxisName,
+    K,
+    V,
+> Op<&'x Live<gqa::Attended<Rows, KvHeads, Groups, Head>, Rows>>
+    for BlockScaled<QWidth, Hidden, f8e4m3, f32, m![Hidden, 1 # 8], Exchanged, Chip, K, V>
+where
+    K: Borrow<HbmTensor<f8e4m3, Chip, linear::fp8::Codes<QWidth, Hidden>>>,
+    V: Borrow<HbmTensor<f32, Chip, m![Hidden, 1 # 8]>>,
+{
+    type Output = Live<Spread<Hidden, Rows>, Rows>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        input: &'x Live<gqa::Attended<Rows, KvHeads, Groups, Head>, Rows>,
+    ) -> Self::Output {
+        let landed = self.forward(&mut *device, Begin(()));
+        self.forward(device, (&landed, input))
+    }
+}
+
+/// The same rows through the weight as it landed under [`Exchanged`].
+impl<
+    'x,
+    Hidden: AxisName,
+    QWidth: AxisName,
+    Rows: AxisName,
+    KvHeads: AxisName,
+    Groups: AxisName,
+    Head: AxisName,
+    K,
+    V,
+    L,
+>
+    Op<(
+        L,
+        &'x Live<gqa::Attended<Rows, KvHeads, Groups, Head>, Rows>,
+    )> for BlockScaled<QWidth, Hidden, f8e4m3, f32, m![Hidden, 1 # 8], Exchanged, Chip, K, V>
+where
+    L: linear::Slabs<Chip, In = Half<QWidth>, Out = Terms<Hidden>, Stored = f8e4m3>,
+{
+    type Output = Live<Spread<Hidden, Rows>, Rows>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (landed, input): (
+            L,
+            &'x Live<gqa::Attended<Rows, KvHeads, Groups, Head>, Rows>,
+        ),
+    ) -> Self::Output {
+        self.forward(device, (landed, input, (&(), &mut ())))
+    }
+}
+
+/// The same rows through the weight as it landed under [`Exchanged`], `boundary` running on its
+/// state once the rows' move and the first slab's restoration are issued, as for BF16 rows.
+impl<
+    'x,
+    'b,
+    's,
+    Hidden: AxisName,
+    QWidth: AxisName,
+    Rows: AxisName,
+    KvHeads: AxisName,
+    Groups: AxisName,
+    Head: AxisName,
+    K,
+    V,
+    L,
+    H,
+    G,
+>
+    Op<(
+        L,
+        &'x Live<gqa::Attended<Rows, KvHeads, Groups, Head>, Rows>,
+        Boundary<'b, 's, H, G>,
+    )> for BlockScaled<QWidth, Hidden, f8e4m3, f32, m![Hidden, 1 # 8], Exchanged, Chip, K, V>
+where
+    L: linear::Slabs<Chip, In = Half<QWidth>, Out = Terms<Hidden>, Stored = f8e4m3>,
+    H: for<'g, 'y> crate::Module<&'g mut G, (), &'y mut (), Output = ()>
+        + for<'g, 'y> crate::Module<linear::Grouped<&'g mut G>, (), &'y mut (), Output = ()>,
+{
+    type Output = Live<Spread<Hidden, Rows>, Rows>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (landed, input, boundary): (
+            L,
+            &'x Live<gqa::Attended<Rows, KvHeads, Groups, Head>, Rows>,
+            Boundary<'b, 's, H, G>,
+        ),
+    ) -> Self::Output {
+        let rows = read::<QWidth, _, _, _, _>(input);
+        exchange(&linear::Affine::new(landed, ()), device, rows, boundary)
+    }
+}
+
 /// The block-scaled output projection of every live row's attention, each row read as one row of
 /// `QWidth` as the BF16 projection reads it.
 impl<
@@ -411,6 +521,84 @@ where
         self.forward(device, read::<QWidth, _, _, _, _>(input))
     }
 }
+
+/// Each row's inputs that one cluster's passes contract when the clusters halve them, to write:
+/// its half, sixteen inputs a slice, as a contraction's ring reads them; `E` a slice's rows.
+type HalfRing<'r, QWidth, E> = DmTensorViewMut<
+    'r,
+    bf16,
+    Chip,
+    m![QWidth / (QWidth / 2)],
+    m![QWidth % (QWidth / 2) / 16 # 256],
+    E,
+>;
+
+/// Every row of [`HalfRing`].
+type HalfRows<'r, QWidth, Rows> = HalfRing<'r, QWidth, m![1, Rows, QWidth % 16]>;
+
+/// A lane group of [`HalfRing`]'s rows.
+type HalfGroup<'r, QWidth, Rows> =
+    HalfRing<'r, QWidth, m![1, { Layout<Rows>::GroupMut<m![QWidth % 16]> }]>;
+
+/// The attended rows `V` of `Rows`, all of them or a lane group, as the contraction of each half
+/// of the inputs stages them: each copy lays half t of a row's inputs on cluster t's ring.
+struct Halving<V, Rows>(V, PhantomData<Rows>);
+
+/// The layout a stage copies [`Halving`]'s rows into, to write.
+type Copied<'a, C, S, E> = DmTensorViewMut<'a, bf16, Chip, C, S, E>;
+
+/// Every row: the ring route's layout of a half's contraction under the rows' own axes.
+impl<'x, QWidth: AxisName, Rows: AxisName, KvHeads: AxisName> linear::kernel::Source
+    for Halving<Read<'x, QWidth, Rows, KvHeads>, Rows>
+{
+    type Chips = Chip;
+
+    fn copy<'a, C: M, S: M, E: M>(self, device: &mut Device, into: Copied<'a, C, S, E>)
+    where
+        Self: 'a,
+    {
+        // SAFETY: the ring route's rows of the contraction of a half, cluster t's ring holding
+        // half t of every row's inputs, sixteen a slice, the rows in order.
+        let into: HalfRows<'a, QWidth, Rows> = unsafe { into.reshape() };
+        self.0.to_dm_view(&mut device.tdma, into);
+    }
+}
+
+/// A lane group of the rows, as every row above.
+impl<'x, QWidth: AxisName, Rows: AxisName, KvHeads: AxisName> linear::kernel::Source
+    for Halving<ReadGroup<'x, QWidth, Rows, KvHeads>, Rows>
+{
+    type Chips = Chip;
+
+    fn copy<'a, C: M, S: M, E: M>(self, device: &mut Device, into: Copied<'a, C, S, E>)
+    where
+        Self: 'a,
+    {
+        // SAFETY: as for every row, a lane group's tile of the ring.
+        let into: HalfGroup<'a, QWidth, Rows> = unsafe { into.reshape() };
+        self.0.to_dm_view(&mut device.tdma, into);
+    }
+}
+
+/// A lane group of [`Read`]'s rows.
+type ReadGroup<'x, Width, Rows, KvHeads> = DmTensorView<
+    'x,
+    bf16,
+    Chip,
+    gqa::Cluster<Rows>,
+    gqa::Merged<Rows, KvHeads, m![Width / (Width / KvHeads)]>,
+    m![{ Layout<Rows>::Selected }, Width % (Width / KvHeads)],
+>;
+
+/// Each cluster's FP32 term of every row's outputs on the feature slices, the cluster digit of the
+/// contraction of a half of `QWidth` into the terms of `Hidden` naming the term.
+type Partial<QWidth, Hidden, Rows> = DmTensor<
+    f32,
+    Chip,
+    linear::kernel::Cluster<Half<QWidth>, Terms<Hidden>, f8e4m3>,
+    normalization::FeatureSlices<Hidden>,
+    m![Rows, { normalization::Offset<Hidden> }],
+>;
 
 /// The live rows and each row's attention as one row of `Width`: its heads' values in head order.
 fn read<Width: AxisName, Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName>(
@@ -492,6 +680,65 @@ where
     live.with(output)
 }
 
+/// Every live row's attention, read as `rows`, through `projection`, which contracts each half of
+/// the inputs into its term of every output, `boundary` as [`project`] runs it: each value of a
+/// live row moves once, into its half's cluster, and the clusters' FP32 terms add in the feature
+/// slices the next projection reads, each output rounded once.
+fn exchange<'x, Hidden, QWidth, Rows, KvHeads, Matrix, H, G>(
+    projection: &linear::Affine<Matrix, ()>,
+    device: &mut Device,
+    (live, rows): (
+        Live<PhantomData<Rows>, Rows>,
+        Read<'x, QWidth, Rows, KvHeads>,
+    ),
+    boundary: Boundary<'_, '_, H, G>,
+) -> Live<Spread<Hidden, Rows>, Rows>
+where
+    Hidden: AxisName,
+    QWidth: AxisName,
+    Rows: AxisName,
+    KvHeads: AxisName,
+    Matrix: linear::Slabs<Chip, In = Half<QWidth>, Out = Terms<Hidden>, Stored = f8e4m3>,
+    H: for<'g, 'y> crate::Module<&'g mut G, (), &'y mut (), Output = ()>
+        + for<'g, 'y> crate::Module<linear::Grouped<&'g mut G>, (), &'y mut (), Output = ()>,
+{
+    let group = |at| {
+        let rows: ReadGroup<'_, QWidth, Rows, KvHeads> = rows.clone().tile::<
+            Layout<Rows>::Groups,
+            1,
+            m![{ Layout<Rows>::Selected }, QWidth % (QWidth / KvHeads)],
+        >(at);
+        Halving(rows, PhantomData::<Rows>)
+    };
+    const {
+        let (.., routing) = contraction::tiling(Half::<QWidth>::SIZE, Terms::<Hidden>::SIZE, 8);
+        assert!(
+            matches!(routing, Routing::Ring),
+            "a half's rows stage through the ring"
+        );
+        assert!(
+            <linear::kernel::Idle<Half<QWidth>, Terms<Hidden>, f8e4m3> as M>::SIZE == 1,
+            "a term's chunks of sixteen fill the feature slices"
+        );
+        assert!(<normalization::Chunk<Hidden> as AxisName>::SIZE == 16);
+    };
+    let sums = projection.summed::<linear::kernel::Scattered, _, _, _, _, _, _, _, _, _>(
+        &mut *device,
+        (
+            live,
+            Halving(rows.clone(), PhantomData::<Rows>),
+            group,
+            boundary,
+        ),
+    );
+    // SAFETY: cluster t's sums are term t of every output, the parts of a block landing its
+    // chunks of sixteen on their feature slices in order; the one slab is a unit digit.
+    let partial: Partial<QWidth, Hidden, Rows> = unsafe { sums.reshape() };
+    let mut spread = Spread::<Hidden, Rows>::new();
+    summed::swap_terms(device, live.with(&partial), &mut spread);
+    live.with(spread)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +751,7 @@ mod tests {
     use crate::tensor::{live::tests::count, scalar::Value};
     use crate::tests::DEVICE;
     use furiosa_opt_std::runtime::launch;
+    use std::iter;
     use std::ops::Range;
 
     /// Live rows of a partial launch: one whole row group and part of the next.
@@ -601,6 +849,100 @@ mod tests {
             geometry::QueryWidth<4096>,
         >(&mut device)
         .await;
+    }
+
+    /// The largest error over its bound of each live row's heads through channel-scaled E4M3
+    /// weights whose clusters halve the inputs, against the FP64 sum over `bf16(code * scale)`.
+    async fn exchanges_attended_rows<H: AxisName, G: AxisName, Q: AxisName>(
+        device: &mut Device,
+    ) -> f64 {
+        let live = count(LIVE).to_hbm(&mut device.pdma).await.unwrap();
+        let attended = random(Sixteen::SIZE * Q::SIZE, 0x3f84_d5b5);
+        let codes: Vec<f8e4m3> = random(H::SIZE * Q::SIZE, 0xb547_0917)
+            .iter()
+            .map(|value| f8e4m3::from_f32(64.0 * value.to_f32()))
+            .collect();
+        let scales: Vec<f32> = (0..H::SIZE)
+            .map(|row| 2f32.powi(-((row % 5) as i32)) / 64.0)
+            .collect();
+        let restored: Vec<f64> = (codes.iter().enumerate())
+            .map(|(at, code)| {
+                f64::from(bf16::from_f32(code.to_f32() * scales[at / Q::SIZE]).to_f32())
+            })
+            .collect();
+        let output: linear::fp8::ChannelScaled<Q, H, _, _, Exchanged> = BlockScaled {
+            weight: HostTensor::<f8e4m3, m![H, Q]>::from_vec(codes)
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap(),
+            weight_scale: HostTensor::<f32, m![H, 1 # 8]>::from_vec(
+                (scales.iter()).flat_map(|&scale| iter::once(scale).chain([0.0; 7])),
+            )
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap(),
+            contract: Exchanged,
+            shape: PhantomData,
+        };
+        let input = HostTensor::<bf16, m![Sixteen, KvHeads, G, Head]>::from_vec(attended.clone())
+            .to_hbm::<Chip, m![Sixteen, KvHeads, G, Head]>(&mut device.pdma)
+            .await
+            .unwrap();
+        let projected: HbmTensor<bf16, Chip, RowMajor<H, Sixteen>> =
+            launch(attended_rows, (&mut *device, &output, &live, &input))
+                .await
+                .unwrap();
+        let projected = projected
+            .to_host::<RowMajor<H, Sixteen>>(&mut device.pdma)
+            .await
+            .unwrap()
+            .into_vec();
+        let mut worst = 0.0f64;
+        for row in 0..LIVE {
+            for column in 0..H::SIZE {
+                let (sum, magnitude) = (0..Q::SIZE)
+                    .map(|at| {
+                        restored[column * Q::SIZE + at]
+                            * f64::from(attended[row * Q::SIZE + at].to_f32())
+                    })
+                    .fold((0.0, 0.0), |(sum, magnitude), term: f64| {
+                        (sum + term, magnitude + term.abs())
+                    });
+                let bound =
+                    sum.abs() / 256.0 + magnitude * Q::SIZE as f64 * f64::from(f32::EPSILON);
+                let got = f64::from(projected[row * H::SIZE + column].to_f32());
+                worst = worst.max((got - sum).abs() / bound);
+                assert!(
+                    (got - sum).abs() <= bound,
+                    "{} wide, row {row} column {column}: {got} vs {sum}",
+                    H::SIZE,
+                );
+            }
+        }
+        worst
+    }
+
+    /// Exchanged halves' FP32 sums round once at Gemma 4's widths (a carved top output digit):
+    /// within one BF16 rounding and FP32 error of the FP64 sum, each row's heads in head order.
+    #[tokio::test(flavor = "current_thread")]
+    async fn exchanged_projects_attended_rows_in_head_order() {
+        let _lease = DEVICE.lock().await;
+        let mut device = Device::new(attended_rows.topology()).unwrap();
+        let sliding = exchanges_attended_rows::<
+            geometry::Hidden<3840>,
+            geometry::QueryGroups<4>,
+            geometry::QueryWidth<4096>,
+        >(&mut device)
+        .await;
+        let full = exchanges_attended_rows::<
+            geometry::Hidden<3840>,
+            geometry::QueryGroups<8>,
+            geometry::QueryWidth<8192>,
+        >(&mut device)
+        .await;
+        eprintln!(
+            "largest error over its bound: {sliding:.3} from 4096 inputs, {full:.3} from 8192"
+        );
     }
 
     /// Block-scaled weights project each live row's heads in head order as BF16 inputs: the exact

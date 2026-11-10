@@ -1557,6 +1557,20 @@ type Scatter<I, O> = m![
 type Scattered<I, O, R> =
     DmTensor<f32, Chip, InputCluster<I>, Scatter<I, O>, m![R, O % ({ Feature<O> })]>;
 
+/// Each cluster's FP32 term of every row's outputs on the output's feature slices, its cluster
+/// digit `C` naming the term, `E` a slice's rows.
+type Termed<C, O, E> = DmTensor<f32, Chip, C, FeatureSlices<O>, E>;
+
+/// Every row's outputs on a feature slice.
+type Rowed<O, R> = m![R, O % ({ Feature<O> })];
+
+/// Rows both clusters add alike, each into its own copy, `E` a slice's rows.
+type Alike<'t, O, E> = DmTensorView<'t, f32, Chip, normalization::Cluster, FeatureSlices<O>, E>;
+
+/// The FP32 sums of each cluster's half of the inputs, its cluster's index naming the term: `E` a
+/// slice's outputs of a row.
+type TermRows<S, R, E> = DmTensor<f32, Chip, m![Term], S, m![R, { E }]>;
+
 /// The live rows of `rows` into `into`'s mapping in one transfer, as a setup costs about as much as
 /// all the rows: the one live row, else the lane group holding them, else the envelope.
 fn transfer<V: Scalar, R: AxisName, C: M, S: M, X: M, D: M, T: M, Y: M>(
@@ -2071,7 +2085,7 @@ fn exchange<I: AxisName, O: AxisName, R: AxisName>(
     let live = rows.with(());
     let (summed, scattered) = rows.into_value();
     let mut sums = Spread::<O, R>::new();
-    let (first, count) = live.groups::<Lanes<R>>();
+    let (_, count) = live.groups::<Lanes<R>>();
     if decoded::<R>(count) > 0 {
         let other: Scattered<I, O, R> = scattered.view().cluster_swap().to_dm(&mut device.tdma);
         // SAFETY: both clusters add the same two terms into their own copy of every row, an
@@ -2097,60 +2111,151 @@ fn exchange<I: AxisName, O: AxisName, R: AxisName>(
     } else {
         // SAFETY: each cluster summed its own half of the inputs, so its index names the term.
         let partial: Partials<I, O, R> = unsafe { summed.reshape() };
-        let mut terms = Terms::<O, R>::new();
-        transfer(device, live.with(&partial), &mut terms);
-        if count > 1 {
-            device
-                .main
-                .begin(terms.view())
-                .fetch::<m![R, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
-                .collect::<m![R, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
-                .vector_init()
-                .vector_intra_slice_unzip::<Term, m![R, O % ({ Feature<O> }) / 8]>()
-                .vector_clip_zip(ClipBinaryOpF32::Add)
-                .vector_final()
-                .cast::<bf16, m![O % 8 # 16]>()
-                .commit_trim::<m![O % 8]>()
-                .commit_view(sums.view_mut());
-        } else if live.rows() == 1 {
-            let row = live.start();
-            device
-                .main
-                .begin(
-                    (terms.view()).tile::<m![R], 1, m![R = 1 # R, Term, O % ({ Feature<O> })]>(row),
-                )
-                .fetch::<m![Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
-                .collect::<m![Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
-                .vector_init()
-                .vector_intra_slice_unzip::<Term, m![O % ({ Feature<O> }) / 8]>()
-                .vector_clip_zip(ClipBinaryOpF32::Add)
-                .vector_final()
-                .cast::<bf16, m![O % 8 # 16]>()
-                .commit_trim::<m![O % 8]>()
-                .commit_view(
-                    (sums.view_mut()).tile::<m![R], 1, m![R = 1 #{!} R, O % ({ Feature<O> })]>(row),
-                );
-        } else {
-            device
-                .main
-                .begin(Layout::<R>::group(terms.view(), first))
-                .fetch::<m![{ Lane<R> }, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
-                .collect::<m![{ Lane<R> }, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
-                .vector_init()
-                .vector_intra_slice_unzip::<Term, m![{ Lane<R> }, O % ({ Feature<O> }) / 8]>()
-                .vector_clip_zip(ClipBinaryOpF32::Add)
-                .vector_final()
-                .cast::<bf16, m![O % 8 # 16]>()
-                .commit_trim::<m![O % 8]>()
-                .commit_view(
-                    (sums.view_mut())
-                        .tile::<Layout<R>::Groups, 1, Layout<R>::GroupMut<m![O % ({ Feature<O> })]>>(
-                            first,
-                        ),
-                );
-        }
+        add_terms(device, live.with(&partial), &mut sums);
     }
     live.with(sums)
+}
+
+/// The FP32 sums of each cluster's half of the inputs that `partial` holds, its cluster's index
+/// naming the term, gathered into the output's feature slices of both clusters in one transfer
+/// and added there into `sums`, each output rounded once to BF16.
+pub(crate) fn add_terms<O: AxisName, R: AxisName, S: M, X: M>(
+    device: &mut Device,
+    partial: Live<&TermRows<S, R, X>, R>,
+    sums: &mut Spread<O, R>,
+) {
+    let live = partial.with(());
+    let (first, count) = live.groups::<Lanes<R>>();
+    let mut terms = Terms::<O, R>::new();
+    transfer(device, partial, &mut terms);
+    if count > 1 {
+        device
+            .main
+            .begin(terms.view())
+            .fetch::<m![R, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+            .collect::<m![R, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+            .vector_init()
+            .vector_intra_slice_unzip::<Term, m![R, O % ({ Feature<O> }) / 8]>()
+            .vector_clip_zip(ClipBinaryOpF32::Add)
+            .vector_final()
+            .cast::<bf16, m![O % 8 # 16]>()
+            .commit_trim::<m![O % 8]>()
+            .commit_view(sums.view_mut());
+    } else if live.rows() == 1 {
+        let row = live.start();
+        device
+            .main
+            .begin((terms.view()).tile::<m![R], 1, m![R = 1 # R, Term, O % ({ Feature<O> })]>(row))
+            .fetch::<m![Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+            .collect::<m![Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+            .vector_init()
+            .vector_intra_slice_unzip::<Term, m![O % ({ Feature<O> }) / 8]>()
+            .vector_clip_zip(ClipBinaryOpF32::Add)
+            .vector_final()
+            .cast::<bf16, m![O % 8 # 16]>()
+            .commit_trim::<m![O % 8]>()
+            .commit_view(
+                (sums.view_mut()).tile::<m![R], 1, m![R = 1 #{!} R, O % ({ Feature<O> })]>(row),
+            );
+    } else {
+        device
+            .main
+            .begin(Layout::<R>::group(terms.view(), first))
+            .fetch::<m![{ Lane<R> }, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+            .collect::<m![{ Lane<R> }, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+            .vector_init()
+            .vector_intra_slice_unzip::<Term, m![{ Lane<R> }, O % ({ Feature<O> }) / 8]>()
+            .vector_clip_zip(ClipBinaryOpF32::Add)
+            .vector_final()
+            .cast::<bf16, m![O % 8 # 16]>()
+            .commit_trim::<m![O % 8]>()
+            .commit_view(
+                (sums.view_mut())
+                    .tile::<Layout<R>::Groups, 1, Layout<R>::GroupMut<m![O % ({ Feature<O> })]>>(
+                        first,
+                    ),
+            );
+    }
+}
+
+/// The FP32 sums of each cluster's half of the inputs that `partial` holds on the output's feature
+/// slices, its cluster digit `C` naming the term: each cluster takes the other's term and both add
+/// the two into `sums`, each output rounded once to BF16; only the live rows move and add.
+pub(crate) fn swap_terms<O: AxisName, R: AxisName, C: M>(
+    device: &mut Device,
+    partial: Live<&Termed<C, O, Rowed<O, R>>, R>,
+    sums: &mut Spread<O, R>,
+) {
+    type Row<O, R> = m![R = 1 # R, O % ({ Feature<O> })];
+    type RowMut<O, R> = m![R = 1 #{!} R, O % ({ Feature<O> })];
+    type Group<O, R> = Layout<R>::Elements<m![O % ({ Feature<O> })]>;
+    let live = partial.with(());
+    let (first, count) = live.groups::<Lanes<R>>();
+    let own = partial.into_value();
+    if count > 1 {
+        let other: Termed<C, O, Rowed<O, R>> = own.view().cluster_swap().to_dm(&mut device.tdma);
+        // SAFETY: once a cluster holds both terms it adds them into its own copy of the rows, and
+        // FP32 addition of two terms commutes: both clusters' sums are the same.
+        let own: Alike<'_, O, Rowed<O, R>> = unsafe { own.view().reshape() };
+        // SAFETY: as for the cluster's own term.
+        let other: Alike<'_, O, Rowed<O, R>> = unsafe { other.view().reshape() };
+        device
+            .main
+            .begin_interleaved::<Term, _, _, _, _, _>(own, other)
+            .fetch::<m![R, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+            .collect::<m![R, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+            .vector_init()
+            .vector_intra_slice_unzip::<Term, m![R, O % ({ Feature<O> }) / 8]>()
+            .vector_clip_zip(ClipBinaryOpF32::Add)
+            .vector_final()
+            .cast::<bf16, m![O % 8 # 16]>()
+            .commit_trim::<m![O % 8]>()
+            .commit_view(sums.view_mut());
+    } else if live.rows() == 1 {
+        let row = live.start();
+        let own = own.view().tile::<m![R], 1, Row<O, R>>(row);
+        let other: Termed<C, O, Row<O, R>> = own.clone().cluster_swap().to_dm(&mut device.tdma);
+        // SAFETY: as for every row above, the one live row.
+        let own: Alike<'_, O, Row<O, R>> = unsafe { own.reshape() };
+        // SAFETY: as for the cluster's own term.
+        let other: Alike<'_, O, Row<O, R>> = unsafe { other.view().reshape() };
+        device
+            .main
+            .begin_interleaved::<Term, _, _, _, _, _>(own, other)
+            .fetch::<m![Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+            .collect::<m![Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+            .vector_init()
+            .vector_intra_slice_unzip::<Term, m![O % ({ Feature<O> }) / 8]>()
+            .vector_clip_zip(ClipBinaryOpF32::Add)
+            .vector_final()
+            .cast::<bf16, m![O % 8 # 16]>()
+            .commit_trim::<m![O % 8]>()
+            .commit_view((sums.view_mut()).tile::<m![R], 1, RowMut<O, R>>(row));
+    } else {
+        let own = Layout::<R>::group(own.view(), first);
+        let other: Termed<C, O, Group<O, R>> = own.clone().cluster_swap().to_dm(&mut device.tdma);
+        // SAFETY: as for every row above, the live lane group.
+        let own: Alike<'_, O, Group<O, R>> = unsafe { own.reshape() };
+        // SAFETY: as for the cluster's own term.
+        let other: Alike<'_, O, Group<O, R>> = unsafe { other.view().reshape() };
+        device
+            .main
+            .begin_interleaved::<Term, _, _, _, _, _>(own, other)
+            .fetch::<m![{ Lane<R> }, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+            .collect::<m![{ Lane<R> }, Term, O % ({ Feature<O> }) / 8], m![O % 8]>()
+            .vector_init()
+            .vector_intra_slice_unzip::<Term, m![{ Lane<R> }, O % ({ Feature<O> }) / 8]>()
+            .vector_clip_zip(ClipBinaryOpF32::Add)
+            .vector_final()
+            .cast::<bf16, m![O % 8 # 16]>()
+            .commit_trim::<m![O % 8]>()
+            .commit_view(
+                (sums.view_mut())
+                    .tile::<Layout<R>::Groups, 1, Layout<R>::GroupMut<m![O % ({ Feature<O> })]>>(
+                        first,
+                    ),
+            );
+    }
 }
 
 /// Whether `count` live lane groups of `R` rows meet a decoded weight: one from three groups,

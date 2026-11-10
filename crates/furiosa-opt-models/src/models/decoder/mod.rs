@@ -672,7 +672,7 @@ pub mod form {
     use crate::tensor;
     use crate::tensor::form::fp8::Block;
     use crate::tensor::form::fp8::Scales;
-    use crate::tensor::form::nvfp4::{self, Early, Features, Late, Summed, W4A4, W4A16};
+    use crate::tensor::form::nvfp4::{self, Early, Exchanged, Features, Late, Summed, W4A4, W4A16};
     use crate::tensor::{parallel::Chip, scalar};
     use furiosa_opt_std::prelude::*;
 
@@ -681,8 +681,9 @@ pub mod form {
 
     /// FP8 weights with one FP32 scale per output channel, as a load quantizes BF16 ones or a
     /// checkpoint declares them; inputs stay BF16. HBM holds the codes as the contraction's slices
-    /// hold them, a load lays them out so.
-    pub struct ChannelScaled;
+    /// hold them, a load lays them out so. A projection's rows end where `P` places them: in the
+    /// feature slices, or there from each cluster's sums over its half of the inputs.
+    pub struct ChannelScaled<P = Features>(PhantomData<P>);
 
     /// How HBM holds [`ChannelScaled`]'s codes.
     pub mod channel {
@@ -777,6 +778,24 @@ pub mod form {
             Chip,
             Projection<Self, Intermediate, Hidden, bf16, Chip, X>,
         >;
+
+        const REQUIREMENT: Requirement =
+            Requirement::quantizable(Declaration::Fp8(Scheme::Channel));
+
+        type Caches = (bf16,);
+    }
+
+    impl Form for ChannelScaled<Exchanged> {
+        type Stored = f8e4m3;
+
+        type Of<In: AxisName, Out: AxisName, D: Scalar, Chips: M + 'static, X: Memory, V> =
+            fp8::ChannelScaled<
+                In,
+                Out,
+                X::Tensor<f8e4m3, Chip, channel::Codes<In, Out>>,
+                X::Tensor<f32, Chip, m![Out, 1 # 8]>,
+                Exchanged,
+            >;
 
         const REQUIREMENT: Requirement =
             Requirement::quantizable(Declaration::Fp8(Scheme::Channel));

@@ -182,7 +182,7 @@ pub(crate) type Cluster<In, Out, Code> =
 
 type Blocks<In, Out, Code> =
     m![Out % ((Out / ({ Carve<In, Out, Code> })) / 2) / ({ Block<In, Out, Code> })];
-type Idle<In, Out, Code> = m![
+pub(crate) type Idle<In, Out, Code> = m![
     256 / ({ Blocks<In, Out, Code> }) / ({ Slots<In, Out, Code> }) / ({ Padded<In, Out, Code> })
 ];
 pub(crate) type ProjectionSlices<In, Out, Code> = m![
@@ -734,6 +734,37 @@ where
             Boundary<'b, 's, H, G>,
         ),
     ) -> Self::Output {
+        self.summed::<bf16, _, _, _, _, _, _, _, _, _>(device, (live, input, group, boundary))
+    }
+}
+
+impl<W> Affine<W, ()> {
+    /// The live rows of `input` against every slab, each output's sum over the parts stored once
+    /// where `P` meets them, `boundary` running on its state once their staging and the first
+    /// slab's restoration are issued, on [`Grouped`] state where fewer than every row group is live.
+    pub(crate) fn summed<P, In, Out, Code, Rows, V, U, Group, H, G>(
+        &self,
+        device: &mut Device,
+        (live, input, group, boundary): (
+            Live<PhantomData<Rows>, Rows>,
+            V,
+            Group,
+            Boundary<'_, '_, H, G>,
+        ),
+    ) -> P::Table<Rows, m![1]>
+    where
+        P: Meet<In, Out, Code>,
+        In: AxisName,
+        Out: AxisName,
+        Code: Scalar,
+        Rows: AxisName,
+        V: Source<Chips = m![1]>,
+        U: Source<Chips = m![1]>,
+        W: Slabs<In = In, Out = Out, Stored = Code>,
+        Group: Fn(usize) -> U,
+        H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()>
+            + for<'g, 'x> crate::Module<Grouped<&'g mut G>, (), &'x mut (), Output = ()>,
+    {
         if live.groups::<axis::Lanes<Rows>>().1 == <Groups<Rows> as M>::SIZE {
             let (boundary, state) = boundary;
             let restored = |device: &mut Device, slab| {
@@ -741,24 +772,32 @@ where
                     crate::Module::forward(boundary, device, (), &mut (), &mut *state);
                 }
             };
-            return Contraction::<In, Out, Code>::resident(device, &self.weight, input, restored);
+            return Contraction::<In, Out, Code>::resident::<P, _, _, _, _>(
+                device,
+                &self.weight,
+                input,
+                restored,
+            );
         }
-        self.grouped(device, (live, input, group), boundary)
+        self.grouped::<P, In, Out, Code, Rows, V, U, Group, H, G>(
+            device,
+            (live, input, group),
+            boundary,
+        )
     }
-}
 
-impl<W> Affine<W, ()> {
     /// The live lane groups of `input`'s rows, each staged from where `group` reads it and
-    /// contracted alone against every slab, `boundary` running on its [`Grouped`] state once the
-    /// staging and the first slab's restoration are issued: the projection of rows of which fewer
-    /// than every row group are live.
-    pub(crate) fn grouped<In, Out, Code, Rows, V, U, Group, H, G>(
+    /// contracted alone against every slab, each sum stored where `P` meets the parts, `boundary`
+    /// running on its [`Grouped`] state once the staging and the first slab's restoration are
+    /// issued: the projection of rows of which fewer than every row group are live.
+    pub(crate) fn grouped<P, In, Out, Code, Rows, V, U, Group, H, G>(
         &self,
         device: &mut Device,
         (live, input, group): (Live<PhantomData<Rows>, Rows>, V, Group),
         (boundary, state): Boundary<'_, '_, H, G>,
-    ) -> Result<In, Out, Code, Rows>
+    ) -> P::Table<Rows, m![1]>
     where
+        P: Meet<In, Out, Code>,
         In: AxisName,
         Out: AxisName,
         Code: Scalar,
@@ -824,7 +863,7 @@ impl<W> Affine<W, ()> {
                 ),
             )),
         };
-        let mut result = DmTensor::new();
+        let mut result = P::table();
         #[unroll]
         for slab in 0..<Passes<In, Out, Code> as M>::SIZE {
             let weight = self.weight.slab(device, slab);
@@ -834,9 +873,10 @@ impl<W> Affine<W, ()> {
             for at in 0..count {
                 let group = first + at;
                 let lanes = rows.forward(&mut *device, (group, PhantomData::<axis::Lanes<Rows>>));
-                Contraction::<In, Out, Code>::store::<_, axis::Lanes<Rows>, _, bf16, _>(
+                P::pass::<_, axis::Lanes<Rows>, _, _>(
+                    device,
+                    (&weight, &lanes),
                     &(),
-                    Contraction::<In, Out, Code>::sums(device, &weight, &lanes),
                     &mut result,
                     (slab, group),
                 );
@@ -1345,13 +1385,13 @@ impl<In: AxisName, Out: AxisName, Code: Scalar> Contraction<In, Out, Code> {
     }
 
     /// Every batch of `B` of the staged rows against weight slab `slab`, each batch's sums plus
-    /// `offset` stored as `D` in its cells of `result`.
-    fn batches<Rows: AxisName, B: AxisName, X: M, D: Rounding, F>(
+    /// `offset` stored in its cells of `result`, where `P` meets the parts.
+    fn batches<Rows: AxisName, B: AxisName, X: M, P: Meet<In, Out, Code>, F>(
         device: &mut Device,
         rows: &Staged<'_, In, Out, Code, Rows, X>,
         weight: &Resident<In, Out, Code, X>,
         offset: &F,
-        result: &mut Table<D, In, Out, Code, Rows, X>,
+        result: &mut P::Table<Rows, X>,
         slab: usize,
     ) where
         F: Offset<X, Cluster<In, Out, Code>, ProjectionSlices<In, Out, Code>>,
@@ -1359,35 +1399,30 @@ impl<In: AxisName, Out: AxisName, Code: Scalar> Contraction<In, Out, Code> {
         #[unroll]
         for at in 0..<m![Rows / ({ Symbol<B> })] as M>::SIZE {
             let lanes = rows.forward(&mut *device, (at, PhantomData::<B>));
-            Self::store::<Rows, B, X, D, F>(
-                offset,
-                Self::sums(device, weight, &lanes),
-                result,
-                (slab, at),
-            );
+            P::pass::<Rows, B, X, F>(device, (weight, &lanes), offset, result, (slab, at));
         }
     }
 
     /// Every row of `input`, staged once, against every slab of `weight` plus that slab's
-    /// `offsets(device, slab)`, each output rounded once to BF16.
-    fn resident<Rows: AxisName, V: Source, W, F>(
+    /// `offsets(device, slab)`, each output's sum stored once where `P` meets the parts.
+    fn resident<P: Meet<In, Out, Code>, Rows: AxisName, V: Source, W, F>(
         device: &mut Device,
         weight: &W,
         input: V,
         mut offsets: impl FnMut(&mut Device, usize) -> F,
-    ) -> Result<In, Out, Code, Rows, V::Chips>
+    ) -> P::Table<Rows, V::Chips>
     where
         W: Slabs<V::Chips, In = In, Out = Out, Stored = Code>,
         F: Offset<V::Chips, Cluster<In, Out, Code>, ProjectionSlices<In, Out, Code>>,
     {
         let rows = Stage::<In, Out, Code, Rows, Batch<In, Out, Code, Rows>>(PhantomData)
             .forward(&mut *device, input);
-        let mut result = DmTensor::new();
+        let mut result = P::table();
         #[unroll]
         for slab in 0..<Passes<In, Out, Code> as M>::SIZE {
             let weight = weight.slab(device, slab);
             let offset = offsets(device, slab);
-            Self::batches::<_, Batch<In, Out, Code, Rows>, _, bf16, _>(
+            Self::batches::<_, Batch<In, Out, Code, Rows>, _, P, _>(
                 device,
                 &rows,
                 &weight,
@@ -1622,6 +1657,144 @@ impl<X: M, C: M, S: M, E: M> Offset<X, C, S> for VrfTensor<f32, X, C, S, E> {
     }
 }
 
+/// Where a pass's FP32 sums land once its parts meet: each block's on the slice of its first
+/// part, as a [`Rounding`] stores them, or [`Scattered`] over the slices of its parts.
+pub(crate) trait Meet<In: AxisName, Out: AxisName, Code: Scalar> {
+    /// Every slab's sums of `Rows` rows where they land.
+    type Table<Rows: AxisName, X: M>;
+
+    /// The place the sums land in.
+    fn table<Rows: AxisName, X: M>() -> Self::Table<Rows, X>;
+
+    /// Slab `slab` of `weight` against batch `at` of `B` rows, `lanes`, plus `offset`: its sums
+    /// where they land in `table`.
+    fn pass<Rows: AxisName, B: AxisName, X: M, F>(
+        device: &mut Device,
+        operands: Operands<'_, In, Out, Code, Rows, B, X>,
+        offset: &F,
+        table: &mut Self::Table<Rows, X>,
+        cells: (usize, usize),
+    ) where
+        F: Offset<X, Cluster<In, Out, Code>, ProjectionSlices<In, Out, Code>>;
+}
+
+impl<In: AxisName, Out: AxisName, Code: Scalar, D: Rounding> Meet<In, Out, Code> for D {
+    type Table<Rows: AxisName, X: M> = Table<D, In, Out, Code, Rows, X>;
+
+    fn table<Rows: AxisName, X: M>() -> Self::Table<Rows, X> {
+        DmTensor::new()
+    }
+
+    fn pass<Rows: AxisName, B: AxisName, X: M, F>(
+        device: &mut Device,
+        (weight, lanes): Operands<'_, In, Out, Code, Rows, B, X>,
+        offset: &F,
+        table: &mut Self::Table<Rows, X>,
+        (slab, at): (usize, usize),
+    ) where
+        F: Offset<X, Cluster<In, Out, Code>, ProjectionSlices<In, Out, Code>>,
+    {
+        Contraction::<In, Out, Code>::store::<Rows, B, X, D, F>(
+            offset,
+            Contraction::<In, Out, Code>::sums(device, weight, lanes),
+            table,
+            (slab, at),
+        );
+    }
+}
+
+/// A pass's weight slab and its batch's lanes.
+type Operands<'o, In, Out, Code, Rows, B, X> = (
+    &'o Resident<In, Out, Code, X>,
+    &'o Lanes<In, Out, Code, Rows, B, X>,
+);
+
+/// FP32 sums each block lands over the slices of its parts, the sixteen outputs a part's index
+/// names on its slice: where a block holds one chunk of sixteen a part, a feature slice each.
+pub(crate) struct Scattered;
+
+/// The slices a block's sums land over: its parts', each the chunk of sixteen its index names.
+pub(crate) type Scatter<In, Out, Code> = m![
+    Out / (Out / ({ Top<In, Out, Code> })) # ({ Padded<In, Out, Code> }),
+    { Blocks<In, Out, Code> },
+    1 # ({ Idle<In, Out, Code> }),
+    Out % ({ Block<In, Out, Code> }) / 16 # ({ Slots<In, Out, Code> })
+];
+
+impl<In: AxisName, Out: AxisName, Code: Scalar> Meet<In, Out, Code> for Scattered {
+    type Table<Rows: AxisName, X: M> = DmTensor<
+        f32,
+        X,
+        Cluster<In, Out, Code>,
+        Scatter<In, Out, Code>,
+        m![{ SlabIndex<In, Out, Code> }, Rows, Out % 16 / 2, Out % 2],
+    >;
+
+    fn table<Rows: AxisName, X: M>() -> Self::Table<Rows, X> {
+        DmTensor::new()
+    }
+
+    fn pass<Rows: AxisName, B: AxisName, X: M, F>(
+        device: &mut Device,
+        (weight, lanes): Operands<'_, In, Out, Code, Rows, B, X>,
+        offset: &F,
+        table: &mut Self::Table<Rows, X>,
+        (slab, at): (usize, usize),
+    ) where
+        F: Offset<X, Cluster<In, Out, Code>, ProjectionSlices<In, Out, Code>>,
+    {
+        const {
+            assert!(
+                OutputBlock::<In, Out, Code>::SIZE == 16 * PartSlots::<In, Out, Code>::SIZE,
+                "a block holds a chunk of sixteen outputs a part"
+            )
+        };
+        type Chunks<In, Out, Code> = m![Out % ({ Block<In, Out, Code> }) / 16, Out % 16];
+        let sums = Contraction::<In, Out, Code>::contract::<
+            Segment,
+            bf16,
+            Chunks<In, Out, Code>,
+            Chunked<In, Out, Code>,
+            Count<Rows, B>,
+            Layout<Rows>::Lanes,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        >(device, weight, lanes);
+        let cells = (table.view_mut())
+            .tile::<SlabIndex<In, Out, Code>, 1, m![
+                { SlabSelected<In, Out, Code> },
+                Rows,
+                Out % 16 / 2,
+                Out % 2
+            ]>(slab)
+            .tile::<m![Rows / B], 1, m![
+                { SlabSelected<In, Out, Code> },
+                Rows / B = 1 #{!} (Rows / B),
+                Rows % B,
+                Out % 16 / 2,
+                Out % 2
+            ]>(at);
+        f32::finish::<
+            Scatter<In, Out, Code>,
+            m![Out % 16, { Count<Rows, B> }],
+            Layout<Rows>::Lanes,
+            m![Out % 16 / 2, { Count<Rows, B> }, { Layout<Rows>::Lanes }],
+            m![Out % 2],
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        >(offset, sums, cells);
+    }
+}
+
 /// How a pass stores its FP32 sums once the parts meet: rounded once to BF16, or as they are.
 pub(crate) trait Rounding: MaterializableScalar {
     /// The eight-byte packets of `Outputs`.
@@ -1761,7 +1934,7 @@ impl<'i, In: AxisName, Out: AxisName, Rows: AxisName, Chips: M, S: M, E: M, X: M
             DmTensorView<'i, bf16, X, Chips, S, E>,
         ),
     ) -> Self::Output {
-        Contraction::<In, Out>::resident(
+        Contraction::<In, Out>::resident::<bf16, _, _, _, _>(
             device,
             weight,
             input,

@@ -2,7 +2,7 @@
 
 pub use affine::{Affine, Bias, output, query};
 pub(crate) use affine::{Coefficients, Inputs, Outputs};
-pub(crate) use decode::{Landed, Matrix};
+pub(crate) use decode::{Half, Landed, Matrix, Terms};
 pub use experts::Experts;
 pub(crate) use kernel::Slabs;
 pub(crate) use rows::Projection;
@@ -603,7 +603,7 @@ where
         device: &mut Device,
         (landed, Grouped(input)): (L, Grouped<&'x Live<Spread<In, Rows>, Rows>>),
     ) -> Self::Output {
-        let projected = Affine::new(landed, ()).grouped(
+        let projected = Affine::new(landed, ()).grouped::<bf16, _, _, _, _, _, _, _, _, _>(
             &mut *device,
             (input.with(PhantomData::<Rows>), input.value(), |at| {
                 mapping::Rows::<Rows>::group(input.value().view(), at)

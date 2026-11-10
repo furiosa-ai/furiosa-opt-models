@@ -5,7 +5,7 @@ use crate::ops::vector::{Restore, Scaled};
 use crate::specialize::contraction;
 use crate::tensor::form::BlockScaled;
 use crate::tensor::form::fp8::Token;
-use crate::tensor::form::nvfp4::{Early, Held, Scale, Scales, W4A16};
+use crate::tensor::form::nvfp4::{Early, Exchanged, Held, Scale, Scales, W4A16};
 use crate::tensor::memory::Memory;
 use crate::tensor::{parallel::Chip, scalar};
 use core::borrow::Borrow;
@@ -286,6 +286,98 @@ where
     type Output = Landed<In, Out, C>;
 
     fn forward(&self, device: &mut Device, _: Begin<()>) -> Landed<In, Out, C> {
+        let mut landed = Landed::default();
+        self.forward(device, &mut landed);
+        landed
+    }
+}
+
+/// A cluster's half of a projection's inputs, which its passes contract when the clusters halve
+/// the inputs.
+#[derive(Clone, Debug)]
+pub struct Half<In>(PhantomData<In>);
+
+impl<In: AxisName> AxisName for Half<In> {
+    const NAME: Ident = Ident::new("Half");
+    const SIZE: usize = {
+        assert!(In::SIZE.is_multiple_of(2));
+        In::SIZE / 2
+    };
+}
+
+/// Each output's two terms, one from each half of the inputs: the outputs of the contraction of
+/// a half, whose cluster digit names the half.
+#[derive(Clone, Debug)]
+pub struct Terms<Out>(PhantomData<Out>);
+
+impl<Out: AxisName> AxisName for Terms<Out> {
+    const NAME: Ident = Ident::new("Terms");
+    const SIZE: usize = 2 * Out::SIZE;
+}
+
+/// The slices of the contraction of a half of `In` into the terms of `Out`, by the digits of `Out`
+/// they hold and `Part`, the part of a half's inputs each holds.
+type HalfSlices<In, Out, Part> = m![
+    Out / (Out / ({ kernel::Top<Half<In>, Terms<Out>, f8e4m3> }))
+        # ({ kernel::Padded<Half<In>, Terms<Out>, f8e4m3> }),
+    Out % (Out / ({ kernel::Carve<Half<In>, Terms<Out>, f8e4m3> }))
+        / ({ kernel::Block<Half<In>, Terms<Out>, f8e4m3> }),
+    1 # ({ kernel::Idle<Half<In>, Terms<Out>, f8e4m3> }),
+    { Part } # ({ kernel::Slots<Half<In>, Terms<Out>, f8e4m3> })
+];
+
+/// A slice's part of a half of `In`: the part digit of [`HalfSlices`].
+type HalfPart<In, Out> = m![In % (In / 2) / ({ kernel::Chunk<Half<In>, Terms<Out>, f8e4m3> })];
+
+/// The codes, then the scales, one transfer each, into a place made before, as the contraction of
+/// each half of the inputs reads them: each cluster its half's codes, both clusters every scale.
+impl<In: AxisName, Out: AxisName, K, V> Op<&mut Landed<Half<In>, Terms<Out>>>
+    for BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], Exchanged, Chip, K, V>
+where
+    K: Borrow<HbmTensor<f8e4m3, Chip, Codes<In, Out>>>,
+    V: Borrow<HbmTensor<f32, Chip, m![Out, 1 # 8]>>,
+{
+    type Output = ();
+
+    fn forward(&self, device: &mut Device, landed: &mut Landed<Half<In>, Terms<Out>>) {
+        type Block<In, Out> = kernel::Block<Half<In>, Terms<Out>, f8e4m3>;
+        type Slab<In, Out> = m![Out / (Out / ({ kernel::Passes<Half<In>, Terms<Out>, f8e4m3> }))];
+        const { assert!(<kernel::Passes<Half<In>, Terms<Out>, f8e4m3> as M>::SIZE == 1) };
+        // SAFETY: the weight's own cells: term t of output o over a half's input q is output o
+        // over input `t * In / 2 + q`, in cluster t, and every cluster holds every scale.
+        let (codes, scales) = unsafe {
+            (
+                landed
+                    .codes
+                    .view_mut()
+                    .reshape::<m![1], m![In / (In / 2)], HalfSlices<In, Out, HalfPart<In, Out>>, m![
+                        { Slab<In, Out> },
+                        Out % ({ Block<In, Out> }),
+                        In % ({ kernel::Chunk<Half<In>, Terms<Out>, f8e4m3> })
+                    ]>(),
+                landed.scales.view_mut().reshape::<m![1], m![2], HalfSlices<
+                    In,
+                    Out,
+                    m![{ Symbol<Half<In>> } / ({ kernel::Chunk<Half<In>, Terms<Out>, f8e4m3> })],
+                >, m![{ Slab<In, Out> }, Out % ({ Block<In, Out> }), 1 # 8]>(
+                ),
+            )
+        };
+        (self.weight.borrow().view()).to_dm_view(&mut device.tdma, codes);
+        (self.scales().view()).to_dm_view(&mut device.tdma, scales);
+    }
+}
+
+/// The weight begun under [`Exchanged`]: it lands in a place of its own.
+impl<In: AxisName, Out: AxisName, K, V> Op<Begin<()>>
+    for BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], Exchanged, Chip, K, V>
+where
+    K: Borrow<HbmTensor<f8e4m3, Chip, Codes<In, Out>>>,
+    V: Borrow<HbmTensor<f32, Chip, m![Out, 1 # 8]>>,
+{
+    type Output = Landed<Half<In>, Terms<Out>>;
+
+    fn forward(&self, device: &mut Device, _: Begin<()>) -> Self::Output {
         let mut landed = Landed::default();
         self.forward(device, &mut landed);
         landed

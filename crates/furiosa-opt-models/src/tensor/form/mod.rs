@@ -130,13 +130,15 @@ impl<In: AxisName, Out: AxisName, E: Scalar, S: Scalar, B: M, C, Chips: M, W, T>
     }
 }
 
-/// The contracts of E4M3 codes with one FP32 scale per output row: none, whose inputs stay BF16, or
-/// [`fp8::Token`], whose inputs quantize per row at run time; either loads the same tensors.
+/// The contracts of E4M3 codes with one FP32 scale per output row, which load the same tensors:
+/// none or [`nvfp4::Exchanged`] (BF16 inputs), or [`fp8::Token`] (rows quantized at run time).
 pub trait Channel: Copy + Default + 'static {}
 
 impl Channel for () {}
 
 impl Channel for fp8::Token {}
+
+impl Channel for nvfp4::Exchanged {}
 
 /// E4M3 codes under a channel contract `C`, one FP32 scale per output row: its codes and scales as
 /// stored, under `weight` and `weight_scale`; in a checkpoint a load quantizes, the codes and scales

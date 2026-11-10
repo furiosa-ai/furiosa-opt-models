@@ -27,14 +27,15 @@ type Input<I, O, D, Chips> = DmTensor<D, Chips, Cluster, Slices<I, O>, m![I % (I
 type Tile<I, O, const ROWS: usize, Chips> =
     DmTensor<f8e4m3, Chips, Cluster, Slices<I, O>, m![{ Elements<O, ROWS> }, I % (I / 2)]>;
 
-/// One FP32 weight scale per output channel: a block of one output row by every input, under no
-/// contract; the codes are held as `W` and the scales as `T`.
+/// One FP32 weight scale per output channel: a block of one output row by every input, under
+/// contract `C`; the codes are held as `W` and the scales as `T`.
 pub(crate) type ChannelScaled<
     In,
     Out,
     W = HbmTensor<f8e4m3, Chip, Codes<In, Out>>,
     T = HbmTensor<f32, Chip, m![Out, 1 # 8]>,
-> = BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], (), Chip, W, T>;
+    C = (),
+> = BlockScaled<In, Out, f8e4m3, f32, m![Out, 1 # 8], C, Chip, W, T>;
 
 /// [`ChannelScaled`]'s codes and scales, against input rows that quantize at run time, each under
 /// a scale of its own, as [`Token`](crate::tensor::form::fp8::Token) states.

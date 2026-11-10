@@ -75,8 +75,8 @@ pub struct Features;
 
 /// A launch's projected rows in the output's feature slices, each cluster's partial sums over its
 /// half of the inputs exchanged and added there: rows a projection kept split over the clusters
-/// project where they lie.
-#[derive(Clone, Debug)]
+/// project where they lie. A channel-scaled weight's contract by this name reads BF16 rows.
+#[derive(Clone, Copy, Debug, Default, DeviceSend, Load)]
 pub struct Exchanged;
 
 /// The reduced FP32 sum times the tensor scales once, inputs in form `A`.

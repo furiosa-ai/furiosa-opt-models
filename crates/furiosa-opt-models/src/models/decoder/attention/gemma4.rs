@@ -183,13 +183,13 @@ axes![
 /// stores them; the query, key and value rows quantize per row at run time as it declares, and the
 /// feed-forward's FP32 sums divide by its tensor scale, so no coefficient rounds. The gate and up
 /// rows stay where their passes summed them, each cluster its half, for the activation, the
-/// product and the down projection to read there; the down projection's clusters each sum their
-/// half and exchange the partial sums.
+/// product and the down projection to read there; the output and down projections' clusters each
+/// sum their half of the inputs and exchange the partial sums.
 pub type Quantized = decoder::Projections<
     form::TokenScaled,
     form::TokenScaled,
     form::TokenScaled,
-    form::ChannelScaled,
+    form::ChannelScaled<Exchanged>,
     form::Nvfp4Summed<Kept>,
     form::Nvfp4Summed<Kept>,
     form::Nvfp4Summed<Exchanged>,
