@@ -196,14 +196,10 @@ async fn resident_q_and_kv_match_scalar_w4a16() {
     q.scales.output =
         fixtures::upload::<f32, m![1 # 8]>(&mut device.pdma, vec![f32::from_bits(1 << 19); 8])
             .await;
-    qn.scales.output = fixtures::upload::<f32, m![1 # 8]>(
-        &mut device.pdma,
-        vec![
-        f32::from_bits(1 << 19); // Exactly 2^-130.
-        8
-    ],
-    )
-    .await;
+    // Exactly 2^-130.
+    qn.scales.output =
+        fixtures::upload::<f32, m![1 # 8]>(&mut device.pdma, vec![f32::from_bits(1 << 19); 8])
+            .await;
     let large_input = fixtures::upload::<bf16, m![Rows, Hidden]>(
         &mut device.pdma,
         vec![bf16::from_f32(2.0_f32.powi(100)); Rows::SIZE * Hidden::SIZE],

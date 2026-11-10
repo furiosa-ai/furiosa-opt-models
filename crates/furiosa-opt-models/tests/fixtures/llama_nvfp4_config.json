@@ -1,15 +1,9 @@
 {
-    "architectures": [
-        "LlamaForCausalLM"
-    ],
+    "architectures": ["LlamaForCausalLM"],
     "attention_bias": false,
     "attention_dropout": 0.0,
     "bos_token_id": 128000,
-    "eos_token_id": [
-        128001,
-        128008,
-        128009
-    ],
+    "eos_token_id": [128001, 128008, 128009],
     "head_dim": 128,
     "hidden_act": "silu",
     "hidden_size": 4096,
@@ -51,14 +45,10 @@
                     "type": "float",
                     "group_size": 16
                 },
-                "targets": [
-                    "Linear"
-                ]
+                "targets": ["Linear"]
             }
         },
-        "ignore": [
-            "lm_head"
-        ],
+        "ignore": ["lm_head"],
         "quant_algo": "NVFP4",
         "kv_cache_scheme": {
             "dynamic": false,
