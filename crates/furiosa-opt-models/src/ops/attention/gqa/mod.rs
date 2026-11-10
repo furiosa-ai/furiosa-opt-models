@@ -1568,10 +1568,10 @@ where
     }
 }
 
-/// The same history attended, `boundary` running on its state once in the first pass: its work
-/// under a transfer once its first window's landing is issued, ahead of what waits for it; the
-/// rest before its last window is prepared where no next pass may land under it, else after its
-/// first window lands.
+/// The same history attended, `boundary` running on its state once: its work under a transfer in
+/// the first pass, once its first window's landing is issued, ahead of what waits for it; the rest
+/// in the first pass before its last window is prepared where no next pass may land under it, else
+/// in the last pass once its last window is prepared, where nothing follows that window.
 impl<
     'a,
     Rows: AxisName,
@@ -1711,7 +1711,7 @@ where
             (&H, &mut G),
         ),
     ) -> Self::Output {
-        // The pass that runs first takes the boundary once, the others none.
+        // The pass that takes the boundary runs it once, the others none.
         let mut once = (boundary, state);
         if const { Self::SLICE_ROWS == 32 }
             && live.count::<Lanes<Rows>>() == <RowGroups<Rows> as M>::SIZE
@@ -1990,8 +1990,8 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
 
     /// Whether a pass of `N` rows over the envelope `Rows` lands the next pass's first window: only
     /// the widest passes repeat, only in an envelope that holds two of them, and only passes whose
-    /// slices hold more than a row group, as a pass of one a slice may be a call's only pass: a
-    /// follower issues the boundary ahead of its windows, where it holds their landings back.
+    /// slices hold more than a row group, as a pass of one a slice may be a call's only pass, which
+    /// spreads its lone row instead.
     const fn follows<Rows: AxisName, const N: usize>() -> bool {
         N == Self::ROWS
             && slice_rows::<KvHeads>(N) > attention::LANES
@@ -2042,9 +2042,8 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
     }
 
     /// Attends the row groups of `count` passes over the `N`-row tiles from tile `first` and writes
-    /// their rows in `attended`; `boundary` runs `times` times in the first pass, where
-    /// [`Windowed`]'s runs. Overlapping passes share two places: each lands the next one's first
-    /// window.
+    /// their rows in `attended`; `boundary` runs `times` times in the pass where [`Windowed`]'s
+    /// runs. Overlapping passes share two places: each lands the next one's first window.
     fn passes<Rows: AxisName, Windows: AxisName, Source, Q, B, const N: usize>(
         &self,
         device: &mut Device,
@@ -2468,9 +2467,17 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                     |device: &mut Device,
                      window: Prepared<'_, Source, Rows, KvHeads, Groups, Head, SCALE, N>,
                      _: &()| scores(device, &query, window);
+                // A follower lands the next pass's first window under its last, so the boundary
+                // waits for the last pass, which lands nothing after its last window.
                 let boundary = |device: &mut Device| {
-                    for _ in 0..1 - tile.min(1) {
-                        boundary.boundary(device, times);
+                    if const { Self::follows::<Rows, N>() } {
+                        for _ in 0..1 - (count - 1 - tile).min(1) {
+                            boundary.boundary(device, times);
+                        }
+                    } else {
+                        for _ in 0..1 - tile.min(1) {
+                            boundary.boundary(device, times);
+                        }
                     }
                 };
                 // The next pass's first window, into the place of this pass's first, which its
@@ -2677,9 +2684,16 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
                                   values: &Transposed<Rows, KvHeads, Groups, Head, SCALE, N>| {
                     attends(device, &projected, registers, values)
                 };
+                // As in the streaming passes: a follower's boundary waits for the last pass.
                 let boundary = |device: &mut Device| {
-                    for _ in 0..1 - tile.min(1) {
-                        boundary.boundary(device, times);
+                    if const { Self::follows::<Rows, N>() } {
+                        for _ in 0..1 - (count - 1 - tile).min(1) {
+                            boundary.boundary(device, times);
+                        }
+                    } else {
+                        for _ in 0..1 - tile.min(1) {
+                            boundary.boundary(device, times);
+                        }
                     }
                 };
                 let places = (&mut *even, &mut *odd, &mut *values);

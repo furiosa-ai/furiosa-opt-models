@@ -422,8 +422,9 @@ pub(crate) trait Partition: Sized {
     ///
     /// `boundary` runs once, where the issue waits for a landing anyway, as a transfer issued while
     /// a window lands waits for it on both paths of a loop around it: before the last window is
-    /// prepared, once the attention before it is issued; with `FOLLOW` before the first, as what
-    /// follows may keep the transfers busy to the end.
+    /// prepared, once the attention before it is issued; with `FOLLOW` once that window is prepared,
+    /// as a prepare's page mapping waits for every transfer issued before it, and ahead of what
+    /// follows it: a caller runs it in a pass that lands nothing after.
     fn overlapped<P, V, F, Rest: AxisName, const FOLLOW: bool>(
         device: &mut Device,
         rest: usize,
@@ -495,10 +496,17 @@ pub(crate) trait Partition: Sized {
             for _ in 0..1 - rest.min(1) {
                 boundary(device);
             }
-        } else {
+        } else if const { !FOLLOW } {
             boundary(device);
         }
         let window = prepare(device, (0, even), values);
+        if const { FOLLOW && Rest::SIZE > 0 } {
+            for _ in 0..1 - rest.min(1) {
+                boundary(device);
+            }
+        } else if const { FOLLOW } {
+            boundary(device);
+        }
         if const { Rest::SIZE > 0 } {
             for _ in 0..rest.min(1) {
                 land(device, 1, odd);
@@ -517,6 +525,9 @@ pub(crate) trait Partition: Sized {
                 }
                 let window = prepare(device, (2 * pair + 1, odd), values);
                 if const { FOLLOW } {
+                    for _ in 0..1 - (after - 1).min(1) {
+                        boundary(device);
+                    }
                     follow(device, 2 * pair + 2, even);
                 } else if const { Rest::SIZE > 1 } {
                     for _ in 0..(after / 2).min(1) {
@@ -533,6 +544,11 @@ pub(crate) trait Partition: Sized {
                             }
                         }
                         let window = prepare(device, (2 * pair + 2, even), values);
+                        if const { FOLLOW } {
+                            for _ in 0..1 - (after - 2).min(1) {
+                                boundary(device);
+                            }
+                        }
                         if const { Rest::SIZE > 2 } {
                             for _ in 0..((after - 1) / 2).min(1) {
                                 land(device, 2 * pair + 3, odd);
