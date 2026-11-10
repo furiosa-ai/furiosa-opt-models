@@ -10,6 +10,7 @@ use safetensors::tensor::TensorView;
 use tokio::task;
 
 use super::{Checkpoint, Children, LoadError, Rule};
+use crate::modules::generic::collection::Interval;
 use ties::Ties;
 
 mod ties;
@@ -307,24 +308,25 @@ impl<'d> Context<'d> {
         }
     }
 
-    /// Runs `read` for each of `N` layers under its index, every HBM leaf it uploads filling its
-    /// layer of one backing; then `stack`s the layers, whose leaves [`Context::widen`] takes back
-    /// to their backings. Absent names of every layer are reported together.
-    pub fn layers<L, R, const N: usize>(
+    /// Checkpoint names use global indices; compact allocation offsets use local indices.
+    pub fn layers<L, R>(
         &mut self,
+        interval: Interval<usize>,
         mut read: impl FnMut(&mut Self) -> Result<L, LoadError>,
-        stack: impl FnOnce([L; N], &mut Self) -> R,
+        stack: impl FnOnce(Vec<L>, &mut Self) -> R,
     ) -> Result<R, LoadError> {
         assert!(self.stack.is_none(), "a stack's layer holds no stack");
         self.stack = Some(Stack {
-            count: N,
+            count: interval.count(),
             layer: 0,
             backings: BTreeMap::new(),
         });
         let mut children = Children::default();
-        let built = (0..N)
-            .map(|layer| {
-                self.stack.as_mut().expect("set above").layer = layer;
+        let built = interval
+            .range()
+            .enumerate()
+            .map(|(local, layer)| {
+                self.stack.as_mut().expect("set above").layer = local;
                 self.cursor.path.push(layer.to_string());
                 let loaded = read(self);
                 self.cursor.path.pop();
@@ -333,24 +335,9 @@ impl<'d> Context<'d> {
             .collect::<Result<Vec<_>, _>>();
         let stacked = built
             .and_then(|built| children.node(built.into_iter().collect::<Option<Vec<L>>>()))
-            .map(|built| stack(built.try_into().ok().expect("one layer per index"), self));
+            .map(|built| stack(built, self));
         self.stack = None;
         stacked
-    }
-
-    /// The backing whose first layer `buffer` holds, as a stacking traversal filled it.
-    pub(crate) fn widen(&mut self, buffer: HbmBuffer) -> HbmBuffer {
-        let backings = &mut self
-            .stack
-            .as_mut()
-            .expect("a stack widens its layers")
-            .backings;
-        let path = backings
-            .iter()
-            .find(|(_, backing)| backing.addr() == buffer.addr())
-            .map(|(path, _)| path.clone())
-            .expect("a stacked leaf is the first layer of its backing");
-        backings.remove(&path).expect("found above")
     }
 
     /// `host` in HBM as the leaf at the current position: a new allocation, or in a stack the

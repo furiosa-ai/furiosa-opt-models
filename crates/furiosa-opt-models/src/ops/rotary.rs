@@ -1361,13 +1361,13 @@ impl<Head: AxisName, Rotated: AxisName, D: Scalar, Chips: M, const N: usize> Vie
     for Rotary<Head, Rotated, D, Chips>
 {
     type Storage = ();
-    type Layer = Self;
+    type Layer<'a> = Self;
 
-    fn view(_: &(), _: usize) -> Self {
+    fn view<'a>(_: &'a (), _: usize) -> Self {
         Self::new()
     }
 
-    fn stack(_: [Self; N], _: &mut Context<'_>) {}
+    fn stack(_: Vec<Self>, _: &mut Context<'_>) {}
 }
 
 /// Each of `Rows` rows' rotation over the rotated dimensions: `[cos | sin]` for the first input
@@ -1766,6 +1766,18 @@ impl<Head: AxisName, Q: AxisName, K: AxisName>
 pub struct SplitHalf<Head: AxisName, Frequency = HbmTensor<f32, m![1], m![Head / 2]>> {
     pub frequency: Frequency,
     pub head: PhantomData<Head>,
+}
+
+impl<'a, H: AxisName, F, B> Load<&'a SplitHalf<H, B>> for SplitHalf<H, F>
+where
+    F: Load<&'a B>,
+{
+    fn load(context: &mut Context<'_>, from: &'a SplitHalf<H, B>) -> Result<Self, LoadError> {
+        Ok(Self {
+            frequency: F::load(context, &from.frequency)?,
+            head: PhantomData,
+        })
+    }
 }
 
 impl<D: Scalar, Head: AxisName, Q: AxisName, K: AxisName, R: AxisName>

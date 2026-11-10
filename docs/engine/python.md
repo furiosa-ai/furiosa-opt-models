@@ -73,23 +73,26 @@ transfer.wait()
 ## Run requests with LoRA adapters
 
 A decoder whose projections take LoRA adapters describes them as `decoder.adapters`, an `engine.decoder.AdapterSpec`, and any other decoder as `None`; a load for adapters, `engine.LoadOptions().adapters()`, refuses any other one from its config.
-An `Adapter` is a PEFT checkpoint loaded onto the decoder's device, and a call takes a list of adapters that each request names one of by its index:
+A `HostAdapter` is a PEFT checkpoint built on host, an `Adapter` is device storage for one, and a call takes a list of adapters that each request names one of by its index:
 
 ```python
 import json
 
 spec = decoder.adapters
 config = json.loads(open("/path/to/adapter/adapter_config.json").read())
-adapter = engine.decoder.Adapter(spec, engine.Checkpoint("/path/to/adapter", config))  # (1)!
+host = engine.decoder.HostAdapter(spec, engine.Checkpoint("/path/to/adapter", config))  # (1)!
+adapter = engine.decoder.Adapter(spec)
+adapter.load(host)  # (3)!
 request = engine.decoder.Request([[0]], 0, prompt, adapter=0)  # (2)!
 token = decoder.forward([request], cache, [adapter])
 ```
 
-1. The directory holds `adapter_model.safetensors`, opened with its `adapter_config.json` as its config; an adapter of a rank above `AdapterSpec.RANK`, or of a module other than an attention or MLP projection, raises when it loads, before any factor reaches the device.
+1. The directory holds `adapter_model.safetensors`, opened with its `adapter_config.json` as its config; an adapter of a rank above `AdapterSpec.RANK`, or of a module other than an attention or MLP projection, raises when it is built, before any factor reaches the device.
 2. The request runs with the adapter at index 0 of the list; one with `adapter=None` runs the base model alone.
+3. `load` writes the whole host adapter into the storage `Adapter(spec)` allocated, under the lock `forward` takes, so a call submitted before it reads the previous adapter and one submitted after it reads this one.
 
 A list holds at most `AdapterSpec.SLOTS` adapters, and each costs its updates on every row of the call.
-An adapter never changes: a call reads it where it lies, so putting it in a slot copies nothing, and an adapter can leave its slot and return to any slot later.
+A call reads an adapter where it lies, so putting it in a slot copies nothing, and an adapter can leave its slot and return to any slot later. Loading another host adapter into it reuses its storage, so a framework can keep a fixed set of adapters on the device and many more on host.
 
 ## Errors and limits
 

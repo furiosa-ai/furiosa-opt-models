@@ -15,6 +15,7 @@ __all__ = [
     "Cache",
     "CacheSpec",
     "Group",
+    "HostAdapter",
     "Keep",
     "Kind",
     "Output",
@@ -25,29 +26,34 @@ __all__ = [
 @typing.final
 class Adapter:
     r"""
-    A PEFT LoRA checkpoint loaded onto a decoder's device as its adapter tree: each adapted
-    module's `lora_A` and `lora_B`, the scale folded in. Nothing changes it, so a call reads it in
-    place; a framework makes it active by putting it in a slot of the list a call takes.
+    A decoder's adapter tree in HBM, which a call lists: `Adapter(spec)` allocates it with every
+    term zero, and `load` writes a host adapter into its storage. A call reads it where it lies, so
+    a framework makes it active by putting it in a slot of the list a call takes.
     """
-    def __new__(cls, spec: AdapterSpec, checkpoint: engine.Checkpoint) -> Adapter:
+    def __new__(cls, spec: AdapterSpec) -> Adapter:
         r"""
-        Load `checkpoint`, a PEFT LoRA checkpoint opened with its `adapter_config.json` as its
-        config, as an adapter of the decoder `spec` describes.
+        Allocate an adapter of the decoder `spec` describes on its device, which updates no row.
 
         Raises:
-            ValueError: A factor is missing, malformed or of another shape, or the checkpoint
-                holds a tensor no adapted module reads.
-            NotImplementedError: The configuration asks for an update a term does not hold, such as
-                DoRA, a bias or a rank past `AdapterSpec.RANK`.
-            RuntimeError: The device fails.
+            RuntimeError: The device fails or has no room for it.
+        """
+    def load(self, host: HostAdapter) -> None:
+        r"""
+        Write `host` into this adapter's storage, every term, holding the device while it writes:
+        a call submitted before reads the adapter it held, and one submitted after reads `host`.
+
+        Raises:
+            ValueError: `host` was built for another model, before anything is written.
+            RuntimeError: The device fails; the adapter may hold part of `host`, so a framework
+                stops serving it.
         """
 
 @typing.final
 class AdapterSpec:
     r"""
     The LoRA adapters a loaded decoder's calls run their requests with: `RANK`, the rank every
-    update holds, and `SLOTS`, the adapters one call runs with. `Adapter(spec, checkpoint)` loads
-    one onto the decoder's device.
+    update holds, and `SLOTS`, the adapters one call runs with. `HostAdapter(spec, checkpoint)`
+    builds one on host and `Adapter(spec)` allocates one on the decoder's device.
     """
 
     RANK: builtins.int = 32
@@ -131,6 +137,24 @@ class Group:
     def window(self) -> builtins.int | None:
         r"""
         Positions a row attends back to in a sliding window; `None` attends the whole history.
+        """
+
+@typing.final
+class HostAdapter:
+    r"""
+    A PEFT LoRA checkpoint built on host as a decoder's adapter tree: each adapted module's
+    `lora_A` and `lora_B`, the scale folded in, the rank zero-padded. It holds no device.
+    """
+    def __new__(cls, spec: AdapterSpec, checkpoint: engine.Checkpoint) -> HostAdapter:
+        r"""
+        Build `checkpoint`, a PEFT LoRA checkpoint opened with its `adapter_config.json` as its
+        config, as an adapter of the decoder `spec` describes; no device is touched.
+
+        Raises:
+            ValueError: A factor is missing, malformed or of another shape, or the checkpoint
+                holds a tensor no adapted module reads.
+            NotImplementedError: The configuration asks for an update a term does not hold, such as
+                DoRA, a bias or a rank past `AdapterSpec.RANK`.
         """
 
 @typing_extensions.disjoint_base

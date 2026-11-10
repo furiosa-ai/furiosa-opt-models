@@ -114,11 +114,14 @@ type Sums<Rows> = DmTensor<f32, m![1], Cluster, m![256], m![Rows, 1 # 8]>;
 
 /// Column `c` of each row is the row's dot product with weight row `c`, plus bias `c` when the bias
 /// is not empty, in FP32; columns past the weight rows are left as they were.
-impl<X: MaterializableScalar + FetchCast<f32>, In: AxisName, Rows: AxisName>
+impl<X: MaterializableScalar + FetchCast<f32>, In: AxisName, Rows: AxisName, W, B>
     Op<(
         &HbmTensor<X, m![1], m![Rows, In]>,
         &mut HbmTensor<f32, m![1], m![Rows, Columns]>,
-    )> for Affine<Weights<In>, Bias>
+    )> for Affine<W, B>
+where
+    W: std::borrow::Borrow<Weights<In>>,
+    B: std::borrow::Borrow<Bias>,
 {
     type Output = ();
 
@@ -131,6 +134,8 @@ impl<X: MaterializableScalar + FetchCast<f32>, In: AxisName, Rows: AxisName>
         ),
     ) {
         type Chunk<In> = Symbol<normalization::Chunk<In>>;
+        let weight = self.weight.borrow();
+        let bias = self.bias.borrow();
         let input: DmTensor<X, m![1], Cluster, FeatureSlices<In>, m![Rows, In % ({ Chunk<In> })]> =
             input.to_dm(&mut device.tdma);
         let store = |device: &mut Device,
@@ -143,14 +148,14 @@ impl<X: MaterializableScalar + FetchCast<f32>, In: AxisName, Rows: AxisName>
             padded.view().to_hbm_view(&mut device.tdma, column);
         };
         for index in 0..COLUMNS {
-            if index < self.weight.len() {
+            if index < weight.len() {
                 let weight: DmTensor<
                     f32,
                     m![1],
                     Cluster,
                     FeatureSlices<In>,
                     m![In % ({ Chunk<In> })],
-                > = self.weight[index].to_dm(&mut device.tdma);
+                > = weight[index].to_dm(&mut device.tdma);
                 let weight: VrfTensor<
                     f32,
                     m![1],
@@ -189,9 +194,9 @@ impl<X: MaterializableScalar + FetchCast<f32>, In: AxisName, Rows: AxisName>
                 let column = output
                     .view_mut()
                     .tile::<m![Columns], 1, Column<Rows>>(index);
-                if index < self.bias.len() {
+                if index < bias.len() {
                     // SAFETY: a bias row holds its value at element zero and zeros after it.
-                    let bias = unsafe { self.bias[index].view().reshape::<m![1], m![1 # 4]>() };
+                    let bias = unsafe { bias[index].view().reshape::<m![1], m![1 # 4]>() };
                     let bias: DmTensor<f32, m![1], Cluster, m![256], m![1 # 8]> =
                         bias.to_dm(&mut device.tdma);
                     let bias: VrfTensor<f32, m![1], Cluster, m![256], m![1 # 8]> = device

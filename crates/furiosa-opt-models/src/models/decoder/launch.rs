@@ -118,22 +118,39 @@ pub type Operands<S> = key_value::Operands<
 >;
 
 /// The rotation of a launch's rows, gathered from the positions' table it loads from the config.
-type Position<S> = SplitHalf<Head, Table<Positions<S>, rotary::Row<Head>>>;
 
 /// The base model over the body `B`, with the rotary table its launches gather their rows'
 /// rotation from.
 // The decoder tree's `Model` is named by its path: this module's `Model` is the catalog's.
-pub type Over<S, B, P> = crate::models::decoder::attention::Model<S, B, Position<S>, P>;
+pub type Over<S, B, P, F = Table<Positions<S>, rotary::Row<Head>>> =
+    crate::models::decoder::attention::Model<S, B, SplitHalf<Head, F>, P>;
 
 /// The catalog's base model of size `S` in form `P`.
-pub type Base<S, P> = Over<S, CatalogBody<S, P, bf16, Hbm>, P>;
+pub type Base<
+    S,
+    P,
+    X = Hbm,
+    K = crate::modules::generic::collection::Stack,
+    F = Table<Positions<S>, rotary::Row<Head>>,
+> = Over<S, CatalogBody<S, P, bf16, X, K>, P, F>;
 
 /// The catalog's causal model of size `S` in form `P`: the base model and the greedy head.
-pub type Model<S, P> = ForCausalLM<S, Base<S, P>, LmHead<S, Hbm>, P>;
+pub type Model<
+    S,
+    P,
+    X = Hbm,
+    K = crate::modules::generic::collection::Stack,
+    F = Table<Positions<S>, rotary::Row<Head>>,
+> = ForCausalLM<S, Base<S, P, X, K, F>, LmHead<S, X>, P>;
 
 /// The catalog's sequence classifier of size `S` in form `P`: the base model and its score head.
-pub type Classifier<S, P> =
-    ForSequenceClassification<S, Base<S, P>, language::Classifier<Hidden<S>>, P>;
+pub type Classifier<
+    S,
+    P,
+    X = Hbm,
+    K = crate::modules::generic::collection::Stack,
+    F = Table<Positions<S>, rotary::Row<Head>>,
+> = ForSequenceClassification<S, Base<S, P, X, K, F>, language::Classifier<Hidden<S>>, P>;
 
 /// The slots of an attention's front: its projections', then its norms'; none holds anything.
 type Front = (((), (), ()), (), ());

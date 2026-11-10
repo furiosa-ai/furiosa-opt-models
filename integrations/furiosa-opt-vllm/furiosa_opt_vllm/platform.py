@@ -4,6 +4,7 @@ does not serve."""
 from __future__ import annotations
 
 import os
+from contextlib import suppress
 from typing import TYPE_CHECKING, final
 
 import torch
@@ -16,11 +17,11 @@ from furiosa_opt_vllm.admission import (
     CONTRACTS,
     Refused,
     adapters,
-    offload,
     options,
     speculative,
     verify_checkpoint,
 )
+from furiosa_opt_vllm.transfer import CONNECTOR, CONNECTOR_MODULE, offload
 
 if TYPE_CHECKING:
     from vllm.config import CacheConfig, ModelConfig, VllmConfig
@@ -34,7 +35,8 @@ if TYPE_CHECKING:
 
 @final
 class FuriosaPlatform(Platform):
-    """vLLM platform for RNGD: host tensors, the plugin worker and no attention backend."""
+    """vLLM platform for RNGD: host tensors, the plugin worker and an attention backend that only
+    names the engine's cache pages."""
 
     _enum: PlatformEnum = PlatformEnum.OOT
     # vLLM's process groups place their tensors on this torch device; framework tensors are on
@@ -50,9 +52,14 @@ class FuriosaPlatform(Platform):
     @classmethod
     @override
     def pre_register_and_update(cls, parser: FlexibleArgumentParser | None = None) -> None:
+        from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
         from vllm.model_executor.models import ModelRegistry
 
         ModelRegistry.register_model("BambaForCausalLM", "furiosa_opt_vllm.recurrent:Bamba")
+        # vLLM's MultiConnector finds a connector's stats class by its registered name when its
+        # stats arrive serialized; vLLM calls this hook again for each config it creates.
+        with suppress(ValueError):
+            KVConnectorFactory.register_connector(CONNECTOR, CONNECTOR_MODULE, CONNECTOR)
 
     @classmethod
     @override
@@ -126,9 +133,14 @@ class FuriosaPlatform(Platform):
         attn_selector_config: AttentionSelectorConfig,
         num_heads: int | None = None,
     ) -> str:
-        raise NotImplementedError(
-            "furiosa-opt-vllm runs attention inside the extension, so vLLM selects no backend"
-        )
+        # The engine runs attention; vLLM's NIXL connectors read the backend's name.
+        return "furiosa_opt_vllm.connector.Attention"
+
+    @classmethod
+    @override
+    def get_nixl_supported_devices(cls) -> dict[str, tuple[str, ...]]:
+        # NIXL stages blocks in host buffers, between which and the device the runner copies them.
+        return {cls.device_type: ("cpu",)}
 
     @classmethod
     @override

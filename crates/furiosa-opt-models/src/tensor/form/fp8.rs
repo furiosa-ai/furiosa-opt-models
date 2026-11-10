@@ -19,6 +19,9 @@ use safetensors::Dtype;
 use crate::load::{Checkpoint, Children, Context, Load, LoadError};
 use crate::tensor::parallel::Chip;
 
+pub use rows::{Rows, Squares};
+mod rows;
+
 // The inputs of one quantization group, apart from the group they belong to.
 axes![Group = 128];
 
@@ -44,113 +47,6 @@ pub struct Blocks<In>(PhantomData<In>);
 impl<In: AxisName> AxisName for Blocks<In> {
     const NAME: Ident = Ident::new("Blocks");
     const SIZE: usize = (In::SIZE / (2 * GROUP)).next_multiple_of(2);
-}
-
-/// A block-scaled E4M3 projection of `In` inputs and `Out` outputs in its row-scaled device form:
-/// its codes `W`, each row's block scales folded under its largest ([`folded`]), and those row
-/// scales `S`. A form without row scales (`S = ()`) holds each row's scale in its codes, exactly.
-#[derive(DeviceSend)]
-pub struct Rows<In, Out, W, S = ()>(pub W, pub S, PhantomData<fn() -> (In, Out)>);
-
-impl<In, Out, W, S> Rows<In, Out, W, S> {
-    pub fn new(codes: W, scales: S) -> Self {
-        Self(codes, scales, PhantomData)
-    }
-}
-
-impl<In: M + 'static, Out: M + 'static, W, S> Rows<In, Out, W, S>
-where
-    W: Load<HostTensor<f8e4m3, m![{ Chip }, { m![{ Out }, { In }] }]>>,
-{
-    /// The codes `W` of `codes` on every chip, and `scales` made into `S`.
-    fn place(
-        codes: Vec<f8e4m3>,
-        scales: impl FnOnce(&mut Context<'_>) -> Result<S, LoadError>,
-        context: &mut Context<'_>,
-    ) -> Result<Self, LoadError> {
-        let codes = HostTensor::from_vec(codes.repeat(Chip::SIZE));
-        Ok(Self::new(
-            context.field("0", "", |cx| W::load(cx, codes))?,
-            context.field("1", "", scales)?,
-        ))
-    }
-}
-
-/// The codes at the context's name with each row's scale folded in, refused unless every code
-/// times its row's scale is an E4M3 value.
-impl<'a, In: M + 'static, Out: M + 'static, W> Load<&'a Checkpoint> for Rows<In, Out, W, ()>
-where
-    W: Load<HostTensor<f8e4m3, m![{ Chip }, { m![{ Out }, { In }] }]>>,
-{
-    fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
-        let (codes, rows) = folded::<In, Out>(from, context)?;
-        let exact = |(index, code): (usize, f8e4m3)| {
-            let value = f64::from(code.to_f32()) * f64::from(rows[index / In::SIZE]);
-            let folded = f8e4m3::from_f32(value as f32);
-            (f64::from(folded.to_f32()) == value).then_some(folded)
-        };
-        let codes = codes
-            .into_iter()
-            .enumerate()
-            .map(exact)
-            .collect::<Option<Vec<_>>>();
-        let codes = codes.ok_or_else(|| LoadError::InvalidData {
-            name: context.name(),
-            reason: "a row's block scale does not fold into its E4M3 codes exactly, and the \
-                form holds no row scales"
-                .into(),
-        })?;
-        Self::place(codes, |_| Ok(()), context)
-    }
-}
-
-/// The codes at the context's name and their FP32 row scales.
-impl<'a, In: M + 'static, Out: M + 'static, W, L: M + 'static> Load<&'a Checkpoint>
-    for Rows<In, Out, W, HbmTensor<f32, Chip, L>>
-where
-    W: Load<HostTensor<f8e4m3, m![{ Chip }, { m![{ Out }, { In }] }]>>,
-{
-    fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
-        let (codes, rows) = folded::<In, Out>(from, context)?;
-        let rows = HostTensor::<f32, m![{ Chip }, { Out }]>::from_vec(rows.repeat(Chip::SIZE));
-        Self::place(codes, |cx| Load::load(cx, rows), context)
-    }
-}
-
-/// Each head's squared row scale `s²`, `K` copies of it, for a projection whose rows of one head
-/// share one row scale: a head norm of the rows its codes give restores its epsilon from it.
-#[derive(DeviceSend)]
-pub struct Squares<T>(pub T);
-
-/// The codes at the context's name and each head's squared row scale; a head whose rows hold
-/// different scales is refused.
-impl<'a, In: M + 'static, Heads: AxisName, Head: AxisName, W, K: M + 'static> Load<&'a Checkpoint>
-    for Rows<In, m![Heads, Head], W, Squares<HbmTensor<f32, Chip, m![Heads, { K }]>>>
-where
-    W: Load<HostTensor<f8e4m3, m![{ Chip }, { m![{ m![Heads, Head] }, { In }] }]>>,
-{
-    fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
-        let (codes, rows) = folded::<In, m![Heads, Head]>(from, context)?;
-        let squares = rows
-            .chunks_exact(Head::SIZE)
-            .map(|head| (head.iter().all(|&row| row == head[0])).then_some(head[0] * head[0]))
-            .collect::<Option<Vec<f32>>>()
-            .ok_or_else(|| LoadError::InvalidData {
-                name: context.name(),
-                reason: "the rows of a head hold different block scales".into(),
-            })?;
-        let squares = squares
-            .iter()
-            .flat_map(|&square| std::iter::repeat_n(square, K::SIZE))
-            .collect::<Vec<_>>()
-            .repeat(Chip::SIZE);
-        let squares = HostTensor::<f32, m![{ Chip }, { m![Heads, { K }] }]>::from_vec(squares);
-        Self::place(
-            codes,
-            |cx| Ok(Squares(cx.field("0", "", |cx| Load::load(cx, squares))?)),
-            context,
-        )
-    }
 }
 
 /// A weight scale's spellings, canonical first: both multiply the E4M3 weight.

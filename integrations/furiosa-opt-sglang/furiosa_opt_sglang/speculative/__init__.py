@@ -158,8 +158,14 @@ class Worker(BaseSpecWorker):
                 # A verification reads its tokens back to the host; no row keeps a device-selected
                 # one.
                 runner.selected.clear()
+                # Drafts are verified with each request's LoRA adapter; proposers run none.
                 for rows, output in sequence.forward(
-                    runner, batch, Batch(chains, tuple(cached)), every=True, feed={}
+                    runner,
+                    batch,
+                    Batch(chains, tuple(cached)),
+                    adapters=runner.bound(batch),
+                    every=True,
+                    feed={},
                 ):
                     for (request, offset), token in zip(
                         rows, output.to_host().numpy()[: len(rows)], strict=True

@@ -8,6 +8,7 @@ are free before the next module's tests start.
 from __future__ import annotations
 
 import gc
+import math
 import os
 import socket
 import subprocess
@@ -16,7 +17,16 @@ import urllib.request
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from signal import SIGKILL, SIGTERM
-from typing import TYPE_CHECKING, Final, Literal, NamedTuple, NotRequired, Required, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    ClassVar,
+    Final,
+    Literal,
+    NamedTuple,
+    NotRequired,
+    Required,
+    TypeVar,
+)
 
 import pytest
 from pydantic import ConfigDict, JsonValue, TypeAdapter, ValidationError, with_config
@@ -28,7 +38,7 @@ from vllm.config.cache import CacheDType
 from vllm.config.model import ConvertOption, ModelDType, RunnerOption
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Generator, Mapping
     from http.client import HTTPResponse
 
     import torch
@@ -187,9 +197,13 @@ def server(
 
 
 @contextmanager
-def serve(arguments: list[str], tmp_path_factory: pytest.TempPathFactory) -> Generator[str]:
-    """The URL of `vllm serve` with `arguments`, until it and every process it started exited, so
-    that a server started next finds the chips free."""
+def serve(
+    arguments: list[str],
+    tmp_path_factory: pytest.TempPathFactory,
+    env: Mapping[str, str] | None = None,
+) -> Generator[str]:
+    """The URL of `vllm serve` with `arguments` and `env` over this process's environment, until
+    it and every process it started exited, so that a server started next finds the chips free."""
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port: int = probe.getsockname()[1]
@@ -200,6 +214,7 @@ def serve(arguments: list[str], tmp_path_factory: pytest.TempPathFactory) -> Gen
             ["vllm", "serve", *arguments, "--port", str(port)],
             stdout=output,
             stderr=subprocess.STDOUT,
+            env=os.environ | dict(env or {}),
             process_group=0,
         )
     url = f"http://127.0.0.1:{port}"
@@ -250,11 +265,15 @@ def stop(process: subprocess.Popen[bytes], timeout: float) -> None:
     raise TimeoutError(f"processes of group {process.pid} outlived SIGKILL by {timeout} s")
 
 
-def post(url: str, request: BaseModel, reply: type[Reply]) -> Reply:
-    """The server's answer to `request` posted to `url`, parsed as vLLM's `reply`."""
+def post(
+    url: str, request: BaseModel, reply: type[Reply], *, headers: Mapping[str, str] | None = None
+) -> Reply:
+    """The server's answer to `request` posted to `url` with `headers`, parsed as vLLM's
+    `reply`."""
     body = request.model_dump_json(exclude_unset=True).encode()
+    sent = {"Content-Type": "application/json", **(headers or {})}
     response: HTTPResponse = urllib.request.urlopen(
-        urllib.request.Request(url, body, {"Content-Type": "application/json"}), timeout=300
+        urllib.request.Request(url, body, sent), timeout=300
     )
     with response:
         return reply.model_validate_json(response.read())
@@ -294,3 +313,116 @@ def platform_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("NUMBA_NUM_THREADS", current or "1")
     if current is None:
         monkeypatch.delenv("NUMBA_NUM_THREADS")
+
+
+class Greedy:
+    """Transformers' greedy decoding of the checkpoints a session's checks read, in FP32.
+
+    A token is greedy when its probability given the tokens before it is at least `TIE` of the top
+    one's, which allows for the engine's BF16 rounding tying the top two; a BF16 reference could
+    not tell such a tie, as its scores past 8 are 1/16 apart, farther than `TIE` allows. The engine
+    computes a token through other calls than Transformers, so a continuation may part from
+    Transformers' at such a tie and is checked on its own prefix, token by token."""
+
+    TIE: ClassVar[float] = 0.95
+
+    def __init__(self) -> None:
+        self.models: dict[str, PreTrainedModel] = {}
+
+    def model(self, name: str) -> PreTrainedModel:
+        """Transformers' FP32 model of checkpoint `name`, loaded once a session."""
+        import torch
+        from transformers import AutoModelForCausalLM
+
+        if name not in self.models:
+            self.models[name] = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32)
+        return self.models[name]
+
+    def scores(self, name: str, tokens: list[int]) -> torch.Tensor:
+        """`name`'s scores after each of `tokens`, one forward of them all."""
+        import torch
+
+        with torch.inference_mode():
+            return self.model(name)(torch.tensor([tokens])).logits[0].float()
+
+    def far(self, scores: torch.Tensor, tokens: list[int]) -> list[tuple[int, int, float]]:
+        """Each of `tokens` that is no greedy token of its row of `scores`, with its position and
+        its probability as a share of the row's top one: not finite, or below `TIE`."""
+        import torch
+
+        chosen = scores.gather(1, torch.tensor(tokens)[:, None])[:, 0]
+        ratios: list[float] = (chosen - scores.max(dim=-1).values).exp().tolist()
+        return [
+            (at, token, ratio)
+            for at, (token, ratio) in enumerate(zip(tokens, ratios, strict=True))
+            if not (math.isfinite(ratio) and ratio >= self.TIE)
+        ]
+
+    def check(self, scores: torch.Tensor, tokens: list[int]) -> None:
+        """Each of `tokens` is a greedy token of its row of `scores`: finite, at least `TIE` of the
+        row's top probability."""
+        import torch
+
+        chosen = scores.gather(1, torch.tensor(tokens)[:, None])[:, 0]
+        least = min((chosen - scores.max(dim=-1).values).exp().tolist(), default=1.0)
+        ties = sum(token != int(row.argmax()) for token, row in zip(tokens, scores, strict=True))
+        print(f"GREEDY {len(tokens)} tokens, {ties} at a tie, least ratio {least:.3f}")
+        far = self.far(scores, tokens)
+        assert not far, far
+
+    def drafts(self, name: str, prefix: list[int], tokens: list[int]) -> None:
+        """Each of `tokens` is a greedy token of `name` after `prefix` and the tokens before it."""
+        start = len(prefix) - 1
+        self.check(self.scores(name, prefix + tokens)[start : start + len(tokens)], tokens)
+
+    def continuation(self, name: str, prompt: list[int], tokens: list[int], length: int) -> None:
+        """`tokens` are greedy decoding of `prompt` by `name`: each a greedy token, ending at the
+        first end-of-sequence token, vLLM's only stop token without a generation config, or after
+        `length` tokens."""
+        from transformers import AutoTokenizer
+
+        self.drafts(name, prompt, tokens)
+        stop = AutoTokenizer.from_pretrained(name).eos_token_id
+        ends = [at for at, token in enumerate(tokens) if token == stop]
+        expected = min(length, ends[0] + 1) if ends else length
+        assert len(tokens) == expected, (len(tokens), ends, length)
+
+
+@pytest.fixture(scope="session")
+def greedy() -> Greedy:
+    """One Transformers model of each target a session's checks read."""
+    return Greedy()
+
+
+@pytest.fixture(scope="module")
+def adapters(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
+    """PEFT checkpoints of Qwen3-0.6B saved by PEFT: of rank 32, the adapter terms' rank, on every
+    attention and MLP projection, of rank 8 under rsLoRA on the attention projections, and of rank
+    4 on the query and output projections, whose larger scale keeps its update as large as the
+    others' on fewer modules.
+
+    Each factor is `0.02 * N(0, 1)`: its update changes the greedy tokens, while a much larger one
+    flattens the scores until BF16 rounding picks the token.
+    """
+    import torch
+    from peft import LoraConfig, get_peft_model
+    from transformers import AutoModelForCausalLM
+
+    attention = ["q_proj", "k_proj", "v_proj", "o_proj"]
+    mlp = ["gate_proj", "up_proj", "down_proj"]
+    directory = tmp_path_factory.mktemp("adapters")
+    forms = {
+        # An update grows as alpha / r times sqrt(r): alpha 45 at rank 32 keeps rank 16's size.
+        "full": LoraConfig(r=32, lora_alpha=45, target_modules=attention + mlp),
+        "rslora": LoraConfig(r=8, lora_alpha=16, use_rslora=True, target_modules=attention),
+        "partial": LoraConfig(r=4, lora_alpha=32, target_modules=["q_proj", "o_proj"]),
+    }
+    for seed, (name, config) in enumerate(forms.items()):
+        model = get_peft_model(AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B"), config)
+        generator = torch.Generator().manual_seed(seed)
+        with torch.no_grad():
+            for parameter, value in model.named_parameters():
+                if ".lora_" in parameter:
+                    _ = value.copy_(0.02 * torch.randn(value.shape, generator=generator))
+        model.save_pretrained(str(directory / name))
+    return {name: directory / name for name in forms}

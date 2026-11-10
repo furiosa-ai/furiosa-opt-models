@@ -139,7 +139,8 @@ def greedy(params: SamplingParams) -> bool:
         and not params.bad_words
         and params.structured_outputs is None
         and params.trace_decode_token_ids is None
-        and not params.extra_args
+        # vLLM passes a request's KV connector parameters among its extra arguments.
+        and set(params.extra_args or ()) <= {"kv_transfer_params"}
     )
 
 

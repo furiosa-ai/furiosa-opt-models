@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::tensor::form::fp8::Rows;
+use crate::tensor::memory::{Hbm, Memory};
 pub(crate) use to_dm::ToDm;
 
 mod contract;
@@ -65,12 +66,12 @@ type Channels<Hidden, QWidth> =
 axes![Replicas = 16];
 
 pub type Blocked<Hidden, QWidth> = m![QWidth / 128, Hidden, QWidth % 128];
-pub type Stored<Hidden, QWidth> = Affine<
+pub type Stored<Hidden, QWidth, X = Hbm> = Affine<
     Rows<
         m![QWidth],
         m![Hidden],
-        HbmTensor<f8e4m3, Chip, Blocked<Hidden, QWidth>>,
-        HbmTensor<f32, Chip, m![Hidden]>,
+        <X as Memory>::Tensor<f8e4m3, Chip, Blocked<Hidden, QWidth>>,
+        <X as Memory>::Tensor<f32, Chip, m![Hidden]>,
     >,
     (),
 >;

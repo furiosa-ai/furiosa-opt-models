@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
+    from furiosa_opt_sglang.lora import Binding
     from furiosa_opt_sglang.runner import Runner
 
     # One engine call's output rows, with the (request, row) pair each holds.
@@ -95,9 +96,10 @@ class Token:
 
 @final
 class Sampled(GenerationBatchResult):
-    """A greedy step whose tokens stay on the device until SGLang processes the step."""
+    """A greedy step whose tokens stay on the device until SGLang processes the step, and the LoRA
+    adapters its calls read, which an unload meanwhile leaves on the device."""
 
-    def __init__(self, calls: tuple[Output, ...], size: int) -> None:
+    def __init__(self, calls: tuple[Output, ...], size: int, adapters: Binding) -> None:
         # SGLang copies and relays these zeros before it processes the step; the decode rows that
         # follow take the device's tokens instead.
         super().__init__(
@@ -107,6 +109,7 @@ class Sampled(GenerationBatchResult):
         )
         self.size = size
         self.calls = calls
+        self.adapters = adapters
 
     def collect(self) -> None:
         """Replace the step's tokens in the result SGLang is about to process, once."""
@@ -153,11 +156,14 @@ def issue(runner: Runner, model: Model, batch: ScheduleBatch, *, overlap: bool) 
         for i, request in enumerate(batch.reqs)
         if (decode or request in running) and (token := selected.get(slots[i])) is not None
     }
-    outputs = sequence.forward(runner, batch, schedule.inputs, every=schedule.logprob, feed=feed)
+    adapters = runner.bound(batch)
+    outputs = sequence.forward(
+        runner, batch, schedule.inputs, adapters=adapters, every=schedule.logprob, feed=feed
+    )
     calls = tuple((kept, tokens) for kept, tokens in outputs if kept)
     for kept, tokens in calls:
         selected.update((slots[i], Token(tokens, row)) for row, (i, _) in enumerate(kept))
-    result = Sampled(calls, len(slots))
+    result = Sampled(calls, len(slots), adapters)
     issued.append(result)
     return result
 

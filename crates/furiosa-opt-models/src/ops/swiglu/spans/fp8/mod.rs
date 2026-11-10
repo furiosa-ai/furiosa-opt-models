@@ -10,11 +10,15 @@ use crate::ops::pointwise::add::Add;
 use crate::ops::swiglu::Mlp;
 use crate::tensor::form::{Projections, fp8};
 use crate::tensor::mapping;
+use crate::tensor::memory::{Hbm, Memory};
 use activation::*;
 use contract::*;
 use input::*;
 use spread::*;
+use std::borrow::Borrow;
 use transfer::*;
+
+pub use weights::{DownWeights, GateUpWeights, QuantizedMlp};
 
 mod activation;
 mod compute;
@@ -23,6 +27,7 @@ mod down;
 mod input;
 mod spread;
 mod transfer;
+mod weights;
 
 const WAVE: usize = 256;
 axes![Copies = 32, Side = 2, Panels = 3];
@@ -104,104 +109,7 @@ pub type Stored<H, I> = m![
 type StoredPanel<H, I> = m![{ Out<I> } / 64 = 1 # ({ Out<I> } / 64), { Cluster<I> },
     H / (H / 8), { Blocks<I> }, H % (H / 8), I % 64];
 pub type Blocked<H, I> = m![Term, H / 1024, I / (I / 64), H % 1024 / 128, { Out<I> }, H % 128];
-/// The packed gate/up weights, E4M3 blocks of 128 inputs, and their FP32 channel scales.
-pub type GateUpWeights<H, I> = (
-    HbmTensor<f8e4m3, Chip, Blocked<H, I>>,
-    HbmTensor<f32, Chip, m![Term, I]>,
-);
-/// The down weights, E4M3 panels of 64 inputs, and their FP32 channel scales.
-pub type DownWeights<H, I> = (
-    HbmTensor<f8e4m3, Chip, Stored<H, I>>,
-    HbmTensor<f32, Chip, m![H]>,
-);
-pub type QuantizedMlp<H, I> = Mlp<H, I, GateUpWeights<H, I>, DownWeights<H, I>>;
-
-/// The gate and up projections of a block-FP8 checkpoint, each row's block scales folded under its
-/// largest ([`fp8::folded`]): their codes packed in [`Blocked`] order, their row scales after them.
-impl<'a, H: AxisName, I: AxisName> Load<Projections<'a, 2>> for GateUpWeights<H, I> {
-    fn load(context: &mut Context<'_>, projections: Projections<'a, 2>) -> Result<Self, LoadError> {
-        let [(gate, gates), (up, ups)] = projections.read(context, |from, cx| {
-            cx.field("weight", "weight", |cx| {
-                fp8::folded::<m![H], m![I]>(from, cx)
-            })
-        })?;
-        let codes = HostTensor::<f8e4m3, m![{ Chip }, { m![Term, I, H] }]>::from_vec(
-            [gate, up].concat().repeat(Chip::SIZE),
-        );
-        let scales = HostTensor::<f32, m![{ Chip }, { m![Term, I] }]>::from_vec(
-            [gates, ups].concat().repeat(Chip::SIZE),
-        );
-        Ok((
-            context.field("0", "", |cx| Load::load(cx, codes))?,
-            context.field("1", "", |cx| Load::load(cx, scales))?,
-        ))
-    }
-}
-
-/// The down projection of a block-FP8 checkpoint, each row's block scales folded under its largest
-/// ([`fp8::folded`]): its codes in [`Stored`] order, its row scales after them.
-impl<'a, H: AxisName, I: AxisName> Load<Projections<'a, 1>> for DownWeights<H, I> {
-    fn load(context: &mut Context<'_>, projections: Projections<'a, 1>) -> Result<Self, LoadError> {
-        let [(codes, scales)] = projections.read(context, |from, cx| {
-            cx.field("weight", "weight", |cx| {
-                fp8::folded::<m![I], m![H]>(from, cx)
-            })
-        })?;
-        let codes =
-            HostTensor::<f8e4m3, m![{ Chip }, { m![H, I] }]>::from_vec(codes.repeat(Chip::SIZE));
-        let scales =
-            HostTensor::<f32, m![{ Chip }, { m![H] }]>::from_vec(scales.repeat(Chip::SIZE));
-        Ok((
-            context.field("0", "", |cx| Load::load(cx, codes))?,
-            context.field("1", "", |cx| Load::load(cx, scales))?,
-        ))
-    }
-}
 type Channels<I, Rows> = DmTensor<f32, Chip, Cluster<I>, Slice<I, Rows>, m![{ Out<I> }]>;
-
-/// Gate/up weight pair `panel`, the weights of 1024 inputs, written on chip.
-impl<Hidden: AxisName, Intermediate: AxisName> Op<Begin<usize>>
-    for GateUpWeights<Hidden, Intermediate>
-{
-    type Output = GateUp<Hidden, Intermediate>;
-
-    fn forward(&self, context: &mut Device, Begin(panel): Begin<usize>) -> Self::Output {
-        self.0
-            .view()
-            .tile::<m![Hidden / 1024], 1, m![Term, Hidden / 1024 = 1 # (Hidden / 1024),
-                Intermediate / (Intermediate / 64), Hidden % 1024 / 128, { Out<Intermediate> },
-                Hidden % 128]>(panel)
-            .to_dm(&mut context.tdma)
-    }
-}
-
-/// The first gate/up weight pair, which needs no rows: it is copied while the rows travel.
-impl<Hidden: AxisName, Intermediate: AxisName> Op<Begin<()>>
-    for GateUpWeights<Hidden, Intermediate>
-{
-    type Output = GateUp<Hidden, Intermediate>;
-
-    fn forward(&self, context: &mut Device, _: Begin<()>) -> Self::Output {
-        self.forward(context, Begin(0))
-    }
-}
-
-/// Down weight panel `panel`, the weights of 64 inputs of each slice's output block, written on
-/// chip.
-impl<Hidden: AxisName, Intermediate: AxisName> Op<Begin<usize>>
-    for DownWeights<Hidden, Intermediate>
-{
-    type Output = Down<Hidden, Intermediate>;
-
-    fn forward(&self, context: &mut Device, Begin(panel): Begin<usize>) -> Self::Output {
-        let mut down = Down::new();
-        self.0
-            .view()
-            .tile::<m![{ Out<Intermediate> } / 64], 1, StoredPanel<Hidden, Intermediate>>(panel)
-            .to_dm_view(&mut context.tdma, down.view_mut());
-        down
-    }
-}
 
 #[cfg(test)]
 mod tests {

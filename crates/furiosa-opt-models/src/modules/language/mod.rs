@@ -59,6 +59,8 @@ pub struct Loop<Body, Norms> {
     pub norms: Norms,
 }
 
+impl<Body, Norm, const N: usize> super::generic::Full for Loop<Body, [Norm; N]> {}
+
 /// An iteration runs the body with its state slot, then the iteration's norm.
 impl<X, S, Body, Norm, const N: usize, Env: Copy> Collection<X, Env, S> for Loop<Body, [Norm; N]>
 where

@@ -20,12 +20,12 @@ Install a plugin first ([Installation](../getting-started/installation.md)); [Qu
 | Prompt embeddings | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Custom logits processors | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Watermarking | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
-| Speculative decoding (ngram, suffix, draft model) | <span class="support support-yes">Supported</span> (ngram and suffix; no draft model yet) | <span class="support support-yes">Supported</span> (ngram and draft model; no suffix decoding in SGLang) | [ngram or suffix](#speculate-with-ngram-or-suffix-decoding), [draft model](#speculate-with-a-draft-model) |
-| Speculative decoding (EAGLE, MTP, Medusa, MLP, parallel draft models) | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
+| Speculative decoding (ngram, suffix, draft model) | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> (ngram and draft model; no suffix decoding in SGLang) | [ngram or suffix](#speculate-with-ngram-or-suffix-decoding), [draft model](#speculate-with-a-draft-model) |
+| Speculative decoding (EAGLE, MTP, Medusa, MLP, parallel draft models) | <span class="support support-yes">Supported</span> (parallel draft models; no EAGLE, MTP, Medusa or MLP yet) | <span class="support support-no">Not yet</span> | [parallel draft model](#speculate-with-a-draft-model) |
 | Automatic prefix caching | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Reuse cached prefixes](#reuse-cached-prefixes) |
 | FP8 KV cache | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Quantized checkpoints (FP8, NVFP4) | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
-| Online quantization | <span class="support support-yes">Supported</span> | <span class="support support-no">Not yet</span> | [Quantize a BF16 checkpoint at load](#quantize-a-bf16-checkpoint-at-load) |
+| Online quantization | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Quantize a BF16 checkpoint at load](#quantize-a-bf16-checkpoint-at-load) |
 | KV cache offloading | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Offload the KV cache to host memory](#offload-the-kv-cache-to-host-memory) |
 | Sleep mode | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> (without speculative decoding) | [Put the server to sleep](#put-the-server-to-sleep) |
 | Long contexts, up to the compiled window | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Serve long contexts](#serve-long-contexts) |
@@ -33,8 +33,8 @@ Install a plugin first ([Installation](../getting-started/installation.md)); [Qu
 | Tensor parallelism over a compiled chip count | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Data parallelism | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Run data-parallel replicas](#run-data-parallel-replicas) |
 | Pipeline, expert and context parallelism | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
-| LoRA | <span class="support support-yes">Supported</span> | <span class="support support-no">Not yet</span> | [Serve LoRA adapters](#serve-lora-adapters) |
-| Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache) | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
+| LoRA | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Serve LoRA adapters](#serve-lora-adapters) |
+| Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache) | <span class="support support-yes">Supported</span> (NIXL) | <span class="support support-yes">Supported</span> (Mooncake over TCP) | [Disaggregate prefill and decode](#disaggregate-prefill-and-decode) |
 | Disaggregated encoder and encoder caches | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Per-request metrics | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Report per-request metrics](#report-per-request-metrics) |
 | Batch invariance | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Keep outputs independent of the batch](#keep-outputs-independent-of-the-batch) |
@@ -109,6 +109,13 @@ Its message pins an older Arctic Inference release; the extra pins the one the p
 
 ## Speculate with a draft model
 
+With vLLM, a smaller causal language model that shares the target's vocabulary and cache block size drafts the tokens on the target's chips; `"parallel_drafting": true` drafts all of a step's positions at once from a mask token the draft config names, such as `pard_token`:
+
+```bash
+vllm serve Qwen/Qwen3-1.7B \
+  --speculative-config '{"method": "draft_model", "model": "amd/PARD-Qwen3-0.6B", "num_speculative_tokens": 4, "parallel_drafting": true}'
+```
+
 With SGLang, a smaller causal language model that shares the target's tokenizer drafts the tokens on the target's chips:
 
 ```bash
@@ -144,8 +151,8 @@ Both servers copy the cache blocks of computed prompts to a tier of host memory,
     The platform serves it through the plugin's `RNGDOffloadingConnector` instead of vLLM's `OffloadingConnector`, which copies with CUDA streams; vLLM's scheduler still decides what to store, load and evict.
     Options of vLLM's CPU offloading, such as `blocks_per_chunk` and `eviction_policy`, go in `--kv-transfer-config '{"kv_connector_extra_config": {...}}'` beside the size.
     vLLM completes a transfer once the worker of each rank reports it, and one worker drives every chip, so offloading serves one chip a replica.
-    It also serves one replica: with data parallelism vLLM ranks each replica's worker among all of them.
-    Sleep mode frees the cache storage the host tier copies, so startup refuses `--enable-sleep-mode` beside offloading.
+    Each data-parallel replica keeps its own host tier.
+    Sleep mode empties the host tier along with the prefix cache, and after waking the host tier copies the blocks of the cache that waking allocates.
     The `vllm:kv_offload_store_bytes` and `vllm:kv_offload_load_bytes` metrics count the bytes moved each way.
 
 === "SGLang"
@@ -161,6 +168,66 @@ Both servers copy the cache blocks of computed prompts to a tier of host memory,
 Only the attention cache moves, so both servers refuse offloading at startup for a model with recurrent state, and vLLM also for one with encoder memory; the [vLLM](vllm.md#options) and [SGLang](sglang.md#options) option pages name the other refused settings.
 A failed copy poisons the memory it touched, and neither server recovers once it observes the failure, so vLLM's `kv_load_failure_policy` takes only `fail`.
 vLLM observes the failure as soon as the copy ends; SGLang may observe it only later, when a call or copy next uses that memory.
+
+## Disaggregate prefill and decode
+
+A disaggregated deployment prefills a prompt on one server and decodes it on another, which moves the prompt's KV cache between them.
+Run the two servers on chips of their own ([Choose the chips](#choose-the-chips)):
+
+=== "vLLM"
+
+    With vLLM, a prefill server computes a prompt's cache and a decode server continues the request from it, through vLLM's NIXL connectors (`NixlConnector`, which names `NixlPullConnector`, or `NixlPushConnector`) in their host-buffer mode:
+
+    ```bash
+    vllm serve Qwen/Qwen3-0.6B --port 8100 \
+      --kv-transfer-config '{"kv_connector": "NixlConnector", "kv_role": "kv_producer", "kv_buffer_device": "cpu"}'
+    VLLM_NIXL_SIDE_CHANNEL_PORT=5601 vllm serve Qwen/Qwen3-0.6B --port 8200 \
+      --kv-transfer-config '{"kv_connector": "NixlConnector", "kv_role": "kv_consumer", "kv_buffer_device": "cpu"}'
+    ```
+
+    A request goes to the prefill server with `"kv_transfer_params": {"do_remote_decode": true}` and `max_tokens` 1, then to the decode server with the `kv_transfer_params` that response returns, both under one request ID (`X-Request-Id` or `request_id`), as vLLM's disaggregation proxies route it; `NixlPushConnector` pairs the decode with its prefill by that ID.
+    NIXL cannot register the device's memory, so it stages blocks in host buffers of its own and the runner copies each request's blocks between them and the engine cache; `kv_buffer_device` must be `cpu`.
+    Each copy ends before NIXL sends the blocks or reports them received, and a failed copy stops the server.
+    The decode server's `vllm:external_prefix_cache_hits` counts the prompt tokens it took from its connector, and `vllm:nixl_bytes_transferred` the bytes NIXL moved.
+
+    Both servers take the same model, quantization and speculative method, which NIXL's handshake compares; a request's LoRA adapter is named on both.
+    Data-parallel replicas and sleep mode are served with a connector.
+    One worker drives every chip while vLLM awaits each tensor-parallel rank, so a connector serves one chip a replica.
+    Only the attention cache moves, so startup refuses a connector for a model with recurrent state or encoder memory and on an encoder-only instance.
+    Mooncake and MoRIIO register the cache's device memory, which the engine does not map for them, and LMCache copies the cache's torch tensors itself, so startup refuses them.
+
+    vLLM's `MultiConnector` runs a NIXL connector and offloading together; the offloading entry names the plugin's connector and its module, since `--kv-offloading-size` replaces any other connector:
+
+    ```bash
+    VLLM_NIXL_SIDE_CHANNEL_PORT=5601 vllm serve Qwen/Qwen3-0.6B --port 8200 --kv-transfer-config '{
+      "kv_connector": "MultiConnector", "kv_role": "kv_both", "kv_connector_extra_config": {"connectors": [
+        {"kv_connector": "NixlConnector", "kv_role": "kv_consumer", "kv_buffer_device": "cpu"},
+        {"kv_connector": "RNGDOffloadingConnector", "kv_connector_module_path": "furiosa_opt_vllm.offload",
+         "kv_role": "kv_both", "kv_connector_extra_config": {"cpu_bytes_to_use": 17179869184}}]}}'
+    ```
+
+    vLLM loads a request's blocks from the first of its connectors that has them and stores them through each; each connector takes the settings it takes alone.
+    The NIXL entry may be `NixlPushConnector`, the entries may come in either order, and the decode server may run data-parallel replicas or sleep mode; each replica keeps its own host tier, so route a request's reloads to the replica that decoded it (`X-data-parallel-rank`).
+
+=== "SGLang"
+
+    No transport reaches the device memory that holds the engine's cache, so each server keeps a pinned host image of its cache, which the transport registers, and copies a request's pages between the device and the image.
+
+    ```bash
+    FURIOSA_VISIBLE_CHIPS=0 python -m sglang.launch_server --model-path Qwen/Qwen3-0.6B --port 30000 \
+      --disaggregation-mode prefill --disaggregation-transfer-backend mooncake_tcp \
+      --disaggregation-bootstrap-port 8998
+    FURIOSA_VISIBLE_CHIPS=1 python -m sglang.launch_server --model-path Qwen/Qwen3-0.6B --port 30001 \
+      --disaggregation-mode decode --disaggregation-transfer-backend mooncake_tcp
+    ```
+
+    Mooncake's backend needs its transfer engine installed, `mooncake-transfer-engine-non-cuda` on a host without CUDA.
+    Send each `/generate` request to both servers at once, as SGLang's router does, with the same `"bootstrap_host"`, `"bootstrap_port": 8998` and a `"bootstrap_room"` number of its own; the decode server's response holds the generated tokens.
+    The prefill server copies the pages of each send to its image before Mooncake reads them, whichever step or hierarchical-cache reload wrote them on the device, so prefix-cache hits and chunked prefills send current pages.
+    The decode server copies the pages a request received to the device as soon as SGLang reports the transfer done, before it caches, backs up or runs the request; a request that `/pause_generation` with `"mode": "retract"` retracted receives them again, and one the server retracts for memory restores from its own host backup.
+    A prefill server, and any server started with `--enable-pd-role-switch`, schedules without overlap: SGLang's overlapped early send of a cached prefix records a CUDA event, and a scheduler keeps the overlap it started with.
+    `mooncake_tcp` selects Mooncake's TCP transport: its RDMA transport registers memory with `ibv_reg_mr`, which refuses the engine's pinned memory.
+    The memory saver, the hierarchical cache, a decode server's radix cache, [data-parallel replicas](#run-data-parallel-replicas), STANDALONE speculative decoding and role switching work beside disaggregation; [SGLang's options](sglang.md#options) list the settings startup refuses with it.
 
 ## Put the server to sleep
 
@@ -216,17 +283,33 @@ Without the copy, waking reads the checkpoint's files as they are then.
 
 ## Quantize a BF16 checkpoint at load
 
-vLLM's per-tensor online FP8 quantizes a Qwen3-0.6B, Qwen3-1.7B or Qwen3-4B BF16 checkpoint as it loads:
+Each framework's online FP8 method quantizes a Qwen3-0.6B, Qwen3-1.7B or Qwen3-4B BF16 checkpoint as it loads:
 
-```bash
-vllm serve Qwen/Qwen3-0.6B --quantization fp8_per_tensor
-```
+=== "vLLM"
 
-The load stores each decoder projection's weight as E4M3 codes with FP32 scales, as vLLM's method computes them: one scale per projection, shared by the projections vLLM fuses into one matrix (a layer's query, key and value; its gate and up), the largest magnitude over 448.
-Each projection restores the codes to BF16 before its product, so the activations stay in BF16, as vLLM computes this method without an FP8 matrix unit; the embedding and the vocabulary head stay in BF16.
+    ```bash
+    vllm serve Qwen/Qwen3-0.6B --quantization fp8_per_tensor
+    ```
+
+    Each projection has one scale, shared by the projections vLLM fuses into one matrix (a layer's query, key and value; its gate and up).
+    Startup refuses `--quantization` on a quantized checkpoint.
+
+=== "SGLang"
+
+    ```bash
+    python -m sglang.launch_server --model-path Qwen/Qwen3-0.6B --quantization fp8
+    ```
+
+    Each output channel of a projection has its own scale, so the projections SGLang fuses into one matrix keep the scales of their own rows.
+    A STANDALONE draft model takes the target's quantization, as in SGLang; `--speculative-draft-model-quantization unquant` loads it as stored.
+    On a quantized checkpoint, `--quantization fp8` changes nothing: the load reads the checkpoint's own weights, as SGLang's does.
+    Waking from [sleep](#put-the-server-to-sleep) quantizes the BF16 weights again, so a woken server answers as before.
+
+The load stores each decoder projection's weight as E4M3 codes with FP32 scales, as the framework's method computes them, each scale the largest magnitude it covers over 448.
+Each projection restores the codes to BF16 before its product, so the activations stay in BF16, as each framework computes its method without an FP8 matrix unit; the embedding and the vocabulary head stay in BF16.
+Where SGLang has FP8 matrix units, its `fp8` also quantizes the activations of each token, so its answers there may differ slightly from these.
 Startup refuses Qwen3-8B, whose packed query, key and value projection has no FP8 form, before downloading its weights.
-Startup also refuses the other methods, which quantize the activations too (`fp8_per_channel`, `fp8_per_block`) or use other formats (MX, NVFP4), and `--quantization` on a quantized checkpoint.
-SGLang refuses `--quantization` for a BF16 checkpoint at startup.
+Startup also refuses the other methods, which quantize the activations too (vLLM's `fp8_per_channel` and `fp8_per_block`, SGLang's `w8a8_fp8`) or use other formats (MX, NVFP4).
 
 ## Serve long contexts
 
@@ -306,25 +389,43 @@ Each response can carry its own timings beside the server's aggregated metrics:
 
 ## Serve LoRA adapters
 
-With vLLM, each request may name a LoRA adapter of the served model, saved as PEFT saves it; requests of different adapters and of the base model share a step.
+Each request may name a LoRA adapter of the served model, saved as PEFT saves it; requests of different adapters and of the base model share a step.
 The engine adds an adapter's updates to the attention projections `q_proj`, `k_proj`, `v_proj` and `o_proj` and the MLP projections `gate_proj`, `up_proj` and `down_proj`, up to rank 32, at most two adapters a step.
 [Qwen3 0.6B](../models/qwen3-0.6b.md) on one chip runs them, its tokens those of Transformers with each adapter merged by PEFT; `--enable-lora` with a quantized checkpoint, such as the block-scaled FP8 [Qwen3 8B](../models/qwen3-8b.md), or with an online quantization is refused at startup, as those loads run no adapter.
 
-```python
-from vllm import LLM, SamplingParams
-from vllm.lora.request import LoRARequest
+=== "vLLM"
 
-llm = LLM("Qwen/Qwen3-0.6B", enable_lora=True, max_loras=2, max_lora_rank=32)
-sky = LoRARequest("sky", 1, "/path/to/adapter")
-outputs = llm.generate(["Why is the sky blue?"], SamplingParams(temperature=0), lora_request=sky)
-```
+    ```python
+    from vllm import LLM, SamplingParams
+    from vllm.lora.request import LoRARequest
 
-A loaded adapter stays on the device, out of the memory the KV cache leaves free.
-`max_loras` sets the adapters a step runs, at most 2, and `max_cpu_loras` the adapters kept loaded, the least recently used unloaded first.
-`llm.llm_engine.add_lora`, `pin_lora` and `remove_lora` act on the loaded adapters: a load also makes its adapter one of the `max_loras` active ones, as vLLM activates every adapter it adds, and a pinned adapter stays loaded and active until it is removed, so a load while `max_loras` pinned adapters are active is refused and changes nothing; a `LoRARequest` with `load_inplace=True` replaces the adapter of its ID.
+    llm = LLM("Qwen/Qwen3-0.6B", enable_lora=True, max_loras=2, max_lora_rank=32)
+    sky = LoRARequest("sky", 1, "/path/to/adapter")
+    outputs = llm.generate(["Why is the sky blue?"], SamplingParams(temperature=0), lora_request=sky)
+    ```
+
+    A loaded adapter is held in host memory; the device holds the `max_loras` active ones, in adapter storage taken before the KV cache sizes, so a load after startup takes no device memory.
+    `max_loras` sets the adapters a step runs, at most 2, and `max_cpu_loras` the adapters kept loaded, the least recently used unloaded first; an inactive adapter a step names is copied into the storage of a free slot or of the least recently used unpinned active adapter.
+    `llm.llm_engine.add_lora`, `pin_lora` and `remove_lora` act on the loaded adapters: a load also makes its adapter one of the `max_loras` active ones, as vLLM activates every adapter it adds, and a pinned adapter stays loaded and active until it is removed, so a load while `max_loras` pinned adapters are active is refused and changes nothing; a `LoRARequest` with `load_inplace=True` replaces the adapter of its ID.
+
+=== "SGLang"
+
+    ```bash
+    python -m sglang.launch_server --model-path Qwen/Qwen3-0.6B --enable-lora --lora-paths sky=/path/to/adapter
+    ```
+
+    A `/generate` or `/encode` request names its adapter in `lora_path`, and an OpenAI request in its model, as `"model": "Qwen/Qwen3-0.6B:sky"`.
+    `/load_lora_adapter` with `{"lora_name": ..., "lora_path": ...}` adds an adapter while the server runs, `/load_lora_adapter_from_tensors` adds one from its configuration and serialized factors, and `/unload_lora_adapter` with `{"lora_name": ...}` removes it; a request that names an adapter unloaded this way loads it again.
+    Each load is a new adapter under a new ID: a request reads no prefix that a request of an earlier load of the same name cached, and an unload frees the adapter once the steps already running with it end.
+    A loaded adapter is held in host memory; the device holds `--max-loras-per-batch` of them, the base model's entry included, in the entries of SGLang's own adapter pool, which take their device memory before the KV cache sizes, so a load after startup takes no device memory and `--max-loaded-loras` bounds the loaded adapters as SGLang does.
+    A batch that names an adapter no entry holds loads it into the entry SGLang's `--lora-eviction-policy` frees, never one the batch or a pinned adapter holds; SGLang refuses to pin the last entry.
+    A batch runs at most two adapters, the adapters one engine call runs, within SGLang's own bound of `--max-loras-per-batch`; requests of other adapters wait for a later batch.
+    A load whose configuration, added tokens or factors are malformed is refused, and the server keeps serving.
+    NGRAM speculation verifies each request's drafts with its adapter; SGLang itself refuses LoRA with STANDALONE speculation.
 
 The adapter directory holds `adapter_config.json` and `adapter_model.safetensors`.
-An adapter that adapts another module, such as the embedding or the output head, or that uses DoRA, bias terms or per-module ranks is refused when it loads, naming what it holds, before any of it reaches the device; [vLLM options](vllm.md#options) lists the refused settings.
+An adapter that adapts another module, such as the embedding or the output head, or that uses DoRA, bias terms or per-module ranks is refused when it loads, naming what it holds, before any of it reaches the device; [vLLM options](vllm.md#options) and [SGLang options](sglang.md#options) list the refused settings.
+An embedding model's adapter names its modules as PEFT names those of the causal model of the same checkpoint.
 
 ## Keep outputs independent of the batch
 
@@ -378,7 +479,7 @@ Asking for a feature that is not supported yet has one of three outcomes:
 
 - **Refused** before it runs, with the reason: an option the [vLLM](vllm.md#options) or [SGLang](sglang.md#options) page names stops startup, and so does a checkpoint config no served decoder holds, such as a rope type the engine does not compute; a request field [SGLang requests](sglang.md#requests) names fails its request with HTTP 400, and vLLM refuses a request that is not greedy or holds prompt embeddings.
 - **Not verified**: tool calling and reasoning outputs with vLLM and `tool_choice` `auto` may work, as its parsers read the greedy answer, but no test runs them on RNGD yet.
-- **Not refused**: any other way to ask may fail with an internal error or not take effect. A vLLM draft model (`"method": "draft_model"`) passes the option check, then fails at load.
+- **Not refused**: any other way to ask may fail with an internal error or not take effect.
 
 Why each feature is not served yet:
 
@@ -386,9 +487,9 @@ Why each feature is not served yet:
 - **Reranking and score heads**: SGLang's reranking reads the logprobs of two tokens; vLLM's reranking and either plugin's classification run a score head, which the engine loads but neither plugin calls yet.
 - **Prompt embeddings**: a decoder call takes token IDs.
 - **Multimodal inputs**: no served checkpoint answers about images, video or audio; Gemma 4 unified's media encoder runs [on an encoder-only instance](#embed-media-on-an-encoder-only-instance), but the engine serves no language model of it.
-- **Speculative methods other than ngram and suffix** (vLLM, which also has no draft model yet) or NGRAM and STANDALONE (SGLang).
+- **Speculative methods other than ngram, suffix and a draft model** (vLLM) or NGRAM and STANDALONE (SGLang).
 - **FP8 KV cache and quantized checkpoints**: the served checkpoints load BF16 weights and cache keys and values in BF16.
-- **Online quantization** with SGLang, and with vLLM any method but `fp8_per_tensor`: the other methods quantize the activations too or use other formats, and the SGLang plugin passes no quantization to the load.
+- **Online quantization** with methods other than vLLM's `fp8_per_tensor` and SGLang's `fp8`: the other methods quantize the activations too or use other formats.
 - **Tensor, pipeline, expert and context parallelism**, and serving across nodes: each served checkpoint runs on one chip.
-- **LoRA with SGLang**: `--enable-lora` and `--lora-paths` are refused; the SGLang plugin runs no adapter yet.
-- **Disaggregated prefill, KV connectors and a disaggregated encoder**: no cache row moves to another instance, and of a disaggregated encoder only the [encoder-only instance](#embed-media-on-an-encoder-only-instance) runs.
+- **KV connectors other than vLLM's NIXL ones, and transports other than Mooncake over TCP with SGLang**: Mooncake, MoRIIO and LMCache reach vLLM's cache without host buffers ([Disaggregate prefill and decode](#disaggregate-prefill-and-decode)).
+- **A disaggregated encoder**: only the [encoder-only instance](#embed-media-on-an-encoder-only-instance) runs.

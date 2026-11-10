@@ -22,6 +22,8 @@ use safetensors::SafeTensors;
 use safetensors::tensor::TensorView;
 
 use super::{Context, Load, LoadError};
+use crate::models::config::language;
+use crate::modules::generic::collection::Interval;
 use crate::tensor::form::fp8::Granularity;
 
 /// Tensors by name and the config of one model or pipeline. A tree loads from it into HBM tensor
@@ -35,17 +37,18 @@ pub struct Checkpoint {
     /// How a load quantizes the projections the checkpoint stores in BF16, if it does.
     pub(super) quantization: Option<Granularity>,
     /// The part of the model a load from the checkpoint reads.
-    pub(super) part: Part,
+    pub(super) part: Part<Interval<usize>>,
 }
 
 /// The part of a model a load reads from a checkpoint; a registry implementation reads one kind
 /// of part, and refuses a checkpoint read for another.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum Part {
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum Part<I = Range<usize>> {
     #[default]
     Whole,
     /// The media encoder alone: the towers or embedders whose rows the language model reads.
     Encoder,
+    Layers(I),
 }
 
 /// A tensor's dtype, shape, and where its little-endian bytes are: a range of a mapped file or of a
@@ -100,7 +103,7 @@ impl Checkpoint {
             tensors: self.tensors.iter().map(read).collect(),
             directory: self.directory.clone(),
             quantization: self.quantization,
-            part: self.part,
+            part: self.part.clone(),
         }
     }
 
@@ -146,7 +149,7 @@ impl Checkpoint {
             tensors: self.tensors.clone(),
             directory: self.directory.clone(),
             quantization: Some(granularity),
-            part: self.part,
+            part: self.part.clone(),
         })
     }
 
@@ -167,8 +170,38 @@ impl Checkpoint {
     }
 
     /// The part of the model a load from the checkpoint reads.
-    pub fn part(&self) -> Part {
-        self.part
+    pub fn part(&self) -> &Part<Interval<usize>> {
+        &self.part
+    }
+
+    /// The decoder layers the config declares for its language model.
+    pub fn depth(&self) -> Result<usize, LoadError> {
+        let invalid = |reason: String| LoadError::InvalidData {
+            name: "layers".into(),
+            reason,
+        };
+        let config = language(&self.config).map_err(|error| invalid(error.to_string()))?;
+        let depth = config["num_hidden_layers"].as_u64();
+        depth
+            .and_then(|depth| usize::try_from(depth).ok())
+            .ok_or_else(|| {
+                invalid("configured num_hidden_layers must be a nonnegative integer".into())
+            })
+    }
+
+    pub fn selected(&self, part: Part) -> Result<Self, LoadError> {
+        let part = match part {
+            Part::Layers(range) => Part::Layers(Interval::new(range, self.depth()?)?),
+            Part::Whole => Part::Whole,
+            Part::Encoder => Part::Encoder,
+        };
+        Ok(Self {
+            config: self.config.clone(),
+            tensors: self.tensors.clone(),
+            directory: self.directory.clone(),
+            quantization: self.quantization,
+            part,
+        })
     }
 
     /// The quantization the config declares for the stored weights: none when its
@@ -852,6 +885,25 @@ pub(super) mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
         let reason = "\u{fffd}: a name not in UTF-8";
         assert!(error.to_string().ends_with(reason), "{error}");
+    }
+
+    /// The configured depth is the language model's: a nested `text_config`'s, else the
+    /// document's own where `text_config` is absent or null.
+    #[test]
+    fn depth_is_the_language_models() {
+        use serde_json::json;
+        for config in [
+            json!({"text_config": {"num_hidden_layers": 3}, "num_hidden_layers": 9}),
+            json!({"text_config": null, "num_hidden_layers": 3}),
+            json!({"num_hidden_layers": 3}),
+        ] {
+            let shown = config.to_string();
+            let checkpoint = Checkpoint {
+                config,
+                ..Checkpoint::default()
+            };
+            assert_eq!(checkpoint.depth().ok(), Some(3), "{shown}");
+        }
     }
 
     /// The float a JSON number's text reads as; `as_f64` has no infinite value.

@@ -1,12 +1,14 @@
 //! Layers applied in order: one fold over a collection of layers and the state slot of each, its
 //! loop rolled or unrolled.
 //!
-//! - A collection holds a fixed number of layers and applies the one at an index: `[L; N]` gives
-//!   each layer its own parameters, `Repeat` one body to every layer.
-//! - The call's state is one slot a layer, `&mut [S; N]`; each layer takes the hidden value with
-//!   its own slot and returns the next hidden value.
-//! - The loop kind is a kernel difference: [`Rolled`] runs one copy of a layer's code every trip,
-//!   [`Unrolled`] places every layer's code before scheduling.
+//! - A collection holds up to `COUNT` layers, `count` of them live, and applies the one at an
+//!   index: `[L; N]` gives each layer its own parameters, `Repeat` one body to every layer, and a
+//!   stack views the layers its interval selects.
+//! - The call's state is one slot a layer, `&mut [S; N]` or a slice of at least `count` slots;
+//!   each layer takes the hidden value with its own slot and returns the next hidden value.
+//! - The loop kind is a kernel difference: [`Rolled`] runs one copy of a layer's code for each
+//!   live layer, [`Unrolled`] places the code of every layer of a full collection before
+//!   scheduling.
 
 use crate::Module;
 use crate::load::Load;
@@ -56,7 +58,7 @@ pub struct Unrolled;
 impl<'s, X, LayerState, C, const N: usize, Env: Copy> Module<X, Env, &'s mut [LayerState; N]>
     for Layers<C, Rolled>
 where
-    C: Collection<X, Env, &'s mut LayerState, Output = X>,
+    C: for<'a> Collection<X, Env, &'a mut LayerState, Output = X>,
 {
     type Output = X;
 
@@ -65,13 +67,29 @@ where
         device: &mut Device,
         env: Env,
         state: &'s mut [LayerState; N],
+        hidden: X,
+    ) -> X {
+        self.forward(device, env, state.as_mut_slice(), hidden)
+    }
+}
+
+impl<'s, X, LayerState, C, Env: Copy> Module<X, Env, &'s mut [LayerState]> for Layers<C, Rolled>
+where
+    C: for<'a> Collection<X, Env, &'a mut LayerState, Output = X>,
+{
+    type Output = X;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        env: Env,
+        state: &'s mut [LayerState],
         mut hidden: X,
     ) -> X {
-        const { assert!(C::COUNT == N, "one state slot for each layer") };
-        if N > 0 {
-            for (index, slot) in state.iter_mut().enumerate() {
-                hidden = self.layers.apply(&mut *device, env, slot, hidden, index);
-            }
+        for index in 0..self.layers.count() {
+            hidden = self
+                .layers
+                .apply(&mut *device, env, &mut state[index], hidden, index);
         }
         hidden
     }
@@ -80,7 +98,7 @@ where
 impl<'s, X, LayerState, C, const N: usize, Env: Copy> Module<X, Env, &'s mut [LayerState; N]>
     for Layers<C, Unrolled>
 where
-    C: Collection<X, Env, &'s mut LayerState, Output = X>,
+    C: Collection<X, Env, &'s mut LayerState, Output = X> + Full,
 {
     type Output = X;
 
@@ -102,14 +120,19 @@ where
     }
 }
 
-/// A fixed number of layers, each taking the call's env and its own state slot; a trait, as an
-/// array, a repeated body and stacked views hold layers differently and `Layers` takes any.
+/// Layers by index, `COUNT` at most and `count` live, each taking the call's env and its own state
+/// slot; a trait, as an array, a repeated body and stacked views hold layers differently.
 pub(crate) trait Collection<X, Env, S> {
     /// What a layer returns for hidden `X`: the next hidden value, of `X`'s type in a loop.
     type Output;
 
-    /// How many layers the collection holds.
+    /// How many layers the collection holds at most.
     const COUNT: usize;
+
+    /// How many layers are live, which a rolled loop runs: every one but in a stack.
+    fn count(&self) -> usize {
+        Self::COUNT
+    }
 
     /// Applies the layer at `index` to `hidden` with that layer's state slot.
     fn apply(
@@ -121,6 +144,13 @@ pub(crate) trait Collection<X, Env, S> {
         index: usize,
     ) -> Self::Output;
 }
+
+/// A collection whose `COUNT` layers are all live, which an unrolled loop places.
+pub(crate) trait Full {}
+
+impl<L, const N: usize> Full for [L; N] {}
+impl<C: Full> Full for &C {}
+impl<Body, const N: usize> Full for Repeat<Body, N> {}
 
 /// Each layer has its own parameters.
 impl<X, Env, S, L: Module<X, Env, S>, const N: usize> Collection<X, Env, S> for [L; N] {
@@ -138,6 +168,10 @@ impl<X, Env, S, C: Collection<X, Env, S>> Collection<X, Env, S> for &C {
     type Output = C::Output;
 
     const COUNT: usize = C::COUNT;
+
+    fn count(&self) -> usize {
+        (**self).count()
+    }
 
     fn apply(&self, device: &mut Device, env: Env, state: S, hidden: X, index: usize) -> C::Output {
         (**self).apply(device, env, state, hidden, index)

@@ -1,9 +1,11 @@
-use super::{HeadScales, HeadSquares, Squared, Stored, ValueScale, Weight, Weights};
+use super::{HeadScales, Squared, Stored, ValueScale, Weight};
 use crate::Begin;
 use crate::Op;
 use crate::ops::linear::Affine;
+use crate::tensor::form::fp8::{Rows, Squares};
 use crate::tensor::parallel::Chip;
 use furiosa_opt_std::prelude::*;
+use std::borrow::Borrow;
 use std::marker::PhantomData;
 
 pub(crate) struct Panel<'a, Hidden: AxisName, Heads: AxisName, Head: AxisName>(
@@ -67,42 +69,51 @@ impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, const HALF: usize>
 
 /// The query projection written to DM: each half of its head dimension in turn, its heads'
 /// squared scales copied beside it for each period to write into its output's slices.
-impl<Hidden: AxisName, Heads: AxisName, Head: AxisName> Op<Begin<()>>
-    for Affine<Weights<Hidden, Heads, Head, HeadSquares<Heads>>, ()>
+impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, W, S> Op<Begin<()>>
+    for Affine<Rows<m![Hidden], m![Heads, Head], W, Squares<S>>, ()>
+where
+    W: Borrow<Stored<Hidden, Heads, Head>>,
+    S: Borrow<Squared<Heads>>,
 {
     type Output = Affine<(Weight<Hidden, Heads, Head>, Squared<Heads>), ()>;
 
     fn forward(&self, device: &mut Device, _: Begin<()>) -> Self::Output {
         let mut output = Affine::new(DmTensor::new(), ());
-        Half::<_, _, _, 0>(&self.weight.0).forward(&mut *device, &mut output);
-        Half::<_, _, _, 1>(&self.weight.0).forward(&mut *device, &mut output);
-        let squares = self.weight.1.0.to_hbm(&mut device.tdma);
+        Half::<_, _, _, 0>(self.weight.0.borrow()).forward(&mut *device, &mut output);
+        Half::<_, _, _, 1>(self.weight.0.borrow()).forward(&mut *device, &mut output);
+        let squares = self.weight.1.0.borrow().to_hbm(&mut device.tdma);
         Affine::new((output.weight, squares), ())
     }
 }
 
 /// The key projection written to DM, its heads' squared scales copied beside it.
-impl<Hidden: AxisName, Heads: AxisName, Head: AxisName> Op<Begin<()>>
-    for Affine<(Weights<Hidden, Heads, Head, HeadSquares<Heads>>, ()), ()>
+impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, W, S> Op<Begin<()>>
+    for Affine<(Rows<m![Hidden], m![Heads, Head], W, Squares<S>>, ()), ()>
+where
+    W: Borrow<Stored<Hidden, Heads, Head>>,
+    S: Borrow<Squared<Heads>>,
 {
     type Output = Affine<((Weight<Hidden, Heads, Head>, Squared<Heads>), ()), ()>;
 
     fn forward(&self, device: &mut Device, _: Begin<()>) -> Self::Output {
         let mut weight = DmTensor::new();
-        Panel(&self.weight.0.0).forward(&mut *device, &mut weight);
-        let squares = self.weight.0.1.0.to_hbm(&mut device.tdma);
+        Panel(self.weight.0.0.borrow()).forward(&mut *device, &mut weight);
+        let squares = self.weight.0.1.0.borrow().to_hbm(&mut device.tdma);
         Affine::new(((weight, squares), ()), ())
     }
 }
 
 /// The value projection written to DM with its head scales.
-impl<Hidden: AxisName, Heads: AxisName, Head: AxisName> Op<Begin<()>>
-    for Affine<Weights<Hidden, Heads, Head, HeadScales<Heads, Head>>, ()>
+impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, W, S> Op<Begin<()>>
+    for Affine<Rows<m![Hidden], m![Heads, Head], W, S>, ()>
+where
+    W: Borrow<Stored<Hidden, Heads, Head>>,
+    S: Borrow<HeadScales<Heads, Head>>,
 {
     type Output = Affine<(Weight<Hidden, Heads, Head>, ValueScale<Hidden, Heads, Head>), ()>;
 
     fn forward(&self, device: &mut Device, _: Begin<()>) -> Self::Output {
-        let (stored, scales) = (&self.weight.0, &self.weight.1);
+        let (stored, scales) = (self.weight.0.borrow(), self.weight.1.borrow());
         let (mut weight, mut scale) = (DmTensor::new(), DmTensor::new());
         Panel(stored).forward(&mut *device, &mut weight);
         Scales {
