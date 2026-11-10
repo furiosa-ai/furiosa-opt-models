@@ -368,8 +368,14 @@ where
     }
 
     fn spill(&self, device: &mut Device, home: &mut Self::Home, rows: Live<&Self::Rows, R>) {
+        // One transfer once the live rows span groups, as `fill` reads them: the envelope, whose
+        // padding rows nothing reads; else the live rows alone.
         let live = rows.with(());
-        crate::Op::forward(&Store, device, ((rows.into_value(), live), home));
+        if live.groups::<Lanes<R>>().1 > 1 {
+            crate::Op::forward(&Store, device, ((rows.into_value(), Live::all()), home));
+        } else {
+            crate::Op::forward(&Store, device, ((rows.into_value(), live), home));
+        }
     }
 
     fn front(&self, device: &mut Device, _: Live<(), R>) -> Self::Front {
