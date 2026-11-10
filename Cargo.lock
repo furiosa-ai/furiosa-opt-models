@@ -418,7 +418,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -441,8 +441,8 @@ checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 
 [[package]]
 name = "furiosa-mapping"
-version = "0.9.0+g875ba56d"
-source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=7226fbfbd832f83026b78b93c4ab3528f098e1d9#7226fbfbd832f83026b78b93c4ab3528f098e1d9"
+version = "0.9.0+g11be7b3c"
+source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=959b4b0b05d78c21dd6ab7baf56b43ab91a4825e#959b4b0b05d78c21dd6ab7baf56b43ab91a4825e"
 dependencies = [
  "abi_stable",
  "furiosa-mapping-macro",
@@ -452,8 +452,8 @@ dependencies = [
 
 [[package]]
 name = "furiosa-mapping-macro"
-version = "0.9.0+g875ba56d"
-source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=7226fbfbd832f83026b78b93c4ab3528f098e1d9#7226fbfbd832f83026b78b93c4ab3528f098e1d9"
+version = "0.9.0+g11be7b3c"
+source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=959b4b0b05d78c21dd6ab7baf56b43ab91a4825e#959b4b0b05d78c21dd6ab7baf56b43ab91a4825e"
 dependencies = [
  "lalrpop",
  "lalrpop-util 0.22.2",
@@ -464,8 +464,8 @@ dependencies = [
 
 [[package]]
 name = "furiosa-mapping-types"
-version = "0.9.0+g875ba56d"
-source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=7226fbfbd832f83026b78b93c4ab3528f098e1d9#7226fbfbd832f83026b78b93c4ab3528f098e1d9"
+version = "0.9.0+g11be7b3c"
+source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=959b4b0b05d78c21dd6ab7baf56b43ab91a4825e#959b4b0b05d78c21dd6ab7baf56b43ab91a4825e"
 dependencies = [
  "abi_stable",
  "furiosa-mapping-macro",
@@ -479,8 +479,8 @@ dependencies = [
 
 [[package]]
 name = "furiosa-opt-abi"
-version = "0.9.0+g875ba56d"
-source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=7226fbfbd832f83026b78b93c4ab3528f098e1d9#7226fbfbd832f83026b78b93c4ab3528f098e1d9"
+version = "0.9.0+g11be7b3c"
+source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=959b4b0b05d78c21dd6ab7baf56b43ab91a4825e#959b4b0b05d78c21dd6ab7baf56b43ab91a4825e"
 dependencies = [
  "bincode",
  "thiserror",
@@ -489,8 +489,8 @@ dependencies = [
 
 [[package]]
 name = "furiosa-opt-common-ir"
-version = "0.9.0+g875ba56d"
-source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=7226fbfbd832f83026b78b93c4ab3528f098e1d9#7226fbfbd832f83026b78b93c4ab3528f098e1d9"
+version = "0.9.0+g11be7b3c"
+source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=959b4b0b05d78c21dd6ab7baf56b43ab91a4825e#959b4b0b05d78c21dd6ab7baf56b43ab91a4825e"
 dependencies = [
  "furiosa-opt-macro",
  "serde",
@@ -519,8 +519,8 @@ dependencies = [
 
 [[package]]
 name = "furiosa-opt-ipc"
-version = "0.9.0+g875ba56d"
-source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=7226fbfbd832f83026b78b93c4ab3528f098e1d9#7226fbfbd832f83026b78b93c4ab3528f098e1d9"
+version = "0.9.0+g11be7b3c"
+source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=959b4b0b05d78c21dd6ab7baf56b43ab91a4825e#959b4b0b05d78c21dd6ab7baf56b43ab91a4825e"
 dependencies = [
  "bincode",
  "bytemuck",
@@ -530,8 +530,8 @@ dependencies = [
 
 [[package]]
 name = "furiosa-opt-lower"
-version = "0.9.0+g875ba56d"
-source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=7226fbfbd832f83026b78b93c4ab3528f098e1d9#7226fbfbd832f83026b78b93c4ab3528f098e1d9"
+version = "0.9.0+g11be7b3c"
+source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=959b4b0b05d78c21dd6ab7baf56b43ab91a4825e#959b4b0b05d78c21dd6ab7baf56b43ab91a4825e"
 dependencies = [
  "abi_stable",
  "furiosa-mapping",
@@ -541,8 +541,8 @@ dependencies = [
 
 [[package]]
 name = "furiosa-opt-lower-types"
-version = "0.9.0+g875ba56d"
-source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=7226fbfbd832f83026b78b93c4ab3528f098e1d9#7226fbfbd832f83026b78b93c4ab3528f098e1d9"
+version = "0.9.0+g11be7b3c"
+source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=959b4b0b05d78c21dd6ab7baf56b43ab91a4825e#959b4b0b05d78c21dd6ab7baf56b43ab91a4825e"
 dependencies = [
  "abi_stable",
  "furiosa-mapping-types",
@@ -552,8 +552,8 @@ dependencies = [
 
 [[package]]
 name = "furiosa-opt-macro"
-version = "0.9.0+g875ba56d"
-source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=7226fbfbd832f83026b78b93c4ab3528f098e1d9#7226fbfbd832f83026b78b93c4ab3528f098e1d9"
+version = "0.9.0+g11be7b3c"
+source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=959b4b0b05d78c21dd6ab7baf56b43ab91a4825e#959b4b0b05d78c21dd6ab7baf56b43ab91a4825e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -606,8 +606,8 @@ dependencies = [
 
 [[package]]
 name = "furiosa-opt-rt"
-version = "0.9.0+g875ba56d"
-source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=7226fbfbd832f83026b78b93c4ab3528f098e1d9#7226fbfbd832f83026b78b93c4ab3528f098e1d9"
+version = "0.9.0+g11be7b3c"
+source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=959b4b0b05d78c21dd6ab7baf56b43ab91a4825e#959b4b0b05d78c21dd6ab7baf56b43ab91a4825e"
 dependencies = [
  "arrayvec",
  "bytemuck",
@@ -625,8 +625,8 @@ dependencies = [
 
 [[package]]
 name = "furiosa-opt-std"
-version = "0.9.0+g875ba56d"
-source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=7226fbfbd832f83026b78b93c4ab3528f098e1d9#7226fbfbd832f83026b78b93c4ab3528f098e1d9"
+version = "0.9.0+g11be7b3c"
+source = "git+https://github.com/furiosa-ai/furiosa-opt-preview?rev=959b4b0b05d78c21dd6ab7baf56b43ab91a4825e#959b4b0b05d78c21dd6ab7baf56b43ab91a4825e"
 dependencies = [
  "abi_stable",
  "arrayvec",
@@ -1631,7 +1631,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2017,7 +2017,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2521,7 +2521,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
