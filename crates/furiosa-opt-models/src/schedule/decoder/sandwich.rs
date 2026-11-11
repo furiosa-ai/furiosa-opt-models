@@ -695,8 +695,8 @@ impl<A: decoder::Attention, L: Decodes, R: AxisName> AxisName for Beside<A, L, R
         );
         let mut tiles = L::TILES;
         while tiles > 0 {
-            let bytes = (size_of::<A::Cache>(), L::LANDED + tiles * L::TILE);
-            if specialize::attention::beside(head, groups, keys, pass, bytes) {
+            let places: (_, &[usize]) = (size_of::<A::Cache>(), &[L::LANDED, tiles * L::TILE]);
+            if specialize::attention::beside(head, groups, keys, pass, places) {
                 break;
             }
             tiles -= 1;

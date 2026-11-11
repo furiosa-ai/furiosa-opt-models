@@ -23,6 +23,9 @@ pub(crate) const TRF: usize = 65_536;
 /// Bytes of the data memory a slice holds.
 pub(crate) const DM: usize = 524_288;
 
+/// Bytes of a data memory page: a place larger than one takes whole pages, smaller ones share them.
+pub(crate) const PAGE: usize = DM / 16;
+
 /// FP32 cells of a slice's contraction accumulators: a reduction in time keeps every output it has
 /// not finished in them.
 pub(crate) const ACCUMULATOR: usize = 1024;

@@ -105,7 +105,7 @@ pub(crate) const fn pass(head: usize, groups: usize, keys: usize) -> usize {
     let mut rows = 32;
     while rows / LANES * keys * head * size_of::<bf16>() > super::TRF
         || 2 * (rows / LANES) * groups * keys * size_of::<f32>() > super::VRF
-        || rows / LANES * groups * head * size_of::<f32>() > super::DM / 16
+        || rows / LANES * groups * head * size_of::<f32>() > super::PAGE
     {
         rows /= 2;
     }
@@ -124,7 +124,7 @@ pub(crate) const fn slots(groups: usize, copies: usize) -> usize {
 /// the FP32 terms of `count` row groups of `groups` query groups, each window's, fit one data memory
 /// page.
 pub(crate) const fn holds(head: usize, groups: usize, count: usize, windows: usize) -> bool {
-    windows > 1 && windows * count * groups * (head + LANES) * size_of::<f32>() <= super::DM / 16
+    windows > 1 && windows * count * groups * (head + LANES) * size_of::<f32>() <= super::PAGE
 }
 
 /// Whether a window's keys and values stream past its `groups` query rows of `head` channels and
@@ -144,34 +144,46 @@ pub(crate) const fn overlaps(
     keys: usize,
     pass: (usize, usize, usize),
 ) -> bool {
-    held(head, groups, keys, pass, size_of::<bf16>()) <= 3 * super::DM / 4
+    let (landing, small) = held(head, groups, keys, pass, size_of::<bf16>());
+    2 * landing + small <= 3 * super::DM / 4
 }
 
-/// Whether such a pass, streaming windows of `element`-byte codes, leaves `bytes` of data memory
-/// beside what it holds within the three quarters [`overlaps`] gives attention.
+/// Whether such a pass, streaming windows of `element`-byte codes, leaves data memory for `places`
+/// beside what it holds, counted in pages as the allocator gives them: each landing and each of the
+/// places takes whole pages, while the pass's smaller places share pages with the layer's, which
+/// take an eighth of DM.
 pub(crate) const fn beside(
     head: usize,
     groups: usize,
     keys: usize,
     pass: (usize, usize, usize),
-    (element, bytes): (usize, usize),
+    (element, places): (usize, &[usize]),
 ) -> bool {
-    streams(head, groups) && held(head, groups, keys, pass, element) + bytes <= 3 * super::DM / 4
+    let (landing, small) = held(head, groups, keys, pass, element);
+    let mut pages =
+        2 * landing.div_ceil(super::PAGE) + (small + super::DM / 8).div_ceil(super::PAGE);
+    let mut place = 0;
+    while place < places.len() {
+        pages += places[place].div_ceil(super::PAGE);
+        place += 1;
+    }
+    streams(head, groups) && pages <= super::DM / super::PAGE
 }
 
-/// Data memory such a pass holds with windows of `element`-byte codes: two landings, a fold, the
-/// envelope's attended rows and the copies of its query rows.
+/// Data memory such a pass holds with windows of `element`-byte codes: a window's landing, of which
+/// it keeps two, and its smaller places: a fold, the envelope's attended rows and the copies of its
+/// query rows.
 const fn held(
     head: usize,
     groups: usize,
     keys: usize,
     (rows, envelope, copies): (usize, usize, usize),
     element: usize,
-) -> usize {
-    let landings = 2 * (rows / LANES) * KeyValue::SIZE * keys * head * element;
+) -> (usize, usize) {
+    let landing = (rows / LANES) * KeyValue::SIZE * keys * head * element;
     let folds = 4 * (rows / LANES) * groups * head * size_of::<f32>();
     let envelope = (1 + copies) * envelope.div_ceil(LANES) * groups * head * size_of::<bf16>();
-    landings + folds + envelope
+    (landing, folds + envelope)
 }
 
 /// Shards a window of `keys` keys splits into, one a slice: as many as a cluster's slices hold
