@@ -15,7 +15,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: furiosa-opt-models-rngd4-runner
     # A runner without the checkpoints cached downloads the gate tier first, several minutes.
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       # The inventory and actions come from the tree the test binaries were built from.
       - uses: actions/checkout@v4

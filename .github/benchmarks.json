@@ -101,6 +101,14 @@
       "doc": "qwen3-reranker", "measured_as": "Qwen/Qwen3-0.6B"
     },
     {
+      "id": "nvidia/Llama-3.1-8B-Instruct-NVFP4", "tier": "nightly", "task": "text",
+      "doc": "llama3.1-8b-nvfp4", "revision": "bdb54e24298451af785c0ac63c1b485e9b7400a2",
+      "forward": "llama31_8b_nvfp4_forward",
+      "quantization": {"weights": ["NVFP4"], "activations": ["BF16"]},
+      "serve": ["--kv-cache-dtype", "bfloat16", "--max-model-len", "40960", "--no-enable-prefix-caching"],
+      "download": ["*.json", "*.safetensors"]
+    },
+    {
       "id": "NousResearch/Meta-Llama-3-8B", "tier": "nightly",
       "task": "text",
       "doc": "llama3-8b",

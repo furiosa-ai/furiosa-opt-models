@@ -9,8 +9,8 @@ use crate::ops::normalization::RmsNorm;
 use crate::ops::pointwise::add::Add;
 use crate::ops::rotary::{self, SplitHalf, group::Table};
 use crate::ops::swiglu::{Down, Mlp};
-use crate::tensor::form::Weight;
 use crate::tensor::form::fp8;
+use crate::tensor::form::{BlockScaled, Weight};
 use crate::tensor::parallel::Chip;
 use crate::tensor::scalar::F32;
 use crate::{First, Sequential};
@@ -28,6 +28,35 @@ impl<A: View<N>, B: View<N>, const N: usize> View<N> for (A, B) {
     fn stack(layers: [Self; N], context: &mut Context<'_>) -> Self::Storage {
         let (a, b) = unzip(layers);
         (A::stack(a, context), B::stack(b, context))
+    }
+}
+
+impl<
+    In: AxisName,
+    Out: AxisName,
+    E: Scalar,
+    S: Scalar,
+    B: M,
+    C: View<N>,
+    Chips: M,
+    W: View<N>,
+    T: View<N>,
+    const N: usize,
+> View<N> for BlockScaled<In, Out, E, S, B, C, Chips, W, T>
+{
+    type Storage = <(W, (T, C)) as View<N>>::Storage;
+    type Layer = BlockScaled<In, Out, E, S, B, C::Layer, Chips, W::Layer, T::Layer>;
+
+    fn view(storage: &Self::Storage, layer: usize) -> Self::Layer {
+        let (weight, (scale, contract)) = <(W, (T, C)) as View<N>>::view(storage, layer);
+        BlockScaled::new(weight, scale, contract)
+    }
+
+    fn stack(layers: [Self; N], context: &mut Context<'_>) -> Self::Storage {
+        <(W, (T, C)) as View<N>>::stack(
+            layers.map(|layer| (layer.weight, (layer.weight_scale, layer.contract))),
+            context,
+        )
     }
 }
 

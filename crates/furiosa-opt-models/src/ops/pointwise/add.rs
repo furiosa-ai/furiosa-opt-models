@@ -1,6 +1,6 @@
 //! Elementwise sums, in FP32 and rounded once.
 
-use super::{Float, Window};
+use super::{Flat, Float, Window};
 use crate::Op;
 use crate::load::Load;
 use crate::modules::generic::schedule::{Fill, IntoStream, Slot, Spill, Stream};
@@ -16,6 +16,47 @@ use furiosa_opt_std::prelude::*;
 /// Elementwise sum of two tensors in the same layout.
 #[derive(Clone, Default, DeviceSend, Load)]
 pub struct Add;
+
+/// FP32 partial sums in any common DM layout, streamed together without a VRF-sized
+/// operand or a BF16 rounding. Flattening changes only local axis names.
+impl<'a, 'b, Chips: M, Cluster: M, Slice: M, E: M + 'static>
+    Op<(
+        DmTensorView<'a, f32, Chips, Cluster, Slice, E>,
+        DmTensorView<'b, f32, Chips, Cluster, Slice, E>,
+    )> for Add
+{
+    type Output = DmTensor<f32, Chips, Cluster, Slice, E>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (left, right): (
+            DmTensorView<'a, f32, Chips, Cluster, Slice, E>,
+            DmTensorView<'b, f32, Chips, Cluster, Slice, E>,
+        ),
+    ) -> Self::Output {
+        type Elements<E> = m![{ Symbol<Flat<E>> }];
+        // SAFETY: preserve cluster/slice ownership and contiguous local element order.
+        let left = unsafe { left.reshape::<Chips, Cluster, Slice, Elements<E>>() };
+        let right = unsafe { right.reshape::<Chips, Cluster, Slice, Elements<E>>() };
+        let output: DmTensor<f32, Chips, Cluster, Slice, Elements<E>> =
+            Self::stream::<
+                f32,
+                m![{Elements<E>} / 8, Term],
+                m![{Elements<E>} / 8],
+                m![{Elements<E>} % 8],
+                Term,
+                _,
+                _,
+                _,
+                _,
+            >(device, (left, right))
+            .commit_trim::<m![{Elements<E>} % 8]>()
+            .commit();
+        // SAFETY: inverse of the local flattening above.
+        unsafe { output.reshape() }
+    }
+}
 
 // --8<-- [start:add]
 /// HBM inputs and output retain their element type and physical layout.
@@ -383,6 +424,39 @@ impl AxisName for Term {
 }
 
 impl Add {
+    /// Sum two DM views in FP32 without rounding or allocating. `Fetched` includes the
+    /// two-term `Inputs` axis; `Time` omits it. The caller commits or rounds the stream,
+    /// retaining its layout and any live-row prefix.
+    pub(crate) fn stream<
+        'l,
+        D: MaterializableScalar + FetchCast<f32>,
+        Fetched: M,
+        Time: M,
+        Packet: M,
+        Inputs: AxisName,
+        Chip: M,
+        Cluster: M,
+        Slice: M,
+        Element: M,
+    >(
+        device: &'l mut Device,
+        (left, right): (
+            DmTensorView<'l, D, Chip, Cluster, Slice, Element>,
+            DmTensorView<'l, D, Chip, Cluster, Slice, Element>,
+        ),
+    ) -> VectorFinalTensor<'l, { Tu::Main }, f32, Chip, Cluster, Slice, Time, Packet> {
+        device
+            .main
+            .begin_interleaved::<Inputs, _, _, _, _, _>(left, right)
+            .fetch::<Fetched, Packet>()
+            .fetch_cast::<f32>()
+            .collect::<Fetched, Packet>()
+            .vector_init()
+            .vector_intra_slice_unzip::<Inputs, Time>()
+            .vector_clip_zip(ClipBinaryOpF32::Add)
+            .vector_final()
+    }
+
     /// `left + right` in FP32, rounded once to BF16, the terms read interleaved along `Inputs` in
     /// `Time` packets of `Run` runs of `Packet` values: the stream a caller commits.
     pub(crate) fn of<
@@ -403,18 +477,19 @@ impl Add {
         ),
     ) -> CommitTrimTensor<'l, { Tu::Main }, bf16, Chip, Cluster, Slice, m![{ Time }, { Run }], Packet>
     {
-        device
-            .main
-            .begin_interleaved::<Inputs, _, _, _, _, _>(left.view(), right.view())
-            .fetch::<m![{ Time }, Inputs, { Run }], Packet>()
-            .fetch_cast::<f32>()
-            .collect::<m![{ Time }, Inputs, { Run }], Packet>()
-            .vector_init()
-            .vector_intra_slice_unzip::<Inputs, m![{ Time }, { Run }]>()
-            .vector_clip_zip(ClipBinaryOpF32::Add)
-            .vector_final()
-            .cast::<bf16, m![{ Packet } # 16]>()
-            .commit_trim::<Packet>()
+        Self::stream::<
+            bf16,
+            m![{ Time }, Inputs, { Run }],
+            m![{ Time }, { Run }],
+            Packet,
+            Inputs,
+            _,
+            _,
+            _,
+            _,
+        >(device, (left.view(), right.view()))
+        .cast::<bf16, m![{ Packet } # 16]>()
+        .commit_trim::<Packet>()
     }
 }
 

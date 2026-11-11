@@ -21,11 +21,16 @@ def sglang_args(row: dict[str, Any]) -> list[str] | None:
         return None
     args = list(SGLANG_TASK_ARGS[row["task"]])
     serve = row.get("serve", [])
-    for flag, value in zip(serve[::2], serve[1::2], strict=False):
-        if flag not in SGLANG_FLAG or value == "-1":
+    flags = iter(serve)
+    for flag in flags:
+        if flag == "--no-enable-prefix-caching":
+            args.append("--disable-radix-cache")
+            continue
+        value = next(flags, None)
+        if flag not in SGLANG_FLAG or value is None or value == "-1":
             return None
         args += [SGLANG_FLAG[flag], value]
-    return None if len(serve) % 2 else args
+    return args
 
 
 def model_types(nav: list[Any]) -> dict[str, str]:

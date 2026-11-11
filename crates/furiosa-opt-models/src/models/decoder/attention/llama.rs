@@ -23,6 +23,8 @@ use crate::tensor::form::Weight;
 use crate::tensor::memory::Memory;
 use furiosa_opt_std::prelude::*;
 
+pub mod nvfp4;
+
 // 128256 rows leave each of a head's slices 4008, which split only into 167 passes of 24 rows; 131072
 // leave 4096, 16 passes of 256.
 axes![Vocabulary = 131072, MistralVocabulary = 32768];

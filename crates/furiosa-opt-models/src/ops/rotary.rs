@@ -1874,7 +1874,7 @@ impl<R: AxisName> PairFrequencies<R> {
 pub mod group {
     use super::SplitHalf;
     use crate::Op;
-    use crate::load::{Checkpoint, Children, Context, Load, LoadError};
+    use crate::load::{Checkpoint, Context, Load, LoadError};
     use crate::modules::generic::Either;
     use crate::ops::linear::query::group::Group;
     use crate::ops::linear::query::{Cluster, Tile, fp8};
@@ -1911,31 +1911,37 @@ pub mod group {
         }
     }
 
-    /// Each position's rotation from the config's `rope_theta`: pair `j` of position `p` turns by
-    /// `p theta^(-2j / Head)`, an output half the sum over the input halves of `[[cos, -sin], [sin,
-    /// cos]]` times them, for the positions of `max_position_embeddings` the compiled `Position`
-    /// holds; every position past them rotates to zero.
+    /// Each position's rotation from the configured spectrum, including scaled RoPE. An output
+    /// half is the sum over the input halves of `[[cos, -sin], [sin, cos]]` times them, for the
+    /// positions of `max_position_embeddings` the compiled `Position` holds; later positions
+    /// rotate to zero.
     impl<'a, Head: AxisName, Position: AxisName> Load<&'a Checkpoint>
         for SplitHalf<Head, Table<Position, super::Row<Head>>>
     {
         fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
-            let mut children = Children::default();
-            let theta = children.ask(context.config_number(from, "rope_theta"))?;
-            let positions = children.ask(context.config_number(from, "max_position_embeddings"))?;
-            let (theta, positions) = children.node(theta.zip(positions))?;
-            let frequencies = super::PairFrequencies::<Head>::unscaled::<Head>(theta.1 as f32)
-                .map_err(|error| LoadError::InvalidData {
-                    name: theta.0,
-                    reason: error.to_string(),
-                })?;
-            let (name, positions) = positions;
+            let (name, positions) = context.config_number(from, "max_position_embeddings")?;
             if positions < 1.0 || positions.fract() != 0.0 {
                 return Err(LoadError::InvalidData {
                     name,
                     reason: format!("{positions} is no count of positions"),
                 });
             }
+            let spectrum: crate::models::config::scaling::Spectrum =
+                crate::models::config::parse(from.config()).map_err(|error| {
+                    LoadError::InvalidData {
+                        name: "config.json:rope_scaling".into(),
+                        reason: error.to_string(),
+                    }
+                })?;
+            let frequencies =
+                spectrum
+                    .bind::<Head, Head>()
+                    .map_err(|error| LoadError::Unsupported {
+                        name: "config.json:rope_scaling".into(),
+                        reason: error.to_string(),
+                    })?;
             let positions = positions.min(Position::SIZE as f64);
+            let amplitude = f64::from(frequencies.amplitude());
             let pairs = frequencies.pairs();
             let table = (0..Position::SIZE).flat_map(|position| {
                 pairs.iter().flat_map(move |&frequency| {
@@ -1944,7 +1950,7 @@ pub mod group {
                         true => angle.sin_cos(),
                         false => (0.0, 0.0),
                     };
-                    [cos, -sin, sin, cos].map(|value| bf16::from_f32(value as f32))
+                    [cos, -sin, sin, cos].map(|value| bf16::from_f32((value * amplitude) as f32))
                 })
             });
             let table = HostTensor::<
@@ -2357,7 +2363,12 @@ pub mod group {
         use super::*;
         use crate::load::Checkpoint;
 
-        axes![Position = 4, Head = 8];
+        axes![
+            Position = 4,
+            Head = 8,
+            LlamaHead = 128,
+            LlamaPosition = 8193
+        ];
 
         /// The checkpoint of a config of `rope_theta` and `max_position_embeddings`.
         fn config(config: serde_json::Value) -> Checkpoint {
@@ -2409,6 +2420,56 @@ pub mod group {
                     assert_eq!(name, "config.json:max_position_embeddings")
                 }
                 other => panic!("{other:?} is not `InvalidData`"),
+            }
+        }
+        #[tokio::test(flavor = "current_thread")]
+        #[ignore = "opens a device"]
+        async fn loads_llama3_scaled_rotation_coefficients() {
+            let _lease = crate::tests::DEVICE.lock().await;
+            let config = serde_json::json!({
+                "max_position_embeddings": 131072, "rope_theta": 500000.0,
+                "rope_scaling": {
+                    "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+                    "high_freq_factor": 4.0, "original_max_position_embeddings": 8192,
+                },
+            });
+            let directory = tempfile::tempdir().unwrap();
+            let checkpoint = Checkpoint::new(directory.path(), Some(config)).unwrap();
+            let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+            let rotation: SplitHalf<LlamaHead, Table<LlamaPosition, super::super::Row<LlamaHead>>> =
+                checkpoint.load(&mut device).unwrap();
+            let table = rotation
+                .frequency
+                .to_host::<m![LlamaPosition, { Symbol<super::super::Row<LlamaHead>> }, OutputHalf, InputHalf]>(&mut device.pdma)
+                .await
+                .unwrap()
+                .into_vec();
+            // Published Llama 3.1 rule: preserve short wavelengths, divide long ones by eight,
+            // and interpolate between the original 8192-token context's two thresholds.
+            for position in [0, 1, 1024, 8192] {
+                for pair in 0..64 {
+                    let base = 500_000_f64.powf(-2.0 * pair as f64 / 128.0);
+                    let wavelength = std::f64::consts::TAU / base;
+                    let frequency = if wavelength < 8192.0 / 4.0 {
+                        base
+                    } else if wavelength > 8192.0 {
+                        base / 8.0
+                    } else {
+                        let smooth = (8192.0 / wavelength - 1.0) / 3.0;
+                        (1.0 - smooth) * base / 8.0 + smooth * base
+                    };
+                    let angle = f64::from(position as f32 * frequency as f32);
+                    for (cell, expected) in [angle.cos(), -angle.sin(), angle.sin(), angle.cos()]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        assert_eq!(
+                            table[(position * 64 + pair) * 4 + cell],
+                            bf16::from_f32(expected as f32),
+                            "position={position} pair={pair} cell={cell}",
+                        );
+                    }
+                }
             }
         }
     }
