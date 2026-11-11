@@ -5,13 +5,13 @@ use super::Context;
 use crate::Module;
 use crate::load::{self, Checkpoint, Load, LoadError};
 use crate::modules::language::Selected;
-use crate::ops::index::table::{self, BlockIndex, Derive, Extents, Fields, Logical};
+use crate::ops::index::table::{self, BlockIndex, Call, Derive, Extents, Logical, SegmentTable};
 use crate::ops::linear::query::Tile;
 use crate::ops::rotary::{self, SplitHalf, group};
 use crate::ops::{
     attention::{
         full::paged,
-        gqa::{Cache, Pages},
+        gqa::{Cache, Counted, Pages, RowMajor, Wrap, Wrapped},
         latent::{self, Slot},
     },
     rotary::{Coefficients, PairFrequencies, Rotation},
@@ -30,7 +30,8 @@ use std::marker::PhantomData;
 /// and selected rows, not live rows.
 #[derive(DeviceSend)]
 pub struct History<Segments: AxisName, Blocks: AxisName, Selected: AxisName, Chips: M = Chip> {
-    pub segments: HbmTensor<i32, Chips, m![Segments, Fields]>,
+    /// Each segment's words as [`table::cells`] stages them.
+    pub segments: HbmTensor<i32, Chips, SegmentTable<Segments>>,
     pub blocks: HbmTensor<i32, Chips, m![Blocks]>,
     pub selected: HbmTensor<i32, Chips, m![Selected]>,
     pub extents: HbmTensor<i32, Chips, m![3]>,
@@ -150,11 +151,14 @@ impl<Rows: AxisName, A, B: AxisName, K: AxisName, Env: Copy>
         (tiles, cache): (Live<(), Rows>, &mut (A, History<Rows, B, K>)),
     ) -> Self::Output {
         let history = &cache.1;
+        let call = self
+            .derive
+            .forward(&mut *device, env, &mut (), &history.segments);
         let logical = self.derive.forward(
             &mut *device,
             env,
             &mut (),
-            (&history.segments, &history.blocks),
+            (&call, (&history.segments, &history.blocks)),
         );
         let (positions, write, read) =
             self.geometry
@@ -183,18 +187,18 @@ pub struct Paging<
 > {
     /// The frequency of each coordinate, on every row.
     frequencies: X::Tensor<f32, Chips, m![Rows, Rotated]>,
-    /// The phases and signs that turn each row's angles into its rotation.
-    coefficients: Coefficients<Rotated, Chips, X::Tensor<f32, Chips, m![Rotated]>>,
+    /// The phases and signs that turn each row's angles into its rotation, on every row.
+    coefficients: RowCoefficients<X, Rows, Rotated, Chips>,
     /// Longest visible history in tokens.
     window: X::Tensor<i32, Chips, m![1]>,
     /// The same, on the host.
     visible: Visible,
-    /// Window `w`'s first token, negated: `-512 w` on every row.
+    /// Window `w`'s first block, negated: `-32 w` on every row.
     starts: X::Tensor<i32, Chips, m![Windows, { Packets<Rows> }]>,
     /// Window `w`'s first table row in bytes: `128 w` on every row.
     rows: X::Tensor<i32, Chips, m![Windows, { Packets<Rows> }]>,
-    /// Zero on every row: a past-live row's history length.
-    zeros: X::Tensor<i32, Chips, m![Rows]>,
+    /// Window `w`'s first token, `512 w`, a window a flit.
+    firsts: PerWindow<X, Windows, Chips>,
     /// The middle of each window slot, `t + 1/2`, on every row.
     slots: X::Tensor<f32, Chips, m![Rows, Cache]>,
     shape: PhantomData<fn() -> (Heads, Head, D, Layer)>,
@@ -247,11 +251,11 @@ impl<
 where
     X::Tensor<f32, Chips, m![Rows, Rotated]>:
         Load<HostTensor<f32, m![{ Chips }, { m![Rows, Rotated] }]>>,
-    X::Tensor<f32, Chips, m![Rotated]>: Load<HostTensor<f32, m![{ Chips }, { m![Rotated] }]>>,
     X::Tensor<i32, Chips, m![1]>: Load<HostTensor<i32, m![{ Chips }, { m![1] }]>>,
     X::Tensor<i32, Chips, m![Windows, { Packets<Rows> }]>:
         Load<HostTensor<i32, m![{ Chips }, { m![Windows, { Packets<Rows> }] }]>>,
-    X::Tensor<i32, Chips, m![Rows]>: Load<HostTensor<i32, m![{ Chips }, { m![Rows] }]>>,
+    X::Tensor<i32, Chips, m![Windows, 1 # 8]>:
+        Load<HostTensor<i32, m![{ Chips }, { m![Windows, 1 # 8] }]>>,
     X::Tensor<f32, Chips, m![Rows, Cache]>:
         Load<HostTensor<f32, m![{ Chips }, { m![Rows, Cache] }]>>,
 {
@@ -284,7 +288,14 @@ where
         let visible = Visible(window);
         let window = vec![window as i32; Chips::SIZE];
         let block = (BlockIndex::SIZE * size_of::<i32>()) as i32;
-        let zeros = vec![0; Rows::SIZE * Chips::SIZE];
+        let firsts = (0..Windows::SIZE * 8).map(|at| {
+            if at % 8 == 0 {
+                (at / 8 * Cache::SIZE) as i32
+            } else {
+                0
+            }
+        });
+        let firsts = firsts.collect::<Vec<_>>().repeat(Chips::SIZE);
         let slots =
             (0..Chips::SIZE * Rows::SIZE * Cache::SIZE).map(|at| (at % Cache::SIZE) as f32 + 0.5);
         Ok(Self {
@@ -297,14 +308,14 @@ where
             })?,
             visible,
             starts: cx.field("starts", "starts", |cx| {
-                let starts = windows(&|w| -((w * Cache::SIZE) as i32));
+                let starts = windows(&|w| -((w * BlockIndex::SIZE) as i32));
                 Load::load(cx, HostTensor::from_vec(starts))
             })?,
             rows: cx.field("rows", "rows", |cx| {
                 Load::load(cx, HostTensor::from_vec(windows(&|w| w as i32 * block)))
             })?,
-            zeros: cx.field("zeros", "zeros", |cx| {
-                Load::load(cx, HostTensor::from_vec(zeros))
+            firsts: cx.field("firsts", "firsts", |cx| {
+                Load::load(cx, HostTensor::from_vec(firsts))
             })?,
             slots: cx.field("slots", "slots", |cx| {
                 Load::load(cx, HostTensor::from_vec(slots))
@@ -361,11 +372,10 @@ impl<
     for Paging<Heads, Head, Rows, Windows, D, X, Chips, Rotated, Layer>
 where
     X::Tensor<f32, Chips, m![Rows, Rotated]>: Load<&'a Y::Tensor<f32, Chips, m![Rows, Rotated]>>,
-    X::Tensor<f32, Chips, m![Rotated]>: Load<&'a Y::Tensor<f32, Chips, m![Rotated]>>,
     X::Tensor<i32, Chips, m![1]>: Load<&'a Y::Tensor<i32, Chips, m![1]>>,
     X::Tensor<i32, Chips, m![Windows, { Packets<Rows> }]>:
         Load<&'a Y::Tensor<i32, Chips, m![Windows, { Packets<Rows> }]>>,
-    X::Tensor<i32, Chips, m![Rows]>: Load<&'a Y::Tensor<i32, Chips, m![Rows]>>,
+    X::Tensor<i32, Chips, m![Windows, 1 # 8]>: Load<&'a Y::Tensor<i32, Chips, m![Windows, 1 # 8]>>,
     X::Tensor<f32, Chips, m![Rows, Cache]>: Load<&'a Y::Tensor<f32, Chips, m![Rows, Cache]>>,
 {
     fn load(
@@ -384,7 +394,7 @@ where
             visible: from.visible,
             starts: context.field("starts", "starts", |cx| Load::load(cx, &from.starts))?,
             rows: context.field("rows", "rows", |cx| Load::load(cx, &from.rows))?,
-            zeros: context.field("zeros", "zeros", |cx| Load::load(cx, &from.zeros))?,
+            firsts: context.field("firsts", "firsts", |cx| Load::load(cx, &from.firsts))?,
             slots: context.field("slots", "slots", |cx| Load::load(cx, &from.slots))?,
             shape: PhantomData,
         })
@@ -416,32 +426,40 @@ where
     Windows: AxisName,
     D: Scalar,
     Derive<Rows, Chips, X>: for<'d, 'h> Module<
+            &'h HbmTensor<i32, Chips, SegmentTable<Rows>>,
+            Env,
+            &'d mut (),
+            Output = Call<Rows, Chips>,
+        > + for<'d, 'c, 'h> Module<
             (
-                &'h HbmTensor<i32, Chips, m![Rows, Fields]>,
-                &'h HbmTensor<i32, Chips, m![B]>,
+                &'c Call<Rows, Chips>,
+                (
+                    &'h HbmTensor<i32, Chips, SegmentTable<Rows>>,
+                    &'h HbmTensor<i32, Chips, m![B]>,
+                ),
             ),
             Env,
             &'d mut (),
-            Output = Logical<Rows, Chips>,
+            Output = Logical<'c, Rows, Chips>,
         >,
-    Paging<Heads, Head, Rows, Windows, D, X, Chips, Rotated, Layer>: for<'d, 'l, 'h> Module<
+    Paging<Heads, Head, Rows, Windows, D, X, Chips, Rotated, Layer>: for<'d, 'l, 'c, 'h> Module<
             (
                 Live<(), Rows>,
-                (&'l Logical<Rows, Chips>, &'h History<Rows, B, K, Chips>),
+                (&'l Logical<'c, Rows, Chips>, &'h History<Rows, B, K, Chips>),
             ),
             Env,
             &'d mut (),
             Output = Context<
                 Rotation<Rotated, Chips, Rows>,
                 HbmTensor<i32, Chips, m![Rows]>,
-                Pages<Rows, Windows, Chips>,
+                Pages<Rows, Windows, Chips, Counted<Rows, Chips>>,
             >,
         >,
 {
     type Output = Context<
         Rotation<Rotated, Chips, Rows>,
         HbmTensor<i32, Chips, m![Rows]>,
-        Pages<Rows, Windows, Chips>,
+        Pages<Rows, Windows, Chips, Counted<Rows, Chips>>,
     >;
 
     fn forward(
@@ -452,11 +470,101 @@ where
         (tiles, cache): (Live<(), Rows>, &mut (A, History<Rows, B, K, Chips>)),
     ) -> Self::Output {
         let history = &cache.1;
+        let call = self
+            .derive
+            .forward(&mut *device, env, &mut (), &history.segments);
         let logical = self.derive.forward(
             &mut *device,
             env,
             &mut (),
-            (&history.segments, &history.blocks),
+            (&call, (&history.segments, &history.blocks)),
+        );
+        self.geometry
+            .forward(device, env, &mut (), (tiles, (&logical, history)))
+    }
+}
+
+/// The multi-row paged context of a step whose call's rows another cache group's history gave:
+/// this group's logical rows of them, then this geometry's read form.
+impl<
+    'c,
+    B: AxisName,
+    K: AxisName,
+    A,
+    Heads,
+    Head,
+    Rows,
+    Windows,
+    D,
+    X: Memory,
+    Env: Copy,
+    Chips: M + 'static,
+    Rotated: AxisName,
+    Layer,
+>
+    Module<
+        (
+            Live<(), Rows>,
+            (&'c Call<Rows, Chips>, &mut (A, History<Rows, B, K, Chips>)),
+        ),
+        Env,
+        &mut (),
+    >
+    for Preparation<Rows, Paging<Heads, Head, Rows, Windows, D, X, Chips, Rotated, Layer>, Chips, X>
+where
+    Heads: AxisName,
+    Head: AxisName,
+    Rows: AxisName,
+    Windows: AxisName,
+    D: Scalar,
+    Derive<Rows, Chips, X>: for<'d, 'h> Module<
+            (
+                &'c Call<Rows, Chips>,
+                (
+                    &'h HbmTensor<i32, Chips, SegmentTable<Rows>>,
+                    &'h HbmTensor<i32, Chips, m![B]>,
+                ),
+            ),
+            Env,
+            &'d mut (),
+            Output = Logical<'c, Rows, Chips>,
+        >,
+    Paging<Heads, Head, Rows, Windows, D, X, Chips, Rotated, Layer>: for<'d, 'l, 'h> Module<
+            (
+                Live<(), Rows>,
+                (&'l Logical<'c, Rows, Chips>, &'h History<Rows, B, K, Chips>),
+            ),
+            Env,
+            &'d mut (),
+            Output = Context<
+                Rotation<Rotated, Chips, Rows>,
+                HbmTensor<i32, Chips, m![Rows]>,
+                Pages<Rows, Windows, Chips, Counted<Rows, Chips>>,
+            >,
+        >,
+{
+    type Output = Context<
+        Rotation<Rotated, Chips, Rows>,
+        HbmTensor<i32, Chips, m![Rows]>,
+        Pages<Rows, Windows, Chips, Counted<Rows, Chips>>,
+    >;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        env: Env,
+        _: &mut (),
+        (tiles, (call, cache)): (
+            Live<(), Rows>,
+            (&'c Call<Rows, Chips>, &mut (A, History<Rows, B, K, Chips>)),
+        ),
+    ) -> Self::Output {
+        let history = &cache.1;
+        let logical = self.derive.forward(
+            &mut *device,
+            env,
+            &mut (),
+            (call, (&history.segments, &history.blocks)),
         );
         self.geometry
             .forward(device, env, &mut (), (tiles, (&logical, history)))
@@ -511,16 +619,23 @@ where
     Waves: AxisName,
     W: AxisName,
     Derive<Rows, Chips, X>: for<'d, 'h> Module<
+            &'h HbmTensor<i32, Chips, SegmentTable<Rows>>,
+            Env,
+            &'d mut (),
+            Output = Call<Rows, Chips>,
+        > + for<'d, 'c, 'h> Module<
             (
-                &'h HbmTensor<i32, Chips, m![Rows, Fields]>,
-                &'h HbmTensor<i32, Chips, m![B]>,
+                &'c Call<Rows, Chips>,
+                (
+                    &'h HbmTensor<i32, Chips, SegmentTable<Rows>>,
+                    &'h HbmTensor<i32, Chips, m![B]>,
+                ),
             ),
             Env,
             &'d mut (),
-            Output = Logical<Rows, Chips>,
+            Output = Logical<'c, Rows, Chips>,
         >,
     X::Tensor<f32, Chips, m![Rows, Rotated]>: Borrow<HbmTensor<f32, Chips, m![Rows, Rotated]>>,
-    X::Tensor<f32, Chips, m![Rotated]>: Borrow<HbmTensor<f32, Chips, m![Rotated]>>,
 {
     type Output = Context<
         Rotation<Rotated, Chips, Rows>,
@@ -545,16 +660,19 @@ where
         ),
     ) -> Self::Output {
         let (history, work) = &cache.1;
+        let call = self
+            .derive
+            .forward(&mut *device, env, &mut (), &history.segments);
         let logical = self.derive.forward(
             &mut *device,
             env,
             &mut (),
-            (&history.segments, &history.blocks),
+            (&call, (&history.segments, &history.blocks)),
         );
         let geometry = &self.geometry;
         let frequencies = geometry.frequencies.borrow();
         let positions =
-            table::positions::<Rows, Rotated, _>(device, frequencies, &logical.positions);
+            table::positions::<Rows, Rotated, _>(device, frequencies, &logical.call.positions);
         Context {
             positions: geometry.coefficients.forward(
                 &mut *device,
@@ -564,7 +682,7 @@ where
             ),
             write: table::writes::<Rows, _>(
                 device,
-                &logical.slots,
+                &logical,
                 const { Blocks::<Heads, Head, D, Chips>::ROW_STRIDE },
             ),
             read: work.read::<Rows>(),
@@ -590,7 +708,7 @@ impl<
     Module<
         (
             Live<(), Rows>,
-            (&Logical<Rows, Chips>, &History<G, B, K, Chips>),
+            (&Logical<'_, Rows, Chips>, &History<G, B, K, Chips>),
         ),
         Env,
         &mut (),
@@ -602,17 +720,16 @@ where
     Windows: AxisName,
     D: Scalar,
     X::Tensor<f32, Chips, m![Rows, Rotated]>: Borrow<HbmTensor<f32, Chips, m![Rows, Rotated]>>,
-    X::Tensor<f32, Chips, m![Rotated]>: Borrow<HbmTensor<f32, Chips, m![Rotated]>>,
     X::Tensor<i32, Chips, m![1]>: Borrow<Value<Chips>>,
     X::Tensor<i32, Chips, m![Windows, { Packets<Rows> }]>:
         Borrow<HbmTensor<i32, Chips, m![Windows, { Packets<Rows> }]>>,
-    X::Tensor<i32, Chips, m![Rows]>: Borrow<HbmTensor<i32, Chips, m![Rows]>>,
+    X::Tensor<i32, Chips, m![Windows, 1 # 8]>: Borrow<HbmTensor<i32, Chips, m![Windows, 1 # 8]>>,
     X::Tensor<f32, Chips, m![Rows, Cache]>: Borrow<HbmTensor<f32, Chips, m![Rows, Cache]>>,
 {
     type Output = Context<
         Rotation<Rotated, Chips, Rows>,
         HbmTensor<i32, Chips, m![Rows]>,
-        Pages<Rows, Windows, Chips>,
+        Pages<Rows, Windows, Chips, Counted<Rows, Chips>>,
     >;
 
     fn forward(
@@ -622,21 +739,55 @@ where
         _: &mut (),
         (tiles, (logical, history)): (
             Live<(), Rows>,
-            (&Logical<Rows, Chips>, &History<G, B, K, Chips>),
+            (&Logical<'_, Rows, Chips>, &History<G, B, K, Chips>),
         ),
     ) -> Self::Output {
-        let (starts, frequencies) = (self.starts.borrow(), self.frequencies.borrow());
-        let length = table::live(device, self.zeros.borrow(), tiles, &logical.lengths);
-        let extents = Extents::new(device, (self.window.borrow(), starts), &length);
+        let frequencies = self.frequencies.borrow();
+        let extents = Extents::new(
+            device,
+            (self.window.borrow(), self.starts.borrow()),
+            (logical, tiles),
+        );
         let blocks = extents.table(
             device,
             (self.rows.borrow(), &history.blocks),
-            &logical.tables,
+            logical,
             const { Blocks::<Heads, Head, D, Chips>::BLOCK_STRIDE },
         );
-        let bias = extents.bias(device, (starts, self.slots.borrow()));
+        let bias = extents.bias(device, (self.firsts.borrow(), self.slots.borrow()));
+        // Copied here, once a step, so no layer writes the memory its gathers read their entries
+        // from: that write would sync the cores ahead of each gather.
+        let rows = RowMajor::new::<D>(device, (&blocks, &extents.counts), tiles);
+        let mut offsets = Wrapped::<Rows, Chips>::new();
+        // Only a history past its ring holds tokens to wrap; a group whose ring is its context
+        // never does. The layers take the count read here.
+        let times = extents.wraps.extent::<m![1]>();
+        for _ in 0..times {
+            extents.wrap(
+                device,
+                (&history.blocks, self.slots.borrow()),
+                (
+                    logical,
+                    const {
+                        (
+                            Blocks::<Heads, Head, D, Chips>::BLOCK_STRIDE,
+                            Blocks::<Heads, Head, D, Chips>::ROW_STRIDE,
+                        )
+                    },
+                ),
+                &mut offsets,
+            );
+        }
+        let counts = extents.wrapped(device, logical);
+        // Before the rotation, so the rows of `logical` leave data memory before the paging's last
+        // passes: where the owners after the paging land depends on what is still held there.
+        let write = table::writes::<Rows, _>(
+            device,
+            logical,
+            const { Blocks::<Heads, Head, D, Chips>::ROW_STRIDE },
+        );
         let positions =
-            table::positions::<Rows, Rotated, _>(device, frequencies, &logical.positions);
+            table::positions::<Rows, Rotated, _>(device, frequencies, &logical.call.positions);
         Context {
             positions: self.coefficients.forward(
                 &mut *device,
@@ -644,20 +795,32 @@ where
                 &mut (),
                 (frequencies, &positions),
             ),
-            write: table::writes::<Rows, _>(
-                device,
-                &logical.slots,
-                const { Blocks::<Heads, Head, D, Chips>::ROW_STRIDE },
-            ),
+            write,
             read: Pages {
                 table: blocks,
                 lengths: extents.counts,
                 bias,
                 rest: extents.rest,
+                rows,
+                wrap: (
+                    Wrap {
+                        offsets,
+                        counts,
+                        any: extents.wraps,
+                    },
+                    times,
+                ),
             },
         }
     }
 }
+
+/// One I32 a window in memory `X`, a window a flit.
+type PerWindow<X, Windows, Chips> = <X as Memory>::Tensor<i32, Chips, m![Windows, 1 # 8]>;
+
+/// A rotation's constants in memory `X`, a copy for each of `Rows` rows.
+type RowCoefficients<X, Rows, Rotated, Chips> =
+    Coefficients<Rows, Rotated, Chips, <X as Memory>::Tensor<f32, Chips, m![Rows, Rotated]>>;
 
 #[cfg(test)]
 mod tests {
@@ -806,7 +969,7 @@ mod tests {
             chips(device, &paging.window).await,
             chips(device, &paging.starts).await,
             chips(device, &paging.rows).await,
-            chips(device, &paging.zeros).await,
+            chips(device, &paging.firsts).await,
             chips(device, &paging.slots).await,
         ]
     }

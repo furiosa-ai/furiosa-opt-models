@@ -63,13 +63,14 @@ impl<S: decoder::Attention + Decode + 'static> AxisName for Waves<S> {
 }
 
 /// Block IDs of a call of `R` rows whose every row is a request spanning the whole context of `W`
-/// windows.
+/// windows, from the table row holding its first key: a context that starts within a table row
+/// reaches into one more.
 #[derive(Clone, Debug)]
 pub struct Tables<R, W>(PhantomData<fn() -> (R, W)>);
 
 impl<R: AxisName, W: AxisName> AxisName for Tables<R, W> {
     const NAME: Ident = Ident::new("Tables");
-    const SIZE: usize = R::SIZE * W::SIZE * BlockIndex::SIZE;
+    const SIZE: usize = R::SIZE * (W::SIZE + 1) * BlockIndex::SIZE;
 }
 
 impl<S> Clone for Positions<S> {

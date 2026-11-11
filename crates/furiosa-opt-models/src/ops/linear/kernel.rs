@@ -2,16 +2,20 @@ use crate::tensor::mapping;
 use core::borrow::Borrow;
 use core::marker::PhantomData;
 
-use crate::Op;
 use crate::specialize::contraction::{self, BAND, Routing};
+use crate::{Boundary, Op};
 use furiosa_opt_std::prelude;
 use furiosa_opt_std::prelude::*;
 
 use crate::ops::linear::Groups;
-use crate::ops::linear::{Affine, Linear, Matrix};
+use crate::ops::linear::{Affine, Grouped, Linear, Matrix};
+use crate::ops::normalization::{self, FeatureSlices, Spread};
 use crate::tensor::axis;
 use crate::tensor::live::Live;
 use crate::tensor::mapping::Rows as Layout;
+
+pub(crate) use token::{TokenBanks, Tokens};
+mod token;
 
 /// A projection's tiling: the measured choices and the geometry they fix.
 struct Config {
@@ -152,11 +156,25 @@ impl<In: AxisName, Out: AxisName, Code: Scalar> AxisName for PassCount<In, Out, 
 
 pub(crate) type Passes<In, Out, Code> = Symbol<PassCount<In, Out, Code>>;
 
+#[derive(Clone, Debug)]
+pub struct PartSlots<In, Out, Code>(PhantomData<(In, Out, Code)>);
+
+impl<In: AxisName, Out: AxisName, Code: Scalar> AxisName for PartSlots<In, Out, Code> {
+    const NAME: Ident = Ident::new("PartSlots");
+
+    const SIZE: usize = contraction::slots(In::SIZE / Contraction::<In, Out, Code>::config().chunk);
+}
+
+/// Slices a block's parts take: the parts, padded to a power of two.
+pub(crate) type Slots<In, Out, Code> = Symbol<PartSlots<In, Out, Code>>;
+
 pub(crate) type Input<In, Out, Code, Rows> =
     m![In / ({ Chunk<In, Out, Code> }), Rows, In % ({ Chunk<In, Out, Code> })];
 pub(crate) type Output<In, Out, Code, Rows> =
     m![Out / ({ Block<In, Out, Code> }), Rows, Out % ({ Block<In, Out, Code> })];
 type Parts<In, Out, Code> = m![In / ({ Chunk<In, Out, Code> })];
+/// The part digit of a block's slices, padded to its slots.
+type Parted<In, Out, Code> = m![In / ({ Chunk<In, Out, Code> }) # ({ Slots<In, Out, Code> })];
 type Chunked<In, Out, Code> = m![In % ({ Chunk<In, Out, Code> })];
 
 pub(crate) type Cluster<In, Out, Code> =
@@ -164,20 +182,20 @@ pub(crate) type Cluster<In, Out, Code> =
 
 type Blocks<In, Out, Code> =
     m![Out % ((Out / ({ Carve<In, Out, Code> })) / 2) / ({ Block<In, Out, Code> })];
-type Idle<In, Out, Code> = m![
-    256 / ({ Blocks<In, Out, Code> }) / ({ Parts<In, Out, Code> }) / ({ Padded<In, Out, Code> })
+pub(crate) type Idle<In, Out, Code> = m![
+    256 / ({ Blocks<In, Out, Code> }) / ({ Slots<In, Out, Code> }) / ({ Padded<In, Out, Code> })
 ];
-type ProjectionSlices<In, Out, Code> = m![
+pub(crate) type ProjectionSlices<In, Out, Code> = m![
     Out / (Out / ({ Top<In, Out, Code> })) # ({ Padded<In, Out, Code> }),
     { Blocks<In, Out, Code> },
     1 # ({ Idle<In, Out, Code> }),
-    { Parts<In, Out, Code> }
+    { Parted<In, Out, Code> }
 ];
 pub(crate) type Reduced<In, Out, Code> = m![
     Out / (Out / ({ Top<In, Out, Code> })) # ({ Padded<In, Out, Code> }),
     { Blocks<In, Out, Code> },
     1 # ({ Idle<In, Out, Code> }),
-    1 # ({ Parts<In, Out, Code> })
+    1 # ({ Slots<In, Out, Code> })
 ];
 type SlabIndex<In, Out, Code> = m![Out / (Out / ({ Passes<In, Out, Code> }))];
 type SlabSelected<In, Out, Code> =
@@ -196,14 +214,17 @@ type CellsMut<'a, D, In, Out, Code, Rows, B, X> = DmTensorViewMut<
     X,
     Cluster<In, Out, Code>,
     Reduced<In, Out, Code>,
-    m![
-        { SlabSelected<In, Out, Code> },
-        Rows / B = 1 #{!} (Rows / B),
-        Rows % B,
-        { <D as Rounding>::Packets<m![Out % ({ Block<In, Out, Code> })]> },
-        { <D as Rounding>::Packet<Out> }
-    ],
+    Cells<D, In, Out, Code, Rows, B>,
 >;
+
+/// A slice's cells of [`CellsMut`].
+type Cells<D, In, Out, Code, Rows, B> = m![
+    { SlabSelected<In, Out, Code> },
+    Rows / B = 1 #{!} (Rows / B),
+    Rows % B,
+    { <D as Rounding>::Packets<m![Out % ({ Block<In, Out, Code> })]> },
+    { <D as Rounding>::Packet<Out> }
+];
 
 /// The outputs as `D`: each slab's outputs of each row, in eight-byte packets.
 type Table<D, In, Out, Code, Rows, X> = DmTensor<
@@ -219,7 +240,7 @@ type Table<D, In, Out, Code, Rows, X> = DmTensor<
     ],
 >;
 
-type Resident<In, Out, Code, X = m![1]> = DmTensor<
+pub(super) type Resident<In, Out, Code, X = m![1]> = DmTensor<
     bf16,
     X,
     Cluster<In, Out, Code>,
@@ -242,6 +263,14 @@ impl<In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName> AxisName
         <Chunked<In, Out, Code> as M>::SIZE,
         axis::Lanes::<Rows>::SIZE,
     );
+}
+
+/// An envelope's rows in both banks of the tensor registers, half the envelope a bank, as the
+/// contraction of `In` inputs into `Out` outputs reads them: filled once, they serve every
+/// projection of the same rows whose tiling places each part's inputs on the same slices.
+pub struct Banks<In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName> {
+    low: Lanes<In, Out, Code, Rows, Batch<In, Out, Code, Rows>>,
+    high: Lanes<In, Out, Code, Rows, Batch<In, Out, Code, Rows>>,
 }
 
 /// The rows of an HBM envelope one staging is written beside a resident weight slab.
@@ -325,17 +354,29 @@ type ChunkRows<In, Out, Code, Rows, X = m![1]> = DmTensor<
     m![1, Rows, { Chunked<In, Out, Code> }],
 >;
 
-enum Staged<In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName, X: M = m![1]> {
+/// Rows in their feature slices under a contraction's names, which its ring reads where they lie.
+type Features<'r, In, Out, Code, Rows, X> = DmTensorView<
+    'r,
+    bf16,
+    X,
+    Cluster<In, Out, Code>,
+    FeatureSlices<In>,
+    m![1, Rows, { normalization::Offset<In> }],
+>;
+
+pub(crate) enum Staged<'r, In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName, X: M = m![1]>
+{
     Replicated(Replicated<In, Out, Code, Rows, X>),
     Transposed(Transposed<In, Out, Code, Rows, X>),
     Ring(Ring<In, Out, Code, Rows, X>),
+    Features(Features<'r, In, Out, Code, Rows, X>),
     Chunk(ChunkRows<In, Out, Code, Rows, X>),
 }
 
 /// The route a batch of `B` of the `Rows` takes. A transposed broadcast serves one lane group
 /// only, and a chunk fetch grows with the lanes, so either takes the ring past its reach.
 impl<In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName, X: M>
-    Staged<In, Out, Code, Rows, X>
+    Staged<'_, In, Out, Code, Rows, X>
 {
     const fn route<B: AxisName>() -> Routing {
         match Contraction::<In, Out, Code>::config().routing {
@@ -344,9 +385,32 @@ impl<In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName, X: M>
             routing => routing,
         }
     }
+
+    /// A batch of `B` rows in the ring layout as the lanes of every slice: the switch ring takes
+    /// each slice's sixteen inputs to the slices whose part holds them.
+    fn lanes<B: AxisName, S: M, E: M>(
+        device: &mut Device,
+        rows: DmTensorView<'_, bf16, X, Cluster<In, Out, Code>, S, E>,
+    ) -> Lanes<In, Out, Code, Rows, B, X> {
+        device
+            .sub
+            .begin(rows)
+            .fetch::<m![{ Layout<Rows>::Lanes }, { Count<Rows, B> }], m![In % 16]>()
+            .switch::<ProjectionSlices<In, Out, Code>, m![
+                { Layout<Rows>::Lanes },
+                { Count<Rows, B> },
+                { Chunked<In, Out, Code> } / 16
+            ]>(SwitchConfig::CustomBroadcast { ring_size: 256 })
+            .collect::<m![
+                { Layout<Rows>::Lanes },
+                { Count<Rows, B> },
+                { Chunked<In, Out, Code> } / 16
+            ], m![In % 16]>()
+            .to_trf()
+    }
 }
 
-/// A view of a contraction's input rows, on chip or in HBM, that a stage copies from.
+/// A contraction's input rows, on chip or in HBM, that a stage copies from.
 pub(crate) trait Source {
     type Chips: M;
 
@@ -356,6 +420,19 @@ pub(crate) trait Source {
         into: DmTensorViewMut<'a, bf16, Self::Chips, C, S, E>,
     ) where
         Self: 'a;
+
+    /// The rows as the ring route of a contraction of `In` inputs into `Out` outputs reads them:
+    /// copied by `fill` into a ring layout of their own, unless they already lie in one.
+    fn ring<'a, In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName>(
+        self,
+        device: &mut Device,
+        fill: impl FnOnce(&mut Device, Self) -> Ring<In, Out, Code, Rows, Self::Chips>,
+    ) -> Staged<'a, In, Out, Code, Rows, Self::Chips>
+    where
+        Self: Sized + 'a,
+    {
+        Staged::Ring(fill(device, self))
+    }
 }
 
 impl<'v, X: M, ViewCluster: M, ViewSlices: M, ViewElements: M> Source
@@ -388,12 +465,47 @@ impl<'v, X: M, ViewElements: M> Source for HbmTensorView<'v, bf16, X, ViewElemen
     }
 }
 
-struct Stage<In, Out, Code, Rows, B>(PhantomData<(In, Out, Code, Rows, B)>);
+/// Rows in their feature slices already lie in the ring layout: a ring carries sixteen inputs a
+/// slice, a feature slice's share of every width it carries.
+impl<'v, W: AxisName, R: AxisName, X: M> Source for &'v Spread<W, R, X> {
+    type Chips = X;
 
-impl<In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName, B: AxisName, V: Source> crate::Op<V>
-    for Stage<In, Out, Code, Rows, B>
+    fn copy<'a, C: M, S: M, E: M>(
+        self,
+        device: &mut Device,
+        into: DmTensorViewMut<'a, bf16, X, C, S, E>,
+    ) where
+        Self: 'a,
+    {
+        self.view().to_dm_view(&mut device.tdma, into);
+    }
+
+    fn ring<'a, In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName>(
+        self,
+        _: &mut Device,
+        _: impl FnOnce(&mut Device, Self) -> Ring<In, Out, Code, Rows, X>,
+    ) -> Staged<'a, In, Out, Code, Rows, X>
+    where
+        Self: 'a,
+    {
+        // SAFETY: the same cells under the contraction's names: both physical clusters hold every
+        // row, and the rows and their features keep their order.
+        Staged::Features(unsafe { self.view().reshape() })
+    }
+}
+
+struct Stage<'r, In, Out, Code, Rows, B>(PhantomData<(&'r (), In, Out, Code, Rows, B)>);
+
+impl<'r, In, Out, Code, Rows, B, V> crate::Op<V> for Stage<'r, In, Out, Code, Rows, B>
+where
+    In: AxisName,
+    Out: AxisName,
+    Code: Scalar,
+    Rows: AxisName,
+    B: AxisName,
+    V: Source + 'r,
 {
-    type Output = Staged<In, Out, Code, Rows, V::Chips>;
+    type Output = Staged<'r, In, Out, Code, Rows, V::Chips>;
 
     fn forward(&self, device: &mut Device, input: V) -> Self::Output {
         /// The rows of `input` copied whole into the layout their route reads.
@@ -408,14 +520,14 @@ impl<In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName, B: AxisName, V: 
         match const { Staged::<In, Out, Code, Rows, V::Chips>::route::<B>() } {
             Routing::Replicated => Staged::Replicated(copied(device, input)),
             Routing::Transposed => Staged::Transposed(copied(device, input)),
-            Routing::Ring => Staged::Ring(copied(device, input)),
+            Routing::Ring => input.ring(device, |device, input| copied(device, input)),
             Routing::Chunk => Staged::Chunk(copied(device, input)),
         }
     }
 }
 
 impl<In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName, X: M, B: AxisName>
-    Op<(usize, PhantomData<B>)> for Staged<In, Out, Code, Rows, X>
+    Op<(usize, PhantomData<B>)> for Staged<'_, In, Out, Code, Rows, X>
 {
     type Output = Lanes<In, Out, Code, Rows, B, X>;
 
@@ -470,26 +582,19 @@ impl<In: AxisName, Out: AxisName, Code: Scalar, Rows: AxisName, X: M, B: AxisNam
                 >()
                 .to_trf(),
 
-            Self::Ring(input) => device
-                .sub
-                .begin(input.view().tile::<m![Rows / B], 1, m![
+            Self::Ring(input) => Self::lanes(
+                device,
+                input.view().tile::<m![Rows / B], 1, m![
                     1, Rows / B = 1 # (Rows / B), Rows % B, In % 16
-                ]>(at))
-                .fetch::<m![{ Layout<Rows>::Lanes }, { Count<Rows, B> }], m![In % 16]>()
-                .switch::<ProjectionSlices<In, Out, Code>, m![
-                    { Layout<Rows>::Lanes },
-                    { Count<Rows, B> },
-                    { Chunked<In, Out, Code> } / 16
-                ]>(SwitchConfig::CustomBroadcast { ring_size: 256 })
-                .collect::<
-                    m![
-                        { Layout<Rows>::Lanes },
-                        { Count<Rows, B> },
-                        { Chunked<In, Out, Code> } / 16
-                    ],
-                    m![In % 16],
-                >()
-                .to_trf(),
+                ]>(at),
+            ),
+
+            Self::Features(input) => Self::lanes(
+                device,
+                input.tile::<m![Rows / B], 1, m![
+                    1, Rows / B = 1 # (Rows / B), Rows % B, { normalization::Offset<In> }
+                ]>(at),
+            ),
 
             Self::Chunk(input) => device
                 .sub
@@ -545,6 +650,33 @@ pub(crate) trait Tiling<In: AxisName, Out: AxisName>: 'static {
     ) -> DmTensor<D, X, Self::Cluster, Self::Slices, E>;
 }
 
+/// A weight the contraction reads one slab at a time as its BF16 tile: a [`Matrix`], each slab
+/// decoded where it is stored, or a weight landed in the contraction's tiling before its rows.
+pub(crate) trait Slabs<X: M = m![1]> {
+    type In: AxisName;
+    type Out: AxisName;
+    /// The scalar the weight stores its values in, which fixes the contraction's tiling.
+    type Stored: Scalar;
+
+    /// Slab `at` in BF16.
+    fn slab(
+        &self,
+        device: &mut Device,
+        at: usize,
+    ) -> Resident<Self::In, Self::Out, Self::Stored, X>;
+}
+
+/// A matrix's slab is its slab of the contraction's tiling.
+impl<X: M, W: Matrix<X>> Slabs<X> for W {
+    type In = W::In;
+    type Out = W::Out;
+    type Stored = W::Stored;
+
+    fn slab(&self, device: &mut Device, at: usize) -> Resident<W::In, W::Out, W::Stored, X> {
+        Matrix::slab(self, device, at)
+    }
+}
+
 impl<In, Out, Code, Rows, V, U, W, Group> Op<(Live<PhantomData<Rows>, Rows>, V, Group)>
     for Affine<W, ()>
 where
@@ -554,7 +686,7 @@ where
     Rows: AxisName,
     V: Source<Chips = m![1]>,
     U: Source<Chips = m![1]>,
-    W: Matrix<In = In, Out = Out, Stored = Code>,
+    W: Slabs<In = In, Out = Out, Stored = Code>,
     Group: Fn(usize) -> U,
 {
     type Output = Result<In, Out, Code, Rows>;
@@ -564,13 +696,138 @@ where
         device: &mut Device,
         (live, input, group): (Live<PhantomData<Rows>, Rows>, V, Group),
     ) -> Self::Output {
-        let (first, count) = live.groups::<axis::Lanes<Rows>>();
-        if count == <Groups<Rows> as M>::SIZE {
-            return Contraction::<In, Out, Code>::resident(device, &self.weight, input, |_, _| ());
+        self.forward(device, (live, input, group, (&(), &mut ())))
+    }
+}
+
+/// The same rows, `boundary` running on its state once their staging and the first slab's
+/// restoration are issued, on [`Grouped`] state where fewer than every row group is live: its
+/// transfers queue behind theirs and land while the passes run.
+impl<'b, 's, In, Out, Code, Rows, V, U, W, Group, H, G>
+    Op<(
+        Live<PhantomData<Rows>, Rows>,
+        V,
+        Group,
+        Boundary<'b, 's, H, G>,
+    )> for Affine<W, ()>
+where
+    In: AxisName,
+    Out: AxisName,
+    Code: Scalar,
+    Rows: AxisName,
+    V: Source<Chips = m![1]>,
+    U: Source<Chips = m![1]>,
+    W: Slabs<In = In, Out = Out, Stored = Code>,
+    Group: Fn(usize) -> U,
+    H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()>
+        + for<'g, 'x> crate::Module<Grouped<&'g mut G>, (), &'x mut (), Output = ()>,
+{
+    type Output = Result<In, Out, Code, Rows>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (live, input, group, boundary): (
+            Live<PhantomData<Rows>, Rows>,
+            V,
+            Group,
+            Boundary<'b, 's, H, G>,
+        ),
+    ) -> Self::Output {
+        self.summed::<bf16, _, _, _, _, _, _, _, _, _>(device, (live, input, group, boundary))
+    }
+}
+
+impl<W> Affine<W, ()> {
+    /// The live rows of `input` against every slab, each output's sum over the parts stored once
+    /// where `P` meets them, `boundary` running on its state once their staging and the first
+    /// slab's restoration are issued, on [`Grouped`] state where fewer than every row group is live.
+    pub(crate) fn summed<P, In, Out, Code, Rows, V, U, Group, H, G>(
+        &self,
+        device: &mut Device,
+        (live, input, group, boundary): (
+            Live<PhantomData<Rows>, Rows>,
+            V,
+            Group,
+            Boundary<'_, '_, H, G>,
+        ),
+    ) -> P::Table<Rows, m![1]>
+    where
+        P: Meet<In, Out, Code>,
+        In: AxisName,
+        Out: AxisName,
+        Code: Scalar,
+        Rows: AxisName,
+        V: Source<Chips = m![1]>,
+        U: Source<Chips = m![1]>,
+        W: Slabs<In = In, Out = Out, Stored = Code>,
+        Group: Fn(usize) -> U,
+        H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()>
+            + for<'g, 'x> crate::Module<Grouped<&'g mut G>, (), &'x mut (), Output = ()>,
+    {
+        if live.groups::<axis::Lanes<Rows>>().1 == <Groups<Rows> as M>::SIZE {
+            return self.resident::<P, In, Out, Code, Rows, V, H, G>(device, input, boundary);
         }
+        self.grouped::<P, In, Out, Code, Rows, V, U, Group, H, G>(
+            device,
+            (live, input, group),
+            boundary,
+        )
+    }
+
+    /// Every row of `input`'s envelope, padding rows and all, against every slab, each output's sum
+    /// over the parts stored once where `P` meets them, `boundary` running on its state once the
+    /// staging and the first slab's restoration are issued.
+    pub(crate) fn resident<P, In, Out, Code, Rows, V, H, G>(
+        &self,
+        device: &mut Device,
+        input: V,
+        (boundary, state): Boundary<'_, '_, H, G>,
+    ) -> P::Table<Rows, m![1]>
+    where
+        P: Meet<In, Out, Code>,
+        In: AxisName,
+        Out: AxisName,
+        Code: Scalar,
+        Rows: AxisName,
+        V: Source<Chips = m![1]>,
+        W: Slabs<In = In, Out = Out, Stored = Code>,
+        H: for<'g, 'x> crate::Module<&'g mut G, (), &'x mut (), Output = ()>,
+    {
+        let restored = |device: &mut Device, slab| {
+            if slab == 0 {
+                crate::Module::forward(boundary, device, (), &mut (), &mut *state);
+            }
+        };
+        Contraction::<In, Out, Code>::resident::<P, _, _, _, _>(device, &self.weight, input, restored)
+    }
+
+    /// The live lane groups of `input`'s rows, each staged from where `group` reads it and
+    /// contracted alone against every slab, each sum stored where `P` meets the parts, `boundary`
+    /// running on its [`Grouped`] state once the staging and the first slab's restoration are
+    /// issued: the projection of rows of which fewer than every row group are live.
+    pub(crate) fn grouped<P, In, Out, Code, Rows, V, U, Group, H, G>(
+        &self,
+        device: &mut Device,
+        (live, input, group): (Live<PhantomData<Rows>, Rows>, V, Group),
+        (boundary, state): Boundary<'_, '_, H, G>,
+    ) -> P::Table<Rows, m![1]>
+    where
+        P: Meet<In, Out, Code>,
+        In: AxisName,
+        Out: AxisName,
+        Code: Scalar,
+        Rows: AxisName,
+        V: Source<Chips = m![1]>,
+        U: Source<Chips = m![1]>,
+        W: Slabs<In = In, Out = Out, Stored = Code>,
+        Group: Fn(usize) -> U,
+        H: for<'g, 'x> crate::Module<Grouped<&'g mut G>, (), &'x mut (), Output = ()>,
+    {
+        let (first, count) = live.groups::<axis::Lanes<Rows>>();
         /// The lane groups the live rows touch, each copied from where `group` reads it into its
         /// tile `T` of the layout their route reads.
-        fn grouped<Rows: AxisName, T: M, U: Source, C: M, S: M, E: M>(
+        fn staged<Rows: AxisName, T: M, U: Source, C: M, S: M, E: M>(
             device: &mut Device,
             live: &Live<PhantomData<Rows>, Rows>,
             (group, _): (&impl Fn(usize) -> U, PhantomData<T>),
@@ -587,7 +844,7 @@ where
             rows
         }
         let rows = match const { Staged::<In, Out, Code, Rows>::route::<axis::Lanes<Rows>>() } {
-            Routing::Replicated => Staged::Replicated(grouped(
+            Routing::Replicated => Staged::Replicated(staged(
                 device,
                 &live,
                 (
@@ -595,7 +852,7 @@ where
                     PhantomData::<Layout<Rows>::GroupMut<Chunked<In, Out, Code>>>,
                 ),
             )),
-            Routing::Transposed => Staged::Transposed(grouped(
+            Routing::Transposed => Staged::Transposed(staged(
                 device,
                 &live,
                 (
@@ -603,15 +860,17 @@ where
                     PhantomData::<m![1, { Layout<Rows>::SelectedMut }, In % ({ Packet<Rows> })]>,
                 ),
             )),
-            Routing::Ring => Staged::Ring(grouped(
-                device,
-                &live,
-                (
-                    &group,
-                    PhantomData::<m![1, { Layout<Rows>::GroupMut<m![In % 16]> }]>,
-                ),
-            )),
-            Routing::Chunk => Staged::Chunk(grouped(
+            Routing::Ring => input.ring(device, |device, _| {
+                staged(
+                    device,
+                    &live,
+                    (
+                        &group,
+                        PhantomData::<m![1, { Layout<Rows>::GroupMut<m![In % 16]> }]>,
+                    ),
+                )
+            }),
+            Routing::Chunk => Staged::Chunk(staged(
                 device,
                 &live,
                 (
@@ -620,16 +879,20 @@ where
                 ),
             )),
         };
-        let mut result = DmTensor::new();
+        let mut result = P::table();
         #[unroll]
         for slab in 0..<Passes<In, Out, Code> as M>::SIZE {
-            let weight = self.weight.tile::<Contraction<In, Out, Code>>(device, slab);
+            let weight = self.weight.slab(device, slab);
+            if slab == 0 {
+                crate::Module::forward(boundary, &mut *device, (), &mut (), Grouped(&mut *state));
+            }
             for at in 0..count {
                 let group = first + at;
                 let lanes = rows.forward(&mut *device, (group, PhantomData::<axis::Lanes<Rows>>));
-                Contraction::<In, Out, Code>::store::<_, axis::Lanes<Rows>, _, bf16, _>(
+                P::pass::<_, axis::Lanes<Rows>, _, _>(
+                    device,
+                    (&weight, &lanes),
                     &(),
-                    Contraction::<In, Out, Code>::sums(device, &weight, &lanes),
                     &mut result,
                     (slab, group),
                 );
@@ -797,7 +1060,7 @@ where
     Window: AxisName,
     S: Stored<Rows = Rows>,
     O: Stored<Rows = Window>,
-    W: Matrix<In = In, Out = Out>,
+    W: Slabs<In = In, Out = Out>,
 {
     type Output = ();
 
@@ -939,8 +1202,69 @@ impl<In: AxisName, Out: AxisName, Code: Scalar> Tiling<In, Out> for Contraction<
     }
 }
 
-/// Output rows of a block one restoration scales: a power of two dividing the block, at most 64,
-/// so their FP32 scales take at most 2 KiB of the VRF.
+/// A weight in HBM as the contraction's slices hold it, each slice's tile of a slab after the one
+/// before: a transfer reads each tile as one run of HBM, faster than a part of every row.
+pub(crate) type Tiles<In, Out, Code> = m![
+    Out / ({ Block<In, Out, Code> }),
+    In / ({ Chunk<In, Out, Code> }),
+    Out % ({ Block<In, Out, Code> }),
+    In % ({ Chunk<In, Out, Code> })
+];
+
+/// Every slab of a weight tensor on slices `P` of the contraction, every part's unless named, a
+/// slice keeping `E` of each slab, the slab outermost.
+pub(super) type Landing<D, In, Out, Code, E, P = ProjectionSlices<In, Out, Code>> =
+    DmTensor<D, m![1], Cluster<In, Out, Code>, P, m![{ SlabIndex<In, Out, Code> }, { E }]>;
+
+/// One slab of a [`Landing`], chosen from its slabs.
+pub(super) type Slab<In, Out, Code> =
+    m![{ SlabIndex<In, Out, Code> } = 1 # ({ SlabIndex<In, Out, Code> })];
+
+impl<In: AxisName, Out: AxisName, Code: Scalar> Contraction<In, Out, Code> {
+    /// Every slab of a tensor laid out as `S`, `[Out, K]` or [`Tiles`], into `landing` in one
+    /// transfer, a slice keeping `E`, its rows' share of `K`, of each.
+    pub(super) fn land<D: MaterializableScalar, S: M, E: M, P: M>(
+        device: &mut Device,
+        tensor: &HbmTensor<D, m![1], S>,
+        landing: &mut Landing<D, In, Out, Code, E, P>,
+    ) {
+        const { Self::TILED };
+        tensor
+            .view()
+            .to_dm_view(&mut device.tdma, landing.view_mut());
+    }
+
+    /// Slab `at` of a tensor held as [`Tiles`], a slice keeping `E` of it.
+    pub(super) fn slab<D: MaterializableScalar, X: M, E: M>(
+        device: &mut Device,
+        tensor: &HbmTensor<D, X, Tiles<In, Out, Code>>,
+        at: usize,
+    ) -> DmTensor<D, X, Cluster<In, Out, Code>, ProjectionSlices<In, Out, Code>, E> {
+        const { Self::TILED };
+        tensor
+            .view()
+            .tile::<SlabIndex<In, Out, Code>, 1, m![
+                Out % (Out / ({ Passes<In, Out, Code> })) / ({ Block<In, Out, Code> })
+                    # (Out / ({ Block<In, Out, Code> })),
+                In / ({ Chunk<In, Out, Code> }),
+                Out % ({ Block<In, Out, Code> }),
+                In % ({ Chunk<In, Out, Code> })
+            ]>(at)
+            .to_dm(&mut device.tdma)
+    }
+
+    /// Slab `at` of a tensor landed whole.
+    pub(super) fn landed<D: Scalar, E: M, P: M>(
+        landing: &Landing<D, In, Out, Code, E, P>,
+        at: usize,
+    ) -> DmTensorView<'_, D, m![1], Cluster<In, Out, Code>, P, m![{ Slab<In, Out, Code> }, { E }]>
+    {
+        landing.view().tile::<SlabIndex<In, Out, Code>, 1, _>(at)
+    }
+}
+
+/// Output rows of a block one restoration scales: the most dividing the block, at most 64, so
+/// their FP32 scales take at most 2 KiB of the VRF.
 #[derive(Clone, Debug)]
 pub(crate) struct RestoredRows<In, Out, Code>(PhantomData<(In, Out, Code)>);
 
@@ -1077,13 +1401,13 @@ impl<In: AxisName, Out: AxisName, Code: Scalar> Contraction<In, Out, Code> {
     }
 
     /// Every batch of `B` of the staged rows against weight slab `slab`, each batch's sums plus
-    /// `offset` stored as `D` in its cells of `result`.
-    fn batches<Rows: AxisName, B: AxisName, X: M, D: Rounding, F>(
+    /// `offset` stored in its cells of `result`, where `P` meets the parts.
+    fn batches<Rows: AxisName, B: AxisName, X: M, P: Meet<In, Out, Code>, F>(
         device: &mut Device,
-        rows: &Staged<In, Out, Code, Rows, X>,
+        rows: &Staged<'_, In, Out, Code, Rows, X>,
         weight: &Resident<In, Out, Code, X>,
         offset: &F,
-        result: &mut Table<D, In, Out, Code, Rows, X>,
+        result: &mut P::Table<Rows, X>,
         slab: usize,
     ) where
         F: Offset<X, Cluster<In, Out, Code>, ProjectionSlices<In, Out, Code>>,
@@ -1091,35 +1415,30 @@ impl<In: AxisName, Out: AxisName, Code: Scalar> Contraction<In, Out, Code> {
         #[unroll]
         for at in 0..<m![Rows / ({ Symbol<B> })] as M>::SIZE {
             let lanes = rows.forward(&mut *device, (at, PhantomData::<B>));
-            Self::store::<Rows, B, X, D, F>(
-                offset,
-                Self::sums(device, weight, &lanes),
-                result,
-                (slab, at),
-            );
+            P::pass::<Rows, B, X, F>(device, (weight, &lanes), offset, result, (slab, at));
         }
     }
 
     /// Every row of `input`, staged once, against every slab of `weight` plus that slab's
-    /// `offsets(device, slab)`, each output rounded once to BF16.
-    fn resident<Rows: AxisName, V: Source, W, F>(
+    /// `offsets(device, slab)`, each output's sum stored once where `P` meets the parts.
+    fn resident<P: Meet<In, Out, Code>, Rows: AxisName, V: Source, W, F>(
         device: &mut Device,
         weight: &W,
         input: V,
         mut offsets: impl FnMut(&mut Device, usize) -> F,
-    ) -> Result<In, Out, Code, Rows, V::Chips>
+    ) -> P::Table<Rows, V::Chips>
     where
-        W: Matrix<V::Chips, In = In, Out = Out, Stored = Code>,
+        W: Slabs<V::Chips, In = In, Out = Out, Stored = Code>,
         F: Offset<V::Chips, Cluster<In, Out, Code>, ProjectionSlices<In, Out, Code>>,
     {
         let rows = Stage::<In, Out, Code, Rows, Batch<In, Out, Code, Rows>>(PhantomData)
             .forward(&mut *device, input);
-        let mut result = DmTensor::new();
+        let mut result = P::table();
         #[unroll]
         for slab in 0..<Passes<In, Out, Code> as M>::SIZE {
-            let weight = weight.tile::<Self>(device, slab);
+            let weight = weight.slab(device, slab);
             let offset = offsets(device, slab);
-            Self::batches::<_, Batch<In, Out, Code, Rows>, _, bf16, _>(
+            Self::batches::<_, Batch<In, Out, Code, Rows>, _, P, _>(
                 device,
                 &rows,
                 &weight,
@@ -1127,6 +1446,147 @@ impl<In: AxisName, Out: AxisName, Code: Scalar> Contraction<In, Out, Code> {
                 &mut result,
                 slab,
             );
+        }
+        result
+    }
+
+    /// Every row of `input`, padding and all, against every slab of `weight`, each output rounded
+    /// once to BF16, as [`Self::resident`] contracts them: the first slab fills each bank of the
+    /// registers beside its contraction of the bank before, and both banks stay filled for every
+    /// congruent projection of the same rows.
+    pub(crate) fn kept<Rows: AxisName, V: Source<Chips = m![1]>, S>(
+        device: &mut Device,
+        weight: &S,
+        input: V,
+    ) -> (Result<In, Out, Code, Rows>, Banks<In, Out, Code, Rows>)
+    where
+        S: Slabs<In = In, Out = Out, Stored = Code>,
+    {
+        type Half<In, Out, Code, Rows> = Batch<In, Out, Code, Rows>;
+        const {
+            assert!(
+                Rows::SIZE == 2 * <Half<In, Out, Code, Rows> as AxisName>::SIZE,
+                "a bank holds half the envelope"
+            )
+        };
+        let rows = Stage::<In, Out, Code, Rows, Half<In, Out, Code, Rows>>(PhantomData)
+            .forward(&mut *device, input);
+        let mut result = DmTensor::new();
+        let first = weight.slab(device, 0);
+        let low = rows.forward(&mut *device, (0, PhantomData));
+        let sums = Self::sums(device, &first, &low);
+        Self::store::<Rows, Half<In, Out, Code, Rows>, m![1], bf16, _>(
+            &(),
+            sums,
+            &mut result,
+            (0, 0),
+        );
+        let high = rows.forward(&mut *device, (1, PhantomData));
+        let sums = Self::sums(device, &first, &high);
+        Self::store::<Rows, Half<In, Out, Code, Rows>, m![1], bf16, _>(
+            &(),
+            sums,
+            &mut result,
+            (0, 1),
+        );
+        #[unroll]
+        for slab in 1..<Passes<In, Out, Code> as M>::SIZE {
+            let weight = weight.slab(device, slab);
+            let sums = Self::sums(device, &weight, &low);
+            Self::store::<Rows, Half<In, Out, Code, Rows>, m![1], bf16, _>(
+                &(),
+                sums,
+                &mut result,
+                (slab, 0),
+            );
+            let sums = Self::sums(device, &weight, &high);
+            Self::store::<Rows, Half<In, Out, Code, Rows>, m![1], bf16, _>(
+                &(),
+                sums,
+                &mut result,
+                (slab, 1),
+            );
+        }
+        (result, Banks { low, high })
+    }
+
+    /// Whether this tiling places each part's inputs on the same slices as the tiling of `W`
+    /// outputs: as many clusters and slices, the same parts of the inputs, the parts innermost.
+    const fn congruent<W: AxisName>() -> bool {
+        <Cluster<In, Out, Code> as M>::SIZE == <Cluster<In, W, Code> as M>::SIZE
+            && <ProjectionSlices<In, Out, Code> as M>::SIZE
+                == <ProjectionSlices<In, W, Code> as M>::SIZE
+            && <Parts<In, Out, Code> as M>::SIZE == <Parts<In, W, Code> as M>::SIZE
+            && <Chunk<In, Out, Code> as M>::SIZE == <Chunk<In, W, Code> as M>::SIZE
+    }
+
+    /// Every row of `banks`, filled as the congruent tiling of `W` outputs reads them, against
+    /// every slab of `weight`, each output rounded once to BF16.
+    pub(crate) fn banked<Rows: AxisName, W: AxisName, S>(
+        device: &mut Device,
+        weight: &S,
+        banks: &Banks<In, W, Code, Rows>,
+    ) -> Result<In, Out, Code, Rows>
+    where
+        S: Slabs<In = In, Out = Out, Stored = Code>,
+    {
+        const {
+            assert!(
+                Self::congruent::<W>(),
+                "the tilings place each part's inputs on the same slices"
+            )
+        };
+        type Filled<In, W, Code, Rows> = Batch<In, W, Code, Rows>;
+        let mut result = DmTensor::new();
+        #[unroll]
+        for slab in 0..<Passes<In, Out, Code> as M>::SIZE {
+            // SAFETY: congruent tilings hold a slice's weight rows in the same order under either
+            // tiling's names, and its inputs are the part the bank's lanes hold.
+            let weight: DmTensor<
+                bf16,
+                m![1],
+                Cluster<In, W, Code>,
+                ProjectionSlices<In, W, Code>,
+                m![Out % ({ Block<In, Out, Code> }), In % ({ Chunk<In, W, Code> })],
+            > = unsafe { weight.slab(device, slab).reshape() };
+            let mut bank = |device: &mut Device,
+                            lanes: &Lanes<In, W, Code, Rows, Filled<In, W, Code, Rows>>,
+                            at: usize| {
+                let cells = Self::cells::<Rows, Filled<In, W, Code, Rows>, m![1], bf16>(
+                    &mut result,
+                    slab,
+                    at,
+                );
+                // SAFETY: as the slab's, the cells' clusters and slices under the band's names.
+                let cells = unsafe {
+                    cells.reshape::<
+                        m![1],
+                        Cluster<In, W, Code>,
+                        Reduced<In, W, Code>,
+                        Cells<bf16, In, Out, Code, Rows, Filled<In, W, Code, Rows>>,
+                    >()
+                };
+                bf16::finish::<
+                    Reduced<In, W, Code>,
+                    m![Out % ({ Block<In, Out, Code> }), { Count<Rows, Filled<In, W, Code, Rows>> }],
+                    Layout<Rows>::Lanes,
+                    m![
+                        { <bf16 as Rounding>::Packets<m![Out % ({ Block<In, Out, Code> })]> },
+                        { Count<Rows, Filled<In, W, Code, Rows>> },
+                        { Layout<Rows>::Lanes }
+                    ],
+                    <bf16 as Rounding>::Packet<Out>,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                >(&(), Self::sums(device, &weight, lanes), cells);
+            };
+            bank(&mut *device, &banks.low, 0);
+            bank(&mut *device, &banks.high, 1);
         }
         result
     }
@@ -1210,6 +1670,144 @@ impl<X: M, C: M, S: M, E: M> Offset<X, C, S> for VrfTensor<f32, X, C, S, E> {
             .vector_clip(ClipBinaryOpF32::Add, self)
             .vector_inter_slice_reduce::<Target, Reduced>(InterSliceReduceOpF32::Add)
             .vector_final()
+    }
+}
+
+/// Where a pass's FP32 sums land once its parts meet: each block's on the slice of its first
+/// part, as a [`Rounding`] stores them, or [`Scattered`] over the slices of its parts.
+pub(crate) trait Meet<In: AxisName, Out: AxisName, Code: Scalar> {
+    /// Every slab's sums of `Rows` rows where they land.
+    type Table<Rows: AxisName, X: M>;
+
+    /// The place the sums land in.
+    fn table<Rows: AxisName, X: M>() -> Self::Table<Rows, X>;
+
+    /// Slab `slab` of `weight` against batch `at` of `B` rows, `lanes`, plus `offset`: its sums
+    /// where they land in `table`.
+    fn pass<Rows: AxisName, B: AxisName, X: M, F>(
+        device: &mut Device,
+        operands: Operands<'_, In, Out, Code, Rows, B, X>,
+        offset: &F,
+        table: &mut Self::Table<Rows, X>,
+        cells: (usize, usize),
+    ) where
+        F: Offset<X, Cluster<In, Out, Code>, ProjectionSlices<In, Out, Code>>;
+}
+
+impl<In: AxisName, Out: AxisName, Code: Scalar, D: Rounding> Meet<In, Out, Code> for D {
+    type Table<Rows: AxisName, X: M> = Table<D, In, Out, Code, Rows, X>;
+
+    fn table<Rows: AxisName, X: M>() -> Self::Table<Rows, X> {
+        DmTensor::new()
+    }
+
+    fn pass<Rows: AxisName, B: AxisName, X: M, F>(
+        device: &mut Device,
+        (weight, lanes): Operands<'_, In, Out, Code, Rows, B, X>,
+        offset: &F,
+        table: &mut Self::Table<Rows, X>,
+        (slab, at): (usize, usize),
+    ) where
+        F: Offset<X, Cluster<In, Out, Code>, ProjectionSlices<In, Out, Code>>,
+    {
+        Contraction::<In, Out, Code>::store::<Rows, B, X, D, F>(
+            offset,
+            Contraction::<In, Out, Code>::sums(device, weight, lanes),
+            table,
+            (slab, at),
+        );
+    }
+}
+
+/// A pass's weight slab and its batch's lanes.
+type Operands<'o, In, Out, Code, Rows, B, X> = (
+    &'o Resident<In, Out, Code, X>,
+    &'o Lanes<In, Out, Code, Rows, B, X>,
+);
+
+/// FP32 sums each block lands over the slices of its parts, the sixteen outputs a part's index
+/// names on its slice: where a block holds one chunk of sixteen a part, a feature slice each.
+pub(crate) struct Scattered;
+
+/// The slices a block's sums land over: its parts', each the chunk of sixteen its index names.
+pub(crate) type Scatter<In, Out, Code> = m![
+    Out / (Out / ({ Top<In, Out, Code> })) # ({ Padded<In, Out, Code> }),
+    { Blocks<In, Out, Code> },
+    1 # ({ Idle<In, Out, Code> }),
+    Out % ({ Block<In, Out, Code> }) / 16 # ({ Slots<In, Out, Code> })
+];
+
+impl<In: AxisName, Out: AxisName, Code: Scalar> Meet<In, Out, Code> for Scattered {
+    type Table<Rows: AxisName, X: M> = DmTensor<
+        f32,
+        X,
+        Cluster<In, Out, Code>,
+        Scatter<In, Out, Code>,
+        m![{ SlabIndex<In, Out, Code> }, Rows, Out % 16 / 2, Out % 2],
+    >;
+
+    fn table<Rows: AxisName, X: M>() -> Self::Table<Rows, X> {
+        DmTensor::new()
+    }
+
+    fn pass<Rows: AxisName, B: AxisName, X: M, F>(
+        device: &mut Device,
+        (weight, lanes): Operands<'_, In, Out, Code, Rows, B, X>,
+        offset: &F,
+        table: &mut Self::Table<Rows, X>,
+        (slab, at): (usize, usize),
+    ) where
+        F: Offset<X, Cluster<In, Out, Code>, ProjectionSlices<In, Out, Code>>,
+    {
+        const {
+            assert!(
+                OutputBlock::<In, Out, Code>::SIZE == 16 * PartSlots::<In, Out, Code>::SIZE,
+                "a block holds a chunk of sixteen outputs a part"
+            )
+        };
+        type Chunks<In, Out, Code> = m![Out % ({ Block<In, Out, Code> }) / 16, Out % 16];
+        let sums = Contraction::<In, Out, Code>::contract::<
+            Segment,
+            bf16,
+            Chunks<In, Out, Code>,
+            Chunked<In, Out, Code>,
+            Count<Rows, B>,
+            Layout<Rows>::Lanes,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        >(device, weight, lanes);
+        let cells = (table.view_mut())
+            .tile::<SlabIndex<In, Out, Code>, 1, m![
+                { SlabSelected<In, Out, Code> },
+                Rows,
+                Out % 16 / 2,
+                Out % 2
+            ]>(slab)
+            .tile::<m![Rows / B], 1, m![
+                { SlabSelected<In, Out, Code> },
+                Rows / B = 1 #{!} (Rows / B),
+                Rows % B,
+                Out % 16 / 2,
+                Out % 2
+            ]>(at);
+        f32::finish::<
+            Scatter<In, Out, Code>,
+            m![Out % 16, { Count<Rows, B> }],
+            Layout<Rows>::Lanes,
+            m![Out % 16 / 2, { Count<Rows, B> }, { Layout<Rows>::Lanes }],
+            m![Out % 2],
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        >(offset, sums, cells);
     }
 }
 
@@ -1352,7 +1950,7 @@ impl<'i, In: AxisName, Out: AxisName, Rows: AxisName, Chips: M, S: M, E: M, X: M
             DmTensorView<'i, bf16, X, Chips, S, E>,
         ),
     ) -> Self::Output {
-        Contraction::<In, Out>::resident(
+        Contraction::<In, Out>::resident::<bf16, _, _, _, _>(
             device,
             weight,
             input,

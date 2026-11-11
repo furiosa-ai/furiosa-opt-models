@@ -3,13 +3,15 @@
 //!
 //! - Code times block scale is exact in BF16. The tensor scale divides each restored coefficient
 //!   before its one BF16 rounding ([`Early`]), or multiplies the reduced FP32 sum once ([`Late`]),
-//!   as a block-scaled FP4 product does.
+//!   as a block-scaled FP4 product does. [`Summed`], an experimental contract, reads an early
+//!   checkpoint's tensor scale and divides the reduced FP32 sum by it, so no coefficient rounds.
 //! - [`W4A4`] inputs quantize as the weights do: a 16-input block's E4M3 scale comes from its
 //!   largest magnitude under the input's FP32 tensor scale, and its codes round to nearest even,
 //!   bit for bit as the reference quantizer `ref_nvfp4_quant` does. [`W4A16`] inputs stay BF16.
 //!
 //! Source: <https://github.com/vllm-project/vllm/blob/ee0da84ab9e04ac7610e28580af62c365e898389/vllm/model_executor/layers/quantization/utils/nvfp4_emulation_utils.py>.
 
+use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
 use furiosa_opt_std::runtime::HostBuffer;
 use safetensors::Dtype;
@@ -18,17 +20,21 @@ use crate::load::{Checkpoint, Children, Context, Load, LoadError};
 use crate::tensor::memory::{Hbm, Memory};
 use crate::tensor::parallel::Chip;
 
-/// FP32 scalar in the first lane of an eight-element padded vector.
-pub type Scale = HbmTensor<f32, Chip, m![1 # 8]>;
+/// FP32 scalar in the first lane of an eight-element padded vector, laid out in HBM as `S`: one
+/// copy, or [`Copies`](crate::tensor::scalar::Copies) of it.
+pub type Scale<S = m![1 # 8]> = HbmTensor<f32, Chip, S>;
 
 /// A [`Scale`] held in memory `X`.
-pub type Held<X> = <X as Memory>::Tensor<f32, Chip, m![1 # 8]>;
+pub type Held<X, S = m![1 # 8]> = <X as Memory>::Tensor<f32, Chip, S>;
 
 /// One E4M3 scale for each 16 consecutive inputs of an output row.
 pub type Scales<In, Out> = m![Out, In / 16];
 
 /// The host value of a weight's [`Scales`] on every chip of `C`.
-pub(crate) type BlockScales<In, Out, C = Chip> = HostTensor<f8e4m3, m![{ C }, { Scales<In, Out> }]>;
+pub type BlockScales<In, Out, C = Chip> = HostTensor<f8e4m3, m![{ C }, { Scales<In, Out> }]>;
+
+/// The host value of a weight's tensor scale: its FP32 value in the first lane of a packet.
+pub type Global = HostTensor<f32, m![1 # 8]>;
 
 /// Each restored coefficient divided by the tensor scale before its one BF16 rounding, inputs in
 /// form `A`: a compressed-tensors checkpoint's `weight_global_scale`.
@@ -41,6 +47,37 @@ pub struct Early<A, X: Memory = Hbm> {
     #[load(rename = "weight_global_scale")]
     pub global: Held<X>,
 }
+
+/// The reduced FP32 sum divided by the tensor scale once, inputs in form `A`: an early checkpoint's
+/// `weight_global_scale` under the late contract's arithmetic. Experimental: a row projected this
+/// way differs from [`Early`]'s in the rounding of each coefficient, which it leaves out. The order
+/// the sum adds a row's blocks follows how many rows a launch holds, so a row's outputs may change
+/// in their last bits with the rows beside it. A launch's projected rows end where `P` places
+/// them: in the feature slices ([`Features`]), there from both clusters' partial sums
+/// ([`Exchanged`]), or kept where their passes summed them for elementwise steps and a next summed
+/// projection to read there. HBM holds the tensor scale laid out as `S`, a [`Scale`]'s.
+#[derive(DeviceSend, Load)]
+pub struct Summed<A, X: Memory = Hbm, P = Features, S: M + 'static = m![1 # 8]> {
+    /// The form inputs enter the contraction in.
+    #[load(rename = "")]
+    pub input: A,
+    /// The tensor scale the reduced sum divides by: an output is `sum(code * block scale * x) /
+    /// global`.
+    #[load(rename = "weight_global_scale")]
+    pub global: Held<X, S>,
+    /// Where a launch's projected rows end.
+    pub place: PhantomData<P>,
+}
+
+/// A launch's projected rows in the output's feature slices, where every reader takes them.
+#[derive(Clone, Debug)]
+pub struct Features;
+
+/// A launch's projected rows in the output's feature slices, each cluster's partial sums over its
+/// half of the inputs exchanged and added there: rows a projection kept split over the clusters
+/// project where they lie. A channel-scaled weight's contract by this name reads BF16 rows.
+#[derive(Clone, Copy, Debug, Default, DeviceSend, Load)]
+pub struct Exchanged;
 
 /// The reduced FP32 sum times the tensor scales once, inputs in form `A`.
 #[derive(DeviceSend, Load)]
@@ -195,6 +232,13 @@ pub(crate) fn codes<C: M + 'static, S: M + 'static>(
             name,
             reason: error.to_string(),
         }
+    })
+}
+
+/// The tensor scale beside the context's name, `weight_global_scale`, on host.
+pub(crate) fn global(from: &Checkpoint, context: &mut Context<'_>) -> Result<Global, LoadError> {
+    context.field("global", "weight_global_scale", |cx| {
+        from.host::<f32, m![1 # 8], m![1 # 8]>(cx)
     })
 }
 

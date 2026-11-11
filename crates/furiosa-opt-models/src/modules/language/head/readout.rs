@@ -3,6 +3,7 @@
 use super::{Cap, InDm, Tree};
 use crate::Module;
 use crate::ops::index::scatter::Store;
+use crate::ops::linear;
 use crate::ops::normalization::span::{Selection, Span, Tile};
 use crate::ops::normalization::{Blocked, Spread};
 use crate::ops::reduction;
@@ -60,7 +61,7 @@ impl<Capacity: AxisName> Selected<Capacity> {
 
 impl<Width: AxisName, V: AxisName, W, B, I, C> Tree<Width, V, W, B, I, C>
 where
-    W: Borrow<HbmTensor<bf16, Chip, m![V, Width]>>,
+    W: linear::Table<Chip, Hidden = Width, Vocabulary = V>,
     B: Borrow<HbmTensor<f32, Chip, m![V]>>,
     I: Borrow<HbmTensor<i32, Chip, m![V]>>,
 {
@@ -101,16 +102,17 @@ where
 
 /// One span's tiles: each read by the head, and its tokens stored where its rows sit among the
 /// launch's.
-struct Tiles<'a, Width: AxisName, V: AxisName, C, Capacity: AxisName> {
+struct Tiles<'a, Width: AxisName, V: AxisName, W, C, Capacity: AxisName> {
     rows: &'a Spread<Width, Span>,
-    head: &'a InDm<'a, Width, V, C>,
+    head: &'a InDm<'a, Width, V, W, C>,
     tokens: &'a mut HbmTensor<i32, Chip, m![Capacity]>,
     tile: Live<(), Capacity>,
 }
 
-impl<R: AxisName, Width: AxisName, V: AxisName, C, Capacity: AxisName> OnTile<Device, R>
-    for Tiles<'_, Width, V, C, Capacity>
+impl<R: AxisName, Width: AxisName, V: AxisName, W, C, Capacity: AxisName> OnTile<Device, R>
+    for Tiles<'_, Width, V, W, C, Capacity>
 where
+    W: linear::Table<Chip, Hidden = Width, Vocabulary = V>,
     C: Cap<Width, V>,
 {
     fn run(&mut self, device: &mut Device, index: usize) {

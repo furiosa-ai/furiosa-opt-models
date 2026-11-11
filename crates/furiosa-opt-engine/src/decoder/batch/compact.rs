@@ -6,7 +6,7 @@
 //!   many entries before them as it skips blocks.
 
 use furiosa_opt_models::ops::index::table::BlockIndex;
-use furiosa_opt_models::ops::index::table::FIELDS;
+use furiosa_opt_models::ops::index::table::{FIELDS, cells};
 use furiosa_opt_models::tensor::cache::Block;
 use furiosa_opt_std::prelude::AxisName;
 use std::{io, ops::Range};
@@ -111,16 +111,18 @@ impl Descriptor {
         (rows.collect(), &self.blocks)
     }
 
-    /// The segments, the block IDs and the selected rows at the capacities of `S` segments, `B`
-    /// blocks (the words `table` reads) and `R` rows, then the three extents.
+    /// The segment table of `S` segments as the device reads it ([`cells`]), then the block IDs
+    /// and the selected rows at the capacities of `B` blocks (the words `table` reads) and `R`
+    /// rows, then the three extents.
     pub(super) fn arrays<S: AxisName, B: AxisName, R: AxisName>(
         &self,
         table: Table,
     ) -> io::Result<[Vec<i32>; 4]> {
         let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+        let envelope = || invalid("descriptor exceeds the compiled envelope");
         let pad = |mut values: Vec<i32>, capacity| {
             if values.len() > capacity {
-                return Err(invalid("descriptor exceeds the compiled envelope"));
+                return Err(envelope());
             }
             values.resize(capacity, 0);
             Ok(values)
@@ -129,12 +131,12 @@ impl Descriptor {
             Table::Capacity => B::SIZE,
             Table::Blocks => self.blocks.len().min(B::SIZE),
         };
+        if self.segments.len() > S::SIZE {
+            return Err(envelope());
+        }
         let extents = [self.segments.len(), self.blocks.len(), self.selected.len()];
         Ok([
-            pad(
-                self.segments.iter().flatten().copied().collect(),
-                S::SIZE * FIELDS,
-            )?,
+            cells::<S>(&self.segments).into_vec(),
             pad(self.blocks.clone(), blocks)?,
             pad(self.selected.clone(), R::SIZE)?,
             (extents.into_iter())

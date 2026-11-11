@@ -2,22 +2,25 @@
 
 pub use affine::{Affine, Bias, output, query};
 pub(crate) use affine::{Coefficients, Inputs, Outputs};
-pub(crate) use decode::Matrix;
+pub(crate) use decode::{Half, Landed, Matrix, Terms};
 pub use experts::Experts;
+pub(crate) use kernel::Slabs;
 pub(crate) use rows::Projection;
+pub use stream::{Contraction, Parted, Pass, Table};
 
 use core::borrow::Borrow;
 use core::marker::PhantomData;
 
 use furiosa_opt_std::prelude::*;
 
-use crate::Op;
 use crate::load::{self, Load, LoadError};
 use crate::ops::normalization::Spread;
 use crate::tensor::form::Weight;
+use crate::tensor::form::fp8::Token;
 use crate::tensor::form::{BlockScaled, Part, Projections};
 use crate::tensor::mapping;
 use crate::tensor::{axis::Lanes, live::Live};
+use crate::{Begin, Op};
 
 pub mod affine;
 mod decode;
@@ -443,7 +446,7 @@ where
 impl<'x, In: AxisName, Out: AxisName, Rows: AxisName, Chips: M, S: M, F: M, W>
     Op<&'x Live<DmTensor<bf16, m![1], Chips, S, m![Rows, { F }]>, Rows>> for Affine<W, ()>
 where
-    W: Matrix<In = In, Out = Out>,
+    W: Slabs<In = In, Out = Out>,
 {
     type Output = Live<Spread<Out, Rows>, Rows>;
 
@@ -464,6 +467,399 @@ where
         .view()
         .to_dm_view(&mut device.tdma, output.view_mut());
         input.with(output)
+    }
+}
+
+/// A projection whose live rows its head view `View` takes where the contraction leaves them: a
+/// weight form `W` read as itself, each row split into `View`'s heads.
+#[derive(DeviceSend, Load)]
+pub struct Native<W, View>(pub W, pub PhantomData<View>);
+
+/// A projection begun: its weight lands as its form lands it, before any rows arrive.
+impl<W: Op<Begin<()>>, View> Op<Begin<()>> for Native<W, View> {
+    type Output = W::Output;
+
+    fn forward(&self, device: &mut Device, begin: Begin<()>) -> Self::Output {
+        self.0.forward(device, begin)
+    }
+}
+
+/// The live row groups of a launch's rows in their feature slices, projected by the dense
+/// contraction over the weight as it landed, split into heads where the contraction leaves them;
+/// the heads keep the launch's live rows.
+impl<'x, In, Out, Code, Rows, W, View, L> Op<(L, &'x Live<Spread<In, Rows>, Rows>)>
+    for Native<W, View>
+where
+    In: AxisName,
+    Out: AxisName,
+    Code: Scalar,
+    Rows: AxisName,
+    L: Slabs<In = In, Out = Out, Stored = Code>,
+    mapping::Reshape<View>: Op<Live<Projected<In, Out, Code, Rows>, Rows>>,
+{
+    type Output =
+        <mapping::Reshape<View> as Op<Live<Projected<In, Out, Code, Rows>, Rows>>>::Output;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (landed, input): (L, &'x Live<Spread<In, Rows>, Rows>),
+    ) -> Self::Output {
+        let projected = Affine::new(landed, ()).forward(
+            &mut *device,
+            (input.with(PhantomData::<Rows>), input.value(), |at| {
+                mapping::Rows::<Rows>::group(input.value().view(), at)
+            }),
+        );
+        mapping::Reshape::<View>::default().forward(device, input.with(projected))
+    }
+}
+
+/// The rows of a launch in their feature slices, padding and all, begun: projected over the weight
+/// as it landed and split into heads, and kept in both register banks as its contraction read them,
+/// for every congruent projection of the same rows; both keep the rows.
+impl<'x, In, Out, Code, Rows, W, View, L> Op<(L, Begin<&'x Live<Spread<In, Rows>, Rows>>)>
+    for Native<W, View>
+where
+    In: AxisName,
+    Out: AxisName,
+    Code: Scalar,
+    Rows: AxisName,
+    L: Slabs<In = In, Out = Out, Stored = Code>,
+    mapping::Reshape<View>: Op<Live<Projected<In, Out, Code, Rows>, Rows>>,
+{
+    type Output = (
+        <mapping::Reshape<View> as Op<Live<Projected<In, Out, Code, Rows>, Rows>>>::Output,
+        Live<kernel::Banks<In, Out, Code, Rows>, Rows>,
+    );
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (landed, Begin(input)): (L, Begin<&'x Live<Spread<In, Rows>, Rows>>),
+    ) -> Self::Output {
+        let (projected, banks) =
+            kernel::Contraction::<In, Out, Code>::kept(&mut *device, &landed, input.value());
+        let heads = mapping::Reshape::<View>::default().forward(device, input.with(projected));
+        (heads, input.with(banks))
+    }
+}
+
+/// The rows another projection filled into both register banks, projected over the weight as it
+/// landed and split into heads where the contraction leaves them; the heads keep the live rows.
+impl<'x, In, Out, Code, Rows, W, View, L, F>
+    Op<(L, &'x Live<kernel::Banks<In, F, Code, Rows>, Rows>)> for Native<W, View>
+where
+    In: AxisName,
+    Out: AxisName,
+    Code: Scalar,
+    Rows: AxisName,
+    F: AxisName,
+    L: Slabs<In = In, Out = Out, Stored = Code>,
+    mapping::Reshape<View>: Op<Live<Projected<In, Out, Code, Rows>, Rows>>,
+{
+    type Output =
+        <mapping::Reshape<View> as Op<Live<Projected<In, Out, Code, Rows>, Rows>>>::Output;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (landed, banks): (L, &'x Live<kernel::Banks<In, F, Code, Rows>, Rows>),
+    ) -> Self::Output {
+        let projected =
+            kernel::Contraction::<In, Out, Code>::banked(device, &landed, banks.value());
+        mapping::Reshape::<View>::default().forward(device, banks.with(projected))
+    }
+}
+
+/// Rows a projection contracts a live lane group at a time, as no register bank holds the envelope;
+/// a boundary runs on its state so wrapped.
+pub struct Grouped<T>(pub T);
+
+/// No work beside a projection of such rows either.
+impl Op<Grouped<&mut ()>> for () {
+    type Output = ();
+
+    fn forward(&self, _: &mut Device, _: Grouped<&mut ()>) {}
+}
+
+/// The live lane groups of a launch's rows in their feature slices, projected over the weight as it
+/// landed and split into heads where the contraction leaves them.
+impl<'x, In, Out, Code, Rows, W, View, L> Op<(L, Grouped<&'x Live<Spread<In, Rows>, Rows>>)>
+    for Native<W, View>
+where
+    In: AxisName,
+    Out: AxisName,
+    Code: Scalar,
+    Rows: AxisName,
+    L: Slabs<In = In, Out = Out, Stored = Code>,
+    mapping::Reshape<View>: Op<Live<Projected<In, Out, Code, Rows>, Rows>>,
+{
+    type Output =
+        <mapping::Reshape<View> as Op<Live<Projected<In, Out, Code, Rows>, Rows>>>::Output;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (landed, Grouped(input)): (L, Grouped<&'x Live<Spread<In, Rows>, Rows>>),
+    ) -> Self::Output {
+        let projected = Affine::new(landed, ()).grouped::<bf16, _, _, _, _, _, _, _, _, _>(
+            &mut *device,
+            (input.with(PhantomData::<Rows>), input.value(), |at| {
+                mapping::Rows::<Rows>::group(input.value().view(), at)
+            }),
+            (&(), &mut ()),
+        );
+        mapping::Reshape::<View>::default().forward(device, input.with(projected))
+    }
+}
+
+/// The live lane groups of a launch's rows, begun: projected as above, and nothing kept, as each
+/// congruent projection of a weight read as BF16 fills its own lanes.
+impl<'x, In, Out, Code, Rows, W, View, L> Op<(L, Begin<Grouped<&'x Live<Spread<In, Rows>, Rows>>>)>
+    for Native<W, View>
+where
+    In: AxisName,
+    Out: AxisName,
+    Code: Scalar,
+    Rows: AxisName,
+    L: Slabs<In = In, Out = Out, Stored = Code>,
+    mapping::Reshape<View>: Op<Live<Projected<In, Out, Code, Rows>, Rows>>,
+{
+    type Output = (
+        <mapping::Reshape<View> as Op<Live<Projected<In, Out, Code, Rows>, Rows>>>::Output,
+        (),
+    );
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (landed, Begin(input)): (L, Begin<Grouped<&'x Live<Spread<In, Rows>, Rows>>>),
+    ) -> Self::Output {
+        (self.forward(device, (landed, input)), ())
+    }
+}
+
+/// The live lane groups of a launch's rows after a projection that kept nothing.
+impl<'x, 'k, In, Out, Code, Rows, W, View, L>
+    Op<(L, (Grouped<&'x Live<Spread<In, Rows>, Rows>>, &'k ()))> for Native<W, View>
+where
+    In: AxisName,
+    Out: AxisName,
+    Code: Scalar,
+    Rows: AxisName,
+    L: Slabs<In = In, Out = Out, Stored = Code>,
+    mapping::Reshape<View>: Op<Live<Projected<In, Out, Code, Rows>, Rows>>,
+{
+    type Output =
+        <mapping::Reshape<View> as Op<Live<Projected<In, Out, Code, Rows>, Rows>>>::Output;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (landed, (input, ())): (L, (Grouped<&'x Live<Spread<In, Rows>, Rows>>, &'k ())),
+    ) -> Self::Output {
+        self.forward(device, (landed, input))
+    }
+}
+
+/// The rows of a launch in their feature slices, padding and all, begun under the token contract:
+/// each row quantized under its own scale, each half of the envelope staged in the slices of each
+/// part and filled into its register bank while the bank before contracts, projected over the
+/// weight as it landed and split into heads; the banks are kept for every congruent projection of
+/// the same rows.
+impl<'x, In, Out, Rows, W, View>
+    Op<(
+        Landed<In, Out, Token>,
+        Begin<&'x Live<Spread<In, Rows>, Rows>>,
+    )> for Native<W, View>
+where
+    In: AxisName,
+    Out: AxisName,
+    Rows: AxisName,
+    mapping::Reshape<View>: Op<Live<Projected<In, Out, f8e4m3, Rows>, Rows>>,
+{
+    type Output = (
+        <mapping::Reshape<View> as Op<Live<Projected<In, Out, f8e4m3, Rows>, Rows>>>::Output,
+        Live<kernel::TokenBanks<In, Out, Rows>, Rows>,
+    );
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (landed, Begin(input)): (
+            Landed<In, Out, Token>,
+            Begin<&'x Live<Spread<In, Rows>, Rows>>,
+        ),
+    ) -> Self::Output {
+        let (projected, banks) = kernel::Contraction::<In, Out, f8e4m3>::token_kept(
+            &mut *device,
+            &landed,
+            input.value(),
+        );
+        let heads = mapping::Reshape::<View>::default().forward(device, input.with(projected));
+        (heads, input.with(banks))
+    }
+}
+
+/// The live lane groups of a launch's rows, begun under the token contract: each row quantized
+/// under its own scale and the live groups' codes staged in the slices of each part, projected over
+/// the weight as it landed a lane group at a time and split into heads; the staged rows are kept
+/// for every congruent projection of the same rows.
+impl<'x, In, Out, Rows, W, View>
+    Op<(
+        Landed<In, Out, Token>,
+        Begin<Grouped<&'x Live<Spread<In, Rows>, Rows>>>,
+    )> for Native<W, View>
+where
+    In: AxisName,
+    Out: AxisName,
+    Rows: AxisName,
+    mapping::Reshape<View>: Op<Live<Projected<In, Out, f8e4m3, Rows>, Rows>>,
+{
+    type Output = (
+        <mapping::Reshape<View> as Op<Live<Projected<In, Out, f8e4m3, Rows>, Rows>>>::Output,
+        Live<kernel::Tokens<In, Out, Rows>, Rows>,
+    );
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (landed, Begin(Grouped(input))): (
+            Landed<In, Out, Token>,
+            Begin<Grouped<&'x Live<Spread<In, Rows>, Rows>>>,
+        ),
+    ) -> Self::Output {
+        let tokens = input.with(kernel::Contraction::<In, Out, f8e4m3>::tokens(
+            &mut *device,
+            input,
+        ));
+        let projected =
+            kernel::Contraction::<In, Out, f8e4m3>::tokened(&mut *device, &landed, &tokens);
+        let heads = mapping::Reshape::<View>::default().forward(device, input.with(projected));
+        (heads, tokens)
+    }
+}
+
+/// The rows a congruent projection filled into both register banks under the token contract,
+/// projected over the weight as it landed and split into heads.
+impl<'b, In, Out, F, Rows, W, View>
+    Op<(
+        Landed<In, Out, Token>,
+        &'b Live<kernel::TokenBanks<In, F, Rows>, Rows>,
+    )> for Native<W, View>
+where
+    In: AxisName,
+    Out: AxisName,
+    F: AxisName,
+    Rows: AxisName,
+    mapping::Reshape<View>: Op<Live<Projected<In, Out, f8e4m3, Rows>, Rows>>,
+{
+    type Output =
+        <mapping::Reshape<View> as Op<Live<Projected<In, Out, f8e4m3, Rows>, Rows>>>::Output;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (landed, banks): (
+            Landed<In, Out, Token>,
+            &'b Live<kernel::TokenBanks<In, F, Rows>, Rows>,
+        ),
+    ) -> Self::Output {
+        let projected = kernel::Contraction::<In, Out, f8e4m3>::token_banked(
+            &mut *device,
+            &landed,
+            banks.value(),
+        );
+        mapping::Reshape::<View>::default().forward(device, banks.with(projected))
+    }
+}
+
+/// The live lane groups a congruent projection staged under the token contract, projected over the
+/// weight as it landed a lane group at a time and split into heads.
+impl<'x, 'k, In, Out, F, Rows, W, View>
+    Op<(
+        Landed<In, Out, Token>,
+        (
+            Grouped<&'x Live<Spread<In, Rows>, Rows>>,
+            &'k Live<kernel::Tokens<In, F, Rows>, Rows>,
+        ),
+    )> for Native<W, View>
+where
+    In: AxisName,
+    Out: AxisName,
+    F: AxisName,
+    Rows: AxisName,
+    mapping::Reshape<View>: Op<Live<Projected<In, Out, f8e4m3, Rows>, Rows>>,
+{
+    type Output =
+        <mapping::Reshape<View> as Op<Live<Projected<In, Out, f8e4m3, Rows>, Rows>>>::Output;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (landed, (_, tokens)): (
+            Landed<In, Out, Token>,
+            (
+                Grouped<&'x Live<Spread<In, Rows>, Rows>>,
+                &'k Live<kernel::Tokens<In, F, Rows>, Rows>,
+            ),
+        ),
+    ) -> Self::Output {
+        let projected =
+            kernel::Contraction::<In, Out, f8e4m3>::tokened(&mut *device, &landed, tokens);
+        mapping::Reshape::<View>::default().forward(device, tokens.with(projected))
+    }
+}
+
+/// The same rows through the token-scaled weight begun here: dense in the envelope, through both
+/// register banks, else a live lane group at a time; what it staged is dropped.
+impl<'x, In, Out, Rows, K, V, View> Op<&'x Live<Spread<In, Rows>, Rows>>
+    for Native<fp8::TokenScaled<In, Out, K, V>, View>
+where
+    In: AxisName,
+    Out: AxisName,
+    Rows: AxisName,
+    fp8::TokenScaled<In, Out, K, V>: Op<Begin<()>, Output = Landed<In, Out, Token>>,
+    mapping::Reshape<View>: Op<Live<Projected<In, Out, f8e4m3, Rows>, Rows>>,
+{
+    type Output =
+        <mapping::Reshape<View> as Op<Live<Projected<In, Out, f8e4m3, Rows>, Rows>>>::Output;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        input: &'x Live<Spread<In, Rows>, Rows>,
+    ) -> Self::Output {
+        let landed = self.0.forward(&mut *device, Begin(()));
+        if input.dense::<crate::tensor::axis::Lanes<Rows>>() {
+            return self.forward(device, (landed, Begin(input))).0;
+        }
+        self.forward(device, (landed, Begin(Grouped(input)))).0
+    }
+}
+
+/// The same rows through the weight begun here.
+impl<'x, In, Out, Code, Rows, W, View, L> Op<&'x Live<Spread<In, Rows>, Rows>> for Native<W, View>
+where
+    In: AxisName,
+    Out: AxisName,
+    Code: Scalar,
+    Rows: AxisName,
+    W: Op<Begin<()>, Output = L>,
+    L: Slabs<In = In, Out = Out, Stored = Code>,
+    mapping::Reshape<View>: Op<Live<Projected<In, Out, Code, Rows>, Rows>>,
+{
+    type Output =
+        <mapping::Reshape<View> as Op<Live<Projected<In, Out, Code, Rows>, Rows>>>::Output;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        input: &'x Live<Spread<In, Rows>, Rows>,
+    ) -> Self::Output {
+        let landed = self.forward(&mut *device, Begin(()));
+        self.forward(device, (landed, input))
     }
 }
 

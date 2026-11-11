@@ -55,10 +55,14 @@ pub const DECODES: usize = 1024;
 pub const INPUTS: usize = 64;
 
 /// Rows of a row group, the lanes of a vector packet.
-const LANES: usize = 8;
+pub(crate) const LANES: usize = 8;
 
 /// Row lanes a cluster holds: a row group's lanes split over the chip's two clusters.
-const CLUSTER_LANES: usize = LANES / 2;
+pub(crate) const CLUSTER_LANES: usize = LANES / 2;
+
+/// Shard slices a ring carries a pass's query rows over at most: a ring takes about half a
+/// microsecond a slice whatever it carries, so a head of more shards lands a copy a ring.
+pub(crate) const RING: usize = 8;
 
 /// Slots each slice holds of a work item's landed history, a key and a value of `heads` KV heads
 /// of `head` BF16 channels a slot: 64, or fewer so a landing takes at most a quarter of the slice's
@@ -93,20 +97,93 @@ pub(crate) const fn channels(head: usize, keys: usize) -> usize {
     width
 }
 
-/// Rows one pass of windowed attention attends at most: 32, or fewer so a slice's tensor registers
-/// hold the `keys` keys of `head` BF16 channels it scores for each row group of the pass, its
+/// Rows a slice attends in one pass of windowed attention at most: 32, or fewer so its tensor
+/// registers hold the `keys` keys of `head` BF16 channels it scores for each of its row groups, its
 /// vector registers the mask and the bias of those scores, `groups` query groups a row, and one
 /// data memory page the FP32 attention of those groups, of which a window's fold keeps four.
 pub(crate) const fn pass(head: usize, groups: usize, keys: usize) -> usize {
     let mut rows = 32;
     while rows / LANES * keys * head * size_of::<bf16>() > super::TRF
         || 2 * (rows / LANES) * groups * keys * size_of::<f32>() > super::VRF
-        || rows / LANES * groups * head * size_of::<f32>() > super::DM / 16
+        || rows / LANES * groups * head * size_of::<f32>() > super::PAGE
     {
         rows /= 2;
     }
     assert!(rows >= LANES, "a pass attends a whole row group");
     rows
+}
+
+/// The copies of a head's slot, of `copies`, that a pass of `groups` row groups fills, a row group
+/// a copy; each of its slices holds the rest of its row groups.
+pub(crate) const fn slots(groups: usize, copies: usize) -> usize {
+    if groups < copies { groups } else { copies }
+}
+
+/// Whether a history of `windows` windows holds every window's softmax terms until one merge
+/// combines them, rather than folding each into a running attention: when it has a fold to save and
+/// the FP32 terms of `count` row groups of `groups` query groups, each window's, fit one data memory
+/// page.
+pub(crate) const fn holds(head: usize, groups: usize, count: usize, windows: usize) -> bool {
+    windows > 1 && windows * count * groups * (head + LANES) * size_of::<f32>() <= super::PAGE
+}
+
+/// Whether a window's keys and values stream past its `groups` query rows of `head` channels and
+/// their softmax weights in the tensor registers, rather than fill the registers themselves: when
+/// the groups fit the register lanes and the weighted sum's accumulators hold each lane's whole
+/// head while the keys stream.
+pub(crate) const fn streams(head: usize, groups: usize) -> bool {
+    groups.is_power_of_two() && groups <= LANES && groups * head <= super::ACCUMULATOR
+}
+
+/// Whether a pass of `rows` rows over an `envelope` lands a window while the one before it is
+/// attended: when two landings, a fold, the envelope's attended rows and the `copies` of its query
+/// rows that data memory holds leave a quarter of DM to the layer.
+pub(crate) const fn overlaps(
+    head: usize,
+    groups: usize,
+    keys: usize,
+    pass: (usize, usize, usize),
+) -> bool {
+    let (landing, small) = held(head, groups, keys, pass, size_of::<bf16>());
+    2 * landing + small <= 3 * super::DM / 4
+}
+
+/// Whether such a pass, streaming windows of `element`-byte codes, leaves data memory for `places`
+/// beside what it holds, counted in pages as the allocator gives them: each landing and each of the
+/// places takes whole pages, while the pass's smaller places share pages with the layer's, which
+/// take an eighth of DM.
+pub(crate) const fn beside(
+    head: usize,
+    groups: usize,
+    keys: usize,
+    pass: (usize, usize, usize),
+    (element, places): (usize, &[usize]),
+) -> bool {
+    let (landing, small) = held(head, groups, keys, pass, element);
+    let mut pages =
+        2 * landing.div_ceil(super::PAGE) + (small + super::DM / 8).div_ceil(super::PAGE);
+    let mut place = 0;
+    while place < places.len() {
+        pages += places[place].div_ceil(super::PAGE);
+        place += 1;
+    }
+    streams(head, groups) && pages <= super::DM / super::PAGE
+}
+
+/// Data memory such a pass holds with windows of `element`-byte codes: a window's landing, of which
+/// it keeps two, and its smaller places: a fold, the envelope's attended rows and the copies of its
+/// query rows.
+const fn held(
+    head: usize,
+    groups: usize,
+    keys: usize,
+    (rows, envelope, copies): (usize, usize, usize),
+    element: usize,
+) -> (usize, usize) {
+    let landing = (rows / LANES) * KeyValue::SIZE * keys * head * element;
+    let folds = 4 * (rows / LANES) * groups * head * size_of::<f32>();
+    let envelope = (1 + copies) * envelope.div_ceil(LANES) * groups * head * size_of::<bf16>();
+    (landing, folds + envelope)
 }
 
 /// Shards a window of `keys` keys splits into, one a slice: as many as a cluster's slices hold
@@ -129,4 +206,24 @@ pub(crate) const fn shards(heads: usize, keys: usize, block: usize) -> usize {
 /// Heads a cluster's slices hold at `shards` shards of each of its row lanes.
 pub(crate) const fn heads(shards: usize) -> usize {
     super::SLICES / (CLUSTER_LANES * shards)
+}
+
+/// Windows of a lone row its cluster's cells hold at once, one a cell: all of its `windows` where
+/// whole rows' windows fill the cluster's lanes; else, where a history may span as many, its first
+/// [`LANES`], which the lanes of a head's two slots hold; else one.
+pub(crate) const fn lanes(windows: usize) -> usize {
+    if windows > 1 && CLUSTER_LANES.is_multiple_of(windows) {
+        windows
+    } else if windows >= LANES {
+        LANES
+    } else {
+        1
+    }
+}
+
+/// Whether a pass holds a lone row's every window at once, one a lane: where the lanes hold them
+/// and each cell is `element` bytes, narrower than BF16, as landing them together then costs less
+/// than attending them in turn saves; a BF16 window's landing costs about as much.
+pub(crate) const fn spreads(windows: usize, element: usize) -> bool {
+    lanes(windows) > 1 && element < size_of::<bf16>()
 }

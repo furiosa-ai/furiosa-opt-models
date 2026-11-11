@@ -3,7 +3,7 @@
 use crate::load::{Checkpoint, Context, Load, LoadError};
 use crate::ops::index::gather::Gather;
 use crate::ops::index::table::{ByteOffset, Offset};
-use crate::ops::linear::Groups;
+use crate::ops::linear::{self, Groups};
 use crate::ops::normalization::span::Owned;
 use crate::ops::normalization::{Blocked, Chunk, Spread};
 use crate::ops::pointwise::{Float, add::Add};
@@ -265,8 +265,8 @@ where
 }
 
 /// The rows of a launch's tokens in the decoder's feature mapping, with the launch's live rows:
-/// each token's table row gathered whole at its byte offset, so any width a row's slices hold
-/// serves, then landed in the feature slices.
+/// each token's table row gathered whole as the table lies, so any width a row's slices hold
+/// serves, then landed in the feature slices; a row past the live rows' lane groups is unspecified.
 impl<
     'x,
     Vocabulary: AxisName,
@@ -278,7 +278,7 @@ impl<
 > Module<(&'x Ids<Rows, Chips>, Live<(), Rows>), Env, &mut ()>
     for Embedding<Vocabulary, Hidden, Chips, Parameter>
 where
-    Parameter: Borrow<HbmTensor<bf16, Chips, m![Vocabulary, Hidden]>>,
+    Parameter: linear::Table<Chips, Hidden = Hidden, Vocabulary = Vocabulary>,
 {
     type Output = Live<Spread<Hidden, Rows, Chips>, Rows>;
 
@@ -289,14 +289,25 @@ where
         _: &mut (),
         (ids, tiles): (&'x Ids<Rows, Chips>, Live<(), Rows>),
     ) -> Self::Output {
-        let offsets = Op::forward(
-            &ByteOffset::<bf16, m![Hidden], m![Rows]>::default(),
-            &mut *device,
-            ids,
-        );
-        let rows: HbmTensor<bf16, Chips, m![Rows, Hidden]> =
-            Op::forward(&Gather, &mut *device, (self.weight.borrow(), &offsets));
-        tiles.with(rows.to_dm(&mut device.tdma))
+        type Feature<W> = Symbol<Chunk<W>>;
+        let rows = self.weight.rows(&mut *device, ids, tiles);
+        let mut landed = Spread::<Hidden, Rows, Chips>::new();
+        // One transfer, as its setup costs about as much as all its rows: the live rows' lane group,
+        // or the envelope when they span groups.
+        let (first, count) = tiles.groups::<Lanes<Rows>>();
+        if count > 1 {
+            rows.view().to_dm_view(&mut device.tdma, landed.view_mut());
+        } else {
+            (rows.view())
+                .tile::<Layout<Rows>::Groups, 1, Layout<Rows>::Elements<m![Hidden]>>(first)
+                .to_dm_view(
+                    &mut device.tdma,
+                    (landed.view_mut()).tile::<Layout<Rows>::Groups, 1, Layout<Rows>::GroupMut<
+                        m![Hidden % ({ Feature<Hidden> })],
+                    >>(first),
+                );
+        }
+        tiles.with(landed)
     }
 }
 
@@ -685,6 +696,79 @@ mod tests {
         (0..8)
             .map(|lane| rows[lane.min(rows.len() - 1)] as i32)
             .collect()
+    }
+
+    /// A launch's rows of its tokens from a table that lies by parts, as a head's passes land it.
+    #[device(chip = 1)]
+    fn by_parts<Hidden: AxisName>(
+        device: &mut Device,
+        embedding: &Embedding<Table, Hidden, Chip, Weight<m![Table, Hidden], Chip, Parted<Hidden>>>,
+        ids: &Ids<Eight>,
+        count: &Value,
+        output: &mut HbmTensor<bf16, m![1], RowMajor<Hidden, Eight>>,
+    ) {
+        let tiles = Live::<(), Eight>::read(count);
+        let rows = Module::forward(embedding, &mut *device, (), &mut (), (ids, tiles));
+        (rows.value().view()).to_hbm_view(&mut device.tdma, output.view_mut());
+    }
+
+    type Parted<Hidden> = HbmTensor<bf16, Chip, crate::ops::linear::Parted<Hidden, Table>>;
+
+    axes![Parts = 3840];
+
+    /// From a table that lies by parts, eight tokens' rows are their rows of the row-major table,
+    /// bit for bit, whether a row lies in sixteen parts or in eight.
+    #[tokio::test]
+    async fn gathers_a_row_per_token_by_parts() {
+        let _lease = crate::tests::DEVICE.lock().await;
+        gathers_by_parts::<Served>().await;
+        gathers_by_parts::<Parts>().await;
+    }
+
+    async fn gathers_by_parts<Hidden: AxisName>() {
+        let mut device = Device::new(by_parts.topology()).unwrap();
+        let values = table::<Hidden>();
+        let rows = [23, 5, 61, 0, 40, 7, 63, 12];
+        let weight = HostTensor::<bf16, m![Table, Hidden]>::from_vec(values.clone())
+            .to_hbm::<Chip, crate::ops::linear::Parted<Hidden, Table>>(&mut device.pdma)
+            .await
+            .unwrap();
+        let embedding = Embedding::new(Weight::new(weight));
+        let ids = HostTensor::<i32, Packets<Eight>>::from_vec(ids(&rows))
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap();
+        let rows_live = count(Eight::SIZE).to_hbm(&mut device.pdma).await.unwrap();
+        let mut output: HbmTensor<bf16, Chip, RowMajor<Hidden, Eight>> =
+            HostTensor::<bf16, RowMajor<Hidden, Eight>>::zero()
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+        launch(
+            by_parts,
+            (&mut device, &embedding, &ids, &rows_live, &mut output),
+        )
+        .await
+        .unwrap();
+        let gathered = output
+            .to_host::<RowMajor<Hidden, Eight>>(&mut device.pdma)
+            .await
+            .unwrap()
+            .into_vec();
+        for (at, row) in rows.into_iter().enumerate() {
+            assert_eq!(
+                gathered[at * Hidden::SIZE..][..Hidden::SIZE]
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                values[row * Hidden::SIZE..][..Hidden::SIZE]
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "width {}, token {at} (row {row})",
+                Hidden::SIZE
+            );
+        }
     }
 
     /// Eight tokens' rows are written each in its own hidden row, bit for bit.
