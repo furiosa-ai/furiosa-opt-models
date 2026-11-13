@@ -1,6 +1,6 @@
 //! Channel-scaled checkpoint storage for token-dynamic FP8 MLPs.
-//! The down matrix retains each intermediate owner's complete local width in HBM, so the final
-//! 32-feature panel is a native window rather than a padded 64-feature panel.
+//! Down weights are packed into contiguous panels at load, with the native 32-feature tail
+//! stored separately. Runtime DMA never strides across a complete 224-feature owner.
 
 use super::*;
 use crate::ops::vector::{self, Quantization};
@@ -37,11 +37,17 @@ pub type GateUpWeights<H, I> = StoredRows<
     HbmTensor<f32, Chip, m![Term, I]>,
     Channel,
 >;
-pub type Stored<H, I> = m![{Cluster<I>}, H / (H / 8), {Blocks<I>}, H % (H / 8), {Out<I>}];
+pub type Stored<H, const B: usize, const N: usize> = m![
+    Panels = {N}, {Cluster<Inputs<B>>}, H / (H / 8), {Blocks<Inputs<B>>},
+    H % (H / 8), {Symbol<Inputs<B>>} % {B}
+];
 pub type DownWeights<H, I> = StoredRows<
     m![I],
     m![H],
-    HbmTensor<f8e4m3, Chip, Stored<H, I>>,
+    (
+        HbmTensor<f8e4m3, Chip, Stored<H, 64, 3>>,
+        HbmTensor<f8e4m3, Chip, Stored<H, 32, 1>>,
+    ),
     HbmTensor<f32, Chip, m![H]>,
     Channel,
 >;
@@ -49,7 +55,7 @@ pub type DownWeights<H, I> = StoredRows<
 /// The packed inputs of one panel: 64 intermediate owners, each contributing B features.
 /// A panel coordinate is not the original intermediate index: owner b selects b*224+offset.
 #[derive(Debug, Clone)]
-pub(crate) struct Inputs<const B: usize>;
+pub struct Inputs<const B: usize>;
 impl<const B: usize> AxisName for Inputs<B> {
     const NAME: Ident = Ident::new("PanelInputs");
     const SIZE: usize = 64 * B;
@@ -75,14 +81,55 @@ impl<'a, H: AxisName, I: AxisName> Load<Projections<'a, 2>> for GateUpWeights<H,
     }
 }
 
+/// Checkpoint output-major codes, reordered without rounding into contiguous DMA panels.
+fn packed_down<H: AxisName, I: AxisName, const B: usize, const N: usize>(
+    codes: &[f8e4m3],
+    offset: usize,
+) -> HostTensor<f8e4m3, m![{Chip}, {Stored<H, B, N>}]> {
+    const {
+        assert!(I::SIZE == 64 * 224 && H::SIZE.is_multiple_of(8));
+    }
+    let mut packed = Vec::with_capacity(N * 64 * H::SIZE * B);
+    for panel in 0..N {
+        for cluster in 0..2 {
+            for output_owner in 0..8 {
+                for input_owner in 0..32 {
+                    for output in 0..H::SIZE / 8 {
+                        let row = output_owner * (H::SIZE / 8) + output;
+                        let input = (cluster * 32 + input_owner) * 224 + offset + panel * B;
+                        packed.extend_from_slice(
+                            &codes[row * I::SIZE + input..row * I::SIZE + input + B],
+                        );
+                    }
+                }
+            }
+        }
+    }
+    HostTensor::from_vec(packed.repeat(Chip::SIZE))
+}
+
 impl<'a, H: AxisName, I: AxisName> Load<Projections<'a, 1>> for DownWeights<H, I> {
     fn load(cx: &mut Context<'_>, projections: Projections<'a, 1>) -> Result<Self, LoadError> {
-        let [weight] = projections.read(cx, |from, cx| {
+        let [(codes, scales)] = projections.read(cx, |from, cx| {
             cx.field("weight", "weight", |cx| {
-                <Self as Load<&crate::load::Checkpoint>>::load(cx, from)
+                fp8::channels::<m![I], m![H]>(from, cx)
             })
         })?;
-        Ok(weight)
+        let panels = cx.field("0", "", |cx| {
+            Ok((
+                cx.field("0", "", |cx| {
+                    Load::load(cx, packed_down::<H, I, 64, 3>(&codes, 0))
+                })?,
+                cx.field("1", "", |cx| {
+                    Load::load(cx, packed_down::<H, I, 32, 1>(&codes, 192))
+                })?,
+            ))
+        })?;
+        let scales = HostTensor::<f32, m![{ Chip }, H]>::from_vec(scales.repeat(Chip::SIZE));
+        Ok(Self::new(
+            panels,
+            cx.field("1", "", |cx| Load::load(cx, scales))?,
+        ))
     }
 }
 
@@ -363,17 +410,19 @@ pub(crate) fn down<H: AxisName, I: AxisName, const B: usize>(
     const {
         assert!(B == 64 || B == 32);
     }
-    let window = weights.0.view().tile::<Out<I>, B, m![
-        {Cluster<I>}, H / (H / 8), {Blocks<I>}, H % (H / 8),
-        {Out<I>} = {B} # (I / 64)
-    ]>(64 * panel);
-    // SAFETY: a selected band's B consecutive features retain their local physical order; the
-    // owner is still the same 224-feature run, with the band offset selected by the HBM window.
-    let window = unsafe {
-        window.reshape::<Chip, m![{Cluster<Inputs<B>>}, H / (H / 8), {Blocks<Inputs<B>>},
-        H % (H / 8), {Symbol<Inputs<B>>} % {B} # (I / 64)]>()
-    };
-    window.to_dm(&mut device.tdma)
+    let mut output = Down::<H, Inputs<B>, B>::new();
+    if const { B == 64 } {
+        weights.0.0.view()
+            .tile::<m![Panels = 3], 1, m![Panels = 1 # 3, {Cluster<Inputs<64>>}, H / (H / 8), {Blocks<Inputs<64>>}, H % (H / 8), {Symbol<Inputs<64>>} % 64]>(panel)
+            .to_dm_view(&mut device.tdma, output.view_mut());
+    } else {
+        weights
+            .0
+            .1
+            .view()
+            .to_dm_view(&mut device.tdma, output.view_mut());
+    }
+    output
 }
 fn stage_codes<I: AxisName, R: AxisName, const B: usize>(
     device: &mut Device,
@@ -383,11 +432,32 @@ fn stage_codes<I: AxisName, R: AxisName, const B: usize>(
     let band = codes
         .view()
         .tile::<Out<I>, B, m![R % (R / 8), {Out<I>} = {B} # (I / 64)]>(64 * panel);
-    // SAFETY: undo gate/up's row permutation; rename each owner's selected contiguous band.
+    // SAFETY: give the selected band its panel-input coordinate, retaining the source stride.
     let band = unsafe {
         band.reshape::<Chip, Cluster<Inputs<B>>,
+            m![{Blocks<Inputs<B>>}, R / (R / 8)],
+            m![R % (R / 8), {Symbol<Inputs<B>>} % {B} # (I / 64)]>()
+    };
+    // Pack locally before row redistribution: DMA reads consecutive B-feature rows.
+    let mut packed: DmTensor<
+        f8e4m3,
+        Chip,
+        Cluster<Inputs<B>>,
+        m![{Blocks<Inputs<B>>}, R / (R / 8)],
+        m![R % (R / 8), {Symbol<Inputs<B>>} % {B}],
+    > = DmTensor::new();
+    device
+        .main
+        .begin(band)
+        .fetch::<m![R % (R / 8), {Symbol<Inputs<B>>} % {B} / 32], m![{Symbol<Inputs<B>>} % 32]>()
+        .collect::<m![R % (R / 8), {Symbol<Inputs<B>>} % {B} / 32], m![{Symbol<Inputs<B>>} % 32]>()
+        .commit_trim::<m![{Symbol<Inputs<B>>} % 32]>()
+        .commit_view(packed.view_mut());
+    // SAFETY: only row labels and equal-sized owner coordinates change; the packed stride is B.
+    let band = unsafe {
+        packed.view().reshape::<Chip, Cluster<Inputs<B>>,
         m![{Blocks<Inputs<B>>}, R % 64 / 8],
-        m![R / 128, R % 128 / 64, R % 8, {Symbol<Inputs<B>>} % {B} # (I / 64)]>()
+        m![R / 128, R % 128 / 64, R % 8, {Symbol<Inputs<B>>} % {B}]>()
     };
     let mut stored = PackedPanel::new();
     band.to_hbm_view(&mut device.tdma, stored.view_mut());
@@ -537,9 +607,16 @@ mod tests {
             f8e4m3::from_f32(0.0);
             H::SIZE * I::SIZE
         ])
-        .to_hbm::<Chip, Stored<H, I>>(&mut device.pdma)
-        .await
-        .unwrap();
+        .into_vec();
+        let full = packed_down::<H, I, 64, 3>(&codes, 0)
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap();
+        let tail = packed_down::<H, I, 32, 1>(&codes, 192)
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap();
+        let codes = (full, tail);
         let scales = HostTensor::<f32, m![H]>::from_vec(vec![1.0; H::SIZE])
             .to_hbm(&mut device.pdma)
             .await
@@ -645,10 +722,12 @@ mod tests {
         weight: &DownWeights<H, I>,
         input: &Input,
         count: &Value,
-    ) -> (Output, Output) {
+    ) -> (Output, Output, Output, Output) {
         let rows = Live::<(), R>::read(count).rows();
         (
             project::<64>(device, weight, input, rows, 0),
+            project::<64>(device, weight, input, rows, 1),
+            project::<64>(device, weight, input, rows, 2),
             project::<32>(device, weight, input, rows, 3),
         )
     }
@@ -666,9 +745,16 @@ mod tests {
             (0..H::SIZE * I::SIZE)
                 .map(|at| f8e4m3::from_f32(coefficient(at / I::SIZE, at % I::SIZE))),
         )
-        .to_hbm::<Chip, Stored<H, I>>(&mut device.pdma)
-        .await
-        .unwrap();
+        .into_vec();
+        let full = packed_down::<H, I, 64, 3>(&codes, 0)
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap();
+        let tail = packed_down::<H, I, 32, 1>(&codes, 192)
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap();
+        let codes = (full, tail);
         let scales = HostTensor::<f32, m![H]>::from_vec(vec![1.0; H::SIZE])
             .to_hbm(&mut device.pdma)
             .await
@@ -690,10 +776,15 @@ mod tests {
                 .to_hbm(&mut device.pdma)
                 .await
                 .unwrap();
-            let (full, tail) = launch(panels, (&mut device, &weight, &input, &count))
+            let outputs = launch(panels, (&mut device, &weight, &input, &count))
                 .await
                 .unwrap();
-            for (output, offset, width) in [(full, 0, 64), (tail, 192, 32)] {
+            let outputs = [outputs.0, outputs.1, outputs.2, outputs.3];
+            for (output, (offset, width)) in
+                outputs
+                    .into_iter()
+                    .zip([(0, 64), (64, 64), (128, 64), (192, 32)])
+            {
                 let actual = output
                     .to_host::<m![{Cluster<I>}, R, H]>(&mut device.pdma)
                     .await
