@@ -18,8 +18,7 @@ type InputQuantizer<H, R> = Quantization<
 >;
 
 type TokenScales<I, R> = DmTensor<f32, Chip, Cluster<I>, m![1 # 32, R / (R / 8)], m![R % (R / 8)]>;
-type ProductCodes<I, R> =
-    DmTensor<f8e4m3, Chip, Cluster<I>, Slice<I, R>, m![R % (R / 8), {Out<I>}]>;
+type ProductScales<I, R> = VrfTensor<f32, Chip, Cluster<I>, Slice<I, R>, m![R % (R / 8)]>;
 type ProductQuantizer<I, R> = Quantization<
     m![R % (R / 8), {Out<I>} / 8],
     m![R % (R / 8), {Out<I>} / 4],
@@ -242,12 +241,12 @@ impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName>
             };
             store_rows(device, values, stored, rows);
         } else {
-            let codes = product_codes(device, &product, &factors, rows);
+            let scales = product_scale_operand(device, &factors);
             panels = (
-                stage_codes(device, &codes, 0),
-                stage_codes(device, &codes, 1),
-                stage_codes(device, &codes, 2),
-                stage_codes(device, &codes, 3),
+                quantize_panel(device, &product, &scales, 0, rows),
+                quantize_panel(device, &product, &scales, 1, rows),
+                quantize_panel(device, &product, &scales, 2, rows),
+                quantize_panel(device, &product, &scales, 3, rows),
             );
         }
         Staging {
@@ -379,26 +378,20 @@ fn product_scales<I: AxisName, R: AxisName>(
     let local: TokenScales<I, R> = reduced.to_dm(&mut device.tdma);
     vector::cluster_max(device, &local, local_rows)
 }
-fn product_codes<I: AxisName, R: AxisName>(
+fn product_scale_operand<I: AxisName, R: AxisName>(
     device: &mut Device,
-    product: &Projection<I, R>,
     scales: &TokenScales<I, R>,
-    rows: usize,
-) -> ProductCodes<I, R> {
+) -> ProductScales<I, R> {
     // TokenScales holds one owner plus slice padding. Broadcast the scale to every feature
     // owner before quantization; reinterpreting that padding would read unwritten scales.
     let broadcast: DmTensor<f32, Chip, Cluster<I>, Slice<I, R>, m![R % (R / 8)]> =
         scales.to_dm(&mut device.tdma);
-    let scales: VrfTensor<f32, Chip, Cluster<I>, Slice<I, R>, m![R % (R / 8)]> = device
+    device
         .sub
         .begin(broadcast.view())
         .fetch::<m![R % (R / 8) / 8], m![R % 8]>()
         .collect::<m![R % (R / 8) / 8], m![R % 8]>()
-        .to_vrf();
-    let mut codes = ProductCodes::<I, R>::new();
-    ProductQuantizer::<I, R>::rows(&mut device.main, product.view(), &scales)
-        .commit_prefix::<m![R % (R / 8)], _, _>(codes.view_mut(), rows.div_ceil(64) * 8);
-    codes
+        .to_vrf()
 }
 /// One of the first three 64-feature panels, or the final native 32-feature panel, of every
 /// intermediate owner. Each panel is staged once and reused across the span's live waves.
@@ -424,35 +417,42 @@ pub(crate) fn down<H: AxisName, I: AxisName, const B: usize>(
     }
     output
 }
-fn stage_codes<I: AxisName, R: AxisName, const B: usize>(
+/// Quantize directly into consecutive B-feature rows, ready for the panel's HBM store.
+/// All panels reuse the full-token FP32 scale; selecting a band does not recompute its maximum.
+fn quantize_panel<I: AxisName, R: AxisName, const B: usize>(
     device: &mut Device,
-    codes: &ProductCodes<I, R>,
+    product: &Projection<I, R>,
+    scales: &ProductScales<I, R>,
     panel: usize,
+    rows: usize,
 ) -> PackedPanel<R, B> {
-    let band = codes
+    let band = product
         .view()
         .tile::<Out<I>, B, m![R % (R / 8), {Out<I>} = {B} # (I / 64)]>(64 * panel);
-    // SAFETY: give the selected band its panel-input coordinate, retaining the source stride.
+    // SAFETY: rename only the selected feature band, retaining its BF16 source stride and
+    // the original cluster/slice owners so all four panels share the same scale operand.
     let band = unsafe {
-        band.reshape::<Chip, Cluster<Inputs<B>>,
-            m![{Blocks<Inputs<B>>}, R / (R / 8)],
+        band.reshape::<Chip, Cluster<I>, Slice<I, R>,
             m![R % (R / 8), {Symbol<Inputs<B>>} % {B} # (I / 64)]>()
     };
-    // Pack locally before row redistribution: DMA reads consecutive B-feature rows.
+    type Quantizer<I, R, const B: usize> = Quantization<
+        m![R % (R / 8), {Symbol<Inputs<B>>} % {B} / 8],
+        m![R % (R / 8), {Symbol<Inputs<B>>} % {B} / 4],
+        Inputs<B>,
+        m![R % (R / 8)],
+        Slice<I, R>,
+        m![R % (R / 8) / 4],
+        m![R % 4],
+    >;
     let mut packed: DmTensor<
         f8e4m3,
         Chip,
-        Cluster<Inputs<B>>,
-        m![{Blocks<Inputs<B>>}, R / (R / 8)],
+        Cluster<I>,
+        Slice<I, R>,
         m![R % (R / 8), {Symbol<Inputs<B>>} % {B}],
     > = DmTensor::new();
-    device
-        .main
-        .begin(band)
-        .fetch::<m![R % (R / 8), {Symbol<Inputs<B>>} % {B} / 32], m![{Symbol<Inputs<B>>} % 32]>()
-        .collect::<m![R % (R / 8), {Symbol<Inputs<B>>} % {B} / 32], m![{Symbol<Inputs<B>>} % 32]>()
-        .commit_trim::<m![{Symbol<Inputs<B>>} % 32]>()
-        .commit_view(packed.view_mut());
+    Quantizer::<I, R, B>::rows(&mut device.main, band, scales)
+        .commit_prefix::<m![R % (R / 8)], _, _>(packed.view_mut(), rows.div_ceil(64) * 8);
     // SAFETY: only row labels and equal-sized owner coordinates change; the packed stride is B.
     let band = unsafe {
         packed.view().reshape::<Chip, Cluster<Inputs<B>>,
