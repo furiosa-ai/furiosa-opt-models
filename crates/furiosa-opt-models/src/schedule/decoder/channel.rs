@@ -156,6 +156,7 @@ fn start(
 /// input rows: the output projection, the attention residual and the MLP's first step on its norm.
 fn end(
     device: &mut Device,
+    call: Launched<'_, '_>,
     layer: &Layer,
     (attended, landed): Output<'_>,
     input: Live<Owned<Width, Span>, Capacity>,
@@ -184,7 +185,15 @@ fn end(
     let normalized = gain.forward(&mut *device, (), &mut (), &attended);
     let rows = tile.with(normalized.value());
     let projected = gate_up.forward(&mut *device, (), &mut (), (ahead, rows));
-    let staged = down.forward(&mut *device, (), &mut (), Begin(tile.with(projected)));
+    // Only pure item launches retain product scales in DM. Prompt and mixed launches keep
+    // the HBM path, even for short spans; row count alone does not identify decode work.
+    let decode = call.context.0.read.items().rows() == call.live.rows();
+    let staged = down.forward(
+        &mut *device,
+        (),
+        &mut (),
+        Begin((tile.with(projected), decode)),
+    );
     Staged {
         product: staged,
         attended,
@@ -244,7 +253,7 @@ impl<'l, 'c, 'a, 'p, 's>
     ) -> Self::Output {
         let Self(layer, next) = *self;
         let tile = input.with(());
-        let staged = end(device, layer, attended, input);
+        let staged = end(device, call, layer, attended, input);
         let front = front(device, next, tile);
         let rows = update(device, layer, staged);
         start(device, call, next, front, rows, stored)
@@ -261,12 +270,12 @@ impl<'l, 'c, 'a, 'p, 's>
     fn forward(
         &self,
         device: &mut Device,
-        _: Launched<'c, 'a>,
+        call: Launched<'c, 'a>,
         _: &'s mut (),
         (attended, input): (Output<'p>, Live<Owned<Width, Span>, Capacity>),
     ) -> Self::Output {
         let Self(layer, norm) = *self;
-        let staged = end(device, layer, attended, input);
+        let staged = end(device, call, layer, attended, input);
         let rows = update(device, layer, staged);
         norm.forward(device, (), &mut (), &rows)
     }
