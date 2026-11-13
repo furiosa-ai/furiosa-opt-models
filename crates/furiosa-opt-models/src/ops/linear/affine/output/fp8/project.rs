@@ -9,11 +9,11 @@ type Attended<Reach, KvHeads, Groups, Head> =
 /// What the first step leaves the second: the rows in DM, the resident weight, the quantized rows,
 /// their scales, the partial sums, and the waves with their whole blocks, tail, first passes and
 /// single pass.
-type First<Hidden, QWidth, Rows> = (
+type First<Hidden, QWidth, Rows, D> = (
     InDm<Hidden, QWidth, Rows>,
     Resident<Hidden, QWidth>,
     Source<Hidden, QWidth, Rows>,
-    ReplicatedScales<Hidden, QWidth, Rows>,
+    ReplicatedScales<Hidden, QWidth, Rows, D>,
     tiles::Partial<Hidden, QWidth, Rows>,
     [usize; 5],
 );
@@ -30,16 +30,18 @@ type Second<Hidden, QWidth, Rows> = (
 /// and what each step leaves the next. A tile takes three steps, one a poll: the tile's rows
 /// landed and the first block's first pass, then the other passes and the exchange of one half of
 /// the clusters' partial sums, then the sum, which it gives.
-pub struct Landed<Hidden: AxisName, QWidth: AxisName, Rows: AxisName> {
+pub struct Landed<Hidden: AxisName, QWidth: AxisName, Rows: AxisName, D: Scalar = bf16> {
     staged: Staged<Hidden, QWidth>,
     step: usize,
-    first: Option<First<Hidden, QWidth, Rows>>,
+    first: Option<First<Hidden, QWidth, Rows, D>>,
     second: Option<Second<Hidden, QWidth, Rows>>,
 }
 
 /// The weights and their channel scales staged before any attended row arrives.
-impl<Hidden: AxisName, QWidth: AxisName> Op<Begin<()>> for Stored<Hidden, QWidth> {
-    type Output = Landed<Hidden, QWidth, Span>;
+impl<Hidden: AxisName, QWidth: AxisName, F: quantize::Tokens> Op<Begin<()>>
+    for Stored<Hidden, QWidth, F>
+{
+    type Output = Landed<Hidden, QWidth, Span, F::Scale>;
 
     fn forward(&self, context: &mut Device, _: Begin<()>) -> Self::Output {
         let mut staged = Self::empty();
@@ -55,10 +57,10 @@ impl<Hidden: AxisName, QWidth: AxisName> Op<Begin<()>> for Stored<Hidden, QWidth
 
 /// The projection over weights staged beforehand, e.g. while an attention's last history is in
 /// flight.
-impl<Hidden: AxisName, QWidth: AxisName> Op<Begin<Staged<Hidden, QWidth>>>
-    for Stored<Hidden, QWidth>
+impl<Hidden: AxisName, QWidth: AxisName, F: quantize::Tokens> Op<Begin<Staged<Hidden, QWidth>>>
+    for Stored<Hidden, QWidth, F>
 {
-    type Output = Landed<Hidden, QWidth, Span>;
+    type Output = Landed<Hidden, QWidth, Span, F::Scale>;
 
     fn forward(
         &self,
@@ -75,12 +77,12 @@ impl<Hidden: AxisName, QWidth: AxisName> Op<Begin<Staged<Hidden, QWidth>>>
 }
 
 /// One step of span tile `tile` of the attended rows; the sum once the third step gives it.
-impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head>
+impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head, F: quantize::Tokens>
     Op<(
-        &'l mut Landed<Hidden, QWidth, Span>,
+        &'l mut Landed<Hidden, QWidth, Span, F::Scale>,
         &'a Attended<Reach, KvHeads, Groups, Head>,
         Live<(), Capacity>,
-    )> for Stored<Hidden, QWidth>
+    )> for Stored<Hidden, QWidth, F>
 where
     Hidden: AxisName,
     QWidth: AxisName,
@@ -96,7 +98,7 @@ where
         &self,
         context: &mut Device,
         (landed, attended, tile): (
-            &'l mut Landed<Hidden, QWidth, Span>,
+            &'l mut Landed<Hidden, QWidth, Span, F::Scale>,
             &'a Attended<Reach, KvHeads, Groups, Head>,
             Live<(), Capacity>,
         ),
@@ -125,11 +127,7 @@ where
             let mut scales = ReplicatedScales::new();
             let resident = Op::forward(&contract::Stage, &mut *context, weight);
             let waves = (rows + 31) / 32;
-            Op::forward(
-                &quantize::First,
-                &mut *context,
-                (&in_dm, (&mut source, &mut scales)),
-            );
+            F::first(context, &in_dm, (&mut source, &mut scales), rows);
             let (whole, tail) = (waves / 4, waves % 4);
             let first = (whole + 3) / 4;
             // One pass of eight rows when no whole block exists.
@@ -142,11 +140,7 @@ where
                     ((&resident, &source), (&mut partial, 0)),
                 );
             } else {
-                Op::forward(
-                    &contract::Pass::<8>,
-                    &mut *context,
-                    ((&resident, &source), (&mut partial, 0)),
-                );
+                F::pass(context, &resident, &source, &mut partial, 0, rows);
             }
             landed.first = Some((
                 in_dm,
@@ -166,11 +160,7 @@ where
                 let [waves, whole, tail, first, single] = counts;
                 let channels = &staged.weight.1;
                 if waves > 4 {
-                    Op::forward(
-                        &quantize::All,
-                        &mut *context,
-                        ((&in_dm, (&mut source, &mut scales)), waves),
-                    );
+                    F::rest(context, &in_dm, (&mut source, &mut scales), rows);
                 }
                 for block in 0..3 * whole / 4 {
                     Op::forward(
@@ -180,16 +170,20 @@ where
                     );
                 }
                 for wave in 0..(tail + 3 + first) % 4 {
-                    Op::forward(
-                        &contract::Pass::<8>,
-                        &mut *context,
-                        (
-                            (&resident, &source),
-                            (&mut partial, 4 * whole + single + wave),
-                        ),
+                    F::pass(
+                        context,
+                        &resident,
+                        &source,
+                        &mut partial,
+                        4 * whole + single + wave,
+                        rows,
                     );
                 }
-                let scales = Op::forward(&scale::Gather, &mut *context, &scales);
+                let scales = Op::forward(
+                    &scale::Gather::<F::Packet>(PhantomData),
+                    &mut *context,
+                    &scales,
+                );
                 let partial = Op::forward(
                     &scale::Rescale,
                     &mut *context,

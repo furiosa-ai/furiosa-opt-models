@@ -46,19 +46,24 @@ impl<In: AxisName> AxisName for Blocks<In> {
     const SIZE: usize = (In::SIZE / (2 * GROUP)).next_multiple_of(2);
 }
 
-/// A block-scaled E4M3 projection of `In` inputs and `Out` outputs in its row-scaled device form:
-/// its codes `W`, each row's block scales folded under its largest ([`folded`]), and those row
-/// scales `S`. A form without row scales (`S = ()`) holds each row's scale in its codes, exactly.
+/// An E4M3 projection of `In` inputs and `Out` outputs in its row-scaled device form: codes `W`
+/// and channel scales `S`. `Block` folds checkpoint block scales under each row's largest
+/// ([`folded`]); `Channel` preserves native checkpoint codes and scales. A form without row
+/// scales (`S = ()`) holds each row's scale in its codes, exactly.
 #[derive(DeviceSend)]
-pub struct Rows<In, Out, W, S = ()>(pub W, pub S, PhantomData<fn() -> (In, Out)>);
+pub struct Rows<In, Out, W, S = (), Format = Block>(
+    pub W,
+    pub S,
+    PhantomData<fn() -> (In, Out, Format)>,
+);
 
-impl<In, Out, W, S> Rows<In, Out, W, S> {
+impl<In, Out, W, S, Format> Rows<In, Out, W, S, Format> {
     pub fn new(codes: W, scales: S) -> Self {
         Self(codes, scales, PhantomData)
     }
 }
 
-impl<In: M + 'static, Out: M + 'static, W, S> Rows<In, Out, W, S>
+impl<In: M + 'static, Out: M + 'static, W, S, Format> Rows<In, Out, W, S, Format>
 where
     W: Load<HostTensor<f8e4m3, m![{ Chip }, { m![{ Out }, { In }] }]>>,
 {
@@ -73,6 +78,21 @@ where
             context.field("0", "", |cx| W::load(cx, codes))?,
             context.field("1", "", scales)?,
         ))
+    }
+}
+
+/// Native E4M3 codes with separate per-output-channel scales: loading changes only their layout.
+pub struct Channel;
+
+impl<'a, In: M + 'static, Out: M + 'static, W, L: M + 'static> Load<&'a Checkpoint>
+    for Rows<In, Out, W, HbmTensor<f32, Chip, L>, Channel>
+where
+    W: Load<HostTensor<f8e4m3, m![{ Chip }, { m![{ Out }, { In }] }]>>,
+{
+    fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
+        let (codes, rows) = channels::<In, Out>(from, context)?;
+        let rows = HostTensor::<f32, m![{ Chip }, { Out }]>::from_vec(rows.repeat(Chip::SIZE));
+        Self::place(codes, |cx| Load::load(cx, rows), context)
     }
 }
 
@@ -220,6 +240,53 @@ impl Granularity {
     }
 }
 
+/// Native channel codes and finite positive scales, preserving every checkpoint code bit.
+pub(crate) fn channels<In: M, Out: M>(
+    from: &Checkpoint,
+    context: &mut Context<'_>,
+) -> Result<(Vec<f8e4m3>, Vec<f32>), LoadError> {
+    let (name, weight) = context.tensor(from)?;
+    let shape = [Out::SIZE, In::SIZE];
+    if weight.dtype() != Dtype::F8_E4M3 || weight.shape() != shape {
+        return Err(LoadError::InvalidData {
+            name,
+            reason: format!("expected E4M3 codes of shape {shape:?}"),
+        });
+    }
+    let codes: Vec<_> = weight
+        .data()
+        .iter()
+        .map(|&code| <f8e4m3 as ScalarBytes>::from_le_bytes(&[code]))
+        .collect();
+    if codes.iter().any(|code| !code.to_f32().is_finite()) {
+        return Err(LoadError::InvalidData {
+            name,
+            reason: "weight codes must be finite".into(),
+        });
+    }
+    let name = context.sibling("weight_scale");
+    context.read(&name);
+    let scale = from
+        .get(&name)
+        .ok_or_else(|| LoadError::Missing(vec![name.clone()]))?;
+    if scale.shape() != [Out::SIZE, 1] || !matches!(scale.dtype(), Dtype::BF16 | Dtype::F32) {
+        return Err(LoadError::InvalidData {
+            name,
+            reason: format!(
+                "expected BF16 or FP32 channel scales of shape [{}, 1]",
+                Out::SIZE
+            ),
+        });
+    }
+    let rows = Checkpoint::floats(&scale).expect("scale dtype checked above");
+    if rows.iter().any(|scale| !scale.is_finite() || *scale <= 0.0) {
+        return Err(LoadError::InvalidData {
+            name,
+            reason: "scale must be finite and positive".into(),
+        });
+    }
+    Ok((codes, rows))
+}
 /// A checkpoint's `[out / 128, in / 128]` block scales `grid` in the device form [`Scales`]: each
 /// block row once per four output rows, each input half's blocks padded to an even count.
 pub(crate) fn layout<In: AxisName, Out: AxisName>(grid: &[f32]) -> Vec<f32> {
@@ -232,7 +299,6 @@ pub(crate) fn layout<In: AxisName, Out: AxisName>(grid: &[f32]) -> Vec<f32> {
         })
         .collect()
 }
-
 /// The `[out / 128, in / 128]` FP32 block scales of the `Out` x `In` projection, stored under
 /// one of `names` (its spellings, canonical first) as FP32 or BF16, each finite and positive.
 pub(crate) fn grid<In: M, Out: M>(
@@ -268,7 +334,6 @@ pub(crate) fn grid<In: M, Out: M>(
         false => Err(invalid("scale must be finite and positive")),
     }
 }
-
 /// The E4M3 codes of the `Out` x `In` projection whose `weight` is the context's name, each
 /// requantized under its row's largest block scale, and those row scales.
 ///
@@ -313,7 +378,6 @@ pub(crate) fn folded<In: M, Out: M>(
         .collect();
     Ok((folded, rows))
 }
-
 /// The block scales of the projection at the context's name in the device form, on every chip of
 /// `C`.
 pub(crate) fn scales<In: AxisName, Out: AxisName, C: M + 'static>(
@@ -434,6 +498,34 @@ mod tests {
                 folded::<m![In], m![Out]>(source, cx)
             })
         })
+    }
+
+    #[test]
+    fn native_channels_preserve_codes_and_promote_scales() {
+        let codes = codes();
+        let scales: Vec<_> = (0..Out::SIZE)
+            .map(|row| half::bf16::from_f32((row + 1) as f32 / 103.0).to_f32())
+            .collect();
+        let shape = [Out::SIZE, 1];
+        let read = |source: &Checkpoint| {
+            Context::new(None).field("", "proj", |cx| {
+                cx.field("weight", "weight", |cx| {
+                    channels::<m![In], m![Out]>(source, cx)
+                })
+            })
+        };
+        let source = checkpoint(&codes, &[("weight_scale", Dtype::BF16, &shape, &scales)]);
+        let (actual, factors) = read(&source).unwrap();
+        assert_eq!(f8e4m3::to_buf(&actual), f8e4m3::to_buf(&codes));
+        assert_eq!(factors, scales);
+        for invalid in [0.0, -1.0, f32::INFINITY, f32::NAN] {
+            let mut scales = scales.clone();
+            scales[Out::SIZE - 1] = invalid;
+            let source = checkpoint(&codes, &[("weight_scale", Dtype::BF16, &shape, &scales)]);
+            assert!(read(&source).is_err());
+        }
+        let source = checkpoint(&codes, &[("weight_scale", Dtype::BF16, &[2, 2], &[1.0; 4])]);
+        assert!(read(&source).is_err());
     }
 
     /// The value a checkpoint code means under its block's scale.

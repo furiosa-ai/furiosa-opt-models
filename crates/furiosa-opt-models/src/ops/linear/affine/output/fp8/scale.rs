@@ -2,17 +2,23 @@ use super::*;
 use crate::Op;
 
 /// The row scales, gathered into the slices that rescale the partial sums.
-pub(super) struct Gather;
+pub(super) struct Gather<P>(pub(super) PhantomData<P>);
 
-impl<'a, Hidden: AxisName, QWidth: AxisName, Capacity: AxisName>
-    Op<&'a ReplicatedScales<Hidden, QWidth, Capacity>> for Gather
+impl<
+    'a,
+    Hidden: AxisName,
+    QWidth: AxisName,
+    Capacity: AxisName,
+    D: MaterializableScalar,
+    P: M + Count,
+> Op<&'a ReplicatedScales<Hidden, QWidth, Capacity, D>> for Gather<P>
 {
-    type Output = Scales<Hidden, QWidth, Capacity>;
+    type Output = Scales<Hidden, QWidth, Capacity, D>;
 
     fn forward(
         &self,
         context: &mut Device,
-        scales: &'a ReplicatedScales<Hidden, QWidth, Capacity>,
+        scales: &'a ReplicatedScales<Hidden, QWidth, Capacity, D>,
     ) -> Self::Output {
         // SAFETY: the same slices; a quarter's replicas are named by the slices they reach.
         let quarters = unsafe {
@@ -20,17 +26,23 @@ impl<'a, Hidden: AxisName, QWidth: AxisName, Capacity: AxisName>
                 m![Hidden / 1024, Capacity / (Capacity / 4), Hidden % 256 / 16],
                 m![Capacity % (Capacity / 4)]>()
         };
-        let mut gathered = Scales::new();
-        context.main.begin(quarters)
-            .fetch::<m![Capacity % (Capacity / 4) / 16], m![Capacity % 16]>()
-            .switch::<
-                m![Hidden / 16],
-                m![Capacity % (Capacity / 4) / 16, Capacity / (Capacity / 4)],
-            >(
-                SwitchConfig::Broadcast1 { slice1: 4, slice0: 16 })
-            .collect::<m![Capacity % (Capacity / 4) / 16, Capacity / (Capacity / 4)],
-                m![Capacity % 16]>()
-            .commit_trim::<m![Capacity % 16]>()
+        let mut gathered = Scales::<Hidden, QWidth, Capacity, D>::new();
+        context
+            .main
+            .begin(quarters)
+            .fetch::<m![Capacity % (Capacity / 4) / ({ P })], m![Capacity % ({ P })]>()
+            .switch::<m![Hidden / 16], m![
+                Capacity % (Capacity / 4) / ({ P }),
+                Capacity / (Capacity / 4)
+            ]>(SwitchConfig::Broadcast1 {
+                slice1: 4,
+                slice0: 16,
+            })
+            .collect::<m![
+                Capacity % (Capacity / 4) / ({ P }),
+                Capacity / (Capacity / 4)
+            ], m![Capacity % ({ P })]>()
+            .commit_trim::<m![Capacity % ({ P })]>()
             .commit_view(gathered.view_mut());
         gathered
     }
@@ -40,24 +52,29 @@ impl<'a, Hidden: AxisName, QWidth: AxisName, Capacity: AxisName>
 pub(super) struct Rescale;
 
 /// The partial sums, the row and channel scales, and the row groups a [`Rescale`] writes.
-type Operands<'a, Hidden, QWidth, Capacity> = (
+type Operands<'a, Hidden, QWidth, Capacity, D> = (
     &'a tiles::Partial<Hidden, QWidth, Capacity>,
     (
-        &'a Scales<Hidden, QWidth, Capacity>,
+        &'a Scales<Hidden, QWidth, Capacity, D>,
         &'a Channels<Hidden, QWidth>,
     ),
     usize,
 );
 
-impl<'a, Hidden: AxisName, QWidth: AxisName, Capacity: AxisName>
-    Op<Operands<'a, Hidden, QWidth, Capacity>> for Rescale
+impl<
+    'a,
+    Hidden: AxisName,
+    QWidth: AxisName,
+    Capacity: AxisName,
+    D: MaterializableScalar + FetchCast<f32>,
+> Op<Operands<'a, Hidden, QWidth, Capacity, D>> for Rescale
 {
     type Output = tiles::Partial<Hidden, QWidth, Capacity>;
 
     fn forward(
         &self,
         context: &mut Device,
-        (partial, (scales, channels), waves): Operands<'a, Hidden, QWidth, Capacity>,
+        (partial, (scales, channels), waves): Operands<'a, Hidden, QWidth, Capacity, D>,
     ) -> Self::Output {
         let row: VrfTensor<
             f32,

@@ -2,6 +2,114 @@ use super::*;
 use crate::Op;
 use crate::ops::vector::Quantization;
 
+/// Only the activation quantizer differs: Qwen's BF16 partition scales or native FP32 token
+/// scales agreed across input-half clusters. Weight staging and projection scheduling are shared.
+pub trait Tokens {
+    type Scale: MaterializableScalar + FetchCast<f32>;
+    type Packet: M + Count;
+    fn pass<H: AxisName, Q: AxisName, R: AxisName>(
+        device: &mut Device,
+        weight: &Resident<H, Q>,
+        input: &Source<H, Q, R>,
+        output: &mut tiles::Partial<H, Q, R>,
+        offset: usize,
+        _rows: usize,
+    ) {
+        Op::forward(
+            &contract::Pass::<8>,
+            device,
+            ((weight, input), (output, offset)),
+        );
+    }
+    fn first<H: AxisName, Q: AxisName, R: AxisName>(
+        device: &mut Device,
+        input: &InDm<H, Q, R>,
+        output: (
+            &mut Source<H, Q, R>,
+            &mut ReplicatedScales<H, Q, R, Self::Scale>,
+        ),
+        rows: usize,
+    );
+    fn rest<H: AxisName, Q: AxisName, R: AxisName>(
+        device: &mut Device,
+        input: &InDm<H, Q, R>,
+        output: (
+            &mut Source<H, Q, R>,
+            &mut ReplicatedScales<H, Q, R, Self::Scale>,
+        ),
+        rows: usize,
+    );
+}
+
+impl Tokens for crate::tensor::form::fp8::Block {
+    type Scale = bf16;
+    type Packet = m![16];
+    fn first<H: AxisName, Q: AxisName, R: AxisName>(
+        device: &mut Device,
+        input: &InDm<H, Q, R>,
+        output: (&mut Source<H, Q, R>, &mut ReplicatedScales<H, Q, R>),
+        _: usize,
+    ) {
+        Op::forward(&First, device, (input, output));
+    }
+    fn rest<H: AxisName, Q: AxisName, R: AxisName>(
+        device: &mut Device,
+        input: &InDm<H, Q, R>,
+        output: (&mut Source<H, Q, R>, &mut ReplicatedScales<H, Q, R>),
+        rows: usize,
+    ) {
+        Op::forward(&All, device, ((input, output), rows.div_ceil(32)));
+    }
+}
+
+impl Tokens for crate::tensor::form::fp8::Channel {
+    type Scale = f32;
+    type Packet = m![8];
+    fn pass<H: AxisName, Q: AxisName, R: AxisName>(
+        device: &mut Device,
+        weight: &Resident<H, Q>,
+        input: &Source<H, Q, R>,
+        output: &mut tiles::Partial<H, Q, R>,
+        offset: usize,
+        rows: usize,
+    ) {
+        if rows <= 32 {
+            match rows.div_ceil(8) {
+                1 => channel::contract::<H, Q, R, 1>(device, weight, input, output),
+                2 => channel::contract::<H, Q, R, 2>(device, weight, input, output),
+                3 => channel::contract::<H, Q, R, 3>(device, weight, input, output),
+                _ => channel::contract::<H, Q, R, 4>(device, weight, input, output),
+            }
+        } else {
+            Op::forward(
+                &contract::Pass::<8>,
+                device,
+                ((weight, input), (output, offset)),
+            );
+        }
+    }
+    fn first<H: AxisName, Q: AxisName, R: AxisName>(
+        device: &mut Device,
+        input: &InDm<H, Q, R>,
+        output: (&mut Source<H, Q, R>, &mut ReplicatedScales<H, Q, R, f32>),
+        rows: usize,
+    ) {
+        let (codes, scales) = channel::quantize(device, input, rows.min(128));
+        *output.0 = codes;
+        *output.1 = scales;
+    }
+    fn rest<H: AxisName, Q: AxisName, R: AxisName>(
+        device: &mut Device,
+        input: &InDm<H, Q, R>,
+        output: (&mut Source<H, Q, R>, &mut ReplicatedScales<H, Q, R, f32>),
+        rows: usize,
+    ) {
+        let (codes, scales) = channel::quantize(device, input, rows);
+        *output.0 = codes;
+        *output.1 = scales;
+    }
+}
+
 /// The copied rows' first wave as E4M3 rows and their BF16 row scales.
 pub(super) struct First;
 
@@ -26,7 +134,7 @@ type Tile<Hidden, QWidth, Capacity> = Quantization<
 >;
 
 /// The quantization of each chunk's quarter of the copied rows.
-type Quarter<Hidden, QWidth, Capacity> = Quantization<
+pub(super) type Quarter<Hidden, QWidth, Capacity> = Quantization<
     m![Capacity % (Capacity / 4), QWidth % 128 / 8],
     m![Capacity % (Capacity / 4), QWidth % 128 / 4],
     QWidth,

@@ -625,6 +625,10 @@ pub mod form {
     /// FP8 weights with one FP32 scale per output channel.
     pub struct ChannelScaled;
 
+    /// Native channel-scaled E4M3 weights and dynamically quantized complete-token activations.
+    /// Runtime token scales remain FP32; this is distinct from the undeclared W8A16 form above.
+    pub struct TokenScaled;
+
     /// FP8 weights and activations with static per-tensor scales.
     pub struct TensorScaled;
 
@@ -676,6 +680,36 @@ pub mod form {
 
         const REQUIREMENT: Requirement = Requirement::Undeclared;
 
+        type Caches = (bf16,);
+    }
+
+    impl Form for TokenScaled {
+        type Stored = f8e4m3;
+        type Of<In: AxisName, Out: AxisName, D: Scalar, Chips: M + 'static, X: Memory, V> =
+            linear::Affine<
+                tensor::form::fp8::Rows<
+                    m![In],
+                    m![Out],
+                    V,
+                    X::Tensor<f32, Chips, m![Out]>,
+                    tensor::form::fp8::Channel,
+                >,
+                (),
+            >;
+        type Query<Hidden: AxisName, Heads: AxisName, Head: AxisName, X: Memory> =
+            linear::Affine<query::fp8::channel::Weights<Hidden, Heads, Head>, ()>;
+        type Key<Hidden: AxisName, Heads: AxisName, Head: AxisName, X: Memory> =
+            Self::Query<Hidden, Heads, Head, X>;
+        type Value<Hidden: AxisName, Heads: AxisName, Head: AxisName, X: Memory> =
+            Self::Query<Hidden, Heads, Head, X>;
+        type Output<Queries: AxisName, Hidden: AxisName, X: Memory> =
+            output::fp8::channel::Stored<Hidden, Queries>;
+        type GateUp<Hidden: AxisName, Intermediate: AxisName, X: Memory> =
+            swiglu::spans::fp8::channel::GateUpWeights<Hidden, Intermediate>;
+        type Down<Hidden: AxisName, Intermediate: AxisName, X: Memory> =
+            swiglu::spans::fp8::channel::DownWeights<Hidden, Intermediate>;
+        const REQUIREMENT: Requirement =
+            Requirement::Declared(Declaration::Fp8(Scheme::ChannelToken));
         type Caches = (bf16,);
     }
 

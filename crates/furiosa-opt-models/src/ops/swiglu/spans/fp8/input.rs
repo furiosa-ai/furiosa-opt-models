@@ -70,16 +70,15 @@ impl<'a, Hidden: AxisName, Rows: AxisName> Op<&'a Owned<Hidden, Rows>> for Input
 /// The copied row scales, fetched into the VRF of each slice.
 pub(super) struct FetchRows;
 
-impl<'i, Intermediate: AxisName, Rows: AxisName, S: M>
-    Op<DmTensorView<'i, bf16, Chip, Cluster<Intermediate>, S, m![Rows % (Rows / 8)]>>
-    for FetchRows
+impl<'i, Intermediate: AxisName, Rows: AxisName, S: M, D: MaterializableScalar + FetchCast<f32>>
+    Op<DmTensorView<'i, D, Chip, Cluster<Intermediate>, S, m![Rows % (Rows / 8)]>> for FetchRows
 {
     type Output = VrfTensor<f32, Chip, Cluster<Intermediate>, S, m![Rows % (Rows / 8)]>;
 
     fn forward(
         &self,
         context: &mut Device,
-        scales: DmTensorView<'i, bf16, Chip, Cluster<Intermediate>, S, m![Rows % (Rows / 8)]>,
+        scales: DmTensorView<'i, D, Chip, Cluster<Intermediate>, S, m![Rows % (Rows / 8)]>,
     ) -> Self::Output {
         context
             .sub
@@ -191,23 +190,28 @@ type TileScale<Hidden, Intermediate, Rows> = VrfTensor<
 pub(super) struct FetchTile;
 
 /// The row scales of a span, written in each slice.
-type InDm<Hidden, Intermediate, Rows> = DmTensor<
-    bf16,
+type InDm<Hidden, Intermediate, Rows, D = bf16> = DmTensor<
+    D,
     Chip,
     Cluster<Intermediate>,
     m![Hidden % 1024 / 32, Rows / (Rows / 8)],
     m![Rows % (Rows / 8)],
 >;
 
-impl<'a, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>
-    Op<(&'a InDm<Hidden, Intermediate, Rows>, usize)> for FetchTile
+impl<
+    'a,
+    Hidden: AxisName,
+    Intermediate: AxisName,
+    Rows: AxisName,
+    D: MaterializableScalar + FetchCast<f32>,
+> Op<(&'a InDm<Hidden, Intermediate, Rows, D>, usize)> for FetchTile
 {
     type Output = TileScale<Hidden, Intermediate, Rows>;
 
     fn forward(
         &self,
         context: &mut Device,
-        (scales, wave): (&'a InDm<Hidden, Intermediate, Rows>, usize),
+        (scales, wave): (&'a InDm<Hidden, Intermediate, Rows, D>, usize),
     ) -> Self::Output {
         context.sub.begin(scales.view().tile::<m![Rows % (Rows / 8) / 16], 1,
             m![Rows % (Rows / 8) / 16 = 1 # (Rows / 128), Rows % 16]>(wave))

@@ -46,6 +46,7 @@ use core::task::Poll;
 use furiosa_opt_std::prelude::*;
 
 mod affine;
+mod channel;
 pub(crate) mod nvfp4;
 
 /// The work between two attentions on one row tile: the end of `A`, then the start of `B`.
@@ -130,6 +131,51 @@ impl<Z: Geometry + Decode> Places<Z> {
             attended: Attended(HbmTensor::new()),
         }
     }
+}
+
+/// The common FP8 attention-to-attention loop. Each form supplies only its typed leaf
+/// preparation/consumption; layer ownership, live spans, cache slots and head staging stay here.
+fn run<Z: Geometry + Decode, P>(
+    device: &mut Device,
+    live: Live<(), Capacity<Z>>,
+    layers: usize,
+    (mut first, mut attend, mut step, mut last, read): (
+        impl FnMut(&mut Device, Live<(), Capacity<Z>>, &mut Stored<Z>) -> RowTile<Z>,
+        impl FnMut(&mut Device, usize, &mut Places<Z>) -> P,
+        impl FnMut(&mut Device, usize, Output<'_, Z, P>, RowTile<Z>, &mut Stored<Z>) -> RowTile<Z>,
+        impl FnMut(&mut Device, Output<'_, Z, P>, RowTile<Z>) -> RowTile<Z>,
+        impl FnOnce(&mut Device, &Rows<Z>),
+    ),
+) {
+    let spans = live.count::<Span>();
+    let mut places = Places::<Z>::new();
+    for span in 0..spans {
+        let tile = live.tile::<Span>(span);
+        let rows = first(device, tile, &mut places.stored);
+        places.input.spill(device, rows.value(), tile);
+    }
+    for index in 0..layers - 1 {
+        let mut projecting = attend(device, index, &mut places);
+        let mut ahead = Places::<Z>::new();
+        for span in 0..spans {
+            let tile = live.tile::<Span>(span);
+            let input = tile.with(places.input.fill(device, tile));
+            let output = (tile.with(&places.attended), &mut projecting);
+            let rows = step(device, index, output, input, &mut ahead.stored);
+            ahead.input.spill(device, rows.value(), tile);
+        }
+        places = ahead;
+    }
+    let mut projecting = attend(device, layers - 1, &mut places);
+    let mut head = Rows::<Z>::new();
+    for span in 0..spans {
+        let tile = live.tile::<Span>(span);
+        let input = tile.with(places.input.fill(device, tile));
+        let output = (tile.with(&places.attended), &mut projecting);
+        let rows = last(device, output, input);
+        head.spill(device, rows.value(), tile);
+    }
+    read(device, &head);
 }
 
 // # The cut of a pre-norm layer at its attention
@@ -432,7 +478,7 @@ impl<'m, 'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, S>, Env, launch::
             output: &mut *embedded,
         };
         crate::Op::forward(&embedding.0, &mut *device, launch);
-        let (layers, spans) = (&body.layers.0, live.count::<Span>());
+        let layers = &body.layers.0;
         // A layer's attention once every tile stored its rows: the rows attended as items written
         // to the cache before, the deferred rows after.
         let attend = |device: &mut Device,
@@ -470,40 +516,30 @@ impl<'m, 'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, S>, Env, launch::
             stage.forward(&mut *device, (), &mut *pool, rows);
             output.forward(device, (), &mut (), Begin(staged))
         };
-        let mut places = Places::new();
-        let first = layers.layer(0);
-        for span in 0..spans {
-            let tile = live.tile::<Span>(span);
-            let tokenwise = Tokenwise(&*embedded, &first);
-            let rows = tokenwise.forward(&mut *device, call, &mut places.stored, tile);
-            places.input.spill(&mut *device, rows.value(), tile);
-        }
-        for index in 0..LAYERS - 1 {
-            let (layer, next) = (layers.layer(index), layers.layer(index + 1));
-            let mut projecting = attend(&mut *device, &layer, &mut slots[index], &mut places);
-            let mut ahead = Places::new();
-            for span in 0..spans {
-                let tile = live.tile::<Span>(span);
-                let input = tile.with(places.input.fill(&mut *device, tile));
-                let tokenwise = Tokenwise(&layer, &next);
-                let output = (tile.with(&places.attended), &mut projecting);
-                let rows =
-                    tokenwise.forward(&mut *device, call, &mut ahead.stored, (output, input));
-                ahead.input.spill(&mut *device, rows.value(), tile);
-            }
-            places = ahead;
-        }
-        let last = layers.layer(LAYERS - 1);
-        let mut projecting = attend(&mut *device, &last, &mut slots[LAYERS - 1], &mut places);
-        let mut head: Rows = HbmTensor::new();
-        for span in 0..spans {
-            let tile = live.tile::<Span>(span);
-            let input = tile.with(places.input.fill(&mut *device, tile));
-            let output = (tile.with(&places.attended), &mut projecting);
-            let rows = Tokenwise(&last, norm).forward(&mut *device, call, &mut (), (output, input));
-            head.spill(&mut *device, rows.value(), tile);
-        }
-        causal.lm_head.read(device, &head, call.context.1, tokens);
+        run::<S, _>(
+            device,
+            live,
+            LAYERS,
+            (
+                |device, tile, stored| {
+                    let first = layers.layer(0);
+                    Tokenwise(&*embedded, &first).forward(device, call, stored, tile)
+                },
+                |device, index, places| {
+                    let layer = layers.layer(index);
+                    attend(device, &layer, &mut slots[index], places)
+                },
+                |device, index, output, input, stored| {
+                    let (layer, next) = (layers.layer(index), layers.layer(index + 1));
+                    Tokenwise(&layer, &next).forward(device, call, stored, (output, input))
+                },
+                |device, output, input| {
+                    let last = layers.layer(LAYERS - 1);
+                    Tokenwise(&last, norm).forward(device, call, &mut (), (output, input))
+                },
+                |device, head| causal.lm_head.read(device, head, call.context.1, tokens),
+            ),
+        );
     }
 }
 

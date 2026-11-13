@@ -679,6 +679,28 @@ def test_keeps_quantization(named: QuantizationMethods | None, tmp_path: Path) -
 
 
 @pytest.mark.usefixtures("platform_env")
+@pytest.mark.parametrize("shared", [True, False])
+def test_native_llama_fp8_requires_separate_prefixes(shared: bool, tmp_path: Path) -> None:
+    """The native Llama launch is admitted only with per-request KV storage."""
+    AutoConfig.from_pretrained(
+        "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8-dynamic",
+        revision="442e7f522277df12f53d63e8384087af31fbfc4b",
+    ).save_pretrained(tmp_path)
+    arguments = EngineArgs(
+        model=str(tmp_path),
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        kv_cache_dtype="bfloat16",
+        max_model_len=40960,
+        enable_prefix_caching=shared,
+    )
+    if shared:
+        assert refusal(arguments) == "enable_prefix_caching"
+    else:
+        assert arguments.create_engine_config().model_config.quantization == "compressed-tensors"
+
+
+@pytest.mark.usefixtures("platform_env")
 def test_refuses_kernels(served: Path) -> None:
     """Startup reports a model refusal when its architecture has no compiled kernels."""
 

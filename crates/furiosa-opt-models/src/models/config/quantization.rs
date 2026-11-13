@@ -32,6 +32,8 @@ pub enum Scheme {
     /// E4M3 weights with one scale per 128 x 128 block; the activations quantize at run time per
     /// group of 128 inputs.
     Block,
+    /// E4M3 weights with one scale per output channel and dynamic per-token input scales.
+    ChannelToken,
     /// E2M1 weights and inputs with an E4M3 scale per 16 inputs under a static FP32 tensor scale.
     Nvfp4,
 }
@@ -56,9 +58,9 @@ enum Hf {
     Modelopt(Modelopt),
     #[serde(rename = "compressed-tensors")]
     CompressedTensors {
-        format: Literal<"float-quantized">,
+        format: FloatFormat,
         quantization_status: Literal<"compressed">,
-        config_groups: BTreeMap<String, BlockGroup>,
+        config_groups: BTreeMap<String, Value>,
         ignore: Option<Vec<String>>,
         #[serde(default)]
         kv_cache_scheme: Absent,
@@ -66,6 +68,115 @@ enum Hf {
         sparsity_config: Absent,
         transform_config: Option<BTreeMap<String, Value>>,
     },
+}
+
+/// The two FP8 storage formats: block-scaled codes or already channel-scaled codes.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(try_from = "String")]
+enum FloatFormat {
+    Block,
+    Channel,
+}
+
+impl TryFrom<String> for FloatFormat {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match value.as_str() {
+            "float-quantized" => Ok(Self::Block),
+            "naive-quantized" => Ok(Self::Channel),
+            _ => Err(super::refuse(
+                format_args!("{value:?}"),
+                "\"float-quantized\" or \"naive-quantized\"",
+            )),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct Groups<T> {
+    config_groups: BTreeMap<String, T>,
+}
+
+/// Native E4M3 output-channel weights and symmetric, dynamic per-token input activations.
+#[derive(Deserialize)]
+struct ChannelGroup {
+    weights: ChannelWeights,
+    input_activations: TokenActivations,
+    #[serde(default)]
+    output_activations: Absent,
+    targets: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct ChannelWeights {
+    num_bits: Constant<8>,
+    #[serde(rename = "type")]
+    kind: Literal<"float">,
+    symmetric: Enabled,
+    dynamic: Disabled,
+    strategy: Literal<"channel">,
+    #[serde(default)]
+    group_size: Absent,
+    #[serde(default)]
+    block_structure: Absent,
+    #[serde(default)]
+    actorder: Absent,
+    #[serde(default)]
+    scale_dtype: Absent,
+    #[serde(default)]
+    zp_dtype: Absent,
+}
+
+#[derive(Deserialize)]
+struct TokenActivations {
+    num_bits: Constant<8>,
+    #[serde(rename = "type")]
+    kind: Literal<"float">,
+    symmetric: Enabled,
+    dynamic: Enabled,
+    strategy: Literal<"token">,
+    #[serde(default)]
+    group_size: Absent,
+    #[serde(default)]
+    block_structure: Absent,
+    #[serde(default)]
+    actorder: Absent,
+    #[serde(default)]
+    scale_dtype: Absent,
+    #[serde(default)]
+    zp_dtype: Absent,
+}
+
+impl ChannelGroup {
+    fn linear(&self) -> bool {
+        let ChannelWeights {
+            num_bits: Constant,
+            kind: Literal,
+            symmetric: Enabled,
+            dynamic: Disabled,
+            strategy: Literal,
+            group_size: Absent,
+            block_structure: Absent,
+            actorder: Absent,
+            scale_dtype: Absent,
+            zp_dtype: Absent,
+        } = &self.weights;
+        let TokenActivations {
+            num_bits: Constant,
+            kind: Literal,
+            symmetric: Enabled,
+            dynamic: Enabled,
+            strategy: Literal,
+            group_size: Absent,
+            block_structure: Absent,
+            actorder: Absent,
+            scale_dtype: Absent,
+            zp_dtype: Absent,
+        } = &self.input_activations;
+        let Absent = &self.output_activations;
+        self.targets == ["Linear"]
+    }
 }
 
 /// A ModelOpt `quantization_config`, by its quantization algorithm.
@@ -349,7 +460,7 @@ impl TryFrom<Value> for Quantization {
                 return Err(unsupported("quant_algo: expected \"FP8\" or \"NVFP4\""));
             }
             Hf::CompressedTensors {
-                format: Literal,
+                format,
                 quantization_status: Literal,
                 config_groups,
                 ignore,
@@ -358,12 +469,30 @@ impl TryFrom<Value> for Quantization {
                 transform_config,
             } => {
                 if config_groups.is_empty()
-                    || !config_groups.values().all(BlockGroup::linear)
                     || transform_config.is_some_and(|transforms| !transforms.is_empty())
                 {
                     return Err(fp8());
                 }
-                (Scheme::Block, ignore.unwrap_or_default(), Some(false))
+                let groups = serde_json::json!({ "config_groups": config_groups });
+                let scheme = match format {
+                    FloatFormat::Block => {
+                        let groups: Groups<BlockGroup> = located(groups)?;
+                        if !groups.config_groups.values().all(BlockGroup::linear) {
+                            return Err(fp8());
+                        }
+                        Scheme::Block
+                    }
+                    FloatFormat::Channel => {
+                        let groups: Groups<ChannelGroup> = located(groups)?;
+                        if !groups.config_groups.values().all(ChannelGroup::linear) {
+                            return Err(unsupported(
+                                "expected channel-scaled E4M3 weights and dynamic per-token inputs on Linear modules",
+                            ));
+                        }
+                        Scheme::ChannelToken
+                    }
+                };
+                (scheme, ignore.unwrap_or_default(), Some(false))
             }
         };
         let excluded = excluded
@@ -377,7 +506,7 @@ impl TryFrom<Value> for Quantization {
                         },
                         "NVFP4 exclusions must be module names or prefixes ending in `*`",
                     ),
-                    Scheme::Tensor | Scheme::Block => (
+                    Scheme::Tensor | Scheme::Block | Scheme::ChannelToken => (
                         match entry
                             .strip_prefix("re:.*")
                             .and_then(|part| part.strip_suffix(".*"))
@@ -408,6 +537,62 @@ mod tests {
 
     fn quantization(document: &Value) -> io::Result<Quantization> {
         parse(document)
+    }
+
+    /// Native channel-scaled FP8 keeps its token quantization declaration, refusing block or
+    /// static input variants instead of changing the model's arithmetic.
+    #[test]
+    fn channel_weights_require_dynamic_token_inputs() {
+        let declared = json!({
+            "quant_method": "compressed-tensors", "format": "naive-quantized",
+            "quantization_status": "compressed", "ignore": ["lm_head"],
+            "config_groups": {"group_0": {
+                "targets": ["Linear"], "output_activations": null,
+                "weights": {"num_bits": 8, "type": "float", "strategy": "channel",
+                    "dynamic": false, "symmetric": true},
+                "input_activations": {"num_bits": 8, "type": "float", "strategy": "token",
+                    "dynamic": true, "symmetric": true}
+            }}
+        });
+        let parsed = quantization(&declared).unwrap();
+        assert_eq!(parsed.scheme, Scheme::ChannelToken);
+        assert!(!parsed.kv_cache);
+        assert_eq!(
+            parsed.excluded,
+            Exclusions(vec![Exclusion::Module("lm_head".into())])
+        );
+        for (part, field, value, reason) in [
+            (
+                "weights",
+                "strategy",
+                json!("block"),
+                "compiled \"channel\"",
+            ),
+            (
+                "input_activations",
+                "strategy",
+                json!("group"),
+                "compiled \"token\"",
+            ),
+            (
+                "input_activations",
+                "dynamic",
+                json!(false),
+                "compiled true",
+            ),
+            (
+                "input_activations",
+                "group_size",
+                json!(128),
+                "compiled none",
+            ),
+        ] {
+            let mut invalid = declared.clone();
+            invalid["config_groups"]["group_0"][part][field] = value;
+            let error = quantization(&invalid).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert!(error.to_string().contains(reason), "{error}");
+        }
     }
 
     /// The quantization objects of published FP8 checkpoints, by dialect.
@@ -687,7 +872,7 @@ mod tests {
                 &compressed,
                 &["format"][..],
                 json!("pack-quantized"),
-                "found \"pack-quantized\", compiled \"float-quantized\"",
+                "found \"pack-quantized\", compiled \"float-quantized\" or \"naive-quantized\"",
             ),
         ];
         let found: Vec<_> = cases

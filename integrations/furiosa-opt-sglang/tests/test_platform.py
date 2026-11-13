@@ -1,7 +1,10 @@
 """The plugin rejects unsupported server options before a scheduler loads the model."""
 
+from pathlib import Path
+
 import pytest
 from sglang.srt.server_args import ServerArgs, prepare_server_args
+from transformers import AutoConfig
 
 from furiosa_opt_sglang.platform import (
     Hierarchical,
@@ -11,6 +14,33 @@ from furiosa_opt_sglang.platform import (
     Requested,
     Resolved,
 )
+
+
+@pytest.mark.parametrize("shared", [True, False])
+def test_native_llama_fp8_requires_separate_prefixes(shared: bool, tmp_path: Path) -> None:
+    """Admission refuses shared prefixes before a scheduler starts this native FP8 model."""
+    AutoConfig.from_pretrained(
+        "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8-dynamic",
+        revision="442e7f522277df12f53d63e8384087af31fbfc4b",
+    ).save_pretrained(tmp_path)
+    flags = [] if shared else ["--disable-radix-cache"]
+    arguments = prepare_server_args(
+        [
+            "--model-path",
+            str(tmp_path),
+            "--context-length",
+            "40960",
+            "--kv-cache-dtype",
+            "bf16",
+            *flags,
+        ]
+    )
+    if shared:
+        with pytest.raises(Refused) as error:
+            arguments.resolve_once()
+        assert error.value.option == "disable_radix_cache"
+    else:
+        arguments.resolve_once()
 
 
 @pytest.mark.parametrize(

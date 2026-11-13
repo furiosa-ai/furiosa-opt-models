@@ -14,19 +14,20 @@ pub(crate) type Spread<Hidden, All> = DmTensor<
     m![All % 32 / 8, Hidden / 64],
     m![All / 64, Hidden % 64 / 16, All % 8, Hidden % 16],
 >;
-type SpreadInput<Hidden, All> = DmTensor<
+pub(super) type SpreadInput<Hidden, All> = DmTensor<
     f8e4m3,
     Chip,
     m![All % 64 / 32],
     m![All % 32 / 8, Hidden / 64],
     m![All / 64, All % 8, Hidden % 64],
 >;
-type SpreadScales<All> =
-    DmTensor<bf16, Chip, m![All % 64 / 32], m![All % 32 / 8, Copies], m![All / 64, All % 8]>;
+pub(super) type SpreadScales<All, D = bf16> =
+    DmTensor<D, Chip, m![All % 64 / 32], m![All % 32 / 8, Copies], m![All / 64, All % 8]>;
 pub(super) type Staged<Hidden, All> = HbmTensor<f8e4m3, Chip, m![Hidden / 64, All, Hidden % 64]>;
-pub(super) type StagedScales<All> = HbmTensor<bf16, Chip, m![All % 64 / 8, All / 64, All % 8]>;
+pub(super) type StagedScales<All, D = bf16> =
+    HbmTensor<D, Chip, m![All % 64 / 8, All / 64, All % 8]>;
 /// The quantization of the spread rows.
-type Rows<Hidden, All> = Quantization<
+pub(super) type Rows<Hidden, All> = Quantization<
     m![All / 64, All % 8, Hidden % 64 / 8],
     m![All / 64, All % 8, Hidden % 64 / 4],
     Hidden,
@@ -77,20 +78,20 @@ impl<'a, Hidden: AxisName, All: AxisName> Op<(&'a Spread<Hidden, All>, usize)> f
 /// Quantized spread rows and their scales, stored in HBM in row order for the wave pairs.
 pub(crate) struct Stage;
 
-impl<'a, Hidden: AxisName, All: AxisName> Op<(&'a SpreadInput<Hidden, All>, &'a SpreadScales<All>)>
-    for Stage
+impl<'a, Hidden: AxisName, All: AxisName, D: MaterializableScalar>
+    Op<(&'a SpreadInput<Hidden, All>, &'a SpreadScales<All, D>)> for Stage
 {
-    type Output = (Staged<Hidden, All>, StagedScales<All>);
+    type Output = (Staged<Hidden, All>, StagedScales<All, D>);
 
     fn forward(
         &self,
         context: &mut Device,
-        (rows, scales): (&'a SpreadInput<Hidden, All>, &'a SpreadScales<All>),
+        (rows, scales): (&'a SpreadInput<Hidden, All>, &'a SpreadScales<All, D>),
     ) -> Self::Output {
         let mut staged = Staged::<Hidden, All>::new();
         rows.view()
             .to_hbm_view(&mut context.tdma, staged.view_mut());
-        let mut stored = StagedScales::<All>::new();
+        let mut stored = StagedScales::<All, D>::new();
         scales
             .view()
             .slice_tile::<m![Copies], 1, m![All % 32 / 8, Copies = 1 # 64]>(0)
@@ -123,13 +124,15 @@ impl<'a, Hidden: AxisName, All: AxisName> Op<(&'a Staged<Hidden, All>, usize)> f
 /// Pair `pair`'s row scales, written from the staged scales in the slices of each head partition.
 pub(crate) struct PairScales<Heads>(pub(crate) PhantomData<Heads>);
 
-impl<'a, All: AxisName, Heads: AxisName> Op<(&'a StagedScales<All>, usize)> for PairScales<Heads> {
-    type Output = RowGroups<TilePair, Heads>;
+impl<'a, All: AxisName, Heads: AxisName, D: MaterializableScalar>
+    Op<(&'a StagedScales<All, D>, usize)> for PairScales<Heads>
+{
+    type Output = RowGroups<TilePair, Heads, D>;
 
     fn forward(
         &self,
         context: &mut Device,
-        (scales, pair): (&'a StagedScales<All>, usize),
+        (scales, pair): (&'a StagedScales<All, D>, usize),
     ) -> Self::Output {
         // SAFETY: the same order with the 64-row block split into its wave and half.
         let scales = unsafe {

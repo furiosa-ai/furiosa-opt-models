@@ -346,6 +346,16 @@ class Platform(SRTPlatform):
         # SGLang leaves the checkpoint's Transformers config untyped.
         hf_config = cast("PretrainedConfig", model_config.hf_config)
         model_type = hf_config.model_type
+        quantization_config = getattr(hf_config, "quantization_config", None) or {}
+        if (
+            model_type == "llama"
+            and quantization_config.get("format") == "naive-quantized"
+            and not server_args.disable_radix_cache
+        ):
+            raise Refused(
+                "disable_radix_cache",
+                "requires --disable-radix-cache for Llama 3.1 FP8 dynamic",
+            )
         state = recurrent(model_type)
         if state:
             _ = Recurrent.parse(server_args)

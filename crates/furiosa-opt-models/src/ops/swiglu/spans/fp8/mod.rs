@@ -18,6 +18,7 @@ use spread::*;
 use transfer::*;
 
 mod activation;
+pub mod channel;
 mod compute;
 mod contract;
 mod down;
@@ -26,7 +27,7 @@ mod spread;
 mod transfer;
 
 const WAVE: usize = 256;
-axes![Copies = 32, Side = 2, Panels = 3];
+axes![Copies = 32, Side = 2, Panels = 3, DownGroups = 4];
 
 pub(crate) type Panel<H, I> =
     DmTensor<f8e4m3, Chip, Cluster<I>, Partition<H, I>, m![{ Out<I> }, { K<H> }]>;
@@ -51,15 +52,16 @@ type Lanes<H, I, Rows> = TrfTensor<
 >;
 /// The down projection's eight blocks of hidden outputs, one a slice of each output block.
 type DownSlice<H, I> = m![H / (H / 8), { Blocks<I> }];
-pub(crate) type Down<H, I> =
-    DmTensor<f8e4m3, Chip, Cluster<I>, DownSlice<H, I>, m![H % (H / 8), I % 64]>;
+pub(crate) type Down<H, I, const B: usize = 64> =
+    DmTensor<f8e4m3, Chip, Cluster<I>, DownSlice<H, I>, m![H % (H / 8), I % { B }]>;
 type Product<H, I, Rows> = DmTensor<bf16, Chip, Cluster<I>, DownSlice<H, I>, m![Rows, I % 64]>;
-type Activation<H, I, Rows> = DmTensor<f8e4m3, Chip, Cluster<I>, DownSlice<H, I>, m![Rows, I % 64]>;
+type Activation<H, I, Rows, const B: usize = 64> =
+    DmTensor<f8e4m3, Chip, Cluster<I>, DownSlice<H, I>, m![Rows, I % { B }]>;
 type Spread<I, Rows, E> =
     DmTensor<E, Chip, Cluster<I>, Slice<I, Rows>, m![Panels, Rows % (Rows / 8), I % 64]>;
 type Scale<H, I, Rows> = DmTensor<bf16, Chip, Cluster<I>, m![H / 16], m![Rows]>;
 type RowLanes<Rows> = mapping::Rows<Rows>::Lanes;
-type Operand<H, I, Rows, Fill, const W: usize> = TrfTensor<
+type Operand<H, I, Rows, Fill, const W: usize, const B: usize = 64, const G: usize = 4> = TrfTensor<
     f8e4m3,
     Chip,
     Cluster<I>,
@@ -68,8 +70,8 @@ type Operand<H, I, Rows, Fill, const W: usize> = TrfTensor<
     m![
         { Fill } % { W } / 32,
         { Fill } / { W },
-        Rows % 32 / 8,
-        I % 64
+        DownGroups = { G },
+        I % { B }
     ],
 >;
 pub(crate) type Chunks<I, Rows> = m![{ Cluster<I> }, I % (I / 2) / 64, Rows, I % 64];
@@ -167,12 +169,7 @@ impl<Hidden: AxisName, Intermediate: AxisName> Op<Begin<usize>>
     type Output = GateUp<Hidden, Intermediate>;
 
     fn forward(&self, context: &mut Device, Begin(panel): Begin<usize>) -> Self::Output {
-        self.0
-            .view()
-            .tile::<m![Hidden / 1024], 1, m![Term, Hidden / 1024 = 1 # (Hidden / 1024),
-                Intermediate / (Intermediate / 64), Hidden % 1024 / 128, { Out<Intermediate> },
-                Hidden % 128]>(panel)
-            .to_dm(&mut context.tdma)
+        stage_gate_up(context, &self.0, panel)
     }
 }
 
@@ -202,6 +199,19 @@ impl<Hidden: AxisName, Intermediate: AxisName> Op<Begin<usize>>
             .to_dm_view(&mut context.tdma, down.view_mut());
         down
     }
+}
+
+fn stage_gate_up<Hidden: AxisName, Intermediate: AxisName>(
+    context: &mut Device,
+    stored: &HbmTensor<f8e4m3, Chip, Blocked<Hidden, Intermediate>>,
+    panel: usize,
+) -> GateUp<Hidden, Intermediate> {
+    stored
+        .view()
+        .tile::<m![Hidden / 1024], 1, m![Term, Hidden / 1024 = 1 # (Hidden / 1024),
+                Intermediate / (Intermediate / 64), Hidden % 1024 / 128, { Out<Intermediate> },
+                Hidden % 128]>(panel)
+        .to_dm(&mut context.tdma)
 }
 
 #[cfg(test)]

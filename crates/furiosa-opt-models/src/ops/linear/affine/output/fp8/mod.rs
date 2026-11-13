@@ -6,6 +6,9 @@ use crate::tensor::form::fp8::Rows;
 pub(crate) use project::Landed;
 pub(crate) use to_dm::ToDm;
 
+pub use quantize::Tokens;
+
+pub mod channel;
 mod contract;
 mod project;
 mod quantize;
@@ -47,15 +50,15 @@ type Source<Hidden, QWidth, Capacity> = DmTensor<
     RowWise<Hidden, QWidth, Capacity>,
     m![Capacity % (Capacity / 4), QWidth % 128],
 >;
-type ReplicatedScales<Hidden, QWidth, Capacity> = DmTensor<
-    bf16,
+type ReplicatedScales<Hidden, QWidth, Capacity, D = bf16> = DmTensor<
+    D,
     Chip,
     Cluster<QWidth>,
     m![Hidden / 1024, Capacity / (Capacity / 4), Replicas],
     m![Capacity % (Capacity / 4)],
 >;
-type Scales<Hidden, QWidth, Capacity> = DmTensor<
-    bf16,
+type Scales<Hidden, QWidth, Capacity, D = bf16> = DmTensor<
+    D,
     Chip,
     Cluster<QWidth>,
     m![Hidden / 16],
@@ -67,27 +70,28 @@ type Channels<Hidden, QWidth> =
 axes![Replicas = 16];
 
 pub type Blocked<Hidden, QWidth> = m![QWidth / 128, Hidden, QWidth % 128];
-pub type Stored<Hidden, QWidth> = Affine<
+pub type Stored<Hidden, QWidth, Format = crate::tensor::form::fp8::Block> = Affine<
     Rows<
         m![QWidth],
         m![Hidden],
         HbmTensor<f8e4m3, Chip, Blocked<Hidden, QWidth>>,
         HbmTensor<f32, Chip, m![Hidden]>,
+        Format,
     >,
     (),
 >;
 pub(crate) type Staged<Hidden, QWidth> =
     Affine<(Weight<Hidden, QWidth>, Channels<Hidden, QWidth>), ()>;
 
-impl<Hidden: AxisName, QWidth: AxisName> Stored<Hidden, QWidth> {
+impl<Hidden: AxisName, QWidth: AxisName, Format> Stored<Hidden, QWidth, Format> {
     pub(crate) fn empty() -> Staged<Hidden, QWidth> {
         Affine::new((Weight::new(), Channels::new()), ())
     }
 }
 
 /// The weight and its channel scales, written in the staged form the projection reads.
-impl<Hidden: AxisName, QWidth: AxisName> Op<&mut Staged<Hidden, QWidth>>
-    for Stored<Hidden, QWidth>
+impl<Hidden: AxisName, QWidth: AxisName, Format> Op<&mut Staged<Hidden, QWidth>>
+    for Stored<Hidden, QWidth, Format>
 {
     type Output = ();
 

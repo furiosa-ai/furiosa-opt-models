@@ -14,6 +14,7 @@ use std::marker::PhantomData;
 pub(crate) use to_dm::ToDm;
 
 mod activation;
+pub mod channel;
 mod produce;
 mod sink;
 pub(crate) mod source;
@@ -65,8 +66,8 @@ pub(crate) type Lanes<Hidden, G, Heads> = TrfTensor<
 >;
 pub(crate) type ValueScale<Hidden, Heads, Head> =
     DmTensor<f32, Chip, Cluster<Heads>, Slice<Hidden, Heads>, m![Heads % (Heads / 8), Head]>;
-pub(crate) type RowGroups<G, Heads> =
-    DmTensor<bf16, Chip, Cluster<Heads>, Reduced<G, Heads, <G as Group>::Copies>, m![Tile % 8]>;
+pub(crate) type RowGroups<G, Heads, D = bf16> =
+    DmTensor<D, Chip, Cluster<Heads>, Reduced<G, Heads, <G as Group>::Copies>, m![Tile % 8]>;
 pub(crate) type HeadScale<G, Heads, Head> = VrfTensor<
     f32,
     Chip,

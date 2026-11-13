@@ -550,6 +550,16 @@ def options(config: VllmConfig) -> engine.LoadOptions:
     import furiosa_opt_engine as engine
 
     model = config.model_config
+    quantization_config = getattr(model.hf_text_config, "quantization_config", None) or {}
+    if (
+        model.hf_text_config.model_type == "llama"
+        and quantization_config.get("format") == "naive-quantized"
+        and config.cache_config.enable_prefix_caching
+    ):
+        raise Refused(
+            "enable_prefix_caching",
+            "requires --no-enable-prefix-caching for Llama 3.1 FP8 dynamic",
+        )
     loads = engine.LoadOptions()
     if config.is_mm_encoder_only:
         # An encoder cache producer runs no language model, so no cache, chip split or tiling.
