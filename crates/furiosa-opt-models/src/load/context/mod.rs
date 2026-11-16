@@ -4,11 +4,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::IntoFuture;
 use std::mem;
 
-use furiosa_opt_std::prelude::{Device, HbmBuffer, HbmTensor, HostTensor, M, MaterializableScalar};
+use furiosa_opt_std::prelude::{
+    Device, HbmBuffer, HbmTensor, HostTensor, M, MaterializableScalar, Pair, m,
+};
 use safetensors::Dtype;
 use safetensors::tensor::TensorView;
 use tokio::task;
 
+use super::tensor::laid_out;
 use super::{Checkpoint, Children, LoadError, Rule};
 use ties::Ties;
 
@@ -356,6 +359,17 @@ impl<'d> Context<'d> {
     /// `host` in HBM as the leaf at the current position: a new allocation, or in a stack the
     /// current layer of the leaf's backing, which the leaf's first layer allocates.
     pub(crate) fn upload<D: MaterializableScalar, C: M, S: M, E: M>(
+        &mut self,
+        host: &HostTensor<D, E>,
+    ) -> Result<HbmTensor<D, C, S>, LoadError> {
+        match laid_out::<D, E, m![{ C }, { S }]>(host) {
+            Some(host) => self.place(&host),
+            None => self.place(host),
+        }
+    }
+
+    /// [`Self::upload`] of `host` as it is laid out.
+    fn place<D: MaterializableScalar, C: M, S: M, E: M>(
         &mut self,
         host: &HostTensor<D, E>,
     ) -> Result<HbmTensor<D, C, S>, LoadError> {

@@ -1,10 +1,11 @@
 //! `x * w / sqrt(mean(x²) + epsilon)` per row, with FP32 statistics and one rounding.
 
 use super::{Chunk, Cluster, FeatureSlices, Lines, Spread, Tile, TilePart, TileParts, TileRows};
-use crate::Op;
 use crate::load::{Checkpoint, Context, Load, LoadError};
+use crate::ops::linear::Groups;
 use crate::tensor::form::Weight;
-use crate::tensor::{axis::Single, live::Live, scalar};
+use crate::tensor::{axis, axis::Single, live::Live, scalar};
+use crate::{Begin, Op};
 use core::borrow::Borrow;
 use core::marker::PhantomData;
 use furiosa_opt_std::prelude::stage::{Standalone, VeOrder::IntraFirst, Way::Way4};
@@ -139,6 +140,47 @@ where
     }
 }
 
+/// A norm begun: its gain written in the feature slices of the rows it scales, before they
+/// arrive.
+impl<Width: AxisName, const EPSILON: usize, Chips: M, T> Op<Begin<()>>
+    for RmsNorm<Width, EPSILON, Chips, Weight<m![Width], Chips, T>>
+where
+    T: Borrow<HbmTensor<bf16, Chips, m![Width]>>,
+{
+    type Output = RmsNorm<Width, EPSILON, Chips, InDm<Width, Chips>>;
+
+    fn forward(&self, device: &mut Device, _: Begin<()>) -> Self::Output {
+        RmsNorm::new(self.weight.tensor().to_dm(&mut device.tdma))
+    }
+}
+
+/// The same norm begun into a place made before, so a schedule can land its gain under other work.
+impl<Width: AxisName, const EPSILON: usize, Chips: M, T>
+    Op<&mut RmsNorm<Width, EPSILON, Chips, InDm<Width, Chips>>>
+    for RmsNorm<Width, EPSILON, Chips, Weight<m![Width], Chips, T>>
+where
+    T: Borrow<HbmTensor<bf16, Chips, m![Width]>>,
+{
+    type Output = ();
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        begun: &mut RmsNorm<Width, EPSILON, Chips, InDm<Width, Chips>>,
+    ) {
+        (self.weight.tensor().view()).to_dm_view(&mut device.tdma, begun.weight.view_mut());
+    }
+}
+
+/// The place a begun norm's gain lands in, before it lands.
+impl<Width: AxisName, const EPSILON: usize, Chips: M> Default
+    for RmsNorm<Width, EPSILON, Chips, InDm<Width, Chips>>
+{
+    fn default() -> Self {
+        Self::new(DmTensor::new())
+    }
+}
+
 /// An [`RmsNorm`] of unit gain, whose checkpoint stores no weight: it multiplies by a vector of
 /// ones a load places, held as `T`, so it runs the learned norm's kernel.
 #[derive(DeviceSend, Load)]
@@ -254,50 +296,49 @@ impl<Width: AxisName, const EPSILON: usize, Chips: M> Op<&HbmTensor<bf16, Chips,
     }
 }
 
-/// `input * weight / sqrt(mean(input^2) + epsilon)` over each of the `P` head rows of every slice,
-/// the squares summed in one pass and scaled in another; `EPSILON` holds epsilon's FP32 bits.
-impl<'x, S: M, P: M, Head: AxisName, R: AxisName, const EPSILON: usize, T, Chips: M + 'static>
-    Op<&'x Live<DmTensor<bf16, Chips, m![1 # 2], S, m![{ P }, Head]>, R>>
+/// `input * weight / sqrt(mean(input^2) + epsilon)` over each of the `P` head rows of every slice
+/// of clusters `C`, the squares summed in one pass and scaled in another; `EPSILON` holds epsilon's
+/// FP32 bits. The head rows lead with the row group, and both passes stop at the group of the last
+/// live row.
+impl<'x, C: M, S: M, P: M, Head: AxisName, R: AxisName, const EPSILON: usize, T, Chips: M + 'static>
+    Op<&'x Live<DmTensor<bf16, Chips, C, S, m![{ P }, Head]>, R>>
     for RmsNorm<Head, EPSILON, Chips, Weight<m![Head], Chips, T>>
 where
     T: Borrow<HbmTensor<bf16, Chips, m![Head]>>,
 {
-    type Output = Live<DmTensor<bf16, Chips, m![1 # 2], S, m![{ P }, Head]>, R>;
+    type Output = Live<DmTensor<bf16, Chips, C, S, m![{ P }, Head]>, R>;
 
     fn forward(
         &self,
         device: &mut Device,
-        input: &'x Live<DmTensor<bf16, Chips, m![1 # 2], S, m![{ P }, Head]>, R>,
+        input: &'x Live<DmTensor<bf16, Chips, C, S, m![{ P }, Head]>, R>,
     ) -> Self::Output {
-        let mean: DmTensor<f32, Chips, m![1 # 2], S, m![{ P }, 1 # 8]> =
-            Squares::<HeadLanes<P, Head>, Head, m![{ P }], m![1], EPSILON>::of(
-                &mut device.main,
-                input.value().view(),
-            )
-            .vector_final()
-            .commit_trim::<m![1 # 8]>()
-            .commit();
-        let inverse: VrfTensor<f32, Chips, m![1 # 2], S, m![{ P }, 1 # 8]> =
+        let (first, count) = input.groups::<axis::Lanes<R>>();
+        // Issued first, so the weight lands while the squares and their root compute.
+        let weight: DmTensor<bf16, Chips, C, S, m![Head]> =
+            self.weight.tensor().to_dm(&mut device.tdma);
+        let mut mean: DmTensor<f32, Chips, C, S, m![{ P }, 1 # 8]> = DmTensor::new();
+        Squares::<HeadLanes<P, Head>, Head, m![{ P }], m![1], EPSILON>::of(
+            &mut device.main,
+            input.value().view(),
+        )
+        .vector_final()
+        .commit_trim::<m![1 # 8]>()
+        .commit_prefix::<Groups<R>, _, _>(mean.view_mut(), first + count);
+        let inverse: VrfTensor<f32, Chips, C, S, m![{ P }, 1 # 8]> =
             Root::<m![{ P }], m![1 # 8]>::of(&mut device.sub, mean.view(), |square| square)
                 .to_vrf();
-        let weight: DmTensor<bf16, Chips, m![1 # 2], S, m![Head]> =
-            self.weight.tensor().to_dm(&mut device.tdma);
-        let weight: VrfTensor<f32, Chips, m![1 # 2], S, m![Head]> = device
+        let weight: VrfTensor<f32, Chips, C, S, m![Head]> = device
             .sub
             .begin(weight.view())
             .fetch::<m![Head / 16], m![Head % 16]>()
             .fetch_cast::<f32>()
             .collect::<m![Head / 8], m![Head % 8]>()
             .to_vrf();
-        input.with(
-            Scale::<HeadLanes<P, Head>>::of(
-                &mut device.main,
-                input.value().view(),
-                &inverse,
-                &weight,
-            )
-            .commit(),
-        )
+        let mut normalized = DmTensor::new();
+        Scale::<HeadLanes<P, Head>>::of(&mut device.main, input.value().view(), &inverse, &weight)
+            .commit_prefix::<Groups<R>, _, _>(normalized.view_mut(), first + count);
+        input.with(normalized)
     }
 }
 

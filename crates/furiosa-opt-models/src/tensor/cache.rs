@@ -1,10 +1,14 @@
 //! The KV cache layout: blocks of token rows, each token's key and value stored together, and the
-//! bytes they span.
+//! bytes they span; and the static scales of a cache that stores E4M3 codes.
 
 use super::parallel::Chip;
-use crate::tensor::memory::blocks;
+use super::scalar::Copies;
+use crate::Op;
+use crate::load::Load;
+use crate::tensor::memory::{Hbm, Memory, blocks};
 use furiosa_opt_std::prelude::*;
 use furiosa_opt_std::runtime::HbmBuffer as Buffer;
+use std::borrow::Borrow;
 use std::io;
 #[cfg(test)]
 use std::{error::Error, ops::Range};
@@ -12,10 +16,79 @@ use std::{error::Error, ops::Range};
 axes![
     Block = 16,   // token rows one cache block stores
     KeyValue = 2, // the key and the value each token stores
+    Slices = 512, // the slices of a chip's two clusters
 ];
 
 /// A cache that stores each key and value in BF16.
 pub type Bf16 = bf16;
+
+/// A cache that stores each key and value as an E4M3 code under its layer's [`Scales`].
+pub type E4m3 = f8e4m3;
+
+/// A layer's static key and value scales, as a checkpoint whose cache holds E4M3 codes stores
+/// them: a cached key is `e4m3(k / k_scale)`, saturated, read back as `code * k_scale`, a value
+/// alike. HBM holds each a copy a slice, so a landing into every slice reads a copy of its own.
+#[derive(DeviceSend, Load)]
+pub struct Scales<X: Memory = Hbm> {
+    pub k_scale: X::Tensor<f32, Chip, Copies>,
+    pub v_scale: X::Tensor<f32, Chip, Copies>,
+}
+
+/// A layer's [`Scales`] landed once in every slice of both clusters, where the write that codes
+/// its rows and the attention that reads its codes each take them in their own layout.
+pub struct Landed {
+    key: Spread,
+    value: Spread,
+}
+
+/// An FP32 scale's packet in every slice.
+type Spread = DmTensor<f32, Chip, m![Slices / 256], m![Slices % 256], m![1 # 8]>;
+
+impl Default for Landed {
+    fn default() -> Self {
+        Self {
+            key: DmTensor::new(),
+            value: DmTensor::new(),
+        }
+    }
+}
+
+impl Landed {
+    /// The key and value scales in the registers of a stream over `Cluster` and `Slice`, which
+    /// span both clusters and their 256 slices.
+    pub fn registers<Cluster: M, Slice: M>(
+        &self,
+        device: &mut Device,
+    ) -> (
+        VrfTensor<f32, Chip, Cluster, Slice, m![1 # 8]>,
+        VrfTensor<f32, Chip, Cluster, Slice, m![1 # 8]>,
+    ) {
+        let mut register = |scale: &Spread| {
+            // SAFETY: every slice of both clusters holds the same packet, so a mapping of the
+            // slices in any order reads it in each one.
+            let packet = unsafe { scale.view().reshape::<Chip, Cluster, Slice, m![1 # 8]>() };
+            (device.sub.begin(packet))
+                .fetch::<m![1], m![1 # 8]>()
+                .collect::<m![1], m![1 # 8]>()
+                .to_vrf()
+        };
+        (register(&self.key), register(&self.value))
+    }
+}
+
+/// The scales landed into every slice of `landed`, one transfer each.
+impl<X: Memory> Op<&mut Landed> for Scales<X>
+where
+    X::Tensor<f32, Chip, Copies>: Borrow<HbmTensor<f32, Chip, Copies>>,
+{
+    type Output = ();
+
+    fn forward(&self, device: &mut Device, landed: &mut Landed) {
+        let tdma = &mut device.tdma;
+        (self.k_scale.borrow().view()).to_dm_view(tdma, landed.key.view_mut());
+        (self.v_scale.borrow().view()).to_dm_view(tdma, landed.value.view_mut());
+    }
+}
 
 /// One layer's runtime-sized cache, with each token's key and value stored together.
 #[derive(DeviceSend)]

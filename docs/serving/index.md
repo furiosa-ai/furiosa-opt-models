@@ -23,7 +23,7 @@ Install a plugin first ([Installation](../getting-started/installation.md)); [Qu
 | Speculative decoding (ngram, suffix, draft model) | <span class="support support-yes">Supported</span> (ngram and suffix; no draft model yet) | <span class="support support-yes">Supported</span> (ngram and draft model; no suffix decoding in SGLang) | [ngram or suffix](#speculate-with-ngram-or-suffix-decoding), [draft model](#speculate-with-a-draft-model) |
 | Speculative decoding (EAGLE, MTP, Medusa, MLP, parallel draft models) | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Automatic prefix caching | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Reuse cached prefixes](#reuse-cached-prefixes) |
-| FP8 KV cache | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
+| FP8 KV cache | <span class="support support-yes">Supported</span> (Gemma 4 12B NVFP4, by default) | <span class="support support-no">Not yet</span> | [vLLM options](vllm.md#options), [Not supported yet](#features-not-supported-yet) |
 | Quantized checkpoints (FP8, NVFP4) | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Online quantization | <span class="support support-yes">Supported</span> | <span class="support support-no">Not yet</span> | [Quantize a BF16 checkpoint at load](#quantize-a-bf16-checkpoint-at-load) |
 | KV cache offloading | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Offload the KV cache to host memory](#offload-the-kv-cache-to-host-memory) |
@@ -387,7 +387,7 @@ Why each feature is not served yet:
 - **Prompt embeddings**: a decoder call takes token IDs.
 - **Multimodal inputs**: no served checkpoint answers about images, video or audio. Gemma 4 12B's language model serves text under `--language-model-only`, as its calls take token IDs, and its media encoder runs [on an encoder-only instance](#embed-media-on-an-encoder-only-instance), whose rows no instance reads yet.
 - **Speculative methods other than ngram and suffix** (vLLM, which also has no draft model yet) or NGRAM and STANDALONE (SGLang).
-- **FP8 KV cache and quantized checkpoints**: the served checkpoints load BF16 weights and cache keys and values in BF16.
+- **FP8 KV cache and quantized checkpoints**: apart from Gemma 4 12B NVFP4 with vLLM, whose cache holds E4M3 codes, the served checkpoints load BF16 weights and cache keys and values in BF16.
 - **Online quantization** with SGLang, and with vLLM any method but `fp8_per_tensor`: the other methods quantize the activations too or use other formats, and the SGLang plugin passes no quantization to the load.
 - **Tensor, pipeline, expert and context parallelism**, and serving across nodes: each served checkpoint runs on one chip.
 - **LoRA with SGLang**: `--enable-lora` and `--lora-paths` are refused; the SGLang plugin runs no adapter yet.

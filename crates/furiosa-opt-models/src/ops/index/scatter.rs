@@ -7,10 +7,12 @@ use crate::ops::index::gather::RowStorage;
 use crate::ops::index::table::{self, Access, Length, Offsets};
 use crate::ops::normalization::Chunk;
 use crate::ops::normalization::{RowMajor, Spread};
+use crate::ops::pointwise::cast::Finite;
 use crate::ops::reduction::Selected;
 use crate::specialize::index::store;
-use crate::tensor::cache::Blocks;
-use crate::tensor::cache::{Block, KeyValue};
+use crate::tensor::cache::{self, Block, Blocks, KeyValue};
+use crate::tensor::memory::{Hbm, Memory};
+use crate::tensor::scalar::Copies;
 use crate::tensor::{
     axis::{self, Lanes, Single, Tile},
     live::Live,
@@ -506,8 +508,10 @@ impl<Heads: AxisName, Head: AxisName, D: MaterializableScalar, Chips: M>
 /// and a later row's entry is never read.
 pub type Slots<'s, R, Chips = Chip> = (&'s HbmTensor<i32, Chips, m![R]>, Live<(), R>);
 
-/// The live rows' interleaved keys and values written in the slots their byte offsets name, all in
-/// one transfer when every row is live, else a packet at a time; no other slot changes.
+/// The live rows' interleaved keys and values written in the slots their byte offsets name: all in
+/// one transfer when every row is live, else stores of the shortest of [`store::LENGTHS`] while the
+/// live rows fill one, then a packet, then a row, at a time (only packets and rows from a start no
+/// such store divides); no other slot changes.
 impl<
     R: AxisName,
     Heads: AxisName,
@@ -534,78 +538,134 @@ impl<
             &DmTensor<D, Chips, Cluster, m![Heads, { Spread }], m![R, KeyValue, Head]>,
         ),
     ) {
-        type Payload<Heads, Spread, Head> = m![Heads, { Spread }, KeyValue, Head];
-        rows.cover::<Lanes<R>, _>(
-            &mut (device, layer),
-            (
-                |(device, layer)| {
-                    layer
-                        .tokens
-                        .scatter::<m![Block], Payload<Heads, Spread, Head>>()
-                        .by_byte_offsets(slot.view())
-                        .from_dm_view(&mut device.tdma, token.view());
-                },
-                |(device, layer), packet| {
-                    // A scatter takes its offsets as a whole tensor.
-                    let mut index: HbmTensor<i32, Chips, m![{ Layout<R>::Lanes }]> =
-                        HbmTensor::new();
-                    slot.view()
-                        .tile::<
-                            Layout<R>::Groups,
-                            1,
-                            m![{ Layout<R>::Selected }, { Layout<R>::Lanes }],
-                        >(
-                            packet,
-                        )
-                        .to_hbm_view(&mut device.tdma, index.view_mut());
-                    layer
-                        .tokens
-                        .scatter::<m![Block], Payload<Heads, Spread, Head>>()
-                        .by_byte_offsets(index.view())
-                        .from_dm_view(
-                            &mut device.tdma,
-                            token
-                                .view()
-                                .tile::<
-                                    Layout<R>::Groups,
-                                    1,
-                                    Layout<R>::Elements<m![KeyValue, Head]>,
-                                >(
-                                    packet,
-                                ),
-                        );
-                },
-                |(device, layer), row| {
-                    let mut index: HbmTensor<i32, Chips, m![1]> = HbmTensor::new();
-                    slot.view()
-                        .tile::<m![R], 1, m![R = 1 # R]>(row)
-                        .to_hbm_view(&mut device.tdma, index.view_mut());
-                    layer
-                        .tokens
-                        .scatter::<m![Block], Payload<Heads, Spread, Head>>()
-                        .by_byte_offsets(index.view())
-                        .from_dm_view(
-                            &mut device.tdma,
-                            token
-                                .view()
-                                .tile::<m![R], 1, m![R = 1 # R, KeyValue, Head]>(row),
-                        );
-                },
-            ),
-        );
+        type Short<R> = Tile<R, { store::LENGTHS[2] }>;
+        let mut tokens = Tokens { layer, slot, token };
+        let (start, live) = (rows.start(), rows.rows());
+        if live == R::SIZE {
+            tokens.every(device);
+        } else if start % Short::<R>::SIZE == 0 {
+            for tile in 0..live / Short::<R>::SIZE {
+                tokens.store::<Short<R>>(device, start / Short::<R>::SIZE + tile);
+            }
+            let first = start + live / Short::<R>::SIZE * Short::<R>::SIZE;
+            for packet in 0..live % Short::<R>::SIZE / Lanes::<R>::SIZE {
+                tokens.store::<Lanes<R>>(device, first / Lanes::<R>::SIZE + packet);
+            }
+            let first = start + live / Lanes::<R>::SIZE * Lanes::<R>::SIZE;
+            for row in 0..live % Lanes::<R>::SIZE {
+                tokens.row(device, first + row);
+            }
+        } else {
+            rows.cover::<Lanes<R>, _>(
+                &mut (device, tokens),
+                (
+                    |(device, tokens)| tokens.every(device),
+                    |(device, tokens), packet| tokens.store::<Lanes<R>>(device, packet),
+                    |(device, tokens), row| tokens.row(device, row),
+                ),
+            );
+        }
     }
 }
 
+/// What one slot of a layer's blocks takes: a row's interleaved key and value for every head.
+type Payload<Heads, Spread, Head> = m![Heads, { Spread }, KeyValue, Head];
+
+/// Each row's key and value beside each other, on clusters `Cluster` and each head's slices.
+type Interleaved<D, Chips, Cluster, Heads, Spread, R, Head> =
+    DmTensor<D, Chips, Cluster, m![Heads, { Spread }], m![R, KeyValue, Head]>;
+
+/// A launch's tokens in DM, each row's interleaved key and value, the slot each row names, and
+/// the layer they write.
+struct Tokens<
+    'a,
+    R: AxisName,
+    Heads: AxisName,
+    Head: AxisName,
+    D: Scalar,
+    Chips: M,
+    Cluster: M,
+    Spread: M,
+> {
+    layer: &'a mut Blocks<Heads, Head, D, Chips>,
+    slot: &'a HbmTensor<i32, Chips, m![R]>,
+    token: &'a Interleaved<D, Chips, Cluster, Heads, Spread, R, Head>,
+}
+
+impl<
+    R: AxisName,
+    Heads: AxisName,
+    Head: AxisName,
+    D: MaterializableScalar,
+    Chips: M,
+    Cluster: M,
+    Spread: M,
+> Tokens<'_, R, Heads, Head, D, Chips, Cluster, Spread>
+{
+    /// Every row written, each into its slot, in one transfer.
+    fn every(&mut self, device: &mut Device) {
+        self.layer
+            .tokens
+            .scatter::<m![Block], Payload<Heads, Spread, Head>>()
+            .by_byte_offsets(self.slot.view())
+            .from_dm_view(&mut device.tdma, self.token.view());
+    }
+
+    /// Tile `at` of `B` rows written, each row into its slot. A scatter takes its offsets as a
+    /// whole tensor: the tile's, named in place.
+    fn store<B: AxisName>(&mut self, device: &mut Device, at: usize) {
+        // SAFETY: the window holds the tile's slots in row order, and nothing writes them.
+        let index: HbmTensor<i32, Chips, m![R % B]> = unsafe {
+            self.slot
+                .view()
+                .tile::<m![R / B], 1, m![R / B = 1 # (R / B), R % B]>(at)
+                .alias()
+        };
+        self.layer
+            .tokens
+            .scatter::<m![Block], Payload<Heads, Spread, Head>>()
+            .by_byte_offsets(index.view())
+            .from_dm_view(
+                &mut device.tdma,
+                self.token
+                    .view()
+                    .tile::<m![R / B], 1, m![R / B = 1 # (R / B), R % B, KeyValue, Head]>(at),
+            );
+    }
+
+    /// Row `row` written into its slot, its offset named in place as a tile's are.
+    fn row(&mut self, device: &mut Device, row: usize) {
+        // SAFETY: as for a tile, the row's slot.
+        let index: HbmTensor<i32, Chips, m![1]> = unsafe {
+            self.slot
+                .view()
+                .tile::<m![R], 1, m![R = 1 # R]>(row)
+                .alias()
+        };
+        self.layer
+            .tokens
+            .scatter::<m![Block], Payload<Heads, Spread, Head>>()
+            .by_byte_offsets(index.view())
+            .from_dm_view(
+                &mut device.tdma,
+                self.token
+                    .view()
+                    .tile::<m![R], 1, m![R = 1 # R, KeyValue, Head]>(row),
+            );
+    }
+}
+
+/// Key or value heads of every row as attention projects them, on clusters `C` and slices `S`.
+type KeyRows<R, C, S, Head> =
+    DmTensor<bf16, Chip, C, S, m![{ attention::RowGroups<R, Single> }, Head]>;
+
 /// Rows spread over the lanes of each head's slices, as the dense projection leaves them: each
 /// row's key and value move beside each other into the row's token, then only the live rows write.
-impl<R: AxisName, Heads: AxisName, Head: AxisName, Chips: M + 'static>
+impl<R: AxisName, Heads: AxisName, Head: AxisName, C: M, S: M, Chips: M + 'static>
     Op<(
         &mut Blocks<Heads, Head, bf16, Chips>,
         Slots<'_, R, Chips>,
-        (
-            &attention::Heads<R, Heads, Single, Head>,
-            &attention::Heads<R, Heads, Single, Head>,
-        ),
+        (&KeyRows<R, C, S, Head>, &KeyRows<R, C, S, Head>),
     )> for Scatter
 {
     type Output = ();
@@ -616,10 +676,7 @@ impl<R: AxisName, Heads: AxisName, Head: AxisName, Chips: M + 'static>
         (layer, slots, (key, value)): (
             &mut Blocks<Heads, Head, bf16, Chips>,
             Slots<'_, R, Chips>,
-            (
-                &attention::Heads<R, Heads, Single, Head>,
-                &attention::Heads<R, Heads, Single, Head>,
-            ),
+            (&KeyRows<R, C, S, Head>, &KeyRows<R, C, S, Head>),
         ),
     ) {
         let mut token: DmTensor<
@@ -645,15 +702,142 @@ impl<R: AxisName, Heads: AxisName, Head: AxisName, Chips: M + 'static>
     }
 }
 
+/// Write key and value rows as E4M3 codes under the layer's static scales, which it holds and
+/// lands once for its write and its attention: each value divided by its scale, saturated at the
+/// largest E4M3 magnitude and rounded to nearest even.
+#[derive(DeviceSend, Load)]
+pub struct Scaled<X: Memory = Hbm> {
+    #[load(rename = "")]
+    pub scales: cache::Scales<X>,
+}
+
+/// The layer's scales landed into `landed`, ahead of its write and its attention.
+impl<X: Memory> Op<&mut cache::Landed> for Scaled<X>
+where
+    X::Tensor<f32, Chip, Copies>: Borrow<HbmTensor<f32, Chip, Copies>>,
+{
+    type Output = ();
+
+    fn forward(&self, device: &mut Device, landed: &mut cache::Landed) {
+        self.scales.forward(device, landed)
+    }
+}
+
+/// A launch's keys and values as attention projects them, coded under the layer's landed scales
+/// where they stand, then copied together into each row's token: only the live rows write, each
+/// into the slot the write operand names for it.
+impl<R: AxisName, Heads: AxisName, Head: AxisName, C: M, S: M, X: Memory>
+    Op<(
+        &mut Blocks<Heads, Head, f8e4m3>,
+        &(&HbmTensor<i32, Chip, m![R]>, &cache::Landed),
+        (
+            &Live<KeyRows<R, C, S, Head>, R>,
+            &Live<KeyRows<R, C, S, Head>, R>,
+        ),
+    )> for Scaled<X>
+{
+    type Output = ();
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (layer, &(slot, landed), (key, value)): (
+            &mut Blocks<Heads, Head, f8e4m3>,
+            &(&HbmTensor<i32, Chip, m![R]>, &cache::Landed),
+            (
+                &Live<KeyRows<R, C, S, Head>, R>,
+                &Live<KeyRows<R, C, S, Head>, R>,
+            ),
+        ),
+    ) {
+        // Where attention projects them, a head's rows spread over the slices of its lanes, so a
+        // pass codes far fewer elements a slice there than in the tokens, one slice a head.
+        type RowGroups<R> = attention::RowGroups<R, Single>;
+        type Codes<R, C, S, Head> =
+            DmTensor<f8e4m3, Chip, C, S, m![{ RowGroups<R> }, KeyValue, Head]>;
+        type Token<R, Heads, Head> =
+            DmTensor<f8e4m3, Chip, m![1 # 2], m![Heads, 1 # (256 / Heads)], m![R, KeyValue, Head]>;
+        type Scale<C, S> = VrfTensor<f32, Chip, C, S, m![1 # 8]>;
+        let (key_scale, value_scale) = landed.registers::<C, S>(device);
+        let mut codes = Codes::<R, C, S, Head>::new();
+        let mut code = |device: &mut Device,
+                        (at, part): (usize, &KeyRows<R, C, S, Head>),
+                        scale: &Scale<C, S>| {
+            device
+                .main
+                .begin(part.view())
+                .fetch::<m![{ RowGroups<R> }, Head / 16], m![Head % 16]>()
+                .fetch_cast::<f32>()
+                .collect::<m![{ RowGroups<R> }, Head / 8], m![Head % 8]>()
+                .vector_init()
+                .vector_intra_slice_tag(TagMode::Zero)
+                .vector_narrow_split::<m![{ RowGroups<R> }, Head / 4], m![Head % 4]>()
+                .vector_fp_div(scale)
+                .vector_widen_concat::<m![{ RowGroups<R> }, Head / 8], m![Head % 8]>()
+                .vector_clip(ClipBinaryOpF32::Max, -f8e4m3::LARGEST)
+                .vector_clip(ClipBinaryOpF32::Min, f8e4m3::LARGEST)
+                .vector_final()
+                .cast::<f8e4m3, m![Head % 8 # 32]>()
+                .commit_trim::<m![Head % 8]>()
+                .commit_view(codes.view_mut().tile::<m![KeyValue], 1, m![
+                    { RowGroups<R> },
+                    KeyValue = 1 #{!} 2,
+                    Head
+                ]>(at));
+        };
+        code(device, (0, key.value()), &key_scale);
+        code(device, (1, value.value()), &value_scale);
+        let mut token = Token::<R, Heads, Head>::new();
+        codes.view().to_dm_view(&mut device.tdma, token.view_mut());
+        Scatter.forward(device, (layer, (slot, key.with(())), &token));
+    }
+}
+
+/// A BF16 cache lands nothing for its write or its attention.
+impl Op<&mut ()> for Scatter {
+    type Output = ();
+
+    fn forward(&self, _: &mut Device, _: &mut ()) {}
+}
+
+/// The same rows written as they are, under nothing landed.
+impl<R: AxisName, Heads: AxisName, Head: AxisName, C: M, S: M, Chips: M + 'static>
+    Op<(
+        &mut Blocks<Heads, Head, bf16, Chips>,
+        &(&HbmTensor<i32, Chips, m![R]>, &()),
+        (
+            &Live<KeyRows<R, C, S, Head>, R>,
+            &Live<KeyRows<R, C, S, Head>, R>,
+        ),
+    )> for Scatter
+{
+    type Output = ();
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (layer, &(slot, _), rows): (
+            &mut Blocks<Heads, Head, bf16, Chips>,
+            &(&HbmTensor<i32, Chips, m![R]>, &()),
+            (
+                &Live<KeyRows<R, C, S, Head>, R>,
+                &Live<KeyRows<R, C, S, Head>, R>,
+            ),
+        ),
+    ) {
+        self.forward(device, (layer, slot, rows))
+    }
+}
+
 /// A launch's keys and values as attention projects them: only the live rows write, each into the
 /// slot the write operand names for it, in the layer's blocks.
-impl<R: AxisName, Heads: AxisName, Head: AxisName, Chips: M + 'static>
+impl<R: AxisName, Heads: AxisName, Head: AxisName, C: M, S: M, Chips: M + 'static>
     Op<(
         &mut Blocks<Heads, Head, bf16, Chips>,
         &HbmTensor<i32, Chips, m![R]>,
         (
-            &Live<attention::Heads<R, Heads, Single, Head>, R>,
-            &Live<attention::Heads<R, Heads, Single, Head>, R>,
+            &Live<KeyRows<R, C, S, Head>, R>,
+            &Live<KeyRows<R, C, S, Head>, R>,
         ),
     )> for Scatter
 {
@@ -666,8 +850,8 @@ impl<R: AxisName, Heads: AxisName, Head: AxisName, Chips: M + 'static>
             &mut Blocks<Heads, Head, bf16, Chips>,
             &HbmTensor<i32, Chips, m![R]>,
             (
-                &Live<attention::Heads<R, Heads, Single, Head>, R>,
-                &Live<attention::Heads<R, Heads, Single, Head>, R>,
+                &Live<KeyRows<R, C, S, Head>, R>,
+                &Live<KeyRows<R, C, S, Head>, R>,
             ),
         ),
     ) {
@@ -1227,7 +1411,8 @@ mod tests {
     }
 
     /// Only live rows write, at no row, one, a partial and a whole first packet, a partial second
-    /// packet, and one short of and at a whole 64-row envelope.
+    /// packet, three packets, a 32-row store alone and with a packet and a row past it, and one
+    /// short of and at a whole 64-row envelope.
     #[tokio::test(flavor = "current_thread")]
     async fn writes_only_live_rows_at_every_count() {
         let _lease = DEVICE.lock().await;
@@ -1236,7 +1421,7 @@ mod tests {
             writes_only_live_rows::<Eight>(&mut device, live).await;
         }
         writes_only_live_rows::<Sixteen>(&mut device, 9).await;
-        for live in [63, 64] {
+        for live in [24, 32, 41, 63, 64] {
             writes_only_live_rows::<SixtyFour>(&mut device, live).await;
         }
     }

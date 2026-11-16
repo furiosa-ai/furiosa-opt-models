@@ -420,7 +420,8 @@ class LoadOptions:
         """
     def kv_cache(self, dtype: builtins.str) -> LoadOptions:
         r"""
-        Cache keys and values as `dtype`, a tensor dtype name, instead of `bfloat16`.
+        Cache keys and values as `dtype`, a tensor dtype name, instead of the one the checkpoint
+        declares.
 
         Raises:
             ValueError: `dtype` names no tensor dtype.

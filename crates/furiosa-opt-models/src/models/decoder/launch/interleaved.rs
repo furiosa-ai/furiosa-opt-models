@@ -37,7 +37,7 @@ pub type Input<R, A, B> = language::Input<
 /// A layer's slot over group `A`'s cache: its blocks, which it writes and reads, then what its
 /// leaves run with in the call, nothing.
 pub type Layer<'b, A> = (
-    &'b mut Blocks<<A as Attention>::Heads, <A as Attention>::Head>,
+    &'b mut Blocks<<A as Attention>::Heads, <A as Attention>::Head, <A as Attention>::Cache>,
     (),
 );
 

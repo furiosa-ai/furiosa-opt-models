@@ -3,7 +3,7 @@
 
 use super::{Batch, Rows, compact::Table};
 use furiosa_opt_models::modules::attention::key_value::History;
-use furiosa_opt_models::ops::index::{copy, table::FIELDS};
+use furiosa_opt_models::ops::index::copy;
 use furiosa_opt_models::tensor::{memory::alias, scalar::Value};
 use furiosa_opt_std::prelude::*;
 use std::{borrow::Cow, io, iter, ops::Range};
@@ -19,16 +19,17 @@ pub struct Staged<R: AxisName, B: AxisName, Chips: M> {
 }
 
 impl<A> Batch<'_, A> {
-    /// Cache group `group`'s history for at most `R` rows: its segments, block tables of `B` words
-    /// and selected rows, then its three extents, each as its values and capacity in words; `table`
-    /// forms the block tables.
+    /// Cache group `group`'s history for at most `R` rows: its segment table, block tables of `B`
+    /// words and selected rows, then its three extents, each as its values and capacity in words;
+    /// `table` forms the block tables.
     pub fn history<R: AxisName, B: AxisName>(
         &self,
         (group, table): (usize, Table),
     ) -> io::Result<[(Vec<i32>, usize); 4]> {
         let [segments, blocks, selected, extents] = self.compact[group].arrays::<R, B, R>(table)?;
+        let words = segments.len();
         Ok([
-            (segments, R::SIZE * FIELDS),
+            (segments, words),
             (blocks, B::SIZE),
             (selected, R::SIZE),
             (extents, 3),

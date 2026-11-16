@@ -44,6 +44,10 @@ impl<const BITS: usize, S: M> Load<HostTensor<f32, S>> for F32<BITS> {
 /// Scalar repeated over the eight cells of a vector packet in both clusters and 256 slices.
 pub type Packet<D = i32, Chips = Chip> = DmTensor<D, Chips, Cluster, Slices, m![1 # 8]>;
 
+/// A scalar's padded packet in HBM once for each slice a [`Packet`] spans, so a landing into many
+/// slices reads a copy a slice rather than one address a slice in turn; a load writes every copy.
+pub type Copies = m![{ Broadcast<{ <Cluster as M>::SIZE * <Slices as M>::SIZE }> }, 1 # 8];
+
 /// A packet in the main vector engine at stage `S`; it enters as I32 at the tag stage.
 pub type Stream<'l, S = stage::Tag, D = i32, Stash = Fresh, Chips = Chip> = VectorTensor<
     'l,
@@ -58,16 +62,6 @@ pub type Stream<'l, S = stage::Tag, D = i32, Stash = Fresh, Chips = Chip> = Vect
     Stash,
     { stage::VeOrder::IntraFirst },
 >;
-
-/// Copy the one I32 element a view selects into a scalar of its own.
-pub(crate) fn read<Chips: M, E: M>(
-    device: &mut Device,
-    input: HbmTensorView<'_, i32, Chips, E>,
-) -> Value<Chips> {
-    let mut output = Value::new();
-    input.to_hbm_view(&mut device.tdma, output.view_mut());
-    output
-}
 
 /// Stage a scalar as an eight-cell DM packet for vector arithmetic.
 pub(crate) fn packet<Chips: M>(device: &mut Device, input: &Value<Chips>) -> Packet<i32, Chips> {

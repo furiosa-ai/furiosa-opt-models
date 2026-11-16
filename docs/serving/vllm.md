@@ -12,7 +12,7 @@ The platform accepts these values:
 | `--dtype` | `auto` (for BF16 checkpoints), `bfloat16` |
 | `--block-size` | The model's compiled cache block; a refused size names it |
 | `--max-model-len` | At most the decoder's compiled window, which startup names otherwise |
-| `--kv-cache-dtype` | `auto`, `bfloat16`; startup refuses a dtype the model does not cache in with the engine's reason ([FP8 KV cache](index.md#features-not-supported-yet) is not supported yet) |
+| `--kv-cache-dtype` | `auto`, the KV cache the checkpoint declares where the model caches in it, else BF16: E4M3 codes under the checkpoint's static scales for Gemma 4 12B NVFP4, BF16 for every other model; `bfloat16`; `fp8` and `fp8_e4m3`, E4M3 codes; startup refuses a dtype the model does not cache in with the engine's reason |
 | `--tensor-parallel-size` | 1, or a chip count the model is compiled to split over; a refused count names the accepted ones |
 | `--convert classify` | A checkpoint with a score head, or `classifier_from_token` over its vocabulary head |
 | `head_dtype` in `--hf-overrides` | `float32`, the pooling default, for a score head |

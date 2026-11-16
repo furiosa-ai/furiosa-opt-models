@@ -21,7 +21,10 @@ use furiosa_opt_models::ops::attention::full::paged::{Options, Plan, Waves};
 use furiosa_opt_models::ops::attention::gqa;
 use furiosa_opt_models::ops::index::table::{BlockIndex, FIELDS};
 use furiosa_opt_models::specialize::attention::WAVES;
-use furiosa_opt_models::tensor::{cache::Block, parallel::Chip};
+use furiosa_opt_models::tensor::{
+    cache::{self, Block},
+    parallel::Chip,
+};
 use furiosa_opt_std::prelude::*;
 
 /// Each cache group's operands attend that group's window: a sliding group's decode rows and
@@ -118,8 +121,8 @@ fn plans_each_group_under_its_window() -> io::Result<()> {
 }
 
 /// What a call of Gemma 4's decoder is planned within: 64 rows up to the full group's context, the
-/// sliding group attending the positions of all but one of its cache windows, both paged in blocks
-/// of 16 positions; one layer a group, of pages no plan reads.
+/// sliding group attending the positions of its cache windows, both paged in blocks of 16
+/// positions; one layer a group, of pages no plan reads.
 fn limits() -> Limits {
     let positions = |windows: usize| windows * gqa::Cache::SIZE;
     let group = |layer, window| Group {
@@ -137,7 +140,7 @@ fn limits() -> Limits {
                 bytes: 64,
             }],
             groups: vec![
-                group(0, Some(positions(gemma4::sliding::Windows::SIZE - 1))),
+                group(0, Some(positions(gemma4::sliding::Windows::SIZE))),
                 group(1, None),
             ],
         },
@@ -178,8 +181,13 @@ fn reads<B: AxisName>(
         batch.history::<gemma4::Rows, B>((group, Table::Blocks))?;
     let window = limits.cache.groups[group].window;
     let word = |value: usize| i32::try_from(value).unwrap();
+    // The table is word-major, each word in a cell of its own.
+    let cell = |segment: usize, field: usize| {
+        segments[(field * gemma4::Rows::SIZE + segment) * <m![1 # 8] as M>::SIZE]
+    };
     let mut start = 0;
-    for (request, segment) in requests.iter().zip(segments.chunks_exact(FIELDS)) {
+    for (index, request) in requests.iter().enumerate() {
+        let segment: [i32; FIELDS] = std::array::from_fn(|field| cell(index, field));
         let rows = request.tokens.len();
         let fields = [start, rows, request.cached].map(word);
         assert_eq!(segment[..3], fields, "group {group}, row {start}");
@@ -449,8 +457,25 @@ fn continues_a_prompt_over_both_groups_as_the_reference() {
     let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
     let source = Checkpoint::new(snapshot(GEMMA4, &["*.json", "*.safetensors"]), None).unwrap();
     let root: gemma4::ForCausalLM = source.load(&mut device).unwrap();
-    let instance = Instance::new(root, Tiling::Adaptive);
-    let model: &dyn Served = &instance;
+    continues(&mut device, &Instance::new(root, Tiling::Adaptive));
+}
+
+/// The same continuation from caches that store each key and value in BF16.
+#[test]
+#[ignore = "reads the published checkpoint from the local hub cache"]
+fn continues_a_prompt_from_bf16_caches_as_the_reference() {
+    let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+    let source = Checkpoint::new(snapshot(GEMMA4, &["*.json", "*.safetensors"]), None).unwrap();
+    let root: Bf16 = source.load(&mut device).unwrap();
+    continues(&mut device, &Instance::new(root, Tiling::Adaptive));
+}
+
+/// Gemma 4's decoder over caches of BF16 keys and values.
+type Bf16 = gemma4::ForCausalLM<gemma4::Quantized, cache::Bf16>;
+
+/// `model`'s greedy continuations of the reference prompt, as
+/// [`continues_a_prompt_over_both_groups_as_the_reference`] states them.
+fn continues(device: &mut Device, model: &dyn Served) {
     let limits = model.limits();
     let [sliding, full] = &limits.cache.groups[..] else {
         panic!("{:?}", limits.cache.groups);
@@ -471,14 +496,14 @@ fn continues_a_prompt_over_both_groups_as_the_reference() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let cache = Cache::new(&device, &limits.cache, 8).unwrap();
-        let first = next(&mut device, model, &cache, (0, &PROMPT)).await;
-        let second = next(&mut device, model, &cache, (PROMPT.len(), &[first])).await;
+        let cache = Cache::new(&*device, &limits.cache, 8).unwrap();
+        let first = next(&mut *device, model, &cache, (0, &PROMPT)).await;
+        let second = next(&mut *device, model, &cache, (PROMPT.len(), &[first])).await;
         assert_eq!([first, second], CONTINUATION, "the prompt in one call");
         let mut stepped = Vec::new();
         for position in 0..PROMPT.len() + 1 {
             let token = PROMPT.get(position).copied().unwrap_or_else(|| stepped[0]);
-            let token = next(&mut device, model, &cache, (position, &[token])).await;
+            let token = next(&mut *device, model, &cache, (position, &[token])).await;
             if position + 1 >= PROMPT.len() {
                 stepped.push(token);
             }
@@ -486,14 +511,14 @@ fn continues_a_prompt_over_both_groups_as_the_reference() {
         assert_eq!(stepped, CONTINUATION, "one position a call");
         let mut prompts = Vec::new();
         for blocks in [BLOCKS, OTHER] {
-            prompts.push(request(&mut device, (&blocks, 0), &PROMPT).await);
+            prompts.push(request(&mut *device, (&blocks, 0), &PROMPT).await);
         }
-        let firsts = kept(&mut device, model, &cache, &prompts).await;
+        let firsts = kept(&mut *device, model, &cache, &prompts).await;
         let mut steps = Vec::new();
         for (blocks, &token) in [BLOCKS, OTHER].iter().zip(&firsts) {
-            steps.push(request(&mut device, (blocks, PROMPT.len()), &[token]).await);
+            steps.push(request(&mut *device, (blocks, PROMPT.len()), &[token]).await);
         }
-        let seconds = kept(&mut device, model, &cache, &steps).await;
+        let seconds = kept(&mut *device, model, &cache, &steps).await;
         let continued: Vec<_> = firsts
             .into_iter()
             .zip(seconds)
@@ -501,4 +526,207 @@ fn continues_a_prompt_over_both_groups_as_the_reference() {
             .collect();
         assert_eq!(continued, [CONTINUATION; 2], "two sequences a call");
     });
+}
+
+/// Calls of Gemma 4's decoder by shape, profiled at the level `FURIOSA_OPT_PROFILE` asks for: the
+/// published checkpoint loaded as the reference test loads it, then each case `GEMMA_PROFILE_CASES`
+/// names (all by default), a warm-up and `GEMMA_PROFILE_STEPS` timed calls each.
+#[test]
+#[ignore = "reads the published checkpoint from the local hub cache"]
+fn gemma_profile() {
+    let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+    // Installed before the functions load, so that they load with the profile.
+    let _spans = lines();
+    let source = Checkpoint::new(snapshot(GEMMA4, &["*.json", "*.safetensors"]), None).unwrap();
+    let loading = std::time::Instant::now();
+    let root: gemma4::ForCausalLM = source.load(&mut device).unwrap();
+    println!("loaded in {:.1} s", loading.elapsed().as_secs_f64());
+    profile(&mut device, &Instance::new(root, Tiling::Adaptive));
+}
+
+/// The same calls profiled over caches of BF16 keys and values.
+#[test]
+#[ignore = "reads the published checkpoint from the local hub cache"]
+fn gemma_profile_bf16() {
+    let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+    // Installed before the functions load, so that they load with the profile.
+    let _spans = lines();
+    let source = Checkpoint::new(snapshot(GEMMA4, &["*.json", "*.safetensors"]), None).unwrap();
+    let loading = std::time::Instant::now();
+    let root: Bf16 = source.load(&mut device).unwrap();
+    println!("loaded in {:.1} s", loading.elapsed().as_secs_f64());
+    profile(&mut device, &Instance::new(root, Tiling::Adaptive));
+}
+
+/// `model`'s calls by shape, as [`gemma_profile`] profiles them.
+fn profile(device: &mut Device, model: &dyn Served) {
+    use std::time::Instant;
+    use tracing::Instrument;
+    // Blocks of the history every sequence of a case shares; a decode row writes its position to
+    // a block of its own after them.
+    const SHARED: usize = 160;
+    // Name, sequences, tokens a sequence, cached positions.
+    const CASES: [(&str, usize, usize, usize); 8] = [
+        ("decode-1-at-27", 1, 1, 27),
+        ("decode-1-at-1024", 1, 1, 1024),
+        ("decode-1-at-2187", 1, 1, 2187),
+        ("decode-8-at-1024", 8, 1, 1024),
+        ("decode-32-at-1024", 32, 1, 1024),
+        ("decode-64-at-1024", 64, 1, 1024),
+        ("chunk-64-at-0", 1, 64, 0),
+        ("chunk-64-at-512", 1, 64, 512),
+    ];
+    let steps: usize =
+        std::env::var("GEMMA_PROFILE_STEPS").map_or(20, |steps| steps.parse().unwrap());
+    let wanted = std::env::var("GEMMA_PROFILE_CASES").unwrap_or_default();
+    let limits = model.limits();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let cache = Cache::new(&*device, &limits.cache, SHARED + gemma4::Rows::SIZE).unwrap();
+        let bytes: usize = cache.layers().iter().map(HbmBuffer::size).sum();
+        println!("cache of {} blocks, {bytes} B", cache.blocks());
+        let ids = |end: usize| (0..end).map(|id| id as u32);
+        for (case, sequences, tokens, cached) in CASES {
+            if !wanted.is_empty() && !wanted.split(',').any(|name| name == case) {
+                continue;
+            }
+            let mut requests = Vec::with_capacity(sequences);
+            for sequence in 0..sequences {
+                let blocks: Vec<u32> = match tokens {
+                    1 => (ids(cached / Block::SIZE).chain([(SHARED + sequence) as u32])).collect(),
+                    _ => ids((cached + tokens).div_ceil(Block::SIZE)).collect(),
+                };
+                requests.push(request(&mut *device, (&blocks, cached), &vec![0; tokens]).await);
+            }
+            for sample in 0..=steps {
+                let span = match sample {
+                    0 => tracing::info_span!("warmup", case),
+                    step => tracing::info_span!("forward", case, step),
+                };
+                let started = Instant::now();
+                let tokens = async {
+                    let output = (model.forward(&mut *device, &cache, &requests, &[]))
+                        .instrument(tracing::info_span!("submit"))
+                        .await
+                        .unwrap();
+                    (device.synchronize())
+                        .instrument(tracing::info_span!("wait"))
+                        .await
+                        .unwrap();
+                    (words(&mut *device, &output.buffer))
+                        .instrument(tracing::info_span!("readback"))
+                        .await
+                        .unwrap()
+                }
+                .instrument(span)
+                .await;
+                println!(
+                    "{case} step {sample}: {:.3} ms, first token {}",
+                    started.elapsed().as_secs_f64() * 1e3,
+                    tokens[0],
+                );
+            }
+        }
+    });
+}
+
+/// Records every span to `GEMMA_PROFILE_OUT` (default `npu.tsv`), a line each: `S id parent name
+/// ns fields` as it opens (an NPU span's fields carry its cycles) and `C id ns` as it closes; a
+/// kernel's name, written once on a `K label bytes name` line, is its label in the spans.
+fn lines() -> tracing::subscriber::DefaultGuard {
+    use tracing_subscriber::prelude::*;
+    let path = std::env::var("GEMMA_PROFILE_OUT").unwrap_or_else(|_| "npu.tsv".into());
+    let out = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+    let layer = Lines {
+        out: std::sync::Mutex::new(out),
+        base: std::time::Instant::now(),
+        kernels: std::sync::Mutex::default(),
+    };
+    tracing::subscriber::set_default(tracing_subscriber::registry().with(layer))
+}
+
+struct Lines {
+    out: std::sync::Mutex<std::io::BufWriter<std::fs::File>>,
+    base: std::time::Instant,
+    kernels: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+/// A span's fields as `\tname=value` text, and the `K` line of a kernel it names first.
+struct Fields<'a> {
+    text: String,
+    kernels: &'a std::sync::Mutex<std::collections::HashSet<String>>,
+    named: String,
+}
+
+impl tracing::field::Visit for Fields<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        use std::hash::{Hash, Hasher};
+        let label = match field.name() {
+            "kernel" if value.contains("copy::__furiosa_opt_place") => "place".into(),
+            "kernel" if value.contains("gemma4") => "root48".into(),
+            "kernel" => {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                value.hash(&mut hasher);
+                format!("kernel-{:016x}", hasher.finish())
+            }
+            _ => {
+                self.text.push_str(&format!("\t{}={value}", field.name()));
+                return;
+            }
+        };
+        if self.kernels.lock().unwrap().insert(label.clone()) {
+            let name: String = value.chars().take(400).collect();
+            self.named = format!("K\t{label}\t{}\t{name}\n", value.len());
+        }
+        self.text.push_str(&format!("\tkernel={label}"));
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let text = format!("{value:?}");
+        self.record_str(field, text.trim_matches('"'));
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for Lines
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attributes: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        use std::io::Write;
+        let parent = match attributes.parent() {
+            Some(parent) => Some(parent.clone()),
+            None if attributes.is_contextual() => context.current_span().id().cloned(),
+            None => None,
+        };
+        let mut fields = Fields {
+            text: String::new(),
+            kernels: &self.kernels,
+            named: String::new(),
+        };
+        attributes.record(&mut fields);
+        let line = format!(
+            "{}S\t{}\t{}\t{}\t{}{}\n",
+            fields.named,
+            id.into_u64(),
+            parent.map_or(0, |parent| parent.into_u64()),
+            attributes.metadata().name(),
+            self.base.elapsed().as_nanos(),
+            fields.text
+        );
+        self.out.lock().unwrap().write_all(line.as_bytes()).unwrap();
+    }
+
+    fn on_close(&self, id: tracing::span::Id, _: tracing_subscriber::layer::Context<'_, S>) {
+        use std::io::Write;
+        let line = format!("C\t{}\t{}\n", id.into_u64(), self.base.elapsed().as_nanos());
+        self.out.lock().unwrap().write_all(line.as_bytes()).unwrap();
+    }
 }

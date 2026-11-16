@@ -40,11 +40,11 @@ impl<Head: AxisName> AxisName for Row<Head> {
     const SIZE: usize = Head::SIZE / 2;
 }
 
-type Table<Slice, Count, Row, Chips = Chip> =
-    DmTensor<bf16, Chips, Cluster, Slice, m![{ Count }, OutputHalf, Row]>;
+type Table<Slice, Count, Row, Chips = Chip, C = Cluster> =
+    DmTensor<bf16, Chips, C, Slice, m![{ Count }, OutputHalf, Row]>;
 
-type Coefficient<Slice, Count, Row> =
-    VrfTensor<f32, Chip, Cluster, Slice, m![{ Count }, OutputHalf, Row]>;
+type Coefficient<Slice, Count, Row, C = Cluster> =
+    VrfTensor<f32, Chip, C, Slice, m![{ Count }, OutputHalf, Row]>;
 
 /// Row groups one pass of `Head`-wide heads rotates: those of up to 32 rows whose two coefficient
 /// tables, `Head` FP32 a row group each, take at most half of a slice's VRF.
@@ -76,33 +76,53 @@ impl<Query, Key, Rows> RotaryEmbedding<Query, Key, Rows> {
     }
 }
 
-/// The query and key heads, the coefficient rows of their positions and the live rows.
-pub type Input<'a, Slice, Query, Key, Rows, Head> = (
-    &'a DmTensor<bf16, Chip, Cluster, Slice, m![{ RowGroups<Rows, Query> }, Head]>,
-    &'a DmTensor<bf16, Chip, Cluster, Slice, m![{ RowGroups<Rows, Key> }, Head]>,
+/// Slices that hold a lane's key rows where slices `Query` hold the same lane's query rows, so the
+/// coefficients a rotation lands on the query rows' slices serve the keys.
+///
+/// # Safety
+///
+/// Each slice of `Self` that holds a key row of a lane is a slice on which `Query` holds a query row
+/// of that lane.
+pub(crate) unsafe trait Within<Query: M>: M {}
+
+/// The query heads on slices `Slice` and the key heads on slices `KeySlice` within them, both on
+/// clusters `C`, the coefficient rows of their positions and the live rows.
+pub type Input<'a, Slice, KeySlice, Query, Key, Rows, Head, C = Cluster> = (
+    &'a DmTensor<bf16, Chip, C, Slice, m![{ RowGroups<Rows, Query> }, Head]>,
+    &'a DmTensor<bf16, Chip, C, KeySlice, m![{ RowGroups<Rows, Key> }, Head]>,
     &'a HbmTensor<bf16, Chip, m![Rows, Head]>,
     &'a HbmTensor<bf16, Chip, m![Rows, Head]>,
     Live<(), Rows>,
 );
 
-impl<'a, Slice: M, Query: AxisName, Key: AxisName, Rows: AxisName, Head: AxisName>
-    crate::Op<Input<'a, Slice, Query, Key, Rows, Head>> for RotaryEmbedding<Query, Key, Rows>
+impl<'a, C, Slice, KeySlice, Query, Key, Rows, Head>
+    crate::Op<Input<'a, Slice, KeySlice, Query, Key, Rows, Head, C>>
+    for RotaryEmbedding<Query, Key, Rows>
+where
+    C: M,
+    Slice: M,
+    KeySlice: Within<Slice>,
+    Query: AxisName,
+    Key: AxisName,
+    Rows: AxisName,
+    Head: AxisName,
 {
     type Output = (
-        DmTensor<bf16, Chip, Cluster, Slice, m![{ RowGroups<Rows, Query> }, Head]>,
-        DmTensor<bf16, Chip, Cluster, Slice, m![{ RowGroups<Rows, Key> }, Head]>,
+        DmTensor<bf16, Chip, C, Slice, m![{ RowGroups<Rows, Query> }, Head]>,
+        DmTensor<bf16, Chip, C, KeySlice, m![{ RowGroups<Rows, Key> }, Head]>,
     );
 
     /// Every row group in shared passes when every group holds a live row; otherwise each group
-    /// the live rows touch alone, and a group outside them is not rotated.
+    /// the live rows touch alone, and a group outside them is not rotated. The coefficients land
+    /// once, on every slice of the queries' lanes, and the keys read them where they lie.
     fn forward(
         &self,
         device: &mut Device,
-        (query, key, low, high, live): Input<'a, Slice, Query, Key, Rows, Head>,
+        (query, key, low, high, live): Input<'a, Slice, KeySlice, Query, Key, Rows, Head, C>,
     ) -> Self::Output {
         let table = |device: &mut Device,
                      table: &HbmTensor<bf16, Chip, m![Rows, Head]>|
-         -> Table<Slice, Groups<Rows>, Row<Head>> {
+         -> Table<Slice, Groups<Rows>, Row<Head>, Chip, C> {
             // SAFETY: a coefficient row consists of its two consecutive output halves.
             unsafe {
                 table
@@ -116,15 +136,15 @@ impl<'a, Slice: M, Query: AxisName, Key: AxisName, Rows: AxisName, Head: AxisNam
         let mut rotated_query: DmTensor<
             bf16,
             Chip,
-            Cluster,
+            C,
             Slice,
             m![{ Groups<Rows> }, Query, OutputHalf, { Symbol<Row<Head>> }],
         > = DmTensor::new();
         let mut rotated_key: DmTensor<
             bf16,
             Chip,
-            Cluster,
-            Slice,
+            C,
+            KeySlice,
             m![{ Groups<Rows> }, Key, OutputHalf, { Symbol<Row<Head>> }],
         > = DmTensor::new();
         // SAFETY: each head's two halves remain consecutive within the same row and slice.
@@ -133,20 +153,20 @@ impl<'a, Slice: M, Query: AxisName, Key: AxisName, Rows: AxisName, Head: AxisNam
                 .view()
                 .reshape::<
                     Chip,
-                    Cluster,
+                    C,
                     Slice,
                     m![{ Groups<Rows> }, Query, Half, { Symbol<Row<Head>> }],
                 >()
         };
         let key = unsafe {
-            key.view()
-                .reshape::<
-                    Chip,
-                    Cluster,
-                    Slice,
-                    m![{ Groups<Rows> }, Key, Half, { Symbol<Row<Head>> }],
-                >()
+            key.view().reshape::<
+                Chip,
+                C,
+                KeySlice,
+                m![{ Groups<Rows> }, Key, Half, { Symbol<Row<Head>> }],
+            >()
         };
+
         let (first, count) = live.groups::<Lanes<Rows>>();
         if count == <Groups<Rows> as M>::SIZE {
             #[unroll]
@@ -180,6 +200,13 @@ impl<'a, Slice: M, Query: AxisName, Key: AxisName, Rows: AxisName, Head: AxisNam
                         &high,
                     ),
                 );
+                // SAFETY: the tables land on every slice of the queries' lanes, and each key slice
+                // is one of its lane's query slices (`Within`), so it holds the lane's coefficients.
+                let low: Coefficient<KeySlice, TileRows<Rows, Head>, Row<Head>, C> =
+                    unsafe { low.reshape() };
+                // SAFETY: as for the low half.
+                let high: Coefficient<KeySlice, TileRows<Rows, Head>, Row<Head>, C> =
+                    unsafe { high.reshape() };
                 RotateRows::<TileRows<Rows, Head>, m![Key], Row<Head>>(PhantomData).forward(
                     device,
                     (
@@ -224,6 +251,10 @@ impl<'a, Slice: M, Query: AxisName, Key: AxisName, Rows: AxisName, Head: AxisNam
                         &high,
                     ),
                 );
+                // SAFETY: as for every row group above.
+                let low: Coefficient<KeySlice, m![1], Row<Head>, C> = unsafe { low.reshape() };
+                // SAFETY: as for every row group above.
+                let high: Coefficient<KeySlice, m![1], Row<Head>, C> = unsafe { high.reshape() };
                 RotateRows::<m![1], m![Key], Row<Head>>(PhantomData).forward(
                     device,
                     (
@@ -246,16 +277,16 @@ impl<'a, Slice: M, Query: AxisName, Key: AxisName, Rows: AxisName, Head: AxisNam
 
 struct Fetch<Count, Row>(PhantomData<(Count, Row)>);
 
-impl<Slice: M, Count: M, Element: M, Row: AxisName>
-    crate::Op<DmTensorView<'_, bf16, Chip, Cluster, Slice, Element>> for Fetch<Count, Row>
+impl<C: M, Slice: M, Count: M, Element: M, Row: AxisName>
+    crate::Op<DmTensorView<'_, bf16, Chip, C, Slice, Element>> for Fetch<Count, Row>
 {
-    type Output = Coefficient<Slice, Count, Row>;
+    type Output = Coefficient<Slice, Count, Row, C>;
 
     fn forward(
         &self,
         device: &mut Device,
-        table: DmTensorView<'_, bf16, Chip, Cluster, Slice, Element>,
-    ) -> Coefficient<Slice, Count, Row> {
+        table: DmTensorView<'_, bf16, Chip, C, Slice, Element>,
+    ) -> Coefficient<Slice, Count, Row, C> {
         device
             .sub
             .begin(table)
@@ -268,12 +299,12 @@ impl<Slice: M, Count: M, Element: M, Row: AxisName>
 
 struct RotateRows<Count, Group, Row>(PhantomData<(Count, Group, Row)>);
 
-impl<Slice: M, Count: M, Group: M, Row: AxisName, Input: M, Output: M>
+impl<C: M, Slice: M, Count: M, Group: M, Row: AxisName, Input: M, Output: M>
     crate::Op<(
-        DmTensorView<'_, bf16, Chip, Cluster, Slice, Input>,
-        DmTensorViewMut<'_, bf16, Chip, Cluster, Slice, Output>,
-        &Coefficient<Slice, Count, Row>,
-        &Coefficient<Slice, Count, Row>,
+        DmTensorView<'_, bf16, Chip, C, Slice, Input>,
+        DmTensorViewMut<'_, bf16, Chip, C, Slice, Output>,
+        &Coefficient<Slice, Count, Row, C>,
+        &Coefficient<Slice, Count, Row, C>,
     )> for RotateRows<Count, Group, Row>
 {
     type Output = ();
@@ -282,10 +313,10 @@ impl<Slice: M, Count: M, Group: M, Row: AxisName, Input: M, Output: M>
         &self,
         device: &mut Device,
         (input, output, low, high): (
-            DmTensorView<'_, bf16, Chip, Cluster, Slice, Input>,
-            DmTensorViewMut<'_, bf16, Chip, Cluster, Slice, Output>,
-            &Coefficient<Slice, Count, Row>,
-            &Coefficient<Slice, Count, Row>,
+            DmTensorView<'_, bf16, Chip, C, Slice, Input>,
+            DmTensorViewMut<'_, bf16, Chip, C, Slice, Output>,
+            &Coefficient<Slice, Count, Row, C>,
+            &Coefficient<Slice, Count, Row, C>,
         ),
     ) {
         device
@@ -329,31 +360,37 @@ impl<Head: AxisName> Rotation<Head> {
 }
 
 type Scalars<Rows, Rotated, Chips = Chip> = HbmTensor<f32, Chips, m![Rows, Rotated]>;
-type Parameters<Rotated, Chips = Chip> = HbmTensor<f32, Chips, m![Rotated]>;
 
+/// A row's rotated coordinates on the row's slice, so a row lands and stores as one run.
 type Angles<Rows, Rotated, Chips = Chip> =
-    DmTensor<f32, Chips, Cluster, m![Rotated / 8 # 256], m![Rows, Rotated % 8]>;
+    DmTensor<f32, Chips, Cluster, m![Rows # 256], m![Rotated]>;
 
-type Constants<Rotated, Chips = Chip> =
-    VrfTensor<f32, Chips, Cluster, m![Rotated / 8 # 256], m![Rotated % 8]>;
+type Constants<Rows, Rotated, Chips = Chip> =
+    VrfTensor<f32, Chips, Cluster, m![Rows # 256], m![Rotated / 8, Rotated % 8]>;
 
 type CoefficientRows<Rows, Rotated, Chips = Chip> = HbmTensor<bf16, Chips, m![Rows, Rotated]>;
 
 type CoefficientSlices<Rows, Rotated, Chips = Chip> =
-    DmTensor<bf16, Chips, Cluster, m![Rotated / 8 # 256], m![Rows, Rotated % 8]>;
+    DmTensor<bf16, Chips, Cluster, m![Rows # 256], m![Rotated]>;
 
-/// Produce each row's rotation from the frequency of each rotated coordinate and the row's token
-/// position; each constant is held as `T`: the HBM tensor, or a borrow of it in a borrowed tree.
+/// Produce each row's rotation on the row's slice from the frequency of each rotated coordinate and
+/// the row's token position; each constant is held as `T`: the HBM tensor or a borrow of it.
 #[derive(DeviceSend, Load)]
 #[load(tree)]
-pub struct Coefficients<Rotated: AxisName, Chips: M = Chip, T = Parameters<Rotated, Chips>> {
+pub struct Coefficients<
+    Rows: AxisName,
+    Rotated: AxisName,
+    Chips: M = Chip,
+    T = Scalars<Rows, Rotated, Chips>,
+> {
     /// The first input half's coefficients.
     low: Component<T>,
     /// The second input half's coefficients.
     high: Component<T>,
     /// The amplitude of every coefficient, on each coordinate.
     amplitude: T,
-    shape: core::marker::PhantomData<fn() -> (Rotated, Chips)>,
+    /// Each constant's rows and coordinates: a copy a row, as each row's slice reads its own.
+    shape: core::marker::PhantomData<fn() -> (Rows, Rotated, Chips)>,
 }
 
 /// The constants of one half's coefficients: the sine of each angle times `sign` plus `phase`.
@@ -366,7 +403,7 @@ pub struct Component<T> {
     sign: T,
 }
 
-impl<Rotated: AxisName, Chips: M, T> Coefficients<Rotated, Chips, T> {
+impl<Rows: AxisName, Rotated: AxisName, Chips: M, T> Coefficients<Rows, Rotated, Chips, T> {
     /// The constants the rotation reads: each half's phase and sign, low first, then the amplitude.
     pub fn constants(&self) -> [&T; 5] {
         let (low, high) = (&self.low, &self.high);
@@ -381,10 +418,10 @@ impl<Rotated: AxisName, Chips: M, T> Coefficients<Rotated, Chips, T> {
 }
 
 /// The constants of a rotation at the amplitude of `frequencies`, as no checkpoint stores them.
-impl<'f, Rotated: AxisName, Chips: M, T> Load<&'f PairFrequencies<Rotated>>
-    for Coefficients<Rotated, Chips, T>
+impl<'f, Rows: AxisName, Rotated: AxisName, Chips: M, T> Load<&'f PairFrequencies<Rotated>>
+    for Coefficients<Rows, Rotated, Chips, T>
 where
-    T: Load<HostTensor<f32, m![{ Chips }, { m![Rotated] }]>>,
+    T: Load<HostTensor<f32, m![{ Chips }, { m![Rows, Rotated] }]>>,
 {
     fn load(
         context: &mut Context<'_>,
@@ -396,7 +433,7 @@ where
             (0..Rotated::SIZE)
                 .map(half)
                 .collect::<Vec<_>>()
-                .repeat(Chips::SIZE)
+                .repeat(Rows::SIZE * Chips::SIZE)
         };
         let constant = |cx: &mut Context<'_>, name: &str, values: Vec<f32>| {
             cx.field(name, name, |cx| T::load(cx, HostTensor::from_vec(values)))
@@ -419,31 +456,40 @@ where
     }
 }
 
-impl<Rotated: AxisName, Chip: M, T> Coefficients<Rotated, Chip, T> {
-    fn angle<Rows: AxisName>(
-        &self,
+impl<Rows: AxisName, Rotated: AxisName, Chip: M, T> Coefficients<Rows, Rotated, Chip, T>
+where
+    T: Borrow<Scalars<Rows, Rotated, Chip>>,
+{
+    /// A per-row constant as a vector-engine operand on each row's slice.
+    fn constant(
+        device: &mut Device,
+        input: &Scalars<Rows, Rotated, Chip>,
+    ) -> Constants<Rows, Rotated, Chip> {
+        let input: Angles<Rows, Rotated, Chip> = input.to_dm(&mut device.tdma);
+        device
+            .sub
+            .begin(input.view())
+            .fetch::<m![Rotated / 8], m![Rotated % 8]>()
+            .collect::<m![Rotated / 8], m![Rotated % 8]>()
+            .to_vrf()
+    }
+
+    fn angle(
         device: &mut Device,
         (frequency, position): (&Scalars<Rows, Rotated, Chip>, &Scalars<Rows, Rotated, Chip>),
     ) -> Angles<Rows, Rotated, Chip> {
         let frequency: Angles<Rows, Rotated, Chip> = frequency.to_dm(&mut device.tdma);
-        let position: Angles<Rows, Rotated, Chip> = position.to_dm(&mut device.tdma);
-        let position: VrfTensor<f32, Chip, Cluster, m![Rotated / 8 # 256], m![Rows, Rotated % 8]> =
-            device
-                .sub
-                .begin(position.view())
-                .fetch::<m![Rows], m![Rotated % 8]>()
-                .collect::<m![Rows], m![Rotated % 8]>()
-                .to_vrf();
+        let position = Self::constant(device, position);
         device
             .main
             .begin(frequency.view())
-            .fetch::<m![Rows], m![Rotated % 8]>()
-            .collect::<m![Rows], m![Rotated % 8]>()
+            .fetch::<m![Rotated / 8], m![Rotated % 8]>()
+            .collect::<m![Rotated / 8], m![Rotated % 8]>()
             .vector_init()
             .vector_intra_slice_tag(TagMode::Zero)
-            .vector_narrow_split::<m![Rows, Rotated % 8 / 4], m![Rotated % 4]>()
+            .vector_narrow_split::<m![Rotated / 8, Rotated % 8 / 4], m![Rotated % 4]>()
             .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &position)
-            .vector_widen_concat::<m![Rows], m![Rotated % 8]>()
+            .vector_widen_concat::<m![Rotated / 8], m![Rotated % 8]>()
             .vector_final()
             .commit_trim::<m![Rotated % 8]>()
             .commit()
@@ -451,86 +497,68 @@ impl<Rotated: AxisName, Chip: M, T> Coefficients<Rotated, Chip, T> {
 
     /// One coefficient component of each row: `amplitude` times the sine of its angle times
     /// `sign` plus `phase`.
-    fn component<Rows: AxisName>(
+    fn component(
         device: &mut Device,
         angle: &Angles<Rows, Rotated, Chip>,
         Component { phase, sign }: &Component<T>,
-        amplitude: &Parameters<Rotated, Chip>,
-    ) -> CoefficientSlices<Rows, Rotated, Chip>
-    where
-        T: Borrow<Parameters<Rotated, Chip>>,
-    {
-        let (phase, sign) = (phase.borrow(), sign.borrow());
-        let constants =
-            |device: &mut Device, input: &Parameters<Rotated, Chip>| -> Constants<Rotated, Chip> {
-                let input: DmTensor<f32, Chip, Cluster, m![Rotated / 8 # 256], m![Rotated % 8]> =
-                    input.to_dm(&mut device.tdma);
-                device
-                    .sub
-                    .begin(input.view())
-                    .fetch::<m![1], m![Rotated % 8]>()
-                    .collect::<m![1], m![Rotated % 8]>()
-                    .to_vrf()
-            };
-        let phase = constants(device, phase);
-        let sign = constants(device, sign);
-        let amplitude = constants(device, amplitude);
+        amplitude: &Constants<Rows, Rotated, Chip>,
+    ) -> CoefficientSlices<Rows, Rotated, Chip> {
+        let phase = Self::constant(device, phase.borrow());
+        let sign = Self::constant(device, sign.borrow());
         let shifted: Angles<Rows, Rotated, Chip> = device
             .main
             .begin(angle.view())
-            .fetch::<m![Rows], m![Rotated % 8]>()
-            .collect::<m![Rows], m![Rotated % 8]>()
+            .fetch::<m![Rotated / 8], m![Rotated % 8]>()
+            .collect::<m![Rotated / 8], m![Rotated % 8]>()
             .vector_init()
             .vector_intra_slice_tag(TagMode::Zero)
-            .vector_narrow_split::<m![Rows, Rotated % 8 / 4], m![Rotated % 4]>()
+            .vector_narrow_split::<m![Rotated / 8, Rotated % 8 / 4], m![Rotated % 4]>()
             .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &sign)
-            .vector_widen_concat::<m![Rows], m![Rotated % 8]>()
+            .vector_widen_concat::<m![Rotated / 8], m![Rotated % 8]>()
             .vector_clip(ClipBinaryOpF32::Add, &phase)
             .vector_final()
             .commit_trim::<m![Rotated % 8]>()
             .commit();
         // Hardware trigonometric instructions require a reduced angle within one turn.
-        let turns: DmTensor<i32, Chip, Cluster, m![Rotated / 8 # 256], m![Rows, Rotated % 8]> =
-            device
-                .main
-                .begin(shifted.view())
-                .fetch::<m![Rows], m![Rotated % 8]>()
-                .collect::<m![Rows], m![Rotated % 8]>()
-                .vector_init()
-                .vector_intra_slice_tag(TagMode::Zero)
-                .vector_narrow_split::<m![Rows, Rotated % 8 / 4], m![Rotated % 4]>()
-                .vector_fp_div(TAU)
-                .vector_widen_concat::<m![Rows], m![Rotated % 8]>()
-                .vector_fp_to_fxp(31)
-                .vector_final()
-                .commit_trim::<m![Rotated % 8]>()
-                .commit();
-        let turns: VrfTensor<f32, Chip, Cluster, m![Rotated / 8 # 256], m![Rows, Rotated % 8]> =
-            device
-                .sub
-                .begin(turns.view())
-                .fetch::<m![Rows], m![Rotated % 8]>()
-                .collect::<m![Rows], m![Rotated % 8]>()
-                .vector_init()
-                .vector_intra_slice_tag(TagMode::Zero)
-                .vector_fxp_to_fp(31)
-                .vector_narrow_split::<m![Rows, Rotated % 8 / 4], m![Rotated % 4]>()
-                .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), TAU)
-                .vector_widen_concat::<m![Rows], m![Rotated % 8]>()
-                .vector_final()
-                .to_vrf();
+        let turns: DmTensor<i32, Chip, Cluster, m![Rows # 256], m![Rotated]> = device
+            .main
+            .begin(shifted.view())
+            .fetch::<m![Rotated / 8], m![Rotated % 8]>()
+            .collect::<m![Rotated / 8], m![Rotated % 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_split::<m![Rotated / 8, Rotated % 8 / 4], m![Rotated % 4]>()
+            .vector_fp_div(TAU)
+            .vector_widen_concat::<m![Rotated / 8], m![Rotated % 8]>()
+            .vector_fp_to_fxp(31)
+            .vector_final()
+            .commit_trim::<m![Rotated % 8]>()
+            .commit();
+        let turns: Constants<Rows, Rotated, Chip> = device
+            .sub
+            .begin(turns.view())
+            .fetch::<m![Rotated / 8], m![Rotated % 8]>()
+            .collect::<m![Rotated / 8], m![Rotated % 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_fxp_to_fp(31)
+            .vector_narrow_split::<m![Rotated / 8, Rotated % 8 / 4], m![Rotated % 4]>()
+            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), TAU)
+            .vector_widen_concat::<m![Rotated / 8], m![Rotated % 8]>()
+            .vector_final()
+            .to_vrf();
         device
             .main
             .begin(shifted.view())
-            .fetch::<m![Rows], m![Rotated % 8]>()
-            .collect::<m![Rows], m![Rotated % 8]>()
+            .fetch::<m![Rotated / 8], m![Rotated % 8]>()
+            .collect::<m![Rotated / 8], m![Rotated % 8]>()
             .vector_init()
             .vector_intra_slice_tag(TagMode::Zero)
-            .vector_narrow_split::<m![Rows, Rotated % 8 / 4], m![Rotated % 4]>()
+            .vector_narrow_split::<m![Rotated / 8, Rotated % 8 / 4], m![Rotated % 4]>()
             .vector_fp_binary(FpBinaryOp::SubF, &turns)
             .vector_fp_unary(FpUnaryOp::Sin)
-            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), &amplitude)
-            .vector_widen_concat::<m![Rows], m![Rotated % 8]>()
+            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), amplitude)
+            .vector_widen_concat::<m![Rotated / 8], m![Rotated % 8]>()
             .vector_final()
             .cast::<bf16, m![Rotated % 8 # 16]>()
             .commit_trim::<m![Rotated % 8]>()
@@ -538,11 +566,12 @@ impl<Rotated: AxisName, Chip: M, T> Coefficients<Rotated, Chip, T> {
     }
 }
 
+/// Every row's rotation, each row's coefficients stored as one run from the row's slice.
 impl<Rows: AxisName, Rotated: AxisName, Chip: M, T>
     crate::Op<(&Scalars<Rows, Rotated, Chip>, &Scalars<Rows, Rotated, Chip>)>
-    for Coefficients<Rotated, Chip, T>
+    for Coefficients<Rows, Rotated, Chip, T>
 where
-    T: Borrow<Parameters<Rotated, Chip>>,
+    T: Borrow<Scalars<Rows, Rotated, Chip>>,
 {
     type Output = Rotation<Rotated, Chip, Rows>;
 
@@ -551,88 +580,10 @@ where
         device: &mut Device,
         scalars: (&Scalars<Rows, Rotated, Chip>, &Scalars<Rows, Rotated, Chip>),
     ) -> Self::Output {
-        let angle = self.angle(device, scalars);
-        let amplitude = self.amplitude.borrow();
-        let low = Self::component(device, &angle, &self.low, amplitude).to_hbm(&mut device.tdma);
-        let high = Self::component(device, &angle, &self.high, amplitude).to_hbm(&mut device.tdma);
-        Rotation { low, high }
-    }
-}
-
-/// The rotation of the live rows only; a later row's rotation is unspecified.
-impl<Rows: AxisName, Rotated: AxisName, Chip: M, T>
-    crate::Op<(
-        &Scalars<Rows, Rotated, Chip>,
-        &Scalars<Rows, Rotated, Chip>,
-        Live<(), Rows>,
-    )> for Coefficients<Rotated, Chip, T>
-where
-    T: Borrow<Parameters<Rotated, Chip>>,
-{
-    type Output = Rotation<Rotated, Chip, Rows>;
-
-    fn forward(
-        &self,
-        device: &mut Device,
-        (frequency, position, live): (
-            &Scalars<Rows, Rotated, Chip>,
-            &Scalars<Rows, Rotated, Chip>,
-            Live<(), Rows>,
-        ),
-    ) -> Self::Output {
-        // Stores only the live rows; a later row is left unwritten.
-        let store = |device: &mut Device,
-                     table: &CoefficientSlices<Rows, Rotated, Chip>|
-         -> CoefficientRows<Rows, Rotated, Chip> {
-            let mut output: CoefficientRows<Rows, Rotated, Chip> = HbmTensor::new();
-            live.cover::<Lanes<Rows>, _>(
-                &mut (device, &mut output),
-                (
-                    |(device, output)| {
-                        table
-                            .view()
-                            .to_hbm_view(&mut device.tdma, output.view_mut());
-                    },
-                    |(device, output), packet| {
-                        table
-                        .view()
-                        .tile::<Layout<Rows>::Groups, 1, Layout<Rows>::Elements<m![Rotated % 8]>>(
-                            packet,
-                        )
-                        .to_hbm_view(
-                            &mut device.tdma,
-                            output
-                                .view_mut()
-                                .tile::<
-                                    Layout<Rows>::Groups,
-                                    1,
-                                    Layout<Rows>::GroupMut<m![Rotated]>,
-                                >(
-                                    packet,
-                                ),
-                        );
-                    },
-                    |(device, output), row| {
-                        table
-                            .view()
-                            .tile::<m![Rows], 1, m![Rows = 1 # Rows, Rotated % 8]>(row)
-                            .to_hbm_view(
-                                &mut device.tdma,
-                                output
-                                    .view_mut()
-                                    .tile::<m![Rows], 1, m![Rows = 1 #{!} Rows, Rotated]>(row),
-                            );
-                    },
-                ),
-            );
-            output
-        };
-        let angle = self.angle(device, (frequency, position));
-        let amplitude = self.amplitude.borrow();
-        let low = Self::component(device, &angle, &self.low, amplitude);
-        let low = store(device, &low);
-        let high = Self::component(device, &angle, &self.high, amplitude);
-        let high = store(device, &high);
+        let angle = Self::angle(device, scalars);
+        let amplitude = Self::constant(device, self.amplitude.borrow());
+        let low = Self::component(device, &angle, &self.low, &amplitude).to_hbm(&mut device.tdma);
+        let high = Self::component(device, &angle, &self.high, &amplitude).to_hbm(&mut device.tdma);
         Rotation { low, high }
     }
 }
@@ -661,7 +612,7 @@ mod tests {
     #[device(chip = 1)]
     pub(super) fn positioned<Rows: AxisName, Rotated: AxisName>(
         device: &mut Device,
-        coefficients: &super::Coefficients<Rotated>,
+        coefficients: &super::Coefficients<Rows, Rotated>,
         frequency: &super::Scalars<Rows, Rotated>,
         position: &super::Scalars<Rows, Rotated>,
     ) -> (
@@ -675,7 +626,7 @@ mod tests {
     pub(super) async fn coefficients<Rotated: AxisName>(
         device: &mut Device,
         amplitude: f32,
-    ) -> super::Coefficients<Rotated> {
+    ) -> super::Coefficients<crate::tensor::axis::Eight, Rotated> {
         let pairs = vec![1.0; Rotated::SIZE / 2];
         let frequencies = super::PairFrequencies::<Rotated>::new(&pairs, amplitude.into()).unwrap();
         let mut context = crate::load::Context::new(device);
@@ -1405,20 +1356,23 @@ where
     }
 }
 
-/// `Width` coordinates of each row's `Group` heads per key/value head, as attention projects them.
-type HeadValues<Rows, Slice, Group, Width> =
-    DmTensor<bf16, Chip, Cluster, Slice, m![{ RowGroups<Rows, Group> }, Width]>;
+/// `Width` coordinates of each row's `Group` heads per key/value head on clusters `C`, as attention
+/// projects them.
+type HeadValues<Rows, Slice, Group, Width, C = Cluster> =
+    DmTensor<bf16, Chip, C, Slice, m![{ RowGroups<Rows, Group> }, Width]>;
 
 /// Query and key head rows as attention projects them, for `Group` heads per key/value head.
-type HeadRows<Rows, Slice, Group, Head> = Live<HeadValues<Rows, Slice, Group, Head>, Rows>;
+type HeadRows<Rows, Slice, Group, Head, C = Cluster> =
+    Live<HeadValues<Rows, Slice, Group, Head, C>, Rows>;
 
 /// Each live row's query and key rotated by its own row of the rotation, over the first
-/// `Rotated / 2` coordinates of each head half; the other coordinates keep their values.
-impl<Head, Rotated, Rows, Slice, Query, Key>
+/// `Rotated / 2` coordinates of each head half; the other coordinates keep their values. The keys
+/// lie on slices `KeySlice` within the queries' `Slice`.
+impl<Head, Rotated, Rows, C, Slice, KeySlice, Query, Key>
     crate::Op<(
         (
-            HeadRows<Rows, Slice, Query, Head>,
-            HeadRows<Rows, Slice, Key, Head>,
+            HeadRows<Rows, Slice, Query, Head, C>,
+            HeadRows<Rows, KeySlice, Key, Head, C>,
         ),
         &Rotation<Rotated, Chip, Rows>,
     )> for Rotary<Head, Rotated, bf16, Chip>
@@ -1426,13 +1380,15 @@ where
     Head: AxisName,
     Rotated: AxisName,
     Rows: AxisName,
+    C: M,
     Slice: M,
+    KeySlice: Within<Slice>,
     Query: AxisName,
     Key: AxisName,
 {
     type Output = (
-        HeadRows<Rows, Slice, Query, Head>,
-        HeadRows<Rows, Slice, Key, Head>,
+        HeadRows<Rows, Slice, Query, Head, C>,
+        HeadRows<Rows, KeySlice, Key, Head, C>,
     );
 
     fn forward(
@@ -1440,16 +1396,16 @@ where
         device: &mut Device,
         ((query, key), rotation): (
             (
-                HeadRows<Rows, Slice, Query, Head>,
-                HeadRows<Rows, Slice, Key, Head>,
+                HeadRows<Rows, Slice, Query, Head, C>,
+                HeadRows<Rows, KeySlice, Key, Head, C>,
             ),
             &Rotation<Rotated, Chip, Rows>,
         ),
     ) -> Self::Output {
         let live = query.with(());
         let rotate = |device: &mut Device,
-                      query: &HeadValues<Rows, Slice, Query, Rotated>,
-                      key: &HeadValues<Rows, Slice, Key, Rotated>| {
+                      query: &HeadValues<Rows, Slice, Query, Rotated, C>,
+                      key: &HeadValues<Rows, KeySlice, Key, Rotated, C>| {
             RotaryEmbedding::<Query, Key, Rows>::new()
                 .forward(device, (query, key, &rotation.low, &rotation.high, live))
         };
@@ -1484,24 +1440,24 @@ struct Prefix<Head, Rotated>(PhantomData<(Head, Rotated)>);
 type Leading<Rows, Group, Head, Rotated> =
     m![{ RowGroups<Rows, Group> }, Half, { Symbol<Row<Head>> } = (Rotated / 2)];
 
-impl<Head: AxisName, Rotated: AxisName, Rows: AxisName, Slice: M, Group: AxisName>
-    crate::Op<&HeadValues<Rows, Slice, Group, Head>> for Prefix<Head, Rotated>
+impl<Head: AxisName, Rotated: AxisName, Rows: AxisName, C: M, Slice: M, Group: AxisName>
+    crate::Op<&HeadValues<Rows, Slice, Group, Head, C>> for Prefix<Head, Rotated>
 {
-    type Output = HeadValues<Rows, Slice, Group, Rotated>;
+    type Output = HeadValues<Rows, Slice, Group, Rotated, C>;
 
     fn forward(
         &self,
         device: &mut Device,
-        heads: &HeadValues<Rows, Slice, Group, Head>,
+        heads: &HeadValues<Rows, Slice, Group, Head, C>,
     ) -> Self::Output {
         const { assert!(Rotated::SIZE % 2 == 0 && Head::SIZE % Rotated::SIZE == 0) };
-        let mut leading: DmTensor<bf16, Chip, Cluster, Slice, Leading<Rows, Group, Head, Rotated>> =
+        let mut leading: DmTensor<bf16, Chip, C, Slice, Leading<Rows, Group, Head, Rotated>> =
             DmTensor::new();
         // SAFETY: a head is its two halves in order.
         unsafe {
             heads.view().reshape::<
                 Chip,
-                Cluster,
+                C,
                 Slice,
                 m![{ RowGroups<Rows, Group> }, Half, { Symbol<Row<Head>> }],
             >()
@@ -1518,30 +1474,30 @@ impl<Head: AxisName, Rotated: AxisName, Rows: AxisName, Slice: M, Group: AxisNam
     }
 }
 
-impl<Head: AxisName, Rotated: AxisName, Rows: AxisName, Slice: M, Group: AxisName>
+impl<Head: AxisName, Rotated: AxisName, Rows: AxisName, C: M, Slice: M, Group: AxisName>
     crate::Op<(
-        HeadValues<Rows, Slice, Group, Rotated>,
-        HeadValues<Rows, Slice, Group, Head>,
+        HeadValues<Rows, Slice, Group, Rotated, C>,
+        HeadValues<Rows, Slice, Group, Head, C>,
     )> for Prefix<Head, Rotated>
 {
-    type Output = HeadValues<Rows, Slice, Group, Head>;
+    type Output = HeadValues<Rows, Slice, Group, Head, C>;
 
     fn forward(
         &self,
         device: &mut Device,
         (rotated, heads): (
-            HeadValues<Rows, Slice, Group, Rotated>,
-            HeadValues<Rows, Slice, Group, Head>,
+            HeadValues<Rows, Slice, Group, Rotated, C>,
+            HeadValues<Rows, Slice, Group, Head, C>,
         ),
     ) -> Self::Output {
         // SAFETY: as the gather above, in reverse.
-        let rotated: DmTensor<bf16, Chip, Cluster, Slice, Leading<Rows, Group, Head, Rotated>> =
+        let rotated: DmTensor<bf16, Chip, C, Slice, Leading<Rows, Group, Head, Rotated>> =
             unsafe { rotated.reshape() };
         // SAFETY: a head is its two halves in order.
         let mut heads: DmTensor<
             bf16,
             Chip,
-            Cluster,
+            C,
             Slice,
             m![{ RowGroups<Rows, Group> }, Half, { Symbol<Row<Head>> }],
         > = unsafe { heads.reshape() };

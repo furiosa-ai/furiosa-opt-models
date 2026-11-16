@@ -10,7 +10,10 @@ use furiosa_opt_models::ops::normalization::Spread;
 use furiosa_opt_models::ops::pointwise::multiply::Scale;
 use furiosa_opt_models::tensor::axis::{Eight, Sixteen, SixtyFour};
 use furiosa_opt_models::tensor::live::Live;
-use furiosa_opt_models::tensor::{parallel::Chip, scalar::Value};
+use furiosa_opt_models::tensor::{
+    parallel::Chip,
+    scalar::{Copies, Value},
+};
 use furiosa_opt_std::{prelude::*, runtime::launch};
 use tokio::sync::Mutex;
 
@@ -47,7 +50,7 @@ fn count(value: usize) -> HostTensor<i32, m![1]> {
 #[device(chip = 1)]
 fn scaled_rows(
     device: &mut Device,
-    scale: &Scale<HbmTensor<f32, Chip, m![1 # 8]>>,
+    scale: &Scale<HbmTensor<f32, Chip, Copies>>,
     input: &HbmTensor<bf16, Chip, Rows>,
     (start, rows): (&Value, &Value),
     output: &mut HbmTensor<bf16, Chip, Rows>,
@@ -91,8 +94,9 @@ async fn scales_live_rows_once_rounded() {
         .map(|(at, value)| value.to_f32() * (1 << (at / Features::SIZE % 5)) as f32)
         .collect();
     for factor in [62.0, core::f32::consts::FRAC_1_SQRT_2] {
+        let packet = [factor, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let scale = Scale(
-            HostTensor::<f32, m![1 # 8]>::from_vec([factor, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            HostTensor::<f32, Copies>::from_vec(packet.repeat(<Copies as M>::SIZE / packet.len()))
                 .to_hbm(&mut device.pdma)
                 .await
                 .unwrap(),

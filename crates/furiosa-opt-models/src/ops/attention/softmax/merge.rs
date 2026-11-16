@@ -87,11 +87,11 @@ pub(crate) fn merge<
         .vector_widen_pad::<m![1 # 8]>()
         .vector_final()
         .to_vrf(&mut device.sub);
-    let weighted: DmTensor<f32, Chip, Cluster, Slices, m![{ SliceTime }, { R }, { Head }]> = device
+    device
         .main
         .begin(partials)
-        .fetch::<m![{ SliceTime }, { R }, { Head } / 8], m![{ Head } % 8]>()
-        .collect::<m![{ SliceTime }, { R }, { Head } / 8], m![{ Head } % 8]>()
+        .fetch::<m![{ R }, { Head } / 8, { SliceTime }], m![{ Head } % 8]>()
+        .collect::<m![{ R }, { Head } / 8, { SliceTime }], m![{ Head } % 8]>()
         .vector_init()
         .vector_intra_slice_tag(TagMode::Comparison([
             Cmp::Less(f32::INFINITY),
@@ -103,24 +103,12 @@ pub(crate) fn merge<
             LogicBinaryOpF32::BitAnd,
             Branched::imm(FIRST, 0.0f32).imm(SECOND, 0.0f32),
         )
-        .vector_narrow_split::<m![{ SliceTime }, { R }, { Head } / 4], m![{ Head } % 4]>()
-        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &shares)
-        .vector_widen_concat::<m![{ SliceTime }, { R }, { Head } / 8], m![{ Head } % 8]>()
-        .vector_final()
-        .commit_trim::<m![{ Head } % 8]>()
-        .commit();
-    device
-        .main
-        .begin(weighted.view())
-        .fetch::<m![{ R }, { Head } / 8, { SliceTime }], m![{ Head } % 8]>()
-        .collect::<m![{ R }, { Head } / 8, { SliceTime }], m![{ Head } % 8]>()
-        .vector_init()
-        .vector_intra_slice_tag(TagMode::Zero)
         .vector_narrow_split::<
             m![{ R }, { Head } / 8, { SliceTime }, { Head } % 8 / 4],
             m![{ Head } % 4],
         >(
         )
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &shares)
         .vector_intra_slice_reduce::<S, m![{ R }, { Head } / 4], m![{ Head } % 4]>(
             IntraSliceReduceOpF32::Add,
         )

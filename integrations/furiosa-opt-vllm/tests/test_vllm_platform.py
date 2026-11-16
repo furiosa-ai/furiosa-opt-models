@@ -1,3 +1,5 @@
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal, TypedDict, get_args
 
@@ -20,6 +22,7 @@ from vllm.config import (
     ECTransferConfig,
     KVTransferConfig,
     LoadConfig,
+    ModelConfig,
     VllmConfig,
     speculative,
 )
@@ -36,7 +39,7 @@ from vllm.v1.sample.logits_processor.builtin import MinPLogitsProcessor
 import furiosa_opt_engine as engine
 from furiosa_opt_vllm import offload
 from furiosa_opt_vllm.additional import Placement, Section
-from furiosa_opt_vllm.admission import Draft, Method, Refused, quantization
+from furiosa_opt_vllm.admission import Draft, Method, Refused, options, quantization
 from furiosa_opt_vllm.platform import FuriosaPlatform
 
 # Every speculative method vLLM names.
@@ -234,6 +237,42 @@ def test_inherits_settings(
     assert config.speculative_config is not None
     draft = Draft.parse(config, config.speculative_config, Section.parse(config))
     assert (draft.cache_dtype, draft.download_dir) == (dtype, directory)
+
+
+@dataclass(frozen=True, slots=True)
+class Chosen:
+    """The engine's load options as the choices made on them, standing in for its options, which
+    expose none."""
+
+    choices: tuple[tuple[str, tuple[object, ...]], ...] = ()
+
+    def __getattr__(self, name: str) -> "Callable[..., Chosen]":
+        return lambda *arguments: Chosen((*self.choices, (name, arguments)))
+
+
+@pytest.mark.usefixtures("platform_env")
+@pytest.mark.feature("FP8 KV cache")
+@pytest.mark.parametrize(
+    ("dtype", "named"),
+    [
+        ("auto", []),
+        ("bfloat16", [("bfloat16",)]),
+        ("fp8", [("float8_e4m3fn",)]),
+        ("fp8_e4m3", [("float8_e4m3fn",)]),
+    ],
+)
+def test_names_the_engine_its_cache_dtype(
+    dtype: CacheDType, named: list[tuple[str]], served: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The engine caches in vLLM's `--kv-cache-dtype` by the engine's dtype name; `auto` names
+    none, so the engine caches in the element the checkpoint declares."""
+    monkeypatch.setattr(engine, "LoadOptions", Chosen)
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    config.model_config = ModelConfig(model=str(served), dtype="bfloat16", skip_tokenizer_init=True)
+    config.cache_config.cache_dtype = dtype
+    chosen = options(config)
+    assert isinstance(chosen, Chosen)
+    assert [arguments for name, arguments in chosen.choices if name == "kv_cache"] == named
 
 
 @pytest.mark.usefixtures("platform_env")

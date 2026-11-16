@@ -20,7 +20,8 @@ use furiosa_opt_models::models::decoder::launch;
 use furiosa_opt_models::models::vision_language::gemma4_unified;
 use furiosa_opt_models::models::{Class, Implements};
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
-use furiosa_opt_models::tensor::memory::Hbm;
+use furiosa_opt_models::tensor::cache;
+use furiosa_opt_models::tensor::memory::{Dtype, Hbm};
 
 /// Every upstream architecture name, by family level, with the decoders that implement it; a
 /// refused name has none.
@@ -477,6 +478,7 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
         &[
             Implementation::of::<gemma4_unified::Encoder<Hbm>>(),
             Implementation::of::<gemma4::ForCausalLM>(),
+            Implementation::of::<gemma4::ForCausalLM<gemma4::Quantized, cache::Bf16>>(),
         ],
     ),
     ("Glm4vForConditionalGeneration", &[]),
@@ -797,8 +799,8 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
 ];
 
 /// A type that implements an architecture at one size: its size, its class, the scope it reads a
-/// checkpoint at, the adapters its calls run, whether they attend under `Tiling::Fixed`, and its
-/// strict load into HBM.
+/// checkpoint at, the adapters its calls run, whether they attend under `Tiling::Fixed`, the
+/// element its cache stores keys and values in, if it has one, and its strict load into HBM.
 #[derive(Debug)]
 pub struct Implementation {
     size: &'static str,
@@ -806,6 +808,7 @@ pub struct Implementation {
     scope: fn(&Checkpoint) -> Result<&'static str, LoadError>,
     adapters: usize,
     fixed: bool,
+    kv_cache: Option<Dtype>,
     load: fn(&mut Context<'_>, &Checkpoint, Tiling) -> Result<Model, LoadError>,
 }
 
@@ -836,6 +839,9 @@ pub trait Listed: Implements + for<'a> Load<&'a Checkpoint> + Sized + 'static {
     /// rows serves any tiling.
     const FIXED: bool = true;
 
+    /// The element the model's cache stores keys and values in: none for a model without one.
+    const KV_CACHE: Option<Dtype> = None;
+
     /// Refuses a load of `part`, which the type does not read.
     fn reads(part: Part) -> Result<(), LoadError>;
 
@@ -847,6 +853,7 @@ pub trait Listed: Implements + for<'a> Load<&'a Checkpoint> + Sized + 'static {
 impl<D: Implements + for<'a> Load<&'a Checkpoint> + Decoder + 'static> Listed for D {
     const ADAPTERS: usize = <D as Decoder>::ADAPTERS;
     const FIXED: bool = <D as Decoder>::FIXED;
+    const KV_CACHE: Option<Dtype> = Some(<D as Decoder>::KV_CACHE);
 
     fn reads(part: Part) -> Result<(), LoadError> {
         match part {
@@ -875,6 +882,7 @@ impl Implementation {
             },
             adapters: T::ADAPTERS,
             fixed: T::FIXED,
+            kv_cache: T::KV_CACHE,
             load: |context, source, tiling| Ok(T::load(context, source)?.served(tiling)),
         }
     }
@@ -897,11 +905,11 @@ impl Implementation {
         }
     }
 
-    /// The one of `implementations`, those listed for `name`, whose scope serves `source`, from its
-    /// config and names alone; when none serves, a lone refusal is returned as it is.
+    /// The one of `implementations`, some of those listed for `name`, whose scope serves `source`,
+    /// from its config and names alone; when none serves, a lone refusal is returned as it is.
     pub fn choose(
         name: &str,
-        implementations: &'static [Self],
+        implementations: impl IntoIterator<Item = &'static Self>,
         source: &Checkpoint,
     ) -> Result<&'static Self, LoadError> {
         let (mut served, mut refused) = (Vec::new(), Vec::new());
@@ -971,6 +979,11 @@ impl Implementation {
     /// Adapters a call of the decoder runs at most: none when its projections take none.
     pub fn adapters(&self) -> usize {
         self.adapters
+    }
+
+    /// The element its cache stores keys and values in: none for a model without one.
+    pub fn kv_cache(&self) -> Option<Dtype> {
+        self.kv_cache
     }
 }
 
@@ -1142,11 +1155,15 @@ mod tests {
                 .size(),
             "small"
         );
+        let decoded = (decoders.iter())
+            .map(|decoder| Implementation::choose(name, [decoder], &media.encoder()));
         for refused in [
             Implementation::choose(name, encoders, &media),
-            Implementation::choose(name, decoders, &media.encoder()),
             Implementation::choose("Causal", &SIZES[..1], &small.encoder()),
-        ] {
+        ]
+        .into_iter()
+        .chain(decoded)
+        {
             assert!(
                 matches!(&refused, Err(LoadError::Unsupported { name, .. }) if name == "encoder"),
                 "{refused:?}"

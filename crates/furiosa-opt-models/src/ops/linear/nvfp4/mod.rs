@@ -1,5 +1,6 @@
 //! The linear of the late NVFP4 contract of [`crate::tensor::form::nvfp4`]: a contiguous row
-//! through a [`BlockScaled`] projection, its inputs entering in the contract's input form.
+//! through a [`BlockScaled`] projection, its inputs entering in the contract's input form. The
+//! experimental summed contract's row projects in [`summed`].
 
 use super::kernel::{Contraction, Tiling};
 use super::projection::{Block, Cluster, OneRow, Partials, Reduced, Slices};
@@ -15,7 +16,10 @@ use crate::tensor::form::nvfp4::{Held, Late, Scale, Scales, W4A4, W4A16};
 use crate::tensor::memory::Memory;
 use core::borrow::Borrow;
 
+pub(crate) use summed::rows::Decodes;
+
 mod rows;
+pub(crate) mod summed;
 
 /// One contiguous feature vector.
 pub(crate) type Vector<W> = HbmTensor<bf16, Chip, m![W]>;

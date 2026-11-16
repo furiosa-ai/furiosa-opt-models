@@ -3,6 +3,7 @@
 use crate::Op;
 use crate::load::Load;
 use crate::ops::linear;
+use crate::ops::rotary::Within;
 use crate::specialize::attention::Strategy;
 use crate::tensor::cache::KeyValue;
 use crate::tensor::scalar::F32;
@@ -242,7 +243,10 @@ pub mod geometry {
 /// One slice per lane and KV head, holding the head's query rows or its key or value row of each
 /// row group; a row's key and value scatter from here, so its group stays in the element. Fewer
 /// than eight KV heads leave the slices of the absent ones empty.
-pub(super) type HeadSlice<Rows, KvHeads> = m![{ Layout<Rows>::Lanes } # 8, KvHeads # 8, 1 # 4];
+pub(super) type HeadSlice<Rows, KvHeads> = KvSlots<Layout<Rows>::Lanes, KvHeads>;
+
+/// [`HeadSlice`] of the lanes `L` and the KV heads `K`.
+type KvSlots<L, K> = m![{ L } # 8, K # 8, 1 # 4];
 
 pub(super) type RowGroups<Rows, Group> = m![{ linear::Groups<Rows> }, Group];
 
@@ -257,6 +261,57 @@ impl<Rows: AxisName, const N: usize> AxisName for TileGroups<Rows, N> {
 
 pub(crate) type Heads<Rows, KvHeads, Group, Head> =
     DmTensor<bf16, Chip, m![1 # 2], HeadSlice<Rows, KvHeads>, m![{ RowGroups<Rows, Group> }, Head]>;
+
+/// The clusters that hold a split's KV heads: two when the KV heads pair up, one otherwise.
+#[derive(Clone, Debug)]
+pub struct HeadClusters<KvHeads>(PhantomData<KvHeads>);
+
+impl<KvHeads: AxisName> AxisName for HeadClusters<KvHeads> {
+    const NAME: Ident = Ident::new("HeadClusters");
+    const SIZE: usize = if KvHeads::SIZE.is_multiple_of(2) {
+        2
+    } else {
+        1
+    };
+}
+
+/// The cluster of each KV head: their top digit when they pair up, which is the digit a
+/// projection that carves no outputs splits them over both clusters by; else cluster 0.
+pub(crate) type HeadCluster<KvHeads> =
+    m![KvHeads / (KvHeads / ({ Symbol<HeadClusters<KvHeads>> })) # 2];
+
+/// The slices of [`SplitHeads`] in each cluster, a head row a slice: a lane's 32 slices hold the
+/// `Group` heads of each of the cluster's KV heads in turn, so a pass over the rows reads one head
+/// a slice. A key or value row (`Group` of one) lies on one of its lane's query rows' slices.
+pub(crate) type ClusterSlice<Rows, KvHeads, Group> = HeadRowSlots<
+    Layout<Rows>::Lanes,
+    m![KvHeads % (KvHeads / ({ Symbol<HeadClusters<KvHeads>> }))],
+    Group,
+>;
+
+/// [`ClusterSlice`] of the lanes `L` and a cluster's KV heads `K`.
+type HeadRowSlots<L, K, Group> = m![{ L } # 8, { m![{ K }, Group] } # 32];
+
+// SAFETY: `HeadSlice`'s keys and queries share their slices.
+unsafe impl<L: M, K: AxisName> Within<KvSlots<L, K>> for KvSlots<L, K> {}
+
+// SAFETY: in `ClusterSlice` a lane's key row of KV head `h` lies on the lane's slice `h`, and the
+// lane's query rows take its first `K x Groups` slices, `h` among them.
+unsafe impl<L: M, K: M, Groups: AxisName> Within<HeadRowSlots<L, K, Groups>>
+    for HeadRowSlots<L, K, Single>
+{
+}
+
+/// The heads of each row of `Rows` with each KV head on its [`HeadCluster`] and each head row on a
+/// slice of its own ([`ClusterSlice`]): a split from the clusters a projection computed its outputs
+/// on moves each cluster's heads within it.
+pub type SplitHeads<Rows, KvHeads, Group, Head> = DmTensor<
+    bf16,
+    Chip,
+    HeadCluster<KvHeads>,
+    ClusterSlice<Rows, KvHeads, Group>,
+    m![{ RowGroups<Rows, Single> }, Head],
+>;
 
 #[cfg(test)]
 pub(crate) mod tests {

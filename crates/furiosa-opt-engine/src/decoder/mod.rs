@@ -170,6 +170,8 @@ pub trait Decoder: Send + Sync {
     const ADAPTERS: usize = 0;
     /// Whether its calls' rows also attend under `Tiling::Fixed`, beside the adaptive tiling.
     const FIXED: bool = true;
+    /// The element its cache stores keys and values in.
+    const KV_CACHE: Dtype = Dtype::BF16;
     /// What a call returns: the kept rows' token IDs, hidden values or scores.
     type Output: TryInto<HbmTensor, Error = io::Error>;
     /// The views a call borrows of a cache's layers.
@@ -414,6 +416,8 @@ pub trait Groups<R: Root> {
     const ADAPTERS: usize;
     /// Whether a call's rows also attend under `Tiling::Fixed`.
     const FIXED: bool;
+    /// The element the groups' caches store keys and values in.
+    const KV_CACHE: Dtype = Dtype::BF16;
     /// An adapter a call may run its requests with, or `Infallible` for a root that runs none.
     type Adapter: Send + Sync + 'static;
     /// The views a call borrows of a cache's layers, each group's.
@@ -582,6 +586,7 @@ where
     const OUTPUT: Output = <R::Place as Place>::OUTPUT;
     const ADAPTERS: usize = <R::Groups as Groups<R>>::ADAPTERS;
     const FIXED: bool = <R::Groups as Groups<R>>::FIXED;
+    const KV_CACHE: Dtype = <R::Groups as Groups<R>>::KV_CACHE;
     type Output = Rows<<R::Place as Place>::Scalar, R::Row>;
     type Layers = <R::Groups as Groups<R>>::Layers;
     type Adapter = <R::Groups as Groups<R>>::Adapter;

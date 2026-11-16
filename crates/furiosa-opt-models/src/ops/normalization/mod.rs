@@ -31,14 +31,7 @@ pub struct Chunk<Width>(PhantomData<Width>);
 impl<Width: AxisName> AxisName for Chunk<Width> {
     const NAME: Ident = Ident::new("Chunk");
 
-    const SIZE: usize = {
-        assert!(Width::SIZE > 0 && Width::SIZE.is_multiple_of(16));
-        let mut chunk = 16;
-        while Width::SIZE / chunk > 256 || Width::SIZE % chunk != 0 {
-            chunk += 16;
-        }
-        chunk
-    };
+    const SIZE: usize = specialize::normalization::chunk(Width::SIZE);
 }
 
 /// Feature chunks broadcast across the 256 hardware slices.

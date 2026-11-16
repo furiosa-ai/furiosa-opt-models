@@ -35,6 +35,9 @@ const SCALED: usize = 16 * 8;
 /// [`tiling`] restores, its staged copy fits a slice's data memory if any pass count [`holds`] it.
 pub(crate) const BAND: usize = 64;
 
+/// Inputs a ring of the slices carries: a row's sixteen-input packets, one a slice.
+const RING: usize = 16 * super::SLICES;
+
 /// Data memory a derived tiling's working set takes at most: fifteen pages, since the allocator
 /// leaves part of a page between them unused (measured: 469 KiB of them fit, 484 KiB do not).
 const WORKING: usize = 15 * PAGE;
@@ -757,8 +760,9 @@ const ROW_TILES: [RowTile; 22] = [
 ];
 
 /// The `(chunk, block, passes, routing)` of `(input, output)` of `bits`-bit coefficients: a listed
-/// shape's entry, else the widest legal replicated tiling of fewest passes, preferring parts of
-/// whole E2M1 scale blocks, over the fewest passes that hold a slab restored from codes, if any.
+/// shape's entry, else the [`parted`] tiling; a slab restored from E4M3 codes takes parts a band of
+/// rows fits the tensor registers beside where any is legal, so each half of the band fills one
+/// register bank while the other contracts.
 pub(crate) const fn tiling(
     input: usize,
     output: usize,
@@ -777,36 +781,117 @@ pub(crate) const fn tiling(
         }
         at += 1;
     }
+    if bits == 8
+        && let Some(tiling) = parted(input, output, bits, super::TRF / (BAND * BF16))
+    {
+        return tiling;
+    }
+    match parted(input, output, bits, input) {
+        Some(tiling) => tiling,
+        None => panic!("no contraction tiling fits these projection widths"),
+    }
+}
+
+/// The widest legal replicated tiling of fewest passes whose parts hold at most `most` inputs,
+/// preferring parts of whole E2M1 scale blocks, over the fewest passes that hold a slab restored
+/// from codes, if any; a slab restored from codes takes its rows over the ring where the ring
+/// carries all their inputs. Parts of 8-bit codes keep whole scale blocks, so whole 64-code E4M3
+/// steps, over a part digit padded to the next power of two where no power-of-two part count holds
+/// them and at most one slice in sixteen idles.
+const fn parted(
+    input: usize,
+    output: usize,
+    bits: usize,
+    most: usize,
+) -> Option<(usize, usize, usize, Routing)> {
     let mut unit = SCALED;
     loop {
         let mut passes = 1;
         while passes <= output / 8 {
-            if let Some((chunk, block, passes, routing)) = widest(input, output, passes, unit) {
-                // A BF16 slab is staged as stored; one restored from narrower codes must hold.
-                let (block, passes) = if bits < 8 * BF16 {
-                    held(input, output, (chunk, block, passes))
-                } else {
-                    (block, passes)
-                };
-                return (chunk, block, passes, routing);
+            if let Some(tiling) = widest(input, output, passes, (unit, most), false) {
+                return Some(fitted(input, output, tiling, bits));
             }
             passes += 1;
         }
-        assert!(
-            unit != 1,
-            "no contraction tiling fits these projection widths"
-        );
+        if bits == 8 && unit == SCALED {
+            let mut passes = 1;
+            while passes <= output / 8 {
+                if let Some((chunk, block, passes, routing)) =
+                    widest(input, output, passes, (unit, most), true)
+                {
+                    let (slices, active) = occupancy(input, output, (chunk, block, passes));
+                    if full(active, slices) {
+                        let (block, passes) = scaled(input, output, (chunk, block, passes));
+                        return Some(fitted(input, output, (chunk, block, passes, routing), bits));
+                    }
+                }
+                passes += 1;
+            }
+        }
+        if unit == 1 {
+            return None;
+        }
         unit = 1;
     }
 }
 
-/// The legal replicated tiling of `passes` slabs, parts a multiple of `unit` inputs, with the most
-/// active slices, then cheap row staging, then fewest parts; none if no tiling is legal.
+/// The derived `(chunk, block, passes, routing)` fitted to its weight: a BF16 slab is staged as
+/// stored, beside the replicated rows the listed tilings were timed against; one restored from
+/// codes must hold, beside rows on the ring.
+const fn fitted(
+    input: usize,
+    output: usize,
+    (chunk, block, passes, routing): (usize, usize, usize, Routing),
+    bits: usize,
+) -> (usize, usize, usize, Routing) {
+    if bits >= 8 * BF16 {
+        let block = carved(input, output, (chunk, block, passes), bits);
+        return (chunk, block, passes, routing);
+    }
+    let (block, passes) = held(input, output, (chunk, block, passes));
+    let routing = if input <= RING { Ring } else { routing };
+    let block = carved(input, output, (chunk, block, passes), bits);
+    (chunk, block, passes, routing)
+}
+
+/// The `(block, passes)` of a padded tiling of 8-bit codes: as derived, unless a block's FP32
+/// output scales take over half the vector registers, which an E4M3 contraction's epilogue holds
+/// at once; then of the fewest more passes of the same parts whose block's do not.
+const fn scaled(
+    input: usize,
+    output: usize,
+    (chunk, block, passes): (usize, usize, usize),
+) -> (usize, usize) {
+    if block * SCALE <= super::VRF / 2 {
+        return (block, passes);
+    }
+    let blocks = super::SLICES / slots(input / chunk);
+    let mut more = passes + 1;
+    while more <= output / 8 {
+        if output.is_multiple_of(2 * more) && (output / (2 * more)).is_multiple_of(blocks) {
+            let block = output / (2 * more) / blocks;
+            if block * SCALE <= super::VRF / 2
+                && legal(input, output, (chunk, block, more))
+                && holds(chunk, block, more)
+            {
+                return (block, more);
+            }
+        }
+        more += 1;
+    }
+    (block, passes)
+}
+
+/// The legal replicated tiling of `passes` slabs, parts a multiple of `unit` and at most `most`
+/// inputs, with the most active slices, then cheap row staging, then fewest parts; none if no
+/// tiling is legal. Part counts are powers of two, or, `padded`, the others, each over
+/// [`slots`] slices.
 const fn widest(
     input: usize,
     output: usize,
     passes: usize,
-    unit: usize,
+    (unit, most): (usize, usize),
+    padded: bool,
 ) -> Option<(usize, usize, usize, Routing)> {
     if !output.is_multiple_of(2 * passes) {
         return None;
@@ -816,30 +901,38 @@ const fn widest(
     let mut rank = (0, false);
     let mut parts = 1;
     while parts <= super::SLICES {
-        let mut blocks = 1;
-        while parts * blocks <= super::SLICES {
-            // A slab index shares its digit with the top, so several passes leave it one.
-            let mut top = 1;
-            while top <= if passes == 1 { super::SLICES - 1 } else { 1 } {
-                if input.is_multiple_of(parts) && half.is_multiple_of(blocks * top) {
-                    let (chunk, block) = (input / parts, half / (blocks * top));
-                    let active = parts * blocks * top;
-                    let cheap = cheap(chunk, block);
-                    if (active > rank.0 || (active == rank.0 && cheap && !rank.1))
-                        && chunk.is_multiple_of(unit)
-                        && legal(input, output, (chunk, block, passes))
-                    {
-                        rank = (active, cheap);
-                        best = Some((chunk, block, passes, Replicated));
+        if parts.is_power_of_two() != padded {
+            let mut blocks = 1;
+            while slots(parts) * blocks <= super::SLICES {
+                // A slab index shares its digit with the top, so several passes leave it one.
+                let mut top = 1;
+                while top <= if passes == 1 { super::SLICES - 1 } else { 1 } {
+                    if input.is_multiple_of(parts) && half.is_multiple_of(blocks * top) {
+                        let (chunk, block) = (input / parts, half / (blocks * top));
+                        let active = parts * blocks * top;
+                        let cheap = cheap(chunk, block);
+                        if (active > rank.0 || (active == rank.0 && cheap && !rank.1))
+                            && chunk.is_multiple_of(unit)
+                            && chunk <= most
+                            && legal(input, output, (chunk, block, passes))
+                        {
+                            rank = (active, cheap);
+                            best = Some((chunk, block, passes, Replicated));
+                        }
                     }
+                    top += 2;
                 }
-                top += 2;
+                blocks *= 2;
             }
-            blocks *= 2;
         }
-        parts *= 2;
+        parts += 1;
     }
     best
+}
+
+/// Slices a contraction's `parts` parts take: the next power of two, the rest idle.
+pub(crate) const fn slots(parts: usize) -> usize {
+    parts.next_power_of_two()
 }
 
 /// Whether a part's eight-lane fill ping-pongs in half the tensor registers and a band of staged
@@ -862,7 +955,7 @@ const fn held(
     while more <= output / 8 {
         if output.is_multiple_of(2 * more) {
             let half = output / (2 * more);
-            let mut blocks = super::SLICES / (input / chunk);
+            let mut blocks = super::SLICES / slots(input / chunk);
             while blocks > 0
                 && !(half.is_multiple_of(blocks)
                     && legal(input, output, (chunk, half / blocks, more)))
@@ -878,6 +971,90 @@ const fn held(
     // No pass count holds a band beside a restoration, so the budget cannot choose one; fewer
     // staged rows may still fit the derived tiling.
     (block, passes)
+}
+
+/// The block of the derived `(chunk, block, passes)`, the outputs' odd factor carved as the top
+/// digit where that leaves whole feature chunks over the same slices, at most one in sixteen idle,
+/// and a slab of `bits`-bit codes still restores beside its rows: its sums reach the slices whole.
+const fn carved(
+    input: usize,
+    output: usize,
+    (chunk, block, passes): (usize, usize, usize),
+    bits: usize,
+) -> usize {
+    let feature = super::normalization::chunk(output);
+    if whole(block, feature) {
+        return block;
+    }
+    let (slices, _) = occupancy(input, output, (chunk, block, passes));
+    let half = output / (2 * passes);
+    let mut best = (0, block);
+    let mut blocks = 1;
+    while blocks <= super::SLICES {
+        let mut top = 1;
+        while top <= if passes == 1 { super::SLICES - 1 } else { 1 } {
+            if half.is_multiple_of(blocks * top) {
+                let carved = half / (blocks * top);
+                let (filled, active) = occupancy(input, output, (chunk, carved, passes));
+                if whole(carved, feature)
+                    && legal(input, output, (chunk, carved, passes))
+                    && filled == slices
+                    && full(active, slices)
+                    && active > best.0
+                    && (bits >= 8 * BF16 || holds(chunk, carved, passes))
+                {
+                    best = (active, carved);
+                }
+            }
+            top += 2;
+        }
+        blocks *= 2;
+    }
+    best.1
+}
+
+/// Output rows each owner of a summed projection holds when a cluster's half of `output` outputs
+/// splits over the owners of `parts` input parts: the even share, or where that is no whole number
+/// of `grain` outputs nor a divisor of one, the next that is, if at most one owner in sixteen idles.
+pub(crate) const fn owned(output: usize, parts: usize, grain: usize) -> usize {
+    let half = output / 2;
+    let seats = super::SLICES / parts;
+    let even = half / seats;
+    let mut rows = even;
+    while !whole(rows, grain) || !half.is_multiple_of(rows) {
+        rows += 4;
+        if !full(half / rows, seats) {
+            return even;
+        }
+    }
+    rows
+}
+
+/// Whether `block` outputs are a whole number of feature chunks of `feature` outputs or divide one.
+const fn whole(block: usize, feature: usize) -> bool {
+    block.is_multiple_of(feature) || feature.is_multiple_of(block)
+}
+
+/// Whether `active` of `slices` slices leave at most one in sixteen idle, the price a carving into
+/// whole feature chunks may pay.
+const fn full(active: usize, slices: usize) -> bool {
+    16 * active >= 15 * slices
+}
+
+/// The slices `(chunk, block, passes)` takes, its top digit and its parts padded, and the active
+/// ones.
+const fn occupancy(
+    input: usize,
+    output: usize,
+    (chunk, block, passes): (usize, usize, usize),
+) -> (usize, usize) {
+    let top = odd(output / (2 * passes * block));
+    let blocks = output / (2 * passes * block * top);
+    let parts = input / chunk;
+    (
+        blocks * slots(parts) * top.next_power_of_two(),
+        blocks * parts * top,
+    )
 }
 
 /// Whether a slice holds `(chunk, block, passes)` while it restores a slab beside a band of staged
@@ -906,7 +1083,8 @@ pub(crate) const fn legal(
         return false;
     }
     let top = odd(output / (2 * passes * block));
-    let slices = output / (2 * passes * block * top) * (input / chunk) * top.next_power_of_two();
+    let slices =
+        output / (2 * passes * block * top) * slots(input / chunk) * top.next_power_of_two();
     (top == 1 || passes == 1)
         && super::SLICES.is_multiple_of(slices)
         && LANES * chunk * 2 <= super::TRF
@@ -932,12 +1110,12 @@ pub(crate) const fn batch(rows: usize, inputs: usize, lanes: usize) -> usize {
     batch
 }
 
-/// Output rows of a block of `block` rows one restoration scales: a power of two dividing the
-/// block, at most 64, so their FP32 scales take at most 2 KiB of the VRF.
+/// Output rows of a block of `block` rows one restoration scales: the most dividing the block, at
+/// most 64, so their FP32 scales take at most 2 KiB of the VRF.
 pub(crate) const fn restored(block: usize) -> usize {
     let mut rows = 64;
     while !block.is_multiple_of(rows) {
-        rows /= 2;
+        rows -= 1;
     }
     rows
 }

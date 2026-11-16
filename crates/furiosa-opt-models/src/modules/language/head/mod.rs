@@ -8,7 +8,7 @@ use crate::ops::index::gather::{self, Rows};
 use crate::ops::index::scatter::Store;
 use crate::ops::linear::affine::{self, COLUMNS, Weights};
 use crate::ops::linear::stream::{Columns, Logits, ToDm};
-use crate::ops::linear::{Affine, Bias, Biased};
+use crate::ops::linear::{self, Affine, Bias, Biased};
 use crate::ops::normalization::span::Span;
 use crate::ops::normalization::{Blocked, Spread};
 use crate::ops::pointwise::activation::Softcap;
@@ -275,13 +275,13 @@ impl<H: AxisName, V: AxisName, Head, Select, Bound> Greedy<H, V, Head, Select, B
 }
 
 /// A greedy head with its bias and the argmax's indices in data memory, where each call's passes
-/// read them, and its cap borrowed.
-pub(crate) type InDm<'a, H, V, C> =
-    Greedy<H, V, Streamed<'a, H, V>, Argmax<V, Chip, Columns<H, V, i32>>, &'a C>;
+/// read them, its weight `W` and its cap borrowed.
+pub(crate) type InDm<'a, H, V, W, C> =
+    Greedy<H, V, Streamed<'a, H, V, W>, Argmax<V, Chip, Columns<H, V, i32>>, &'a C>;
 
-/// A greedy head's projection as a call's passes stream it: its weight in HBM, its bias in data
-/// memory.
-type Streamed<'a, H, V> = Affine<&'a HbmTensor<bf16, Chip, m![V, H]>, Columns<H, V, f32>>;
+/// A greedy head's projection as a call's passes stream it: its weight table `W` in HBM, its bias
+/// in data memory.
+type Streamed<'a, H, V, W> = Affine<&'a W, Columns<H, V, f32>>;
 
 /// A greedy head whose projection's weight, bias and argmax ranks are held as `W`, `B` and `I`:
 /// HBM tensors, or borrows of them in a borrowed tree; `C` caps its logits.
@@ -292,16 +292,16 @@ const CAP: &str = "final_logit_softcapping";
 
 impl<H: AxisName, V: AxisName, W, B, I, C> Tree<H, V, W, B, I, C>
 where
-    W: Borrow<HbmTensor<bf16, Chip, m![V, H]>>,
+    W: linear::Table<Chip, Hidden = H, Vocabulary = V>,
     B: Borrow<HbmTensor<f32, Chip, m![V]>>,
     I: Borrow<HbmTensor<i32, Chip, m![V]>>,
 {
     /// This head with its bias and indices written in data memory.
-    pub(crate) fn to_dm(&self, device: &mut Device) -> InDm<'_, H, V, C> {
+    pub(crate) fn to_dm(&self, device: &mut Device) -> InDm<'_, H, V, W, C> {
         let columns = ToDm::<H>(PhantomData);
         Greedy::new(
             Affine::new(
-                self.head.weight.borrow(),
+                &self.head.weight,
                 columns.forward(&mut *device, (), &mut (), self.head.bias.borrow()),
             ),
             self.argmax.to_dm(device),
@@ -431,9 +431,10 @@ where
 
 /// Each row's token: the projection's logits, through the cap, reach the argmax's candidates a
 /// pass at a time; every row of the envelope is projected.
-impl<H: AxisName, V: AxisName, R: AxisName, C, Env: Copy> Module<&Spread<H, R>, Env, &mut ()>
-    for InDm<'_, H, V, C>
+impl<H: AxisName, V: AxisName, R: AxisName, W, C, Env: Copy> Module<&Spread<H, R>, Env, &mut ()>
+    for InDm<'_, H, V, W, C>
 where
+    W: linear::Table<Chip, Hidden = H, Vocabulary = V>,
     C: Cap<H, V>,
 {
     type Output = reduction::Selected<R>;
@@ -461,19 +462,19 @@ where
 /// through the head's cap.
 pub(crate) trait Cap<H: AxisName, V: AxisName> {
     /// Every pass's logits of `projection`'s input rows, capped, into `push` with the pass.
-    fn project<R: AxisName>(
+    fn project<R: AxisName, W: linear::Table<Chip, Hidden = H, Vocabulary = V>>(
         &self,
         device: &mut Device,
-        projection: (&Streamed<'_, H, V>, &Spread<H, R>),
+        projection: (&Streamed<'_, H, V, W>, &Spread<H, R>),
         push: impl FnMut(&mut Device, &Logits<H, V, R>, usize),
     );
 }
 
 impl<H: AxisName, V: AxisName> Cap<H, V> for () {
-    fn project<R: AxisName>(
+    fn project<R: AxisName, W: linear::Table<Chip, Hidden = H, Vocabulary = V>>(
         &self,
         device: &mut Device,
-        (head, input): (&Streamed<'_, H, V>, &Spread<H, R>),
+        (head, input): (&Streamed<'_, H, V, W>, &Spread<H, R>),
         push: impl FnMut(&mut Device, &Logits<H, V, R>, usize),
     ) {
         crate::Op::forward(head, device, (input, push));
@@ -486,10 +487,10 @@ impl<H: AxisName, V: AxisName, F> Cap<H, V> for Softcap<F>
 where
     F: Borrow<HbmTensor<f32, Chip, m![1 # 8]>>,
 {
-    fn project<R: AxisName>(
+    fn project<R: AxisName, W: linear::Table<Chip, Hidden = H, Vocabulary = V>>(
         &self,
         device: &mut Device,
-        (head, input): (&Streamed<'_, H, V>, &Spread<H, R>),
+        (head, input): (&Streamed<'_, H, V, W>, &Spread<H, R>),
         mut push: impl FnMut(&mut Device, &Logits<H, V, R>, usize),
     ) {
         let cap = self.to_vrf::<H, V, Chip>(&mut *device);
@@ -504,7 +505,7 @@ where
 impl<H: AxisName, V: AxisName, R: AxisName, W, B, I, C, Env: Copy>
     Module<&mut Rows<'_, bf16, H, R>, Env, &mut ()> for Tree<H, V, W, B, I, C>
 where
-    W: Borrow<HbmTensor<bf16, Chip, m![V, H]>>,
+    W: linear::Table<Chip, Hidden = H, Vocabulary = V>,
     B: Borrow<HbmTensor<f32, Chip, m![V]>>,
     I: Borrow<HbmTensor<i32, Chip, m![V]>>,
     C: Cap<H, V>,

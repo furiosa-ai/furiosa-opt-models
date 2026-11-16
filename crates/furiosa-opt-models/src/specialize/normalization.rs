@@ -15,6 +15,17 @@ const OPERAND: usize = 32;
 /// VRF bytes a pass with register operands keeps for its register cache.
 const CACHE: usize = 1024;
 
+/// Features of a row one feature slice holds: the smallest multiple of 16 that divides `width`
+/// into at most 256 slices.
+pub(crate) const fn chunk(width: usize) -> usize {
+    assert!(width > 0 && width.is_multiple_of(16));
+    let mut chunk = 16;
+    while width / chunk > 256 || !width.is_multiple_of(chunk) {
+        chunk += 16;
+    }
+    chunk
+}
+
 /// Rows per tile when tiles alternate, so two inverses fit beside the gain of `E` features and
 /// the operand.
 pub(crate) const fn capacity<E: M>() -> usize {

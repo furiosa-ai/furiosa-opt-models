@@ -3,6 +3,8 @@
 //! attention reads.
 //!
 //! - Live rows start anywhere in the envelope; each turns by its own envelope row's rotation.
+//! - The projections quantize each live row to E4M3 under a scale of its own, as the checkpoint
+//!   declares their inputs.
 //! - The rotated coordinates of a live row are the products of its normalized heads in FP32
 //!   rounded once; every row's other coordinates keep the normalized heads' bits.
 
@@ -13,9 +15,10 @@ use furiosa_opt_models::load::Checkpoint;
 use furiosa_opt_models::models::decoder::Attention;
 use furiosa_opt_models::models::decoder::attention::gemma4::{self, full};
 use furiosa_opt_models::modules::{attention, language, transformer};
+use furiosa_opt_models::ops::attention::SplitHeads;
 use furiosa_opt_models::ops::normalization::Spread;
 use furiosa_opt_models::ops::rotary::{PairFrequencies, Rotation};
-use furiosa_opt_models::tensor::axis::{self, Lanes, Single};
+use furiosa_opt_models::tensor::axis::{self, Single};
 use furiosa_opt_models::tensor::live::Live;
 use furiosa_opt_models::tensor::memory::Hbm;
 use furiosa_opt_models::tensor::parallel::Chip;
@@ -57,17 +60,8 @@ type Catalog = gemma4::Catalog<gemma4::Quantized, bf16, Hbm>;
 type Qkv = <Catalog as FullLayers>::Qkv;
 type Position = <Catalog as FullLayers>::Position;
 
-/// `Group` heads of each key/value head on every live row, as attention reads them.
-type HeadRows<Group> = Live<
-    DmTensor<
-        bf16,
-        Chip,
-        m![1 # 2],
-        m![Rows % ({ Symbol<Lanes<Rows>> }) # 8, Heads # 8, 1 # 4],
-        m![{ m![Rows / ({ Symbol<Lanes<Rows>> }), Group] }, Head],
-    >,
-    Rows,
->;
+/// `Group` heads of each key/value head on every live row, as the projections' split leaves them.
+type HeadRows<Group> = Live<SplitHeads<Rows, Heads, Group, Head>, Rows>;
 
 type QueryRows = m![Rows, Heads, Groups, Head];
 type KeyRows = m![Rows, Heads, Head];
@@ -121,8 +115,8 @@ fn from_hidden(
         Live::<(), Rows>::all().subrange(start.extent::<m![Rows]>(), rows.extent::<m![Rows]>());
     let hidden: Live<Spread<Hidden, Rows, Chip>, Rows> = live.with(hidden.to_dm(&mut device.tdma));
     let projection = &stage.0.projection;
-    let query = Module::forward(&projection.query, &mut *device, (), &mut ((), ()), &hidden);
-    let key = Module::forward(&projection.key, &mut *device, (), &mut ((), ()), &hidden);
+    let query = Module::forward(&projection.query, &mut *device, (), &mut (), &hidden);
+    let key = Module::forward(&projection.key, &mut *device, (), &mut (), &hidden);
     position(device, stage, (query, key), rotation)
 }
 
@@ -184,17 +178,24 @@ fn checkpoint() -> Checkpoint {
     checkpoint
 }
 
-/// Row `row`'s first `channels` projected features on the host, rounded to BF16 once.
+/// Row `row`'s first `channels` projected features on the host, as the catalog's projections
+/// quantize their inputs: the row in E4M3 under its largest magnitude over 448 rounded once to
+/// BF16, each sum in FP64 times that scale and the channel's, rounded to BF16.
 fn project(row: usize, channels: usize) -> Vec<bf16> {
     let input: Vec<f32> = (0..Hidden::SIZE)
         .map(|column| bf16::from_f32(feature(row, column)).to_f32())
         .collect();
+    let largest = input.iter().map(|x| x.abs()).fold(0.0, f32::max);
+    let row_scale = bf16::from_f32(largest / 448.0).to_f32();
+    let codes: Vec<f64> = (input.iter())
+        .map(|x| f64::from(f8e4m3::from_f32((x / row_scale).clamp(-448.0, 448.0)).to_f32()))
+        .collect();
     (0..channels)
         .map(|channel| {
-            let dot: f32 = (input.iter().enumerate())
-                .map(|(column, x)| x * code(channel, column))
+            let dot: f64 = (codes.iter().enumerate())
+                .map(|(column, x)| x * f64::from(code(channel, column)))
                 .sum();
-            bf16::from_f32(dot * scale(channel))
+            bf16::from_f32((dot * f64::from(row_scale) * f64::from(scale(channel))) as f32)
         })
         .collect()
 }

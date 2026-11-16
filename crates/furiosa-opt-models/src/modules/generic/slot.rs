@@ -6,7 +6,7 @@ use crate::load::Named;
 use crate::modules::attention::{NormalizedQkv, Positioned, Projection};
 use crate::modules::parallel::RowParallel;
 use crate::modules::residual::Sum;
-use crate::ops::linear::{Affine, fp8::TensorScaled};
+use crate::ops::linear::{Affine, Native, fp8::TensorScaled};
 use crate::ops::normalization::{RmsNorm, UnitRmsNorm};
 use crate::ops::pointwise::{activation::NewGelu, multiply::Multiply};
 use crate::tensor::form::BlockScaled;
@@ -74,6 +74,10 @@ impl<L, P: Parallelism> Slot for RowParallel<L, P> {
 // # Ops
 
 impl<Matrix, Offset> Slot for Affine<Matrix, Offset> {
+    type Empty = ();
+}
+
+impl<W, View> Slot for Native<W, View> {
     type Empty = ();
 }
 

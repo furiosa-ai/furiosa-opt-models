@@ -136,7 +136,7 @@
         "weights": ["NVFP4 MLP", "FP8 attention"],
         "activations": ["NVFP4 MLP", "Dynamic FP8 attention"]
       },
-      "serve": ["--language-model-only", "--max-model-len", "-1"],
+      "serve": ["--language-model-only", "--kv-cache-dtype", "fp8_e4m3", "--max-model-len", "-1"],
       "download": ["*.json", "*.safetensors", "*.model", "*.jinja"]
     }
   ]

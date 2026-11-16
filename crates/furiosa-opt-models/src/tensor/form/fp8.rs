@@ -30,6 +30,12 @@ pub const GROUP: usize = Group::SIZE;
 #[derive(Clone, Copy, Default, DeviceSend, Load)]
 pub struct Block;
 
+/// Each row's inputs quantize at run time to E4M3 under one scale, the row's largest magnitude
+/// over the largest E4M3 value rounded once to BF16; each FP32 sum of the row takes that scale,
+/// then its output row's weight scale, before it rounds.
+#[derive(Clone, Copy, Default, DeviceSend, Load)]
+pub struct Token;
+
 /// One FP32 weight scale per four output rows and 128 inputs, in [output, input] order, with the
 /// blocks of each input half padded to an even count: a checkpoint's 128 x 128 block scale repeats
 /// over the 32 four-row tiles of its block.

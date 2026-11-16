@@ -6,6 +6,8 @@
 //!   last layer, each tile's rows back in the home.
 //! - A period's last edge leads to the next period's first layer; the last period, peeled, ends in
 //!   the final norm instead.
+//! - A run of a period's edges that each lead to the next layer of the same collection rolls too:
+//!   one device loop over the run's layers, as those edges differ only in their layers' indices.
 //! - Each group's layers share its places: a layer stores into them once the group's previous
 //!   attention read them.
 //! - A causal model over such collections launches once a call: each group's context prepared from
@@ -18,10 +20,12 @@ use crate::models::decoder::attention::{ForCausalLM, Geometry, Model};
 use crate::models::decoder::{self, launch::interleaved};
 use crate::modules::attention;
 use crate::modules::language::{Backbone, Cap, Greedy, Normalized};
-use crate::ops::attention::gqa::Pages;
+use crate::ops::attention::gqa::{Counted, Pages};
 use crate::ops::embedding::Ids;
 use crate::ops::index::gather::Gather;
-use crate::ops::linear::Affine;
+use crate::ops::index::scatter::Store;
+use crate::ops::index::table::Call;
+use crate::ops::linear::{self, Affine};
 use crate::ops::normalization::{RowMajor, Spread};
 use crate::ops::reduction::Argmax;
 use crate::ops::rotary::Rotation;
@@ -56,6 +60,7 @@ impl<
     H,
     LX,
     LY,
+    K,
     const FIRST: usize,
     const SECOND: usize,
     const ORDER: &'static [Branch],
@@ -81,10 +86,33 @@ where
     RB: AxisName,
     CX: Copy,
     CY: Copy,
+    K: Default,
     T: Copy,
     U: Copy,
-    X: Cut<A, CX, T, Rows = W, Envelope = E, Tile = Tl, Reach = RA, Home = H, Landed = LX>,
-    Y: Cut<B, CY, U, Rows = W, Envelope = E, Tile = Tl, Reach = RB, Home = H, Landed = LY>,
+    X: Cut<
+            A,
+            CX,
+            T,
+            Rows = W,
+            Envelope = E,
+            Tile = Tl,
+            Reach = RA,
+            Home = H,
+            Landed = LX,
+            Ahead = K,
+        >,
+    Y: Cut<
+            B,
+            CY,
+            U,
+            Rows = W,
+            Envelope = E,
+            Tile = Tl,
+            Reach = RB,
+            Home = H,
+            Landed = LY,
+            Ahead = K,
+        >,
     Named<"norm", F>: for<'r, 'x> Module<&'r Live<W, E>, (), &'x mut (), Output = Live<W, E>>,
 {
     type Output = ();
@@ -101,47 +129,72 @@ where
     ) {
         let (interleave, norm) = self.0;
         let (first, second) = &interleave.layers;
-        let (positions, period, groups, counts) = const {
+        let (positions, period, groups, counts, runs) = const {
             let order = Order::<FIRST, SECOND>::new(ORDER);
             (
                 order.positions.0,
                 order.period,
                 ORDER.len() / order.period,
                 order.counts,
+                runs::<FIRST, SECOND>(ORDER, order.period),
             )
         };
         // Whether a period starts with a layer of the first collection.
         let leads = counts[0] > 0 && positions[0] == 0;
+        let mut ahead = K::default();
         // The first layer's start over every tile.
         macro_rules! starts {
             ($layer:expr, $call:expr, $places:expr, $slot:expr) => {{
                 let mut slot = $slot;
                 for at in 0..live.count::<Tl>() {
                     let tile = live.tile::<Tl>(at);
-                    let state = (&mut $places.stored, &mut slot);
-                    let rows = Tokenwise(&*home, $layer).forward(&mut *device, $call, state, tile);
+                    let state = (&mut $places.stored, ahead, &mut slot);
+                    let work = Tokenwise(&*home, $layer);
+                    let (rows, landed) = work.forward(&mut *device, $call, state, tile);
+                    ahead = landed;
                     $layer.spill(&mut *device, home, rows.with(rows.value()));
                 }
             }};
         }
-        // Tile by tile, a layer's end from its attention and the next part's start.
+        // Tile by tile, a layer's end from its attention and the next part's start; `$ahead` takes
+        // what the next part landed ahead, carried by value so its value before is dead once read.
         macro_rules! edge {
-            ($layer:expr, $places:expr, $landed:expr, $work:expr, $call:expr, $state:expr) => {{
+            (
+                $layer:expr, $places:expr, $landed:expr, $work:expr, $call:expr, $state:expr
+                $(, $ahead:ident)?
+            ) => {{
                 for at in 0..live.count::<Tl>() {
                     let tile = live.tile::<Tl>(at);
                     let input = tile.with($layer.fill(&mut *device, home, tile));
                     let output = (tile.with(&$places.attended), &mut $landed);
                     let rows = $work.forward(&mut *device, $call, $state, (output, input));
+                    $(let (rows, landed) = rows; $ahead = landed;)?
                     $layer.spill(&mut *device, home, rows.with(rows.value()));
                 }
             }};
+        }
+        // `$body` for each edge of a run of `$run`, `$step` its place in the run: a device loop
+        // over a run of two or more.
+        macro_rules! roll {
+            ($run:expr, $step:ident, $body:block) => {
+                match $run > 1 {
+                    true => {
+                        for $step in 0..$run $body
+                    }
+                    false => {
+                        let $step = 0;
+                        $body
+                    }
+                }
+            };
         }
         match leads {
             true => starts!(&first[0], cx, pa, sa[0].1),
             false => starts!(&second[0], cy, pb, sb[0].1),
         }
-        let mut period_of = |group: usize, last: bool| {
-            let (mut a, mut b) = (0, 0);
+        let mut period_of = |group: usize, last: bool, mut ahead: K| {
+            // The end of the last run, whose device loop ran the edges before it.
+            let (mut a, mut b, mut end) = (0, 0, 0);
             #[unroll]
             for offset in 0..period {
                 let current = a < counts[0] && positions[a] == offset;
@@ -158,87 +211,137 @@ where
                     true => ((group + 1) * counts[0], (group + 1) * counts[1]),
                     false => (group * counts[0] + na, group * counts[1] + nb),
                 };
-                match current {
-                    true => {
-                        let index = group * counts[0] + a;
-                        let layer = &first[index];
-                        let attend = (&mut sa[index].0, live);
-                        let mut landed = layer.attend(&mut *device, cx, attend, pa);
-                        let mut slot = sa[index].1;
-                        if wraps && last {
-                            edge!(layer, pa, landed, Tokenwise(layer, norm), cx, &mut slot);
-                        } else if next {
-                            let mut following = sa[ja].1;
-                            let work = Tokenwise(layer, &first[ja]);
-                            edge!(
-                                layer,
-                                pa,
-                                landed,
-                                work,
-                                (cx, cx),
-                                (&mut pa.stored, (&mut slot, &mut following))
-                            );
-                        } else {
-                            let mut following = sb[jb].1;
-                            let work = Tokenwise(layer, &second[jb]);
-                            edge!(
-                                layer,
-                                pa,
-                                landed,
-                                work,
-                                (cx, cy),
-                                (&mut pb.stored, (&mut slot, &mut following))
-                            );
-                        }
+                let run = match current {
+                    true => runs.0[a],
+                    false => runs.1[b],
+                };
+                // The last period's last edge leads to the final norm, outside any run.
+                let run = match last && offset + run == period {
+                    true => run - 1,
+                    false => run,
+                };
+                if offset >= end {
+                    match current {
+                        true => roll!(run, step, {
+                            let index = group * counts[0] + a + step;
+                            let layer = &first[index];
+                            let attend = (&mut sa[index].0, live);
+                            let mut landed = layer.attend(&mut *device, cx, attend, pa, &ahead);
+                            let mut slot = sa[index].1;
+                            if wraps && last {
+                                let work = Tokenwise(layer, norm);
+                                edge!(layer, pa, landed, work, cx, (&ahead, &mut slot));
+                            } else if next {
+                                let mut following = sa[index + 1].1;
+                                let work = Tokenwise(layer, &first[index + 1]);
+                                edge!(
+                                    layer,
+                                    pa,
+                                    landed,
+                                    work,
+                                    (cx, cx),
+                                    (&mut pa.stored, ahead, (&mut slot, &mut following)),
+                                    ahead
+                                );
+                            } else {
+                                let mut following = sb[jb].1;
+                                let work = Tokenwise(layer, &second[jb]);
+                                edge!(
+                                    layer,
+                                    pa,
+                                    landed,
+                                    work,
+                                    (cx, cy),
+                                    (&mut pb.stored, ahead, (&mut slot, &mut following)),
+                                    ahead
+                                );
+                            }
+                        }),
+                        false => roll!(run, step, {
+                            let index = group * counts[1] + b + step;
+                            let layer = &second[index];
+                            let attend = (&mut sb[index].0, live);
+                            let mut landed = layer.attend(&mut *device, cy, attend, pb, &ahead);
+                            let mut slot = sb[index].1;
+                            if wraps && last {
+                                let work = Tokenwise(layer, norm);
+                                edge!(layer, pb, landed, work, cy, (&ahead, &mut slot));
+                            } else if next {
+                                let mut following = sa[ja].1;
+                                let work = Tokenwise(layer, &first[ja]);
+                                edge!(
+                                    layer,
+                                    pb,
+                                    landed,
+                                    work,
+                                    (cy, cx),
+                                    (&mut pa.stored, ahead, (&mut slot, &mut following)),
+                                    ahead
+                                );
+                            } else {
+                                let mut following = sb[index + 1].1;
+                                let work = Tokenwise(layer, &second[index + 1]);
+                                edge!(
+                                    layer,
+                                    pb,
+                                    landed,
+                                    work,
+                                    (cy, cy),
+                                    (&mut pb.stored, ahead, (&mut slot, &mut following)),
+                                    ahead
+                                );
+                            }
+                        }),
                     }
-                    false => {
-                        let index = group * counts[1] + b;
-                        let layer = &second[index];
-                        let attend = (&mut sb[index].0, live);
-                        let mut landed = layer.attend(&mut *device, cy, attend, pb);
-                        let mut slot = sb[index].1;
-                        if wraps && last {
-                            edge!(layer, pb, landed, Tokenwise(layer, norm), cy, &mut slot);
-                        } else if next {
-                            let mut following = sa[ja].1;
-                            let work = Tokenwise(layer, &first[ja]);
-                            edge!(
-                                layer,
-                                pb,
-                                landed,
-                                work,
-                                (cy, cx),
-                                (&mut pa.stored, (&mut slot, &mut following))
-                            );
-                        } else {
-                            let mut following = sb[jb].1;
-                            let work = Tokenwise(layer, &second[jb]);
-                            edge!(
-                                layer,
-                                pb,
-                                landed,
-                                work,
-                                (cy, cy),
-                                (&mut pb.stored, (&mut slot, &mut following))
-                            );
-                        }
-                    }
+                    end = offset + run;
                 }
                 (a, b) = (na, nb);
             }
+            ahead
         };
         for group in 0..groups - 1 {
-            period_of(group, false);
+            ahead = period_of(group, false, ahead);
         }
-        period_of(groups - 1, true);
+        period_of(groups - 1, true, ahead);
     }
+}
+
+/// Each layer's run in a period of `order`, the first collection's layers and then the second's,
+/// each in storage order: how many edges from the layer on each lead to the next layer of the same
+/// collection, the period's last edge to the next period's first layer.
+const fn runs<const FIRST: usize, const SECOND: usize>(
+    order: &[Branch],
+    period: usize,
+) -> ([usize; FIRST], [usize; SECOND]) {
+    let mut runs = ([0; FIRST], [0; SECOND]);
+    let (mut offset, mut a, mut b) = (0, 0, 0);
+    while offset < period {
+        let mut run = 0;
+        while offset + run < period
+            && order[offset + run] as usize == order[(offset + run + 1) % period] as usize
+        {
+            run += 1;
+        }
+        match order[offset] {
+            Branch::First => {
+                runs.0[a] = run;
+                a += 1;
+            }
+            _ => {
+                runs.1[b] = run;
+                b += 1;
+            }
+        }
+        offset += 1;
+    }
+    runs
 }
 
 /// A call's context of `R` rows in group `A`: their rotation, write slots and pages.
 type Context<A, R> = attention::Context<
     Rotation<<A as decoder::Attention>::Rotated, Chip, R>,
     HbmTensor<i32, Chip, m![R]>,
-    Pages<R, <A as decoder::Attention>::Windows, Chip>,
+    Pages<R, <A as decoder::Attention>::Windows, Chip, Counted<R>>,
 >;
 
 /// A launch's `R` rows of `Hidden` features in HBM, where a tile of them waits between two
@@ -297,18 +400,24 @@ where
     B: decoder::Attention<Rotated: AxisName>,
     R: AxisName,
     V: AxisName,
-    W: Borrow<HbmTensor<bf16, Chip, m![V, Hidden]>>,
+    W: linear::Table<Chip, Hidden = Hidden, Vocabulary = V>,
     Bias: Borrow<HbmTensor<f32, Chip, m![V]>>,
     I: Borrow<HbmTensor<i32, Chip, m![V]>>,
     C: Cap<Hidden, V>,
-    decoder::Paging<A, R>: for<'x> Module<
-            (Live<(), R>, &'x mut interleaved::History<R, A>),
+    decoder::Paging<A, R>: for<'x, 'c> Module<
+            (
+                Live<(), R>,
+                (&'c Call<R>, &'x mut interleaved::History<R, A>),
+            ),
             (),
             &'x mut (),
             Output = Context<A, R>,
         >,
-    decoder::Paging<B, R>: for<'x> Module<
-            (Live<(), R>, &'x mut interleaved::History<R, B>),
+    decoder::Paging<B, R>: for<'x, 'c> Module<
+            (
+                Live<(), R>,
+                (&'c Call<R>, &'x mut interleaved::History<R, B>),
+            ),
             (),
             &'x mut (),
             Output = Context<B, R>,
@@ -344,14 +453,19 @@ where
         let live = Live::<(), R>::read(&input.count);
         let (a, b, returned) = &mut input.cache;
         let rotary = &self.model.rotary_emb;
+        // Both groups' histories hold the call's rows: derived once, from the first.
+        let call = crate::Op::forward(&rotary.0.derive, &mut *device, &a.1.segments);
         let contexts = (
-            rotary.0.forward(&mut *device, (), &mut (), (live, a)),
-            rotary.1.forward(&mut *device, (), &mut (), (live, b)),
+            rotary
+                .0
+                .forward(&mut *device, (), &mut (), (live, (&call, &mut *a))),
+            rotary
+                .1
+                .forward(&mut *device, (), &mut (), (live, (&call, &mut *b))),
         );
         let Then(Backbone { embedding, body }, norm) = &self.model.body;
         let embedded = embedding.forward(&mut *device, (), &mut ((), ()), (&input.tokens, live));
-        let mut home: Home<Hidden, R> = HbmTensor::new();
-        (embedded.value().view()).to_hbm_view(&mut device.tdma, home.view_mut());
+        let mut home: Home<Hidden, R> = crate::Op::forward(&Store, &mut *device, &embedded);
         let mut places = (
             (Places::<A, R>::new(), first),
             (Places::<B, R>::new(), second),
@@ -359,7 +473,7 @@ where
         let call = (&contexts.0, &contexts.1);
         Decoder((body, norm)).forward(&mut *device, call, &mut places, (&mut home, live));
         let rows: HbmTensor<bf16, Chip, m![R, Hidden]> =
-            crate::Op::forward(&Gather, &mut *device, (&home, &*returned));
+            crate::Op::forward(&Gather, &mut *device, (&home, &*returned, live));
         let rows: Spread<Hidden, R, Chip> = rows.to_dm(&mut device.tdma);
         let head = self.lm_head.to_dm(&mut *device);
         let chosen = head.forward(&mut *device, (), &mut (), &rows);

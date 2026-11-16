@@ -1,4 +1,4 @@
-use super::{Chip, HeadSlice, Heads, Single};
+use super::{Chip, HeadClusters, HeadSlice, Heads, Single, SplitHeads};
 use crate::Op;
 use crate::load::quantization::fp8::{Codes, Unquantized};
 use crate::load::{Checkpoint, Context, Load, LoadError};
@@ -379,7 +379,8 @@ impl<Width: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName, Rows:
 }
 
 /// The rows a projection of one head kind leaves in feature slices, as `Heads` heads of
-/// `Groups` query heads each; each row keeps its lane and its heads their order.
+/// `Groups` query heads each; each row keeps its lane and its heads their order, and live rows
+/// that lie in one row group move alone.
 impl<Width: AxisName, Heads: AxisName, Groups: AxisName, Head: AxisName, Rows: AxisName>
     Op<Live<Spread<Width, Rows>, Rows>> for Reshape<m![Heads, Groups, Head]>
 {
@@ -388,11 +389,41 @@ impl<Width: AxisName, Heads: AxisName, Groups: AxisName, Head: AxisName, Rows: A
     fn forward(&self, device: &mut Device, input: Live<Spread<Width, Rows>, Rows>) -> Self::Output {
         const { assert!(Width::SIZE == Heads::SIZE * Groups::SIZE * Head::SIZE) };
         let mut rows: Staged<Width, Rows> = DmTensor::new();
+        let mut heads: super::Heads<Rows, Heads, Groups, Head> = DmTensor::new();
+        let (first, count) = input.groups::<crate::tensor::axis::Lanes<Rows>>();
+        if count == 1 && count < <linear::Groups<Rows> as M>::SIZE {
+            Layout::<Rows>::group(input.value().view(), first).to_dm_view(
+                &mut device.tdma,
+                Layout::<Rows>::selected_mut(rows.view_mut(), first),
+            );
+            // SAFETY: as for every row group below.
+            unsafe {
+                rows.view().reshape::<
+                    Chip,
+                    m![1 # 2],
+                    Lane<Rows>,
+                    m![{ linear::Groups<Rows> }, Heads, Groups, Head],
+                >()
+            }
+            .tile::<
+                linear::Groups<Rows>,
+                1,
+                m![{ Layout<Rows>::Selected }, Heads, Groups, Head],
+            >(first)
+            .to_dm_view(
+                &mut device.tdma,
+                heads.view_mut().tile::<
+                    linear::Groups<Rows>,
+                    1,
+                    m![{ Layout<Rows>::SelectedMut }, Groups, Head],
+                >(first),
+            );
+            return input.with(heads);
+        }
         input
             .value()
             .view()
             .to_dm_view(&mut device.tdma, rows.view_mut());
-        let mut heads: super::Heads<Rows, Heads, Groups, Head> = DmTensor::new();
         // SAFETY: the features are head-major within every row. Relabeling preserves cells.
         unsafe {
             rows.view().reshape::<
@@ -407,6 +438,76 @@ impl<Width: AxisName, Heads: AxisName, Groups: AxisName, Head: AxisName, Rows: A
     }
 }
 
+type HeadFeatures<Width, Head> = m![Width % ({ Symbol<Head> })];
+
+type Clusters<Heads> = Symbol<HeadClusters<Heads>>;
+
+/// [`SplitHeads`] holding a head-major row's `Width` features before they are named as heads:
+/// the cluster is the features' top digit when the KV heads pair up, and each `Head` features
+/// within a cluster take a slice of their own.
+type Unsplit<'h, Rows, Width, Heads, Head> = DmTensorViewMut<
+    'h,
+    bf16,
+    Chip,
+    m![Width / (Width / ({ Clusters<Heads> })) # 2],
+    m![
+        { Layout<Rows>::Lanes } # 8,
+        Width % (Width / ({ Clusters<Heads> })) / ({ Symbol<Head> }) # 32
+    ],
+    m![{ linear::Groups<Rows> }, { HeadFeatures<Width, Head> }],
+>;
+
+/// The rows a projection of one head kind leaves where its contraction computes them, as `Heads`
+/// heads of `Groups` query heads each, moved straight into the head slices of each KV head's
+/// cluster; live rows that lie in one row group move alone.
+impl<In, Width, Code, Heads, Groups, Head, Rows>
+    Op<Live<linear::Projected<In, Width, Code, Rows>, Rows>> for Reshape<m![Heads, Groups, Head]>
+where
+    In: AxisName,
+    Width: AxisName,
+    Code: Scalar,
+    Heads: AxisName,
+    Groups: AxisName,
+    Head: AxisName,
+    Rows: AxisName,
+{
+    type Output = Live<SplitHeads<Rows, Heads, Groups, Head>, Rows>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        input: Live<linear::Projected<In, Width, Code, Rows>, Rows>,
+    ) -> Self::Output {
+        const {
+            assert!(Width::SIZE == Heads::SIZE * Groups::SIZE * Head::SIZE);
+            assert!(
+                Heads::SIZE / HeadClusters::<Heads>::SIZE * Groups::SIZE <= 32,
+                "a lane's slices of a cluster hold at most 32 head rows"
+            );
+        };
+        let mut heads: SplitHeads<Rows, Heads, Groups, Head> = DmTensor::new();
+        let (first, count) = input.groups::<crate::tensor::axis::Lanes<Rows>>();
+        if count == 1 && count < <linear::Groups<Rows> as M>::SIZE {
+            // SAFETY: as for every row group below.
+            let unsplit: Unsplit<'_, Rows, Width, Heads, Head> =
+                unsafe { heads.view_mut().reshape() };
+            linear::Linear::<In, Width>::group(input.value(), first).to_dm_view(
+                &mut device.tdma,
+                unsplit.tile::<
+                    linear::Groups<Rows>,
+                    1,
+                    m![{ Layout<Rows>::SelectedMut }, { HeadFeatures<Width, Head> }],
+                >(first),
+            );
+            return input.with(heads);
+        }
+        // SAFETY: the features are head-major within every row. Relabeling preserves cells.
+        let unsplit: Unsplit<'_, Rows, Width, Heads, Head> = unsafe { heads.view_mut().reshape() };
+        (input.value().view()).to_dm_view(&mut device.tdma, unsplit);
+        input.with(heads)
+    }
+}
+
 /// The rows a key or value projection leaves in feature slices, as `Heads` heads: the view above
 /// with one head in each group.
 impl<Width: AxisName, Heads: AxisName, Head: AxisName, Rows: AxisName>
@@ -415,6 +516,29 @@ impl<Width: AxisName, Heads: AxisName, Head: AxisName, Rows: AxisName>
     type Output = Live<super::Heads<Rows, Heads, Single, Head>, Rows>;
 
     fn forward(&self, device: &mut Device, input: Live<Spread<Width, Rows>, Rows>) -> Self::Output {
+        Reshape::<m![Heads, Single, Head]>::default().forward(device, input)
+    }
+}
+
+/// The rows a key or value projection leaves where its contraction computes them, as `Heads`
+/// heads: the view above with one head in each group.
+impl<In, Width, Code, Heads, Head, Rows> Op<Live<linear::Projected<In, Width, Code, Rows>, Rows>>
+    for Reshape<m![Heads, Head]>
+where
+    In: AxisName,
+    Width: AxisName,
+    Code: Scalar,
+    Heads: AxisName,
+    Head: AxisName,
+    Rows: AxisName,
+{
+    type Output = Live<SplitHeads<Rows, Heads, Single, Head>, Rows>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        input: Live<linear::Projected<In, Width, Code, Rows>, Rows>,
+    ) -> Self::Output {
         Reshape::<m![Heads, Single, Head]>::default().forward(device, input)
     }
 }
