@@ -186,7 +186,7 @@ pub struct Staging<H: AxisName, I: AxisName, R: AxisName> {
     ),
     scales: TokenScales<I, R>,
     stored_scales: StoredTokens<I, R>,
-    decode: bool,
+    resident_scales: bool,
     first: Down<H, Inputs<64>>,
 }
 
@@ -200,6 +200,9 @@ impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName>
         Begin((projected, decode)): Begin<(Live<(Projection<I, R>, Projection<I, R>), C>, bool)>,
     ) -> Self::Output {
         let rows = projected.rows();
+        // Small spans reuse the token scales across all four panel quantizers. Preserve
+        // DM residency for pure decode launches even when their span exceeds 256 rows.
+        let resident_scales = decode || rows <= 256;
         let (gate, up) = projected.into_value();
         use super::super::product;
         let product = if rows <= 8 {
@@ -215,7 +218,7 @@ impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName>
         };
         let factors = product_scales(device, &product, rows);
         let mut stored_scales = StoredTokens::<I, R>::new();
-        if !decode {
+        if !resident_scales {
             // SAFETY: the row digits match the same physical gate/up output permutation.
             let scales = unsafe {
                 factors.view().reshape::<Chip, Cluster<I>,
@@ -257,9 +260,13 @@ impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName>
         Staging {
             products,
             panels,
-            scales: if decode { factors } else { TokenScales::new() },
+            scales: if resident_scales {
+                factors
+            } else {
+                TokenScales::new()
+            },
             stored_scales,
-            decode,
+            resident_scales,
             first: down::<H, I, 64>(device, self, 0),
         }
     }
@@ -276,15 +283,15 @@ impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName> Op<Live<Staging<H, I, R
             panels: (p0, p1, p2, p3),
             scales,
             stored_scales,
-            decode,
+            resident_scales,
             first,
         } = staging.into_value();
-        let scales = if decode {
+        let scales = if resident_scales {
             down_scale_rows::<H, I, R>(device, &scales, rows)
         } else {
             DownScales::new()
         };
-        let row = if decode {
+        let row = if resident_scales {
             down_scale_operand(device, &scales)
         } else {
             let loaded = stored_scales.to_dm(&mut device.tdma);
@@ -308,7 +315,7 @@ impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName> Op<Live<Staging<H, I, R
                         device,
                         &products,
                         [&p0, &p1, &p2][panel],
-                        (decode, &scales, &stored_scales),
+                        (resident_scales, &scales, &stored_scales),
                         panel,
                         rows,
                     )
@@ -324,7 +331,7 @@ impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName> Op<Live<Staging<H, I, R
                             device,
                             &products,
                             &p3,
-                            (decode, &scales, &stored_scales),
+                            (resident_scales, &scales, &stored_scales),
                             3,
                             rows,
                         ),
@@ -545,7 +552,7 @@ fn load_product<H: AxisName, I: AxisName, R: AxisName, const B: usize>(
     device: &mut Device,
     products: &HbmTensor<bf16, Chip, StoredProducts<I, R>>,
     packed: &PackedPanel<R, B>,
-    (decode, scales, stored_scales): (bool, &DownScales<H, I, R>, &StoredTokens<I, R>),
+    (resident_scales, scales, stored_scales): (bool, &DownScales<H, I, R>, &StoredTokens<I, R>),
     panel: usize,
     rows: usize,
 ) -> Activation<H, Inputs<B>, R, B> {
@@ -568,40 +575,46 @@ fn load_product<H: AxisName, I: AxisName, R: AxisName, const B: usize>(
         m![R, {Symbol<Inputs<B>>} % {B}],
     > = DmTensor::new();
     load_rows(device, band, values.view_mut(), rows);
-    let scale: VrfTensor<f32, Chip, Cluster<Inputs<B>>, DownSlice<H, Inputs<B>>, m![R]> = if decode
-    {
-        // SAFETY: each slice has the same scales. Rename coordinates without redistribution.
-        let scales = unsafe {
-            scales
-                .view()
-                .reshape::<Chip, Cluster<Inputs<B>>, DownSlice<H, Inputs<B>>, m![R]>()
+    let scale: VrfTensor<f32, Chip, Cluster<Inputs<B>>, DownSlice<H, Inputs<B>>, m![R]> =
+        if resident_scales {
+            // SAFETY: each slice has the same scales. Rename coordinates without redistribution.
+            let scales = unsafe {
+                scales
+                    .view()
+                    .reshape::<Chip, Cluster<Inputs<B>>, DownSlice<H, Inputs<B>>, m![R]>()
+            };
+            device
+                .sub
+                .begin(scales)
+                .fetch::<m![R / 8], m![R % 8]>()
+                .collect::<m![R / 8], m![R % 8]>()
+                .to_vrf()
+        } else {
+            // Preserve the prefill path's panel-local HBM load and buffer lifetime.
+            let source = unsafe {
+                stored_scales
+                    .view()
+                    .reshape::<Chip, m![{Cluster<Inputs<B>>}, R, 1]>()
+            };
+            let mut loaded: DmTensor<
+                f32,
+                Chip,
+                Cluster<Inputs<B>>,
+                DownSlice<H, Inputs<B>>,
+                m![R, 1],
+            > = DmTensor::new();
+            load_rows(device, source, loaded.view_mut(), rows);
+            // SAFETY: removing the unit feature digit does not change scale storage.
+            let factors = unsafe {
+                loaded.reshape::<Chip, Cluster<Inputs<B>>, DownSlice<H, Inputs<B>>, m![R]>()
+            };
+            device
+                .sub
+                .begin(factors.view())
+                .fetch::<m![R / 8], m![R % 8]>()
+                .collect::<m![R / 8], m![R % 8]>()
+                .to_vrf()
         };
-        device
-            .sub
-            .begin(scales)
-            .fetch::<m![R / 8], m![R % 8]>()
-            .collect::<m![R / 8], m![R % 8]>()
-            .to_vrf()
-    } else {
-        // Preserve the prefill path's panel-local HBM load and buffer lifetime.
-        let source = unsafe {
-            stored_scales
-                .view()
-                .reshape::<Chip, m![{Cluster<Inputs<B>>}, R, 1]>()
-        };
-        let mut loaded: DmTensor<f32, Chip, Cluster<Inputs<B>>, DownSlice<H, Inputs<B>>, m![R, 1]> =
-            DmTensor::new();
-        load_rows(device, source, loaded.view_mut(), rows);
-        // SAFETY: removing the unit feature digit does not change scale storage.
-        let factors =
-            unsafe { loaded.reshape::<Chip, Cluster<Inputs<B>>, DownSlice<H, Inputs<B>>, m![R]>() };
-        device
-            .sub
-            .begin(factors.view())
-            .fetch::<m![R / 8], m![R % 8]>()
-            .collect::<m![R / 8], m![R % 8]>()
-            .to_vrf()
-    };
     type Quantizer<R, const B: usize> = Quantization<
         m![R, {Symbol<Inputs<B>>} % {B} / 8],
         m![R, {Symbol<Inputs<B>>} % {B} / 4],
@@ -670,7 +683,8 @@ mod tests {
         let live = Live::<(), R>::read(count);
         let decode = decode.extent::<m![1]>() != 0;
         let staged = weight.forward(device, Begin((live.with((gate, up)), decode)));
-        let scales = if decode {
+        let resident_scales = staged.resident_scales;
+        let scales = if resident_scales {
             down_scale_rows::<H, I, R>(device, &staged.scales, live.rows())
         } else {
             DownScales::new()
@@ -679,7 +693,7 @@ mod tests {
             device,
             &staged.products,
             &staged.panels.0,
-            (decode, &scales, &staged.stored_scales),
+            (resident_scales, &scales, &staged.stored_scales),
             0,
             live.rows(),
         );
@@ -687,7 +701,7 @@ mod tests {
             device,
             &staged.products,
             &staged.panels.3,
-            (decode, &scales, &staged.stored_scales),
+            (resident_scales, &scales, &staged.stored_scales),
             3,
             live.rows(),
         );
@@ -700,7 +714,7 @@ mod tests {
         tail.view()
             .slice_tile::<m![H / (H / 8)], 1, m![H / (H / 8) = 1 # 8, {Blocks<Inputs<32>>}]>(0)
             .to_hbm_view(&mut device.tdma, tail_stored.view_mut());
-        let stored_scales = if decode {
+        let stored_scales = if resident_scales {
             let mut stored = StoredTokens::new();
             scales
                 .view()

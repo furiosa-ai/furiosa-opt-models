@@ -185,8 +185,8 @@ fn end(
     let normalized = gain.forward(&mut *device, (), &mut (), &attended);
     let rows = tile.with(normalized.value());
     let projected = gate_up.forward(&mut *device, (), &mut (), (ahead, rows));
-    // Only pure item launches retain product scales in DM. Prompt and mixed launches keep
-    // the HBM path, even for short spans; row count alone does not identify decode work.
+    // Pure item launches retain product scales in DM at any span size. The MLP also
+    // retains them for spans of at most 256 rows, including prompt and mixed launches.
     let decode = call.context.0.read.items().rows() == call.live.rows();
     let staged = down.forward(
         &mut *device,
