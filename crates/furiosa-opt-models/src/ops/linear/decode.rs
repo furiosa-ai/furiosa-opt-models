@@ -121,71 +121,6 @@ where
     }
 }
 
-/// A tile of tiling `T` as `bf16(code * scale)`, from its `coded` E4M3 codes and its rows' FP32
-/// `scales`.
-fn restored<T: Tiling<In, Out>, In: AxisName, Out: AxisName>(
-    device: &mut Device,
-    coded: &DmTensor<f8e4m3, m![1], T::Cluster, T::Slices, m![{ T::Rows }, { T::Inputs }]>,
-    scales: &DmTensor<f32, m![1], T::Cluster, T::Slices, m![{ T::Rows }, 1 # 8]>,
-) -> DmTensor<bf16, m![1], T::Cluster, T::Slices, m![{ T::Rows }, { T::Inputs }]> {
-    restore_rows::<T, In, Out, _, _>(
-        device,
-        |part| {
-            coded.view().tile::<T::Restorations, 1, m![
-                { Selected<T::Restorations> }, { T::Restored }, { T::Inputs }
-            ]>(part)
-        },
-        |part| {
-            scales.view().tile::<T::Restorations, 1, m![
-                { Selected<T::Restorations> }, { T::Restored }, 1 # 8
-            ]>(part)
-        },
-    )
-}
-
-/// A tile of tiling `T` as `bf16(code * scale)` with the FP32 scale of the code's output row, a
-/// restoration's rows at a time: `codes(at)` and `scales(at)` give restoration `at`'s.
-fn restore_rows<'t, T, In, Out, C, S>(
-    device: &mut Device,
-    codes: impl Fn(usize) -> DmTensorView<'t, f8e4m3, m![1], T::Cluster, T::Slices, C>,
-    scales: impl Fn(usize) -> DmTensorView<'t, f32, m![1], T::Cluster, T::Slices, S>,
-) -> DmTensor<bf16, m![1], T::Cluster, T::Slices, m![{ T::Rows }, { T::Inputs }]>
-where
-    T: Tiling<In, Out>,
-    In: AxisName,
-    Out: AxisName,
-    C: M,
-    S: M,
-{
-    let mut restored = DmTensor::new();
-    for at in 0..<T::Restorations as M>::SIZE {
-        let scale: VrfTensor<f32, m![1], T::Cluster, T::Slices, m![{ T::Restored }, 1 # 8]> =
-            device
-                .sub
-                .begin(scales(at))
-                .fetch::<T::Restored, m![1 # 8]>()
-                .collect::<T::Restored, m![1 # 8]>()
-                .to_vrf();
-        device
-            .main
-            .begin(codes(at))
-            .fetch::<m![{ T::Restored }, { T::Inputs } / 16], m![In % 16]>()
-            .fetch_cast::<f32>()
-            .collect::<m![{ T::Restored }, { T::Inputs } / 8], m![In % 8]>()
-            .vector_init()
-            .vector_intra_slice_tag(TagMode::Zero)
-            .vector_narrow_split::<m![{ T::Restored }, { T::Inputs } / 4], m![In % 4]>()
-            .vector_restore::<m![{ T::Restored }, { T::Inputs } / 8], m![In % 8], _, _>(
-                &scale,
-                |values| values,
-            )
-            .commit_view(restored.view_mut().tile::<T::Restorations, 1, m![
-                { SelectedMut<T::Restorations> }, { T::Restored }, { T::Inputs }
-            ]>(at));
-    }
-    restored
-}
-
 /// The contraction of an `In` by `Out` E4M3 weight, and its tiling's rows, inputs and restorations.
 type Tiled<In, Out> = Contraction<In, Out, f8e4m3>;
 type Rows<In, Out> = <Tiled<In, Out> as Tiling<In, Out>>::Rows;
@@ -549,6 +484,71 @@ impl<In: AxisName, Out: AxisName, Contract, K, V>
         }
         restored
     }
+}
+
+/// A tile of tiling `T` as `bf16(code * scale)`, from its `coded` E4M3 codes and its rows' FP32
+/// `scales`.
+fn restored<T: Tiling<In, Out>, In: AxisName, Out: AxisName>(
+    device: &mut Device,
+    coded: &DmTensor<f8e4m3, m![1], T::Cluster, T::Slices, m![{ T::Rows }, { T::Inputs }]>,
+    scales: &DmTensor<f32, m![1], T::Cluster, T::Slices, m![{ T::Rows }, 1 # 8]>,
+) -> DmTensor<bf16, m![1], T::Cluster, T::Slices, m![{ T::Rows }, { T::Inputs }]> {
+    restore_rows::<T, In, Out, _, _>(
+        device,
+        |part| {
+            coded.view().tile::<T::Restorations, 1, m![
+                { Selected<T::Restorations> }, { T::Restored }, { T::Inputs }
+            ]>(part)
+        },
+        |part| {
+            scales.view().tile::<T::Restorations, 1, m![
+                { Selected<T::Restorations> }, { T::Restored }, 1 # 8
+            ]>(part)
+        },
+    )
+}
+
+/// A tile of tiling `T` as `bf16(code * scale)` with the FP32 scale of the code's output row, a
+/// restoration's rows at a time: `codes(at)` and `scales(at)` give restoration `at`'s.
+fn restore_rows<'t, T, In, Out, C, S>(
+    device: &mut Device,
+    codes: impl Fn(usize) -> DmTensorView<'t, f8e4m3, m![1], T::Cluster, T::Slices, C>,
+    scales: impl Fn(usize) -> DmTensorView<'t, f32, m![1], T::Cluster, T::Slices, S>,
+) -> DmTensor<bf16, m![1], T::Cluster, T::Slices, m![{ T::Rows }, { T::Inputs }]>
+where
+    T: Tiling<In, Out>,
+    In: AxisName,
+    Out: AxisName,
+    C: M,
+    S: M,
+{
+    let mut restored = DmTensor::new();
+    for at in 0..<T::Restorations as M>::SIZE {
+        let scale: VrfTensor<f32, m![1], T::Cluster, T::Slices, m![{ T::Restored }, 1 # 8]> =
+            device
+                .sub
+                .begin(scales(at))
+                .fetch::<T::Restored, m![1 # 8]>()
+                .collect::<T::Restored, m![1 # 8]>()
+                .to_vrf();
+        device
+            .main
+            .begin(codes(at))
+            .fetch::<m![{ T::Restored }, { T::Inputs } / 16], m![In % 16]>()
+            .fetch_cast::<f32>()
+            .collect::<m![{ T::Restored }, { T::Inputs } / 8], m![In % 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_split::<m![{ T::Restored }, { T::Inputs } / 4], m![In % 4]>()
+            .vector_restore::<m![{ T::Restored }, { T::Inputs } / 8], m![In % 8], _, _>(
+                &scale,
+                |values| values,
+            )
+            .commit_view(restored.view_mut().tile::<T::Restorations, 1, m![
+                { SelectedMut<T::Restorations> }, { T::Restored }, { T::Inputs }
+            ]>(at));
+    }
+    restored
 }
 
 #[cfg(test)]

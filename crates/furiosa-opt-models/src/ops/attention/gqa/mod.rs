@@ -497,27 +497,6 @@ impl<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Count: M, D: Scalar, Slo
     }
 }
 
-/// Rows a slice holds in a pass of `rows` rows over heads of `KvHeads`: the pass's, less those its
-/// heads' slot copies take.
-const fn slice_rows<KvHeads: AxisName>(rows: usize) -> usize {
-    rows / attention::slots(rows.div_ceil(attention::LANES), HeadCopies::<KvHeads>::SIZE)
-}
-
-/// Whether a cluster's cells, a head's lanes in each copy of its slot, hold a lone row's
-/// [`LaneWindows`] of a history of `Windows`, one a cell.
-const fn held<KvHeads: AxisName, Windows: AxisName>() -> bool {
-    LaneWindows::<Windows>::SIZE <= HeadCopies::<KvHeads>::SIZE * attention::CLUSTER_LANES
-}
-
-/// The cells of `cells` as attention reads a chunk.
-fn chunk<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Count: M, D: Scalar, Slot: M>(
-    cells: &InDm<Rows, KvHeads, Head, Count, D, Slot>,
-) -> ChunkView<'_, Rows, KvHeads, Head, Count, D, Slot> {
-    // SAFETY: a shard's blocks are its consecutive slots, so both nests name the same cells in the
-    // same order.
-    unsafe { cells.view().reshape() }
-}
-
 /// A history as its windows land and as attention reads them: BF16 cells as they landed, or a
 /// pool's E4M3 codes, which widen to BF16 where a pass reads them and whose scales the scores and
 /// the weighted sum take. Keys that fill the registers widen once a window is prepared (behind no
@@ -1356,35 +1335,6 @@ impl<Rows: AxisName, KvHeads: AxisName, Groups: AxisName, Head: AxisName>
             _,
         >(device, rows.view())
     }
-}
-
-/// `Count` row groups' query rows from the first slice of each ring of `R` consecutive shards of
-/// their heads, as `Slices` holds them, to every shard slice of their heads in `Slot`, round the
-/// rings.
-fn broadcast<
-    Rows: AxisName,
-    KvHeads: AxisName,
-    Groups: AxisName,
-    Head: AxisName,
-    Count: M,
-    Slot: M,
-    Slices: M,
-    R: AxisName,
-    E: M,
->(
-    device: &mut Device,
-    rows: DmTensorView<'_, bf16, Chip, Cluster<Rows>, Slices, E>,
-) -> Query<Rows, KvHeads, Groups, Head, Count, Slot> {
-    device
-        .sub
-        .begin(rows)
-        .fetch::<m![{ Count }, Groups, Head / 16], m![Head % 16]>()
-        .switch::<CacheSlices<Rows, KvHeads, Slot>, m![{ Count }, Groups, Head / 16]>(
-            SwitchConfig::CustomBroadcast { ring_size: R::SIZE },
-        )
-        .collect::<m![{ Count }, Groups, Head / 16], m![Head % 16]>()
-        .commit_trim::<m![Head % 16]>()
-        .commit()
 }
 
 /// Each shard's bias of its slots, once a row: the masks read it once a query group, as a register
@@ -2808,6 +2758,56 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, const SCALE: usize>
             }
         }
     }
+}
+
+/// Rows a slice holds in a pass of `rows` rows over heads of `KvHeads`: the pass's, less those its
+/// heads' slot copies take.
+const fn slice_rows<KvHeads: AxisName>(rows: usize) -> usize {
+    rows / attention::slots(rows.div_ceil(attention::LANES), HeadCopies::<KvHeads>::SIZE)
+}
+
+/// Whether a cluster's cells, a head's lanes in each copy of its slot, hold a lone row's
+/// [`LaneWindows`] of a history of `Windows`, one a cell.
+const fn held<KvHeads: AxisName, Windows: AxisName>() -> bool {
+    LaneWindows::<Windows>::SIZE <= HeadCopies::<KvHeads>::SIZE * attention::CLUSTER_LANES
+}
+
+/// The cells of `cells` as attention reads a chunk.
+fn chunk<Rows: AxisName, KvHeads: AxisName, Head: AxisName, Count: M, D: Scalar, Slot: M>(
+    cells: &InDm<Rows, KvHeads, Head, Count, D, Slot>,
+) -> ChunkView<'_, Rows, KvHeads, Head, Count, D, Slot> {
+    // SAFETY: a shard's blocks are its consecutive slots, so both nests name the same cells in the
+    // same order.
+    unsafe { cells.view().reshape() }
+}
+
+/// `Count` row groups' query rows from the first slice of each ring of `R` consecutive shards of
+/// their heads, as `Slices` holds them, to every shard slice of their heads in `Slot`, round the
+/// rings.
+fn broadcast<
+    Rows: AxisName,
+    KvHeads: AxisName,
+    Groups: AxisName,
+    Head: AxisName,
+    Count: M,
+    Slot: M,
+    Slices: M,
+    R: AxisName,
+    E: M,
+>(
+    device: &mut Device,
+    rows: DmTensorView<'_, bf16, Chip, Cluster<Rows>, Slices, E>,
+) -> Query<Rows, KvHeads, Groups, Head, Count, Slot> {
+    device
+        .sub
+        .begin(rows)
+        .fetch::<m![{ Count }, Groups, Head / 16], m![Head % 16]>()
+        .switch::<CacheSlices<Rows, KvHeads, Slot>, m![{ Count }, Groups, Head / 16]>(
+            SwitchConfig::CustomBroadcast { ring_size: R::SIZE },
+        )
+        .collect::<m![{ Count }, Groups, Head / 16], m![Head % 16]>()
+        .commit_trim::<m![Head % 16]>()
+        .commit()
 }
 
 /// The values of every row group of `chunk`, each a `D`, transposed into `values`, as

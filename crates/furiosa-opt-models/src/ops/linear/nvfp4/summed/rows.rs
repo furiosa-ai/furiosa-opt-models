@@ -682,14 +682,6 @@ type HalfKept<'k, H, I, R> = DmTensorView<
     m![R, I % ({ Share<H, I, Kept> })],
 >;
 
-/// Whether [`Both`] holds the rows a projection of `H` inputs into `I` outputs summed: the runs of
-/// both halves fit a cluster's slices and a part of `I` inputs is whole runs.
-const fn fits_both<H: AxisName, I: AxisName>() -> bool {
-    H::SIZE / Chunk::<H>::SIZE >= 2
-        && I::SIZE / Chunk::<I>::SIZE >= 2
-        && Chunk::<I>::SIZE.is_multiple_of(Shared::<H, I, Kept>::SIZE)
-}
-
 /// Inputs a switch packet takes from one share's run of `H`-input rows: the most, at most a flit,
 /// that divide the run, so a packet never spans two owners.
 #[derive(Clone, Debug)]
@@ -2156,64 +2148,6 @@ type Alike<'t, O, E> = DmTensorView<'t, f32, Chip, normalization::Cluster, Featu
 /// slice's outputs of a row.
 type TermRows<S, R, E> = DmTensor<f32, Chip, m![Term], S, m![R, { E }]>;
 
-/// A pass of lane groups `G` over a place of a decoded weight's rows `T`, its sums a share on each
-/// share's first part slice, those rows there `K`, into the view `into` gives once they round,
-/// which holds those rows of the groups' lanes.
-fn weigh<'s, I: AxisName, O: AxisName, R: AxisName, P: Ownership, G: Held<R>, T: M, K: M, E: M>(
-    device: &mut Device,
-    operands: Operands<'_, I, O, R, P, G, T>,
-    into: impl FnOnce() -> SumsMut<'s, I, O, P, E>,
-) where
-    P::Sum: Rounding,
-{
-    let sums = <Summing<I, O, R, P> as Sums<I, O, R, P>>::divided::<T, Tall<I, O, P>, G, T>(
-        device, operands,
-    )
-    .vector_inter_slice_reduce::<Reduced<I, O, P>, m![{ K }, { G::Groups }]>(
-        InterSliceReduceOpF32::Add,
-    )
-    .vector_final();
-    <P::Sum as Rounding>::round::<
-        _,
-        _,
-        _,
-        _,
-        Lane<R>,
-        m![{ <P::Sum as Rounding>::Packets<K> }, { G::Groups }, { Lane<R> }],
-        <P::Sum as Rounding>::Packet<O>,
-        _,
-    >(sums)
-    .commit_view(into());
-}
-
-/// The live rows of `rows` into `into`'s mapping in one transfer, as a setup costs about as much as
-/// all the rows: the one live row, else the lane group holding them, else the envelope.
-fn transfer<V: Scalar, R: AxisName, C: M, S: M, X: M, D: M, T: M, Y: M>(
-    device: &mut Device,
-    rows: Live<&DmTensor<V, Chip, C, S, m![R, { X }]>, R>,
-    into: &mut DmTensor<V, Chip, D, T, m![R, { Y }]>,
-) {
-    let (first, count) = rows.groups::<Lanes<R>>();
-    if count > 1 {
-        rows.value()
-            .view()
-            .to_dm_view(&mut device.tdma, into.view_mut());
-    } else if rows.rows() == 1 {
-        let row = rows.start();
-        (rows.value().view())
-            .tile::<m![R], 1, m![R = 1 # R, { X }]>(row)
-            .to_dm_view(
-                &mut device.tdma,
-                (into.view_mut()).tile::<m![R], 1, m![R = 1 #{!} R, { Y }]>(row),
-            );
-    } else {
-        Layout::<R>::group(rows.value().view(), first).to_dm_view(
-            &mut device.tdma,
-            (into.view_mut()).tile::<Layout<R>::Groups, 1, Layout<R>::GroupMut<Y>>(first),
-        );
-    }
-}
-
 /// Rows a projection of `I` inputs into `O` outputs reads a lane group of as the tensor-register
 /// lanes of every slice, each slice the group's inputs in its part: the switch ring writes a group
 /// into its staging DM, whole or in `PARTS` parts, and the group fills the TRF from there.
@@ -2591,6 +2525,72 @@ impl<I: AxisName, O: AxisName, R: AxisName> Dense<I, O, R, Exchanged> for HalfSp
             )
             .collect::<m![{ Lane<R> }, { G::Groups }, { Packets<I, Exchanged> }], m![I % 16]>()
             .to_trf()
+    }
+}
+
+/// Whether [`Both`] holds the rows a projection of `H` inputs into `I` outputs summed: the runs of
+/// both halves fit a cluster's slices and a part of `I` inputs is whole runs.
+const fn fits_both<H: AxisName, I: AxisName>() -> bool {
+    H::SIZE / Chunk::<H>::SIZE >= 2
+        && I::SIZE / Chunk::<I>::SIZE >= 2
+        && Chunk::<I>::SIZE.is_multiple_of(Shared::<H, I, Kept>::SIZE)
+}
+
+/// A pass of lane groups `G` over a place of a decoded weight's rows `T`, its sums a share on each
+/// share's first part slice, those rows there `K`, into the view `into` gives once they round,
+/// which holds those rows of the groups' lanes.
+fn weigh<'s, I: AxisName, O: AxisName, R: AxisName, P: Ownership, G: Held<R>, T: M, K: M, E: M>(
+    device: &mut Device,
+    operands: Operands<'_, I, O, R, P, G, T>,
+    into: impl FnOnce() -> SumsMut<'s, I, O, P, E>,
+) where
+    P::Sum: Rounding,
+{
+    let sums = <Summing<I, O, R, P> as Sums<I, O, R, P>>::divided::<T, Tall<I, O, P>, G, T>(
+        device, operands,
+    )
+    .vector_inter_slice_reduce::<Reduced<I, O, P>, m![{ K }, { G::Groups }]>(
+        InterSliceReduceOpF32::Add,
+    )
+    .vector_final();
+    <P::Sum as Rounding>::round::<
+        _,
+        _,
+        _,
+        _,
+        Lane<R>,
+        m![{ <P::Sum as Rounding>::Packets<K> }, { G::Groups }, { Lane<R> }],
+        <P::Sum as Rounding>::Packet<O>,
+        _,
+    >(sums)
+    .commit_view(into());
+}
+
+/// The live rows of `rows` into `into`'s mapping in one transfer, as a setup costs about as much as
+/// all the rows: the one live row, else the lane group holding them, else the envelope.
+fn transfer<V: Scalar, R: AxisName, C: M, S: M, X: M, D: M, T: M, Y: M>(
+    device: &mut Device,
+    rows: Live<&DmTensor<V, Chip, C, S, m![R, { X }]>, R>,
+    into: &mut DmTensor<V, Chip, D, T, m![R, { Y }]>,
+) {
+    let (first, count) = rows.groups::<Lanes<R>>();
+    if count > 1 {
+        rows.value()
+            .view()
+            .to_dm_view(&mut device.tdma, into.view_mut());
+    } else if rows.rows() == 1 {
+        let row = rows.start();
+        (rows.value().view())
+            .tile::<m![R], 1, m![R = 1 # R, { X }]>(row)
+            .to_dm_view(
+                &mut device.tdma,
+                (into.view_mut()).tile::<m![R], 1, m![R = 1 #{!} R, { Y }]>(row),
+            );
+    } else {
+        Layout::<R>::group(rows.value().view(), first).to_dm_view(
+            &mut device.tdma,
+            (into.view_mut()).tile::<Layout<R>::Groups, 1, Layout<R>::GroupMut<Y>>(first),
+        );
     }
 }
 

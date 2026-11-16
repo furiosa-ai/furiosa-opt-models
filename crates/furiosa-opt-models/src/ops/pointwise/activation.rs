@@ -244,73 +244,6 @@ impl<'x, R: AxisName, Chips: M + 'static, C: M, S: M, E: M + 'static>
     }
 }
 
-/// `x / 2 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 x³)))` of each BF16 cell walked as `K` says, in
-/// FP32 over three DM round trips, rounded once to BF16.
-fn new_gelu<K: Walk, Chips: M + 'static, C: M, S: M, E: M>(
-    device: &mut Device,
-    input: DmTensorView<'_, bf16, Chips, C, S, E>,
-) -> DmTensor<bf16, Chips, C, S, E> {
-    let x: DmTensor<f32, Chips, C, S, E> = device
-        .main
-        .begin(input.clone())
-        .fetch::<K::Time, K::Packet>()
-        .fetch_cast::<f32>()
-        .collect::<K::Time, K::Packet>()
-        .commit_trim::<K::Packet>()
-        .commit();
-    let inner: DmTensor<f32, Chips, C, S, E> = device
-        .main
-        .begin(input)
-        .fetch::<K::Time, K::Packet>()
-        .fetch_cast::<f32>()
-        .collect::<K::Time, K::Packet>()
-        .vector_init()
-        .vector_intra_slice_tag(TagMode::Zero)
-        .vector_narrow_split::<K::Narrow, K::Half>()
-        .vector_fp_binary_with_mode(
-            FpBinaryOp::MulF(FpMulAlu::Mul0),
-            BinaryArgMode::Mode00,
-            0.0f32,
-        )
-        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), CUBIC)
-        .vector_fp_binary(FpBinaryOp::AddF, 1_f32)
-        .vector_widen_concat::<K::Time, K::Packet>()
-        .vector_final()
-        .commit_trim::<K::Packet>()
-        .commit();
-    let tanh: DmTensor<f32, Chips, C, S, E> = device
-        .main
-        .begin_interleaved::<Factors, _, _, _, _, _>(inner.view(), x.view())
-        .fetch::<K::Pairs, K::Packet>()
-        .collect::<K::Pairs, K::Packet>()
-        .vector_init()
-        .vector_intra_slice_unzip::<Factors, K::Time>()
-        .vector_narrow_split::<K::Narrow, K::Half>()
-        .vector_fp_zip(FpBinaryOp::MulF(FpMulAlu::Mul0))
-        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), ROOT)
-        .vector_fp_unary(FpUnaryOp::Tanh)
-        .vector_widen_concat::<K::Time, K::Packet>()
-        .vector_final()
-        .commit_trim::<K::Packet>()
-        .commit();
-    device
-        .main
-        .begin_interleaved::<Factors, _, _, _, _, _>(tanh.view(), x.view())
-        .fetch::<K::Pairs, K::Packet>()
-        .collect::<K::Pairs, K::Packet>()
-        .vector_init()
-        .vector_intra_slice_unzip::<Factors, K::Time>()
-        .vector_narrow_split::<K::Narrow, K::Half>()
-        .vector_fp_binary(FpBinaryOp::AddF, 1_f32, ())
-        .vector_fp_zip(FpBinaryOp::MulF(FpMulAlu::Mul0))
-        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), 0.5_f32)
-        .vector_widen_concat::<K::Time, K::Packet>()
-        .vector_final()
-        .cast::<bf16, K::Padded>()
-        .commit_trim::<K::Packet>()
-        .commit()
-}
-
 /// x * sigmoid(x), preserving any input chip mapping.
 #[derive(Clone, Copy, Default, DeviceSend, Load)]
 pub struct Silu;
@@ -524,28 +457,6 @@ impl<'x, R: AxisName, Chips: M + 'static, C: M, S: M, E: M + 'static>
     }
 }
 
-/// `x * sigmoid(x)` of each BF16 cell walked as `K` says, in FP32, rounded once to BF16.
-fn silu<K: Walk, Chips: M + 'static, C: M, S: M, E: M>(
-    device: &mut Device,
-    input: DmTensorView<'_, bf16, Chips, C, S, E>,
-) -> DmTensor<bf16, Chips, C, S, E> {
-    device
-        .main
-        .begin(input)
-        .fetch::<K::Time, K::Packet>()
-        .fetch_cast::<f32>()
-        .collect::<K::Time, K::Packet>()
-        .vector_init()
-        .vector_intra_slice_tag(TagMode::Zero)
-        .vector_narrow_split::<K::Narrow, K::Half>()
-        .vector_silu()
-        .vector_widen_concat::<K::Time, K::Packet>()
-        .vector_final()
-        .cast::<bf16, K::Padded>()
-        .commit_trim::<K::Packet>()
-        .commit()
-}
-
 /// `bf16(silu(t))` of each timestep's time embedding, FP32 inside and rounded once.
 impl<In: AxisName, Chips: M> Op<HbmTensorView<'_, f32, Chips, m![Timestep, In]>> for Silu {
     type Output = DmTensor<bf16, Chips, m![2], m![1 # 256], m![Timestep, In]>;
@@ -572,6 +483,95 @@ impl<In: AxisName, Chips: M> Op<HbmTensorView<'_, f32, Chips, m![Timestep, In]>>
             .commit_trim::<m![In % 8]>()
             .commit()
     }
+}
+
+/// `x * sigmoid(x)` of each BF16 cell walked as `K` says, in FP32, rounded once to BF16.
+fn silu<K: Walk, Chips: M + 'static, C: M, S: M, E: M>(
+    device: &mut Device,
+    input: DmTensorView<'_, bf16, Chips, C, S, E>,
+) -> DmTensor<bf16, Chips, C, S, E> {
+    device
+        .main
+        .begin(input)
+        .fetch::<K::Time, K::Packet>()
+        .fetch_cast::<f32>()
+        .collect::<K::Time, K::Packet>()
+        .vector_init()
+        .vector_intra_slice_tag(TagMode::Zero)
+        .vector_narrow_split::<K::Narrow, K::Half>()
+        .vector_silu()
+        .vector_widen_concat::<K::Time, K::Packet>()
+        .vector_final()
+        .cast::<bf16, K::Padded>()
+        .commit_trim::<K::Packet>()
+        .commit()
+}
+
+/// `x / 2 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 x³)))` of each BF16 cell walked as `K` says, in
+/// FP32 over three DM round trips, rounded once to BF16.
+fn new_gelu<K: Walk, Chips: M + 'static, C: M, S: M, E: M>(
+    device: &mut Device,
+    input: DmTensorView<'_, bf16, Chips, C, S, E>,
+) -> DmTensor<bf16, Chips, C, S, E> {
+    let x: DmTensor<f32, Chips, C, S, E> = device
+        .main
+        .begin(input.clone())
+        .fetch::<K::Time, K::Packet>()
+        .fetch_cast::<f32>()
+        .collect::<K::Time, K::Packet>()
+        .commit_trim::<K::Packet>()
+        .commit();
+    let inner: DmTensor<f32, Chips, C, S, E> = device
+        .main
+        .begin(input)
+        .fetch::<K::Time, K::Packet>()
+        .fetch_cast::<f32>()
+        .collect::<K::Time, K::Packet>()
+        .vector_init()
+        .vector_intra_slice_tag(TagMode::Zero)
+        .vector_narrow_split::<K::Narrow, K::Half>()
+        .vector_fp_binary_with_mode(
+            FpBinaryOp::MulF(FpMulAlu::Mul0),
+            BinaryArgMode::Mode00,
+            0.0f32,
+        )
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), CUBIC)
+        .vector_fp_binary(FpBinaryOp::AddF, 1_f32)
+        .vector_widen_concat::<K::Time, K::Packet>()
+        .vector_final()
+        .commit_trim::<K::Packet>()
+        .commit();
+    let tanh: DmTensor<f32, Chips, C, S, E> = device
+        .main
+        .begin_interleaved::<Factors, _, _, _, _, _>(inner.view(), x.view())
+        .fetch::<K::Pairs, K::Packet>()
+        .collect::<K::Pairs, K::Packet>()
+        .vector_init()
+        .vector_intra_slice_unzip::<Factors, K::Time>()
+        .vector_narrow_split::<K::Narrow, K::Half>()
+        .vector_fp_zip(FpBinaryOp::MulF(FpMulAlu::Mul0))
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), ROOT)
+        .vector_fp_unary(FpUnaryOp::Tanh)
+        .vector_widen_concat::<K::Time, K::Packet>()
+        .vector_final()
+        .commit_trim::<K::Packet>()
+        .commit();
+    device
+        .main
+        .begin_interleaved::<Factors, _, _, _, _, _>(tanh.view(), x.view())
+        .fetch::<K::Pairs, K::Packet>()
+        .collect::<K::Pairs, K::Packet>()
+        .vector_init()
+        .vector_intra_slice_unzip::<Factors, K::Time>()
+        .vector_narrow_split::<K::Narrow, K::Half>()
+        .vector_fp_binary(FpBinaryOp::AddF, 1_f32, ())
+        .vector_fp_zip(FpBinaryOp::MulF(FpMulAlu::Mul0))
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), 0.5_f32)
+        .vector_widen_concat::<K::Time, K::Packet>()
+        .vector_final()
+        .cast::<bf16, K::Padded>()
+        .commit_trim::<K::Packet>()
+        .commit()
 }
 
 #[cfg(test)]

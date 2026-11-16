@@ -657,6 +657,8 @@ mod tests {
     /// A launch's rows: the span gathers' rows, as every launch names them.
     type Capacity = crate::tensor::axis::Rows<1024>;
 
+    type Parted<Hidden> = HbmTensor<bf16, Chip, crate::ops::linear::Parted<Hidden, Table>>;
+
     #[device(chip = 1)]
     fn forward<Vocabulary: AxisName, Hidden: AxisName, Rows: AxisName>(
         device: &mut Device,
@@ -711,8 +713,6 @@ mod tests {
         let rows = Module::forward(embedding, &mut *device, (), &mut (), (ids, tiles));
         (rows.value().view()).to_hbm_view(&mut device.tdma, output.view_mut());
     }
-
-    type Parted<Hidden> = HbmTensor<bf16, Chip, crate::ops::linear::Parted<Hidden, Table>>;
 
     axes![Parts = 3840];
 

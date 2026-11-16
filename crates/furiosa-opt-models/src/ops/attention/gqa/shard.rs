@@ -1240,6 +1240,9 @@ pub(crate) trait Partition: Sized {
     }
 }
 
+const PRESENT: TagGuard =
+    TagGuard::matches([BitReq::Zero, BitReq::Ignore, BitReq::Ignore, BitReq::Ignore]);
+
 /// Whether a history of at most `Rest` windows after the first holds every window's terms.
 pub(crate) const fn holds<G: Partition, Rest: AxisName>() -> bool {
     attention::holds(
@@ -1249,9 +1252,6 @@ pub(crate) const fn holds<G: Partition, Rest: AxisName>() -> bool {
         Rest::SIZE + 1,
     )
 }
-
-const PRESENT: TagGuard =
-    TagGuard::matches([BitReq::Zero, BitReq::Ignore, BitReq::Ignore, BitReq::Ignore]);
 
 /// The scores of `query` over a window's keys in the registers, each times the window's `scale`
 /// where its keys are codes, before the score divisor.

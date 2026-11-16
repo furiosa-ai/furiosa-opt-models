@@ -21,16 +21,6 @@ use safetensors::tensor::TensorView;
 use super::{Checkpoint, Context, LoadError};
 use crate::tensor::memory::dtype;
 
-/// `host` laid out as `To` a contiguous run at a time, or none when its layout is `To`'s or no walk
-/// of whole-byte runs reads each cell once (a broadcast, inner padding): the upload lays those out.
-pub(crate) fn laid_out<D: MaterializableScalar, E: M, To: M>(
-    host: &HostTensor<D, E>,
-) -> Option<HostTensor<D, To>> {
-    let runs = Runs::new(&E::to_value(), &To::to_value(), D::BITS)?;
-    let source: Vec<u8> = host.clone().into_buffer().into();
-    HostTensor::try_from(HostBuffer::from_vec(runs.copy(&source))).ok()
-}
-
 /// One layout's bytes as another's a run at a time: a run's source offset sums `steps` (size, byte
 /// stride, innermost first), and runs fill `block` bytes of each `padded` of the image.
 struct Runs {
@@ -95,26 +85,6 @@ impl Runs {
             image[cell..cell + self.run].copy_from_slice(&source[offset..offset + self.run]);
         }
         image
-    }
-}
-
-/// `mapping` without the padding of its innermost factor, with that factor's live and padded
-/// cells: equal when it is not padded.
-fn unpadded(mapping: Mapping) -> (Mapping, usize, usize) {
-    match mapping {
-        Mapping::Pair { left, right } => {
-            let (right, live, padded) = unpadded((*right).clone());
-            ((*left).clone().pair(right), live, padded)
-        }
-        Mapping::Padding { inner, padding, .. } => {
-            let inner = (*inner).clone();
-            let live = inner.size();
-            (inner, live, padding)
-        }
-        other => {
-            let size = other.size();
-            (other, size, size)
-        }
     }
 }
 
@@ -354,6 +324,36 @@ impl Checkpoint {
             }
         }
         axes
+    }
+}
+
+/// `host` laid out as `To` a contiguous run at a time, or none when its layout is `To`'s or no walk
+/// of whole-byte runs reads each cell once (a broadcast, inner padding): the upload lays those out.
+pub(crate) fn laid_out<D: MaterializableScalar, E: M, To: M>(
+    host: &HostTensor<D, E>,
+) -> Option<HostTensor<D, To>> {
+    let runs = Runs::new(&E::to_value(), &To::to_value(), D::BITS)?;
+    let source: Vec<u8> = host.clone().into_buffer().into();
+    HostTensor::try_from(HostBuffer::from_vec(runs.copy(&source))).ok()
+}
+
+/// `mapping` without the padding of its innermost factor, with that factor's live and padded
+/// cells: equal when it is not padded.
+fn unpadded(mapping: Mapping) -> (Mapping, usize, usize) {
+    match mapping {
+        Mapping::Pair { left, right } => {
+            let (right, live, padded) = unpadded((*right).clone());
+            ((*left).clone().pair(right), live, padded)
+        }
+        Mapping::Padding { inner, padding, .. } => {
+            let inner = (*inner).clone();
+            let live = inner.size();
+            (inner, live, padding)
+        }
+        other => {
+            let size = other.size();
+            (other, size, size)
+        }
     }
 }
 
