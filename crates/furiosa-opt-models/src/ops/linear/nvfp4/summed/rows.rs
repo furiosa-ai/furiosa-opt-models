@@ -214,17 +214,41 @@ type Coded<I, O, P> = m![O % ({ Owner<I, O, P> }), { Part<I> }];
 /// A feature slice's run of a row's inputs.
 type Feature<I> = Symbol<normalization::Chunk<I>>;
 
+/// A dense source's inputs: whole 16-input packets dividing a pair's part within the slice seats.
+#[derive(Clone, Debug)]
+pub struct Source<I, P = Exchanged>(PhantomData<(I, P)>);
+
+impl<I: AxisName, P: Ownership> AxisName for Source<I, P> {
+    const NAME: Ident = Ident::new("Source");
+    const SIZE: usize = {
+        let part = part::<I>(16);
+        let parts = I::SIZE / 2 / part;
+        let seats = SLICES / if parts == 0 { 1 } else { parts };
+        let mut run = 16;
+        while !part.is_multiple_of(run) || part / run > seats {
+            run += 16;
+        }
+        if P::HALVES_INPUTS {
+            run
+        } else {
+            normalization::Chunk::<I>::SIZE
+        }
+    };
+}
+
+type Run<I, P = Exchanged> = Symbol<Source<I, P>>;
+
 /// A part's 16-input packets in the order the switch delivers them from the feature slices: a
 /// slice's own packets outer, the slices inner. The input order where a slice holds one packet.
-type Packets<I> = m![I % ({ Feature<I> }) / 16, I % ({ Width<I> }) / ({ Feature<I> })];
+type Packets<I, P> = m![I % ({ Run<I, P> }) / 16, I % ({ Width<I> }) / ({ Run<I, P> })];
 
 /// A part's inputs in the order the switch delivers them from the feature slices.
-type Switched<I> = m![{ Packets<I> }, I % 16];
+type Switched<I, P> = m![{ Packets<I, P> }, I % 16];
 
 /// A slice's weights in BF16, each code times its block scale, of its rows `T` (all of them by
 /// default), each row's inputs in [`Switched`] order.
 type Weights<I, O, P, T = m![O % ({ Owner<I, O, P> })]> =
-    DmTensor<bf16, Chip, Cluster<I, O, P>, Owners<I, O, P>, m![{ T }, { Switched<I> }]>;
+    DmTensor<bf16, Chip, Cluster<I, O, P>, Owners<I, O, P>, m![{ T }, { Switched<I, P> }]>;
 
 /// The rows of `N` of a slice's tiles in a place of their own, a tile's rows inner.
 type Tiled<I, O, P, N> = m![{ Symbol<N> }, { Elements<I, O, P> }];
@@ -274,7 +298,8 @@ pub(crate) trait Decodes: 'static {
 impl<I: AxisName, O: AxisName, P: Ownership> Decodes for Landed<I, O, P> {
     type Decoded<N: AxisName> = Decoded<I, O, P, N>;
     const TILES: usize = <Tiles<I, O, P> as M>::SIZE;
-    const TILE: usize = <m![{ Elements<I, O, P> }, { Switched<I> }] as M>::SIZE * size_of::<bf16>();
+    const TILE: usize =
+        <m![{ Elements<I, O, P> }, { Switched<I, P> }] as M>::SIZE * size_of::<bf16>();
     // Two 4-bit codes a byte.
     const LANDED: usize = <Packed<I, O, P> as M>::SIZE / 2 + <Lead<I, O, P> as M>::SIZE;
 }
@@ -424,11 +449,11 @@ trait Held<R: AxisName> {
     /// The groups' axis in the TRF, in a pass's time and in its sums.
     type Groups: M;
     /// The order a pass streams the weight's rows `T` of `I` inputs in, `C` of them a tile.
-    type Stream<I: AxisName, T: M, C: Count>: M;
+    type Stream<I: AxisName, T: M, C: Count, P: Ownership>: M;
     /// The time of that pass.
-    type Time<I: AxisName, T: M, C: Count>: M;
+    type Time<I: AxisName, T: M, C: Count, P: Ownership>: M;
     /// The packet of the weight a group meets each cycle.
-    type Packet<I: AxisName>: M;
+    type Packet<I: AxisName, P: Ownership>: M;
     /// The groups' rows of `X` values from a group on, as the switch reads them.
     type Rows<X: M>: M;
     /// The same rows as a pass writes them.
@@ -457,9 +482,9 @@ struct One;
 
 impl<R: AxisName> Held<R> for One {
     type Groups = m![1];
-    type Stream<I: AxisName, T: M, C: Count> = m![{ T }, { Packets<I> }];
-    type Time<I: AxisName, T: M, C: Count> = m![{ T }, { Packets<I> }, 1];
-    type Packet<I: AxisName> = m![I % 16];
+    type Stream<I: AxisName, T: M, C: Count, P: Ownership> = m![{ T }, { Packets<I, P> }];
+    type Time<I: AxisName, T: M, C: Count, P: Ownership> = m![{ T }, { Packets<I, P> }, 1];
+    type Packet<I: AxisName, P: Ownership> = m![I % 16];
     type Rows<X: M> = Layout<R>::Elements<X>;
     type RowsMut<X: M> = Layout<R>::GroupMut<X>;
 
@@ -495,11 +520,11 @@ struct Two;
 
 impl<R: AxisName> Held<R> for Two {
     type Groups = m![Twin];
-    type Stream<I: AxisName, T: M, C: Count> =
-        m![{ T } / ({ C }), { Packets<I> } / 2, { T } % ({ C }), { Packets<I> } % 2];
-    type Time<I: AxisName, T: M, C: Count> =
-        m![{ T } / ({ C }), { Packets<I> } / 2, { T } % ({ C }), Twin];
-    type Packet<I: AxisName> = m![{ Packets<I> } % 2, I % 16];
+    type Stream<I: AxisName, T: M, C: Count, P: Ownership> =
+        m![{ T } / ({ C }), { Packets<I, P> } / 2, { T } % ({ C }), { Packets<I, P> } % 2];
+    type Time<I: AxisName, T: M, C: Count, P: Ownership> =
+        m![{ T } / ({ C }), { Packets<I, P> } / 2, { T } % ({ C }), Twin];
+    type Packet<I: AxisName, P: Ownership> = m![{ Packets<I, P> } % 2, I % 16];
     type Rows<X: M> = m![Twin # ({ Layout<R>::Groups }), { Layout<R>::Lanes }, { X }];
     type RowsMut<X: M> = m![Twin #{!} ({ Layout<R>::Groups }), { Layout<R>::Lanes }, { X }];
 
@@ -553,7 +578,7 @@ type Holding<I, O, R, P, G> = TrfTensor<
     Cluster<I, O, P>,
     Owners<I, O, P>,
     Lane<R>,
-    m![{ <G as Held<R>>::Groups }, { Switched<I> }],
+    m![{ <G as Held<R>>::Groups }, { Switched<I, P> }],
 >;
 
 /// The tensor scale in the vector registers of every slice of a projection.
@@ -598,9 +623,9 @@ type HalfSpread<I, R> = DmTensor<
     InputCluster<I>,
     m![
         I % (I / 2) / ({ Width<I> }),
-        I % ({ Width<I> }) / ({ Feature<I> }) # ({ Symbol<Seats<I>> })
+        I % ({ Width<I> }) / ({ Run<I> }) # ({ Symbol<Seats<I>> })
     ],
-    m![R, I % ({ Feature<I> })],
+    m![R, I % ({ Run<I> })],
 >;
 
 /// A part of a cluster's half of a projection's inputs, and an input within its part, as axes of
@@ -894,7 +919,7 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
             rows.densely(device, |device, rows| {
                 let places = ahead.places(self, device);
                 let live = (rows, (first, count));
-                if const { paired::<I>() } {
+                if const { Source::<I, P>::SIZE <= 32 && paired::<I>() } {
                     places.passes::<Two, _>(device, live, (&mut projected, &global));
                 } else {
                     places.passes::<One, _>(device, live, (&mut projected, &global));
@@ -1020,7 +1045,7 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
             self.unpack(device, tile, move || {
                 place
                     .view_mut()
-                    .tile::<Tiles<I, O, P>, 1, WindowMut<I, O, P, Switched<I>>>(tile)
+                    .tile::<Tiles<I, O, P>, 1, WindowMut<I, O, P, Switched<I, P>>>(tile)
             });
         }
     }
@@ -1037,7 +1062,7 @@ impl<I: AxisName, O: AxisName, P: Ownership, C: Borrow<InDm<I, O, P>>> Landed<I,
             let place = &mut *weights;
             self.unpack(device, from + tile, move || {
                 place.view_mut().tile::<m![{ Symbol<N> }], 1, m![
-                    { Symbol<N> } = 1 #{!} ({ Symbol<N> }), { Elements<I, O, P> }, { Switched<I> }
+                    { Symbol<N> } = 1 #{!} ({ Symbol<N> }), { Elements<I, O, P> }, { Switched<I, P> }
                 ]>(tile)
             });
         }
@@ -1274,9 +1299,9 @@ trait Sums<I: AxisName, O: AxisName, R: AxisName, P: Ownership> {
         device
             .main
             .begin(weights.view())
-            .fetch::<G::Stream<I, T, C>, m![I % 16]>()
-            .collect::<G::Stream<I, T, C>, m![I % 16]>()
-            .contract_outer::<G::Time<I, T, C>, G::Packet<I>, _, _, _>(lanes)
+            .fetch::<G::Stream<I, T, C, P>, m![I % 16]>()
+            .collect::<G::Stream<I, T, C, P>, m![I % 16]>()
+            .contract_outer::<G::Time<I, T, C, P>, G::Packet<I, P>, _, _, _>(lanes)
             .contract_packet::<m![1]>()
             .contract_time::<m![{ T }, { G::Groups }]>()
             .contract_lane::<m![{ T }, { G::Groups }], m![{ Lane<R> } # 8]>(LaneMode::Interleaved)
@@ -2542,10 +2567,10 @@ impl<I: AxisName, O: AxisName, R: AxisName, P: Place<I, O, R>> Dense<I, O, R, P>
             .sub
             .begin(input)
             .fetch::<m![{ Lane<R> }, { G::Groups }, I % ({ Feature<I> }) / 16], m![I % 16]>()
-            .switch::<Owners<I, O, P>, m![{ Lane<R> }, { G::Groups }, { Packets<I> }]>(
+            .switch::<Owners<I, O, P>, m![{ Lane<R> }, { G::Groups }, { Packets<I, P> }]>(
                 SwitchConfig::CustomBroadcast { ring_size: 256 },
             )
-            .collect::<m![{ Lane<R> }, { G::Groups }, { Packets<I> }], m![I % 16]>()
+            .collect::<m![{ Lane<R> }, { G::Groups }, { Packets<I, P> }], m![I % 16]>()
             .to_trf()
     }
 }
@@ -2560,11 +2585,11 @@ impl<I: AxisName, O: AxisName, R: AxisName> Dense<I, O, R, Exchanged> for HalfSp
         device
             .sub
             .begin(G::rows(self.view(), group))
-            .fetch::<m![{ Lane<R> }, { G::Groups }, I % ({ Feature<I> }) / 16], m![I % 16]>()
-            .switch::<Owners<I, O, Exchanged>, m![{ Lane<R> }, { G::Groups }, { Packets<I> }]>(
+            .fetch::<m![{ Lane<R> }, { G::Groups }, I % ({ Run<I> }) / 16], m![I % 16]>()
+            .switch::<Owners<I, O, Exchanged>, m![{ Lane<R> }, { G::Groups }, { Packets<I, Exchanged> }]>(
                 SwitchConfig::CustomBroadcast { ring_size: 256 },
             )
-            .collect::<m![{ Lane<R> }, { G::Groups }, { Packets<I> }], m![I % 16]>()
+            .collect::<m![{ Lane<R> }, { G::Groups }, { Packets<I, Exchanged> }], m![I % 16]>()
             .to_trf()
     }
 }
@@ -2661,8 +2686,8 @@ fn halve<H: AxisName, I: AxisName, R: AxisName>(
                 ),
                 spread.view_mut().reshape::<Chip, InputCluster<I>, m![
                     { Which<I> },
-                    { At<I> } / ({ Feature<I> }) # ({ Symbol<Seats<I>> })
-                ], m![R, { At<I> } % ({ Feature<I> })]>(),
+                    { At<I> } / ({ Run<I> }) # ({ Symbol<Seats<I>> })
+                ], m![R, { At<I> } % ({ Run<I> })]>(),
             )
         };
         from.to_dm_view(&mut device.tdma, into);
@@ -2853,10 +2878,9 @@ pub(crate) fn swap_terms<O: AxisName, R: AxisName, C: M>(
     }
 }
 
-/// Whether a pass over a decoded weight of `I` inputs holds two lane groups: where a feature slice
-/// holds one packet of a row, so the switch of the next two takes a step a row, shorter than a pass.
+/// Whether a pair's source run takes at most two packets, bounding its ring fill to 32 steps.
 const fn paired<I: AxisName>() -> bool {
-    normalization::Chunk::<I>::SIZE == 16
+    Source::<I>::SIZE <= 32
 }
 
 /// Inputs of a row in each of the fewest power-of-two parts whose `rows` rows fill at most half of
