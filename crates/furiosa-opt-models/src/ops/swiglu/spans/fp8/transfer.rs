@@ -336,7 +336,7 @@ pub(super) fn load_rows<
         load_prefix::<R, 8, _, _, _, _, _, _>(device, source, output);
     }
 }
-fn load_prefix<
+pub(super) fn load_prefix<
     R: AxisName,
     const N: usize,
     D: MaterializableScalar,

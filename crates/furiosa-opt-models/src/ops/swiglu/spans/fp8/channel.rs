@@ -166,7 +166,6 @@ impl<H: AxisName, I: AxisName> Op<Begin<()>> for GateUpWeights<H, I> {
     }
 }
 
-type StoredProducts<I, R> = m![{Cluster<I>}, {Blocks<I>}, R, {Out<I>}];
 type StoredTokens<I, R> = HbmTensor<f32, Chip, m![{Cluster<I>}, R]>;
 type DownScales<H, I, R> = DmTensor<f32, Chip, Cluster<I>, m![H / 16], m![R]>;
 type PackedPanel<R, const B: usize> = HbmTensor<
@@ -177,7 +176,6 @@ type PackedPanel<R, const B: usize> = HbmTensor<
 
 /// The span's product and complete-token scales, with the first weight panel prefetched.
 pub struct Staging<H: AxisName, I: AxisName, R: AxisName> {
-    products: HbmTensor<bf16, Chip, StoredProducts<I, R>>,
     panels: (
         PackedPanel<R, 64>,
         PackedPanel<R, 64>,
@@ -200,8 +198,8 @@ impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName>
         Begin((projected, decode)): Begin<(Live<(Projection<I, R>, Projection<I, R>), C>, bool)>,
     ) -> Self::Output {
         let rows = projected.rows();
-        // Small spans reuse the token scales across all four panel quantizers. Preserve
-        // DM residency for pure decode launches even when their span exceeds 256 rows.
+        // Retain the existing short-span/decode scale policy for down output rescaling.
+        // All product panel quantizers share the full-token scale before HBM staging.
         let resident_scales = decode || rows <= 256;
         let (gate, up) = projected.into_value();
         use super::super::product;
@@ -226,39 +224,14 @@ impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName>
             };
             scales.to_hbm_view(&mut device.tdma, stored_scales.view_mut());
         }
-        let mut products = HbmTensor::new();
-        let mut panels = (
-            PackedPanel::new(),
-            PackedPanel::new(),
-            PackedPanel::new(),
-            PackedPanel::new(),
+        let scales = product_scale_operand(device, &factors);
+        let panels = (
+            quantize_panel(device, &product, &scales, 0, rows),
+            quantize_panel(device, &product, &scales, 1, rows),
+            quantize_panel(device, &product, &scales, 2, rows),
+            quantize_panel(device, &product, &scales, 3, rows),
         );
-        if rows <= 256 {
-            // Preserve Qwen's small-product route: redistribute BF16, then quantize in the
-            // down owners. Its divisor is still the maximum over the entire 14336-feature row.
-            // SAFETY: retain the same wave/half/lane permutation as Qwen; a native owner
-            // has one feature run rather than three uniform panels.
-            let values = unsafe {
-                product.view().reshape::<Chip, Cluster<I>, Slice<I, R>,
-                    m![1, R % (R / 8) / 16, R % 16 / 8, R % 8, {Out<I>}]>()
-            };
-            let stored = unsafe {
-                products
-                    .view_mut()
-                    .reshape::<Chip, ProductStore<I, R, m![1], m![{Out<I>}]>>()
-            };
-            store_rows(device, values, stored, rows);
-        } else {
-            let scales = product_scale_operand(device, &factors);
-            panels = (
-                quantize_panel(device, &product, &scales, 0, rows),
-                quantize_panel(device, &product, &scales, 1, rows),
-                quantize_panel(device, &product, &scales, 2, rows),
-                quantize_panel(device, &product, &scales, 3, rows),
-            );
-        }
         Staging {
-            products,
             panels,
             scales: if resident_scales {
                 factors
@@ -279,7 +252,6 @@ impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName> Op<Live<Staging<H, I, R
     fn forward(&self, device: &mut Device, staging: Live<Staging<H, I, R>, C>) -> Self::Output {
         let rows = staging.rows();
         let Staging {
-            products,
             panels: (p0, p1, p2, p3),
             scales,
             stored_scales,
@@ -310,16 +282,7 @@ impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName> Op<Live<Staging<H, I, R
             first,
             rows,
             (
-                |device, panel| {
-                    load_product(
-                        device,
-                        &products,
-                        [&p0, &p1, &p2][panel],
-                        (resident_scales, &scales, &stored_scales),
-                        panel,
-                        rows,
-                    )
-                },
+                |device, panel| load_product(device, [&p0, &p1, &p2][panel], rows),
                 |device, panel| down::<H, I, 64>(device, self, panel),
                 |device, weight, input| project_panel(device, weight, &input, &row, &channel, rows),
             ),
@@ -327,14 +290,7 @@ impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName> Op<Live<Staging<H, I, R
                 |device| {
                     (
                         down::<H, I, 32>(device, self, 3),
-                        load_product(
-                            device,
-                            &products,
-                            &p3,
-                            (resident_scales, &scales, &stored_scales),
-                            3,
-                            rows,
-                        ),
+                        load_product(device, &p3, rows),
                     )
                 },
                 |device, (weight, input), sum| {
@@ -479,18 +435,48 @@ fn quantize_panel<I: AxisName, R: AxisName, const B: usize>(
     > = DmTensor::new();
     Quantizer::<I, R, B>::rows(&mut device.main, band, scales)
         .commit_prefix::<m![R % (R / 8)], _, _>(packed.view_mut(), rows.div_ceil(64) * 8);
-    // SAFETY: only row labels and equal-sized owner coordinates change; the packed stride is B.
+    // SAFETY: the same eight-row owner permutation, with compact B-feature rows.
     let band = unsafe {
         packed.view().reshape::<Chip, Cluster<Inputs<B>>,
-        m![{Blocks<Inputs<B>>}, R % 64 / 8],
-        m![R / 128, R % 128 / 64, R % 8, {Symbol<Inputs<B>>} % {B}]>()
+            m![{Blocks<Inputs<B>>}, R % 64 / 8],
+            m![R / 64, R % 8, {Symbol<Inputs<B>>} % {B}]>()
     };
+    fn store<R: AxisName, const B: usize, const N: usize, const G: usize, const W: usize>(
+        device: &mut Device,
+        band: DmTensorView<
+            '_,
+            f8e4m3,
+            Chip,
+            Cluster<Inputs<B>>,
+            m![{Blocks<Inputs<B>>}, R % 64 / 8],
+            m![R / 64, R % 8, {Symbol<Inputs<B>>} % {B}],
+        >,
+        output: &mut PackedPanel<R, B>,
+    ) {
+        const {
+            assert!(N == G * W * 8 && G <= 8 && (W == 1 || G == 8));
+        }
+        band.slice_tile::<m![R % 64 / 8], G,
+                m![{Blocks<Inputs<B>>}, R % 64 / 8 = {G} # 8]>(0)
+            .tile::<m![R / 64], W,
+                m![R / 64 = {W} # (R / 64), R % 8, {Symbol<Inputs<B>>} % {B}]>(0)
+            .to_hbm_view(&mut device.tdma, output.view_mut().tile::<m![R], N,
+                m![{Cluster<Inputs<B>>}, {Blocks<Inputs<B>>}, R = {N} #{!} R, {Symbol<Inputs<B>>} % {B}]>(0));
+    }
     let mut stored = PackedPanel::new();
-    band.to_hbm_view(&mut device.tdma, stored.view_mut());
+    match rows {
+        0..=8 => store::<R, B, 8, 1, 1>(device, band, &mut stored),
+        9..=16 => store::<R, B, 16, 2, 1>(device, band, &mut stored),
+        17..=32 => store::<R, B, 32, 4, 1>(device, band, &mut stored),
+        33..=64 => store::<R, B, 64, 8, 1>(device, band, &mut stored),
+        65..=128 => store::<R, B, 128, 8, 2>(device, band, &mut stored),
+        129..=256 => store::<R, B, 256, 8, 4>(device, band, &mut stored),
+        _ => store::<R, B, 512, 8, 8>(device, band, &mut stored),
+    }
     stored
 }
 /// Reorder the gate/up row digits once and broadcast the unchanged FP32 token scales to
-/// down's slices in DM. Reuse this buffer for all panel quantizers and output rescaling.
+/// down's slices in DM for output rescaling across all four panels.
 fn down_scale_rows<H: AxisName, I: AxisName, R: AxisName>(
     device: &mut Device,
     scales: &TokenScales<I, R>,
@@ -548,86 +534,29 @@ fn down_scale_operand<H: AxisName, I: AxisName, R: AxisName>(
         .collect::<m![{Groups<R>}], m![{RowLanes<R>}]>()
         .to_vrf()
 }
-fn load_product<H: AxisName, I: AxisName, R: AxisName, const B: usize>(
+/// Reload exactly the store's transfer capacity into down's output owners. Products are
+/// already FP8 under the full-token scale; this performs no panel-local quantization.
+fn load_product<H: AxisName, R: AxisName, const B: usize>(
     device: &mut Device,
-    products: &HbmTensor<bf16, Chip, StoredProducts<I, R>>,
     packed: &PackedPanel<R, B>,
-    (resident_scales, scales, stored_scales): (bool, &DownScales<H, I, R>, &StoredTokens<I, R>),
-    panel: usize,
     rows: usize,
 ) -> Activation<H, Inputs<B>, R, B> {
-    if rows > 256 {
-        return packed.to_dm(&mut device.tdma);
-    }
-    let band = products
-        .view()
-        .tile::<Out<I>, B, m![{Cluster<I>}, {Blocks<I>}, R, {Out<I>} = {B} # (I / 64)]>(64 * panel);
-    // SAFETY: packed-panel coordinates preserve each intermediate owner's selected band.
-    let band = unsafe {
-        band.reshape::<Chip,
-        m![{m![{Cluster<Inputs<B>>}, {Blocks<Inputs<B>>}]}, R, {Symbol<Inputs<B>>} % {B} # (I / 64)]>()
+    let mut output = Activation::new();
+    // SAFETY: grouping the cluster/input-owner digits leaves the stored row order unchanged.
+    let source = unsafe {
+        packed.view().reshape::<Chip,
+            m![{m![{Cluster<Inputs<B>>}, {Blocks<Inputs<B>>}]}, R, {Symbol<Inputs<B>>} % {B}]>()
     };
-    let mut values: DmTensor<
-        bf16,
-        Chip,
-        Cluster<Inputs<B>>,
-        DownSlice<H, Inputs<B>>,
-        m![R, {Symbol<Inputs<B>>} % {B}],
-    > = DmTensor::new();
-    load_rows(device, band, values.view_mut(), rows);
-    let scale: VrfTensor<f32, Chip, Cluster<Inputs<B>>, DownSlice<H, Inputs<B>>, m![R]> =
-        if resident_scales {
-            // SAFETY: each slice has the same scales. Rename coordinates without redistribution.
-            let scales = unsafe {
-                scales
-                    .view()
-                    .reshape::<Chip, Cluster<Inputs<B>>, DownSlice<H, Inputs<B>>, m![R]>()
-            };
-            device
-                .sub
-                .begin(scales)
-                .fetch::<m![R / 8], m![R % 8]>()
-                .collect::<m![R / 8], m![R % 8]>()
-                .to_vrf()
-        } else {
-            // Preserve the prefill path's panel-local HBM load and buffer lifetime.
-            let source = unsafe {
-                stored_scales
-                    .view()
-                    .reshape::<Chip, m![{Cluster<Inputs<B>>}, R, 1]>()
-            };
-            let mut loaded: DmTensor<
-                f32,
-                Chip,
-                Cluster<Inputs<B>>,
-                DownSlice<H, Inputs<B>>,
-                m![R, 1],
-            > = DmTensor::new();
-            load_rows(device, source, loaded.view_mut(), rows);
-            // SAFETY: removing the unit feature digit does not change scale storage.
-            let factors = unsafe {
-                loaded.reshape::<Chip, Cluster<Inputs<B>>, DownSlice<H, Inputs<B>>, m![R]>()
-            };
-            device
-                .sub
-                .begin(factors.view())
-                .fetch::<m![R / 8], m![R % 8]>()
-                .collect::<m![R / 8], m![R % 8]>()
-                .to_vrf()
-        };
-    type Quantizer<R, const B: usize> = Quantization<
-        m![R, {Symbol<Inputs<B>>} % {B} / 8],
-        m![R, {Symbol<Inputs<B>>} % {B} / 4],
-        Inputs<B>,
-        m![R],
-        m![1 # 256],
-        m![R / 4],
-        m![R % 4],
-    >;
-    let mut codes = Activation::new();
-    Quantizer::<R, B>::rows(&mut device.main, values.view(), &scale)
-        .commit_prefix::<m![R], _, _>(codes.view_mut(), rows.next_multiple_of(8));
-    codes
+    match rows {
+        0..=8 => load_prefix::<R, 8, _, _, _, _, _, _>(device, source, output.view_mut()),
+        9..=16 => load_prefix::<R, 16, _, _, _, _, _, _>(device, source, output.view_mut()),
+        17..=32 => load_prefix::<R, 32, _, _, _, _, _, _>(device, source, output.view_mut()),
+        33..=64 => load_prefix::<R, 64, _, _, _, _, _, _>(device, source, output.view_mut()),
+        65..=128 => load_prefix::<R, 128, _, _, _, _, _, _>(device, source, output.view_mut()),
+        129..=256 => load_prefix::<R, 256, _, _, _, _, _, _>(device, source, output.view_mut()),
+        _ => source.to_dm_view(&mut device.tdma, output.view_mut()),
+    }
+    output
 }
 fn project_panel<H: AxisName, I: AxisName, R: AxisName, const B: usize>(
     device: &mut Device,
@@ -689,22 +618,8 @@ mod tests {
         } else {
             DownScales::new()
         };
-        let first = load_product::<H, I, R, 64>(
-            device,
-            &staged.products,
-            &staged.panels.0,
-            (resident_scales, &scales, &staged.stored_scales),
-            0,
-            live.rows(),
-        );
-        let tail = load_product::<H, I, R, 32>(
-            device,
-            &staged.products,
-            &staged.panels.3,
-            (resident_scales, &scales, &staged.stored_scales),
-            3,
-            live.rows(),
-        );
+        let first = load_product::<H, R, 64>(device, &staged.panels.0, live.rows());
+        let tail = load_product::<H, R, 32>(device, &staged.panels.3, live.rows());
         let mut first_stored = PackedPanel::<R, 64>::new();
         first
             .view()
@@ -727,7 +642,7 @@ mod tests {
         (first_stored, tail_stored, stored_scales)
     }
 
-    /// Both transfer routes quantize panels with one token scale, including a maximum in the tail.
+    /// Trimmed FP8 stores/reloads preserve one token scale, including a maximum in the tail.
     #[tokio::test(flavor = "current_thread")]
     async fn products_preserve_token_scales_and_live_rows() {
         let _lease = DEVICE.lock().await;
