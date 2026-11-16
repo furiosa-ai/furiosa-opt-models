@@ -799,7 +799,12 @@ impl<W> Affine<W, ()> {
                 crate::Module::forward(boundary, device, (), &mut (), &mut *state);
             }
         };
-        Contraction::<In, Out, Code>::resident::<P, _, _, _, _>(device, &self.weight, input, restored)
+        Contraction::<In, Out, Code>::resident::<P, _, _, _, _>(
+            device,
+            &self.weight,
+            input,
+            restored,
+        )
     }
 
     /// The live lane groups of `input`'s rows, each staged from where `group` reads it and
