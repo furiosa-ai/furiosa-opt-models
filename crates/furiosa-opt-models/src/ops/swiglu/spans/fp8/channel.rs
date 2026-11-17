@@ -167,7 +167,7 @@ impl<H: AxisName, I: AxisName> Op<Begin<()>> for GateUpWeights<H, I> {
 }
 
 type StoredTokens<I, R> = HbmTensor<f32, Chip, m![{Cluster<I>}, R]>;
-type DownScales<H, I, R> = DmTensor<f32, Chip, Cluster<I>, m![H / 16], m![R]>;
+type DownScales<H, I, R> = down::TokenScales<H, I, R>;
 type PackedPanel<R, const B: usize> = HbmTensor<
     f8e4m3,
     Chip,
@@ -258,16 +258,10 @@ impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName> Op<Live<Staging<H, I, R
             resident_scales,
             first,
         } = staging.into_value();
-        let scales = if resident_scales {
+        let row = if resident_scales {
             down_scale_rows::<H, I, R>(device, &scales, rows)
         } else {
-            DownScales::new()
-        };
-        let row = if resident_scales {
-            down_scale_operand(device, &scales)
-        } else {
-            let loaded = stored_scales.to_dm(&mut device.tdma);
-            down_scale_operand(device, &loaded)
+            stored_scales.to_dm(&mut device.tdma)
         };
         let channel: DmTensor<bf16, Chip, Cluster<I>, m![H / 16], m![H % 16]> =
             self.1.to_dm(&mut device.tdma);
@@ -524,17 +518,6 @@ fn down_scale_rows<H: AxisName, I: AxisName, R: AxisName>(
         _ => transfer::<H, I, R, 512, 8, 8>(device, scales),
     }
 }
-fn down_scale_operand<H: AxisName, I: AxisName, R: AxisName>(
-    device: &mut Device,
-    scales: &DownScales<H, I, R>,
-) -> PanelScale<H, I, R> {
-    device
-        .sub
-        .begin(scales.view())
-        .fetch::<m![{Groups<R>}], m![{RowLanes<R>}]>()
-        .collect::<m![{Groups<R>}], m![{RowLanes<R>}]>()
-        .to_vrf()
-}
 /// Reload exactly the store's transfer capacity into down's output owners. Products are
 /// already FP8 under the full-token scale; this performs no panel-local quantization.
 fn load_product<H: AxisName, R: AxisName, const B: usize>(
@@ -563,15 +546,24 @@ fn project_panel<H: AxisName, I: AxisName, R: AxisName, const B: usize>(
     device: &mut Device,
     weight: &Down<H, Inputs<B>, B>,
     input: &Activation<H, Inputs<B>, R, B>,
-    row: &PanelScale<H, I, R>,
+    row: &DownScales<H, I, R>,
     channel: &down::ChannelScales<H, I>,
     rows: usize,
 ) -> Partial<H, I, R> {
-    let partial = down::trimmed(device, weight, input, rows);
-    // SAFETY: both cluster axes name the same intermediate input halves; outputs are unchanged.
-    let partial: Partial<H, I, R> = unsafe { partial.reshape() };
-    down::Rescale::<R>(core::marker::PhantomData)
-        .forward(device, (&partial, (row, channel), rows.div_ceil(8)))
+    // SAFETY: each packed panel and the full intermediate width have the same two
+    // clusters and 32 input owners per cluster. Relabel only their B-feature bands;
+    // the weights, activations and scale operands keep their physical placement.
+    let weight = unsafe {
+        weight
+            .view()
+            .reshape::<Chip, Cluster<I>, DownSlice<H, I>, m![H % (H / 8), I % { B }]>()
+    };
+    let input = unsafe {
+        input
+            .view()
+            .reshape::<Chip, Cluster<I>, DownSlice<H, I>, m![R, I % { B }]>()
+    };
+    down::trimmed(device, &weight, &input, rows, (&row.view(), channel))
 }
 
 #[cfg(test)]
@@ -747,7 +739,18 @@ mod tests {
         input: &Input,
         rows: usize,
         panel: usize,
+        tokens: &HbmTensor<f32, Chip, m![R]>,
     ) -> Output {
+        let row: DownScales<H, I, R> = tokens.to_dm(&mut device.tdma);
+        let channel: DmTensor<bf16, Chip, Cluster<I>, m![H / 16], m![H % 16]> =
+            weight.1.to_dm(&mut device.tdma);
+        let channel: down::ChannelScales<H, I> = device
+            .sub
+            .begin(channel.view())
+            .fetch::<m![H % 16 / 8], m![H % 8]>()
+            .fetch_cast::<f32>()
+            .collect::<m![H % 16 / 8], m![H % 8]>()
+            .to_vrf();
         let weight = down::<H, I, B>(device, weight, panel);
         // SAFETY: split the complete intermediate width into the same cluster and 224-feature
         // owner runs as the weights; the selected B-feature bands retain their original strides.
@@ -764,9 +767,7 @@ mod tests {
             input.reshape::<Chip, m![R, {Cluster<Inputs<B>>}, {Blocks<Inputs<B>>}, {Symbol<Inputs<B>>} % {B} # (I / 64)]>()
         };
         let input: Activation<H, Inputs<B>, R, B> = input.to_dm(&mut device.tdma);
-        let partial = super::super::down::trimmed(device, &weight, &input, rows);
-        // SAFETY: the packed-panel and full-intermediate axes name the same input-half clusters.
-        let partial: Partial<H, I, R> = unsafe { partial.reshape() };
+        let partial = project_panel(device, &weight, &input, &row, &channel, rows);
         partial.to_hbm(&mut device.tdma)
     }
 
@@ -776,20 +777,21 @@ mod tests {
         weight: &DownWeights<H, I>,
         input: &Input,
         count: &Value,
+        tokens: &HbmTensor<f32, Chip, m![R]>,
     ) -> (Output, Output, Output, Output) {
         let rows = Live::<(), R>::read(count).rows();
         (
-            project::<64>(device, weight, input, rows, 0),
-            project::<64>(device, weight, input, rows, 1),
-            project::<64>(device, weight, input, rows, 2),
-            project::<32>(device, weight, input, rows, 3),
+            project::<64>(device, weight, input, rows, 0, tokens),
+            project::<64>(device, weight, input, rows, 1, tokens),
+            project::<64>(device, weight, input, rows, 2, tokens),
+            project::<32>(device, weight, input, rows, 3, tokens),
         )
     }
 
     /// The fourth panel is precisely features 192..224 of every 224-feature owner; dense dots
     /// span all 32 input slices per cluster, with poisoned rows beyond the live prefix.
     #[tokio::test(flavor = "current_thread")]
-    async fn native_down_tail_uses_each_owners_last_32_features() {
+    async fn down_panels_scale_fp32_sums_before_bf16_commit() {
         let _lease = DEVICE.lock().await;
         let mut device = Device::new(panels.topology()).unwrap();
         fn coefficient(output: usize, input: usize) -> f32 {
@@ -809,12 +811,18 @@ mod tests {
             .await
             .unwrap();
         let codes = (full, tail);
-        let scales = HostTensor::<bf16, m![H]>::from_vec(vec![bf16::from_f32(1.0); H::SIZE])
-            .to_hbm(&mut device.pdma)
-            .await
-            .unwrap();
+        let channel_scale = |out: usize| bf16::from_f32(0.13 + (out % 5) as f32 * 0.17).to_f32();
+        let token_scale = |row: usize| (row % 7 + 3) as f32 / 11.0;
+        let scales = HostTensor::<bf16, m![H]>::from_vec(
+            (0..H::SIZE).map(|out| bf16::from_f32(channel_scale(out))),
+        )
+        .to_hbm(&mut device.pdma)
+        .await
+        .unwrap();
         let weight = DownWeights::new(codes, scales);
-        for rows in [1, 8, 9, 16, 17, 24, 25, 32, 33, 257, 512] {
+        for rows in [
+            1, 8, 9, 16, 17, 24, 25, 32, 33, 129, 255, 256, 257, 497, 512,
+        ] {
             let input =
                 HostTensor::<f8e4m3, m![R, I]>::from_vec((0..R::SIZE * I::SIZE).map(|at| {
                     f8e4m3::from_f32(if at / I::SIZE < rows {
@@ -830,7 +838,13 @@ mod tests {
                 .to_hbm(&mut device.pdma)
                 .await
                 .unwrap();
-            let outputs = launch(panels, (&mut device, &weight, &input, &count))
+            let tokens = HostTensor::<f32, m![R]>::from_vec(
+                (0..R::SIZE).map(|r| if r < rows { token_scale(r) } else { f32::NAN }),
+            )
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap();
+            let outputs = launch(panels, (&mut device, &weight, &input, &count, &tokens))
                 .await
                 .unwrap();
             let outputs = [outputs.0, outputs.1, outputs.2, outputs.3];
@@ -858,14 +872,17 @@ mod tests {
                                         * f8e4m3::from_f32((i % 17 + 1) as f32 / 16.0).to_f32()
                                 })
                                 .sum();
-                            bf16::from_f32(dot).to_f32()
+                            dot
                         })
                         .collect();
                     for row in 0..rows {
                         for out in 0..H::SIZE {
                             assert_eq!(
                                 actual[(cluster * R::SIZE + row) * H::SIZE + out].to_f32(),
-                                reference[out % 5],
+                                bf16::from_f32(
+                                    (reference[out % 5] * token_scale(row)) * channel_scale(out)
+                                )
+                                .to_f32(),
                                 "rows={rows} panel-offset={offset} cluster={cluster} row={row} out={out}"
                             );
                         }

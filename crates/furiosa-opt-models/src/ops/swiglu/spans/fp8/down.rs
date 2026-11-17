@@ -55,7 +55,13 @@ impl<'a, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, const B: usiz
             (usize, usize),
         ),
     ) -> Self::Output {
-        project::<Hidden, Intermediate, Rows, B, WAVE, 4>(context, weight, product, rows)
+        project::<Hidden, Intermediate, Rows, B, WAVE, 4>(
+            context,
+            &weight.view(),
+            &product.view(),
+            rows,
+            None,
+        )
     }
 }
 
@@ -257,22 +263,37 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
     }
 }
 
+/// Full-token scales remain in DM; each contraction wave fetches its own row window.
+pub(super) type TokenScales<H, I, R> = DmTensor<f32, Chip, Cluster<I>, m![H / 16], m![R]>;
+type FusedScales<'a, H, I, R> = (
+    &'a DmTensorView<'a, f32, Chip, Cluster<I>, m![H / 16], m![R]>,
+    &'a ChannelScales<H, I>,
+);
+
 /// The native channel-scaled path uses eight or sixteen rows when possible, then Qwen's
 /// 32-row coverage. A three-group transpose cannot gather its 24 columns on this compiler.
 pub(super) fn trimmed<H: AxisName, I: AxisName, R: AxisName, const B: usize>(
     context: &mut Device,
-    weight: &Down<H, I, B>,
-    product: &Activation<H, I, R, B>,
+    weight: &DmTensorView<
+        '_,
+        f8e4m3,
+        Chip,
+        Cluster<I>,
+        DownSlice<H, I>,
+        m![H % (H / 8), I % { B }],
+    >,
+    product: &DmTensorView<'_, f8e4m3, Chip, Cluster<I>, DownSlice<H, I>, m![R, I % { B }]>,
     rows: usize,
+    scales: FusedScales<'_, H, I, R>,
 ) -> Partial<H, I, R> {
     if rows <= 32 {
         match rows.div_ceil(8) {
-            1 => project::<H, I, R, B, 32, 1>(context, weight, product, rows),
-            2 => project::<H, I, R, B, 32, 2>(context, weight, product, rows),
-            _ => project::<H, I, R, B, 32, 4>(context, weight, product, rows),
+            1 => project::<H, I, R, B, 32, 1>(context, weight, product, rows, Some(scales)),
+            2 => project::<H, I, R, B, 32, 2>(context, weight, product, rows, Some(scales)),
+            _ => project::<H, I, R, B, 32, 4>(context, weight, product, rows, Some(scales)),
         }
     } else {
-        project::<H, I, R, B, WAVE, 4>(context, weight, product, rows)
+        project::<H, I, R, B, WAVE, 4>(context, weight, product, rows, Some(scales))
     }
 }
 fn project<
@@ -284,9 +305,24 @@ fn project<
     const G: usize,
 >(
     context: &mut Device,
-    weight: &Down<Hidden, Intermediate, B>,
-    product: &Activation<Hidden, Intermediate, Rows, B>,
+    weight: &DmTensorView<
+        '_,
+        f8e4m3,
+        Chip,
+        Cluster<Intermediate>,
+        DownSlice<Hidden, Intermediate>,
+        m![Hidden % (Hidden / 8), Intermediate % { B }],
+    >,
+    product: &DmTensorView<
+        '_,
+        f8e4m3,
+        Chip,
+        Cluster<Intermediate>,
+        DownSlice<Hidden, Intermediate>,
+        m![Rows, Intermediate % { B }],
+    >,
     rows: usize,
+    scales: Option<FusedScales<'_, Hidden, Intermediate, Rows>>,
 ) -> Partial<Hidden, Intermediate, Rows> {
     const { assert!(Hidden::SIZE / 16 == 256, "written for 16-output slices") };
     type Batch<Rows, const W: usize> = m![Rows = { W }];
@@ -334,10 +370,17 @@ fn project<
     };
     let project = |context: &mut Device,
                    (weight, lanes): (
-        &Down<Hidden, Intermediate, B>,
+        &DmTensorView<
+            '_,
+            f8e4m3,
+            Chip,
+            Cluster<Intermediate>,
+            DownSlice<Hidden, Intermediate>,
+            m![Hidden % (Hidden / 8), Intermediate % { B }],
+        >,
         &Operand<Hidden, Intermediate, Rows, Batch<Rows, W>, W, B, G>,
     ),
-                   (output, quarters): (
+                   (output, quarters, at): (
         DmTensorViewMut<
             '_,
             bf16,
@@ -347,10 +390,11 @@ fn project<
             m![Rows = { W } #{!} Rows, Hidden % 16],
         >,
         usize,
+        usize,
     )| {
         let contracted = context
             .main
-            .begin(weight.view())
+            .begin(weight.clone())
             .fetch::<m![
                 { Batch<Rows, W> } % { W } / 32,
                 Hidden % 16 / 4,
@@ -402,8 +446,40 @@ fn project<
                 { Batch<Rows, W> } / { W },
                 Hidden % 4,
                 DownGroups = {G}
-            ]>(InterSliceReduceOpF32::Add)
-            .vector_final()
+            ]>(InterSliceReduceOpF32::Add);
+        let contracted = if let Some((row, channel)) = scales {
+            // SAFETY: name the selected wave's row digits as the contraction does. The
+            // window retains canonical row order, including the second 256-row wave.
+            let row = unsafe {
+                row.clone().tile::<m![Rows], W, m![Rows = {W} # Rows]>(at)
+                    .unpad::<m![Rows = {W}]>()
+                    .reshape::<Chip, Cluster<Intermediate>, m![Hidden / 16],
+                        m![{Batch<Rows, W>} % {W} / 32, DownGroups, Rows % 8]>()
+            };
+            let row = context.sub.begin(row.tile::<m![DownGroups], G,
+                    m![{Batch<Rows, W>} % {W} / 32, DownGroups = {G} # 4, Rows % 8]>(0))
+                .fetch::<m![{Batch<Rows, W>} % {W} / 32, DownGroups = {G}], m![Rows % 8]>()
+                .collect::<m![{Batch<Rows, W>} % {W} / 32, DownGroups = {G}], m![Rows % 8]>()
+                .to_vrf::<m![{Batch<Rows, W>} % {W} / 32, DownGroups = {G}, Rows % 8]>();
+            // Scale the complete FP32 slice sum before its first BF16 rounding. The
+            // channel path has no unscaled partial in DM; Qwen retains its old boundary.
+            contracted
+                .vector_intra_slice_tag(TagMode::Zero)
+                .vector_narrow_split::<m![
+                    {Batch<Rows, W>} % {W} / 32, Hidden % 16 / 4,
+                    {Batch<Rows, W>} / {W}, Hidden % 4, DownGroups = {G}, Rows % 8 / 4
+                ], m![Rows % 4]>()
+                .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &row)
+                .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), channel)
+                .vector_widen_concat::<m![
+                    {Batch<Rows, W>} % {W} / 32, Hidden % 16 / 4,
+                    {Batch<Rows, W>} / {W}, Hidden % 4, DownGroups = {G}
+                ], m![{RowLanes<Rows>} # 8]>()
+                .vector_final()
+        } else {
+            contracted.vector_final()
+        };
+        let contracted = contracted
             .cast::<bf16, m![{ RowLanes<Rows> } # 16]>()
             .transpose::<m![
                 { Batch<Rows, W> } % { W } / 32,
@@ -435,7 +511,7 @@ fn project<
     let mut lanes = down_lanes(
         context,
         product
-            .view()
+            .clone()
             .tile::<m![Rows], W, m![Rows = { W } # Rows, Intermediate % {B}]>(0)
             .unpad::<m![Rows = { W }, Intermediate % { B }]>(),
         quarters,
@@ -451,13 +527,14 @@ fn project<
                         .view_mut()
                         .tile::<m![Rows], W, m![Rows = {W} #{!} Rows, Hidden % 16]>(0),
                     quarters,
+                    0,
                 ),
             );
         } else {
             let next = down_lanes(
                 context,
                 product
-                    .view()
+                    .clone()
                     .tile::<m![Rows], W, m![Rows = { W } # Rows, Intermediate % {B}]>(upcoming * W)
                     .unpad::<m![Rows = { W }, Intermediate % { B }]>(),
                 quarters - W / 32 * (pair + 1),
@@ -470,6 +547,7 @@ fn project<
                         .view_mut()
                         .tile::<m![Rows], W, m![Rows = { W } #{!} Rows, Hidden % 16]>(pair * W),
                     quarters - W / 32 * pair,
+                    pair * W,
                 ),
             );
             lanes = next;
