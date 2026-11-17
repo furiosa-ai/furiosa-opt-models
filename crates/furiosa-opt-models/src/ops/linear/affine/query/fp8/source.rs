@@ -20,17 +20,17 @@ impl<Hidden: AxisName, Heads: AxisName, Head: AxisName> Op<&mut Weight<Hidden, H
     }
 }
 
-pub(crate) struct Scales<'a, Hidden: AxisName, Heads: AxisName, Head: AxisName> {
-    pub(crate) stored: &'a HbmTensor<f32, Chip, m![Heads, Head]>,
+pub(crate) struct Scales<'a, Hidden: AxisName, Heads: AxisName, Head: AxisName, D: Scalar = f32> {
+    pub(crate) stored: &'a HbmTensor<D, Chip, m![Heads, Head]>,
     pub(crate) hidden: PhantomData<Hidden>,
 }
 
-impl<Hidden: AxisName, Heads: AxisName, Head: AxisName> Op<&mut ValueScale<Hidden, Heads, Head>>
-    for Scales<'_, Hidden, Heads, Head>
+impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, D: MaterializableScalar>
+    Op<&mut ValueScale<Hidden, Heads, Head, D>> for Scales<'_, Hidden, Heads, Head, D>
 {
     type Output = ();
 
-    fn forward(&self, device: &mut Device, slot: &mut ValueScale<Hidden, Heads, Head>) {
+    fn forward(&self, device: &mut Device, slot: &mut ValueScale<Hidden, Heads, Head, D>) {
         self.stored
             .view()
             .to_dm_view(&mut device.tdma, slot.view_mut());

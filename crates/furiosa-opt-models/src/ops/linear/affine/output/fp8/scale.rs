@@ -52,11 +52,11 @@ impl<
 pub(super) struct Rescale;
 
 /// The partial sums, the row and channel scales, and the row groups a [`Rescale`] writes.
-type Operands<'a, Hidden, QWidth, Capacity, D> = (
+type Operands<'a, Hidden, QWidth, Capacity, D, S> = (
     &'a tiles::Partial<Hidden, QWidth, Capacity>,
     (
         &'a Scales<Hidden, QWidth, Capacity, D>,
-        &'a Channels<Hidden, QWidth>,
+        &'a Channels<Hidden, QWidth, S>,
     ),
     usize,
 );
@@ -67,14 +67,15 @@ impl<
     QWidth: AxisName,
     Capacity: AxisName,
     D: MaterializableScalar + FetchCast<f32>,
-> Op<Operands<'a, Hidden, QWidth, Capacity, D>> for Rescale
+    S: MaterializableScalar + FetchCast<f32>,
+> Op<Operands<'a, Hidden, QWidth, Capacity, D, S>> for Rescale
 {
     type Output = tiles::Partial<Hidden, QWidth, Capacity>;
 
     fn forward(
         &self,
         context: &mut Device,
-        (partial, (scales, channels), waves): Operands<'a, Hidden, QWidth, Capacity, D>,
+        (partial, (scales, channels), waves): Operands<'a, Hidden, QWidth, Capacity, D, S>,
     ) -> Self::Output {
         let row: VrfTensor<
             f32,
@@ -100,6 +101,7 @@ impl<
                 .sub
                 .begin(channels.view())
                 .fetch::<m![Hidden % 16 / 8], m![Hidden % 8]>()
+                .fetch_cast::<f32>()
                 .collect::<m![Hidden % 16 / 8], m![Hidden % 8]>()
                 .to_vrf();
         let mut output = tiles::Partial::new();

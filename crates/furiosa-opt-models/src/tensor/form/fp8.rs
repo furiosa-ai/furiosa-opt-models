@@ -96,6 +96,19 @@ where
     }
 }
 
+/// Native channel scales kept in BF16 until the vector operand fetch.
+impl<'a, In: M + 'static, Out: M + 'static, W, L: M + 'static> Load<&'a Checkpoint>
+    for Rows<In, Out, W, HbmTensor<bf16, Chip, L>, Channel>
+where
+    W: Load<HostTensor<f8e4m3, m![{ Chip }, { m![{ Out }, { In }] }]>>,
+{
+    fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
+        let (codes, rows) = channels_bf16::<In, Out>(from, context)?;
+        let rows = HostTensor::<bf16, m![{ Chip }, { Out }]>::from_vec(rows.repeat(Chip::SIZE));
+        Self::place(codes, |cx| Load::load(cx, rows), context)
+    }
+}
+
 /// The codes at the context's name with each row's scale folded in, refused unless every code
 /// times its row's scale is an E4M3 value.
 impl<'a, In: M + 'static, Out: M + 'static, W> Load<&'a Checkpoint> for Rows<In, Out, W, ()>
@@ -287,6 +300,29 @@ pub(crate) fn channels<In: M, Out: M>(
     }
     Ok((codes, rows))
 }
+/// Preserve native channel scales exactly in BF16 storage; never silently round FP32 scales.
+pub(crate) fn channels_bf16<In: M, Out: M>(
+    from: &Checkpoint,
+    context: &mut Context<'_>,
+) -> Result<(Vec<f8e4m3>, Vec<bf16>), LoadError> {
+    let (codes, scales) = channels::<In, Out>(from, context)?;
+    let scales = scales
+        .into_iter()
+        .map(|scale| {
+            let stored = bf16::from_f32(scale);
+            if stored.to_f32() == scale {
+                Ok(stored)
+            } else {
+                Err(LoadError::InvalidData {
+                    name: context.sibling("weight_scale"),
+                    reason: "channel scale is not exactly representable in BF16 storage".into(),
+                })
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((codes, scales))
+}
+
 /// A checkpoint's `[out / 128, in / 128]` block scales `grid` in the device form [`Scales`]: each
 /// block row once per four output rows, each input half's blocks padded to an even count.
 pub(crate) fn layout<In: AxisName, Out: AxisName>(grid: &[f32]) -> Vec<f32> {
@@ -526,6 +562,39 @@ mod tests {
         }
         let source = checkpoint(&codes, &[("weight_scale", Dtype::BF16, &[2, 2], &[1.0; 4])]);
         assert!(read(&source).is_err());
+    }
+
+    #[test]
+    fn native_bf16_channels_refuse_lossy_scales() {
+        let codes = codes();
+        let shape = [Out::SIZE, 1];
+        let read = |source: &Checkpoint| {
+            Context::new(None).field("", "proj", |cx| {
+                cx.field("weight", "weight", |cx| {
+                    channels_bf16::<m![In], m![Out]>(source, cx)
+                })
+            })
+        };
+        let scales: Vec<_> = (0..Out::SIZE)
+            .map(|row| bf16::from_f32((row + 1) as f32 / 103.0).to_f32())
+            .collect();
+        for dtype in [Dtype::BF16, Dtype::F32] {
+            let source = checkpoint(&codes, &[("weight_scale", dtype, &shape, &scales)]);
+            let (actual, factors) = read(&source).unwrap();
+            assert_eq!(f8e4m3::to_buf(&actual), f8e4m3::to_buf(&codes));
+            assert_eq!(
+                factors.iter().map(|s| s.to_f32()).collect::<Vec<_>>(),
+                scales
+            );
+        }
+        let source = checkpoint(
+            &codes,
+            &[("weight_scale", Dtype::F32, &shape, &vec![1.001; Out::SIZE])],
+        );
+        assert!(
+            matches!(read(&source), Err(LoadError::InvalidData { name, reason })
+            if name == "proj.weight_scale" && reason.contains("exactly representable"))
+        );
     }
 
     /// The value a checkpoint code means under its block's scale.

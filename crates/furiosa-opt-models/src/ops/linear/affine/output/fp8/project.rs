@@ -30,18 +30,28 @@ type Second<Hidden, QWidth, Rows> = (
 /// and what each step leaves the next. A tile takes three steps, one a poll: the tile's rows
 /// landed and the first block's first pass, then the other passes and the exchange of one half of
 /// the clusters' partial sums, then the sum, which it gives.
-pub struct Landed<Hidden: AxisName, QWidth: AxisName, Rows: AxisName, D: Scalar = bf16> {
-    staged: Staged<Hidden, QWidth>,
+pub struct Landed<
+    Hidden: AxisName,
+    QWidth: AxisName,
+    Rows: AxisName,
+    D: Scalar = bf16,
+    S: Scalar = f32,
+> {
+    staged: Staged<Hidden, QWidth, S>,
     step: usize,
     first: Option<First<Hidden, QWidth, Rows, D>>,
     second: Option<Second<Hidden, QWidth, Rows>>,
 }
 
 /// The weights and their channel scales staged before any attended row arrives.
-impl<Hidden: AxisName, QWidth: AxisName, F: quantize::Tokens> Op<Begin<()>>
-    for Stored<Hidden, QWidth, F>
+impl<
+    Hidden: AxisName,
+    QWidth: AxisName,
+    F: quantize::Tokens,
+    S: MaterializableScalar + FetchCast<f32>,
+> Op<Begin<()>> for Stored<Hidden, QWidth, F, S>
 {
-    type Output = Landed<Hidden, QWidth, Span, F::Scale>;
+    type Output = Landed<Hidden, QWidth, Span, F::Scale, S>;
 
     fn forward(&self, context: &mut Device, _: Begin<()>) -> Self::Output {
         let mut staged = Self::empty();
@@ -57,15 +67,19 @@ impl<Hidden: AxisName, QWidth: AxisName, F: quantize::Tokens> Op<Begin<()>>
 
 /// The projection over weights staged beforehand, e.g. while an attention's last history is in
 /// flight.
-impl<Hidden: AxisName, QWidth: AxisName, F: quantize::Tokens> Op<Begin<Staged<Hidden, QWidth>>>
-    for Stored<Hidden, QWidth, F>
+impl<
+    Hidden: AxisName,
+    QWidth: AxisName,
+    F: quantize::Tokens,
+    S: MaterializableScalar + FetchCast<f32>,
+> Op<Begin<Staged<Hidden, QWidth, S>>> for Stored<Hidden, QWidth, F, S>
 {
-    type Output = Landed<Hidden, QWidth, Span, F::Scale>;
+    type Output = Landed<Hidden, QWidth, Span, F::Scale, S>;
 
     fn forward(
         &self,
         _: &mut Device,
-        Begin(staged): Begin<Staged<Hidden, QWidth>>,
+        Begin(staged): Begin<Staged<Hidden, QWidth, S>>,
     ) -> Self::Output {
         Landed {
             staged,
@@ -77,12 +91,24 @@ impl<Hidden: AxisName, QWidth: AxisName, F: quantize::Tokens> Op<Begin<Staged<Hi
 }
 
 /// One step of span tile `tile` of the attended rows; the sum once the third step gives it.
-impl<'l, 'a, Hidden, QWidth, Capacity, Reach, KvHeads, Groups, Head, F: quantize::Tokens>
+impl<
+    'l,
+    'a,
+    Hidden,
+    QWidth,
+    Capacity,
+    Reach,
+    KvHeads,
+    Groups,
+    Head,
+    F: quantize::Tokens,
+    S: MaterializableScalar + FetchCast<f32>,
+>
     Op<(
-        &'l mut Landed<Hidden, QWidth, Span, F::Scale>,
+        &'l mut Landed<Hidden, QWidth, Span, F::Scale, S>,
         &'a Attended<Reach, KvHeads, Groups, Head>,
         Live<(), Capacity>,
-    )> for Stored<Hidden, QWidth, F>
+    )> for Stored<Hidden, QWidth, F, S>
 where
     Hidden: AxisName,
     QWidth: AxisName,
@@ -98,7 +124,7 @@ where
         &self,
         context: &mut Device,
         (landed, attended, tile): (
-            &'l mut Landed<Hidden, QWidth, Span, F::Scale>,
+            &'l mut Landed<Hidden, QWidth, Span, F::Scale, S>,
             &'a Attended<Reach, KvHeads, Groups, Head>,
             Live<(), Capacity>,
         ),

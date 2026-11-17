@@ -5,7 +5,7 @@ use super::*;
 use crate::ops::vector;
 use crate::tensor::form::fp8::Channel;
 
-pub type Stored<Hidden, QWidth> = super::Stored<Hidden, QWidth, Channel>;
+pub type Stored<Hidden, QWidth> = super::Stored<Hidden, QWidth, Channel, bf16>;
 
 /// Select complete eight-row owners statically: the switch fixes their position inside time,
 /// where a runtime prefix is unsupported. Physical owner coordinates and weights stay unchanged.

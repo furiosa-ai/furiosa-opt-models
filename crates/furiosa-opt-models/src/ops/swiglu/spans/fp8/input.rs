@@ -6,20 +6,21 @@ use core::marker::PhantomData;
 /// A gate or up panel's channel scales, fetched into the VRF of each row slice.
 pub(super) struct FetchChannels;
 
-impl<'a, Intermediate: AxisName, Rows: AxisName> Op<&'a Channels<Intermediate, Rows>>
-    for FetchChannels
+impl<'a, Intermediate: AxisName, Rows: AxisName, D: MaterializableScalar + FetchCast<f32>>
+    Op<&'a Channels<Intermediate, Rows, D>> for FetchChannels
 {
     type Output = ChannelScale<Intermediate, Rows>;
 
     fn forward(
         &self,
         context: &mut Device,
-        scale: &'a Channels<Intermediate, Rows>,
+        scale: &'a Channels<Intermediate, Rows, D>,
     ) -> Self::Output {
         context
             .sub
             .begin(scale.view())
             .fetch::<m![{ Out<Intermediate> } / 8], m![{ Out<Intermediate> } % 8]>()
+            .fetch_cast::<f32>()
             .collect::<m![{ Out<Intermediate> } / 8], m![{ Out<Intermediate> } % 8]>()
             .to_vrf()
     }

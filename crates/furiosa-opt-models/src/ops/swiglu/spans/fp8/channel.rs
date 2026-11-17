@@ -33,7 +33,7 @@ pub type GateUpWeights<H, I> = StoredRows<
     m![H],
     m![Term, I],
     HbmTensor<f8e4m3, Chip, Blocked<H, I>>,
-    HbmTensor<f32, Chip, m![Term, I]>,
+    HbmTensor<bf16, Chip, m![Term, I]>,
     Channel,
 >;
 pub type Stored<H, const B: usize, const N: usize> = m![
@@ -47,7 +47,7 @@ pub type DownWeights<H, I> = StoredRows<
         HbmTensor<f8e4m3, Chip, Stored<H, 64, 3>>,
         HbmTensor<f8e4m3, Chip, Stored<H, 32, 1>>,
     ),
-    HbmTensor<f32, Chip, m![H]>,
+    HbmTensor<bf16, Chip, m![H]>,
     Channel,
 >;
 
@@ -64,13 +64,13 @@ impl<'a, H: AxisName, I: AxisName> Load<Projections<'a, 2>> for GateUpWeights<H,
     fn load(cx: &mut Context<'_>, projections: Projections<'a, 2>) -> Result<Self, LoadError> {
         let [(gate, gates), (up, ups)] = projections.read(cx, |from, cx| {
             cx.field("weight", "weight", |cx| {
-                fp8::channels::<m![H], m![I]>(from, cx)
+                fp8::channels_bf16::<m![H], m![I]>(from, cx)
             })
         })?;
         let codes = HostTensor::<f8e4m3, m![{ Chip }, { m![Term, I, H] }]>::from_vec(
             [gate, up].concat().repeat(Chip::SIZE),
         );
-        let scales = HostTensor::<f32, m![{ Chip }, { m![Term, I] }]>::from_vec(
+        let scales = HostTensor::<bf16, m![{ Chip }, { m![Term, I] }]>::from_vec(
             [gates, ups].concat().repeat(Chip::SIZE),
         );
         Ok(Self::new(
@@ -111,7 +111,7 @@ impl<'a, H: AxisName, I: AxisName> Load<Projections<'a, 1>> for DownWeights<H, I
     fn load(cx: &mut Context<'_>, projections: Projections<'a, 1>) -> Result<Self, LoadError> {
         let [(codes, scales)] = projections.read(cx, |from, cx| {
             cx.field("weight", "weight", |cx| {
-                fp8::channels::<m![I], m![H]>(from, cx)
+                fp8::channels_bf16::<m![I], m![H]>(from, cx)
             })
         })?;
         let panels = cx.field("0", "", |cx| {
@@ -124,7 +124,7 @@ impl<'a, H: AxisName, I: AxisName> Load<Projections<'a, 1>> for DownWeights<H, I
                 })?,
             ))
         })?;
-        let scales = HostTensor::<f32, m![{ Chip }, H]>::from_vec(scales.repeat(Chip::SIZE));
+        let scales = HostTensor::<bf16, m![{ Chip }, H]>::from_vec(scales.repeat(Chip::SIZE));
         Ok(Self::new(
             panels,
             cx.field("1", "", |cx| Load::load(cx, scales))?,
@@ -269,12 +269,13 @@ impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName> Op<Live<Staging<H, I, R
             let loaded = stored_scales.to_dm(&mut device.tdma);
             down_scale_operand(device, &loaded)
         };
-        let channel: DmTensor<f32, Chip, Cluster<I>, m![H / 16], m![H % 16]> =
+        let channel: DmTensor<bf16, Chip, Cluster<I>, m![H / 16], m![H % 16]> =
             self.1.to_dm(&mut device.tdma);
         let channel: down::ChannelScales<H, I> = device
             .sub
             .begin(channel.view())
             .fetch::<m![H % 16 / 8], m![H % 8]>()
+            .fetch_cast::<f32>()
             .collect::<m![H % 16 / 8], m![H % 8]>()
             .to_vrf();
         let sum = down::panels(
@@ -661,7 +662,7 @@ mod tests {
             .await
             .unwrap();
         let codes = (full, tail);
-        let scales = HostTensor::<f32, m![H]>::from_vec(vec![1.0; H::SIZE])
+        let scales = HostTensor::<bf16, m![H]>::from_vec(vec![bf16::from_f32(1.0); H::SIZE])
             .to_hbm(&mut device.pdma)
             .await
             .unwrap();
@@ -808,7 +809,7 @@ mod tests {
             .await
             .unwrap();
         let codes = (full, tail);
-        let scales = HostTensor::<f32, m![H]>::from_vec(vec![1.0; H::SIZE])
+        let scales = HostTensor::<bf16, m![H]>::from_vec(vec![bf16::from_f32(1.0); H::SIZE])
             .to_hbm(&mut device.pdma)
             .await
             .unwrap();

@@ -130,11 +130,12 @@ pub(super) fn forward<
     Rows: AxisName,
     Capacity: AxisName,
     D: MaterializableScalar + FetchCast<f32>,
+    S: MaterializableScalar + FetchCast<f32>,
 >(
     context: &mut Device,
     weights: (
         &HbmTensor<f8e4m3, Chip, Blocked<Hidden, Intermediate>>,
-        &HbmTensor<f32, Chip, m![Term, Intermediate]>,
+        &HbmTensor<S, Chip, m![Term, Intermediate]>,
     ),
     first: GateUp<Hidden, Intermediate>,
     normalized: Live<&Owned<Hidden, Rows>, Capacity>,
@@ -195,7 +196,7 @@ pub(super) fn forward<
         quantized
     };
     let channels = |context: &mut Device, term: usize| -> ChannelScale<Intermediate, Rows> {
-        let channels: Channels<Intermediate, Rows> = weights
+        let channels: Channels<Intermediate, Rows, S> = weights
             .1
             .view()
             .tile::<m![Term], 1, m![Term = 1 # 2, Intermediate]>(term)

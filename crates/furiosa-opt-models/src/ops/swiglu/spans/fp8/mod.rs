@@ -160,7 +160,7 @@ impl<'a, H: AxisName, I: AxisName> Load<Projections<'a, 1>> for DownWeights<H, I
         ))
     }
 }
-type Channels<I, Rows> = DmTensor<f32, Chip, Cluster<I>, Slice<I, Rows>, m![{ Out<I> }]>;
+type Channels<I, Rows, D = f32> = DmTensor<D, Chip, Cluster<I>, Slice<I, Rows>, m![{ Out<I> }]>;
 
 /// Gate/up weight pair `panel`, the weights of 1024 inputs, written on chip.
 impl<Hidden: AxisName, Intermediate: AxisName> Op<Begin<usize>>

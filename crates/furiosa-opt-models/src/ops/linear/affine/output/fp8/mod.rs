@@ -64,38 +64,40 @@ type Scales<Hidden, QWidth, Capacity, D = bf16> = DmTensor<
     m![Hidden / 16],
     m![Capacity / (Capacity / 4), Capacity % (Capacity / 4)],
 >;
-type Channels<Hidden, QWidth> =
-    DmTensor<f32, Chip, Cluster<QWidth>, m![Hidden / 16], m![Hidden % 16]>;
+type Channels<Hidden, QWidth, S = f32> =
+    DmTensor<S, Chip, Cluster<QWidth>, m![Hidden / 16], m![Hidden % 16]>;
 
 axes![Replicas = 16];
 
 pub type Blocked<Hidden, QWidth> = m![QWidth / 128, Hidden, QWidth % 128];
-pub type Stored<Hidden, QWidth, Format = crate::tensor::form::fp8::Block> = Affine<
+pub type Stored<Hidden, QWidth, Format = crate::tensor::form::fp8::Block, S = f32> = Affine<
     Rows<
         m![QWidth],
         m![Hidden],
         HbmTensor<f8e4m3, Chip, Blocked<Hidden, QWidth>>,
-        HbmTensor<f32, Chip, m![Hidden]>,
+        HbmTensor<S, Chip, m![Hidden]>,
         Format,
     >,
     (),
 >;
-pub(crate) type Staged<Hidden, QWidth> =
-    Affine<(Weight<Hidden, QWidth>, Channels<Hidden, QWidth>), ()>;
+pub(crate) type Staged<Hidden, QWidth, S = f32> =
+    Affine<(Weight<Hidden, QWidth>, Channels<Hidden, QWidth, S>), ()>;
 
-impl<Hidden: AxisName, QWidth: AxisName, Format> Stored<Hidden, QWidth, Format> {
-    pub(crate) fn empty() -> Staged<Hidden, QWidth> {
+impl<Hidden: AxisName, QWidth: AxisName, Format, S: MaterializableScalar>
+    Stored<Hidden, QWidth, Format, S>
+{
+    pub(crate) fn empty() -> Staged<Hidden, QWidth, S> {
         Affine::new((Weight::new(), Channels::new()), ())
     }
 }
 
 /// The weight and its channel scales, written in the staged form the projection reads.
-impl<Hidden: AxisName, QWidth: AxisName, Format> Op<&mut Staged<Hidden, QWidth>>
-    for Stored<Hidden, QWidth, Format>
+impl<Hidden: AxisName, QWidth: AxisName, Format, S: MaterializableScalar>
+    Op<&mut Staged<Hidden, QWidth, S>> for Stored<Hidden, QWidth, Format, S>
 {
     type Output = ();
 
-    fn forward(&self, context: &mut Device, staged: &mut Staged<Hidden, QWidth>) {
+    fn forward(&self, context: &mut Device, staged: &mut Staged<Hidden, QWidth, S>) {
         let (weight, channels) = &mut staged.weight;
         self.weight
             .0

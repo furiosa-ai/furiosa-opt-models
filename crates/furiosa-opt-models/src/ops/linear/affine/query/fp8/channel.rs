@@ -12,13 +12,13 @@ pub type Weights<Hidden, Heads, Head> = StoredRows<
     m![Hidden],
     m![Heads, Head],
     Stored<Hidden, Heads, Head>,
-    HeadScales<Heads, Head>,
+    HeadScales<Heads, Head, bf16>,
     Channel,
 >;
 
 pub(crate) struct Prepared<Hidden: AxisName, Heads: AxisName, Head: AxisName> {
     weight: Weight<Hidden, Heads, Head>,
-    scale: ValueScale<Hidden, Heads, Head>,
+    scale: ValueScale<Hidden, Heads, Head, bf16>,
 }
 
 axes![Owner = 8];
@@ -118,7 +118,7 @@ impl<Hidden: AxisName, G: Group> Period<Hidden, G> {
         operand: &Operand<Hidden, G>,
     ) -> Output<G, Heads, Head, Spread, Local> {
         let scale: DmTensor<
-            f32,
+            bf16,
             Chip,
             Cluster<Heads>,
             Reduced<G, Heads, Spread>,
@@ -151,6 +151,7 @@ impl<Hidden: AxisName, G: Group> Period<Hidden, G> {
                 .sub
                 .begin(channels)
                 .fetch::<m![{ Local }, Head / 8], m![Head % 8]>()
+                .fetch_cast::<f32>()
                 .collect::<m![{ Local }, Head / 8], m![Head % 8]>()
                 .to_vrf();
         // SAFETY: the row digits occupy identical physical positions for Q, K and V; the
@@ -366,8 +367,8 @@ mod tests {
                 .to_hbm::<Chip, Layout<H, Heads, D>>(&mut device.pdma)
                 .await
                 .unwrap();
-            let scales = HostTensor::<f32, m![Heads, D]>::from_vec(
-                (0..Heads::SIZE * D::SIZE).map(|out| scale(out, projection)),
+            let scales = HostTensor::<bf16, m![Heads, D]>::from_vec(
+                (0..Heads::SIZE * D::SIZE).map(|out| bf16::from_f32(scale(out, projection))),
             )
             .to_hbm(&mut device.pdma)
             .await

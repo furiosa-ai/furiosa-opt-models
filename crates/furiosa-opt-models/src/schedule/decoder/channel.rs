@@ -38,7 +38,7 @@ type Stored = super::Stored<S>;
 type Places = super::Places<S>;
 type FinalNorm = super::FinalNorm<S>;
 type Launched<'c, 'a> = super::Launched<'c, 'a, S>;
-type Projecting = crate::ops::linear::output::fp8::Landed<Width, Queries, Span, f32>;
+type Projecting = crate::ops::linear::output::fp8::Landed<Width, Queries, Span, f32, bf16>;
 type Output<'p> = super::Output<'p, S, Projecting>;
 
 struct Front {
