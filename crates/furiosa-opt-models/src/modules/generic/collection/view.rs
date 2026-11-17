@@ -74,6 +74,42 @@ impl<In, Out, W: View<N>, S: View<N>, const N: usize> View<N> for fp8::Rows<In, 
     }
 }
 
+impl<In, Out, E, S, B, C, Chips, W, T, const N: usize> View<N>
+    for BlockScaled<In, Out, E, S, B, C, Chips, W, T>
+where
+    In: AxisName,
+    Out: AxisName,
+    E: Scalar,
+    S: Scalar,
+    B: M,
+    C: View<N>,
+    Chips: M,
+    W: View<N>,
+    T: View<N>,
+{
+    type Storage = (W::Storage, T::Storage, C::Storage);
+    type Layer = BlockScaled<In, Out, E, S, B, C::Layer, Chips, W::Layer, T::Layer>;
+
+    fn view(storage: &Self::Storage, layer: usize) -> Self::Layer {
+        BlockScaled {
+            weight: W::view(&storage.0, layer),
+            weight_scale: T::view(&storage.1, layer),
+            contract: C::view(&storage.2, layer),
+            shape: PhantomData,
+        }
+    }
+
+    fn stack(layers: [Self; N], context: &mut Context<'_>) -> Self::Storage {
+        let parts = layers.map(|layer| (layer.weight, layer.weight_scale, layer.contract));
+        let (w, t, c) = unzip3(parts);
+        (
+            W::stack(w, context),
+            T::stack(t, context),
+            C::stack(c, context),
+        )
+    }
+}
+
 impl<T: View<N>, const N: usize> View<N> for fp8::Squares<T> {
     type Storage = T::Storage;
     type Layer = fp8::Squares<T::Layer>;
