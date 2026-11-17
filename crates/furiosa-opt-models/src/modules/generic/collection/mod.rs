@@ -200,15 +200,23 @@ mod view;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::load::Named;
     use crate::modules::generic::{Collection, Layers};
+    use crate::modules::language::Backbone;
     use crate::ops::attention::geometry::Hidden;
+    use crate::ops::linear::Linear;
     use crate::ops::normalization::tests::random;
     use crate::ops::normalization::{RmsNorm, RowMajor, Spread};
+    use crate::ops::swiglu::{GateUp, Intermediate, Mlp};
     use crate::tensor::form::Weight;
+    use crate::tensor::memory::{Hbm, Memory};
     use crate::tensor::{axis::Sixteen, parallel::Chip};
     use crate::tests::DEVICE;
     use crate::{Module, Rolled};
     use furiosa_opt_std::runtime::launch;
+    use safetensors::Dtype;
+    use std::marker::PhantomData;
+    use std::ptr;
 
     type Features = Hidden<1024>;
     type Plane = Spread<Features, Sixteen>;
@@ -241,270 +249,254 @@ mod tests {
 
     // # Loading a stack
 
-    mod load {
-        use super::super::*;
-        use crate::Rolled;
-        use crate::load::Named;
-        use crate::modules::generic::Layers;
-        use crate::modules::language::Backbone;
-        use crate::ops::linear::Linear;
-        use crate::ops::swiglu::{GateUp, Intermediate, Mlp};
-        use crate::tensor::memory::{Hbm, Memory};
-        use crate::tests::DEVICE;
-        use safetensors::Dtype;
-        use std::marker::PhantomData;
-        use std::ptr;
+    axes![F = 32];
+    type I = Intermediate<32>;
 
-        axes![F = 32];
-        type I = Intermediate<32>;
+    /// A leaf on host holding the bytes it read; a stack's storage holds its layers' bytes in
+    /// layer order.
+    #[derive(Debug, PartialEq)]
+    struct Leaf<D, C, S>(Vec<u8>, PhantomData<fn() -> (D, C, S)>);
 
-        /// A leaf on host holding the bytes it read; a stack's storage holds its layers' bytes in
-        /// layer order.
-        #[derive(Debug, PartialEq)]
-        struct Leaf<D, C, S>(Vec<u8>, PhantomData<fn() -> (D, C, S)>);
-
-        impl<D, C, S> Clone for Leaf<D, C, S> {
-            fn clone(&self) -> Self {
-                Leaf(self.0.clone(), PhantomData)
-            }
+    impl<D, C, S> Clone for Leaf<D, C, S> {
+        fn clone(&self) -> Self {
+            Leaf(self.0.clone(), PhantomData)
         }
+    }
 
-        /// The memory whose leaves are [`Leaf`]s.
-        struct Bytes;
+    /// The memory whose leaves are [`Leaf`]s.
+    struct Bytes;
 
-        impl Memory for Bytes {
-            type Tensor<D: MaterializableScalar, C: M + 'static, S: M + 'static> = Leaf<D, C, S>;
-        }
+    impl Memory for Bytes {
+        type Tensor<D: MaterializableScalar, C: M + 'static, S: M + 'static> = Leaf<D, C, S>;
+    }
 
-        impl<'a, D: 'static, C: 'static, S: 'static> Load<&'a Checkpoint> for Leaf<D, C, S> {
-            fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
-                let read = |cx: &mut Context<'_>| {
-                    let name = cx.name();
-                    cx.read(&name);
-                    let view = from.get(&name).ok_or(LoadError::Missing(vec![name]))?;
-                    Ok(Leaf(view.data().to_vec(), PhantomData))
-                };
-                context.checkpoint(from, |cx| {
-                    cx.leaf(from, read, |_, leaf| Ok((leaf.clone(), leaf)))
-                })
-            }
-        }
-
-        impl<D: MaterializableScalar, C: M + 'static, S: M + 'static, L: M + 'static>
-            Load<HostTensor<D, m![{ C }, { L }]>> for Leaf<D, C, S>
-        {
-            fn load(
-                _: &mut Context<'_>,
-                host: HostTensor<D, m![{ C }, { L }]>,
-            ) -> Result<Self, LoadError> {
-                Ok(Leaf(D::to_buf(&host.into_vec()), PhantomData))
-            }
-        }
-
-        impl<'a, D, C, S> Load<&'a Leaf<D, C, S>> for &'a Leaf<D, C, S> {
-            fn load(_: &mut Context<'_>, from: &'a Leaf<D, C, S>) -> Result<Self, LoadError> {
-                Ok(from)
-            }
-        }
-
-        impl<D, C, S, const N: usize> View<N> for Leaf<D, C, S> {
-            type Storage = Self;
-            type Layer = Self;
-
-            fn view(storage: &Self, layer: usize) -> Self {
-                let bytes = storage.0.len() / N;
-                Leaf(storage.0[layer * bytes..][..bytes].to_vec(), PhantomData)
-            }
-
-            fn stack(layers: [Self; N], _: &mut Context<'_>) -> Self {
-                Leaf(
-                    layers.into_iter().flat_map(|layer| layer.0).collect(),
-                    PhantomData,
-                )
-            }
-        }
-
-        impl<'a, D, C, S, const N: usize> View<N> for &'a Leaf<D, C, S> {
-            type Storage = &'a Leaf<D, C, S>;
-            type Layer = Leaf<D, C, S>;
-
-            fn view(storage: &Self::Storage, layer: usize) -> Leaf<D, C, S> {
-                <Leaf<D, C, S> as View<N>>::view(storage, layer)
-            }
-
-            fn stack(_: [Self; N], _: &mut Context<'_>) -> Self::Storage {
-                unreachable!("a borrowed leaf is not loaded from a checkpoint")
-            }
-        }
-
-        type Matrix<X, O, In> = <X as Memory>::Tensor<bf16, m![1], m![O, In]>;
-
-        /// A layer: a norm's gain and a gated MLP, named as a checkpoint's decoder layer.
-        type Layer<X> = (
-            Named<"input_layernorm", <X as Memory>::Tensor<bf16, m![1], m![F]>>,
-            Named<
-                "mlp",
-                Mlp<
-                    F,
-                    I,
-                    Linear<F, GateUp<I>, m![1], Matrix<X, GateUp<I>, F>>,
-                    Linear<I, F, m![1], Matrix<X, F, I>>,
-                >,
-            >,
-        );
-
-        type Model<X> = Backbone<
-            Named<"embed_tokens", <X as Memory>::Tensor<bf16, m![1], m![F]>>,
-            Layers<Collected<Stack, Layer<X>, 2>, Rolled>,
-        >;
-
-        /// BF16 bytes of `count` elements valued `value` plus a run of 0 to 6.
-        fn values(count: usize, value: f32) -> Vec<u8> {
-            (0..count)
-                .flat_map(|index| half::bf16::from_f32(value + (index % 7) as f32).to_le_bytes())
-                .collect()
-        }
-
-        /// The tensors of a two-layer model, layer `l`'s values starting at `10 * (l + 1)`.
-        fn tensors() -> Vec<(String, Vec<usize>, Vec<u8>)> {
-            let layer = |l: usize| {
-                let at = 10.0 * (l + 1) as f32;
-                let (f, i) = (F::SIZE, I::SIZE);
-                [
-                    ("input_layernorm", vec![f], values(f, at)),
-                    ("mlp.gate_proj.weight", vec![i, f], values(i * f, at + 1.0)),
-                    ("mlp.up_proj.weight", vec![i, f], values(i * f, at + 2.0)),
-                    ("mlp.down_proj.weight", vec![f, i], values(f * i, at + 3.0)),
-                ]
-                .map(|(name, shape, data)| (format!("layers.{l}.{name}"), shape, data))
+    impl<'a, D: 'static, C: 'static, S: 'static> Load<&'a Checkpoint> for Leaf<D, C, S> {
+        fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
+            let read = |cx: &mut Context<'_>| {
+                let name = cx.name();
+                cx.read(&name);
+                let view = from.get(&name).ok_or(LoadError::Missing(vec![name]))?;
+                Ok(Leaf(view.data().to_vec(), PhantomData))
             };
-            let embedding = (
-                "embed_tokens".to_string(),
-                vec![F::SIZE],
-                values(F::SIZE, 0.0),
-            );
-            [vec![embedding], layer(0).to_vec(), layer(1).to_vec()].concat()
+            context.checkpoint(from, |cx| {
+                cx.leaf(from, read, |_, leaf| Ok((leaf.clone(), leaf)))
+            })
+        }
+    }
+
+    impl<D: MaterializableScalar, C: M + 'static, S: M + 'static, L: M + 'static>
+        Load<HostTensor<D, m![{ C }, { L }]>> for Leaf<D, C, S>
+    {
+        fn load(
+            _: &mut Context<'_>,
+            host: HostTensor<D, m![{ C }, { L }]>,
+        ) -> Result<Self, LoadError> {
+            Ok(Leaf(D::to_buf(&host.into_vec()), PhantomData))
+        }
+    }
+
+    impl<'a, D, C, S> Load<&'a Leaf<D, C, S>> for &'a Leaf<D, C, S> {
+        fn load(_: &mut Context<'_>, from: &'a Leaf<D, C, S>) -> Result<Self, LoadError> {
+            Ok(from)
+        }
+    }
+
+    impl<D, C, S, const N: usize> View<N> for Leaf<D, C, S> {
+        type Storage = Self;
+        type Layer = Self;
+
+        fn view(storage: &Self, layer: usize) -> Self {
+            let bytes = storage.0.len() / N;
+            Leaf(storage.0[layer * bytes..][..bytes].to_vec(), PhantomData)
         }
 
-        fn checkpoint(tensors: &[(String, Vec<usize>, Vec<u8>)]) -> Checkpoint {
-            let mut checkpoint = Checkpoint::default();
-            for (name, shape, data) in tensors {
-                checkpoint
-                    .insert(name, Dtype::BF16, shape, data.clone())
-                    .unwrap();
-            }
+        fn stack(layers: [Self; N], _: &mut Context<'_>) -> Self {
+            Leaf(
+                layers.into_iter().flat_map(|layer| layer.0).collect(),
+                PhantomData,
+            )
+        }
+    }
+
+    impl<'a, D, C, S, const N: usize> View<N> for &'a Leaf<D, C, S> {
+        type Storage = &'a Leaf<D, C, S>;
+        type Layer = Leaf<D, C, S>;
+
+        fn view(storage: &Self::Storage, layer: usize) -> Leaf<D, C, S> {
+            <Leaf<D, C, S> as View<N>>::view(storage, layer)
+        }
+
+        fn stack(_: [Self; N], _: &mut Context<'_>) -> Self::Storage {
+            unreachable!("a borrowed leaf is not loaded from a checkpoint")
+        }
+    }
+
+    type Matrix<X, O, In> = <X as Memory>::Tensor<bf16, m![1], m![O, In]>;
+
+    /// A layer: a norm's gain and a gated MLP, named as a checkpoint's decoder layer.
+    type LayerOf<X> = (
+        Named<"input_layernorm", <X as Memory>::Tensor<bf16, m![1], m![F]>>,
+        Named<
+            "mlp",
+            Mlp<
+                F,
+                I,
+                Linear<F, GateUp<I>, m![1], Matrix<X, GateUp<I>, F>>,
+                Linear<I, F, m![1], Matrix<X, F, I>>,
+            >,
+        >,
+    );
+
+    type Model<X> = Backbone<
+        Named<"embed_tokens", <X as Memory>::Tensor<bf16, m![1], m![F]>>,
+        Layers<Collected<Stack, LayerOf<X>, 2>, Rolled>,
+    >;
+
+    /// BF16 bytes of `count` elements valued `value` plus a run of 0 to 6.
+    fn values(count: usize, value: f32) -> Vec<u8> {
+        (0..count)
+            .flat_map(|index| half::bf16::from_f32(value + (index % 7) as f32).to_le_bytes())
+            .collect()
+    }
+
+    /// The tensors of a two-layer model, layer `l`'s values starting at `10 * (l + 1)`.
+    fn tensors() -> Vec<(String, Vec<usize>, Vec<u8>)> {
+        let layer = |l: usize| {
+            let at = 10.0 * (l + 1) as f32;
+            let (f, i) = (F::SIZE, I::SIZE);
+            [
+                ("input_layernorm", vec![f], values(f, at)),
+                ("mlp.gate_proj.weight", vec![i, f], values(i * f, at + 1.0)),
+                ("mlp.up_proj.weight", vec![i, f], values(i * f, at + 2.0)),
+                ("mlp.down_proj.weight", vec![f, i], values(f * i, at + 3.0)),
+            ]
+            .map(|(name, shape, data)| (format!("layers.{l}.{name}"), shape, data))
+        };
+        let embedding = (
+            "embed_tokens".to_string(),
+            vec![F::SIZE],
+            values(F::SIZE, 0.0),
+        );
+        [vec![embedding], layer(0).to_vec(), layer(1).to_vec()].concat()
+    }
+
+    fn checkpoint(tensors: &[(String, Vec<usize>, Vec<u8>)]) -> Checkpoint {
+        let mut checkpoint = Checkpoint::default();
+        for (name, shape, data) in tensors {
             checkpoint
-        }
-
-        fn load(source: &Checkpoint) -> Result<Model<Bytes>, LoadError> {
-            Model::<Bytes>::load(&mut Context::new(None), source)
-        }
-
-        /// The norm and the packed gate/up of `layer`.
-        fn parts(layer: &<Layer<Bytes> as View<2>>::Layer) -> (Vec<u8>, Vec<u8>) {
-            let (norm, mlp) = layer;
-            (norm.0.0.clone(), mlp.0.parts().0.affine.weight.0.clone())
-        }
-
-        /// A stack reads each layer under its global index in the body's `layers`, and its views
-        /// give each layer its own values: the gate rows, then the up rows, of the layer's MLP.
-        #[test]
-        fn stacks_each_layer_under_its_index() {
-            let tensors = tensors();
-            let model = load(&checkpoint(&tensors)).unwrap();
-            let stack = &model.body.layers.0;
-            let stored = |name: &str| tensors.iter().find(|(n, ..)| n == name).unwrap().2.clone();
-            for l in 0..2 {
-                let (norm, gate_up) = parts(&stack.layer(l));
-                assert_eq!(norm, stored(&format!("layers.{l}.input_layernorm")));
-                let gate = stored(&format!("layers.{l}.mlp.gate_proj.weight"));
-                let up = stored(&format!("layers.{l}.mlp.up_proj.weight"));
-                assert_eq!(gate_up, [gate, up].concat(), "layer {l}");
-            }
-            assert_ne!(parts(&stack.layer(0)), parts(&stack.layer(1)));
-        }
-
-        /// A stack fails with every absent name of every layer, and with a name past its last layer.
-        #[test]
-        fn stack_reads_strictly() {
-            let mut tensors = tensors();
-            tensors.retain(|(name, ..)| {
-                !["layers.0.mlp.up_proj.weight", "layers.1.input_layernorm"]
-                    .contains(&name.as_str())
-            });
-            match load(&checkpoint(&tensors)).err() {
-                Some(LoadError::Missing(names)) => assert_eq!(
-                    names,
-                    ["layers.0.mlp.up_proj.weight", "layers.1.input_layernorm"]
-                ),
-                other => panic!("{other:?} is not `Missing`"),
-            }
-            let mut tensors = self::tensors();
-            let extra = (
-                "layers.2.input_layernorm".into(),
-                vec![F::SIZE],
-                values(F::SIZE, 0.0),
-            );
-            tensors.push(extra);
-            match load(&checkpoint(&tensors)).err() {
-                Some(LoadError::Unexpected(names)) => {
-                    assert_eq!(names, ["layers.2.input_layernorm"])
-                }
-                other => panic!("{other:?} is not `Unexpected`"),
-            }
-        }
-
-        /// A borrowed stack borrows the loaded storage and builds each layer as the owned stack does.
-        #[test]
-        fn borrowed_stack_borrows_the_storage() {
-            let model = load(&checkpoint(&tensors())).unwrap();
-            let borrowed: Model<&Bytes> = Load::load(&mut Context::new(None), &model).unwrap();
-            let (owned, stack) = (&model.body.layers.0, &borrowed.body.layers.0);
-            assert!(ptr::eq(stack.storage.0, &owned.storage.0));
-            for l in 0..2 {
-                assert_eq!(parts(&stack.layer(l)), parts(&owned.layer(l)));
-            }
-        }
-
-        /// The bytes of each HBM leaf of `layer`: its norm, packed gate/up and down weights.
-        async fn read(layer: <Layer<Hbm> as View<2>>::Layer, device: &mut Device) -> [Vec<u8>; 3] {
-            let (norm, mlp) = layer;
-            let (gate_up, down) = mlp.0.into_parts();
-            let norm = norm.0.to_host::<m![F]>(&mut device.pdma).await.unwrap();
-            let gate_up = gate_up
-                .tensor()
-                .to_host::<m![{ Symbol<GateUp<I>> }, F]>(&mut device.pdma);
-            let gate_up = gate_up.await.unwrap();
-            let down = down
-                .tensor()
-                .to_host::<m![F, I]>(&mut device.pdma)
-                .await
+                .insert(name, Dtype::BF16, shape, data.clone())
                 .unwrap();
-            [norm.into_vec(), gate_up.into_vec(), down.into_vec()].map(|v| bf16::to_buf(&v))
         }
+        checkpoint
+    }
 
-        /// A stack in HBM holds every layer of a leaf in one backing, each layer's view its own
-        /// values; a borrowed tree borrows the backings and views the same layers.
-        #[tokio::test(flavor = "current_thread")]
-        async fn loads_a_stack_into_one_backing_per_leaf() {
-            let _lease = DEVICE.lock().await;
-            let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
-            let tensors = tensors();
-            let model: Model<Hbm> = checkpoint(&tensors).load(&mut device).unwrap();
-            let borrowed: Model<&Hbm> = Load::load(&mut Context::new(None), &model).unwrap();
-            let stored = |name: &str| tensors.iter().find(|(n, ..)| n == name).unwrap().2.clone();
-            for l in 0..2 {
-                let at = |name: &str| stored(&format!("layers.{l}.{name}"));
-                let gate_up = [at("mlp.gate_proj.weight"), at("mlp.up_proj.weight")].concat();
-                let want = [at("input_layernorm"), gate_up, at("mlp.down_proj.weight")];
-                assert_eq!(
-                    read(model.body.layers.0.layer(l), &mut device).await,
-                    want,
-                    "{l}"
-                );
-                let view = borrowed.body.layers.0.layer(l);
-                assert_eq!(read(view, &mut device).await, want, "borrowed {l}");
+    fn load_model(source: &Checkpoint) -> Result<Model<Bytes>, LoadError> {
+        Model::<Bytes>::load(&mut Context::new(None), source)
+    }
+
+    /// The norm and the packed gate/up of `layer`.
+    fn parts(layer: &<LayerOf<Bytes> as View<2>>::Layer) -> (Vec<u8>, Vec<u8>) {
+        let (norm, mlp) = layer;
+        (norm.0.0.clone(), mlp.0.parts().0.affine.weight.0.clone())
+    }
+
+    /// A stack reads each layer under its global index in the body's `layers`, and its views
+    /// give each layer its own values: the gate rows, then the up rows, of the layer's MLP.
+    #[test]
+    fn stacks_each_layer_under_its_index() {
+        let tensors = tensors();
+        let model = load_model(&checkpoint(&tensors)).unwrap();
+        let stack = &model.body.layers.0;
+        let stored = |name: &str| tensors.iter().find(|(n, ..)| n == name).unwrap().2.clone();
+        for l in 0..2 {
+            let (norm, gate_up) = parts(&stack.layer(l));
+            assert_eq!(norm, stored(&format!("layers.{l}.input_layernorm")));
+            let gate = stored(&format!("layers.{l}.mlp.gate_proj.weight"));
+            let up = stored(&format!("layers.{l}.mlp.up_proj.weight"));
+            assert_eq!(gate_up, [gate, up].concat(), "layer {l}");
+        }
+        assert_ne!(parts(&stack.layer(0)), parts(&stack.layer(1)));
+    }
+
+    /// A stack fails with every absent name of every layer, and with a name past its last layer.
+    #[test]
+    fn stack_reads_strictly() {
+        let mut tensors = tensors();
+        tensors.retain(|(name, ..)| {
+            !["layers.0.mlp.up_proj.weight", "layers.1.input_layernorm"].contains(&name.as_str())
+        });
+        match load_model(&checkpoint(&tensors)).err() {
+            Some(LoadError::Missing(names)) => assert_eq!(
+                names,
+                ["layers.0.mlp.up_proj.weight", "layers.1.input_layernorm"]
+            ),
+            other => panic!("{other:?} is not `Missing`"),
+        }
+        let mut tensors = self::tensors();
+        let extra = (
+            "layers.2.input_layernorm".into(),
+            vec![F::SIZE],
+            values(F::SIZE, 0.0),
+        );
+        tensors.push(extra);
+        match load_model(&checkpoint(&tensors)).err() {
+            Some(LoadError::Unexpected(names)) => {
+                assert_eq!(names, ["layers.2.input_layernorm"])
             }
+            other => panic!("{other:?} is not `Unexpected`"),
+        }
+    }
+
+    /// A borrowed stack borrows the loaded storage and builds each layer as the owned stack does.
+    #[test]
+    fn borrowed_stack_borrows_the_storage() {
+        let model = load_model(&checkpoint(&tensors())).unwrap();
+        let borrowed: Model<&Bytes> = Load::load(&mut Context::new(None), &model).unwrap();
+        let (owned, stack) = (&model.body.layers.0, &borrowed.body.layers.0);
+        assert!(ptr::eq(stack.storage.0, &owned.storage.0));
+        for l in 0..2 {
+            assert_eq!(parts(&stack.layer(l)), parts(&owned.layer(l)));
+        }
+    }
+
+    /// The bytes of each HBM leaf of `layer`: its norm, packed gate/up and down weights.
+    async fn read(layer: <LayerOf<Hbm> as View<2>>::Layer, device: &mut Device) -> [Vec<u8>; 3] {
+        let (norm, mlp) = layer;
+        let (gate_up, down) = mlp.0.into_parts();
+        let norm = norm.0.to_host::<m![F]>(&mut device.pdma).await.unwrap();
+        let gate_up = gate_up
+            .tensor()
+            .to_host::<m![{ Symbol<GateUp<I>> }, F]>(&mut device.pdma);
+        let gate_up = gate_up.await.unwrap();
+        let down = down
+            .tensor()
+            .to_host::<m![F, I]>(&mut device.pdma)
+            .await
+            .unwrap();
+        [norm.into_vec(), gate_up.into_vec(), down.into_vec()].map(|v| bf16::to_buf(&v))
+    }
+
+    /// A stack in HBM holds every layer of a leaf in one backing, each layer's view its own
+    /// values; a borrowed tree borrows the backings and views the same layers.
+    #[tokio::test(flavor = "current_thread")]
+    async fn loads_a_stack_into_one_backing_per_leaf() {
+        let _lease = DEVICE.lock().await;
+        let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+        let tensors = tensors();
+        let model: Model<Hbm> = checkpoint(&tensors).load(&mut device).unwrap();
+        let borrowed: Model<&Hbm> = Load::load(&mut Context::new(None), &model).unwrap();
+        let stored = |name: &str| tensors.iter().find(|(n, ..)| n == name).unwrap().2.clone();
+        for l in 0..2 {
+            let at = |name: &str| stored(&format!("layers.{l}.{name}"));
+            let gate_up = [at("mlp.gate_proj.weight"), at("mlp.up_proj.weight")].concat();
+            let want = [at("input_layernorm"), gate_up, at("mlp.down_proj.weight")];
+            assert_eq!(
+                read(model.body.layers.0.layer(l), &mut device).await,
+                want,
+                "{l}"
+            );
+            let view = borrowed.body.layers.0.layer(l);
+            assert_eq!(read(view, &mut device).await, want, "borrowed {l}");
         }
     }
 
