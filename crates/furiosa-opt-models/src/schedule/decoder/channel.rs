@@ -69,6 +69,10 @@ fn front<const SPLIT_QUERY: bool>(device: &mut Device, layer: &Layer) -> Front {
     }
 }
 
+fn short_decode(call: Launched<'_, '_>) -> bool {
+    call.live.rows() <= 8 && call.context.0.read.items().rows() == call.live.rows()
+}
+
 fn start(
     device: &mut Device,
     call: Launched<'_, '_>,
@@ -86,7 +90,7 @@ fn start(
         ..
     } = &attention.0;
     let tile = rows.with(());
-    let normalized = front.gain.forward(device, (), &mut (), &rows);
+    let normalized = front.gain.normalize_span(device, &rows, short_decode(call));
     let mut home = Normalized::<Width, Capacity>::new();
     home.spill(device, normalized.value(), (tile, tile.rows()));
     let rotation = &call.context.0.positions;
@@ -196,7 +200,7 @@ fn end(
         Poll::Pending => tile.with(Owned::new()),
     };
     let attended = sum.forward(&mut *device, (), &mut (), (&input, &projected));
-    let normalized = gain.forward(&mut *device, (), &mut (), &attended);
+    let normalized = gain.normalize_span(device, &attended, short_decode(call));
     let rows = tile.with(normalized.value());
     let (projected, second) = mlp::gate_up(device, gate_up, ahead, rows, |device| {
         mlp::down::<_, _, 64>(device, down, 1)
