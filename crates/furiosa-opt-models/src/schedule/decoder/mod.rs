@@ -135,15 +135,23 @@ impl<Z: Geometry + Decode> Places<Z> {
 
 /// The common FP8 attention-to-attention loop. Each form supplies only its typed leaf
 /// preparation/consumption; layer ownership, live spans, cache slots and head staging stay here.
-fn run<Z: Geometry + Decode, P>(
+fn run<Z: Geometry + Decode, P, A>(
     device: &mut Device,
     live: Live<(), Capacity<Z>>,
     layers: usize,
+    ahead: &mut A,
     (mut first, mut attend, mut step, mut last, read): (
-        impl FnMut(&mut Device, Live<(), Capacity<Z>>, &mut Stored<Z>) -> RowTile<Z>,
+        impl FnMut(&mut Device, Live<(), Capacity<Z>>, &mut Stored<Z>, &mut A) -> RowTile<Z>,
         impl FnMut(&mut Device, usize, &mut Places<Z>) -> P,
-        impl FnMut(&mut Device, usize, Output<'_, Z, P>, RowTile<Z>, &mut Stored<Z>) -> RowTile<Z>,
-        impl FnMut(&mut Device, Output<'_, Z, P>, RowTile<Z>) -> RowTile<Z>,
+        impl FnMut(
+            &mut Device,
+            usize,
+            Output<'_, Z, P>,
+            RowTile<Z>,
+            &mut Stored<Z>,
+            &mut A,
+        ) -> RowTile<Z>,
+        impl FnMut(&mut Device, Output<'_, Z, P>, RowTile<Z>, &mut A) -> RowTile<Z>,
         impl FnOnce(&mut Device, &Rows<Z>),
     ),
 ) {
@@ -151,20 +159,20 @@ fn run<Z: Geometry + Decode, P>(
     let mut places = Places::<Z>::new();
     for span in 0..spans {
         let tile = live.tile::<Span>(span);
-        let rows = first(device, tile, &mut places.stored);
+        let rows = first(device, tile, &mut places.stored, ahead);
         places.input.spill(device, rows.value(), tile);
     }
     for index in 0..layers - 1 {
         let mut projecting = attend(device, index, &mut places);
-        let mut ahead = Places::<Z>::new();
+        let mut next = Places::<Z>::new();
         for span in 0..spans {
             let tile = live.tile::<Span>(span);
             let input = tile.with(places.input.fill(device, tile));
             let output = (tile.with(&places.attended), &mut projecting);
-            let rows = step(device, index, output, input, &mut ahead.stored);
-            ahead.input.spill(device, rows.value(), tile);
+            let rows = step(device, index, output, input, &mut next.stored, ahead);
+            next.input.spill(device, rows.value(), tile);
         }
-        places = ahead;
+        places = next;
     }
     let mut projecting = attend(device, layers - 1, &mut places);
     let mut head = Rows::<Z>::new();
@@ -172,7 +180,7 @@ fn run<Z: Geometry + Decode, P>(
         let tile = live.tile::<Span>(span);
         let input = tile.with(places.input.fill(device, tile));
         let output = (tile.with(&places.attended), &mut projecting);
-        let rows = last(device, output, input);
+        let rows = last(device, output, input, ahead);
         head.spill(device, rows.value(), tile);
     }
     read(device, &head);
@@ -516,12 +524,13 @@ impl<'m, 'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, S>, Env, launch::
             stage.forward(&mut *device, (), &mut *pool, rows);
             output.forward(device, (), &mut (), Begin(staged))
         };
-        run::<S, _>(
+        run::<S, _, _>(
             device,
             live,
             LAYERS,
+            &mut (),
             (
-                |device, tile, stored| {
+                |device, tile, stored, _| {
                     let first = layers.layer(0);
                     Tokenwise(&*embedded, &first).forward(device, call, stored, tile)
                 },
@@ -529,11 +538,11 @@ impl<'m, 'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, S>, Env, launch::
                     let layer = layers.layer(index);
                     attend(device, &layer, &mut slots[index], places)
                 },
-                |device, index, output, input, stored| {
+                |device, index, output, input, stored, _| {
                     let (layer, next) = (layers.layer(index), layers.layer(index + 1));
                     Tokenwise(&layer, &next).forward(device, call, stored, (output, input))
                 },
-                |device, output, input| {
+                |device, output, input, _| {
                     let last = layers.layer(LAYERS - 1);
                     Tokenwise(&last, norm).forward(device, call, &mut (), (output, input))
                 },

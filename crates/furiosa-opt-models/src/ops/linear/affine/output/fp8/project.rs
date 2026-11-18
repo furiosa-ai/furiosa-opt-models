@@ -90,6 +90,22 @@ impl<
     }
 }
 
+/// Refill the same weight and channel-scale buffers after the preceding layer's final O pass.
+impl<H: AxisName, Q: AxisName> Op<&mut Landed<H, Q, Span, f32, bf16>> for channel::Stored<H, Q> {
+    type Output = ();
+    fn forward(&self, device: &mut Device, landed: &mut Landed<H, Q, Span, f32, bf16>) {
+        let (weight, scales) = &mut landed.staged.weight;
+        self.weight
+            .1
+            .view()
+            .to_dm_view(&mut device.tdma, scales.view_mut());
+        self.weight
+            .0
+            .view()
+            .to_dm_view(&mut device.tdma, weight.view_mut());
+    }
+}
+
 /// One step of span tile `tile` of the attended rows; the sum once the third step gives it.
 impl<
     'l,

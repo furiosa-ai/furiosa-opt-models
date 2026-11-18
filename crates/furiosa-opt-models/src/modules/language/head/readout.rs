@@ -118,6 +118,35 @@ where
         self.read_with(context, hidden, selected, tokens, ());
     }
 
+    /// Gather each selected tile directly into its head operand. The channel-scaled Llama
+    /// decoder has already applied final RMSNorm to its hidden rows.
+    pub(crate) fn read_gathered<Capacity: AxisName>(
+        &self,
+        device: &mut Device,
+        hidden: &HbmTensor<bf16, Chip, Blocked<Width, Capacity>>,
+        selected: &Selected<Capacity>,
+        tokens: &mut HbmTensor<i32, Chip, m![Capacity]>,
+    ) {
+        let chosen = Live::<(), Capacity>::read(&selected.live);
+        let selection = Selection {
+            hidden,
+            rows: &selected.rows,
+        };
+        for index in 0..chosen.count::<Span>() {
+            let tile = chosen.tile::<Span>(index);
+            let head = self.to_dm(device);
+            tile.tiles::<_, Rows<128>, Rows<64>, Rows<8>>(
+                device,
+                &mut Gathered {
+                    selection: &selection,
+                    head: &head,
+                    tokens: &mut *tokens,
+                    tile,
+                },
+            );
+        }
+    }
+
     /// Gather only the requested rows, normalizing each 8/64/128-row head tile. Limiting
     /// the norm to a tile also keeps its row inverses within the vector register file.
     pub(crate) fn read_normalized<Capacity: AxisName, const EPSILON: usize>(
@@ -161,6 +190,23 @@ where
                 },
             );
         }
+    }
+}
+
+struct Gathered<'a, Width: AxisName, V: AxisName, Capacity: AxisName> {
+    selection: &'a Selection<'a, Width, Capacity>,
+    head: &'a InDm<'a, Width, V>,
+    tokens: &'a mut HbmTensor<i32, Chip, m![Capacity]>,
+    tile: Live<(), Capacity>,
+}
+
+impl<R: AxisName, Width: AxisName, V: AxisName, Capacity: AxisName> OnTile<Device, R>
+    for Gathered<'_, Width, V, Capacity>
+{
+    fn run(&mut self, device: &mut Device, index: usize) {
+        let rows = self.selection.gather::<R>(device, self.tile, index);
+        let selected = self.head.forward(device, (), &mut (), &rows);
+        self.tokens.spill(device, &selected, (self.tile, index));
     }
 }
 

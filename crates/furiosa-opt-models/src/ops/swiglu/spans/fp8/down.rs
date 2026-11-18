@@ -250,7 +250,7 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
         };
         let partial = panels(
             context,
-            first,
+            &first,
             rows,
             (
                 |context, panel| landed(context, (panel, [&h0, &h1, &h2][panel])),
@@ -559,7 +559,7 @@ fn project<
 /// Tail preparation overlaps the third full contraction. Every addition rounds to BF16 in DM.
 pub(super) fn panels<H: AxisName, I: AxisName, R: AxisName, W, Input, Tail>(
     device: &mut Device,
-    first: W,
+    first: &W,
     rows: usize,
     (mut load, mut weight, mut project): (
         impl FnMut(&mut Device, usize) -> Input,
@@ -574,7 +574,7 @@ pub(super) fn panels<H: AxisName, I: AxisName, R: AxisName, W, Input, Tail>(
     let (input0, input1) = (load(device, 0), load(device, 1));
     let second = weight(device, 1);
     let input2 = load(device, 2);
-    let a = project(device, &first, input0);
+    let a = project(device, first, input0);
     let third = weight(device, 2);
     let b = project(device, &second, input1);
     let sum = add(device, &a, &b, rows);

@@ -174,8 +174,8 @@ type PackedPanel<R, const B: usize> = HbmTensor<
     m![{Cluster<Inputs<B>>}, {Blocks<Inputs<B>>}, R, {Symbol<Inputs<B>>} % {B}],
 >;
 
-/// The span's product and complete-token scales, with the first weight panel prefetched.
-pub struct Staging<H: AxisName, I: AxisName, R: AxisName> {
+/// The span's products and complete-token scales. Panel zero is resident across spans.
+pub struct Staging<I: AxisName, R: AxisName> {
     panels: (
         PackedPanel<R, 64>,
         PackedPanel<R, 64>,
@@ -185,13 +185,12 @@ pub struct Staging<H: AxisName, I: AxisName, R: AxisName> {
     scales: TokenScales<I, R>,
     stored_scales: StoredTokens<I, R>,
     resident_scales: bool,
-    first: Down<H, Inputs<64>>,
 }
 
 impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName>
     Op<Begin<(Live<(Projection<I, R>, Projection<I, R>), C>, bool)>> for DownWeights<H, I>
 {
-    type Output = Staging<H, I, R>;
+    type Output = Staging<I, R>;
     fn forward(
         &self,
         device: &mut Device,
@@ -240,23 +239,25 @@ impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName>
             },
             stored_scales,
             resident_scales,
-            first: down::<H, I, 64>(device, self, 0),
         }
     }
 }
 
-impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName> Op<Live<Staging<H, I, R>, C>>
+impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName> Op<(Live<Staging<I, R>, C>, &First<H>)>
     for DownWeights<H, I>
 {
     type Output = Owned<H, R>;
-    fn forward(&self, device: &mut Device, staging: Live<Staging<H, I, R>, C>) -> Self::Output {
+    fn forward(
+        &self,
+        device: &mut Device,
+        (staging, first): (Live<Staging<I, R>, C>, &First<H>),
+    ) -> Self::Output {
         let rows = staging.rows();
         let Staging {
             panels: (p0, p1, p2, p3),
             scales,
             stored_scales,
             resident_scales,
-            first,
         } = staging.into_value();
         let row = if resident_scales {
             down_scale_rows::<H, I, R>(device, &scales, rows)
@@ -380,7 +381,26 @@ pub(crate) fn down<H: AxisName, I: AxisName, const B: usize>(
     const {
         assert!(B == 64 || B == 32);
     }
-    let mut output = Down::<H, Inputs<B>, B>::new();
+    let mut output = Down::new();
+    load_down(device, weights, panel, &mut output);
+    output
+}
+
+pub(crate) type First<H> = Down<H, Inputs<64>>;
+
+impl<H: AxisName, I: AxisName> Op<&mut First<H>> for DownWeights<H, I> {
+    type Output = ();
+    fn forward(&self, device: &mut Device, first: &mut First<H>) {
+        load_down::<H, I, 64>(device, self, 0, first);
+    }
+}
+
+fn load_down<H: AxisName, I: AxisName, const B: usize>(
+    device: &mut Device,
+    weights: &DownWeights<H, I>,
+    panel: usize,
+    output: &mut Down<H, Inputs<B>, B>,
+) {
     if const { B == 64 } {
         weights.0.0.view()
             .tile::<m![Panels = 3], 1, m![Panels = 1 # 3, {Cluster<Inputs<64>>}, H / (H / 8), {Blocks<Inputs<64>>}, H % (H / 8), {Symbol<Inputs<64>>} % 64]>(panel)
@@ -392,7 +412,6 @@ pub(crate) fn down<H: AxisName, I: AxisName, const B: usize>(
             .view()
             .to_dm_view(&mut device.tdma, output.view_mut());
     }
-    output
 }
 /// Quantize directly into consecutive B-feature rows, ready for the panel's HBM store.
 /// All panels reuse the full-token FP32 scale; selecting a band does not recompute its maximum.
