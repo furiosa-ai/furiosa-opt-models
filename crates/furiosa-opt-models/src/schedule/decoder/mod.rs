@@ -48,6 +48,7 @@ use furiosa_opt_std::prelude::*;
 mod affine;
 mod channel;
 pub(crate) mod nvfp4;
+mod rows;
 
 /// The work between two attentions on one row tile: the end of `A`, then the start of `B`.
 pub struct Tokenwise<A, B>(pub A, pub B);
@@ -160,25 +161,25 @@ fn run<Z: Geometry + Decode, P, A>(
     for span in 0..spans {
         let tile = live.tile::<Span>(span);
         let rows = first(device, tile, &mut places.stored, ahead);
-        places.input.spill(device, rows.value(), tile);
+        rows::store::<Z>(device, rows.value(), &mut places.input, tile);
     }
     for index in 0..layers - 1 {
         let mut projecting = attend(device, index, &mut places);
-        let mut next = Places::<Z>::new();
+        // Attention has consumed the stored Q/K/V. Each span reads its residual before
+        // overwriting the same rows for the next layer.
         for span in 0..spans {
             let tile = live.tile::<Span>(span);
-            let input = tile.with(places.input.fill(device, tile));
+            let input = tile.with(rows::load::<Z>(device, &places.input, tile));
             let output = (tile.with(&places.attended), &mut projecting);
-            let rows = step(device, index, output, input, &mut next.stored, ahead);
-            next.input.spill(device, rows.value(), tile);
+            let rows = step(device, index, output, input, &mut places.stored, ahead);
+            rows::store::<Z>(device, rows.value(), &mut places.input, tile);
         }
-        places = next;
     }
     let mut projecting = attend(device, layers - 1, &mut places);
     let mut head = Rows::<Z>::new();
     for span in 0..spans {
         let tile = live.tile::<Span>(span);
-        let input = tile.with(places.input.fill(device, tile));
+        let input = tile.with(rows::load::<Z>(device, &places.input, tile));
         let output = (tile.with(&places.attended), &mut projecting);
         let rows = last(device, output, input, ahead);
         head.spill(device, rows.value(), tile);
