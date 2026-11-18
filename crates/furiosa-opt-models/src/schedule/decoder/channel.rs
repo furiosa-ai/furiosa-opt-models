@@ -39,7 +39,7 @@ type Places = super::Places<S>;
 type FinalNorm = super::FinalNorm<S>;
 type Launched<'c, 'a> = super::Launched<'c, 'a, S>;
 type Projecting = crate::ops::linear::output::fp8::Landed<Width, Queries, Span, f32, bf16>;
-type First = mlp::First<Width>;
+type FullPanel = mlp::FullPanel<Width>;
 type Output<'p> = super::Output<'p, S, Projecting>;
 
 struct Front {
@@ -50,6 +50,7 @@ struct Front {
 }
 struct Staged {
     product: mlp::Staging<Intermediate, Span>,
+    second: FullPanel,
     attended: Live<Owned<Width, Span>, Capacity>,
 }
 
@@ -195,7 +196,9 @@ fn end(
     let attended = sum.forward(&mut *device, (), &mut (), (&input, &projected));
     let normalized = gain.forward(&mut *device, (), &mut (), &attended);
     let rows = tile.with(normalized.value());
-    let projected = gate_up.forward(&mut *device, (), &mut (), (ahead, rows));
+    let (projected, second) = mlp::gate_up(device, gate_up, ahead, rows, |device| {
+        mlp::down::<_, _, 64>(device, down, 1)
+    });
     // Pure item launches retain product scales in DM at any span size. The MLP also
     // retains them for spans of at most 256 rows, including prompt and mixed launches.
     let decode = call.context.0.read.items().rows() == call.live.rows();
@@ -207,6 +210,7 @@ fn end(
     );
     Staged {
         product: staged,
+        second,
         attended,
     }
 }
@@ -217,13 +221,22 @@ fn update(
     device: &mut Device,
     layer: &Layer,
     staged: Staged,
-    first: &First,
+    first: &FullPanel,
 ) -> Live<Owned<Width, Span>, Capacity> {
     let Sequential(_, Residual(_, mlp, sum)) = layer;
     let (_, down) = mlp.0.parts();
-    let Staged { product, attended } = staged;
+    let Staged {
+        product,
+        second,
+        attended,
+    } = staged;
     let tile = attended.with(());
-    let fed = tile.with(down.forward(&mut *device, (), &mut (), (tile.with(product), first)));
+    let fed = tile.with(down.forward(
+        &mut *device,
+        (),
+        &mut (),
+        (tile.with(product), first, second),
+    ));
     sum.forward(device, (), &mut (), (&attended, &fed))
 }
 
@@ -255,7 +268,7 @@ impl<'l, 'c, 'a, 'p, 's>
     Module<
         (Output<'p>, Live<Owned<Width, Span>, Capacity>),
         Launched<'c, 'a>,
-        (&'s mut Stored, &'s First),
+        (&'s mut Stored, &'s FullPanel),
     > for Tokenwise<&'l Layer, &'l Layer>
 {
     type Output = Live<Owned<Width, Span>, Capacity>;
@@ -264,7 +277,7 @@ impl<'l, 'c, 'a, 'p, 's>
         &self,
         device: &mut Device,
         call: Launched<'c, 'a>,
-        (stored, first): (&'s mut Stored, &'s First),
+        (stored, first): (&'s mut Stored, &'s FullPanel),
         (attended, input): (Output<'p>, Live<Owned<Width, Span>, Capacity>),
     ) -> Self::Output {
         let Self(layer, next) = *self;
@@ -279,7 +292,7 @@ impl<'l, 'c, 'a, 'p, 's>
 
 /// A tile through the last layer from its attention and the final norm; the head's rows.
 impl<'l, 'c, 'a, 'p, 's>
-    Module<(Output<'p>, Live<Owned<Width, Span>, Capacity>), Launched<'c, 'a>, &'s First>
+    Module<(Output<'p>, Live<Owned<Width, Span>, Capacity>), Launched<'c, 'a>, &'s FullPanel>
     for Tokenwise<&'l Layer, &'l FinalNorm>
 {
     type Output = Live<Owned<Width, Span>, Capacity>;
@@ -288,7 +301,7 @@ impl<'l, 'c, 'a, 'p, 's>
         &self,
         device: &mut Device,
         call: Launched<'c, 'a>,
-        first: &'s First,
+        first: &'s FullPanel,
         (attended, input): (Output<'p>, Live<Owned<Width, Span>, Capacity>),
     ) -> Self::Output {
         let Self(layer, norm) = *self;
@@ -364,7 +377,7 @@ impl<'m, 'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, S>, Env, launch::
                 read: &stage.read,
             };
             let rows = (&places.stored.queries, &history, &context.read);
-            let mut panel = First::new();
+            let mut panel = FullPanel::new();
             let boundary = (down, &mut panel);
             let rows = (rows.0, rows.1, rows.2, boundary, &mut places.attended.0);
             attend.forward(&mut *device, (), &mut (), rows);

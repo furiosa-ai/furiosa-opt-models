@@ -118,8 +118,12 @@ impl<'t, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: Axi
             first,
             normalized,
             false,
-            |context, normalized, _| InputScales.forward(context, normalized),
+            (
+                |context, normalized, _| InputScales.forward(context, normalized),
+                |_| (),
+            ),
         )
+        .0
     }
 }
 
@@ -131,6 +135,7 @@ pub(super) fn forward<
     Capacity: AxisName,
     D: MaterializableScalar + FetchCast<f32>,
     S: MaterializableScalar + FetchCast<f32>,
+    P,
 >(
     context: &mut Device,
     weights: (
@@ -140,10 +145,16 @@ pub(super) fn forward<
     first: GateUp<Hidden, Intermediate>,
     normalized: Live<&Owned<Hidden, Rows>, Capacity>,
     compact: bool,
-    scales: impl FnOnce(&mut Device, &Owned<Hidden, Rows>, usize) -> HbmTensor<D, Chip, m![Rows]>,
+    (scales, before_final_slab): (
+        impl FnOnce(&mut Device, &Owned<Hidden, Rows>, usize) -> HbmTensor<D, Chip, m![Rows]>,
+        impl FnOnce(&mut Device) -> P,
+    ),
 ) -> (
-    Projection<Intermediate, Rows>,
-    Projection<Intermediate, Rows>,
+    (
+        Projection<Intermediate, Rows>,
+        Projection<Intermediate, Rows>,
+    ),
+    P,
 ) {
     const { assert!(Hidden::SIZE / 1024 == 4, "written for four passes") };
     let sweep = Sweep { compact };
@@ -244,6 +255,7 @@ pub(super) fn forward<
     let mut b2: Both<Intermediate, Rows> = DmTensor::new();
     let l = sweep.forward(&mut *context, (&quantized, &third, &mut b2, (2, l), waves));
     let sums = add(context, (&sums, &b2));
+    let prefetched = before_final_slab(context);
     let mut b3: Both<Intermediate, Rows> = DmTensor::new();
     let l = sweep.forward(
         &mut *context,
@@ -257,5 +269,5 @@ pub(super) fn forward<
     );
     let channel = channels(context, 1);
     let up = Combine.forward(&mut *context, ((&sums, &b3, 1), (&scale, &channel), rows));
-    (gate, up)
+    ((gate, up), prefetched)
 }

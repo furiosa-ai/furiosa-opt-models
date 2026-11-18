@@ -148,15 +148,28 @@ impl<'a, H: AxisName, I: AxisName, R: AxisName, C: AxisName>
         device: &mut Device,
         (first, normalized): (GateUp<H, I>, Live<&'a Owned<H, R>, C>),
     ) -> Self::Output {
-        compute::forward(
-            device,
-            (&self.0, &self.1),
-            first,
-            normalized,
-            true,
-            |device, input, rows| input_scales(device, input, rows),
-        )
+        gate_up(device, self, first, normalized, |_| ()).0
     }
+}
+
+/// Queue token scales before packing the normalized rows, and issue the next weight DMA
+/// once slabs 0–2 have accumulated and the final gate and up contractions can hide it.
+pub(crate) fn gate_up<H: AxisName, I: AxisName, R: AxisName, C: AxisName, P>(
+    device: &mut Device,
+    weights: &GateUpWeights<H, I>,
+    first: GateUp<H, I>,
+    normalized: Live<&Owned<H, R>, C>,
+    before_final_slab: impl FnOnce(&mut Device) -> P,
+) -> ((Projection<I, R>, Projection<I, R>), P) {
+    let scales = input_scales(device, normalized.value(), normalized.rows());
+    compute::forward(
+        device,
+        (&weights.0, &weights.1),
+        first,
+        normalized,
+        true,
+        (|_, _, _| scales, before_final_slab),
+    )
 }
 
 impl<H: AxisName, I: AxisName> Op<Begin<()>> for GateUpWeights<H, I> {
@@ -243,14 +256,14 @@ impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName>
     }
 }
 
-impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName> Op<(Live<Staging<I, R>, C>, &First<H>)>
-    for DownWeights<H, I>
+impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName>
+    Op<(Live<Staging<I, R>, C>, &FullPanel<H>, FullPanel<H>)> for DownWeights<H, I>
 {
     type Output = Owned<H, R>;
     fn forward(
         &self,
         device: &mut Device,
-        (staging, first): (Live<Staging<I, R>, C>, &First<H>),
+        (staging, first, second): (Live<Staging<I, R>, C>, &FullPanel<H>, FullPanel<H>),
     ) -> Self::Output {
         let rows = staging.rows();
         let Staging {
@@ -279,7 +292,7 @@ impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName> Op<(Live<Staging<I, R>,
             rows,
             (
                 |device, panel| load_product(device, [&p0, &p1, &p2][panel], rows),
-                |device, panel| down::<H, I, 64>(device, self, panel),
+                (|_| second, |device| down::<H, I, 64>(device, self, 2)),
                 |device, weight, input| project_panel(device, weight, &input, &row, &channel, rows),
             ),
             (
@@ -386,11 +399,11 @@ pub(crate) fn down<H: AxisName, I: AxisName, const B: usize>(
     output
 }
 
-pub(crate) type First<H> = Down<H, Inputs<64>>;
+pub(crate) type FullPanel<H> = Down<H, Inputs<64>>;
 
-impl<H: AxisName, I: AxisName> Op<&mut First<H>> for DownWeights<H, I> {
+impl<H: AxisName, I: AxisName> Op<&mut FullPanel<H>> for DownWeights<H, I> {
     type Output = ();
-    fn forward(&self, device: &mut Device, first: &mut First<H>) {
+    fn forward(&self, device: &mut Device, first: &mut FullPanel<H>) {
         load_down::<H, I, 64>(device, self, 0, first);
     }
 }

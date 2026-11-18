@@ -254,7 +254,10 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
             rows,
             (
                 |context, panel| landed(context, (panel, [&h0, &h1, &h2][panel])),
-                |context, panel| self.forward(context, Begin(panel)),
+                (
+                    |context| self.forward(context, Begin(1)),
+                    |context| self.forward(context, Begin(2)),
+                ),
                 |context, weight, input| project(context, (weight, input)),
             ),
             (|_| (), |_, (), partial| partial),
@@ -561,9 +564,9 @@ pub(super) fn panels<H: AxisName, I: AxisName, R: AxisName, W, Input, Tail>(
     device: &mut Device,
     first: &W,
     rows: usize,
-    (mut load, mut weight, mut project): (
+    (mut load, (second, third), mut project): (
         impl FnMut(&mut Device, usize) -> Input,
-        impl FnMut(&mut Device, usize) -> W,
+        (impl FnOnce(&mut Device) -> W, impl FnOnce(&mut Device) -> W),
         impl FnMut(&mut Device, &W, Input) -> Partial<H, I, R>,
     ),
     (prepare_tail, finish_tail): (
@@ -572,10 +575,10 @@ pub(super) fn panels<H: AxisName, I: AxisName, R: AxisName, W, Input, Tail>(
     ),
 ) -> Partial<H, I, R> {
     let (input0, input1) = (load(device, 0), load(device, 1));
-    let second = weight(device, 1);
+    let second = second(device);
     let input2 = load(device, 2);
     let a = project(device, first, input0);
-    let third = weight(device, 2);
+    let third = third(device);
     let b = project(device, &second, input1);
     let sum = add(device, &a, &b, rows);
     let tail = prepare_tail(device);
