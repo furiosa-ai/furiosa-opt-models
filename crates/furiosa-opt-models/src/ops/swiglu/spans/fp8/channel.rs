@@ -265,51 +265,69 @@ impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName>
         device: &mut Device,
         (staging, first, second): (Live<Staging<I, R>, C>, &FullPanel<H>, FullPanel<H>),
     ) -> Self::Output {
-        let rows = staging.rows();
-        let Staging {
-            panels: (p0, p1, p2, p3),
-            scales,
-            stored_scales,
-            resident_scales,
-        } = staging.into_value();
-        let row = if resident_scales {
-            down_scale_rows::<H, I, R>(device, &scales, rows)
-        } else {
-            stored_scales.to_dm(&mut device.tdma)
-        };
-        let channel: DmTensor<bf16, Chip, Cluster<I>, m![H / 16], m![H % 16]> =
-            self.1.to_dm(&mut device.tdma);
-        let channel: down::ChannelScales<H, I> = device
-            .sub
-            .begin(channel.view())
-            .fetch::<m![H % 16 / 8], m![H % 8]>()
-            .fetch_cast::<f32>()
-            .collect::<m![H % 16 / 8], m![H % 8]>()
-            .to_vrf();
-        let sum = down::panels(
-            device,
-            first,
-            rows,
-            (
-                |device, panel| load_product(device, [&p0, &p1, &p2][panel], rows),
-                (|_| second, |device| down::<H, I, 64>(device, self, 2)),
-                |device, weight, input| project_panel(device, weight, &input, &row, &channel, rows),
-            ),
-            (
-                |device| {
-                    (
-                        down::<H, I, 32>(device, self, 3),
-                        load_product(device, &p3, rows),
-                    )
-                },
-                |device, (weight, input), sum| {
-                    let tail = project_panel(device, &weight, &input, &row, &channel, rows);
-                    down::add(device, &sum, &tail, rows)
-                },
-            ),
-        );
-        down::finish(device, &sum, rows)
+        project_down(device, self, (staging, first, second), (|_| (), |_, _| ())).0
     }
+}
+
+/// Down inputs have priority on TDMA. Begin the following front once the tail is queued;
+/// finish its query weight immediately behind the cross-cluster partial-sum exchange.
+pub(crate) fn project_down<H: AxisName, I: AxisName, R: AxisName, C: AxisName, F>(
+    device: &mut Device,
+    weights: &DownWeights<H, I>,
+    (staging, first, second): (Live<Staging<I, R>, C>, &FullPanel<H>, FullPanel<H>),
+    (begin_front, finish_front): (
+        impl FnOnce(&mut Device) -> F,
+        impl FnOnce(&mut Device, &mut F),
+    ),
+) -> (Owned<H, R>, F) {
+    let rows = staging.rows();
+    let Staging {
+        panels: (p0, p1, p2, p3),
+        scales,
+        stored_scales,
+        resident_scales,
+    } = staging.into_value();
+    let row = if resident_scales {
+        down_scale_rows::<H, I, R>(device, &scales, rows)
+    } else {
+        stored_scales.to_dm(&mut device.tdma)
+    };
+    let channel: DmTensor<bf16, Chip, Cluster<I>, m![H / 16], m![H % 16]> =
+        weights.1.to_dm(&mut device.tdma);
+    let channel: down::ChannelScales<H, I> = device
+        .sub
+        .begin(channel.view())
+        .fetch::<m![H % 16 / 8], m![H % 8]>()
+        .fetch_cast::<f32>()
+        .collect::<m![H % 16 / 8], m![H % 8]>()
+        .to_vrf();
+    let (sum, mut front) = down::panels(
+        device,
+        first,
+        rows,
+        (
+            |device, panel| load_product(device, [&p0, &p1, &p2][panel], rows),
+            (|_| second, |device| down::<H, I, 64>(device, weights, 2)),
+            |device, weight, input| project_panel(device, weight, &input, &row, &channel, rows),
+        ),
+        (
+            |device| {
+                (
+                    down::<H, I, 32>(device, weights, 3),
+                    load_product(device, &p3, rows),
+                    begin_front(device),
+                )
+            },
+            |device, (weight, input, front), sum| {
+                let tail = project_panel(device, &weight, &input, &row, &channel, rows);
+                (down::add(device, &sum, &tail, rows), front)
+            },
+        ),
+    );
+    let fed = down::finish(device, &sum, rows, |device| {
+        finish_front(device, &mut front)
+    });
+    (fed, front)
 }
 
 fn input_scales<H: AxisName, R: AxisName>(

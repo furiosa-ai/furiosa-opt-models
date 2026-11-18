@@ -54,12 +54,12 @@ struct Staged {
     attended: Live<Owned<Width, Span>, Capacity>,
 }
 
-fn front(device: &mut Device, layer: &Layer, _: Live<(), Capacity>) -> Front {
+fn front<const SPLIT_QUERY: bool>(device: &mut Device, layer: &Layer) -> Front {
     let Sequential(Residual(norm, attention, _), _) = layer;
     let Projection { query, key, value } = &attention.0.qkv.projection.projection;
     let value = qkv::prepare(device, &value.0.weight);
     let key = qkv::prepare(device, &key.0.weight);
-    let query = qkv::prepare(device, &query.0.weight);
+    let query = qkv::prepare_weight::<_, _, _, SPLIT_QUERY>(device, &query.0.weight);
     let gain = crate::Op::forward(&Stage, device, &norm.0);
     Front {
         gain,
@@ -217,12 +217,16 @@ fn end(
 
 /// A `staged` tile through the second step of `layer`'s MLP, the down projection, and the MLP
 /// residual; the rows.
-fn update(
+fn update<F>(
     device: &mut Device,
     layer: &Layer,
     staged: Staged,
     first: &FullPanel,
-) -> Live<Owned<Width, Span>, Capacity> {
+    front: (
+        impl FnOnce(&mut Device) -> F,
+        impl FnOnce(&mut Device, &mut F),
+    ),
+) -> (Live<Owned<Width, Span>, Capacity>, F) {
     let Sequential(_, Residual(_, mlp, sum)) = layer;
     let (_, down) = mlp.0.parts();
     let Staged {
@@ -231,13 +235,11 @@ fn update(
         attended,
     } = staged;
     let tile = attended.with(());
-    let fed = tile.with(down.forward(
-        &mut *device,
-        (),
-        &mut (),
-        (tile.with(product), first, second),
-    ));
-    sum.forward(device, (), &mut (), (&attended, &fed))
+    let (fed, front) = mlp::project_down(device, down, (tile.with(product), first, second), front);
+    (
+        sum.forward(device, (), &mut (), (&attended, &tile.with(fed))),
+        front,
+    )
 }
 
 /// A tile of the embedded rows through the first layer up to its attention's store; the tile's
@@ -256,7 +258,7 @@ impl<'l, 'c, 'a, 's>
         tile: Live<(), Capacity>,
     ) -> Self::Output {
         let Self(embedded, layer) = *self;
-        let front = front(device, layer, tile);
+        let front = front::<false>(device, layer);
         let rows = tile.with(embedded.fill(&mut *device, tile));
         start(device, call, layer, front, rows, stored, projecting)
     }
@@ -281,11 +283,20 @@ impl<'l, 'c, 'a, 'p, 's>
         (attended, input): (Output<'p>, Live<Owned<Width, Span>, Capacity>),
     ) -> Self::Output {
         let Self(layer, next) = *self;
-        let tile = input.with(());
         let (attended, projecting) = attended;
         let staged = end(device, call, layer, (attended, &mut *projecting), input);
-        let front = front(device, next, tile);
-        let rows = update(device, layer, staged, first);
+        let Sequential(Residual(_, attention, _), _) = next;
+        let query = &attention.0.qkv.projection.projection.query.0.weight;
+        let (rows, front) = update(
+            device,
+            layer,
+            staged,
+            first,
+            (
+                |device| front::<true>(device, next),
+                |device, front| qkv::finish_query(device, query, &mut front.query),
+            ),
+        );
         start(device, call, next, front, rows, stored, projecting)
     }
 }
@@ -306,7 +317,7 @@ impl<'l, 'c, 'a, 'p, 's>
     ) -> Self::Output {
         let Self(layer, norm) = *self;
         let staged = end(device, call, layer, attended, input);
-        let rows = update(device, layer, staged, first);
+        let (rows, ()) = update(device, layer, staged, first, (|_| (), |_, _| ()));
         norm.forward(device, (), &mut (), &rows)
     }
 }

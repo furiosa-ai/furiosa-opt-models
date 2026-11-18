@@ -262,7 +262,7 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
             ),
             (|_| (), |_, (), partial| partial),
         );
-        finish(context, &partial, rows)
+        finish(context, &partial, rows, |_| ())
     }
 }
 
@@ -560,7 +560,7 @@ fn project<
 }
 /// Three full input panels in Qwen's load/compute order, followed by an optional native tail.
 /// Tail preparation overlaps the third full contraction. Every addition rounds to BF16 in DM.
-pub(super) fn panels<H: AxisName, I: AxisName, R: AxisName, W, Input, Tail>(
+pub(super) fn panels<H: AxisName, I: AxisName, R: AxisName, W, Input, Tail, Output>(
     device: &mut Device,
     first: &W,
     rows: usize,
@@ -571,9 +571,9 @@ pub(super) fn panels<H: AxisName, I: AxisName, R: AxisName, W, Input, Tail>(
     ),
     (prepare_tail, finish_tail): (
         impl FnOnce(&mut Device) -> Tail,
-        impl FnOnce(&mut Device, Tail, Partial<H, I, R>) -> Partial<H, I, R>,
+        impl FnOnce(&mut Device, Tail, Partial<H, I, R>) -> Output,
     ),
-) -> Partial<H, I, R> {
+) -> Output {
     let (input0, input1) = (load(device, 0), load(device, 1));
     let second = second(device);
     let input2 = load(device, 2);
@@ -605,6 +605,7 @@ pub(super) fn finish<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>(
     context: &mut Device,
     partial: &Partial<Hidden, Intermediate, Rows>,
     rows: usize,
+    after_exchange: impl FnOnce(&mut Device),
 ) -> Owned<Hidden, Rows> {
     let mut result: DmTensor<
         bf16,
@@ -626,6 +627,7 @@ pub(super) fn finish<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>(
         };
         let (send, own) = (half(context, &[1, 0]), half(context, &[0, 1]));
         let exchanged = send.view().cluster_swap().to_dm(&mut context.tdma);
+        after_exchange(context);
         Add::of::<m![Rows % (Rows / 2) = 8, Hidden % 16 / 8], m![1], m![Hidden % 8], Term, _, _, _, _>(&mut *context, (&own, &exchanged)).commit_prefix::<m![Rows % (Rows / 2) = 8], _, _>(result.view_mut().tile::<m![Rows % (Rows / 2)], 8,
                     m![Rows % (Rows / 2) = 8 #{!} (Rows / 2), Hidden % 16]>(0), rows);
     } else {
@@ -637,6 +639,7 @@ pub(super) fn finish<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>(
         };
         let (send, own) = (half(context, &[1, 0]), half(context, &[0, 1]));
         let exchanged = send.view().cluster_swap().to_dm(&mut context.tdma);
+        after_exchange(context);
         let reach = span::reach::<Rows>(rows);
         Add::of::<
             m![Rows % (Rows / 2) / 8],

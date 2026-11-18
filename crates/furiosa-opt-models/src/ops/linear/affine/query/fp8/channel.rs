@@ -260,14 +260,39 @@ pub(crate) fn prepare<Hidden: AxisName, Heads: AxisName, Head: AxisName>(
     device: &mut Device,
     projection: &Weights<Hidden, Heads, Head>,
 ) -> Prepared<Hidden, Heads, Head> {
+    prepare_weight::<_, _, _, false>(device, projection)
+}
+
+/// When split, only channels 0..64 of every head land here. The exchange queues the other half.
+pub(crate) fn prepare_weight<
+    Hidden: AxisName,
+    Heads: AxisName,
+    Head: AxisName,
+    const SPLIT: bool,
+>(
+    device: &mut Device,
+    projection: &Weights<Hidden, Heads, Head>,
+) -> Prepared<Hidden, Heads, Head> {
     let (mut weight, mut scale) = (DmTensor::new(), DmTensor::new());
-    source::Panel(&projection.0).forward(device, &mut weight);
+    if const { SPLIT } {
+        source::Half::<_, _, _, 0>(&projection.0).forward(device, &mut weight);
+    } else {
+        source::Panel(&projection.0).forward(device, &mut weight);
+    }
     source::Scales {
         stored: &projection.1,
         hidden: PhantomData,
     }
     .forward(device, &mut scale);
     Prepared { weight, scale }
+}
+
+pub(crate) fn finish_query<Hidden: AxisName, Heads: AxisName, Head: AxisName>(
+    device: &mut Device,
+    projection: &Weights<Hidden, Heads, Head>,
+    query: &mut Prepared<Hidden, Heads, Head>,
+) {
+    source::Half::<_, _, _, 1>(&projection.0).forward(device, &mut query.weight);
 }
 
 #[cfg(test)]

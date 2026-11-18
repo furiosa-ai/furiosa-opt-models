@@ -43,11 +43,11 @@ pub(crate) struct Half<'a, Hidden: AxisName, Heads: AxisName, Head: AxisName, co
 );
 
 impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, const HALF: usize>
-    Op<&mut Affine<Weight<Hidden, Heads, Head>, ()>> for Half<'_, Hidden, Heads, Head, HALF>
+    Op<&mut Weight<Hidden, Heads, Head>> for Half<'_, Hidden, Heads, Head, HALF>
 {
     type Output = ();
 
-    fn forward(&self, context: &mut Device, output: &mut Affine<Weight<Hidden, Heads, Head>, ()>) {
+    fn forward(&self, context: &mut Device, output: &mut Weight<Hidden, Heads, Head>) {
         const { assert!(Head::SIZE == 128 && HALF < 2) };
         self.0
             .view()
@@ -58,7 +58,7 @@ impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, const HALF: usize>
             ]>(HALF)
             .to_dm_view(
                 &mut context.tdma,
-                output.weight.view_mut().tile::<m![Head / 64], 1, m![
+                output.view_mut().tile::<m![Head / 64], 1, m![
                     Head / 64 = 1 #{!} 2, Heads % (Heads / 8), Head % 64, Hidden % 64
                 ]>(HALF),
             );
@@ -74,8 +74,8 @@ impl<Hidden: AxisName, Heads: AxisName, Head: AxisName> Op<Begin<()>>
 
     fn forward(&self, device: &mut Device, _: Begin<()>) -> Self::Output {
         let mut output = Affine::new(DmTensor::new(), ());
-        Half::<_, _, _, 0>(&self.weight.0).forward(&mut *device, &mut output);
-        Half::<_, _, _, 1>(&self.weight.0).forward(&mut *device, &mut output);
+        Half::<_, _, _, 0>(&self.weight.0).forward(&mut *device, &mut output.weight);
+        Half::<_, _, _, 1>(&self.weight.0).forward(&mut *device, &mut output.weight);
         let squares = self.weight.1.0.to_hbm(&mut device.tdma);
         Affine::new((output.weight, squares), ())
     }
