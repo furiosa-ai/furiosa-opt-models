@@ -117,6 +117,17 @@ impl<Hidden: AxisName, G: Group> Period<Hidden, G> {
         projection: &Prepared<Hidden, Heads, Head>,
         operand: &Operand<Hidden, G>,
     ) -> Output<G, Heads, Head, Spread, Local> {
+        self.project_with_prefetch(device, projection, operand, |_| {})
+    }
+
+    /// Queue independent TDMA work after the channel scales land on the result slices.
+    pub(crate) fn project_with_prefetch<Heads: AxisName, Head: AxisName, Spread: M, Local: M>(
+        &self,
+        device: &mut Device,
+        projection: &Prepared<Hidden, Heads, Head>,
+        operand: &Operand<Hidden, G>,
+        prefetch: impl FnOnce(&mut Device),
+    ) -> Output<G, Heads, Head, Spread, Local> {
         let scale: DmTensor<
             bf16,
             Chip,
@@ -135,6 +146,7 @@ impl<Hidden: AxisName, G: Group> Period<Hidden, G> {
                 .to_dm_view(&mut device.tdma, scale.view_mut());
             scale
         };
+        prefetch(device);
         // SAFETY: the two head-owner digits name the same four physical owners for Q, K and V.
         // Only their labels change; input features and the local output order are untouched.
         let weight = unsafe {

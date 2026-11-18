@@ -114,11 +114,12 @@ fn start(
             // DMA the next pair before this contraction; both use the same resident QKV weights.
             let next = staged.pair(device, (first + pair + 1) % (Capacity::SIZE / 256));
             let operand = current.fill(device);
-            if last_span && !single && pair + 1 == pairs {
-                output.forward(device, (), &mut (), &mut *projecting);
-            }
             let q: query::Queries<TilePair, QueryHeads<S>, Head> =
-                current.project(device, &front.query, &operand);
+                current.project_with_prefetch(device, &front.query, &operand, |device| {
+                    if last_span && !single && pair + 1 == pairs {
+                        output.forward(device, (), &mut (), &mut *projecting);
+                    }
+                });
             let k: query::Pairs<TilePair, KvHeads, Head> =
                 current.project(device, &front.key, &operand);
             let v: query::Pairs<TilePair, KvHeads, Head> =
@@ -144,11 +145,12 @@ fn start(
         );
         let period = qkv::Period::quantize(device, &input, groups);
         let operand = period.fill(device);
-        if last_span {
-            output.forward(device, (), &mut (), &mut *projecting);
-        }
         let q: query::Queries<Tiles<1>, QueryHeads<S>, Head> =
-            period.project(device, &front.query, &operand);
+            period.project_with_prefetch(device, &front.query, &operand, |device| {
+                if last_span {
+                    output.forward(device, (), &mut (), &mut *projecting);
+                }
+            });
         let k: query::Pairs<Tiles<1>, KvHeads, Head> = period.project(device, &front.key, &operand);
         let v: query::Pairs<Tiles<1>, KvHeads, Head> =
             period.project(device, &front.value, &operand);
