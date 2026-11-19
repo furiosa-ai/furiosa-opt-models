@@ -19,11 +19,6 @@ pub(super) struct Prepared {
 }
 
 impl Prepared {
-    pub(super) fn load(source: &Checkpoint, capacity: usize) -> Result<Self, LoadError> {
-        let inputs = Inputs::read(source)?;
-        Self::load_with_inputs(source, capacity, inputs)
-    }
-
     /// Reuse the documents already checked by the load boundary; no second sidecar read.
     pub(super) fn load_with_inputs(
         source: &Checkpoint,

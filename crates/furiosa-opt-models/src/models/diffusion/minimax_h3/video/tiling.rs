@@ -161,11 +161,6 @@ impl Stitch {
         })
     }
 
-    /// The sole next acceptable group, or `None` once all 49 groups have been accepted.
-    pub fn next_group(&self) -> Option<GroupIndex> {
-        (self.accepted < GROUPS).then(|| GroupIndex(self.accepted))
-    }
-
     /// Accept contiguous FP32 `[4,2048,3072]` decoder rows, chip first, including padded rows.
     /// The source stride is 2,048 rows per chip; only the first 1,792 rows are unpacked.
     /// Both sequence and exact input length are checked before any retained buffer is mutated.

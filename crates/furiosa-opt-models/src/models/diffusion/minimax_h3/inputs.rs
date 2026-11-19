@@ -22,7 +22,8 @@ impl Component {
     pub fn directory(&self) -> &Path {
         &self.directory
     }
-    pub fn weights_directory(&self) -> &Path {
+    #[cfg(test)]
+    fn weights_directory(&self) -> &Path {
         &self.weights
     }
     pub fn tensor_prefix(&self) -> &str {
@@ -151,14 +152,8 @@ impl Inputs {
     pub fn video(&self) -> &Video {
         &self.video
     }
-    pub fn video_source(&self) -> &VideoSource {
-        &self.video_source
-    }
     pub fn audio(&self) -> &Audio {
         &self.audio
-    }
-    pub fn audio_metadata(&self) -> &AudioMetadata {
-        &self.audio_metadata
     }
     pub fn layout(&self) -> &Layout {
         &self.layout

@@ -4,7 +4,7 @@
 //! position per valid token. This module does not generate positions or infer their units.
 //! Rotation rows follow compact query work, including identity padding, inside the allocation
 //! envelope. Visibility instead describes the video/audio/text key prefix: K/V placement must
-//! use [`packing::Token::key_row`], not a query row or an upstream position index.
+//! use the packed key order from [`Plan::key_runs`], not query or upstream position order.
 
 use super::packing::{self, Plan};
 use half::bf16;
@@ -117,15 +117,18 @@ impl Positions {
     }
 
     /// Allocation shape for each replicated rotation table; active work is `plan.query_rows()`.
-    pub fn rotation_shape(&self) -> [usize; 2] {
+    #[cfg(test)]
+    fn rotation_shape(&self) -> [usize; 2] {
         [self.plan.capacity().query_capacity(), HEAD]
     }
 
-    pub fn low(&self) -> &[bf16] {
+    #[cfg(test)]
+    fn low(&self) -> &[bf16] {
         &self.low
     }
 
-    pub fn high(&self) -> &[bf16] {
+    #[cfg(test)]
+    fn high(&self) -> &[bf16] {
         &self.high
     }
 
@@ -136,11 +139,13 @@ impl Positions {
 
     /// Row-major visibility image matching `ops::attention::flash::Visible`. Attention's runtime
     /// key limit is `plan.key_count()`, not this allocation's full span count or query work.
-    pub fn visibility_shape(&self) -> [usize; 2] {
+    #[cfg(test)]
+    fn visibility_shape(&self) -> [usize; 2] {
         [self.plan.capacity().key_spans(), packing::KEY_SPAN]
     }
 
-    pub fn visibility(&self) -> &[bf16] {
+    #[cfg(test)]
+    fn visibility(&self) -> &[bf16] {
         &self.visibility
     }
 }

@@ -116,7 +116,8 @@ impl Capacity {
 
     /// Check a caller's compiled per-part allocation against its maximum text limit and gather
     /// equation. The allocation may exceed the minimum, but may not truncate computed rows.
-    pub fn with_gather_rows(max_text: usize, gather_rows: usize) -> io::Result<Self> {
+    #[cfg(test)]
+    pub(super) fn with_gather_rows(max_text: usize, gather_rows: usize) -> io::Result<Self> {
         Self::checked(max_text, Some(gather_rows))
     }
 
@@ -124,27 +125,20 @@ impl Capacity {
         self.max_text
     }
 
-    /// Maximum computed rows per part, including row-block guard padding.
-    pub fn max_work_rows(&self) -> usize {
-        self.max_work.computed
-    }
-
     /// Physical stride of a local allocation and of every capacity-strided gathered part.
-    pub fn gather_rows(&self) -> usize {
+    #[cfg(test)]
+    fn gather_rows(&self) -> usize {
         self.gather_rows
     }
 
-    pub fn gather_tiles(&self) -> usize {
+    #[cfg(test)]
+    fn gather_tiles(&self) -> usize {
         self.gather_tiles
     }
 
-    /// Joined capacity-strided rows, before any compact projection stores.
-    pub fn gathered_rows(&self) -> usize {
-        self.gathered_rows
-    }
-
     /// Gather staging slots: the first slot also has body capacity, though only its head is used.
-    pub fn staging_rows(&self) -> usize {
+    #[cfg(test)]
+    fn staging_rows(&self) -> usize {
         self.staging_rows
     }
 
@@ -156,7 +150,8 @@ impl Capacity {
 
     /// Maximum active compact query work, which can be smaller than the allocation envelope.
     /// A numerical implementation still has to validate the chosen attention mapping.
-    pub fn max_query_rows(&self) -> usize {
+    #[cfg(test)]
+    fn max_query_rows(&self) -> usize {
         self.max_query_rows
     }
 
@@ -428,12 +423,14 @@ impl Part<'_> {
     }
 
     /// Finite row-block padding after the packed spans; it belongs to no modality.
-    pub fn guard_rows(&self) -> Range<usize> {
+    #[cfg(test)]
+    fn guard_rows(&self) -> Range<usize> {
         self.plan.work.packed..self.plan.work.computed
     }
 
     /// Uncomputed allocation tail; no consumer may read it based on this plan.
-    pub fn allocation_tail(&self) -> Range<usize> {
+    #[cfg(test)]
+    fn allocation_tail(&self) -> Range<usize> {
         self.plan.work.computed..self.plan.capacity.gather_rows
     }
 }
@@ -449,7 +446,8 @@ impl Span {
 }
 
 impl Token {
-    pub fn modality(&self) -> Modality {
+    #[cfg(test)]
+    fn modality(&self) -> Modality {
         self.modality
     }
 
@@ -469,12 +467,14 @@ impl Token {
         self.upstream_row
     }
 
-    pub fn key_row(&self) -> usize {
+    #[cfg(test)]
+    pub(super) fn key_row(&self) -> usize {
         self.key_row
     }
 
     /// Row in joined capacity-strided parts. A chip's local residual instead uses `local_row`.
-    pub fn allocated_row(&self) -> usize {
+    #[cfg(test)]
+    fn allocated_row(&self) -> usize {
         self.allocated_row
     }
 
@@ -532,10 +532,9 @@ mod tests {
             (capacity.gather_rows(), capacity.gather_tiles()),
             (10496, 11)
         );
-        assert_eq!(capacity.query_capacity(), 41984);
         assert_eq!(
             (
-                capacity.gathered_rows(),
+                capacity.query_capacity(),
                 capacity.staging_rows(),
                 capacity.max_query_rows(),
                 capacity.key_rows()
@@ -652,7 +651,7 @@ mod tests {
                             Some(token)
                         );
                         assert!(token.query_row() < plan.query_rows());
-                        assert!(token.allocated_row() < capacity.gathered_rows());
+                        assert!(token.allocated_row() < capacity.query_capacity());
                     }
                 }
             }

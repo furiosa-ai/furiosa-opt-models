@@ -27,11 +27,6 @@ use tokio::sync::Mutex;
 pub struct Prepared(weights::Prepared);
 
 impl Prepared {
-    /// Load the one maximum-2048 Live profile. No device is opened or placed here.
-    pub fn load(source: &Checkpoint) -> Result<Self, LoadError> {
-        weights::Prepared::load(source, DEFAULT_MAX_TEXT).map(Self)
-    }
-
     /// Load with already checked component documents, including an in-memory checkpoint.
     pub fn from_inputs(source: &Checkpoint, inputs: Inputs) -> Result<Self, LoadError> {
         weights::Prepared::load_with_inputs(source, DEFAULT_MAX_TEXT, inputs).map(Self)

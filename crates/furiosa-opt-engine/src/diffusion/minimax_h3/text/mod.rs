@@ -30,10 +30,9 @@ type Windows = Rows<{ DEFAULT_MAX_TEXT.div_ceil(gqa::Cache::SIZE) }>;
 type Cache = Blocks<LocalKv, Head, bf16, Chips>;
 type Hidden = HbmTensor<bf16, Chips, m![{ Symbol<text::Hidden> }]>;
 
-/// The owning body and position constants share leaves with every component view. Construction
+/// The embedding, layers and position views retain their shared parameter cells. Construction
 /// measures actual allocation costs before selecting the prefix; no payload estimate decides fit.
 pub(crate) struct Encoder {
-    owner: Resident<(text::Body, text::position::Positions)>,
     embedding: Resident<text::Embedding>,
     positions: Resident<text::position::Positions>,
     layers: [Resident<text::Layer>; text::LAYERS],
@@ -101,7 +100,6 @@ impl Encoder {
             layers[0].to_host()?;
         }
         Ok(Self {
-            owner,
             embedding,
             positions,
             layers,

@@ -60,7 +60,7 @@ pub(super) enum Closing {
 
 /// The copy remains owned until the selected tree has waited for all returned work.
 pub(super) struct Drained {
-    pub(super) copy: Arc<HbmBuffer>,
+    _copy: Arc<HbmBuffer>,
     pub(super) work: Vec<Arc<Completion>>,
     pub(super) failure: Option<String>,
     _owner: Owner,
@@ -183,7 +183,7 @@ impl Parameter {
             .expect("the closing eviction owns the copy");
         let (readers, failure) = gate.take();
         Drained {
-            copy: buffer,
+            _copy: buffer,
             work: upload.into_iter().chain(readers).collect(),
             failure,
             _owner: owner,
@@ -651,7 +651,7 @@ mod tests {
         assert_eq!(drained.work.len(), 1);
         assert!(Arc::ptr_eq(&drained.work[0], &upload));
         assert!(drained.failure.is_none());
-        let copy = Arc::downgrade(&drained.copy);
+        let copy = Arc::downgrade(&drained._copy);
         assert!(copy.upgrade().is_some());
         signal.complete();
         for work in &drained.work {
