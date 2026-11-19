@@ -7,8 +7,9 @@
 use furiosa_opt_models::models::diffusion::minimax_h3::packing::{
     AUDIO_TOKENS, Capacity, Modality, PARTS, Plan, VIDEO_TOKENS,
 };
+use furiosa_opt_models::tensor::memory::filled;
 use furiosa_opt_std::prelude::AxisName;
-use std::{io, mem::size_of};
+use std::io;
 
 /// One request's canonical framework indices and the plan shared with request preparation.
 /// No index list or count can change after parsing.
@@ -260,21 +261,6 @@ fn elements(rows: usize, width: usize) -> io::Result<usize> {
     }
     rows.checked_mul(width)
         .ok_or_else(|| invalid("media element count overflows usize"))
-}
-
-fn filled<T: Clone>(count: usize, value: T) -> io::Result<Vec<T>> {
-    let bytes = count
-        .checked_mul(size_of::<T>())
-        .ok_or_else(|| invalid("host buffer byte count overflows usize"))?;
-    if bytes > isize::MAX as usize {
-        return Err(invalid("host buffer exceeds isize::MAX bytes"));
-    }
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(count)
-        .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
-    values.resize(count, value);
-    Ok(values)
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {

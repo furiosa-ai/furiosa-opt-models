@@ -7,6 +7,7 @@
 //! use the packed key order from [`Plan::key_runs`], not query or upstream position order.
 
 use super::packing::{self, Plan};
+use crate::tensor::memory::filled;
 use half::bf16;
 use std::{io, mem::size_of};
 
@@ -77,9 +78,9 @@ impl Positions {
             }
         }
 
-        let mut low = zeros(rotation_len)?;
-        let mut high = zeros(rotation_len)?;
-        let mut visibility = zeros(visibility_len)?;
+        let mut low = filled(rotation_len, bf16::ZERO)?;
+        let mut high = filled(rotation_len, bf16::ZERO)?;
+        let mut visibility = filled(visibility_len, bf16::ZERO)?;
         for (low, high) in low.chunks_exact_mut(HEAD).zip(high.chunks_exact_mut(HEAD)) {
             low[..HALF].fill(bf16::ONE);
             high[HALF..].fill(bf16::ONE);
@@ -161,15 +162,6 @@ fn elements(rows: usize, width: usize, field: &str) -> io::Result<usize> {
         return Err(invalid(format!("{field}: buffer exceeds isize::MAX bytes")));
     }
     Ok(count)
-}
-
-fn zeros(elements: usize) -> io::Result<Vec<bf16>> {
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(elements)
-        .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
-    values.resize(elements, bf16::ZERO);
-    Ok(values)
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {

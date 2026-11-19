@@ -441,3 +441,11 @@ pub(super) fn rounded(
 pub(super) fn round(value: f32) -> f32 {
     bf16::from_f32(value).to_f32()
 }
+
+/// Split FP32 into a BF16 high part and a rounded BF16 residual.
+#[inline]
+pub(super) fn split(value: f32) -> [bf16; 2] {
+    let high = bf16::from_f32(value);
+    let low = bf16::from_f32(value - high.to_f32());
+    [high, low]
+}

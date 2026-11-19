@@ -19,6 +19,7 @@ use std::io;
 
 use super::{Parts, Patch, Rows, TOKENS};
 use crate::models::diffusion::minimax_h3::embeddings::Chips;
+use crate::tensor::memory::filled;
 use furiosa_opt_std::prelude::*;
 
 /// The fixed request's borrowed latent values in channel, time, row, column order.
@@ -47,7 +48,7 @@ impl<'a> Latents<'a> {
     /// token 1,791 are finite positive zero, including register and class-token input rows.
     /// Latent statistics are not applied here, matching the preserved Rust path.
     pub fn pack(&self, group: GroupIndex) -> io::Result<Packed> {
-        let mut values = zeroed(Chips::SIZE * Rows::SIZE * Parts::SIZE, bf16::from_f32(0.0))?;
+        let mut values = filled(Chips::SIZE * Rows::SIZE * Parts::SIZE, bf16::from_f32(0.0))?;
         for chip in 0..Chips::SIZE {
             let tile = group.spatial() * Chips::SIZE + chip;
             let top = LATENT_TOPS[tile / LATENT_LEFTS.len()];
@@ -63,8 +64,7 @@ impl<'a> Latents<'a> {
                             + left
                             + token % 16;
                     let value = self.values[index];
-                    let high = bf16::from_f32(value);
-                    let low = bf16::from_f32(value - high.to_f32());
+                    let [high, low] = super::parameters::split(value);
                     for (part, value) in [high, low, high].into_iter().enumerate() {
                         let at =
                             (chip * Rows::SIZE + token) * Parts::SIZE + part * CHANNELS + channel;
@@ -405,13 +405,6 @@ const _: () = {
 
 fn zeroed_floats(length: usize) -> io::Result<Vec<f32>> {
     bytemuck::allocation::try_zeroed_vec(length).map_err(|()| io::ErrorKind::OutOfMemory.into())
-}
-
-fn zeroed<T: Clone>(length: usize, zero: T) -> io::Result<Vec<T>> {
-    let mut values = Vec::new();
-    values.try_reserve_exact(length).map_err(allocation)?;
-    values.resize(length, zero);
-    Ok(values)
 }
 
 fn allocation(error: std::collections::TryReserveError) -> io::Error {

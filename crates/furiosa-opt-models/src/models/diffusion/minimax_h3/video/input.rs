@@ -195,8 +195,7 @@ impl Fold {
                     })
                     .sum();
                 let value = product as f32;
-                let high = bf16::from_f32(value);
-                let low = bf16::from_f32(value - high.to_f32());
+                let [high, low] = super::parameters::split(value);
                 let at = row * Parts::SIZE + input;
                 (parts[at], parts[at + CHANNELS], parts[at + 2 * CHANNELS]) = (high, high, low);
             }
