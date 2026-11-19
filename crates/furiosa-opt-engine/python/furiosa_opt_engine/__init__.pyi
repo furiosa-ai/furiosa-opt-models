@@ -11,7 +11,7 @@ import numpy
 import numpy.typing
 import typing_extensions
 
-from . import decoder, llama, mistral, qwen3, vision_language
+from . import decoder, llama, minimax_h3, mistral, qwen3, vision_language
 
 __all__ = [
     "Checkpoint",
@@ -27,6 +27,7 @@ __all__ = [
     "Transfer",
     "decoder",
     "llama",
+    "minimax_h3",
     "mistral",
     "qwen3",
     "vision_language",
@@ -472,7 +473,9 @@ class LoadOptions:
                 checkpoint, or a quantized checkpoint is given a quantization.
             NotImplementedError: The list refuses the architecture, or a choice.
         """
-    def load(self, checkpoint: Checkpoint, device: Device) -> Decoder | Encoder:
+    def load(
+        self, checkpoint: Checkpoint, device: Device
+    ) -> Decoder | Encoder | minimax_h3.Pipeline:
         r"""
         Load the model `checkpoint` selects strictly into HBM of `device`: a decoder, as an object of
         its model type's class such as `qwen3.ForCausalLM`, or an `Encoder` for a load of the media

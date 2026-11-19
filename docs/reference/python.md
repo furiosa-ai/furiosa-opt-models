@@ -30,8 +30,8 @@ For a walkthrough, see [Using the engine](../engine/python.md).
 
 ## Loaded models
 
-A load returns a `Decoder`, which serves every model alike, as an object of its model type's class from the submodule of that model type.
-Every `forward` returns its device outputs once the device accepted the call; a copy of pinned `HostBuffer` memory may return before it ends, and only `Transfer.wait`, every other copy, `HbmTensor.wait` and `Device.synchronize` wait for the device ([asynchronous calls](../engine/python.md#run-calls-asynchronously)).
+A load of a text model returns an instance of its model class derived from `Decoder`.
+Each decoder's `forward` returns its device outputs once the device accepted the call; a copy of pinned `HostBuffer` memory may return before it ends, and only `Transfer.wait`, every other copy, `HbmTensor.wait` and `Device.synchronize` wait for the device ([asynchronous calls](../engine/python.md#run-calls-asynchronously)).
 
 ::: furiosa_opt_engine.Decoder
 
@@ -50,6 +50,25 @@ A load of a vision-language model's media encoder alone (`LoadOptions.encoder()`
 ::: furiosa_opt_engine.vision_language.Image
 
 ::: furiosa_opt_engine.vision_language.Audio
+
+## Diffusion pipelines
+
+A MiniMax H3 load returns one four-chip `Pipeline`. Its component views retain
+the same pipeline and device. Component calls take the framework's arguments and
+return completed host tensors; they do not use the decoder KV-cache API below.
+See the [H3 profile](../models/minimax-h3.md) for supported inputs and serving.
+
+::: furiosa_opt_engine.minimax_h3.Component
+
+::: furiosa_opt_engine.minimax_h3.Pipeline
+
+::: furiosa_opt_engine.minimax_h3.Transformer
+
+::: furiosa_opt_engine.minimax_h3.TextEncoder
+
+::: furiosa_opt_engine.minimax_h3.VideoDecoder
+
+::: furiosa_opt_engine.minimax_h3.AudioDecoder
 
 ## Requests and cache
 

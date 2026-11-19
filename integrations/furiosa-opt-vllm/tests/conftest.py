@@ -117,6 +117,24 @@ INVENTORY: Final = TypeAdapter(Inventory).validate_json(
 JSON: Final = TypeAdapter[JsonValue](JsonValue)
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.getgroup("h3").addoption(
+        "--h3",
+        action="store_true",
+        default=False,
+        help="run H3 tests with a local checkpoint and user-provided external golden data",
+    )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    if config.getoption("h3", default=False):
+        return
+    disabled = pytest.mark.skip(reason="H3 requires explicit --h3 and private local inputs")
+    for item in items:
+        if item.get_closest_marker("h3") is not None:
+            item.add_marker(disabled)
+
+
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     if "row" in metafunc.fixturenames:
         rows = [row for row in INVENTORY["models"] if row["task"] == metafunc.module.TASK]

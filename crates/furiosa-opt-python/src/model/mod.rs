@@ -26,6 +26,7 @@ use std::path::PathBuf;
 use std::sync::PoisonError;
 
 mod llama;
+pub(super) mod minimax_h3;
 mod mistral;
 mod qwen3;
 
@@ -200,7 +201,7 @@ impl LoadOptions {
     ///     ValueError: As `parse` does, or a tensor is missing, unexpected or malformed.
     ///     NotImplementedError: As `parse` does, or no class holds the model yet.
     ///     RuntimeError: The device fails.
-    #[gen_stub(override_return_type(type_repr = "Decoder | Encoder"))]
+    #[gen_stub(override_return_type(type_repr = "Decoder | Encoder | minimax_h3.Pipeline"))]
     fn load(
         &self,
         py: Python<'_>,
@@ -208,6 +209,22 @@ impl LoadOptions {
         device: &Device,
     ) -> Result<Py<PyAny>, Error> {
         let config = self.0.parse(&checkpoint.0)?;
+        if config.is_pipeline() {
+            let shared = py.detach(|| engine::residency::SharedDevice::bind(device.0.clone()));
+            if shared.placement().chips.len() != config.chips() || shared.placement().pes != (0..8)
+            {
+                return Err(LoadError::Unsupported {
+                    name: "placement".into(),
+                    reason: "H3 requires four chips with all eight PEs per chip".into(),
+                }
+                .into());
+            }
+            // Host preparation checks all documents and weights before placement. Bind the
+            // original context owner, and drive the pipeline WITHOUT holding its device lock.
+            let prepared = py.detach(|| self.0.prepare_pipeline(&checkpoint.0))?;
+            let pipeline = py.detach(|| engine::residency::block_on(prepared.place(shared)))?;
+            return Ok(minimax_h3::object(py, pipeline, device.0.clone())?.into_any());
+        }
         // A decoder's class is its model type's, found before a weight is read.
         let unbound = || LoadError::Unsupported {
             name: config.architecture().into(),

@@ -156,6 +156,9 @@ nav:
           - Qwen3:
               - models/qwen3-embedding.md
               - models/qwen3-reranker.md
+      - Video with audio:
+          - MiniMax H3:
+              - models/minimax-h3.md
   - Developer guide:
       - design/architecture.md
       - develop/compose.md
