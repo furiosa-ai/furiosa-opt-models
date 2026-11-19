@@ -25,7 +25,6 @@ pub(super) struct Decoder {
     _owner: Component<audio::Decoder>,
     decoder: Resident<audio::Decoder>,
     device: SharedDevice,
-    active: tokio::sync::Mutex<()>,
 }
 
 impl Decoder {
@@ -48,7 +47,6 @@ impl Decoder {
             _owner: owner,
             decoder,
             device,
-            active: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -60,7 +58,6 @@ impl Decoder {
     /// each channel's trailing allocation padding separately.
     pub(super) async fn decode(&self, shape: &[usize], values: &[f32]) -> io::Result<Vec<f32>> {
         let packed = Latents::new(shape, values)?.pack();
-        let _active = self.active.lock().await;
         let input: audio::Input = self.device.with_device(|device| {
             // Complete the replicated upload while its host source is still owned. There is
             // no cancellation point between DMA submission and its completion.

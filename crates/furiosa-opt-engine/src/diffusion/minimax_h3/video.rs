@@ -23,7 +23,6 @@ pub(super) struct Decoder {
     head: Resident<video::Head>,
     context: Arc<video::Context>,
     device: SharedDevice,
-    active: tokio::sync::Mutex<()>,
 }
 
 impl Decoder {
@@ -65,7 +64,6 @@ impl Decoder {
             head,
             context,
             device,
-            active: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -79,7 +77,6 @@ impl Decoder {
         frames: usize,
     ) -> io::Result<Vec<f32>> {
         let latents = video::tiling::Latents::new(values)?;
-        let _active = self.active.lock().await;
         self.context
             .rotation
             .low

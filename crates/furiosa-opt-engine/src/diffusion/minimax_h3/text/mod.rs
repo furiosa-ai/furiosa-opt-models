@@ -39,7 +39,6 @@ pub(crate) struct Encoder {
     device: SharedDevice,
     capacity: usize,
     fit: Fit,
-    active: tokio::sync::Mutex<()>,
 }
 
 impl Encoder {
@@ -106,7 +105,6 @@ impl Encoder {
             device,
             capacity,
             fit,
-            active: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -114,7 +112,6 @@ impl Encoder {
     /// The single cache is reused only after all of the preceding layer's readers have ended.
     pub(crate) async fn encode(&self, tokens: &[i32]) -> io::Result<Vec<HbmBuffer>> {
         let prepared = request::Prepared::new(tokens, self.capacity)?;
-        let _active = self.active.lock().await;
         let request = Arc::new(self.device.with_device(|device| {
             // This initial transfer has no kernel readers yet. No dependent kernel or weight
             // completion is waited under this lock.
