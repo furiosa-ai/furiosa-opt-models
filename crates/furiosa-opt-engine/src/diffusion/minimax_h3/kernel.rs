@@ -2,7 +2,7 @@
 
 use super::request;
 use furiosa_opt_models::Module;
-use furiosa_opt_models::models::diffusion::minimax_h3::denoiser::stages::{
+use furiosa_opt_models::models::diffusion::minimax_h3::denoiser::launch::{
     Audio, EncoderRows, Hidden, StepInput, Video,
 };
 use furiosa_opt_models::models::diffusion::minimax_h3::embeddings::Chips;
@@ -10,7 +10,7 @@ use furiosa_opt_models::ops::attention::flash;
 use furiosa_opt_models::tensor::scalar::Value;
 use furiosa_opt_std::prelude::*;
 
-pub(super) use furiosa_opt_models::models::diffusion::minimax_h3::denoiser::stages::{
+pub(super) use furiosa_opt_models::models::diffusion::minimax_h3::denoiser::launch::{
     Block, Condition, Embed, EmbeddedTime, Heads, RefinerLayer, RefinerNorm,
 };
 

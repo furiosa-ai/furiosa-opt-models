@@ -71,7 +71,7 @@ impl<
                 &vec![[0.0; 3]; maximum.key_count()],
                 weights.inputs().transformer().rope_theta(),
             )?;
-            let request = block_on(prepared.upload(device))?;
+            let request = block_on(request::Request::upload(prepared, device))?;
             let rows = block_on(
                 HostTensor::<bf16, m![{ Chips }, T, Width]>::zero()
                     .to_hbm(&mut device.pdma)
@@ -192,7 +192,7 @@ impl<
         // coexist with conditioning metadata; joint transports never burden the encoder probe.
         let request = self
             .device
-            .with_device(|device| block_on(prepared.upload(device)))?;
+            .with_device(|device| block_on(request::Request::upload(prepared, device)))?;
         let text = self.conditioner.prepare(plan, encoded).await?;
         let state = Arc::new(denoiser::State::new(request, text)?);
         Ok(Request {

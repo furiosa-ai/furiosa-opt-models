@@ -5,7 +5,7 @@
 //! Callers own destinations, operands and metadata through completion of their readers.
 
 use super::super::{request, transformer};
-use super::stages::EmbeddedTime;
+use super::launch::EmbeddedTime;
 use crate::models::diffusion::minimax_h3::embeddings::{Chips, Time, Width};
 use crate::ops::{
     index::{packed::Table, scatter::Store},
@@ -15,12 +15,13 @@ use crate::tensor::memory::Hbm;
 use crate::{Module, Then};
 use furiosa_opt_std::prelude::*;
 
-pub use super::stages::Hidden;
+pub use super::launch::Hidden;
 
 /// The first block's existing modulation projection, borrowed without loading another tree.
 /// Obtain `model` from `first.0.modulation.0` of the admitted `denoiser::Block<&Hbm>`.
 #[derive(DeviceSend)]
 pub struct LocalTables<'a, M> {
+    /// Borrowed first-block modulation weights.
     pub model: &'a M,
 }
 
@@ -65,6 +66,7 @@ where
 /// Obtain `model` from `first.0.norm.0` of the same admitted block used for modulation.
 #[derive(DeviceSend)]
 pub struct Norm<'a, 'w: 'a> {
+    /// Borrowed first-block adaptive normalization weights.
     pub model: &'a transformer::AdaptiveNorm<Width, &'w Hbm>,
 }
 

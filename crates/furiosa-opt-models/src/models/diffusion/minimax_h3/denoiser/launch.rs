@@ -31,6 +31,7 @@ pub type Times = HbmTensor<f32, Chips, m![{ Symbol<Rows<64>> }, 1 # 8]>;
 /// Every gathered row is initialized before the existing condition projection reads it.
 #[derive(DeviceSend)]
 pub struct Condition<'a, 'w: 'a> {
+    /// Borrowed text projection weights.
     pub model: &'a embeddings::Text<Encoded, Width, Chips, &'w Hbm>,
 }
 
@@ -58,6 +59,7 @@ impl<'i, R: AxisName> Module<EncoderRows<'i, R>, (), &mut ()> for Condition<'_, 
 /// The original refiner's independently launched layer, with all heads on every chip.
 #[derive(DeviceSend)]
 pub struct RefinerLayer<'a, 'w: 'a> {
+    /// Borrowed weights for one text-refiner layer.
     pub model:
         &'a transformer::RefinerLayer<Width, transformer::Attended, transformer::Expanded, &'w Hbm>,
 }
@@ -90,8 +92,10 @@ impl<'e, const N: usize, K: AxisName>
     }
 }
 
+/// Final normalization of the separately launched text refiner.
 #[derive(DeviceSend)]
 pub struct RefinerNorm<'a, 'w: 'a> {
+    /// Borrowed final normalization weights.
     pub model: &'a transformer::Norm<Width, &'w Hbm>,
 }
 
@@ -115,8 +119,10 @@ pub type EmbeddedTime = HbmTensor<f32, Chips, m![Timestep, { Symbol<embeddings::
 /// Timesteps, input media and the request's conditioned text rows.
 pub type StepInput<'a, T, A, V> = (&'a Times, (&'a Video<V>, &'a Audio<A>), &'a Hidden<T>);
 
+/// Project media and timesteps, then join media with the request's conditioned text.
 #[derive(DeviceSend)]
 pub struct Embed<'a, 'w: 'a> {
+    /// Borrowed media and timestep projections.
     pub model: &'a denoiser::Embeddings<&'w Hbm>,
 }
 
@@ -144,6 +150,7 @@ impl<'i, 'e, R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName>
 /// One launch per original block. The request owns transport; the model owns only this layer.
 #[derive(DeviceSend)]
 pub struct Block<'a, 'w: 'a> {
+    /// Borrowed transformer block weights.
     pub model: &'a denoiser::Block<&'w Hbm>,
 }
 
@@ -173,8 +180,10 @@ impl<'i, 'e, R: AxisName, K: AxisName, T, A, V>
     }
 }
 
+/// Split the final joint rows and project video and audio velocities.
 #[derive(DeviceSend)]
 pub struct Heads<'a, 'w: 'a> {
+    /// Borrowed video and audio readout weights.
     pub model: &'a denoiser::Heads<&'w Hbm>,
 }
 

@@ -4,7 +4,7 @@ use super::{Cache, Chips, Hidden, P, request::Row, text};
 use furiosa_opt_models::{Module, tensor::memory::Hbm};
 use furiosa_opt_std::prelude::*;
 
-pub(super) use text::stage::Layer;
+pub(super) use text::launch::Layer;
 
 #[device(chip = 4)]
 pub(super) fn layer(

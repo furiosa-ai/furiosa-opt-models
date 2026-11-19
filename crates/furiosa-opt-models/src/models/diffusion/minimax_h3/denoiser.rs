@@ -13,7 +13,7 @@ use crate::{Layers, Rolled};
 use furiosa_opt_std::prelude::DeviceSend;
 
 pub mod cache;
-pub mod stages;
+pub mod launch;
 
 /// The default four-chip weight tree, retaining each joint block as its own parameter owner.
 pub type Denoiser<X = Hbm> = Model<

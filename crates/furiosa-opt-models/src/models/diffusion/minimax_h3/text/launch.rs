@@ -41,16 +41,24 @@ impl Module<Hidden, &Row, &mut Cache> for Layer<'_, '_> {
 
 /// A row's metadata aliases the prompt's one allocation. Every table entry, including rounded
 /// overfetch, addresses allocated cache storage; the causal bias hides unfilled token rows.
+/// Constructed only by the text request's checked preparation and upload.
 #[derive(DeviceSend)]
 pub struct Row {
     /// The row's replicated full-head position coordinates.
-    pub position: HbmTensor<f32, Chips, m![Single, Head]>,
+    pub(crate) position: HbmTensor<f32, Chips, m![Single, Head]>,
     /// The row's write address in the layer's KV cache.
-    pub slot: HbmTensor<i32, Chips, m![1]>,
+    pub(crate) slot: HbmTensor<i32, Chips, m![1]>,
     /// The allocated cache blocks and causal visibility for this row.
-    pub history: gqa::Read<Windows, Chips>,
+    pub(crate) history: gqa::Read<Windows, Chips>,
     /// The replicated vocabulary ID read by the embedding launch.
-    pub token: HbmTensor<i32, Chips, m![1]>,
+    pub(crate) token: HbmTensor<i32, Chips, m![1]>,
+}
+
+impl Row {
+    /// Borrow the checked vocabulary ID for the separate embedding launch.
+    pub fn token(&self) -> &HbmTensor<i32, Chips, m![1]> {
+        &self.token
+    }
 }
 
 /// Paged BF16 KV storage partitioned over the four served chips.

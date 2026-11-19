@@ -2,7 +2,6 @@
 
 use super::flight::Flight;
 use crate::residency::{Cells, Resident, SharedDevice, block_on};
-use furiosa_opt_models::models::decoder::attention::Head;
 use furiosa_opt_models::models::diffusion::minimax_h3::{packing::DEFAULT_MAX_TEXT, text};
 use furiosa_opt_models::tensor::memory::alias;
 use furiosa_opt_models::tensor::parallel::{Parallel, Parallelism};
@@ -11,7 +10,7 @@ use std::{io, sync::Arc};
 
 use budget::Fit;
 pub(crate) use budget::Limits;
-use text::stage::{Cache, Hidden, Windows};
+use text::launch::{Cache, Hidden};
 pub(crate) use weights::Weights;
 
 mod budget;
@@ -73,9 +72,8 @@ impl Encoder {
         let layered = available()?;
         // Capacity admission reserves the same request layout and indirect-address storage.
         // No fabricated prompt or numerical layer execution is needed.
-        let request_bytes = device.with_device(|device| {
-            request::Layout::new(capacity, capacity)?.workspace_bytes(device)
-        })?;
+        let request_bytes =
+            device.with_device(|device| request::workspace_bytes(device, capacity))?;
         let fixed = start
             .checked_sub(embedded)
             .ok_or_else(|| io::Error::other("encoder embedding allocation accounting changed"))?;
@@ -114,15 +112,15 @@ impl Encoder {
             self.device.upload(&self.layers[0])?;
         }
         let ready = self.device.admit(&self.embedding)?.landed().await?;
-        let mut flight = Flight::new(Arc::clone(&request), request.rows.len());
+        let mut flight = Flight::new(Arc::clone(&request), request.rows().len());
         self.device.launch(ready, |launches, embedding| {
-            for row in &request.rows {
+            for row in request.rows() {
                 let (output, work) = launches.forward_tracked(
                     embedding,
                     kernel::embedding,
                     (),
                     &mut (),
-                    &row.token,
+                    row.token(),
                 )?;
                 flight.accepted(output.into_buffer(), work);
             }
@@ -144,9 +142,9 @@ impl Encoder {
             // Retain original input owners and all metadata/cache owners through every accepted
             // launch, including an error after a partially submitted layer and cancellation.
             let cache = request.cache()?;
-            let mut flight = Flight::new((rows, Arc::clone(&request), cache), request.rows.len());
+            let mut flight = Flight::new((rows, Arc::clone(&request), cache), request.rows().len());
             self.device.launch(ready, |launches, (layer, positions)| {
-                for (at, row) in request.rows.iter().enumerate() {
+                for (at, row) in request.rows().iter().enumerate() {
                     let (rows, _, cache) = flight.held_mut();
                     let input: Hidden = alias(&rows[at], ..)?;
                     let (output, work) = launches.forward_tracked(

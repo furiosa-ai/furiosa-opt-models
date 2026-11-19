@@ -1,15 +1,15 @@
 //! Bind the numerical consumers' work to one checked H3 request before uploading metadata.
 
-use super::embeddings::Chips;
 use super::packing::{
-    AUDIO_ROWS, DEFAULT_MAX_TEXT, PARTS, Plan, ROW_BLOCK, TEXT_STRIP, VIDEO_ROWS,
+    AUDIO_ROWS, Capacity, DEFAULT_MAX_TEXT, PARTS, Plan, ROW_BLOCK, TEXT_STRIP, VIDEO_ROWS,
 };
+use super::{embeddings::Chips, positions::Positions};
 use crate::ops::attention::{
     flash,
     full::{PackInputs, PackPlan},
 };
 use crate::ops::collective::Pieces;
-use crate::ops::index::packed::{RowInputs, SpanPlan, live::SpanInputs};
+use crate::ops::index::packed::{RowInputs, RowPlan, SpanPlan, live::SpanInputs};
 use crate::ops::rotary::Rotation;
 use crate::tensor::{axis::Rows, live::BlockPrefix, scalar::Value};
 use furiosa_opt_std::prelude::*;
@@ -168,18 +168,82 @@ impl<R: AxisName, K: AxisName> BlockCall<'_, R, K> {
     }
 }
 
+/// Host checks finish before the first transfer. Every numerical reader derives from `plan`;
+/// callers cannot mix another request's row transfers, modulation spans or packed-key order.
+pub struct Prepared<R, K, T, A, V> {
+    blocks: BlockPlan<R, K>,
+    rows: RowPlan<R, T, A, V>,
+    positions: Positions,
+}
+
+impl<R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName> Prepared<R, K, T, A, V> {
+    /// Return the one packing plan shared by all prepared numerical inputs.
+    pub fn plan(&self) -> Plan {
+        self.blocks.packing()
+    }
+
+    /// Check joint geometry and positions before allocating any device storage.
+    pub fn new(
+        capacity: Capacity,
+        tokens: usize,
+        positions: &[[f64; 3]],
+        theta: f32,
+    ) -> io::Result<Self> {
+        let plan = capacity.plan(tokens)?;
+        let blocks = BlockPlan::new(plan)?;
+        let rows = plan.row_plan()?;
+        let positions = Positions::new(plan, positions, theta)?;
+        Ok(Self {
+            blocks,
+            rows,
+            positions,
+        })
+    }
+
+    /// Initial metadata upload has no kernel readers. The engine completes it before admitting
+    /// a launch and retains the resulting owner through all accepted request work.
+    pub async fn upload(self, device: &mut Device) -> io::Result<Inputs<R, K, T, A, V>> {
+        let (_, [low, high], visible) = self.positions.into_parts();
+        let blocks = self.blocks.upload(device).await?;
+        let rows = RowInputs::upload(device, &self.rows).await?;
+        let low = HostTensor::<bf16, m![{ Symbol<Pieces<R, PARTS>> }, { Symbol<flash::Head> }]>::from_vec(low.into_iter().map(|value| bf16::from_bits(value.to_bits())))
+            .to_hbm(&mut device.pdma)
+            .await
+            .map_err(io::Error::other)?;
+        let high = HostTensor::<bf16, m![{ Symbol<Pieces<R, PARTS>> }, { Symbol<flash::Head> }]>::from_vec(high.into_iter().map(|value| bf16::from_bits(value.to_bits())))
+            .to_hbm(&mut device.pdma)
+            .await
+            .map_err(io::Error::other)?;
+        let visible = HostTensor::<bf16, m![K, { Symbol<flash::Span> }]>::from_vec(
+            visible
+                .into_iter()
+                .map(|value| bf16::from_bits(value.to_bits())),
+        )
+        .to_hbm(&mut device.pdma)
+        .await
+        .map_err(io::Error::other)?;
+        Ok(Inputs {
+            blocks,
+            rows,
+            rotation: Rotation { low, high },
+            visible,
+        })
+    }
+}
+
 /// Immutable numerical transport. A request's flight guard retains this complete owner rather
 /// than only aliases of individual readers; the entry decodes block and row plans once.
+/// Constructed only through [`Prepared::upload`] from one checked request.
 #[derive(DeviceSend)]
 pub struct Inputs<R: AxisName, K: AxisName, T, A, V> {
     /// Checked spans, initialized work and packed-key metadata.
-    pub blocks: BlockInputs<R, K>,
+    pub(crate) blocks: BlockInputs<R, K>,
     /// Checked text/audio/video row transfers.
-    pub rows: RowInputs<R, T, A, V, Chips>,
+    pub(crate) rows: RowInputs<R, T, A, V, Chips>,
     /// Paired rotary coefficients for the joined rows.
-    pub rotation: Rotation<flash::Head, Chips, Pieces<R, PARTS>>,
+    pub(crate) rotation: Rotation<flash::Head, Chips, Pieces<R, PARTS>>,
     /// Attention visibility for the packed key spans.
-    pub visible: flash::Visible<K, Chips>,
+    pub(crate) visible: flash::Visible<K, Chips>,
 }
 
 #[cfg(test)]
