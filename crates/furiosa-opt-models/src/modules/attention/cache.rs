@@ -15,7 +15,7 @@ use crate::modules::generic::schedule::{Begin, IntoStream, Slot, Spill, Stream};
 use crate::modules::language::Call;
 use crate::ops::attention::full::paged::{self, Retained};
 use crate::ops::index::{gather::Gather, scatter};
-use crate::tensor::cache::Blocks;
+use crate::tensor::cache::{Blocks, Layer};
 use crate::tensor::live::Live;
 use crate::tensor::parallel::Chip;
 use core::ops::Deref;
@@ -145,7 +145,10 @@ impl<'a, Reach: AxisName, KvHeads: AxisName, Head: AxisName, R, A>
         _: A,
     ) -> Self::History {
         let history = Retained {
-            pool,
+            pool: Layer {
+                blocks: pool,
+                entry: 0,
+            },
             key,
             value,
             read: *self,
@@ -270,7 +273,7 @@ impl<
             Live<(), L>,
         ),
         Env,
-        &'s mut &'b mut Blocks<KvHeads, Head>,
+        &'s mut Layer<&'b mut Blocks<KvHeads, Head>>,
     > for KeyValue<W, R>
 where
     W: for<'d, 'r> Module<scatter::Rows<'r, Reach, KvHeads, Head, L>, (), &'d mut (), Output = ()>,
@@ -281,7 +284,7 @@ where
         &self,
         device: &mut Device,
         _: Env,
-        pool: &'s mut &'b mut Blocks<KvHeads, Head>,
+        pool: &'s mut Layer<&'b mut Blocks<KvHeads, Head>>,
         ((key, value), (slot, work), live): (
             &'p Retention<Reach, KvHeads, Head>,
             (
@@ -300,7 +303,10 @@ where
                 pair: (key, value),
                 slot: &**slot,
                 rows: items,
-                pool: &mut **pool,
+                pool: Layer {
+                    blocks: &mut *pool.blocks,
+                    entry: pool.entry,
+                },
             },
         );
         Deferred(live.subrange(items.rows(), live.rows()))
@@ -312,7 +318,7 @@ impl<'p, 'w, 's, 'b, Reach, KvHeads, Head, L, WI, W, R, Env>
     Module<
         (Deferred<L>, &'p Retention<Reach, KvHeads, Head>, &'w WI),
         Env,
-        &'s mut &'b mut Blocks<KvHeads, Head>,
+        &'s mut Layer<&'b mut Blocks<KvHeads, Head>>,
     > for KeyValue<W, R>
 where
     Reach: AxisName,
@@ -328,7 +334,7 @@ where
         &self,
         device: &mut Device,
         _: Env,
-        pool: &'s mut &'b mut Blocks<KvHeads, Head>,
+        pool: &'s mut Layer<&'b mut Blocks<KvHeads, Head>>,
         (Deferred(rows), (key, value), slot): (
             Deferred<L>,
             &'p Retention<Reach, KvHeads, Head>,
@@ -343,7 +349,10 @@ where
                 pair: (key, value),
                 slot: &**slot,
                 rows,
-                pool: &mut **pool,
+                pool: Layer {
+                    blocks: &mut *pool.blocks,
+                    entry: pool.entry,
+                },
             },
         );
     }

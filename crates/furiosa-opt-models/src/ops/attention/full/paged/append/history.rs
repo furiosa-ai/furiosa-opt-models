@@ -19,7 +19,7 @@ pub(crate) struct LastPanel;
 impl<KvHeads: AxisName, Head: AxisName>
     Op<(
         (
-            (&Gather, &Blocks<KvHeads, Head>),
+            (&Gather, Layer<&Blocks<KvHeads, Head>>),
             &HbmTensor<i32, Chip, m![Cache / Block]>,
             &Value,
         ),
@@ -33,7 +33,7 @@ impl<KvHeads: AxisName, Head: AxisName>
         context: &mut Device,
         (input, at): (
             (
-                (&Gather, &Blocks<KvHeads, Head>),
+                (&Gather, Layer<&Blocks<KvHeads, Head>>),
                 &HbmTensor<i32, Chip, m![Cache / Block]>,
                 &Value,
             ),
@@ -128,14 +128,14 @@ pub(crate) struct Gathered<P>(pub(crate) PhantomData<P>);
 /// Whole history block `at` of width `P`, every row of it committed history: read whole, so no
 /// length is staged for it.
 impl<KvHeads: AxisName, Head: AxisName, P: Panel>
-    Op<((&Table, (&Gather, &Blocks<KvHeads, Head>)), usize)> for Gathered<P>
+    Op<((&Table, (&Gather, Layer<&Blocks<KvHeads, Head>>)), usize)> for Gathered<P>
 {
     type Output = InDm<KvHeads, Head, P>;
 
     fn forward(
         &self,
         context: &mut Device,
-        ((table, pool), at): ((&Table, (&Gather, &Blocks<KvHeads, Head>)), usize),
+        ((table, pool), at): ((&Table, (&Gather, Layer<&Blocks<KvHeads, Head>>)), usize),
     ) -> Self::Output {
         // SAFETY: a whole block lies below h, so every gathered row is committed history.
         Op::forward(
@@ -152,14 +152,20 @@ impl<KvHeads: AxisName, Head: AxisName, P: Panel>
 
 /// History block `at` of width `P` up to the history's `length`: the rows past it are unspecified.
 impl<KvHeads: AxisName, Head: AxisName, P: Panel>
-    Op<((&Table, (&Gather, &Blocks<KvHeads, Head>), &Value), usize)> for Gathered<P>
+    Op<(
+        (&Table, (&Gather, Layer<&Blocks<KvHeads, Head>>), &Value),
+        usize,
+    )> for Gathered<P>
 {
     type Output = InDm<KvHeads, Head, P>;
 
     fn forward(
         &self,
         context: &mut Device,
-        ((table, pool, length), at): ((&Table, (&Gather, &Blocks<KvHeads, Head>), &Value), usize),
+        ((table, pool, length), at): (
+            (&Table, (&Gather, Layer<&Blocks<KvHeads, Head>>), &Value),
+            usize,
+        ),
     ) -> Self::Output {
         // SAFETY: the prefix reads committed history only; the table stays readable past it.
         Op::forward(
@@ -367,7 +373,7 @@ pub(crate) struct FoldBlock<P>(pub(crate) PhantomData<P>);
 impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName>
     Op<(
         &Attention<KvHeads, Groups, Head>,
-        (&Table, (&Gather, &Blocks<KvHeads, Head>)),
+        (&Table, (&Gather, Layer<&Blocks<KvHeads, Head>>)),
         usize,
         &Group<KvHeads, Groups, Head, T>,
         (
@@ -383,7 +389,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName>
         context: &mut Device,
         (attention, input, at, query, state): (
             &Attention<KvHeads, Groups, Head>,
-            (&Table, (&Gather, &Blocks<KvHeads, Head>)),
+            (&Table, (&Gather, Layer<&Blocks<KvHeads, Head>>)),
             usize,
             &Group<KvHeads, Groups, Head, T>,
             (

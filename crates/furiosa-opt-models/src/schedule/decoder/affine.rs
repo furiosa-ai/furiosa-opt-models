@@ -29,6 +29,7 @@ use crate::ops::pointwise::SwiGlu;
 use crate::ops::swiglu;
 use crate::specialize::attention::Decode;
 use crate::tensor::axis;
+use crate::tensor::cache::{self, Blocks};
 use crate::tensor::live::Live;
 use crate::tensor::memory::Hbm;
 use crate::tensor::parallel::Chip;
@@ -444,7 +445,6 @@ where
         + qwen3::Front
         + 'static,
     H: Tiled<Capacity = axis::Rows<C>, Last = axis::Rows<L>>,
-    <Z as Geometry>::Layers<launch::Layer<'b>>: AsMut<[launch::Layer<'b>]>,
     swiglu::Down<<Z as Geometry>::Intermediate>: AxisName,
     QueryNorm<Z>: View<DEPTH>,
     KeyNorm<Z>: View<DEPTH>,
@@ -485,8 +485,8 @@ where
             tokens: &input.tokens,
             live,
         };
-        let (((embedded, slots), ()), tokens) = state;
-        let slots = slots.as_mut();
+        let (((embedded, blocks), ()), tokens) = state;
+        let range = blocks.tokens.len() / DEPTH;
         let Then(Backbone { embedding, body }, norm) = &causal.model.body;
         let launch = embedding::Launch {
             ids: call.tokens,
@@ -499,7 +499,7 @@ where
         // to the cache before, the deferred rows after.
         let attend = |device: &mut Device,
                       layer: &Viewed<Affine, Z, DEPTH>,
-                      slot: &mut launch::Layer<'_>,
+                      mut pool: cache::Layer<&mut Blocks<KvHeads, Head>>,
                       places: &mut Places<Z>| {
             let Sequential(Residual(_, attention, _), _) = layer;
             let Attention {
@@ -508,16 +508,16 @@ where
                 output,
                 ..
             } = &attention.0;
-            let (context, pool) = (&call.context.0, &mut slot.0.1);
+            let context = &call.context.0;
             let operands = (&context.write, &context.read);
             let deferred = stage.forward(
                 &mut *device,
                 (),
-                &mut *pool,
+                &mut pool,
                 (&places.stored.retained, operands, live),
             );
             let history = Retained {
-                pool: &**pool,
+                pool: pool.read(),
                 key: &places.stored.retained.0,
                 value: &places.stored.retained.1,
                 read: &stage.read,
@@ -529,7 +529,7 @@ where
             let rows = (rows.0, rows.1, rows.2, boundary, &mut places.attended.0);
             attend.forward(&mut *device, (), &mut (), rows);
             let rows = (deferred, &places.stored.retained, &context.write);
-            stage.forward(&mut *device, (), &mut *pool, rows);
+            stage.forward(&mut *device, (), &mut pool, rows);
             output.forward(device, (), &mut (), Begin(staged))
         };
         let mut places = Places::new();
@@ -542,7 +542,15 @@ where
         }
         for index in 0..DEPTH - 1 {
             let (layer, next) = (layers.layer(index), layers.layer(index + 1));
-            let mut projecting = attend(&mut *device, &layer, &mut slots[index], &mut places);
+            let mut projecting = attend(
+                &mut *device,
+                &layer,
+                cache::Layer {
+                    blocks: &mut **blocks,
+                    entry: (index) * range,
+                },
+                &mut places,
+            );
             let mut ahead = Places::new();
             for span in 0..spans {
                 let tile = live.tile::<Span>(span);
@@ -556,7 +564,15 @@ where
             places = ahead;
         }
         let last = layers.layer(DEPTH - 1);
-        let mut projecting = attend(&mut *device, &last, &mut slots[DEPTH - 1], &mut places);
+        let mut projecting = attend(
+            &mut *device,
+            &last,
+            cache::Layer {
+                blocks: &mut **blocks,
+                entry: (DEPTH - 1) * range,
+            },
+            &mut places,
+        );
         let mut head: Rows<Z> = HbmTensor::new();
         for span in 0..spans {
             let tile = live.tile::<Span>(span);

@@ -106,6 +106,73 @@ impl<H: AxisName, Q: AxisName> Op<&mut Landed<H, Q, Span, f32, bf16>> for channe
     }
 }
 
+impl<H: AxisName, Q: AxisName, F: quantize::Tokens, S: MaterializableScalar + FetchCast<f32>>
+    Stored<H, Q, F, S>
+{
+    /// Land O's input first. The residual can then land while the first projection pass runs.
+    pub(crate) fn begin_span<
+        Capacity: AxisName,
+        Reach: AxisName,
+        KvHeads: AxisName,
+        Groups: AxisName,
+        Head: AxisName,
+        T,
+    >(
+        &self,
+        context: &mut Device,
+        landed: &mut Landed<H, Q, Span, F::Scale, S>,
+        attended: &Attended<Reach, KvHeads, Groups, Head>,
+        tile: Live<(), Capacity>,
+        after_rows: impl FnOnce(&mut Device) -> T,
+    ) -> T {
+        let rows = tile.rows();
+        const { assert!(KvHeads::SIZE * Groups::SIZE * Head::SIZE == Q::SIZE) };
+        // SAFETY: Q is the same contiguous KV-head, query-group and head product.
+        let attended: HbmTensor<bf16, Chip, m![Reach, Q]> = unsafe { attended.view().alias() };
+        let in_dm = Op::forward(
+            &ToDm::<H>(PhantomData),
+            &mut *context,
+            output::ToDm::<Q, Span, Reach> {
+                attended: &attended,
+                start: tile.start(),
+                live: (tile.count::<crate::tensor::axis::Rows<128>>(), tile.rows()),
+                capacity: PhantomData,
+            },
+        );
+        let ready = after_rows(context);
+        landed.step = 1;
+        let (weight, _) = &landed.staged.weight;
+        let mut source = Source::new();
+        let mut scales = ReplicatedScales::new();
+        let resident = Op::forward(&contract::Stage, &mut *context, weight);
+        let waves = (rows + 31) / 32;
+        F::first(context, &in_dm, (&mut source, &mut scales), rows);
+        let (whole, tail) = (waves / 4, waves % 4);
+        let first = (whole + 3) / 4;
+        // One pass of eight rows when no whole block exists.
+        let single = if whole < 1 { 1 } else { 0 };
+        let mut partial = tiles::Partial::new();
+        if first > 0 {
+            Op::forward(
+                &contract::Pass::<32>,
+                &mut *context,
+                ((&resident, &source), (&mut partial, 0)),
+            );
+        } else {
+            F::pass(context, &resident, &source, &mut partial, 0, rows);
+        }
+        landed.first = Some((
+            in_dm,
+            resident,
+            source,
+            scales,
+            partial,
+            [waves, whole, tail, first, single],
+        ));
+        ready
+    }
+}
+
 /// One step of span tile `tile` of the attended rows; the sum once the third step gives it.
 impl<
     'l,
@@ -149,49 +216,7 @@ where
         let rows = tile.rows();
         let staged = &landed.staged;
         if landed.step < 1 {
-            const { assert!(KvHeads::SIZE * Groups::SIZE * Head::SIZE == QWidth::SIZE) };
-            // SAFETY: QWidth is the same contiguous KV-head, query-group and head product.
-            let attended: HbmTensor<bf16, Chip, m![Reach, QWidth]> =
-                unsafe { attended.view().alias() };
-            let in_dm = Op::forward(
-                &ToDm::<Hidden>(PhantomData),
-                &mut *context,
-                output::ToDm::<QWidth, Rows, Reach> {
-                    attended: &attended,
-                    start: tile.start(),
-                    live: (tile.count::<crate::tensor::axis::Rows<128>>(), tile.rows()),
-                    capacity: PhantomData,
-                },
-            );
-            landed.step = 1;
-            let (weight, _) = &staged.weight;
-            let mut source = Source::new();
-            let mut scales = ReplicatedScales::new();
-            let resident = Op::forward(&contract::Stage, &mut *context, weight);
-            let waves = (rows + 31) / 32;
-            F::first(context, &in_dm, (&mut source, &mut scales), rows);
-            let (whole, tail) = (waves / 4, waves % 4);
-            let first = (whole + 3) / 4;
-            // One pass of eight rows when no whole block exists.
-            let single = if whole < 1 { 1 } else { 0 };
-            let mut partial = tiles::Partial::new();
-            if first > 0 {
-                Op::forward(
-                    &contract::Pass::<32>,
-                    &mut *context,
-                    ((&resident, &source), (&mut partial, 0)),
-                );
-            } else {
-                F::pass(context, &resident, &source, &mut partial, 0, rows);
-            }
-            landed.first = Some((
-                in_dm,
-                resident,
-                source,
-                scales,
-                partial,
-                [waves, whole, tail, first, single],
-            ));
+            self.begin_span(context, landed, attended, tile, |_| ());
             return Poll::Pending;
         }
         if landed.step < 2 {

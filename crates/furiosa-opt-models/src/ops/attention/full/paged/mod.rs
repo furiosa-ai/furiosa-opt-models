@@ -21,7 +21,7 @@ use std::marker::PhantomData;
 
 use crate::ops::index::gather::Gather;
 use crate::ops::index::table::FIELDS;
-use crate::tensor::cache::Blocks;
+use crate::tensor::cache::{Blocks, Layer};
 use gqa::items::SINKS;
 use gqa::items::Shape;
 use gqa::items::{GroupTile, Tiled};
@@ -130,10 +130,11 @@ impl<Sequences: AxisName, KvHeads: AxisName, G: AxisName, Head: AxisName, const 
     }
 }
 
-/// The history a scheduled step attends: the pool of committed and item rows' keys and values, and
-/// the launch rows' as the projection retains them; `read` reads the pool's blocks.
+/// The history a scheduled step attends: the layer's range of the pool of committed and item
+/// rows' keys and values, and the launch rows' as the projection retains them; `read` reads the
+/// pool's blocks.
 pub struct Retained<'a, Reach: AxisName, Heads: AxisName, Head: AxisName> {
-    pub pool: &'a Blocks<Heads, Head>,
+    pub pool: Layer<&'a Blocks<Heads, Head>>,
     pub key: &'a HbmTensor<bf16, Chip, m![Reach, Heads, Head]>,
     pub value: &'a HbmTensor<bf16, Chip, m![Reach, Heads, Head]>,
     pub read: &'a Gather,
@@ -343,7 +344,17 @@ impl<
             &mut (),
             (
                 &rows,
-                (&work.work.items, work.shape, (&Gather, pool)),
+                (
+                    &work.work.items,
+                    work.shape,
+                    (
+                        &Gather,
+                        Layer {
+                            blocks: pool,
+                            entry: 0,
+                        },
+                    ),
+                ),
                 &mut attended,
                 (&(), &mut ()),
             ),

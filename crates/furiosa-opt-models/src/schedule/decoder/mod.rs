@@ -38,6 +38,7 @@ use crate::ops::normalization::span::{Owned, Span, Stage};
 use crate::ops::pointwise::SwiGlu;
 use crate::ops::swiglu::spans::fp8::Staging;
 use crate::specialize::attention::Decode;
+use crate::tensor::cache::{self, Blocks};
 use crate::tensor::live::Live;
 use crate::tensor::memory::Hbm;
 use crate::tensor::parallel::Chip;
@@ -142,17 +143,10 @@ fn run<Z: Geometry + Decode, P, A>(
     layers: usize,
     ahead: &mut A,
     (mut first, mut attend, mut step, mut last, read): (
-        impl FnMut(&mut Device, Live<(), Capacity<Z>>, &mut Stored<Z>, &mut A) -> RowTile<Z>,
+        impl FnMut(&mut Device, Live<(), Capacity<Z>>, &mut Stored<Z>, &mut Rows<Z>, &mut A),
         impl FnMut(&mut Device, usize, &mut Places<Z>) -> P,
-        impl FnMut(
-            &mut Device,
-            usize,
-            Output<'_, Z, P>,
-            RowTile<Z>,
-            &mut Stored<Z>,
-            &mut A,
-        ) -> RowTile<Z>,
-        impl FnMut(&mut Device, Output<'_, Z, P>, RowTile<Z>, &mut A) -> RowTile<Z>,
+        impl FnMut(&mut Device, usize, Output<'_, Z, P>, &mut Rows<Z>, &mut Stored<Z>, &mut A),
+        impl FnMut(&mut Device, Output<'_, Z, P>, &Rows<Z>, &mut A) -> RowTile<Z>,
         impl FnOnce(&mut Device, &Rows<Z>),
     ),
 ) {
@@ -160,8 +154,7 @@ fn run<Z: Geometry + Decode, P, A>(
     let mut places = Places::<Z>::new();
     for span in 0..spans {
         let tile = live.tile::<Span>(span);
-        let rows = first(device, tile, &mut places.stored, ahead);
-        rows::store::<Z>(device, rows.value(), &mut places.input, tile);
+        first(device, tile, &mut places.stored, &mut places.input, ahead);
     }
     for index in 0..layers - 1 {
         let mut projecting = attend(device, index, &mut places);
@@ -169,19 +162,23 @@ fn run<Z: Geometry + Decode, P, A>(
         // overwriting the same rows for the next layer.
         for span in 0..spans {
             let tile = live.tile::<Span>(span);
-            let input = tile.with(rows::load::<Z>(device, &places.input, tile));
             let output = (tile.with(&places.attended), &mut projecting);
-            let rows = step(device, index, output, input, &mut places.stored, ahead);
-            rows::store::<Z>(device, rows.value(), &mut places.input, tile);
+            step(
+                device,
+                index,
+                output,
+                &mut places.input,
+                &mut places.stored,
+                ahead,
+            );
         }
     }
     let mut projecting = attend(device, layers - 1, &mut places);
     let mut head = Rows::<Z>::new();
     for span in 0..spans {
         let tile = live.tile::<Span>(span);
-        let input = tile.with(rows::load::<Z>(device, &places.input, tile));
         let output = (tile.with(&places.attended), &mut projecting);
-        let rows = last(device, output, input, ahead);
+        let rows = last(device, output, &places.input, ahead);
         head.spill(device, rows.value(), tile);
     }
     read(device, &head);
@@ -479,7 +476,8 @@ impl<'m, 'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, S>, Env, launch::
             tokens: &input.tokens,
             live,
         };
-        let (((embedded, slots), ()), tokens) = state;
+        let (((embedded, blocks), ()), tokens) = state;
+        let range = blocks.tokens.len() / LAYERS;
         let Then(Backbone { embedding, body }, norm) = &causal.model.body;
         let launch = embedding::Launch {
             ids: call.tokens,
@@ -492,7 +490,7 @@ impl<'m, 'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, S>, Env, launch::
         // to the cache before, the deferred rows after.
         let attend = |device: &mut Device,
                       layer: &Layer,
-                      slot: &mut launch::Layer<'b>,
+                      mut pool: cache::Layer<&mut Blocks<KvHeads, Head>>,
                       places: &mut Places| {
             let Sequential(Residual(_, attention, _), _) = layer;
             let Attention {
@@ -501,16 +499,16 @@ impl<'m, 'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, S>, Env, launch::
                 output,
                 ..
             } = &attention.0;
-            let (context, pool) = (&call.context.0, &mut slot.0.1);
+            let context = &call.context.0;
             let operands = (&context.write, &context.read);
             let deferred = stage.forward(
                 &mut *device,
                 (),
-                &mut *pool,
+                &mut pool,
                 (&places.stored.retained, operands, live),
             );
             let history = Retained {
-                pool: &**pool,
+                pool: pool.read(),
                 key: &places.stored.retained.0,
                 value: &places.stored.retained.1,
                 read: &stage.read,
@@ -522,7 +520,7 @@ impl<'m, 'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, S>, Env, launch::
             let rows = (rows.0, rows.1, rows.2, boundary, &mut places.attended.0);
             attend.forward(&mut *device, (), &mut (), rows);
             let rows = (deferred, &places.stored.retained, &context.write);
-            stage.forward(&mut *device, (), &mut *pool, rows);
+            stage.forward(&mut *device, (), &mut pool, rows);
             output.forward(device, (), &mut (), Begin(staged))
         };
         run::<S, _, _>(
@@ -531,21 +529,36 @@ impl<'m, 'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, S>, Env, launch::
             LAYERS,
             &mut (),
             (
-                |device, tile, stored, _| {
+                |device, tile, stored, residual, _| {
                     let first = layers.layer(0);
-                    Tokenwise(&*embedded, &first).forward(device, call, stored, tile)
+                    let rows = Tokenwise(&*embedded, &first).forward(device, call, stored, tile);
+                    rows::store::<S>(device, rows.value(), residual, tile);
                 },
                 |device, index, places| {
                     let layer = layers.layer(index);
-                    attend(device, &layer, &mut slots[index], places)
+                    attend(
+                        device,
+                        &layer,
+                        cache::Layer {
+                            blocks: &mut **blocks,
+                            entry: (index) * range,
+                        },
+                        places,
+                    )
                 },
                 |device, index, output, input, stored, _| {
                     let (layer, next) = (layers.layer(index), layers.layer(index + 1));
-                    Tokenwise(&layer, &next).forward(device, call, stored, (output, input))
+                    let tile = output.0.with(());
+                    let residual = tile.with(rows::load::<S>(device, input, tile));
+                    let rows =
+                        Tokenwise(&layer, &next).forward(device, call, stored, (output, residual));
+                    rows::store::<S>(device, rows.value(), input, tile);
                 },
                 |device, output, input, _| {
                     let last = layers.layer(LAYERS - 1);
-                    Tokenwise(&last, norm).forward(device, call, &mut (), (output, input))
+                    let tile = output.0.with(());
+                    let residual = tile.with(rows::load::<S>(device, input, tile));
+                    Tokenwise(&last, norm).forward(device, call, &mut (), (output, residual))
                 },
                 |device, head| causal.lm_head.read(device, head, call.context.1, tokens),
             ),

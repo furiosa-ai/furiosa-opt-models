@@ -21,9 +21,11 @@ use crate::ops::linear::query::{
     launch::Normalized,
 };
 use crate::ops::normalization::span::{Owned, Span, Stage};
+use crate::ops::rotary::{self, group};
 use crate::ops::swiglu::spans::fp8::channel as mlp;
+use crate::tensor::cache::{self, Blocks};
 use crate::tensor::live::Live;
-use crate::{Either, Module, Sequential, Then};
+use crate::{Module, Sequential, Then};
 use core::{marker::PhantomData, task::Poll};
 use furiosa_opt_std::prelude::*;
 
@@ -73,19 +75,50 @@ fn short_decode(call: Launched<'_, '_>) -> bool {
     call.live.rows() <= 8 && call.context.0.read.items().rows() == call.live.rows()
 }
 
+/// Q and K read the same period coefficients in their respective head layouts.
+fn store_period<G: Group>(
+    device: &mut Device,
+    positions: &rotary::Rotary<Head>,
+    coefficients: &rotary::SplitHalf<
+        Head,
+        group::Coefficients<
+            query::Cluster<QueryHeads<S>>,
+            query::QuerySlices<G, QueryHeads<S>>,
+            rotary::Row<Head>,
+        >,
+    >,
+    stored: &mut Stored,
+    start: usize,
+    (q, k, v): (
+        query::Queries<G, QueryHeads<S>, Head>,
+        query::Pairs<G, KvHeads, Head>,
+        query::Pairs<G, KvHeads, Head>,
+    ),
+) {
+    let qr = crate::Op::forward(&group::Stage, device, coefficients);
+    let kr = crate::Op::forward(
+        &group::Stage,
+        device,
+        (coefficients, PhantomData::<KvHeads>),
+    );
+    let q = crate::Op::forward(positions, device, (&q, &qr));
+    let k = crate::Op::forward(positions, device, (&k, &kr));
+    stored.queries.spill(device, &q, start);
+    stored.retained.spill(device, (&k, &v), start);
+}
+
 fn start(
     device: &mut Device,
     call: Launched<'_, '_>,
     layer: &Layer,
     front: Front,
     rows: Live<Owned<Width, Span>, Capacity>,
-    stored: &mut Stored,
+    (stored, residual): (&mut Stored, &mut Rows),
     projecting: &mut Projecting,
-) -> Live<Owned<Width, Span>, Capacity> {
+) {
     let Sequential(Residual(_, attention, _), _) = layer;
     let Attention {
         qkv: Positioned { positions, .. },
-        cache: stage,
         output,
         ..
     } = &attention.0;
@@ -98,19 +131,6 @@ fn start(
         home.spill(device, normalized.value(), (tile, tile.rows()));
     }
     let rotation = &call.context.0.positions;
-    let mut store = |device: &mut Device, at, query, key, value| {
-        let (query, key) =
-            positions.forward(device, tile, &mut (), ((query, key), &(rotation, at)));
-        stage.forward(
-            device,
-            (),
-            &mut &mut (),
-            (
-                (&mut stored.queries, &mut stored.retained),
-                at.with((query, key, value)),
-            ),
-        );
-    };
     let last_span = tile.start() + tile.rows() == call.live.rows();
     let single = tile.count::<Tile>() % 2 != 0;
     let pairs = tile.count::<Tile>() / 2;
@@ -121,6 +141,15 @@ fn start(
         for pair in 0..pairs {
             // DMA the next pair before this contraction; both use the same resident QKV weights.
             let next = staged.pair(device, (first + pair + 1) % (Capacity::SIZE / 256));
+            let at = tile.tile::<<TilePair as Group>::Period>(pair);
+            let coefficients = crate::Op::forward(
+                &group::ToDm::<TilePair, QueryHeads<S>>(PhantomData),
+                device,
+                (rotation, first + pair),
+            );
+            if !single && pair + 1 == pairs {
+                super::rows::store::<S>(device, rows.value(), residual, tile);
+            }
             let operand = current.fill(device);
             let q: query::Queries<TilePair, QueryHeads<S>, Head> =
                 current.project_with_prefetch(device, &front.query, &operand, |device| {
@@ -132,13 +161,13 @@ fn start(
                 current.project(device, &front.key, &operand);
             let v: query::Pairs<TilePair, KvHeads, Head> =
                 current.project(device, &front.value, &operand);
-            let at = tile.tile::<<TilePair as Group>::Period>(pair);
-            store(
+            store_period::<TilePair>(
                 device,
-                at,
-                Either::Left(q),
-                Either::Left(k),
-                Either::Left(v),
+                positions,
+                &coefficients,
+                stored,
+                at.start(),
+                (q, k, v),
             );
             current = next;
         }
@@ -151,6 +180,12 @@ fn start(
             device,
             (&home, (at.start(), Tile::SIZE), groups),
         );
+        let coefficients = crate::Op::forward(
+            &group::ToDm::<Tiles<1>, QueryHeads<S>>(PhantomData),
+            device,
+            (rotation, at.start() / Tile::SIZE),
+        );
+        super::rows::store::<S>(device, rows.value(), residual, tile);
         let period = qkv::Period::quantize(device, &input, groups);
         let operand = period.fill(device);
         let early = last_span && short_decode(call);
@@ -171,15 +206,15 @@ fn start(
             period.project_ready(device, &front.key, &operand, key_channels);
         let v: query::Pairs<Tiles<1>, KvHeads, Head> =
             period.project(device, &front.value, &operand);
-        store(
+        store_period::<Tiles<1>>(
             device,
-            at,
-            Either::Right(q),
-            Either::Right(k),
-            Either::Right(v),
+            positions,
+            &coefficients,
+            stored,
+            at.start(),
+            (q, k, v),
         );
     }
-    rows
 }
 
 /// A tile through `layer` from its attention to its MLP's second step, given a tile of its
@@ -190,13 +225,18 @@ fn end(
     call: Launched<'_, '_>,
     layer: &Layer,
     (attended, landed): Output<'_>,
-    input: Live<Owned<Width, Span>, Capacity>,
+    residual: &Rows,
 ) -> Staged {
     let Sequential(Residual(_, attention, sum), Residual(norm, mlp, _)) = layer;
     let Attention { output, .. } = &attention.0;
     let (gate_up, down) = mlp.0.parts();
-    let tile = input.with(());
+    let tile = attended.with(());
     let gain = crate::Op::forward(&Stage, &mut *device, &norm.0);
+    let input = output
+        .0
+        .begin_span(device, landed, &attended.value().0, tile, |device| {
+            tile.with(super::rows::load::<S>(device, residual, tile))
+        });
     let mut step = |device: &mut Device| {
         output.forward(
             device,
@@ -205,7 +245,6 @@ fn end(
             (&mut *landed, &attended.value().0, tile),
         )
     };
-    let _ = step(&mut *device);
     let ahead = gate_up.forward(&mut *device, (), &mut (), Begin(()));
     let _ = step(&mut *device);
     let projected = match step(&mut *device) {
@@ -265,42 +304,47 @@ fn update<F>(
 /// A tile of the embedded rows through the first layer up to its attention's store; the tile's
 /// rows, the first layer's input.
 impl<'l, 'c, 'a, 's>
-    Module<Live<(), Capacity>, Launched<'c, 'a>, (&'s mut Stored, &'s mut Projecting)>
+    Module<Live<(), Capacity>, Launched<'c, 'a>, (&'s mut Stored, &'s mut Rows, &'s mut Projecting)>
     for Tokenwise<&'l Rows, &'l Layer>
 {
-    type Output = Live<Owned<Width, Span>, Capacity>;
+    type Output = ();
 
     fn forward(
         &self,
         device: &mut Device,
         call: Launched<'c, 'a>,
-        (stored, projecting): (&'s mut Stored, &'s mut Projecting),
+        (stored, residual, projecting): (&'s mut Stored, &'s mut Rows, &'s mut Projecting),
         tile: Live<(), Capacity>,
     ) -> Self::Output {
         let Self(embedded, layer) = *self;
         let front = front::<false>(device, layer);
         let rows = tile.with(embedded.fill(&mut *device, tile));
-        start(device, call, layer, front, rows, stored, projecting)
+        start(
+            device,
+            call,
+            layer,
+            front,
+            rows,
+            (stored, residual),
+            projecting,
+        )
     }
 }
 
 /// A tile through a layer from its attention and the next layer up to its attention's store; the
 /// next layer's input rows. The next layer's front lands while this one's MLP projects.
 impl<'l, 'c, 'a, 'p, 's>
-    Module<
-        (Output<'p>, Live<Owned<Width, Span>, Capacity>),
-        Launched<'c, 'a>,
-        (&'s mut Stored, &'s FullPanel),
-    > for Tokenwise<&'l Layer, &'l Layer>
+    Module<(Output<'p>, &'s mut Rows), Launched<'c, 'a>, (&'s mut Stored, &'s FullPanel)>
+    for Tokenwise<&'l Layer, &'l Layer>
 {
-    type Output = Live<Owned<Width, Span>, Capacity>;
+    type Output = ();
 
     fn forward(
         &self,
         device: &mut Device,
         call: Launched<'c, 'a>,
         (stored, first): (&'s mut Stored, &'s FullPanel),
-        (attended, input): (Output<'p>, Live<Owned<Width, Span>, Capacity>),
+        (attended, input): (Output<'p>, &'s mut Rows),
     ) -> Self::Output {
         let Self(layer, next) = *self;
         let (attended, projecting) = attended;
@@ -317,13 +361,12 @@ impl<'l, 'c, 'a, 'p, 's>
                 |device, front| qkv::finish_query(device, query, &mut front.query),
             ),
         );
-        start(device, call, next, front, rows, stored, projecting)
+        start(device, call, next, front, rows, (stored, input), projecting)
     }
 }
 
 /// A tile through the last layer from its attention and the final norm; the head's rows.
-impl<'l, 'c, 'a, 'p, 's>
-    Module<(Output<'p>, Live<Owned<Width, Span>, Capacity>), Launched<'c, 'a>, &'s FullPanel>
+impl<'l, 'c, 'a, 'p, 's> Module<(Output<'p>, &'s Rows), Launched<'c, 'a>, &'s FullPanel>
     for Tokenwise<&'l Layer, &'l FinalNorm>
 {
     type Output = Live<Owned<Width, Span>, Capacity>;
@@ -333,7 +376,7 @@ impl<'l, 'c, 'a, 'p, 's>
         device: &mut Device,
         call: Launched<'c, 'a>,
         first: &'s FullPanel,
-        (attended, input): (Output<'p>, Live<Owned<Width, Span>, Capacity>),
+        (attended, input): (Output<'p>, &'s Rows),
     ) -> Self::Output {
         let Self(layer, norm) = *self;
         let staged = end(device, call, layer, attended, input);
@@ -371,7 +414,8 @@ impl<'m, 'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, S>, Env, launch::
             tokens: &input.tokens,
             live,
         };
-        let (((embedded, slots), ()), tokens) = state;
+        let (((embedded, blocks), ()), tokens) = state;
+        let range = blocks.tokens.len() / LAYERS;
         let Then(Backbone { embedding, body }, norm) = &causal.model.body;
         let launch = embedding::Launch {
             ids: call.tokens,
@@ -384,7 +428,7 @@ impl<'m, 'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, S>, Env, launch::
         // to the cache before, the deferred rows after.
         let attend = |device: &mut Device,
                       layer: &Layer,
-                      slot: &mut launch::Layer<'b>,
+                      mut pool: cache::Layer<&mut Blocks<KvHeads, Head>>,
                       places: &mut Places| {
             let Sequential(Residual(_, attention, _), Residual(_, mlp, _)) = layer;
             let (_, down) = mlp.0.parts();
@@ -393,16 +437,16 @@ impl<'m, 'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, S>, Env, launch::
                 attend,
                 ..
             } = &attention.0;
-            let (context, pool) = (&call.context.0, &mut slot.0.1);
+            let context = &call.context.0;
             let operands = (&context.write, &context.read);
             let deferred = stage.forward(
                 &mut *device,
                 (),
-                &mut *pool,
+                &mut pool,
                 (&places.stored.retained, operands, live),
             );
             let history = Retained {
-                pool: &**pool,
+                pool: pool.read(),
                 key: &places.stored.retained.0,
                 value: &places.stored.retained.1,
                 read: &stage.read,
@@ -413,7 +457,7 @@ impl<'m, 'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, S>, Env, launch::
             let rows = (rows.0, rows.1, rows.2, boundary, &mut places.attended.0);
             attend.forward(&mut *device, (), &mut (), rows);
             let rows = (deferred, &places.stored.retained, &context.write);
-            stage.forward(&mut *device, (), &mut *pool, rows);
+            stage.forward(&mut *device, (), &mut pool, rows);
             panel
         };
         let Sequential(Residual(_, attention, _), _) = layers.layer(0);
@@ -428,13 +472,26 @@ impl<'m, 'i, 'a, 's, 'b, Env> Module<&'i mut launch::Input<'a, S>, Env, launch::
             LAYERS,
             &mut projecting,
             (
-                |device, tile, stored, projecting| {
+                |device, tile, stored, residual, projecting| {
                     let first = layers.layer(0);
-                    Tokenwise(&*embedded, &first).forward(device, call, (stored, projecting), tile)
+                    Tokenwise(&*embedded, &first).forward(
+                        device,
+                        call,
+                        (stored, residual, projecting),
+                        tile,
+                    )
                 },
                 |device, index, places| {
                     let layer = layers.layer(index);
-                    attend(device, &layer, &mut slots[index], places)
+                    attend(
+                        device,
+                        &layer,
+                        cache::Layer {
+                            blocks: &mut **blocks,
+                            entry: (index) * range,
+                        },
+                        places,
+                    )
                 },
                 |device, index, (attended, panel), input, stored, projecting| {
                     let (layer, next) = (layers.layer(index), layers.layer(index + 1));
