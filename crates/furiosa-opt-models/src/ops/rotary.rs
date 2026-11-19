@@ -1877,7 +1877,7 @@ pub mod group {
     use crate::load::{Checkpoint, Context, Load, LoadError};
     use crate::modules::generic::Either;
     use crate::ops::linear::query::group::Group;
-    use crate::ops::linear::query::{Cluster, Tile, fp8};
+    use crate::ops::linear::query::{Cluster, SpreadCopies, Tile, fp8};
     use crate::tensor::live::Live;
     use crate::tensor::parallel::Chip;
     use furiosa_opt_std::prelude::*;
@@ -2040,7 +2040,7 @@ pub mod group {
     }
 
     /// Writes wave group `group`'s coefficients of a rotation in the slices of the projected
-    /// queries of `Heads`, `G` waves at a time.
+    /// queries of `Heads`, the ones their heads leave empty included, `G` waves at a time.
     pub(crate) struct ToDm<G, Heads>(pub(crate) PhantomData<(G, Heads)>);
 
     impl<G: Group, Heads: AxisName, Head: AxisName, S: AxisName, Half: AxisName>
@@ -2054,22 +2054,23 @@ pub mod group {
             context: &mut Device,
             (rotation, group): (&SplitHalf<Head, Rotation<S, Half>>, usize),
         ) -> Self::Output {
-            let query: DmTensor<
+            let copies: DmTensor<
                 bf16,
                 Chip,
                 Cluster<Heads>,
-                fp8::Reduced<G, Heads, fp8::QuerySpread<G, Heads>>,
+                fp8::Reduced<G, Heads, SpreadCopies<G, Heads>>,
                 m![OutputHalf, Tile % 8, InputHalf, Half],
             > = G::stacked(&rotation.frequency, group).to_dm(&mut context.tdma);
             SplitHalf {
-                // SAFETY: head digits only rename replicated coefficient coordinates.
-                frequency: unsafe { query.reshape() },
+                // SAFETY: head digits only rename replicated coefficient coordinates, which every
+                // copy holds.
+                frequency: unsafe { copies.reshape() },
                 head: PhantomData,
             }
         }
     }
 
-    /// The rotation of the keys of `KvHeads`: coefficients written in the slices of the queries,
+    /// The rotation of the keys of `KvHeads`: coefficients written in every slice of the queries,
     /// filled into the register file in the slices of the keys.
     impl<Head: AxisName, G: Group, QueryHeads: AxisName, KvHeads: AxisName, Half: AxisName>
         Op<(
@@ -2095,8 +2096,8 @@ pub mod group {
                 PhantomData<KvHeads>,
             ),
         ) -> Self::Output {
-            // SAFETY: query head digits replicate coefficients; key row digits occupy the same
-            // slices.
+            // SAFETY: query head digits replicate coefficients, which every query slice holds, the
+            // ones the queries leave empty included; key row digits occupy the same slices.
             let frequency = unsafe {
                 coefficients.frequency.view().reshape::<Chip, Cluster<KvHeads>,
                     fp8::PairSlices<G, KvHeads>, m![OutputHalf, Tile % 8, InputHalf, Half]>()

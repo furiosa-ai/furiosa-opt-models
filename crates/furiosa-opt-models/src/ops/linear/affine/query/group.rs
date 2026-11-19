@@ -16,7 +16,7 @@ impl<const N: usize> AxisName for Tiles<N> {
 pub trait Group: AxisName {
     /// The rows of a period of this group, its tiles in order, as one axis.
     type Period: AxisName;
-    type Copies: M;
+    type Copies: Count;
     type Slot: M;
     type Rows<All: AxisName>: M;
 
