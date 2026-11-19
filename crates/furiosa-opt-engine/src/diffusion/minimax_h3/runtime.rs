@@ -472,8 +472,8 @@ impl Staging {
         device: &SharedDevice,
     ) -> io::Result<HbmTensor<f32, Chips, m![R, W]>> {
         device.with_device(|device| {
-            // Allocate ordinary caller-owned storage, matching the original step runner. DMA
-            // completes synchronously here with both source and target owners still alive.
+            // Allocate caller-owned storage as in the earlier H3 implementation's step code.
+            // DMA completes synchronously with both source and target owners still alive.
             let mut target = HbmTensor::<f32, Chips, m![R, W]>::alloc(device)
                 .map_err(io::Error::other)?
                 .into_buffer();
