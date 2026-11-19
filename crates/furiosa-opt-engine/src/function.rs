@@ -40,6 +40,60 @@ impl<M, F> Function<M, F> {
     pub fn new(module: M, entry: F) -> Self {
         Self { module, entry }
     }
+
+    /// Submit a call and retain its completion for weight residency. Submission refusal returns
+    /// an error immediately; an accepted call returns its output and work without waiting.
+    /// The caller keeps every movable weight it reads until the completion ends.
+    /// Returned tensors may still be written. Before passing one to a dependent multi-chip
+    /// launch, wait for its `ready()` future outside the device lock; the runtime refuses
+    /// overlapping accesses to peer-shared return storage. Independent prefetch can run first.
+    pub fn forward_tracked<I, E, S, O>(
+        &self,
+        device: &mut Device,
+        env: E,
+        state: S,
+        input: I,
+    ) -> io::Result<(O, crate::residency::Completion)>
+    where
+        M: DeviceSend + Module<I, E, S, Output = O> + Sync,
+        I: DeviceSend + Send,
+        E: DeviceSend + Send,
+        S: DeviceSend + Send,
+        O: DeviceOutput,
+        F: Copy + Sync + for<'d, 'm> DeviceFn<(&'d mut Device, &'m M, E, S, I), Output = O>,
+    {
+        let mut output = O::alloc(device).map_err(io::Error::other)?;
+        let work = self.forward_into_tracked(device, env, state, input, &mut output)?;
+        Ok((output, work))
+    }
+
+    /// Submit into the caller's retained output, returning only its accepted-work completion.
+    /// The caller retains inputs and output until completion, including on failure/cancellation.
+    /// Explicit local allocations support ordered workspace/ring reuse for entries whose output
+    /// writes stay on each chip; the ordinary return path keeps its shared allocation policy.
+    pub fn forward_into_tracked<I, E, S, O>(
+        &self,
+        device: &mut Device,
+        env: E,
+        state: S,
+        input: I,
+        output: &mut O,
+    ) -> io::Result<crate::residency::Completion>
+    where
+        M: DeviceSend + Module<I, E, S, Output = O> + Sync,
+        I: DeviceSend + Send,
+        E: DeviceSend + Send,
+        S: DeviceSend + Send,
+        O: DeviceOutput,
+        F: Copy + Sync + for<'d, 'm> DeviceFn<(&'d mut Device, &'m M, E, S, I), Output = O>,
+    {
+        let accepted = launch(self.entry, (device, &self.module, env, state, input))
+            .output(output)
+            .submit()
+            .accepted()
+            .map_err(io::Error::other)?;
+        Ok(crate::residency::Completion::new(accepted))
+    }
 }
 
 impl<M, F, I, E, S, O> AsyncModule<I, E, S> for Function<M, F>

@@ -12,6 +12,7 @@
 //! - A refused name is `Unsupported`, an unknown one `InvalidData`.
 
 use crate::decoder::{Decoder, Instance, Served};
+use crate::diffusion::minimax_h3;
 use crate::vision_language::Encoder;
 use furiosa_opt_models::load::{Checkpoint, Context, Load, LoadError, Part};
 use furiosa_opt_models::models::decoder::attention::{llama, qwen3};
@@ -818,6 +819,7 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
     // Source: <https://github.com/vllm-project/vllm-omni/blob/6daf5b30f07cc0b3db87766d22fdf433f8a1a7c9/vllm_omni/model_executor/models/minicpmo_4_5/batched_token2wav.py>.
     ("MiniCPMO45Code2Wav", &[]),
     ("MiniCPMO45OmniForConditionalGeneration", &[]),
+    ("MiniMaxH3Pipeline", &[Implementation::minimax_h3()]),
     ("MiniMaxMusic3AcousticForConditionalGeneration", &[]),
     ("MossTTSCodecDecoder", &[]),
     ("NemotronVoiceChatCode2Wav", &[]),
@@ -895,7 +897,14 @@ pub struct Implementation {
     class: Class,
     scope: fn(&Checkpoint) -> Result<&'static str, LoadError>,
     adapters: usize,
-    load: fn(&mut Context<'_>, &Checkpoint, Tiling) -> Result<Model, LoadError>,
+    load: Loader,
+}
+
+/// Placement through a borrowed device, or through the retained context a pipeline needs.
+#[derive(Debug)]
+enum Loader {
+    Model(fn(&mut Context<'_>, &Checkpoint, Tiling) -> Result<Model, LoadError>),
+    MiniMaxH3,
 }
 
 /// A model a load returns, as a framework serves it.
@@ -958,8 +967,46 @@ impl Implementation {
                 T::scope(source)
             },
             adapters: T::ADAPTERS,
-            load: |context, source, tiling| Ok(T::load(context, source)?.served(tiling)),
+            load: Loader::Model(|context, source, tiling| {
+                Ok(T::load(context, source)?.served(tiling))
+            }),
         }
+    }
+
+    const fn minimax_h3() -> Self {
+        Self {
+            size: "FL2VA",
+            class: minimax_h3::Pipeline::CLASS,
+            scope: |source| {
+                if source.part() != Part::Whole {
+                    return Err(LoadError::Unsupported {
+                        name: "encoder".into(),
+                        reason: "H3 loads as one complete pipeline".into(),
+                    });
+                }
+                if source.config()["_class_name"].as_str() != Some("MiniMaxH3Pipeline") {
+                    return Err(LoadError::InvalidData {
+                        name: "config.json:_class_name".into(),
+                        reason: "expected MiniMaxH3Pipeline".into(),
+                    });
+                }
+                Ok("")
+            },
+            adapters: 0,
+            load: Loader::MiniMaxH3,
+        }
+    }
+
+    /// The chip count of this implementation; it is not a global parallelism choice.
+    pub fn chips(&self) -> usize {
+        match self.load {
+            Loader::Model(_) => 1,
+            Loader::MiniMaxH3 => minimax_h3::Pipeline::CHIPS,
+        }
+    }
+
+    pub(crate) fn is_pipeline(&self) -> bool {
+        matches!(self.load, Loader::MiniMaxH3)
     }
 
     /// The first of `names` that `ARCHITECTURES` lists, as it spells it, with its implementations;
@@ -1022,7 +1069,13 @@ impl Implementation {
         tiling: Tiling,
     ) -> Result<Model, LoadError> {
         let scope = (self.scope)(source)?;
-        context.field("", scope, |cx| (self.load)(cx, source, tiling))
+        match self.load {
+            Loader::Model(load) => context.field("", scope, |cx| load(cx, source, tiling)),
+            Loader::MiniMaxH3 => Err(LoadError::Unsupported {
+                name: "device".into(),
+                reason: "H3 placement requires a retained SharedDevice; use LoadOptions::prepare_pipeline and Prepared::place".into(),
+            }),
+        }
     }
 
     /// The size, as the hub spells it.
@@ -1119,7 +1172,7 @@ mod tests {
     #[test]
     fn lists_every_name_once_by_its_kind() {
         let names: HashSet<_> = ARCHITECTURES.iter().map(|(name, _)| name).collect();
-        assert_eq!((names.len(), ARCHITECTURES.len()), (670, 670));
+        assert_eq!((names.len(), ARCHITECTURES.len()), (671, 671));
         for &(name, implementations) in ARCHITECTURES {
             match (implementations, Implementation::listed(&[name])) {
                 ([], Err(refusal @ LoadError::Unsupported { .. })) => {

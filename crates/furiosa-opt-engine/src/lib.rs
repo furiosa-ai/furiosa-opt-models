@@ -21,8 +21,10 @@
 mod function;
 
 pub mod decoder;
+pub mod diffusion;
 pub mod load;
 pub mod registry;
+pub mod residency;
 pub mod vision_language;
 
 pub use function::{AsyncModule, Function, forward};
