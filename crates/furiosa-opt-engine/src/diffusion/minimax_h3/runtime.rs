@@ -11,7 +11,7 @@ use furiosa_opt_models::models::Class;
 use furiosa_opt_models::models::diffusion::minimax_h3::{
     Inputs,
     embeddings::{Chips, Condition, Latent, Patch, Width},
-    packing::{Capacity, DEFAULT_MAX_TEXT, Modality},
+    packing::{Capacity, DEFAULT_GATHER_ROWS, DEFAULT_MAX_TEXT, Modality},
     video::tiling,
 };
 use furiosa_opt_models::tensor::axis::Rows;
@@ -361,7 +361,7 @@ pub struct Decoded<const N: usize> {
 
 // One compiled profile; runtime valid counts and geometry still belong to the generic core.
 // The core's checked constructor verifies these allocations against the maximum packing plan.
-type JointRows = Rows<10496>;
+type JointRows = Rows<{ DEFAULT_GATHER_ROWS }>;
 type KeySpans = Rows<20>;
 type TextRows = Rows<512>;
 type AudioRows = Rows<128>;

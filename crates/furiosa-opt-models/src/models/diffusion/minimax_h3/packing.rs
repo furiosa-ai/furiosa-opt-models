@@ -16,6 +16,10 @@ pub const TEXT_STRIP: usize = 16;
 pub const ROW_BLOCK: usize = 256;
 pub const GATHER_HEAD: usize = ROW_BLOCK;
 pub const GATHER_BODY: usize = 1024;
+/// Compiled maximum-text profile: one short first tile, then ten body tiles.
+pub const DEFAULT_GATHER_TILES: usize = 11;
+/// Per-part allocation shared by the default planner, gather and engine row axis.
+pub const DEFAULT_GATHER_ROWS: usize = GATHER_HEAD + (DEFAULT_GATHER_TILES - 1) * GATHER_BODY;
 pub const KEY_SPAN: usize = 2048;
 pub const AUDIO_TOKENS: usize = 414;
 pub const VIDEO_TOKENS: usize = 37_296;
@@ -226,7 +230,8 @@ impl Capacity {
 
 impl Default for Capacity {
     fn default() -> Self {
-        Self::new(DEFAULT_MAX_TEXT).expect("the default packing capacity has bounded geometry")
+        Self::checked(DEFAULT_MAX_TEXT, Some(DEFAULT_GATHER_ROWS))
+            .expect("the default packing capacity has bounded geometry")
     }
 }
 

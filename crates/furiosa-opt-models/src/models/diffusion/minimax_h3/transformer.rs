@@ -7,6 +7,7 @@
 //! Request state supplies visibility and runtime lengths separately from these weights.
 
 use super::embeddings::{Chips, EPSILON, Time, Width};
+use super::packing::{DEFAULT_GATHER_TILES, GATHER_BODY, GATHER_HEAD};
 use crate::load::{Checkpoint, Context, Load, LoadError, Named};
 use crate::modules::generic::Prefix;
 use crate::modules::parallel::{Exchanged, Gathered};
@@ -196,7 +197,7 @@ pub type Grouped<I, O, X = Hbm> =
 pub type Dense<I, O, X = Hbm> = Linear<I, O, Chips, <X as Memory>::Tensor<bf16, Chips, m![O, I]>>;
 
 /// Maximum-2048 gather allocation: one 256-row first tile and ten 1024-row bodies.
-pub type GatherTiles = InTiles<1024, 11, 256>;
+pub type GatherTiles = InTiles<GATHER_BODY, DEFAULT_GATHER_TILES, GATHER_HEAD>;
 
 /// Score multiplier fixed by the 128-feature heads.
 pub const SCALE: usize = geometry::scale(flash::Head::SIZE);
