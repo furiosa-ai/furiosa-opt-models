@@ -19,7 +19,6 @@ pub(super) struct Pipeline<const N: usize, R, K, T: AxisName, A, V> {
     encoder: text::Encoder,
     conditioner: Conditioner<N, T>,
     denoiser: step::Runner<R, K, T, A, V>,
-    cached: cache::Runner<R, K, T, A, V>,
     video: video::Decoder,
     audio: audio::Decoder,
     active: Arc<tokio::sync::Mutex<()>>,
@@ -61,7 +60,6 @@ impl<
         device.admit(weights.resident())?.landed().await?;
         let conditioner = Conditioner::from_resident(weights.denoiser(), device.clone()).await?;
         let denoiser = step::Runner::from_resident(weights.denoiser(), device.clone()).await?;
-        let cached = cache::Runner::from_resident(weights.denoiser(), device.clone()).await?;
         let video = video::Decoder::from_resident(weights.video(), device.clone()).await?;
         let audio = audio::Decoder::from_resident(weights.audio(), device.clone()).await?;
         let reserved = device.with_device(|device| {
@@ -91,7 +89,7 @@ impl<
             condition: conditioner.workspace_bytes()?,
             denoising: denoiser
                 .workspace_bytes(&reserved)?
-                .max(cached.workspace_bytes(&reserved)?),
+                .max(denoiser.cached_workspace_bytes(&reserved)?),
             video: video.workspace_bytes()?,
             audio: audio.workspace_bytes()?,
         };
@@ -109,7 +107,6 @@ impl<
             encoder,
             conditioner,
             denoiser,
-            cached,
             video,
             audio,
             active: Arc::new(tokio::sync::Mutex::new(())),
@@ -305,8 +302,8 @@ impl<
         decide: F,
     ) -> io::Result<((step::Video<V>, step::Audio<A>), Arc<cache::Retained<R>>)> {
         self.owner
-            .cached
-            .forward(
+            .denoiser
+            .forward_cached(
                 Arc::clone(&self.state),
                 previous,
                 times,

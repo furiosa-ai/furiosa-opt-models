@@ -1,6 +1,6 @@
-//! One uncached step using request-owned text and metadata, with bounded accepted work.
+//! One denoiser runner for uncached and TeaCache steps, with bounded accepted work.
 
-use super::{condition, flight::Flight, kernel, request, weights::Component};
+use super::{cache, condition, flight::Flight, kernel, request, weights::Component};
 use crate::residency::{Resident, SharedDevice};
 use furiosa_opt_models::models::diffusion::minimax_h3::{
     denoiser::{self, DEPTH, Denoiser},
@@ -38,10 +38,10 @@ impl<R: AxisName, K: AxisName, T: AxisName, A, V> State<R, K, T, A, V> {
 
 pub(super) struct Runner<R, K, T, A, V> {
     _owner: Component<Denoiser>,
-    embedding: Resident<denoiser::Embeddings>,
-    blocks: [Resident<denoiser::Block>; DEPTH],
-    heads: Resident<denoiser::Heads>,
-    device: SharedDevice,
+    pub(super) embedding: Resident<denoiser::Embeddings>,
+    pub(super) blocks: [Resident<denoiser::Block>; DEPTH],
+    pub(super) heads: Resident<denoiser::Heads>,
+    pub(super) device: SharedDevice,
     shape: std::marker::PhantomData<(R, K, T, A, V)>,
 }
 
@@ -57,7 +57,7 @@ impl<
 {
     /// Borrow stages of the already placed tree. The original execution launches embeddings,
     /// each block and heads separately; the same compiled block entry serves all 50 layers.
-    /// Prime entries before sizing the encoder's resident prefix.
+    /// Prime common and TeaCache entries before sizing the encoder's resident prefix.
     pub(super) async fn from_resident(
         owner: Component<Denoiser>,
         device: SharedDevice,
@@ -94,7 +94,7 @@ impl<
                 (&Hidden<R>, &kernel::EmbeddedTime),
             )>::load(kernel::heads, device)
             .map_err(io::Error::other)?;
-            Ok(())
+            cache::prime::<R, K, T, A, V>(device)
         })?;
         let resident = owner.resident();
         let embedding =

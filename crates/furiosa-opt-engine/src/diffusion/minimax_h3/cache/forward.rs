@@ -21,7 +21,7 @@ impl<
     /// Invoke the host decision exactly once after the probe's readers finish. A first call
     /// always computes. The caller removes `previous` from its memo before this call: only a
     /// successful return publishes retained rows again, after every accepted reader has ended.
-    pub(in crate::diffusion::minimax_h3) async fn forward<
+    pub(in crate::diffusion::minimax_h3) async fn forward_cached<
         F: FnMut(Option<Statistics>) -> io::Result<bool> + Send,
     >(
         &self,

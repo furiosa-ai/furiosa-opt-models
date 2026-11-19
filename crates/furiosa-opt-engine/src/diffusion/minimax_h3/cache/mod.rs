@@ -1,13 +1,11 @@
 //! Request-owned TeaCache rows beside the original separately launched denoiser stages.
 
-use super::{flight::Flight, kernel as stage, request, step, weights::Component};
-use crate::residency::{Resident, SharedDevice};
-use furiosa_opt_models::models::diffusion::minimax_h3::{
-    denoiser::{self, DEPTH, Denoiser},
-    embeddings::{Chips, Width},
-};
+use super::{flight::Flight, kernel as stage, request, step};
+use furiosa_opt_models::models::diffusion::minimax_h3::embeddings::{Chips, Width};
 use furiosa_opt_std::prelude::*;
 use std::{io, marker::PhantomData, sync::Arc};
+
+use super::step::Runner;
 
 mod forward;
 mod kernel;
@@ -56,13 +54,65 @@ impl Statistics {
     }
 }
 
-pub(super) struct Runner<R, K, T, A, V> {
-    _owner: Component<Denoiser>,
-    embedding: Resident<denoiser::Embeddings>,
-    blocks: [Resident<denoiser::Block>; DEPTH],
-    heads: Resident<denoiser::Heads>,
-    device: SharedDevice,
-    shape: PhantomData<(R, K, T, A, V)>,
+/// Prime the cache-specific entries alongside the runner's common denoising entries.
+pub(super) fn prime<
+    R: AxisName + Send + Sync,
+    K: AxisName + Send + Sync,
+    T: AxisName + Send + Sync,
+    A: AxisName + Send + Sync,
+    V: AxisName + Send + Sync,
+>(
+    device: &mut Device,
+) -> io::Result<()> {
+    Loadable::<(
+        &mut Device,
+        &kernel::Modulation<'_, '_>,
+        (),
+        &mut kernel::Modulations,
+        &stage::EmbeddedTime,
+    )>::load(kernel::modulate, device)
+    .map_err(io::Error::other)?;
+    Loadable::<(
+        &mut Device,
+        &kernel::Norm<'_, '_>,
+        &request::Inputs<R, K, T, A, V>,
+        &mut Hidden<R>,
+        (&Hidden<R>, &kernel::NormTables),
+    )>::load(kernel::norm, device)
+    .map_err(io::Error::other)?;
+    Loadable::<(
+        &mut Device,
+        &kernel::L1,
+        &request::Inputs<R, K, T, A, V>,
+        &mut (),
+        (&Hidden<R>, &Hidden<R>),
+    )>::load(kernel::l1, device)
+    .map_err(io::Error::other)?;
+    Loadable::<(
+        &mut Device,
+        &rows::Add,
+        &request::Inputs<R, K, T, A, V>,
+        &mut (),
+        (&Hidden<R>, &Hidden<R>),
+    )>::load(rows::add, device)
+    .map_err(io::Error::other)?;
+    Loadable::<(
+        &mut Device,
+        &rows::Subtract,
+        &request::Inputs<R, K, T, A, V>,
+        &mut (),
+        (&Hidden<R>, &Hidden<R>),
+    )>::load(rows::subtract, device)
+    .map_err(io::Error::other)?;
+    Loadable::<(
+        &mut Device,
+        &rows::Copy,
+        &request::Inputs<R, K, T, A, V>,
+        &mut Hidden<R>,
+        &Hidden<R>,
+    )>::load(rows::copy, device)
+    .map_err(io::Error::other)?;
+    Ok(())
 }
 
 impl<
@@ -73,86 +123,9 @@ impl<
     V: AxisName + Send + Sync,
 > Runner<R, K, T, A, V>
 {
-    /// Borrow the same resident tree and prime the additional original cache launches before
-    /// measuring call storage and selecting the text encoder's resident prefix.
-    pub(super) async fn from_resident(
-        owner: Component<Denoiser>,
-        device: SharedDevice,
-    ) -> io::Result<Self> {
-        device.admit(owner.resident())?.landed().await?;
-        device.with_device(|device| {
-            Loadable::<(
-                &mut Device,
-                &kernel::Modulation<'_, '_>,
-                (),
-                &mut kernel::Modulations,
-                &stage::EmbeddedTime,
-            )>::load(kernel::modulate, device)
-            .map_err(io::Error::other)?;
-            Loadable::<(
-                &mut Device,
-                &kernel::Norm<'_, '_>,
-                &request::Inputs<R, K, T, A, V>,
-                &mut Hidden<R>,
-                (&Hidden<R>, &kernel::NormTables),
-            )>::load(kernel::norm, device)
-            .map_err(io::Error::other)?;
-            Loadable::<(
-                &mut Device,
-                &kernel::L1,
-                &request::Inputs<R, K, T, A, V>,
-                &mut (),
-                (&Hidden<R>, &Hidden<R>),
-            )>::load(kernel::l1, device)
-            .map_err(io::Error::other)?;
-            Loadable::<(
-                &mut Device,
-                &rows::Add,
-                &request::Inputs<R, K, T, A, V>,
-                &mut (),
-                (&Hidden<R>, &Hidden<R>),
-            )>::load(rows::add, device)
-            .map_err(io::Error::other)?;
-            Loadable::<(
-                &mut Device,
-                &rows::Subtract,
-                &request::Inputs<R, K, T, A, V>,
-                &mut (),
-                (&Hidden<R>, &Hidden<R>),
-            )>::load(rows::subtract, device)
-            .map_err(io::Error::other)?;
-            Loadable::<(
-                &mut Device,
-                &rows::Copy,
-                &request::Inputs<R, K, T, A, V>,
-                &mut Hidden<R>,
-                &Hidden<R>,
-            )>::load(rows::copy, device)
-            .map_err(io::Error::other)?;
-            Ok(())
-        })?;
-        let resident = owner.resident();
-        let embedding =
-            resident.part::<denoiser::Embeddings>("embeddings", |tree| &tree.embeddings);
-        let blocks = std::array::from_fn(|at| {
-            resident.part::<denoiser::Block>(&format!("blocks.layers.{at}"), |tree| {
-                &tree.blocks.layers[at]
-            })
-        });
-        let heads = resident.part::<denoiser::Heads>("heads", |tree| &tree.heads);
-        Ok(Self {
-            _owner: owner,
-            embedding,
-            blocks,
-            heads,
-            device,
-            shape: PhantomData,
-        })
-    }
-
     /// Measure the same six hidden-row allocations as a first cached call: four transient
     /// rows and two retained rows. No sizing buffer is read by a numerical launch.
-    pub(super) fn workspace_bytes(
+    pub(super) fn cached_workspace_bytes(
         &self,
         state: &Arc<step::State<R, K, T, A, V>>,
     ) -> io::Result<usize> {
