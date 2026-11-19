@@ -17,9 +17,9 @@
 use core::ops::Range;
 use std::io;
 
+use super::super::host::filled;
 use super::{Parts, Patch, Rows, TOKENS};
 use crate::models::diffusion::minimax_h3::embeddings::Chips;
-use crate::tensor::memory::filled;
 use furiosa_opt_std::prelude::*;
 
 /// The fixed request's borrowed latent values in channel, time, row, column order.

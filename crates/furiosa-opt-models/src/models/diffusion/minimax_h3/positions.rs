@@ -6,8 +6,8 @@
 //! envelope. Visibility instead describes the video/audio/text key prefix: K/V placement must
 //! use the packed key order from [`Plan::key_runs`], not query or upstream position order.
 
+use super::host::filled;
 use super::packing::{self, Plan};
-use crate::tensor::memory::filled;
 use half::bf16;
 use std::{io, mem::size_of};
 

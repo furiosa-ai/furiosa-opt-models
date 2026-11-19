@@ -13,8 +13,8 @@
 use furiosa_opt_std::prelude::{HbmTensor, M, MaterializableScalar, Scalar};
 use furiosa_opt_std::runtime::HbmBuffer as Buffer;
 pub use safetensors::Dtype;
+use std::io;
 use std::ops::RangeBounds;
-use std::{io, mem::size_of};
 
 pub mod residency;
 
@@ -53,29 +53,6 @@ pub fn dtype<D: Scalar>() -> io::Result<Dtype> {
     .into_iter()
     .find_map(|(dtype, scalar)| (scalar == TypeId::of::<D>()).then_some(dtype))
     .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "unsupported tensor scalar"))
-}
-
-/// Fill host storage, returning invalid-input errors for unrepresentable byte sizes and
-/// out-of-memory errors when its exact reservation fails.
-pub fn filled<T: Clone>(count: usize, value: T) -> io::Result<Vec<T>> {
-    let bytes = count.checked_mul(size_of::<T>()).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "host buffer byte count overflows usize",
-        )
-    })?;
-    if bytes > isize::MAX as usize {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "host buffer exceeds isize::MAX bytes",
-        ));
-    }
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(count)
-        .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
-    values.resize(count, value);
-    Ok(values)
 }
 
 /// `range` of `buffer` as a tensor of its exact size: another owner of the same storage.

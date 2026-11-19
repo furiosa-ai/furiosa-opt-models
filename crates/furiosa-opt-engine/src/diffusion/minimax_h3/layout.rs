@@ -4,10 +4,10 @@
 //! text/audio/video sequence and preserves selected video order, including repeated indices.
 //! All device addresses come from `Plan`; a media axis supplies its actual allocation stride.
 
+use furiosa_opt_models::models::diffusion::minimax_h3::host::filled;
 use furiosa_opt_models::models::diffusion::minimax_h3::packing::{
     AUDIO_TOKENS, Capacity, Modality, PARTS, Plan, VIDEO_TOKENS,
 };
-use furiosa_opt_models::tensor::memory::filled;
 use furiosa_opt_std::prelude::AxisName;
 use std::io;
 

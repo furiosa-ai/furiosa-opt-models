@@ -13,6 +13,7 @@ pub mod audio;
 pub mod config;
 pub mod denoiser;
 pub mod embeddings;
+pub mod host;
 mod inputs;
 pub mod joint;
 pub mod packing;
