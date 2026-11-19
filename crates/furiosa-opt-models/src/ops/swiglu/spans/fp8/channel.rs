@@ -199,7 +199,6 @@ pub struct Staging<I: AxisName, R: AxisName> {
     scales: TokenScales<I, R>,
     stored_scales: StoredTokens<I, R>,
     resident_scales: bool,
-    early_down: bool,
 }
 
 impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName>
@@ -254,7 +253,6 @@ impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName>
             },
             stored_scales,
             resident_scales,
-            early_down: decode && rows <= 8,
         }
     }
 }
@@ -289,7 +287,6 @@ pub(crate) fn project_down<H: AxisName, I: AxisName, R: AxisName, C: AxisName, F
         scales,
         stored_scales,
         resident_scales,
-        early_down,
     } = staging.into_value();
     let row = if resident_scales {
         down_scale_rows::<H, I, R>(device, &scales, rows)
@@ -309,7 +306,6 @@ pub(crate) fn project_down<H: AxisName, I: AxisName, R: AxisName, C: AxisName, F
         device,
         first,
         rows,
-        early_down,
         (
             |device, panel| load_product(device, [&p0, &p1, &p2][panel], rows),
             (|_| second, |device| down::<H, I, 64>(device, weights, 2)),

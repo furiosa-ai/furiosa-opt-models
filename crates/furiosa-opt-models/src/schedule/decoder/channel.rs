@@ -92,7 +92,11 @@ fn start(
     let tile = rows.with(());
     let normalized = front.gain.normalize_span(device, &rows, short_decode(call));
     let mut home = Normalized::<Width, Capacity>::new();
-    home.spill(device, normalized.value(), (tile, tile.rows()));
+    if tile.rows() > 8 && tile.rows() <= 64 {
+        query::launch::spill_half_wave(device, &mut home, normalized.value(), tile.start());
+    } else {
+        home.spill(device, normalized.value(), (tile, tile.rows()));
+    }
     let rotation = &call.context.0.positions;
     let mut store = |device: &mut Device, at, query, key, value| {
         let (query, key) =
@@ -143,7 +147,7 @@ fn start(
         let at = tile.tile::<Tile>(2 * pairs);
         let groups = at.rows().div_ceil(8);
         let input = crate::Op::forward(
-            &query::fp8::ToDm::<Tiles<1>>(PhantomData),
+            &query::fp8::ToDm::<Tiles<1>, true>(PhantomData),
             device,
             (&home, (at.start(), Tile::SIZE), groups),
         );
