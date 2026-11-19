@@ -2,19 +2,11 @@
 
 use super::{Cache, Chips, DEFAULT_MAX_TEXT, Head, Hidden, Windows, text};
 use furiosa_opt_models::ops::{attention::gqa, index::table::BlockIndex};
-use furiosa_opt_models::tensor::{axis::Single, cache::Block, memory::alias};
+use furiosa_opt_models::tensor::{cache::Block, memory::alias};
 use furiosa_opt_std::prelude::*;
 use std::{io, ops::Range};
 
-/// A row's metadata aliases the prompt's one allocation. Every table entry, including rounded
-/// overfetch, addresses allocated cache storage; the causal bias hides unfilled token rows.
-#[derive(DeviceSend)]
-pub(super) struct Row {
-    pub position: HbmTensor<f32, Chips, m![Single, Head]>,
-    pub slot: HbmTensor<i32, Chips, m![1]>,
-    pub history: gqa::Read<Windows, Chips>,
-    pub token: HbmTensor<i32, Chips, m![1]>,
-}
+pub(super) use super::text::stage::Row;
 
 pub(super) struct Request {
     pub rows: Vec<Row>,

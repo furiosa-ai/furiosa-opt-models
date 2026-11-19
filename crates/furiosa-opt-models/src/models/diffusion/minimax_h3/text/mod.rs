@@ -32,6 +32,7 @@ use furiosa_opt_std::prelude::*;
 
 pub mod parameters;
 pub mod position;
+pub mod stage;
 
 /// The encoder's language body, without final normalization or a vocabulary readout.
 /// Arrays retain independently loadable layers; `N` also permits a one-layer launch.

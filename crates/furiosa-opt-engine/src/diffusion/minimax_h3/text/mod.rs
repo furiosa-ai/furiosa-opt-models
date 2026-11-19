@@ -2,20 +2,16 @@
 
 use super::flight::Flight;
 use crate::residency::{Cells, Resident, SharedDevice, block_on};
-use furiosa_opt_models::models::decoder::attention::{Head, KvHeads};
+use furiosa_opt_models::models::decoder::attention::Head;
 use furiosa_opt_models::models::diffusion::minimax_h3::{packing::DEFAULT_MAX_TEXT, text};
-use furiosa_opt_models::ops::attention::gqa;
 use furiosa_opt_models::tensor::memory::alias;
-use furiosa_opt_models::tensor::{
-    axis::Rows,
-    cache::Blocks,
-    parallel::{Parallel, Parallelism},
-};
+use furiosa_opt_models::tensor::parallel::{Parallel, Parallelism};
 use furiosa_opt_std::prelude::*;
 use std::{io, sync::Arc};
 
 use budget::Fit;
 pub(crate) use budget::Limits;
+use text::stage::{Cache, Hidden, Windows};
 pub(crate) use weights::Weights;
 
 mod budget;
@@ -25,10 +21,6 @@ mod weights;
 
 type P = Parallel<4>;
 type Chips = <P as Parallelism>::Chip;
-type LocalKv = <P as Parallelism>::Local<KvHeads>;
-type Windows = Rows<{ DEFAULT_MAX_TEXT.div_ceil(gqa::Cache::SIZE) }>;
-type Cache = Blocks<LocalKv, Head, bf16, Chips>;
-type Hidden = HbmTensor<bf16, Chips, m![{ Symbol<text::Hidden> }]>;
 
 /// The embedding, layers and position views retain their shared parameter cells. Construction
 /// measures actual allocation costs before selecting the prefix; no payload estimate decides fit.
