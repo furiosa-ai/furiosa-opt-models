@@ -1,9 +1,9 @@
-//! One denoiser runner for uncached and TeaCache steps, with bounded accepted work.
+//! Resident denoising stages for uncached and TeaCache steps, with bounded accepted work.
 
 use super::{cache, condition, flight::Flight, kernel, request, weights::Component};
 use crate::residency::{Launches, Resident, SharedDevice};
 use furiosa_opt_models::models::diffusion::minimax_h3::{
-    denoiser::{self, DEPTH, Denoiser},
+    denoiser::{self as model, DEPTH},
     embeddings::{Chips, Latent, Patch, Width},
 };
 use furiosa_opt_models::tensor::{axis::Rows, memory::Hbm, memory::alias};
@@ -36,31 +36,76 @@ impl<R: AxisName, K: AxisName, T: AxisName, A, V> State<R, K, T, A, V> {
     }
 }
 
-pub(super) struct Runner<R, K, T, A, V> {
-    _owner: Component<Denoiser>,
-    embedding: Resident<denoiser::Embeddings>,
-    blocks: [Resident<denoiser::Block>; DEPTH],
-    heads: Resident<denoiser::Heads>,
+pub(super) struct Denoiser<R, K, T, A, V> {
+    _owner: Component<model::Denoiser>,
+    embedding: Resident<model::Embeddings>,
+    blocks: [Resident<model::Block>; DEPTH],
+    heads: Resident<model::Heads>,
     device: SharedDevice,
     shape: std::marker::PhantomData<(R, K, T, A, V)>,
 }
 
 type Hidden<R> = HbmTensor<bf16, Chips, m![R, Width]>;
 
-// Borrow only the selected workspace slots while the device lock is held.
-type EmbeddingSlots<'a, S, A, V> = (
-    &'a S,
-    &'a Times,
-    (&'a Video<V>, &'a Audio<A>),
-    (&'a HbmBuffer, &'a HbmBuffer),
-);
-type BlockSlots<'a, S> = (&'a S, &'a HbmBuffer, &'a HbmBuffer, &'a HbmBuffer);
-type HeadSlots<'a, S> = (
-    &'a S,
-    &'a HbmBuffer,
-    &'a HbmBuffer,
-    (&'a HbmBuffer, &'a HbmBuffer),
-);
+/// Caller-owned embedded timesteps, kept live by the step's workspace.
+pub(super) struct TimeBuffer(HbmBuffer);
+
+impl TimeBuffer {
+    /// Allocate the original FP32 timestep image on the pipeline's chips.
+    pub(super) fn allocate(device: &mut Device) -> io::Result<Self> {
+        kernel::EmbeddedTime::alloc(device)
+            .map(HbmTensor::into_buffer)
+            .map(Self)
+            .map_err(io::Error::other)
+    }
+
+    /// Borrow the allocation for a fresh per-launch typed alias.
+    pub(super) fn buffer(&self) -> &HbmBuffer {
+        &self.0
+    }
+}
+
+/// Borrowed operands and destinations for the embedding launch.
+pub(super) struct EmbeddingSlots<'a, S, A: AxisName, V: AxisName> {
+    /// Request metadata and conditioned text retained by the flight.
+    pub(super) state: &'a S,
+    /// Unembedded video/audio timesteps supplied by the caller.
+    pub(super) timesteps: &'a Times,
+    /// Video sample rows to project into the hidden representation.
+    pub(super) video: &'a Video<V>,
+    /// Audio sample rows to project into the hidden representation.
+    pub(super) audio: &'a Audio<A>,
+    /// Destination for the joined text, audio and video hidden rows.
+    pub(super) output: &'a mut HbmBuffer,
+    /// Destination for the two embedded timesteps shared by blocks and heads.
+    pub(super) time: &'a mut TimeBuffer,
+}
+
+/// Borrowed row slots for one block, selected while the device lock is held.
+pub(super) struct BlockSlots<'a, S> {
+    /// Request metadata retained by the flight.
+    pub(super) state: &'a S,
+    /// Hidden rows read by this block.
+    pub(super) input: &'a HbmBuffer,
+    /// Embedded timesteps read by this block.
+    pub(super) time: &'a TimeBuffer,
+    /// Separate hidden-row destination reused by the ordered block chain.
+    pub(super) output: &'a mut HbmBuffer,
+}
+
+/// Borrowed final rows and media destinations for the heads launch.
+pub(super) struct HeadSlots<'a, S> {
+    /// Request metadata retained by the flight.
+    pub(super) state: &'a S,
+    /// Final hidden rows selected by the computed or cached path.
+    pub(super) input: &'a HbmBuffer,
+    /// Embedded timesteps shared with the block chain.
+    pub(super) time: &'a TimeBuffer,
+    /// Destination for video velocities.
+    pub(super) video: &'a mut HbmBuffer,
+    /// Destination for audio velocities.
+    pub(super) audio: &'a mut HbmBuffer,
+}
 
 impl<
     R: AxisName + Send + Sync,
@@ -68,13 +113,13 @@ impl<
     T: AxisName + Send + Sync,
     A: AxisName + Send + Sync,
     V: AxisName + Send + Sync,
-> Runner<R, K, T, A, V>
+> Denoiser<R, K, T, A, V>
 {
     /// Borrow stages of the already placed tree. The original execution launches embeddings,
     /// each block and heads separately; the same compiled block entry serves all 50 layers.
     /// Prime common and TeaCache entries before sizing the encoder's resident prefix.
     pub(super) async fn from_resident(
-        owner: Component<Denoiser>,
+        owner: Component<model::Denoiser>,
         device: SharedDevice,
     ) -> io::Result<Self> {
         if device.placement().chips.len() != 4 {
@@ -112,14 +157,13 @@ impl<
             cache::prime::<R, K, T, A, V>(device)
         })?;
         let resident = owner.resident();
-        let embedding =
-            resident.part::<denoiser::Embeddings>("embeddings", |tree| &tree.embeddings);
+        let embedding = resident.part::<model::Embeddings>("embeddings", |tree| &tree.embeddings);
         let blocks = std::array::from_fn(|at| {
-            resident.part::<denoiser::Block>(&format!("blocks.layers.{at}"), |tree| {
+            resident.part::<model::Block>(&format!("blocks.layers.{at}"), |tree| {
                 &tree.blocks.layers[at]
             })
         });
-        let heads = resident.part::<denoiser::Heads>("heads", |tree| &tree.heads);
+        let heads = resident.part::<model::Heads>("heads", |tree| &tree.heads);
         Ok(Self {
             _owner: owner,
             embedding,
@@ -150,31 +194,36 @@ impl<
             .with_device(|device| Workspace::allocate(device, state, times, video, audio))?;
         // One embedding, DEPTH blocks and one completion retained with each of two head outputs.
         let mut flight = Flight::new(workspace, DEPTH + 3);
-        self.submit_embeddings(&mut flight, |work| {
-            (
-                work.state.as_ref(),
-                &work.times,
-                (&work.video, &work.audio),
-                (&work.hidden[0], &work.time),
-            )
+        self.submit_embeddings(&mut flight, |work| EmbeddingSlots {
+            state: work.state.as_ref(),
+            timesteps: &work.times,
+            video: &work.video,
+            audio: &work.audio,
+            output: &mut work.hidden[0],
+            time: &mut work.time,
         })
         .await?;
         self.submit_blocks(&mut flight, |at, work| {
-            (
-                work.state.as_ref(),
-                &work.hidden[at % 2],
-                &work.time,
-                &work.hidden[(at + 1) % 2],
-            )
+            let [even, odd] = &mut work.hidden;
+            let (input, output) = if at % 2 == 0 {
+                (&*even, odd)
+            } else {
+                (&*odd, even)
+            };
+            BlockSlots {
+                state: work.state.as_ref(),
+                input,
+                time: &work.time,
+                output,
+            }
         })
         .await?;
-        self.submit_heads(&mut flight, |work| {
-            (
-                work.state.as_ref(),
-                &work.hidden[DEPTH % 2],
-                &work.time,
-                (&work.velocities.0, &work.velocities.1),
-            )
+        self.submit_heads(&mut flight, |work| HeadSlots {
+            state: work.state.as_ref(),
+            input: &work.hidden[DEPTH % 2],
+            time: &work.time,
+            video: &mut work.velocities.0,
+            audio: &mut work.velocities.1,
         })
         .await?;
         let [video, audio]: [HbmBuffer; 2] = flight
@@ -188,26 +237,35 @@ impl<
         ))
     }
 
+    /// Borrow the bound device for TeaCache's stateless submissions and sizing.
     pub(super) fn device(&self) -> &SharedDevice {
         &self.device
     }
 
+    /// Submit embeddings into joined rows and timestep slots before the block chain.
     pub(super) async fn submit_embeddings<W>(
         &self,
         flight: &mut Flight<W>,
-        slots: impl for<'a> FnOnce(&'a W) -> EmbeddingSlots<'a, State<R, K, T, A, V>, A, V>,
+        slots: impl for<'a> FnOnce(&'a mut W) -> EmbeddingSlots<'a, State<R, K, T, A, V>, A, V>,
     ) -> io::Result<()> {
         let ready = self.device.admit(&self.embedding)?.landed().await?;
         self.device.launch(ready, |launches, model| {
-            let (state, times, media, (hidden, time)) = slots(flight.held_mut());
+            let EmbeddingSlots {
+                state,
+                timesteps,
+                video,
+                audio,
+                output: hidden,
+                time,
+            } = slots(flight.held_mut());
             let mut output: (Hidden<R>, kernel::EmbeddedTime) =
-                (alias(hidden, ..)?, alias(time, ..)?);
+                (alias(hidden, ..)?, alias(time.buffer(), ..)?);
             let accepted = launches.forward_into_tracked(
                 kernel::Embed { model },
                 kernel::embed,
                 &state.request.inputs,
                 &mut (),
-                (times, media, &state.text.rows),
+                (timesteps, (video, audio), &state.text.rows),
                 &mut output,
             )?;
             flight.submitted(accepted);
@@ -215,17 +273,23 @@ impl<
         })
     }
 
+    /// Submit all blocks in layer order using their selected input, time and output slots.
     pub(super) async fn submit_blocks<W>(
         &self,
         flight: &mut Flight<W>,
-        mut slots: impl for<'a> FnMut(usize, &'a W) -> BlockSlots<'a, State<R, K, T, A, V>>,
+        mut slots: impl for<'a> FnMut(usize, &'a mut W) -> BlockSlots<'a, State<R, K, T, A, V>>,
     ) -> io::Result<()> {
         for (at, block) in self.blocks.iter().enumerate() {
             let ready = self.device.admit(block)?.landed().await?;
             self.device.launch(ready, |launches, model| {
-                let (state, input, time, output) = slots(at, flight.held_mut());
+                let BlockSlots {
+                    state,
+                    input,
+                    time,
+                    output,
+                } = slots(at, flight.held_mut());
                 let input: Hidden<R> = alias(input, ..)?;
-                let time: kernel::EmbeddedTime = alias(time, ..)?;
+                let time: kernel::EmbeddedTime = alias(time.buffer(), ..)?;
                 let mut output: Hidden<R> = alias(output, ..)?;
                 let accepted = launches.forward_into_tracked(
                     kernel::Block { model },
@@ -242,16 +306,23 @@ impl<
         Ok(())
     }
 
+    /// Submit media heads from the selected final rows and retain both velocity outputs.
     pub(super) async fn submit_heads<W>(
         &self,
         flight: &mut Flight<W>,
-        slots: impl for<'a> FnOnce(&'a W) -> HeadSlots<'a, State<R, K, T, A, V>>,
+        slots: impl for<'a> FnOnce(&'a mut W) -> HeadSlots<'a, State<R, K, T, A, V>>,
     ) -> io::Result<()> {
         let ready = self.device.admit(&self.heads)?.landed().await?;
         self.device.launch(ready, |launches, model| {
-            let (state, input, time, (video, audio)) = slots(flight.held_mut());
+            let HeadSlots {
+                state,
+                input,
+                time,
+                video,
+                audio,
+            } = slots(flight.held_mut());
             let input: Hidden<R> = alias(input, ..)?;
-            let time: kernel::EmbeddedTime = alias(time, ..)?;
+            let time: kernel::EmbeddedTime = alias(time.buffer(), ..)?;
             let mut output: (Video<V>, Audio<A>) = (alias(video, ..)?, alias(audio, ..)?);
             let accepted = launches.forward_into_tracked(
                 kernel::Heads { model },
@@ -267,10 +338,10 @@ impl<
         })
     }
 
-    /// TeaCache probes the first block without exposing the runner's resident stage bindings.
+    /// TeaCache probes the first block without exposing the denoiser's resident stage bindings.
     pub(super) async fn with_first_block<O>(
         &self,
-        call: impl for<'m, 'w> FnOnce(&mut Launches<'_>, &'m denoiser::Block<&'w Hbm>) -> io::Result<O>,
+        call: impl for<'m, 'w> FnOnce(&mut Launches<'_>, &'m model::Block<&'w Hbm>) -> io::Result<O>,
     ) -> io::Result<O> {
         let ready = self.device.admit(&self.blocks[0])?.landed().await?;
         self.device.launch(ready, call)
@@ -297,7 +368,7 @@ struct Workspace<R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName
     video: Video<V>,
     audio: Audio<A>,
     hidden: [HbmBuffer; 2],
-    time: HbmBuffer,
+    time: TimeBuffer,
     velocities: (HbmBuffer, HbmBuffer),
 }
 
@@ -320,9 +391,7 @@ impl<R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName> Workspace<
             video,
             audio,
             hidden: [row()?, row()?],
-            time: kernel::EmbeddedTime::alloc(device)
-                .map_err(io::Error::other)?
-                .into_buffer(),
+            time: TimeBuffer::allocate(device)?,
             velocities: (
                 Video::<V>::alloc(device)
                     .map_err(io::Error::other)?

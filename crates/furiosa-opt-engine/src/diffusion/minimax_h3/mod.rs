@@ -3,13 +3,13 @@
 mod audio;
 mod cache;
 mod condition;
+mod denoiser;
 mod flight;
 mod kernel;
 mod layout;
 mod memory;
 mod pipeline;
 mod request;
-mod runner;
 mod runtime;
 pub(crate) mod text;
 mod video;

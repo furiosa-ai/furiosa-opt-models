@@ -1,7 +1,8 @@
 //! One retained pipeline owner with exclusive, separately owned request state.
 
 use super::{
-    audio, cache, condition, condition::Conditioner, memory, request, runner, text, video, weights,
+    audio, cache, condition, condition::Conditioner, denoiser, memory, request, text, video,
+    weights,
 };
 use crate::residency::{SharedDevice, block_on};
 use furiosa_opt_models::models::diffusion::minimax_h3::embeddings::{Chips, Condition, Width};
@@ -18,7 +19,7 @@ pub(super) struct Pipeline<const N: usize, R, K, T: AxisName, A, V> {
     device: SharedDevice,
     encoder: text::Encoder,
     conditioner: Conditioner<N, T>,
-    denoiser: runner::Runner<R, K, T, A, V>,
+    denoiser: denoiser::Denoiser<R, K, T, A, V>,
     video: video::Decoder,
     audio: audio::Decoder,
     active: Arc<tokio::sync::Mutex<()>>,
@@ -59,7 +60,8 @@ impl<
         device.upload(weights.resident())?;
         device.admit(weights.resident())?.landed().await?;
         let conditioner = Conditioner::from_resident(weights.denoiser(), device.clone()).await?;
-        let denoiser = runner::Runner::from_resident(weights.denoiser(), device.clone()).await?;
+        let denoiser =
+            denoiser::Denoiser::from_resident(weights.denoiser(), device.clone()).await?;
         let video = video::Decoder::from_resident(weights.video(), device.clone()).await?;
         let audio = audio::Decoder::from_resident(weights.audio(), device.clone()).await?;
         let reserved = device.with_device(|device| {
@@ -76,7 +78,7 @@ impl<
                     .into_future(),
             )
             .map_err(io::Error::other)?;
-            runner::State::new(
+            denoiser::State::new(
                 request,
                 condition::Text {
                     plan: maximum,
@@ -89,7 +91,7 @@ impl<
             condition: conditioner.workspace_bytes()?,
             denoising: denoiser
                 .workspace_bytes(&reserved)?
-                .max(denoiser.cached_workspace_bytes(&reserved)?),
+                .max(denoiser.workspace_bytes_cached(&reserved)?),
             video: video.workspace_bytes()?,
             audio: audio.workspace_bytes()?,
         };
@@ -192,7 +194,7 @@ impl<
             .device
             .with_device(|device| block_on(prepared.upload(device)))?;
         let text = self.conditioner.prepare(plan, encoded).await?;
-        let state = Arc::new(runner::State::new(request, text)?);
+        let state = Arc::new(denoiser::State::new(request, text)?);
         Ok(Request {
             owner: Arc::clone(self),
             state,
@@ -224,7 +226,7 @@ impl<
 /// for a step prevents concurrent solver steps from using the same request through this API.
 pub(super) struct Request<const N: usize, R: AxisName, K: AxisName, T: AxisName, A, V> {
     owner: Arc<Pipeline<N, R, K, T, A, V>>,
-    state: Arc<runner::State<R, K, T, A, V>>,
+    state: Arc<denoiser::State<R, K, T, A, V>>,
     _lease: tokio::sync::OwnedMutexGuard<()>,
 }
 
@@ -233,7 +235,7 @@ pub(super) struct Request<const N: usize, R: AxisName, K: AxisName, T: AxisName,
 /// The serving adapter retains only its current memo and retires it before preparing another.
 pub(super) struct Retained<const N: usize, R: AxisName, K: AxisName, T: AxisName, A, V> {
     owner: Arc<Pipeline<N, R, K, T, A, V>>,
-    state: Arc<runner::State<R, K, T, A, V>>,
+    state: Arc<denoiser::State<R, K, T, A, V>>,
 }
 
 impl<
@@ -277,12 +279,12 @@ impl<
         Retained { owner, state }
     }
 
-    pub(super) async fn step(
+    pub(super) async fn forward(
         &mut self,
-        times: runner::Times,
-        video: runner::Video<V>,
-        audio: runner::Audio<A>,
-    ) -> io::Result<(runner::Video<V>, runner::Audio<A>)> {
+        times: denoiser::Times,
+        video: denoiser::Video<V>,
+        audio: denoiser::Audio<A>,
+    ) -> io::Result<(denoiser::Video<V>, denoiser::Audio<A>)> {
         self.owner
             .denoiser
             .forward(Arc::clone(&self.state), times, video, audio)
@@ -291,17 +293,17 @@ impl<
 
     /// The cache owns only completed rows. The framework supplies its policy after the probe;
     /// caller ownership and admission remain identical to ordinary denoising.
-    pub(super) async fn cached_step<
+    pub(super) async fn forward_cached<
         F: FnMut(Option<cache::Statistics>) -> io::Result<bool> + Send,
     >(
         &mut self,
-        times: runner::Times,
-        video: runner::Video<V>,
-        audio: runner::Audio<A>,
+        times: denoiser::Times,
+        video: denoiser::Video<V>,
+        audio: denoiser::Audio<A>,
         previous: Option<Arc<cache::Retained<R>>>,
         decide: F,
     ) -> io::Result<(
-        (runner::Video<V>, runner::Audio<A>),
+        (denoiser::Video<V>, denoiser::Audio<A>),
         Arc<cache::Retained<R>>,
     )> {
         self.owner

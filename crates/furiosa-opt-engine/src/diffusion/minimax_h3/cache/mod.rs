@@ -1,9 +1,9 @@
 //! Request-owned TeaCache rows beside the original separately launched denoiser stages.
 
 use super::{
+    denoiser::{self, Denoiser, TimeBuffer},
     flight::Flight,
     kernel as stage, request,
-    runner::{self, Runner},
 };
 use furiosa_opt_models::models::diffusion::minimax_h3::embeddings::{Chips, Width};
 use furiosa_opt_std::prelude::*;
@@ -56,7 +56,7 @@ impl Statistics {
     }
 }
 
-/// Prime the cache-specific entries alongside the runner's common denoising entries.
+/// Prime the cache-specific entries alongside the denoiser's common entries.
 pub(super) fn prime<
     R: AxisName + Send + Sync,
     K: AxisName + Send + Sync,
@@ -123,20 +123,20 @@ impl<
     T: AxisName + Send + Sync,
     A: AxisName + Send + Sync,
     V: AxisName + Send + Sync,
-> Runner<R, K, T, A, V>
+> Denoiser<R, K, T, A, V>
 {
     /// Measure the same six hidden-row allocations as a first cached call: four transient
     /// rows and two retained rows. No sizing buffer is read by a numerical launch.
-    pub(super) fn cached_workspace_bytes(
+    pub(super) fn workspace_bytes_cached(
         &self,
-        state: &Arc<runner::State<R, K, T, A, V>>,
+        state: &Arc<denoiser::State<R, K, T, A, V>>,
     ) -> io::Result<usize> {
         self.device().with_device(|device| {
             super::memory::measure(device, |device| {
                 let cache = Arc::new(Retained::allocate(device)?);
-                let times = runner::Times::alloc(device).map_err(io::Error::other)?;
-                let video = runner::Video::<V>::alloc(device).map_err(io::Error::other)?;
-                let audio = runner::Audio::<A>::alloc(device).map_err(io::Error::other)?;
+                let times = denoiser::Times::alloc(device).map_err(io::Error::other)?;
+                let video = denoiser::Video::<V>::alloc(device).map_err(io::Error::other)?;
+                let audio = denoiser::Audio::<A>::alloc(device).map_err(io::Error::other)?;
                 Workspace::allocate(device, Arc::clone(state), cache, times, video, audio)
             })
         })
@@ -147,15 +147,15 @@ impl<
 /// embedding would destroy the original residual's right operand. Probe rows have their own
 /// slot; the previous probe and residual remain in `cache` until their readers finish.
 struct Workspace<R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName> {
-    state: Arc<runner::State<R, K, T, A, V>>,
+    state: Arc<denoiser::State<R, K, T, A, V>>,
     cache: Arc<Retained<R>>,
-    times: runner::Times,
-    video: runner::Video<V>,
-    audio: runner::Audio<A>,
+    times: denoiser::Times,
+    video: denoiser::Video<V>,
+    audio: denoiser::Audio<A>,
     embedded: HbmBuffer,
     hidden: [HbmBuffer; 2],
     probe: HbmBuffer,
-    time: HbmBuffer,
+    time: TimeBuffer,
     modulation: kernel::Modulations,
     totals: kernel::Totals,
     velocities: (HbmBuffer, HbmBuffer),
@@ -164,11 +164,11 @@ struct Workspace<R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName
 impl<R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName> Workspace<R, K, T, A, V> {
     fn allocate(
         device: &mut Device,
-        state: Arc<runner::State<R, K, T, A, V>>,
+        state: Arc<denoiser::State<R, K, T, A, V>>,
         cache: Arc<Retained<R>>,
-        times: runner::Times,
-        video: runner::Video<V>,
-        audio: runner::Audio<A>,
+        times: denoiser::Times,
+        video: denoiser::Video<V>,
+        audio: denoiser::Audio<A>,
     ) -> io::Result<Self> {
         let row = || {
             Hidden::<R>::alloc(device)
@@ -195,9 +195,7 @@ impl<R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName> Workspace<
             embedded,
             hidden,
             probe,
-            time: stage::EmbeddedTime::alloc(device)
-                .map_err(io::Error::other)?
-                .into_buffer(),
+            time: TimeBuffer::allocate(device)?,
             modulation,
             totals: (
                 furiosa_opt_models::ops::pointwise::sum::Total::<Chips>::alloc(device)
@@ -206,10 +204,10 @@ impl<R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName> Workspace<
                     .map_err(io::Error::other)?,
             ),
             velocities: (
-                runner::Video::<V>::alloc(device)
+                denoiser::Video::<V>::alloc(device)
                     .map_err(io::Error::other)?
                     .into_buffer(),
-                runner::Audio::<A>::alloc(device)
+                denoiser::Audio::<A>::alloc(device)
                     .map_err(io::Error::other)?
                     .into_buffer(),
             ),

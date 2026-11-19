@@ -1,9 +1,9 @@
 //! The original cache launch sequence, with accepted readers retained through completion.
 
 use super::{
-    Flight, Hidden, Retained, Runner, Statistics, Workspace, kernel, rows,
-    runner::{self, Audio, Times, Video},
-    stage,
+    Denoiser, Flight, Hidden, Retained, Statistics, Workspace,
+    denoiser::{self, Audio, BlockSlots, EmbeddingSlots, HeadSlots, Times, Video},
+    kernel, rows, stage,
 };
 use crate::Function;
 use crate::residency::block_on;
@@ -18,7 +18,7 @@ impl<
     T: AxisName + Send + Sync,
     A: AxisName + Send + Sync,
     V: AxisName + Send + Sync,
-> Runner<R, K, T, A, V>
+> Denoiser<R, K, T, A, V>
 {
     /// Invoke the host decision exactly once after the probe's readers finish. A first call
     /// always computes. The caller removes `previous` from its memo before this call: only a
@@ -27,7 +27,7 @@ impl<
         F: FnMut(Option<Statistics>) -> io::Result<bool> + Send,
     >(
         &self,
-        state: Arc<runner::State<R, K, T, A, V>>,
+        state: Arc<denoiser::State<R, K, T, A, V>>,
         previous: Option<Arc<Retained<R>>>,
         times: Times,
         video: Video<V>,
@@ -51,20 +51,20 @@ impl<
         // and two head-output records. The flight owns the cache even if this future is dropped.
         let mut flight = Flight::new(workspace, DEPTH + 10);
 
-        self.submit_embeddings(&mut flight, |work| {
-            (
-                work.state.as_ref(),
-                &work.times,
-                (&work.video, &work.audio),
-                (&work.embedded, &work.time),
-            )
+        self.submit_embeddings(&mut flight, |work| EmbeddingSlots {
+            state: work.state.as_ref(),
+            timesteps: &work.times,
+            video: &work.video,
+            audio: &work.audio,
+            output: &mut work.embedded,
+            time: &mut work.time,
         })
         .await?;
 
         let probe_done = self
             .with_first_block(|launches, first| {
                 let work = flight.held_mut();
-                let time: stage::EmbeddedTime = alias(&work.time, ..)?;
+                let time: stage::EmbeddedTime = alias(work.time.buffer(), ..)?;
                 let accepted = launches.forward_into_tracked(
                     kernel::Modulation {
                         model: &first.0.modulation.0,
@@ -149,16 +149,20 @@ impl<
 
         let final_slot = if compute {
             self.submit_blocks(&mut flight, |at, work| {
-                (
-                    work.state.as_ref(),
-                    if at == 0 {
-                        &work.embedded
-                    } else {
-                        &work.hidden[(at - 1) % 2]
-                    },
-                    &work.time,
-                    &work.hidden[at % 2],
-                )
+                let [even, odd] = &mut work.hidden;
+                let (input, output) = if at == 0 {
+                    (&work.embedded, even)
+                } else if at % 2 == 0 {
+                    (&*odd, even)
+                } else {
+                    (&*even, odd)
+                };
+                BlockSlots {
+                    state: work.state.as_ref(),
+                    input,
+                    time: &work.time,
+                    output,
+                }
             })
             .await?;
             self.device().with_device(|device| {
@@ -214,13 +218,12 @@ impl<
             Ok(())
         })?;
 
-        self.submit_heads(&mut flight, |work| {
-            (
-                work.state.as_ref(),
-                &work.hidden[final_slot],
-                &work.time,
-                (&work.velocities.0, &work.velocities.1),
-            )
+        self.submit_heads(&mut flight, |work| HeadSlots {
+            state: work.state.as_ref(),
+            input: &work.hidden[final_slot],
+            time: &work.time,
+            video: &mut work.velocities.0,
+            audio: &mut work.velocities.1,
         })
         .await?;
         let [video, audio]: [HbmBuffer; 2] = flight.finish().await?.try_into().map_err(|_| {
