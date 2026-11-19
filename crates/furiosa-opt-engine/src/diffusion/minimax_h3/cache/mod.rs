@@ -1,11 +1,13 @@
 //! Request-owned TeaCache rows beside the original separately launched denoiser stages.
 
-use super::{flight::Flight, kernel as stage, request, step};
+use super::{
+    flight::Flight,
+    kernel as stage, request,
+    runner::{self, Runner},
+};
 use furiosa_opt_models::models::diffusion::minimax_h3::embeddings::{Chips, Width};
 use furiosa_opt_std::prelude::*;
 use std::{io, marker::PhantomData, sync::Arc};
-
-use super::step::Runner;
 
 mod forward;
 mod kernel;
@@ -127,14 +129,14 @@ impl<
     /// rows and two retained rows. No sizing buffer is read by a numerical launch.
     pub(super) fn cached_workspace_bytes(
         &self,
-        state: &Arc<step::State<R, K, T, A, V>>,
+        state: &Arc<runner::State<R, K, T, A, V>>,
     ) -> io::Result<usize> {
-        self.device.with_device(|device| {
+        self.device().with_device(|device| {
             super::memory::measure(device, |device| {
                 let cache = Arc::new(Retained::allocate(device)?);
-                let times = step::Times::alloc(device).map_err(io::Error::other)?;
-                let video = step::Video::<V>::alloc(device).map_err(io::Error::other)?;
-                let audio = step::Audio::<A>::alloc(device).map_err(io::Error::other)?;
+                let times = runner::Times::alloc(device).map_err(io::Error::other)?;
+                let video = runner::Video::<V>::alloc(device).map_err(io::Error::other)?;
+                let audio = runner::Audio::<A>::alloc(device).map_err(io::Error::other)?;
                 Workspace::allocate(device, Arc::clone(state), cache, times, video, audio)
             })
         })
@@ -145,11 +147,11 @@ impl<
 /// embedding would destroy the original residual's right operand. Probe rows have their own
 /// slot; the previous probe and residual remain in `cache` until their readers finish.
 struct Workspace<R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName> {
-    state: Arc<step::State<R, K, T, A, V>>,
+    state: Arc<runner::State<R, K, T, A, V>>,
     cache: Arc<Retained<R>>,
-    times: step::Times,
-    video: step::Video<V>,
-    audio: step::Audio<A>,
+    times: runner::Times,
+    video: runner::Video<V>,
+    audio: runner::Audio<A>,
     embedded: HbmBuffer,
     hidden: [HbmBuffer; 2],
     probe: HbmBuffer,
@@ -162,11 +164,11 @@ struct Workspace<R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName
 impl<R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName> Workspace<R, K, T, A, V> {
     fn allocate(
         device: &mut Device,
-        state: Arc<step::State<R, K, T, A, V>>,
+        state: Arc<runner::State<R, K, T, A, V>>,
         cache: Arc<Retained<R>>,
-        times: step::Times,
-        video: step::Video<V>,
-        audio: step::Audio<A>,
+        times: runner::Times,
+        video: runner::Video<V>,
+        audio: runner::Audio<A>,
     ) -> io::Result<Self> {
         let row = || {
             Hidden::<R>::alloc(device)
@@ -204,10 +206,10 @@ impl<R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName> Workspace<
                     .map_err(io::Error::other)?,
             ),
             velocities: (
-                step::Video::<V>::alloc(device)
+                runner::Video::<V>::alloc(device)
                     .map_err(io::Error::other)?
                     .into_buffer(),
-                step::Audio::<A>::alloc(device)
+                runner::Audio::<A>::alloc(device)
                     .map_err(io::Error::other)?
                     .into_buffer(),
             ),

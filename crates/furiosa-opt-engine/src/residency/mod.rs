@@ -6,7 +6,7 @@ pub use context::{DeviceContext, SharedDevice};
 pub use work::{Completion, block_on};
 
 pub(crate) use cell::Cells;
-pub(crate) use resident::Resident;
+pub(crate) use resident::{Launches, Resident};
 
 mod cell;
 mod context;

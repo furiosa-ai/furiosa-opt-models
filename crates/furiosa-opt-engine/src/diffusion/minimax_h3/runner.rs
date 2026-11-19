@@ -1,12 +1,12 @@
 //! One denoiser runner for uncached and TeaCache steps, with bounded accepted work.
 
 use super::{cache, condition, flight::Flight, kernel, request, weights::Component};
-use crate::residency::{Resident, SharedDevice};
+use crate::residency::{Launches, Resident, SharedDevice};
 use furiosa_opt_models::models::diffusion::minimax_h3::{
     denoiser::{self, DEPTH, Denoiser},
     embeddings::{Chips, Latent, Patch, Width},
 };
-use furiosa_opt_models::tensor::axis::Rows;
+use furiosa_opt_models::tensor::{axis::Rows, memory::Hbm, memory::alias};
 use furiosa_opt_std::prelude::*;
 use std::{io, sync::Arc};
 
@@ -38,14 +38,29 @@ impl<R: AxisName, K: AxisName, T: AxisName, A, V> State<R, K, T, A, V> {
 
 pub(super) struct Runner<R, K, T, A, V> {
     _owner: Component<Denoiser>,
-    pub(super) embedding: Resident<denoiser::Embeddings>,
-    pub(super) blocks: [Resident<denoiser::Block>; DEPTH],
-    pub(super) heads: Resident<denoiser::Heads>,
-    pub(super) device: SharedDevice,
+    embedding: Resident<denoiser::Embeddings>,
+    blocks: [Resident<denoiser::Block>; DEPTH],
+    heads: Resident<denoiser::Heads>,
+    device: SharedDevice,
     shape: std::marker::PhantomData<(R, K, T, A, V)>,
 }
 
 type Hidden<R> = HbmTensor<bf16, Chips, m![R, Width]>;
+
+// Borrow only the selected workspace slots while the device lock is held.
+type EmbeddingSlots<'a, S, A, V> = (
+    &'a S,
+    &'a Times,
+    (&'a Video<V>, &'a Audio<A>),
+    (&'a HbmBuffer, &'a HbmBuffer),
+);
+type BlockSlots<'a, S> = (&'a S, &'a HbmBuffer, &'a HbmBuffer, &'a HbmBuffer);
+type HeadSlots<'a, S> = (
+    &'a S,
+    &'a HbmBuffer,
+    &'a HbmBuffer,
+    (&'a HbmBuffer, &'a HbmBuffer),
+);
 
 impl<
     R: AxisName + Send + Sync,
@@ -135,73 +150,33 @@ impl<
             .with_device(|device| Workspace::allocate(device, state, times, video, audio))?;
         // One embedding, DEPTH blocks and one completion retained with each of two head outputs.
         let mut flight = Flight::new(workspace, DEPTH + 3);
-        let ready = self.device.admit(&self.embedding)?.landed().await?;
-        self.device.launch(ready, |launches, model| {
-            let work = flight.held_mut();
-            let mut output: (Hidden<R>, kernel::EmbeddedTime) = (
-                furiosa_opt_models::tensor::memory::alias(&work.hidden[0], ..)?,
-                furiosa_opt_models::tensor::memory::alias(&work.time, ..)?,
-            );
-            let accepted = launches.forward_into_tracked(
-                kernel::Embed { model },
-                kernel::embed,
-                &work.state.request.inputs,
-                &mut (),
-                (
-                    &work.times,
-                    (&work.video, &work.audio),
-                    &work.state.text.rows,
-                ),
-                &mut output,
-            )?;
-            flight.submitted(accepted);
-            Ok(())
-        })?;
-        for (at, block) in self.blocks.iter().enumerate() {
-            let ready = self.device.admit(block)?.landed().await?;
-            self.device.launch(ready, |launches, model| {
-                let work = flight.held_mut();
-                let input: Hidden<R> =
-                    furiosa_opt_models::tensor::memory::alias(&work.hidden[at % 2], ..)?;
-                let time: kernel::EmbeddedTime =
-                    furiosa_opt_models::tensor::memory::alias(&work.time, ..)?;
-                let mut output: Hidden<R> =
-                    furiosa_opt_models::tensor::memory::alias(&work.hidden[(at + 1) % 2], ..)?;
-                let accepted = launches.forward_into_tracked(
-                    kernel::Block { model },
-                    kernel::block,
-                    &work.state.request.inputs,
-                    &mut (),
-                    (input, &time),
-                    &mut output,
-                )?;
-                flight.submitted(accepted);
-                Ok(())
-            })?;
-        }
-        let ready = self.device.admit(&self.heads)?.landed().await?;
-        self.device.launch(ready, |launches, model| {
-            let work = flight.held_mut();
-            let input: Hidden<R> =
-                furiosa_opt_models::tensor::memory::alias(&work.hidden[DEPTH % 2], ..)?;
-            let time: kernel::EmbeddedTime =
-                furiosa_opt_models::tensor::memory::alias(&work.time, ..)?;
-            let mut output: (Video<V>, Audio<A>) = (
-                furiosa_opt_models::tensor::memory::alias(&work.velocities.0, ..)?,
-                furiosa_opt_models::tensor::memory::alias(&work.velocities.1, ..)?,
-            );
-            let accepted = launches.forward_into_tracked(
-                kernel::Heads { model },
-                kernel::heads,
-                &work.state.request.inputs,
-                &mut (),
-                (&input, &time),
-                &mut output,
-            )?;
-            flight.accepted(output.0.into_buffer(), Arc::clone(&accepted));
-            flight.accepted(output.1.into_buffer(), accepted);
-            Ok(())
-        })?;
+        self.submit_embeddings(&mut flight, |work| {
+            (
+                work.state.as_ref(),
+                &work.times,
+                (&work.video, &work.audio),
+                (&work.hidden[0], &work.time),
+            )
+        })
+        .await?;
+        self.submit_blocks(&mut flight, |at, work| {
+            (
+                work.state.as_ref(),
+                &work.hidden[at % 2],
+                &work.time,
+                &work.hidden[(at + 1) % 2],
+            )
+        })
+        .await?;
+        self.submit_heads(&mut flight, |work| {
+            (
+                work.state.as_ref(),
+                &work.hidden[DEPTH % 2],
+                &work.time,
+                (&work.velocities.0, &work.velocities.1),
+            )
+        })
+        .await?;
         let [video, audio]: [HbmBuffer; 2] = flight
             .finish()
             .await?
@@ -211,6 +186,94 @@ impl<
             Video::try_from(video).map_err(io::Error::other)?,
             Audio::try_from(audio).map_err(io::Error::other)?,
         ))
+    }
+
+    pub(super) fn device(&self) -> &SharedDevice {
+        &self.device
+    }
+
+    pub(super) async fn submit_embeddings<W>(
+        &self,
+        flight: &mut Flight<W>,
+        slots: impl for<'a> FnOnce(&'a W) -> EmbeddingSlots<'a, State<R, K, T, A, V>, A, V>,
+    ) -> io::Result<()> {
+        let ready = self.device.admit(&self.embedding)?.landed().await?;
+        self.device.launch(ready, |launches, model| {
+            let (state, times, media, (hidden, time)) = slots(flight.held_mut());
+            let mut output: (Hidden<R>, kernel::EmbeddedTime) =
+                (alias(hidden, ..)?, alias(time, ..)?);
+            let accepted = launches.forward_into_tracked(
+                kernel::Embed { model },
+                kernel::embed,
+                &state.request.inputs,
+                &mut (),
+                (times, media, &state.text.rows),
+                &mut output,
+            )?;
+            flight.submitted(accepted);
+            Ok(())
+        })
+    }
+
+    pub(super) async fn submit_blocks<W>(
+        &self,
+        flight: &mut Flight<W>,
+        mut slots: impl for<'a> FnMut(usize, &'a W) -> BlockSlots<'a, State<R, K, T, A, V>>,
+    ) -> io::Result<()> {
+        for (at, block) in self.blocks.iter().enumerate() {
+            let ready = self.device.admit(block)?.landed().await?;
+            self.device.launch(ready, |launches, model| {
+                let (state, input, time, output) = slots(at, flight.held_mut());
+                let input: Hidden<R> = alias(input, ..)?;
+                let time: kernel::EmbeddedTime = alias(time, ..)?;
+                let mut output: Hidden<R> = alias(output, ..)?;
+                let accepted = launches.forward_into_tracked(
+                    kernel::Block { model },
+                    kernel::block,
+                    &state.request.inputs,
+                    &mut (),
+                    (input, &time),
+                    &mut output,
+                )?;
+                flight.submitted(accepted);
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn submit_heads<W>(
+        &self,
+        flight: &mut Flight<W>,
+        slots: impl for<'a> FnOnce(&'a W) -> HeadSlots<'a, State<R, K, T, A, V>>,
+    ) -> io::Result<()> {
+        let ready = self.device.admit(&self.heads)?.landed().await?;
+        self.device.launch(ready, |launches, model| {
+            let (state, input, time, (video, audio)) = slots(flight.held_mut());
+            let input: Hidden<R> = alias(input, ..)?;
+            let time: kernel::EmbeddedTime = alias(time, ..)?;
+            let mut output: (Video<V>, Audio<A>) = (alias(video, ..)?, alias(audio, ..)?);
+            let accepted = launches.forward_into_tracked(
+                kernel::Heads { model },
+                kernel::heads,
+                &state.request.inputs,
+                &mut (),
+                (&input, &time),
+                &mut output,
+            )?;
+            flight.accepted(output.0.into_buffer(), Arc::clone(&accepted));
+            flight.accepted(output.1.into_buffer(), accepted);
+            Ok(())
+        })
+    }
+
+    /// TeaCache probes the first block without exposing the runner's resident stage bindings.
+    pub(super) async fn with_first_block<O>(
+        &self,
+        call: impl for<'m, 'w> FnOnce(&mut Launches<'_>, &'m denoiser::Block<&'w Hbm>) -> io::Result<O>,
+    ) -> io::Result<O> {
+        let ready = self.device.admit(&self.blocks[0])?.landed().await?;
+        self.device.launch(ready, call)
     }
 
     /// Measure call storage beside the separately retained request state. Allocate the same

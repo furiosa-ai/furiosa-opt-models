@@ -117,7 +117,7 @@ impl Layout {
     }
 
     /// Split contiguous framework FP32 `[sequence, width]` media into `[4, R, width]`, chip
-    /// after chip. Pass the row axis of `step::Video<V>` or `step::Audio<A>` as `R`.
+    /// after chip. Pass the row axis of `runner::Video<V>` or `runner::Audio<A>` as `R`.
     /// `width` is the positive row width already established by framework shape parsing.
     /// Every padding row, including any allocation tail beyond the logical span, is exact zero.
     #[cfg(test)]

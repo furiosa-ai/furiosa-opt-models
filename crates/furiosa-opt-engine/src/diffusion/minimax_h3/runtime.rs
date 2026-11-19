@@ -4,7 +4,7 @@
 //! adapter preserves the original component boundary and delegates every numerical call to the
 //! existing core. Component views must retain an `Arc<Pipeline>` and use this same owner.
 
-use super::{audio, cache, layout::Layout, pipeline, step, text, weights};
+use super::{audio, cache, layout::Layout, pipeline, runner, text, weights};
 use crate::residency::{SharedDevice, block_on};
 use furiosa_opt_models::load::{Checkpoint, LoadError};
 use furiosa_opt_models::models::Class;
@@ -528,14 +528,14 @@ fn pinned<R: AxisName, W: AxisName>() -> io::Result<HostBuffer> {
         .map_err(io::Error::other)
 }
 
-fn upload_times(device: &SharedDevice, times: [f32; 2]) -> io::Result<step::Times> {
+fn upload_times(device: &SharedDevice, times: [f32; 2]) -> io::Result<runner::Times> {
     // Preserve the original [64,8] time table and video/audio rows 0/1; all other cells are zero.
     let mut values = vec![0.0_f32; 64 * 8];
     values[0] = times[0];
     values[8] = times[1];
     let host = HostTensor::<f32, m![{ Symbol<Rows<64>> }, 1 # 8]>::from_vec(values);
     device.with_device(|device| {
-        let mut target = step::Times::alloc(device).map_err(io::Error::other)?;
+        let mut target = runner::Times::alloc(device).map_err(io::Error::other)?;
         block_on(
             host.to_hbm(&mut device.pdma)
                 .output(&mut target)

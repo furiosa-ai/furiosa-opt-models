@@ -1,7 +1,7 @@
 //! One retained pipeline owner with exclusive, separately owned request state.
 
 use super::{
-    audio, cache, condition, condition::Conditioner, memory, request, step, text, video, weights,
+    audio, cache, condition, condition::Conditioner, memory, request, runner, text, video, weights,
 };
 use crate::residency::{SharedDevice, block_on};
 use furiosa_opt_models::models::diffusion::minimax_h3::embeddings::{Chips, Condition, Width};
@@ -18,7 +18,7 @@ pub(super) struct Pipeline<const N: usize, R, K, T: AxisName, A, V> {
     device: SharedDevice,
     encoder: text::Encoder,
     conditioner: Conditioner<N, T>,
-    denoiser: step::Runner<R, K, T, A, V>,
+    denoiser: runner::Runner<R, K, T, A, V>,
     video: video::Decoder,
     audio: audio::Decoder,
     active: Arc<tokio::sync::Mutex<()>>,
@@ -59,7 +59,7 @@ impl<
         device.upload(weights.resident())?;
         device.admit(weights.resident())?.landed().await?;
         let conditioner = Conditioner::from_resident(weights.denoiser(), device.clone()).await?;
-        let denoiser = step::Runner::from_resident(weights.denoiser(), device.clone()).await?;
+        let denoiser = runner::Runner::from_resident(weights.denoiser(), device.clone()).await?;
         let video = video::Decoder::from_resident(weights.video(), device.clone()).await?;
         let audio = audio::Decoder::from_resident(weights.audio(), device.clone()).await?;
         let reserved = device.with_device(|device| {
@@ -76,7 +76,7 @@ impl<
                     .into_future(),
             )
             .map_err(io::Error::other)?;
-            step::State::new(
+            runner::State::new(
                 request,
                 condition::Text {
                     plan: maximum,
@@ -192,7 +192,7 @@ impl<
             .device
             .with_device(|device| block_on(prepared.upload(device)))?;
         let text = self.conditioner.prepare(plan, encoded).await?;
-        let state = Arc::new(step::State::new(request, text)?);
+        let state = Arc::new(runner::State::new(request, text)?);
         Ok(Request {
             owner: Arc::clone(self),
             state,
@@ -224,7 +224,7 @@ impl<
 /// for a step prevents concurrent solver steps from using the same request through this API.
 pub(super) struct Request<const N: usize, R: AxisName, K: AxisName, T: AxisName, A, V> {
     owner: Arc<Pipeline<N, R, K, T, A, V>>,
-    state: Arc<step::State<R, K, T, A, V>>,
+    state: Arc<runner::State<R, K, T, A, V>>,
     _lease: tokio::sync::OwnedMutexGuard<()>,
 }
 
@@ -233,7 +233,7 @@ pub(super) struct Request<const N: usize, R: AxisName, K: AxisName, T: AxisName,
 /// The serving adapter retains only its current memo and retires it before preparing another.
 pub(super) struct Retained<const N: usize, R: AxisName, K: AxisName, T: AxisName, A, V> {
     owner: Arc<Pipeline<N, R, K, T, A, V>>,
-    state: Arc<step::State<R, K, T, A, V>>,
+    state: Arc<runner::State<R, K, T, A, V>>,
 }
 
 impl<
@@ -279,10 +279,10 @@ impl<
 
     pub(super) async fn step(
         &mut self,
-        times: step::Times,
-        video: step::Video<V>,
-        audio: step::Audio<A>,
-    ) -> io::Result<(step::Video<V>, step::Audio<A>)> {
+        times: runner::Times,
+        video: runner::Video<V>,
+        audio: runner::Audio<A>,
+    ) -> io::Result<(runner::Video<V>, runner::Audio<A>)> {
         self.owner
             .denoiser
             .forward(Arc::clone(&self.state), times, video, audio)
@@ -295,12 +295,15 @@ impl<
         F: FnMut(Option<cache::Statistics>) -> io::Result<bool> + Send,
     >(
         &mut self,
-        times: step::Times,
-        video: step::Video<V>,
-        audio: step::Audio<A>,
+        times: runner::Times,
+        video: runner::Video<V>,
+        audio: runner::Audio<A>,
         previous: Option<Arc<cache::Retained<R>>>,
         decide: F,
-    ) -> io::Result<((step::Video<V>, step::Audio<A>), Arc<cache::Retained<R>>)> {
+    ) -> io::Result<(
+        (runner::Video<V>, runner::Audio<A>),
+        Arc<cache::Retained<R>>,
+    )> {
         self.owner
             .denoiser
             .forward_cached(
