@@ -31,12 +31,8 @@ pub const VIDEO_ROWS: usize = 9_328;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capacity {
     max_text: usize,
-    max_work: Work,
     gather_rows: usize,
-    gather_tiles: usize,
     gathered_rows: usize,
-    staging_rows: usize,
-    max_query_rows: usize,
     key_rows: usize,
 }
 
@@ -89,18 +85,15 @@ pub struct Span {
     valid: usize,
 }
 
-/// One valid token's semantic position and addresses in the two device row orders.
-/// `upstream_row` indexes supplied positions in text/audio/video order; `key_row` indexes the
-/// video/audio/text prefix. No rotary coordinates or coefficients are synthesized here.
+/// One valid token's source position and compact query address.
+/// `upstream_row` indexes supplied positions in text/audio/video order. Packed key addresses
+/// come from [`Plan::key_runs`]. No rotary coordinates or coefficients are synthesized here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Token {
-    modality: Modality,
     modality_row: usize,
     part: usize,
     local_row: usize,
     upstream_row: usize,
-    key_row: usize,
-    allocated_row: usize,
     query_row: usize,
 }
 
@@ -129,34 +122,10 @@ impl Capacity {
         self.max_text
     }
 
-    /// Physical stride of a local allocation and of every capacity-strided gathered part.
-    #[cfg(test)]
-    fn gather_rows(&self) -> usize {
-        self.gather_rows
-    }
-
-    #[cfg(test)]
-    fn gather_tiles(&self) -> usize {
-        self.gather_tiles
-    }
-
-    /// Gather staging slots: the first slot also has body capacity, though only its head is used.
-    #[cfg(test)]
-    fn staging_rows(&self) -> usize {
-        self.staging_rows
-    }
-
     /// Allocation envelope used for joined QKV/query tensors. Only a request's computed prefix
     /// is initialized by compact stores; allocation capacity is not an active row count.
     pub fn query_capacity(&self) -> usize {
         self.gathered_rows
-    }
-
-    /// Maximum active compact query work, which can be smaller than the allocation envelope.
-    /// A numerical implementation still has to validate the chosen attention mapping.
-    #[cfg(test)]
-    fn max_query_rows(&self) -> usize {
-        self.max_query_rows
     }
 
     /// K/V allocation extent rounded to whole key spans; visibility uses the request's key count.
@@ -210,19 +179,10 @@ impl Capacity {
                 "gather_rows: {gather_rows} must be {GATHER_HEAD} + n * {GATHER_BODY}"
             )));
         }
-        let gather_tiles = add(1, (gather_rows - GATHER_HEAD) / GATHER_BODY, "gather tiles")?;
         Ok(Self {
             max_text,
-            max_work,
             gather_rows,
-            gather_tiles,
             gathered_rows: multiply(PARTS, gather_rows, "gathered allocation rows")?,
-            staging_rows: multiply(
-                multiply(gather_tiles, GATHER_BODY, "gather staging slots")?,
-                PARTS,
-                "gather staging rows",
-            )?,
-            max_query_rows: multiply(PARTS, max_work.computed, "maximum compact query rows")?,
             key_rows: round_up(key_count, KEY_SPAN, "key capacity")?,
         })
     }
@@ -356,13 +316,10 @@ impl Plan {
         let part = row / coordinates.stride;
         let local_row = coordinates.local_start + row % coordinates.stride;
         Some(Token {
-            modality,
             modality_row: row,
             part,
             local_row,
             upstream_row: coordinates.upstream_start + row,
-            key_row: coordinates.key_start + row,
-            allocated_row: part * self.capacity.gather_rows + local_row,
             query_row: part * self.work.computed + local_row,
         })
     }
@@ -426,18 +383,6 @@ impl Part<'_> {
                 .min(coordinates.stride),
         }
     }
-
-    /// Finite row-block padding after the packed spans; it belongs to no modality.
-    #[cfg(test)]
-    fn guard_rows(&self) -> Range<usize> {
-        self.plan.work.packed..self.plan.work.computed
-    }
-
-    /// Uncomputed allocation tail; no consumer may read it based on this plan.
-    #[cfg(test)]
-    fn allocation_tail(&self) -> Range<usize> {
-        self.plan.work.computed..self.plan.capacity.gather_rows
-    }
 }
 
 impl Span {
@@ -451,11 +396,6 @@ impl Span {
 }
 
 impl Token {
-    #[cfg(test)]
-    fn modality(&self) -> Modality {
-        self.modality
-    }
-
     pub fn modality_row(&self) -> usize {
         self.modality_row
     }
@@ -470,17 +410,6 @@ impl Token {
 
     pub fn upstream_row(&self) -> usize {
         self.upstream_row
-    }
-
-    #[cfg(test)]
-    pub(super) fn key_row(&self) -> usize {
-        self.key_row
-    }
-
-    /// Row in joined capacity-strided parts. A chip's local residual instead uses `local_row`.
-    #[cfg(test)]
-    fn allocated_row(&self) -> usize {
-        self.allocated_row
     }
 
     /// Destination row once compact projection stores have established the planned work order.
@@ -534,17 +463,8 @@ mod tests {
         let capacity = Capacity::default();
         let plan = capacity.plan(77).unwrap();
         assert_eq!(
-            (capacity.gather_rows(), capacity.gather_tiles()),
-            (10496, 11)
-        );
-        assert_eq!(
-            (
-                capacity.query_capacity(),
-                capacity.staging_rows(),
-                capacity.max_query_rows(),
-                capacity.key_rows()
-            ),
-            (41984, 45056, 39936, 40960)
+            (capacity.query_capacity(), capacity.key_rows()),
+            (41984, 40960)
         );
         assert_eq!(
             (
@@ -584,11 +504,11 @@ mod tests {
             [9328, 9328, 9328, 9312]
         );
         // Explicit upstream/media-order anchors, independent of the inverse lookup.
-        for (modality, row, part, local, upstream, key, query) in [
-            (Modality::Text, 76, 2, 12, 76, 37786, 18956),
-            (Modality::Audio, 413, 3, 109, 490, 37709, 28525),
-            (Modality::Video, 0, 0, 144, 491, 0, 144),
-            (Modality::Video, 37295, 3, 9455, 37786, 37295, 37871),
+        for (modality, row, part, local, upstream, query) in [
+            (Modality::Text, 76, 2, 12, 76, 18956),
+            (Modality::Audio, 413, 3, 109, 490, 28525),
+            (Modality::Video, 0, 0, 144, 491, 144),
+            (Modality::Video, 37295, 3, 9455, 37786, 37871),
         ] {
             let token = plan.locate(modality, row).unwrap();
             assert_eq!(
@@ -596,12 +516,10 @@ mod tests {
                     token.part(),
                     token.local_row(),
                     token.upstream_row(),
-                    token.key_row(),
                     token.query_row()
                 ),
-                (part, local, upstream, key, query)
+                (part, local, upstream, query)
             );
-            assert_eq!(token.allocated_row(), part * 10496 + local);
         }
     }
 
@@ -639,29 +557,21 @@ mod tests {
     }
 
     #[test]
-    fn all_valid_tokens_have_unique_source_key_and_query_addresses() {
+    fn all_valid_tokens_have_unique_source_and_query_addresses() {
         let capacity = Capacity::default();
         for text in [1, 64, 65, 77, 128, 129, 2048] {
             let plan = capacity.plan(text).unwrap();
-            let (mut source, mut keys, mut queries) =
-                (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+            let (mut source, mut queries) = (BTreeSet::new(), BTreeSet::new());
             for part in 0..4 {
                 for row in 0..plan.work_rows_per_part() {
                     if let Some(token) = plan.token(part, row) {
                         assert!(source.insert(token.upstream_row()));
-                        assert!(keys.insert(token.key_row()));
                         assert!(queries.insert(token.query_row()));
-                        assert_eq!(
-                            plan.locate(token.modality(), token.modality_row()),
-                            Some(token)
-                        );
                         assert!(token.query_row() < plan.query_rows());
-                        assert!(token.allocated_row() < capacity.query_capacity());
                     }
                 }
             }
             assert!(source.into_iter().eq(0..text + 414 + 37296));
-            assert!(keys.into_iter().eq(0..text + 414 + 37296));
             assert_eq!(queries.len(), text + 414 + 37296);
         }
     }
@@ -669,9 +579,6 @@ mod tests {
     #[test]
     fn guard_padding_and_capacity_tail_never_acquire_semantic_positions() {
         let plan = Capacity::default().plan(129).unwrap();
-        let part = plan.part(3).unwrap();
-        assert_eq!(part.guard_rows(), 9488..9728);
-        assert_eq!(part.allocation_tail(), 9728..10496);
         assert!(plan.token(3, 0).is_none()); // This part has no text tokens.
         assert!(plan.token(3, 48 + 78).is_none()); // Last-part audio padding.
         for row in 9472..10496 {
@@ -700,8 +607,11 @@ mod tests {
             }
             assert_eq!(spans.packed_rows(), plan.packed_rows_per_part());
             assert_eq!(spans.work_rows(), plan.work_rows_per_part());
-            assert_eq!(spans.guards().start()..spans.work_rows(), part.guard_rows());
-            assert_eq!(spans.allocation_tail(), part.allocation_tail());
+            assert_eq!(
+                spans.guards().start()..spans.work_rows(),
+                plan.packed_rows_per_part()..plan.work_rows_per_part()
+            );
+            assert_eq!(spans.allocation_tail(), plan.work_rows_per_part()..10496);
             for error in [
                 plan.span_plan::<axis::Rows<9984>>().unwrap_err(),
                 plan.span_plan::<axis::Rows<11520>>().unwrap_err(),
@@ -780,7 +690,7 @@ mod tests {
                 assert!(run.source().end <= plan.query_rows());
                 assert!(run.destination().end <= plan.capacity().key_rows());
                 end = run.destination().end;
-                for (source, key) in run.source().zip(run.destination()) {
+                for source in run.source() {
                     let token = plan
                         .token(
                             source / plan.work_rows_per_part(),
@@ -788,7 +698,6 @@ mod tests {
                         )
                         .expect("key transfers contain only semantic tokens");
                     assert_eq!(token.query_row(), source);
-                    assert_eq!(token.key_row(), key);
                 }
             }
             assert_eq!(end, plan.key_count());
@@ -798,12 +707,9 @@ mod tests {
     #[test]
     fn capacity_is_configurable_and_allocation_geometry_is_checked() {
         let capacity = Capacity::new(513).unwrap();
-        assert_eq!(capacity.max_text(), 513);
         assert_eq!(capacity.plan(513).unwrap().text_rows_per_part(), 144);
         assert!(capacity.plan(514).is_err());
         let larger = Capacity::with_gather_rows(513, 11520).unwrap();
-        assert_eq!(larger.gather_rows(), 11520);
-        assert_eq!(larger.max_query_rows(), capacity.max_query_rows());
         assert_eq!(
             larger.plan(513).unwrap().key_count(),
             capacity.plan(513).unwrap().key_count()

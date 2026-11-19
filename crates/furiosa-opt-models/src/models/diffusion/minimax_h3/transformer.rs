@@ -223,7 +223,7 @@ impl<W: AxisName> AxisName for Heads<W> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_memory::{Host, IMAGES, Image, Leaf};
+    use super::super::embeddings::tests::{Host, IMAGES, Image, Leaf};
     use super::*;
     use crate::load::{Checkpoint, Context, Load, LoadError};
     use crate::tensor::memory::residency::{Leaves, Path, Residency, Visit};

@@ -188,16 +188,90 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::test_memory::{Host, IMAGES, Image, Leaf};
+pub(super) mod tests {
     use super::*;
-    use crate::load::{Checkpoint, Context, LoadError};
+    use crate::load::{Checkpoint, Context, Load, LoadError};
     use crate::ops::index::packed::Timestep;
+    use crate::tensor::memory::Memory;
     use crate::tensor::memory::residency::{Leaves, Path, Visit};
     use safetensors::Dtype;
+    use std::cell::RefCell;
     use std::convert::Infallible;
     use std::marker::PhantomData;
     use std::sync::Arc;
+
+    pub(in super::super) struct Host;
+
+    pub(in super::super) struct Leaf<D, C, S> {
+        pub(in super::super) bytes: Arc<[u8]>,
+        pub(in super::super) shape: PhantomData<(D, C, S)>,
+    }
+
+    #[derive(Clone)]
+    pub(in super::super) struct Image {
+        pub(in super::super) path: String,
+        pub(in super::super) bytes: Vec<u8>,
+        pub(in super::super) chips: usize,
+        pub(in super::super) elements: usize,
+    }
+
+    thread_local! {
+        pub(in super::super) static IMAGES: RefCell<Vec<Image>> = const { RefCell::new(Vec::new()) };
+    }
+
+    impl Memory for Host {
+        type Tensor<D: MaterializableScalar, C: M + 'static, S: M + 'static> = Leaf<D, C, S>;
+    }
+
+    impl<D: MaterializableScalar, C: M + 'static, S: M + 'static, E: M> Load<HostTensor<D, E>>
+        for Leaf<D, C, S>
+    {
+        fn load(cx: &mut Context<'_>, host: HostTensor<D, E>) -> Result<Self, LoadError> {
+            assert_eq!(E::SIZE, C::SIZE * S::SIZE);
+            let bytes = D::to_buf(&host.into_vec());
+            IMAGES.with_borrow_mut(|images| {
+                images.push(Image {
+                    path: cx.path(),
+                    // A capture must not add an owner to the leaf's residency storage.
+                    bytes: bytes.clone(),
+                    chips: C::SIZE,
+                    elements: S::SIZE,
+                })
+            });
+            Ok(Self {
+                bytes: bytes.into(),
+                shape: PhantomData,
+            })
+        }
+    }
+
+    impl<'a, D: MaterializableScalar, C: M + 'static, S: M + 'static> Load<&'a Checkpoint>
+        for Leaf<D, C, S>
+    {
+        fn load(cx: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
+            cx.checkpoint(from, |cx| {
+                let host = from.host::<D, S, m![{ C }, { S }]>(cx)?;
+                Self::load(cx, host)
+            })
+        }
+    }
+
+    impl<'a, D, C, S> Load<&'a Leaf<D, C, S>> for &'a Leaf<D, C, S> {
+        fn load(_: &mut Context<'_>, leaf: &'a Leaf<D, C, S>) -> Result<Self, LoadError> {
+            Ok(leaf)
+        }
+    }
+
+    impl<'a, D: MaterializableScalar, C: M + 'static, S: M + 'static, E: M>
+        Load<&'a dyn Fn() -> Result<HostTensor<D, E>, LoadError>> for Leaf<D, C, S>
+    {
+        fn load(
+            cx: &mut Context<'_>,
+            read: &'a dyn Fn() -> Result<HostTensor<D, E>, LoadError>,
+        ) -> Result<Self, LoadError> {
+            Self::load(cx, read()?)
+        }
+    }
 
     axes![
         SmallCondition = 8,

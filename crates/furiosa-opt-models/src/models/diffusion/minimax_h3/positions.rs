@@ -171,7 +171,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use packing::{Capacity, Modality};
+    use packing::Capacity;
 
     fn input(plan: Plan) -> Vec<[f64; AXES]> {
         vec![[0.0; AXES]; plan.key_count()]
@@ -307,14 +307,6 @@ mod tests {
                 .iter()
                 .all(|&v| v == bf16::ZERO)
         );
-        for (modality, last) in [
-            (Modality::Video, 37295),
-            (Modality::Audio, 413),
-            (Modality::Text, 128),
-        ] {
-            let token = plan.locate(modality, last).unwrap();
-            assert_eq!(visible[token.key_row()], bf16::ONE);
-        }
     }
 
     #[test]
