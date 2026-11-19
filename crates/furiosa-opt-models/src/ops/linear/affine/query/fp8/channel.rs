@@ -128,25 +128,35 @@ impl<Hidden: AxisName, G: Group> Period<Hidden, G> {
         operand: &Operand<Hidden, G>,
         prefetch: impl FnOnce(&mut Device),
     ) -> Output<G, Heads, Head, Spread, Local> {
-        let scale: DmTensor<
-            bf16,
-            Chip,
-            Cluster<Heads>,
-            Reduced<G, Heads, Spread>,
-            m![{ Local }, Head],
-        > = {
-            let mut scale = DmTensor::new();
-            projection
-                .scale
-                .view()
-                .slice_tile::<m![Hidden / 64], 1, m![
-                    Heads % (Heads / 2) / (Heads / 4),
-                    Heads % (Heads / 4) / (Heads / 8), Hidden / 64 = 1 # 64
-                ]>(0)
-                .to_dm_view(&mut device.tdma, scale.view_mut());
-            scale
-        };
+        let scale = self.channels(device, projection);
         prefetch(device);
+        self.project_ready(device, projection, operand, scale)
+    }
+
+    pub(crate) fn channels<Heads: AxisName, Head: AxisName, Spread: M, Local: M>(
+        &self,
+        device: &mut Device,
+        projection: &Prepared<Hidden, Heads, Head>,
+    ) -> DmTensor<bf16, Chip, Cluster<Heads>, Reduced<G, Heads, Spread>, m![{ Local }, Head]> {
+        let mut scale = DmTensor::new();
+        projection
+            .scale
+            .view()
+            .slice_tile::<m![Hidden / 64], 1, m![
+                Heads % (Heads / 2) / (Heads / 4),
+                Heads % (Heads / 4) / (Heads / 8), Hidden / 64 = 1 # 64
+            ]>(0)
+            .to_dm_view(&mut device.tdma, scale.view_mut());
+        scale
+    }
+
+    pub(crate) fn project_ready<Heads: AxisName, Head: AxisName, Spread: M, Local: M>(
+        &self,
+        device: &mut Device,
+        projection: &Prepared<Hidden, Heads, Head>,
+        operand: &Operand<Hidden, G>,
+        scale: DmTensor<bf16, Chip, Cluster<Heads>, Reduced<G, Heads, Spread>, m![{ Local }, Head]>,
+    ) -> Output<G, Heads, Head, Spread, Local> {
         // SAFETY: the two head-owner digits name the same four physical owners for Q, K and V.
         // Only their labels change; input features and the local output order are untouched.
         let weight = unsafe {

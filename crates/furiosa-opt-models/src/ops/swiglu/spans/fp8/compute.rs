@@ -120,6 +120,7 @@ impl<'t, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: Axi
             false,
             (
                 |context, normalized, _| InputScales.forward(context, normalized),
+                false,
                 |_| (),
             ),
         )
@@ -145,8 +146,9 @@ pub(super) fn forward<
     first: GateUp<Hidden, Intermediate>,
     normalized: Live<&Owned<Hidden, Rows>, Capacity>,
     compact: bool,
-    (scales, before_final_slab): (
+    (scales, early_gate, before_final_slab): (
         impl FnOnce(&mut Device, &Owned<Hidden, Rows>, usize) -> HbmTensor<D, Chip, m![Rows]>,
+        bool,
         impl FnOnce(&mut Device) -> P,
     ),
 ) -> (
@@ -206,13 +208,12 @@ pub(super) fn forward<
         }
         quantized
     };
-    let channels = |context: &mut Device, term: usize| -> ChannelScale<Intermediate, Rows> {
-        let channels: Channels<Intermediate, Rows, S> = weights
+    let channels = |context: &mut Device, term: usize| -> Channels<Intermediate, Rows, S> {
+        weights
             .1
             .view()
             .tile::<m![Term], 1, m![Term = 1 # 2, Intermediate]>(term)
-            .to_dm(&mut context.tdma);
-        FetchChannels.forward(&mut *context, &channels)
+            .to_dm(&mut context.tdma)
     };
     let panel = |context: &mut Device, term: usize| -> Panel<Hidden, Intermediate> {
         weights
@@ -255,19 +256,27 @@ pub(super) fn forward<
     let mut b2: Both<Intermediate, Rows> = DmTensor::new();
     let l = sweep.forward(&mut *context, (&quantized, &third, &mut b2, (2, l), waves));
     let sums = add(context, (&sums, &b2));
+    let mut gate_channels = Channels::new();
+    if early_gate {
+        gate_channels = channels(context, 0);
+    }
     let prefetched = before_final_slab(context);
     let mut b3: Both<Intermediate, Rows> = DmTensor::new();
     let l = sweep.forward(
         &mut *context,
         (&quantized, &g3, (&mut b3, 0), (3, l), waves),
     );
-    let channel = channels(context, 0);
+    if !early_gate {
+        gate_channels = channels(context, 0);
+    }
+    let channel = FetchChannels.forward(&mut *context, &gate_channels);
     let gate = Combine.forward(&mut *context, ((&sums, &b3, 0), (&scale, &channel), rows));
     sweep.forward(
         &mut *context,
         (&quantized, &u3, (&mut b3, 1), (3, l), waves),
     );
-    let channel = channels(context, 1);
+    let up_channels = channels(context, 1);
+    let channel = FetchChannels.forward(&mut *context, &up_channels);
     let up = Combine.forward(&mut *context, ((&sums, &b3, 1), (&scale, &channel), rows));
     ((gate, up), prefetched)
 }

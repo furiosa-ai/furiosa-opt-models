@@ -148,7 +148,7 @@ impl<'a, H: AxisName, I: AxisName, R: AxisName, C: AxisName>
         device: &mut Device,
         (first, normalized): (GateUp<H, I>, Live<&'a Owned<H, R>, C>),
     ) -> Self::Output {
-        gate_up(device, self, first, normalized, |_| ()).0
+        gate_up(device, self, first, normalized, false, |_| ()).0
     }
 }
 
@@ -159,6 +159,7 @@ pub(crate) fn gate_up<H: AxisName, I: AxisName, R: AxisName, C: AxisName, P>(
     weights: &GateUpWeights<H, I>,
     first: GateUp<H, I>,
     normalized: Live<&Owned<H, R>, C>,
+    early_gate: bool,
     before_final_slab: impl FnOnce(&mut Device) -> P,
 ) -> ((Projection<I, R>, Projection<I, R>), P) {
     let scales = input_scales(device, normalized.value(), normalized.rows());
@@ -168,7 +169,7 @@ pub(crate) fn gate_up<H: AxisName, I: AxisName, R: AxisName, C: AxisName, P>(
         first,
         normalized,
         true,
-        (|_, _, _| scales, before_final_slab),
+        (|_, _, _| scales, early_gate, before_final_slab),
     )
 }
 
@@ -198,6 +199,7 @@ pub struct Staging<I: AxisName, R: AxisName> {
     scales: TokenScales<I, R>,
     stored_scales: StoredTokens<I, R>,
     resident_scales: bool,
+    early_down: bool,
 }
 
 impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName>
@@ -252,6 +254,7 @@ impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName>
             },
             stored_scales,
             resident_scales,
+            early_down: decode && rows <= 8,
         }
     }
 }
@@ -286,6 +289,7 @@ pub(crate) fn project_down<H: AxisName, I: AxisName, R: AxisName, C: AxisName, F
         scales,
         stored_scales,
         resident_scales,
+        early_down,
     } = staging.into_value();
     let row = if resident_scales {
         down_scale_rows::<H, I, R>(device, &scales, rows)
@@ -305,6 +309,7 @@ pub(crate) fn project_down<H: AxisName, I: AxisName, R: AxisName, C: AxisName, F
         device,
         first,
         rows,
+        early_down,
         (
             |device, panel| load_product(device, [&p0, &p1, &p2][panel], rows),
             (|_| second, |device| down::<H, I, 64>(device, weights, 2)),

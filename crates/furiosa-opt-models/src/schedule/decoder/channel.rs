@@ -149,13 +149,22 @@ fn start(
         );
         let period = qkv::Period::quantize(device, &input, groups);
         let operand = period.fill(device);
+        let early = last_span && short_decode(call);
+        let mut key_channels = DmTensor::new();
         let q: query::Queries<Tiles<1>, QueryHeads<S>, Head> =
             period.project_with_prefetch(device, &front.query, &operand, |device| {
                 if last_span {
+                    if early {
+                        key_channels = period.channels(device, &front.key);
+                    }
                     output.forward(device, (), &mut (), &mut *projecting);
                 }
             });
-        let k: query::Pairs<Tiles<1>, KvHeads, Head> = period.project(device, &front.key, &operand);
+        if !early {
+            key_channels = period.channels(device, &front.key);
+        }
+        let k: query::Pairs<Tiles<1>, KvHeads, Head> =
+            period.project_ready(device, &front.key, &operand, key_channels);
         let v: query::Pairs<Tiles<1>, KvHeads, Head> =
             period.project(device, &front.value, &operand);
         store(
@@ -202,9 +211,10 @@ fn end(
     let attended = sum.forward(&mut *device, (), &mut (), (&input, &projected));
     let normalized = gain.normalize_span(device, &attended, short_decode(call));
     let rows = tile.with(normalized.value());
-    let (projected, second) = mlp::gate_up(device, gate_up, ahead, rows, |device| {
-        mlp::down::<_, _, 64>(device, down, 1)
-    });
+    let (projected, second) =
+        mlp::gate_up(device, gate_up, ahead, rows, short_decode(call), |device| {
+            mlp::down::<_, _, 64>(device, down, 1)
+        });
     // Pure item launches retain product scales in DM at any span size. The MLP also
     // retains them for spans of at most 256 rows, including prompt and mixed launches.
     let decode = call.context.0.read.items().rows() == call.live.rows();
