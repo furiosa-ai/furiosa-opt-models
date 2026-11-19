@@ -6,10 +6,11 @@ use crate::ops::index::packed::{self, Join, Packed, Table};
 use crate::ops::normalization::adaptive::blocks::{Block, Part};
 use crate::ops::normalization::adaptive::rows;
 use crate::tensor::image::{Rows, Vector};
+use crate::tensor::memory::residency::Residency;
 use furiosa_opt_std::prelude::*;
 
 /// Add a residual multiplied by a broadcast scalar or per-channel gate.
-#[derive(Default, DeviceSend, Load)]
+#[derive(Default, DeviceSend, Load, Residency)]
 pub struct Add;
 
 impl<W: AxisName, R: AxisName> Op<(&Rows<W, R>, &Rows<W, R>, &Vector<W>)> for Add {
@@ -89,11 +90,35 @@ impl<T: AxisName, A: AxisName, V: AxisName, W: AxisName, X: M>
             &Table<W, X>,
         ),
     ) {
-        // Each span's strips before its first whole block, its whole blocks, then its strips after;
-        // strips are 64 rows when every span comes in them, else 16.
         let plan = const {
             Block::<Packed<T, A, V>>::plan(Join::spans::<T, A, V>(), Packed::<T, A, V>::STRIP)
         };
+        if const { Packed::<T, A, V>::STRIP == 64 } {
+            self.apply_spans::<Packed<T, A, V>, W, X, 64>(
+                device, input, branch, output, gate, plan,
+            );
+        } else {
+            self.apply_spans::<Packed<T, A, V>, W, X, 16>(
+                device, input, branch, output, gate, plan,
+            );
+        }
+    }
+}
+
+impl Add {
+    /// Execute a prepartitioned plan with the same block and strip arithmetic as static packing.
+    pub(crate) fn apply_spans<R: AxisName, W: AxisName, X: M, const EDGE: usize>(
+        &self,
+        device: &mut Device,
+        input: &packed::Rows<R, W, X>,
+        branch: &packed::Rows<R, W, X>,
+        output: &mut packed::Rows<R, W, X>,
+        gate: &Table<W, X>,
+        plan: [[(usize, usize, usize); 3]; 3],
+    ) {
+        const {
+            assert!(EDGE == 16 || EDGE == 64);
+        }
         #[unroll]
         for span in 0..3 {
             #[unroll]
@@ -101,48 +126,42 @@ impl<T: AxisName, A: AxisName, V: AxisName, W: AxisName, X: M>
                 let (first, count, index) = plan[span][region];
                 if count > 0 {
                     if region == 1 {
-                        type R<T, A, V> = Packed<T, A, V>;
-                        type B<T, A, V> = Block<R<T, A, V>>;
-                        let gate = B::<T, A, V>::new()
-                            .forward(&mut *device, B::<T, A, V>::row(gate, index));
+                        let gate =
+                            Block::<R>::new().forward(&mut *device, Block::<R>::row(gate, index));
                         let last = first + count - 1;
-                        let mut current: (
-                            Part<bf16, R<T, A, V>, W, X>,
-                            Part<bf16, R<T, A, V>, W, X>,
-                        ) = (DmTensor::new(), DmTensor::new());
-                        let mut next: (Part<bf16, R<T, A, V>, W, X>, Part<bf16, R<T, A, V>, W, X>) =
+                        let mut current: (Part<bf16, R, W, X>, Part<bf16, R, W, X>) =
                             (DmTensor::new(), DmTensor::new());
-                        let (mut kept, mut held): (
-                            Part<bf16, R<T, A, V>, W, X>,
-                            Part<bf16, R<T, A, V>, W, X>,
-                        ) = (DmTensor::new(), DmTensor::new());
-                        B::<T, A, V>::new()
+                        let mut next: (Part<bf16, R, W, X>, Part<bf16, R, W, X>) =
+                            (DmTensor::new(), DmTensor::new());
+                        let (mut kept, mut held): (Part<bf16, R, W, X>, Part<bf16, R, W, X>) =
+                            (DmTensor::new(), DmTensor::new());
+                        Block::<R>::new()
                             .forward(&mut *device, ((input, branch), first, &mut current));
-                        B::<T, A, V>::new().forward(
+                        Block::<R>::new().forward(
                             &mut *device,
                             ((input, branch), (first + 1).min(last), &mut next),
                         );
                         for pair in 0..(count + 1) / 2 {
                             let at = first + 2 * pair;
-                            B::<T, A, V>::new().forward(
+                            Block::<R>::new().forward(
                                 &mut *device,
                                 ((&current.0, &current.1), &gate, &mut kept),
                             );
-                            B::<T, A, V>::new().forward(
+                            Block::<R>::new().forward(
                                 &mut *device,
                                 ((input, branch), (at + 2).min(last), &mut current),
                             );
-                            B::<T, A, V>::new().forward(&mut *device, (&kept, &mut *output, at));
-                            B::<T, A, V>::new()
+                            Block::<R>::new().forward(&mut *device, (&kept, &mut *output, at));
+                            Block::<R>::new()
                                 .forward(&mut *device, ((&next.0, &next.1), &gate, &mut held));
-                            B::<T, A, V>::new().forward(
+                            Block::<R>::new().forward(
                                 &mut *device,
                                 ((input, branch), (at + 3).min(last), &mut next),
                             );
-                            B::<T, A, V>::new()
+                            Block::<R>::new()
                                 .forward(&mut *device, (&held, &mut *output, (at + 1).min(last)));
                         }
-                    } else if const { Packed::<T, A, V>::STRIP == 64 } {
+                    } else if const { EDGE == 64 } {
                         rows::Wide::<W>::new().forward(
                             &mut *device,
                             (input, branch, &mut *output, gate, (first, count, index)),

@@ -3,11 +3,13 @@
 use super::Context;
 use crate::Module;
 use crate::load::Load;
+use crate::tensor::memory::residency::Residency;
 use furiosa_opt_std::prelude::{Device, DeviceSend};
 
 /// Attends to Q/K/V from this call only, without a cache, then projects the attended rows with
 /// `Project` (`()` leaves them); each child reads under the names its family gives it.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(Qkv, Attend, Project))]
 pub struct Full<Qkv, Attend, Project> {
     #[load(rename = "")]
     pub qkv: Qkv,

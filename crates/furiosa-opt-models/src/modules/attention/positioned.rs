@@ -5,11 +5,13 @@ use crate::Module;
 use crate::load::Load;
 use crate::modules::generic::schedule::{IntoStream, Slot, Stream};
 use crate::tensor::live::Live;
+use crate::tensor::memory::residency::Residency;
 use core::task::Poll;
 use furiosa_opt_std::prelude::{AxisName, Device, DeviceSend};
 
 /// Positions queries and keys after projection; values keep their original representation.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(Projection, Position))]
 pub struct Positioned<Projection, Position> {
     #[load(rename = "")]
     pub projection: Projection,

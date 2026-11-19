@@ -5,6 +5,7 @@ use crate::load::Load;
 use crate::ops::linear;
 use crate::specialize::attention::Strategy;
 use crate::tensor::cache::KeyValue;
+use crate::tensor::memory::residency::Residency;
 use crate::tensor::scalar::F32;
 use crate::tensor::{
     axis::{Single, Tile},
@@ -30,7 +31,8 @@ mod split;
 
 /// Scaled dot-product attention `softmax(scale * QK^T) V` over the keys each query sees, query
 /// heads grouped over key/value heads, a decode's history attended as `STRATEGY` says.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(Heads, Scale))]
 pub struct Attention<Heads = usize, Scale = f64, const STRATEGY: Strategy = { Strategy::Items }> {
     /// Query-head geometry.
     pub heads: Heads,

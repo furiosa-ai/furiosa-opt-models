@@ -4,21 +4,27 @@
 use crate::load::Load;
 use crate::ops::normalization::Chunk;
 use crate::specialize::pointwise;
+use crate::tensor::memory::residency::Residency;
 use furiosa_opt_std::prelude::*;
 use std::marker::PhantomData;
 
+pub mod abs;
 pub mod activation;
 pub mod add;
+mod arithmetic;
 pub mod cast;
 pub mod clamp;
 pub mod gated;
 pub mod guidance;
 pub mod multiply;
+mod prefix;
 pub mod rescale;
 pub mod softplus;
+pub mod subtract;
+pub mod sum;
 
 /// `silu(gate) * up` of rows packed as their gate features followed by their up features.
-#[derive(Clone, Copy, Default, DeviceSend, Load)]
+#[derive(Clone, Copy, Default, DeviceSend, Load, Residency)]
 pub struct SwiGlu;
 
 /// Flattened logical element count, independent of the input's named axes.
@@ -198,14 +204,32 @@ impl<S: M + 'static> Window<S> {
             let rhs: Rows<D, S, Chips> = unsafe { rhs.view().reshape::<Chips, m![{ Width<S> }]>() }
                 .tile::<m![{ Width<S> } / ({ Extent<S> })], 1, Batch<S>>(index)
                 .to_dm(&mut device.tdma);
-            let rhs: Registers<S, Chips> = device
-                .sub
-                .begin(rhs.view())
-                .fetch::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
-                .fetch_cast::<f32>()
-                .collect::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
-                .to_vrf();
-            let output: Rows<f32, S, Chips> = device
+            let output = Self::combine_tile::<D, MULTIPLY, Chips>(device, &lhs, &rhs);
+            output.view().to_hbm_view(
+                &mut device.tdma,
+                result
+                    .view_mut()
+                    .tile::<m![{ Width<S> } / ({ Extent<S> })], 1, BatchMut<S>>(index),
+            );
+        }
+        // SAFETY: flattening preserves the contiguous element order.
+        unsafe { result.reshape() }
+    }
+
+    /// The same elementwise arithmetic for HBM mapping and a checked-prefix window.
+    fn combine_tile<D: Float, const MULTIPLY: bool, Chips: M>(
+        device: &mut Device,
+        lhs: &Rows<D, S, Chips>,
+        rhs: &Rows<D, S, Chips>,
+    ) -> Rows<D, S, Chips> {
+        let rhs: Registers<S, Chips> = device
+            .sub
+            .begin(rhs.view())
+            .fetch::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
+            .fetch_cast::<f32>()
+            .collect::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
+            .to_vrf();
+        let output: Rows<f32, S, Chips> = device
             .main
             .begin(lhs.view())
             .fetch::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
@@ -226,15 +250,7 @@ impl<S: M + 'static> Window<S> {
             .vector_final()
             .commit_trim::<m![{ Width<S> } % 8]>()
             .commit();
-            D::narrow(device, output).view().to_hbm_view(
-                &mut device.tdma,
-                result
-                    .view_mut()
-                    .tile::<m![{ Width<S> } / ({ Extent<S> })], 1, BatchMut<S>>(index),
-            );
-        }
-        // SAFETY: flattening preserves the contiguous element order.
-        unsafe { result.reshape() }
+        D::narrow(device, output)
     }
 }
 

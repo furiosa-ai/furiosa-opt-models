@@ -6,6 +6,7 @@ use furiosa_opt_std::prelude::*;
 use super::frames::{self, Blocked, Edge, Frames, LEAD, Pads, Row, Window, Zero};
 use crate::Op;
 use crate::load::Load;
+use crate::tensor::memory::residency::Residency;
 
 axes![Term = 2];
 
@@ -54,7 +55,7 @@ impl<C: AxisName, S: Window, X: M> Op<((&Blocked<f32, C, S, X>, &Blocked<f32, C,
 
 /// `x + y`: a residual update; the result's padding rows repeat its edge samples, for the
 /// activation that follows.
-#[derive(Clone, Copy, Debug, Default, DeviceSend, Load)]
+#[derive(Clone, Copy, Debug, Default, DeviceSend, Load, Residency)]
 pub struct Sum;
 
 impl<'x, 'y, C: AxisName, S: Window, X: M> Op<(&'x Frames<f32, C, S, X>, &'y Frames<f32, C, S, X>)>
@@ -75,9 +76,24 @@ impl<'x, 'y, C: AxisName, S: Window, X: M> Op<(&'x Frames<f32, C, S, X>, &'y Fra
     }
 }
 
+/// A residual composition may lend an already borrowed input alongside its owned branch.
+impl<'x, 'a, 'y, C: AxisName, S: Window, X: M>
+    Op<(&'x &'a Frames<f32, C, S, X>, &'y Frames<f32, C, S, X>)> for Sum
+{
+    type Output = Frames<f32, C, S, X>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (x, y): (&'x &'a Frames<f32, C, S, X>, &'y Frames<f32, C, S, X>),
+    ) -> Self::Output {
+        self.forward(device, (*x, y))
+    }
+}
+
 /// The average of three parallel blocks' outputs, its padding rows prepared for `P`'s kind of
 /// consumer.
-#[derive(Clone, Copy, Debug, Default, DeviceSend, Load)]
+#[derive(Clone, Copy, Debug, Default, DeviceSend, Load, Residency)]
 pub struct Mean<P = Zero>(PhantomData<P>);
 
 impl<'x, C: AxisName, S: Window, P: Pads, X: M>

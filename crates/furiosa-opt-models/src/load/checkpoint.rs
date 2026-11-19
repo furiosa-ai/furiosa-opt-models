@@ -204,6 +204,45 @@ impl Checkpoint {
         &self.config
     }
 
+    /// Read a JSON document relative to the directory this checkpoint was opened from.
+    ///
+    /// A model family can read an original pipeline index or an architecture sidecar that is
+    /// not part of the merged configuration. The caller retains and interprets the document;
+    /// this does not merge it, read weights, or change strict tensor-name accounting.
+    /// Paths must be nonempty and root-relative, with normal components only. In-memory
+    /// checkpoints have no document directory and refuse filesystem access.
+    pub fn document(&self, relative: &Path) -> Result<serde_json::Value, LoadError> {
+        let name = relative.to_string_lossy().into_owned();
+        if relative.as_os_str().is_empty()
+            || !relative
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(LoadError::Unsupported {
+                name,
+                reason: "a checkpoint document requires a nonempty root-relative path".into(),
+            });
+        }
+        if self.directory.as_os_str().is_empty() {
+            return Err(LoadError::Unsupported {
+                name,
+                reason: "an in-memory checkpoint has no document directory".into(),
+            });
+        }
+        let invalid = |reason: String| LoadError::InvalidData {
+            name: name.clone(),
+            reason,
+        };
+        let bytes = match fs::read(self.directory.join(relative)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(LoadError::Missing(vec![name]));
+            }
+            Err(error) => return Err(invalid(error.to_string())),
+        };
+        Self::parse_config(&bytes).map_err(|error| invalid(error.to_string()))
+    }
+
     /// The id of the vocabulary entry `token` in the checkpoint's `tokenizer.json`, an added token
     /// or one of its model's.
     pub fn token(&self, token: &str) -> Result<u32, LoadError> {
@@ -852,6 +891,59 @@ pub(super) mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
         let reason = "\u{fffd}: a name not in UTF-8";
         assert!(error.to_string().ends_with(reason), "{error}");
+    }
+
+    /// Original declarations survive config merging, while sidecars stay separate from config
+    /// and tensor accounting. Document parsing follows the same numeric convention as configs.
+    #[test]
+    fn reads_original_and_sidecar_documents_without_merging() {
+        let files = tempfile::tempdir().unwrap();
+        let index = serde_json::json!({"_class_name": "P", "a": ["lib", "A"]});
+        fs::write(files.path().join("model_index.json"), index.to_string()).unwrap();
+        fs::create_dir(files.path().join("a")).unwrap();
+        fs::write(files.path().join("a/config.json"), "{\"x\": 1}").unwrap();
+        fs::write(
+            files.path().join("a/metadata.json"),
+            "{\"limit\": Infinity}",
+        )
+        .unwrap();
+        let source = Checkpoint::new(files.path(), None).unwrap();
+        assert_eq!(
+            source.document(Path::new("model_index.json")).unwrap(),
+            index
+        );
+        let metadata = source.document(Path::new("a/metadata.json")).unwrap();
+        assert_eq!(
+            metadata,
+            serde_json::from_str::<serde_json::Value>("{\"limit\": 1e9999}").unwrap()
+        );
+        assert_eq!(source.config()["a"], serde_json::json!({"x": 1}));
+        assert!(source.names().is_empty());
+
+        let error = source.document(Path::new("a/missing.json")).unwrap_err();
+        assert!(matches!(error, LoadError::Missing(names) if names == ["a/missing.json"]));
+        fs::write(files.path().join("a/metadata.json"), "{").unwrap();
+        let error = source.document(Path::new("a/metadata.json")).unwrap_err();
+        assert!(matches!(error, LoadError::InvalidData { name, .. } if name == "a/metadata.json"));
+    }
+
+    #[test]
+    fn refuses_nonrelative_documents_and_in_memory_filesystem_reads() {
+        let source = Checkpoint::default();
+        for path in [
+            "",
+            ".",
+            "../config.json",
+            "a/../config.json",
+            "/config.json",
+        ] {
+            let error = source.document(Path::new(path)).unwrap_err();
+            assert!(matches!(error, LoadError::Unsupported { reason, .. }
+                if reason.contains("root-relative")));
+        }
+        let error = source.document(Path::new("config.json")).unwrap_err();
+        assert!(matches!(error, LoadError::Unsupported { reason, .. }
+            if reason.contains("in-memory checkpoint")));
     }
 
     /// The float a JSON number's text reads as; `as_f64` has no infinite value.

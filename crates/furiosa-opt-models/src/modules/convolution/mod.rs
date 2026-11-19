@@ -7,6 +7,7 @@ use crate::ops::convolution::activation::Snake;
 use crate::ops::convolution::frames::{self, Blocked, Doubled, Frames, Phase, Window};
 use crate::ops::convolution::transpose::{ConvolutionTranspose, Half, Quad, UpBand};
 use crate::ops::convolution::{Convolution, DownBand, Lag, Lane, Reach, Split, Term};
+use crate::tensor::memory::residency::Residency;
 use crate::tensor::parallel::Chip;
 use crate::{Module, Sequential, Then};
 pub use attention::Projection;
@@ -139,8 +140,9 @@ pub type Stack<First, Layer, const REPEATS: usize> = Sequential<First, [Layer; R
 
 /// `down(snake(up(x)))` by two from checkpoint `upsample.filter`, `downsample.lowpass.filter` and
 /// `act`: `input` repeats its edge samples over its padding rows, the result's are zero.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
 #[load(tree)]
+#[residency(children(U, D, I, F))]
 pub struct AntiAliased<
     C: AxisName,
     X: M = Chip,
@@ -340,6 +342,28 @@ where
     }
 }
 
+/// Residual branches receive a reference to their input, which may already borrow its frame.
+impl<'x, 'a, D: MaterializableScalar + FetchCast<bf16>, C: AxisName, S: Doubled, X: M, U, B, I, F>
+    Module<&'x &'a Frames<D, C, S, X>, (), &mut ()> for AntiAliased<C, X, U, B, I, F>
+where
+    U: Borrow<UpBand<X>>,
+    B: Borrow<DownBand<X>>,
+    I: Borrow<HbmTensor<i32, X, m![C]>>,
+    F: Borrow<HbmTensor<f32, X, m![C]>>,
+{
+    type Output = Frames<bf16, C, S, X>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        env: (),
+        state: &mut (),
+        input: &'x &'a Frames<D, C, S, X>,
+    ) -> Self::Output {
+        self.forward(device, env, state, *input)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::Module;
@@ -359,11 +383,7 @@ mod tests {
     impl frames::Doubled for Rows {
         type Twice = Span<8000, 32, 7980>;
     }
-    type Wide = Span<1040, 8, 1035>;
-
-    impl frames::Doubled for Wide {
-        type Twice = Span<2080, 16, 2070>;
-    }
+    type Wide = crate::models::diffusion::minimax_h3::audio::Fifth;
     axes![C = 16, W = 512];
 
     /// The anti-aliasing filter every activation of the checkpoint stores.

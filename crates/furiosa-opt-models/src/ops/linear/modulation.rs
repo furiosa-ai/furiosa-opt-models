@@ -7,6 +7,7 @@ use crate::ops::index::packed::{Modality, Table, Timestep};
 use crate::ops::linear::kernel;
 use crate::ops::normalization::Shift;
 use crate::ops::pointwise::activation::Silu;
+use crate::tensor::memory::residency::Residency;
 use crate::tensor::parallel::{self, Shard};
 use furiosa_opt_std::prelude::*;
 use safetensors::Dtype;
@@ -26,7 +27,8 @@ impl<W: AxisName> AxisName for ShiftScale<W> {
 
 /// The final norm's `(shift, scale)` of timestep `TIMESTEP` (video 0, audio 1): `bf16(silu(t))`
 /// projected with an FP32 bias by `weight` and `bias`, rounded once, the shift features first.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(T, B))]
 #[load(tree)]
 pub struct HeadModulation<
     In: AxisName,
@@ -183,7 +185,8 @@ type Tables<W, Chips = m![1]> = ((Table<W, Chips>, Table<W, Chips>), Table<W, Ch
 
 /// A layer's modulation tables, `bf16(silu(t))` projected by `weight` with an FP32 `bias`: feature
 /// `modality * 6W + chunk * W + j` lies in table `chunk`, row `timestep * 3 + modality`.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(T, B))]
 #[load(tree)]
 pub struct Projection<
     In: AxisName,

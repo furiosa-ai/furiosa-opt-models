@@ -7,6 +7,7 @@ use crate::Op;
 use crate::load::Load;
 use crate::ops::normalization::{Chunk, Spread};
 use crate::ops::vector::Zip;
+use crate::tensor::memory::residency::Residency;
 use crate::tensor::{axis::Single, live::Live, scalar};
 use furiosa_opt_std::prelude::*;
 use std::num::NonZeroUsize;
@@ -24,7 +25,7 @@ impl<D: Float, S: M + 'static, Chips: M + 'static> Op<&HbmTensor<D, Chips, S>> f
 }
 
 /// Elementwise product of tensors with identical chip and element mappings.
-#[derive(Default, DeviceSend, Load)]
+#[derive(Default, DeviceSend, Load, Residency)]
 pub struct Multiply;
 
 impl<D: Float, S: M + 'static, Chips: M> Op<(&HbmTensor<D, Chips, S>, &HbmTensor<D, Chips, S>)>

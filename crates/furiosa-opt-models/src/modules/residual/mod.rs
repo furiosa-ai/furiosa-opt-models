@@ -3,6 +3,7 @@
 use crate::Module;
 use crate::load::Load;
 use crate::modules::generic::schedule::{IntoStream, RowWise, Slot, Stream};
+use crate::tensor::memory::residency::Residency;
 use core::task::Poll;
 use furiosa_opt_std::prelude::*;
 pub use merge::{Gated, Scaled, Shortcut};
@@ -10,7 +11,8 @@ pub use merge::{Gated, Scaled, Shortcut};
 mod merge;
 
 /// `x + branch(norm(x))`; state belongs to the branch, weights to the modules.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(Norm, Branch, Add))]
 pub struct Residual<Norm, Branch, Add>(pub Norm, pub Branch, pub Add);
 
 /// A composition, not an op.
@@ -122,7 +124,8 @@ where
 
 /// Lends the merge the outputs of its parts, a `Fork` of branches over one input or a pair of
 /// modules over a pair of inputs: `Sum<Fork<(A, B)>, Add>` computes `a(x) + b(x)`.
-#[derive(Clone, DeviceSend, Load)]
+#[derive(Clone, DeviceSend, Load, Residency)]
+#[residency(children(Parts, Merge))]
 pub struct Sum<Parts, Merge>(pub Parts, pub Merge);
 
 /// The state holds the parts' slot, then the merge's.

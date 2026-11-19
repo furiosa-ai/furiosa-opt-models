@@ -6,6 +6,7 @@ use crate::modules::generic::schedule::{IntoStream, RowWise, Stream};
 use crate::ops::index::gather;
 use crate::ops::normalization;
 use crate::ops::normalization::{Cluster, FeatureSlices};
+use crate::tensor::memory::residency::Residency;
 use furiosa_opt_std::prelude::*;
 use std::marker::PhantomData;
 
@@ -13,7 +14,8 @@ pub mod output;
 pub mod query;
 
 /// Projection coefficients in the device form a projection computes with.
-#[derive(Clone, DeviceSend, Load)]
+#[derive(Clone, DeviceSend, Load, Residency)]
+#[residency(children(Matrix, Offset))]
 pub struct Affine<Matrix, Offset> {
     /// Projection weights in [output, input] order, or a quantized weight/scale tuple.
     pub weight: Matrix,

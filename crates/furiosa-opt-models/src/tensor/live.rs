@@ -22,6 +22,87 @@ pub struct Live<X, R> {
     envelope: PhantomData<R>,
 }
 
+/// A zero-based prefix made of whole `B`-row blocks within capacity `R`.
+/// Its private count is bounded and aligned by construction. It describes computed work,
+/// including initialized padding; it does not identify semantically valid model tokens.
+pub struct BlockPrefix<X, R, B> {
+    value: X,
+    blocks: usize,
+    shape: PhantomData<(R, B)>,
+}
+
+impl<R: AxisName, B: AxisName> BlockPrefix<(), R, B> {
+    /// A statically known work extent inside the same allocation envelope. Invalid bounds or
+    /// alignment fail at compilation; runtime requests use the checked host count or HBM reader.
+    pub const fn fixed<Count: AxisName>() -> Self {
+        const {
+            assert!(B::SIZE > 0 && R::SIZE.is_multiple_of(B::SIZE));
+            assert!(Count::SIZE <= R::SIZE && Count::SIZE.is_multiple_of(B::SIZE));
+        }
+        Self {
+            value: (),
+            blocks: Count::SIZE / B::SIZE,
+            shape: PhantomData,
+        }
+    }
+
+    /// Check a host row count without rounding it or discarding an invalid suffix.
+    pub fn try_over(rows: usize) -> Option<Self> {
+        const {
+            assert!(B::SIZE > 0 && R::SIZE.is_multiple_of(B::SIZE));
+        }
+        (rows <= R::SIZE && rows.is_multiple_of(B::SIZE)).then(|| Self {
+            value: (),
+            blocks: rows / B::SIZE,
+            shape: PhantomData,
+        })
+    }
+
+    /// Read a bounded count of **blocks**, not rows, from HBM. The host validates the request
+    /// before upload; bounding units here preserves the type's invariant without a device panic.
+    pub fn read(count: &Value<impl M>) -> Self {
+        const {
+            assert!(B::SIZE > 0 && R::SIZE.is_multiple_of(B::SIZE));
+        }
+        Self {
+            value: (),
+            blocks: count.extent::<m![R / B]>(),
+            shape: PhantomData,
+        }
+    }
+}
+
+impl<X, R: AxisName, B: AxisName> BlockPrefix<X, R, B> {
+    pub fn value(&self) -> &X {
+        &self.value
+    }
+
+    pub fn blocks(&self) -> usize {
+        self.blocks
+    }
+
+    pub fn rows(&self) -> usize {
+        self.blocks * B::SIZE
+    }
+
+    /// The same initialized work as an ordinary live interval, always starting at zero.
+    pub fn interval(&self) -> Live<(), R> {
+        Live::first(self.rows())
+    }
+
+    pub fn with<Y>(&self, value: Y) -> BlockPrefix<Y, R, B> {
+        BlockPrefix {
+            value,
+            blocks: self.blocks,
+            shape: PhantomData,
+        }
+    }
+
+    pub fn into_value(self) -> X {
+        self.value
+    }
+}
+
 /// Written out, as a derive would ask the envelope to be `Clone` too.
 impl<X: Clone, R> Clone for Live<X, R> {
     fn clone(&self) -> Self {
@@ -35,6 +116,42 @@ impl<X: Clone, R> Clone for Live<X, R> {
 }
 
 impl<X: Copy, R> Copy for Live<X, R> {}
+
+/// Equal parts of `value`, each with the same live interval inside its `R`-row slot.
+/// The parts keep their capacity stride: their live rows need not form one contiguous prefix.
+/// `N` is the number of logical parts, independent of where their storage is placed.
+pub struct Partitioned<X, R, const N: usize> {
+    value: X,
+    interval: Live<(), R>,
+}
+
+impl<X, R: AxisName, const N: usize> Partitioned<X, R, N> {
+    /// Retain `value` and the live interval shared by its `N` parts.
+    pub fn new(value: X, interval: Live<(), R>) -> Self {
+        const { assert!(N > 0, "a partitioned value has at least one part") };
+        Self { value, interval }
+    }
+
+    /// The value in capacity-strided part order.
+    pub fn value(&self) -> &X {
+        &self.value
+    }
+
+    /// The live interval within every part's slot, not a count over the joined value.
+    pub fn interval(&self) -> Live<(), R> {
+        self.interval
+    }
+
+    /// These same parts and intervals, holding another value.
+    pub fn with<Y>(&self, value: Y) -> Partitioned<Y, R, N> {
+        Partitioned::new(value, self.interval)
+    }
+
+    /// The value without its per-part live intervals.
+    pub fn into_value(self) -> X {
+        self.value
+    }
+}
 
 impl<R: AxisName> Live<(), R> {
     /// The live rows a step's count names, at most `R`; leaves take these rows, never the count,
@@ -215,6 +332,26 @@ pub(crate) trait OnTile<D, W> {
 pub(crate) mod tests {
     use super::*;
     use crate::tensor::axis::{Eight, Sixteen, SixtyFour};
+
+    /// Block prefixes refuse nonaligned and oversized host counts instead of rounding them.
+    #[test]
+    fn checked_block_prefixes_preserve_bounds_and_units() {
+        for rows in [0, 8, 16, 56, 64] {
+            let prefix = BlockPrefix::<(), SixtyFour, Eight>::try_over(rows).unwrap();
+            assert_eq!(prefix.rows(), rows);
+            assert_eq!(prefix.blocks(), rows / 8);
+            assert_eq!(
+                (prefix.interval().start(), prefix.interval().rows()),
+                (0, rows)
+            );
+            let rows = prefix.with("rows");
+            assert_eq!(rows.value(), &"rows");
+            assert_eq!(rows.into_value(), "rows");
+        }
+        for rows in [1, 7, 9, 63, 65, usize::MAX] {
+            assert!(BlockPrefix::<(), SixtyFour, Eight>::try_over(rows).is_none());
+        }
+    }
 
     /// A step's count, to upload.
     pub(crate) fn count(value: usize) -> HostTensor<i32, m![1]> {

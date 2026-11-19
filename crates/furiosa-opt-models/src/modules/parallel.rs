@@ -4,13 +4,22 @@
 
 use crate::Module;
 use crate::load::Load;
-use crate::ops::collective::{AllGather, AllReduce, Exchange};
-use crate::tensor::parallel::{Parallel, Parallelism as Placement, Replicated};
+use crate::ops::collective::{AllGather, AllReduce, Exchange, Pieces, Whole};
+use crate::tensor::axis::Rows;
+use crate::tensor::live::{BlockPrefix, Live};
+use crate::tensor::memory::residency::Residency;
+use crate::tensor::parallel::{Parallel, Parallelism as Placement, Part, Replicated, Shard};
 use furiosa_opt_std::prelude::*;
 use std::marker::PhantomData;
 
+type ChipMap<const N: usize> = m![{ Symbol<Shard<N>> }];
+type Split<R, W, const N: usize> =
+    HbmTensor<bf16, ChipMap<N>, m![{ Symbol<Pieces<R, N>> }, { Symbol<Part<W, N>> }]>;
+type Local<R, W, const N: usize> = HbmTensor<bf16, ChipMap<N>, m![R, W]>;
+
 /// Sums chip-local partial products of the input columns into a replicated output.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(L))]
 pub struct RowParallel<L, P: Placement = Parallel<1>> {
     #[load(rename = "")]
     pub operation: L,
@@ -44,17 +53,18 @@ where
 
 /// Gathers every chip's part of the input rows onto every chip, then computes chip-local output
 /// columns of all the rows.
-#[derive(DeviceSend, Load)]
-pub struct Gathered<L, P: Placement> {
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(L))]
+pub struct Gathered<L, P: Placement, Strategy = Whole> {
     #[load(rename = "")]
     pub operation: L,
-    placement: PhantomData<P>,
+    placement: PhantomData<(P, Strategy)>,
 }
 
 /// A composition, not an op.
-impl<X, L, P: Placement> !crate::Op<&X> for Gathered<L, P> {}
+impl<X, L, P: Placement, Strategy> !crate::Op<&X> for Gathered<L, P, Strategy> {}
 
-impl<L, P: Placement> Gathered<L, P> {
+impl<L, P: Placement, Strategy> Gathered<L, P, Strategy> {
     pub const fn new(operation: L) -> Self {
         Self {
             operation,
@@ -64,7 +74,8 @@ impl<L, P: Placement> Gathered<L, P> {
 }
 
 /// Every chip already holds every row.
-impl<'x, X, E, S, L, const N: usize> Module<&'x X, E, S> for Gathered<L, Replicated<N>>
+impl<'x, X, E, S, L, const N: usize, Strategy> Module<&'x X, E, S>
+    for Gathered<L, Replicated<N>, Strategy>
 where
     L: Module<&'x X, E, S>,
 {
@@ -75,25 +86,30 @@ where
     }
 }
 
-impl<'x, X, Y, O, L, const N: usize, Env: Copy> Module<&'x X, Env, &mut ()>
-    for Gathered<L, Parallel<N>>
+impl<'x, X, Y, O, L, const N: usize, Env: Copy, Strategy> Module<&'x X, Env, &mut ()>
+    for Gathered<L, Parallel<N>, Strategy>
 where
     Parallel<N>: Placement,
-    AllGather<Parallel<N>>: for<'a, 's> Module<&'a X, Env, &'s mut (), Output = Y>,
+    AllGather<Parallel<N>, Strategy>: for<'a, 's> Module<&'a X, Env, &'s mut (), Output = Y>,
     L: for<'a, 's> Module<&'a Y, Env, &'s mut (), Output = O>,
 {
     type Output = O;
 
     fn forward(&self, device: &mut Device, env: Env, _: &mut (), input: &'x X) -> Self::Output {
-        let gathered =
-            AllGather::<Parallel<N>>::default().forward(&mut *device, env, &mut (), input);
+        let gathered = AllGather::<Parallel<N>, Strategy>::default().forward(
+            &mut *device,
+            env,
+            &mut (),
+            input,
+        );
         self.operation.forward(device, env, &mut (), &gathered)
     }
 }
 
 /// Exchanges each chip's columns of all the rows for all the columns of the chip's part of the
 /// rows, then computes the part's output rows.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(L))]
 pub struct Exchanged<L, P: Placement> {
     #[load(rename = "")]
     pub operation: L,
@@ -108,6 +124,29 @@ impl<L, P: Placement> Exchanged<L, P> {
         Self {
             operation,
             placement: PhantomData,
+        }
+    }
+}
+
+impl<L, const N: usize> Exchanged<L, Parallel<N>>
+where
+    Parallel<N>: Placement,
+{
+    /// Borrow this composition for one compiled compact exchange geometry.
+    ///
+    /// The model dispatches `S` from the checked request work: `S::SIZE` must equal the input
+    /// prefix's row count. The first `N * S::SIZE` source rows must be initialized and packed
+    /// at stride `S::SIZE`, rather than at the allocation capacity's stride. The view neither
+    /// rounds nor checks that dispatch on the device. Its Module implementation requires
+    /// positive, capacity-bounded work aligned to 256 rows at compilation.
+    ///
+    /// The exchange allocates its usual destination, then lends the same checked prefix to the
+    /// child. Environment and state pass through unchanged. The view holds no additional weight
+    /// or state; the owning composition's loading and residency names stay unchanged.
+    pub fn prefix<S: AxisName>(&self) -> ExchangedPrefix<'_, L, S, N> {
+        ExchangedPrefix {
+            operation: &self.operation,
+            work: PhantomData,
         }
     }
 }
@@ -137,5 +176,53 @@ where
         let exchanged =
             Exchange::<Parallel<N>>::default().forward(&mut *device, env, &mut (), input);
         self.operation.forward(device, env, &mut (), &exchanged)
+    }
+}
+
+/// A borrowed [`Exchanged`] call at compact work stride `S`.
+///
+/// Created by [`Exchanged::prefix`]. The input's [`BlockPrefix`] describes local work within
+/// capacity `R`; its tensor holds `N` compact parts of that work in a `Pieces<R,N>` allocation.
+/// The child's returned [`Live`] value cannot borrow the temporary exchange destination.
+pub struct ExchangedPrefix<'a, L, S, const N: usize> {
+    operation: &'a L,
+    work: PhantomData<S>,
+}
+
+impl<I, L, S, const N: usize> !crate::Op<I> for ExchangedPrefix<'_, L, S, N> {}
+
+impl<'i, 'p, R: AxisName, W: AxisName, S: AxisName, L, E, State, O, const N: usize>
+    Module<&'p BlockPrefix<&'i Split<R, W, N>, R, Rows<256>>, E, State>
+    for ExchangedPrefix<'_, L, S, N>
+where
+    Parallel<N>: Placement,
+    L: for<'x, 'v> Module<
+            &'v BlockPrefix<&'x Local<R, W, N>, R, Rows<256>>,
+            E,
+            State,
+            Output = Live<O, R>,
+        >,
+{
+    type Output = Live<O, R>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        env: E,
+        state: State,
+        input: &'p BlockPrefix<&'i Split<R, W, N>, R, Rows<256>>,
+    ) -> Self::Output {
+        const {
+            assert!(S::SIZE > 0 && S::SIZE <= R::SIZE);
+            assert!(S::SIZE.is_multiple_of(256) && R::SIZE.is_multiple_of(256));
+        }
+        let mut exchanged = Local::<R, W, N>::new();
+        Exchange::<Parallel<N>>::default().write_prefix::<bf16, S, R, W>(
+            device,
+            input.value(),
+            &mut exchanged,
+        );
+        self.operation
+            .forward(device, env, state, &input.with(&exchanged))
     }
 }

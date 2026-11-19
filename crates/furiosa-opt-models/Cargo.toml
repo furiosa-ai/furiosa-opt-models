@@ -11,6 +11,7 @@ readme = "README.md"
 [package.metadata.furiosa-opt]
 
 [dependencies]
+bytemuck = { version = "1.25.2", features = ["extern_crate_alloc"] }
 furiosa-opt-std = { workspace = true }
 furiosa-opt-models-macros = { path = "macros", version = "0.1.0" }
 futures-executor = "0.3"

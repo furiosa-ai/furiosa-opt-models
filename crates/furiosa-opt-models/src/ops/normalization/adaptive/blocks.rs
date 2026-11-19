@@ -95,32 +95,31 @@ impl<R: AxisName> Block<R> {
         spans: [(usize, usize, usize); 3],
         edge: usize,
     ) -> [[(usize, usize, usize); 3]; 3] {
-        let mut plan = [[(0, 0, 0); 3]; 3];
-        let mut span = 0;
-        while span < 3 {
-            let regions = {
-                let (first, strips, _) = spans[span];
-                let each = Self::SIZE / edge;
-                let end = first + strips;
-                let (start, stop) = (first.div_ceil(each), end / each);
-                if stop <= start {
-                    [(first, strips), (0, 0), (end, 0)]
-                } else {
-                    [
-                        (first, each * start - first),
-                        (start, stop - start),
-                        (each * stop, end - each * stop),
-                    ]
-                }
-            };
-            let mut region = 0;
-            while region < 3 {
-                plan[span][region] = (regions[region].0, regions[region].1, spans[span].2);
-                region += 1;
-            }
-            span += 1;
+        [
+            Self::span(spans[0], edge),
+            Self::span(spans[1], edge),
+            Self::span(spans[2], edge),
+        ]
+    }
+
+    // Construct each fixed-size result directly: device MIR cannot write through a runtime
+    // index into the nested plan array. The partition arithmetic is also used at const evaluation.
+    const fn span(
+        (first, strips, table): (usize, usize, usize),
+        edge: usize,
+    ) -> [(usize, usize, usize); 3] {
+        let each = Self::SIZE / edge;
+        let end = first + strips;
+        let (start, stop) = (first.div_ceil(each), end / each);
+        if stop <= start {
+            [(first, strips, table), (0, 0, table), (end, 0, table)]
+        } else {
+            [
+                (first, each * start - first, table),
+                (start, stop - start, table),
+                (each * stop, end - each * stop, table),
+            ]
         }
-        plan
     }
 }
 
@@ -301,12 +300,35 @@ where
             &(Table<Width, Chips>, Table<Width, Chips>),
         ),
     ) {
-        let weight = self.weight.tensor();
-        // Each span's strips before its first whole block, its whole blocks, then its strips after;
-        // strips are 64 rows when every span comes in them, else 16.
         let plan = const {
             Block::<Packed<T, A, V>>::plan(Join::spans::<T, A, V>(), Packed::<T, A, V>::STRIP)
         };
+        if const { Packed::<T, A, V>::STRIP == 64 } {
+            self.apply_spans::<Packed<T, A, V>, 64>(device, input, output, tables, plan);
+        } else {
+            self.apply_spans::<Packed<T, A, V>, 16>(device, input, output, tables, plan);
+        }
+    }
+}
+
+impl<Width: AxisName, Chips: M, const EPSILON: usize, G>
+    super::AdaptiveRms<Width, EPSILON, Chips, G>
+where
+    G: Borrow<HbmTensor<bf16, Chips, m![Width]>>,
+{
+    /// Execute a prepartitioned plan with the same block and strip arithmetic as static packing.
+    pub(crate) fn apply_spans<R: AxisName, const EDGE: usize>(
+        &self,
+        device: &mut Device,
+        input: &Rows<R, Width, Chips>,
+        output: &mut Rows<R, Width, Chips>,
+        tables: &(Table<Width, Chips>, Table<Width, Chips>),
+        plan: [[(usize, usize, usize); 3]; 3],
+    ) {
+        const {
+            assert!(EDGE == 16 || EDGE == 64);
+        }
+        let weight = self.weight.tensor();
         #[unroll]
         for span in 0..3 {
             #[unroll]
@@ -314,14 +336,11 @@ where
                 let (first, count, index) = plan[span][region];
                 if count > 0 {
                     if region == 1 {
-                        type R<T, A, V> = Packed<T, A, V>;
-                        type B<T, A, V> = Block<R<T, A, V>>;
                         let (shift, scale) = tables;
                         let gain = {
-                            let (weight, scale) = (weight.view(), B::<T, A, V>::row(scale, index));
-                            let weight = B::<T, A, V>::new().forward(&mut *device, weight);
-                            let scale: Feature<R<T, A, V>, Width, Chips> =
-                                scale.to_dm(&mut device.tdma);
+                            let (weight, scale) = (weight.view(), Block::<R>::row(scale, index));
+                            let weight = Block::<R>::new().forward(&mut *device, weight);
+                            let scale: Feature<R, Width, Chips> = scale.to_dm(&mut device.tdma);
                             device.main.begin(scale.view())
                                 .fetch::<m![Width % ({ E<Width> }) / 8], m![Width % 8]>()
                                 .fetch_cast::<f32>()
@@ -341,43 +360,41 @@ where
                                 .vector_final()
                                 .to_vrf(&mut device.sub)
                         };
-                        let shift = B::<T, A, V>::new()
-                            .forward(&mut *device, B::<T, A, V>::row(shift, index));
+                        let shift =
+                            Block::<R>::new().forward(&mut *device, Block::<R>::row(shift, index));
                         let last = first + count - 1;
                         let (mut current, mut next): (
-                            Part<bf16, R<T, A, V>, Width, Chips>,
-                            Part<bf16, R<T, A, V>, Width, Chips>,
+                            Part<bf16, R, Width, Chips>,
+                            Part<bf16, R, Width, Chips>,
                         ) = (DmTensor::new(), DmTensor::new());
                         let (mut kept, mut held): (
-                            Part<bf16, R<T, A, V>, Width, Chips>,
-                            Part<bf16, R<T, A, V>, Width, Chips>,
+                            Part<bf16, R, Width, Chips>,
+                            Part<bf16, R, Width, Chips>,
                         ) = (DmTensor::new(), DmTensor::new());
-                        B::<T, A, V>::new().forward(&mut *device, (input, first, &mut current));
-                        B::<T, A, V>::new()
+                        Block::<R>::new().forward(&mut *device, (input, first, &mut current));
+                        Block::<R>::new()
                             .forward(&mut *device, (input, (first + 1).min(last), &mut next));
                         for pair in 0..(count + 1) / 2 {
                             let at = first + 2 * pair;
-                            let inverse =
-                                B::<T, A, V>::new().forward(&mut *device, (&current, self));
-                            let following =
-                                B::<T, A, V>::new().forward(&mut *device, (&next, self));
-                            B::<T, A, V>::new().forward(
+                            let inverse = Block::<R>::new().forward(&mut *device, (&current, self));
+                            let following = Block::<R>::new().forward(&mut *device, (&next, self));
+                            Block::<R>::new().forward(
                                 &mut *device,
                                 (&current, (&inverse, &gain, &shift), &mut kept),
                             );
-                            B::<T, A, V>::new()
+                            Block::<R>::new()
                                 .forward(&mut *device, (input, (at + 2).min(last), &mut current));
-                            B::<T, A, V>::new().forward(&mut *device, (&kept, &mut *output, at));
-                            B::<T, A, V>::new().forward(
+                            Block::<R>::new().forward(&mut *device, (&kept, &mut *output, at));
+                            Block::<R>::new().forward(
                                 &mut *device,
                                 (&next, (&following, &gain, &shift), &mut held),
                             );
-                            B::<T, A, V>::new()
+                            Block::<R>::new()
                                 .forward(&mut *device, (input, (at + 3).min(last), &mut next));
-                            B::<T, A, V>::new()
+                            Block::<R>::new()
                                 .forward(&mut *device, (&held, &mut *output, (at + 1).min(last)));
                         }
-                    } else if const { Packed::<T, A, V>::STRIP == 64 } {
+                    } else if const { EDGE == 64 } {
                         Wide::<Width>::new().forward(
                             &mut *device,
                             (input, &mut *output, self, tables, (first, count, index)),

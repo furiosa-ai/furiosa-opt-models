@@ -18,23 +18,51 @@ use crate::Op;
 use crate::specialize::contraction;
 use furiosa_opt_std::prelude::*;
 
+pub(crate) mod grouped;
+mod live;
+mod tiled;
+
 /// Rows projected by `weight` plus `bias`, block by block, into `Out` rows.
-pub(crate) struct Projection<'a, I: AxisName, O: AxisName, R: AxisName, Chips: M, Bias, Out = bf16>
-{
-    weight: &'a HbmTensor<bf16, Chips, m![O, I]>,
+pub(crate) struct Projection<
+    'a,
+    I: AxisName,
+    O: AxisName,
+    R: AxisName,
+    Chips: M,
+    Bias,
+    Out = bf16,
+    W = HbmTensor<bf16, Chips, m![O, I]>,
+> {
+    weight: &'a W,
     bias: &'a Bias,
-    rows: PhantomData<(R, Out)>,
+    rows: PhantomData<(I, O, R, Chips, Out)>,
 }
 
-impl<'a, I: AxisName, O: AxisName, R: AxisName, Chips: M, Bias, Out>
-    Projection<'a, I, O, R, Chips, Bias, Out>
+impl<'a, I: AxisName, O: AxisName, R: AxisName, Chips: M, Bias, Out, W>
+    Projection<'a, I, O, R, Chips, Bias, Out, W>
 {
-    pub(crate) const fn new(weight: &'a HbmTensor<bf16, Chips, m![O, I]>, bias: &'a Bias) -> Self {
+    pub(crate) const fn new(weight: &'a W, bias: &'a Bias) -> Self {
         Self {
             weight,
             bias,
             rows: PhantomData,
         }
+    }
+}
+
+/// The storage layout determines how a row projection lands one weight slab.
+pub(crate) trait Slab<I: AxisName, O: AxisName, R: AxisName, Chips: M> {
+    /// Use the grouped projection's weight-upload order and delayed result stores.
+    const PIPELINED: bool = false;
+
+    fn slab(&self, device: &mut Device, pass: usize) -> Weight<I, O, R, Chips>;
+}
+
+impl<I: AxisName, O: AxisName, R: AxisName, Chips: M> Slab<I, O, R, Chips>
+    for HbmTensor<bf16, Chips, m![O, I]>
+{
+    fn slab(&self, device: &mut Device, pass: usize) -> Weight<I, O, R, Chips> {
+        self.tile::<Chunked<I, O, R>>(device, pass)
     }
 }
 
@@ -230,8 +258,8 @@ type Heads<I, O, R, H> = m![
     O % ({ Symbol<H> })
 ];
 
-impl<'s, 't, I, O, R, Chips, Bias, Out, SourceOrder, SinkOrder, S, T> Op<(&'s S, &'t mut T)>
-    for Projection<'_, I, O, R, Chips, Bias, Out>
+impl<'s, 't, I, O, R, Chips, Bias, Out, W, SourceOrder, SinkOrder, S, T> Op<(&'s S, &'t mut T)>
+    for Projection<'_, I, O, R, Chips, Bias, Out, W>
 where
     I: AxisName,
     O: AxisName,
@@ -239,6 +267,7 @@ where
     Chips: M,
     Bias: Offset<I, O, R, Chips>,
     Out: Rounding,
+    W: Slab<I, O, R, Chips>,
     SourceOrder: M,
     SinkOrder: M,
     S: Source<I, O, R, Chips, Order = SourceOrder>,
@@ -264,7 +293,7 @@ where
 
 axes![Parts = 3];
 
-impl<'i, 'o, I: AxisName, O: AxisName, R: AxisName, Chips: M, W: AxisName>
+impl<'i, 'o, I: AxisName, O: AxisName, R: AxisName, Chips: M, W: AxisName, Matrix>
     Op<(
         &'i HbmTensor<bf16, Chips, m![R, I]>,
         (
@@ -272,7 +301,9 @@ impl<'i, 'o, I: AxisName, O: AxisName, R: AxisName, Chips: M, W: AxisName>
             &'o mut HbmTensor<bf16, Chips, m![R, W]>,
             &'o mut HbmTensor<bf16, Chips, m![R, W]>,
         ),
-    )> for Projection<'_, I, O, R, Chips, ()>
+    )> for Projection<'_, I, O, R, Chips, (), bf16, Matrix>
+where
+    Matrix: Slab<I, O, R, Chips>,
 {
     type Output = ();
 
@@ -368,14 +399,17 @@ impl<
     Chips: M,
     Bias: Offset<I, O, R, Chips>,
     Scalar,
+    W,
     D,
     SourceOrder,
     SinkOrder,
     S,
     Store,
-> Op<(usize, &'s S, Store)> for Pass<'_, Projection<'_, I, O, R, Chips, Bias, Scalar>, D, SinkOrder>
+> Op<(usize, &'s S, Store)>
+    for Pass<'_, Projection<'_, I, O, R, Chips, Bias, Scalar, W>, D, SinkOrder>
 where
     D: Rounding,
+    W: Slab<I, O, R, Chips>,
     SourceOrder: M,
     SinkOrder: M,
     S: Source<I, O, R, Chips, Order = SourceOrder>,
@@ -384,6 +418,27 @@ where
     type Output = ();
 
     fn forward(&self, device: &mut Device, (pass, rows, mut store): (usize, &'s S, Store)) {
+        if const { W::PIPELINED } {
+            let mut first: InDm<I, O, R, Chips, SourceOrder> = DmTensor::new();
+            let mut second: InDm<I, O, R, Chips, SourceOrder> = DmTensor::new();
+            rows.to_dm(device, 0, &mut first);
+            let slab = self.0.weight.slab(device, pass);
+            if const { <Bs<R> as M>::SIZE > 1 } {
+                rows.to_dm(device, 1, &mut second);
+            }
+            let offsets = self.0.bias.pass(device, pass);
+            let (_, (last, block)) = tiled::trips(
+                device,
+                (rows, |block| block, PhantomData::<Bs<R>>),
+                (first, second),
+                (),
+                |_: &mut Device, _, _: &mut InDm<I, O, R, Chips, SourceOrder>| {},
+                |device, register, kept| Bias::contract(device, (&slab, &offsets), register, kept),
+                &mut store,
+            );
+            store(device, &last, block);
+            return;
+        }
         let fill = |device: &mut Device, in_dm: &InDm<I, O, R, Chips, SourceOrder>| {
             device.sub.begin(in_dm.view())
                 .fetch::<
@@ -408,7 +463,7 @@ where
         if const { <Bs<R> as M>::SIZE > 1 } {
             rows.to_dm(device, 1, &mut second);
         }
-        let slab: Weight<I, O, R, Chips> = self.0.weight.tile::<Chunked<I, O, R>>(device, pass);
+        let slab = self.0.weight.slab(device, pass);
         let offsets = self.0.bias.pass(device, pass);
         // Block b contracts while block b + 1 fills and block b + 2 arrives.
         for pair in 0..blocks / 2 {
