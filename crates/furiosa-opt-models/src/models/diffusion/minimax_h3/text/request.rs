@@ -226,6 +226,20 @@ pub struct Reservation {
     _request: Request,
 }
 
+fn invalid_tokens() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "H3 text requires nonempty in-vocabulary tokens within its configured capacity (at most 2048)",
+    )
+}
+
+/// Reserve the ordinary metadata and cache allocations without exposing numerical rows.
+pub fn reserve(device: &mut Device, rows: usize, capacity: usize) -> io::Result<Reservation> {
+    Ok(Reservation {
+        _request: Layout::new(rows, capacity)?.allocate(device)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,18 +267,4 @@ mod tests {
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         }
     }
-}
-
-fn invalid_tokens() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidInput,
-        "H3 text requires nonempty in-vocabulary tokens within its configured capacity (at most 2048)",
-    )
-}
-
-/// Reserve the ordinary metadata and cache allocations without exposing numerical rows.
-pub fn reserve(device: &mut Device, rows: usize, capacity: usize) -> io::Result<Reservation> {
-    Ok(Reservation {
-        _request: Layout::new(rows, capacity)?.allocate(device)?,
-    })
 }
