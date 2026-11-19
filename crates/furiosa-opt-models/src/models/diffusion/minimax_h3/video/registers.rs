@@ -120,9 +120,5 @@ fn shape(source: &Checkpoint, context: &mut Context<'_>) -> Result<(), LoadError
 }
 
 fn round<E: M>(host: HostTensor<f32, E>) -> HostTensor<f32, E> {
-    HostTensor::from_vec(
-        host.into_vec()
-            .into_iter()
-            .map(|v| bf16::from_f32(v).to_f32()),
-    )
+    HostTensor::from_vec(host.into_vec().into_iter().map(super::parameters::round))
 }

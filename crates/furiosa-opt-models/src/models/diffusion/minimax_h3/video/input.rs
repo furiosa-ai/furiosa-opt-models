@@ -239,11 +239,6 @@ fn rounded(
     shape: &[usize],
 ) -> Result<Vec<f32>, LoadError> {
     context.field(name, name, |cx| {
-        cx.floats(source, shape).map(|values| {
-            values
-                .into_iter()
-                .map(|value| bf16::from_f32(value).to_f32())
-                .collect()
-        })
+        super::parameters::rounded(source, cx, shape)
     })
 }

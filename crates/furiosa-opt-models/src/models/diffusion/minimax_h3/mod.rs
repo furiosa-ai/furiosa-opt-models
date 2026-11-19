@@ -21,3 +21,6 @@ pub mod request;
 pub mod text;
 pub mod transformer;
 pub mod video;
+
+#[cfg(test)]
+mod test_memory;

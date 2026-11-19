@@ -189,12 +189,12 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_memory::{Host, IMAGES, Image, Leaf};
     use super::*;
     use crate::load::{Checkpoint, Context, LoadError};
     use crate::ops::index::packed::Timestep;
     use crate::tensor::memory::residency::{Leaves, Path, Visit};
     use safetensors::Dtype;
-    use std::cell::RefCell;
     use std::convert::Infallible;
     use std::marker::PhantomData;
     use std::sync::Arc;
@@ -206,62 +206,6 @@ mod tests {
         SmallVideo = 8,
         SmallAudio = 4
     ];
-
-    struct Host;
-    struct Leaf<D, C, S> {
-        values: Arc<[D]>,
-        shape: PhantomData<(C, S)>,
-    }
-    struct Image {
-        path: String,
-        bytes: Vec<u8>,
-        chips: usize,
-        elements: usize,
-    }
-
-    thread_local! { static IMAGES: RefCell<Vec<Image>> = const { RefCell::new(Vec::new()) }; }
-
-    impl Memory for Host {
-        type Tensor<D: MaterializableScalar, C: M + 'static, S: M + 'static> = Leaf<D, C, S>;
-    }
-
-    impl<D: MaterializableScalar, C: M + 'static, S: M + 'static, E: M> Load<HostTensor<D, E>>
-        for Leaf<D, C, S>
-    {
-        fn load(cx: &mut Context<'_>, host: HostTensor<D, E>) -> Result<Self, LoadError> {
-            assert_eq!(E::SIZE, C::SIZE * S::SIZE);
-            let values = host.into_vec();
-            IMAGES.with_borrow_mut(|images| {
-                images.push(Image {
-                    path: cx.path(),
-                    bytes: D::to_buf(&values),
-                    chips: C::SIZE,
-                    elements: S::SIZE,
-                })
-            });
-            Ok(Self {
-                values: values.into(),
-                shape: PhantomData,
-            })
-        }
-    }
-
-    impl<'a, D: MaterializableScalar, C: M + 'static, S: M + 'static> Load<&'a Checkpoint>
-        for Leaf<D, C, S>
-    {
-        fn load(cx: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
-            cx.checkpoint(from, |cx| {
-                let host = from.host::<D, S, m![{ C }, { S }]>(cx)?;
-                Self::load(cx, host)
-            })
-        }
-    }
-
-    impl<'a, D, C, S> Load<&'a Leaf<D, C, S>> for &'a Leaf<D, C, S> {
-        fn load(_: &mut Context<'_>, from: &'a Leaf<D, C, S>) -> Result<Self, LoadError> {
-            Ok(from)
-        }
-    }
 
     #[derive(Load, Residency)]
     #[residency(children(E, H))]
@@ -314,7 +258,7 @@ mod tests {
                 return Err(path.to_string());
             }
             Ok(Leaf {
-                values: Arc::clone(&leaf.values),
+                bytes: Arc::clone(&leaf.bytes),
                 shape: PhantomData,
             })
         }
@@ -339,11 +283,11 @@ mod tests {
         ) {
             self.0.push(Record {
                 path: path.to_string(),
-                bytes: D::to_buf(&leaf.values),
+                bytes: leaf.bytes.to_vec(),
                 chips: C::SIZE,
                 elements: S::SIZE,
-                identity: Arc::as_ptr(&leaf.values).cast::<D>() as usize,
-                owners: Arc::strong_count(&leaf.values),
+                identity: Arc::as_ptr(&leaf.bytes).cast::<u8>() as usize,
+                owners: Arc::strong_count(&leaf.bytes),
             });
         }
     }

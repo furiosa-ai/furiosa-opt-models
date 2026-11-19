@@ -433,10 +433,11 @@ pub(super) fn rounded(
     context: &mut Context<'_>,
     shape: &[usize],
 ) -> Result<Vec<f32>, LoadError> {
-    context.floats(source, shape).map(|values| {
-        values
-            .into_iter()
-            .map(|v| bf16::from_f32(v).to_f32())
-            .collect()
-    })
+    context
+        .floats(source, shape)
+        .map(|values| values.into_iter().map(round).collect())
+}
+
+pub(super) fn round(value: f32) -> f32 {
+    bf16::from_f32(value).to_f32()
 }

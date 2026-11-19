@@ -222,83 +222,16 @@ impl<W: AxisName> AxisName for Heads<W> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_memory::{Host, IMAGES, Image, Leaf};
     use super::*;
     use crate::load::{Checkpoint, Context, Load, LoadError};
     use crate::tensor::memory::residency::{Leaves, Path, Residency, Visit};
     use safetensors::Dtype;
-    use std::cell::RefCell;
     use std::convert::Infallible;
-    use std::sync::Arc;
 
     axes![W = 256, A = 512, F = 512, T = 64];
     type Joint<X> = Named<"transformer.blocks.0", Block<W, A, F, T, X>>;
     type Text<X> = Named<"transformer.token_refiner", Refiner<W, A, F, X>>;
-
-    struct Host;
-    struct Leaf<D, C, S> {
-        bytes: Arc<[u8]>,
-        shape: PhantomData<(D, C, S)>,
-    }
-
-    impl Memory for Host {
-        type Tensor<D: MaterializableScalar, C: M + 'static, S: M + 'static> = Leaf<D, C, S>;
-    }
-
-    #[derive(Clone)]
-    struct Image {
-        path: String,
-        bytes: Arc<[u8]>,
-        elements_per_chip: usize,
-    }
-    thread_local! { static IMAGES: RefCell<Vec<Image>> = const { RefCell::new(Vec::new()) }; }
-
-    impl<D: MaterializableScalar, C: M + 'static, S: M + 'static, E: M> Load<HostTensor<D, E>>
-        for Leaf<D, C, S>
-    {
-        fn load(cx: &mut Context<'_>, host: HostTensor<D, E>) -> Result<Self, LoadError> {
-            assert_eq!(E::SIZE, C::SIZE * S::SIZE);
-            let bytes: Arc<[u8]> = D::to_buf(&host.into_vec()).into();
-            IMAGES.with_borrow_mut(|images| {
-                images.push(Image {
-                    path: cx.path(),
-                    bytes: Arc::clone(&bytes),
-                    elements_per_chip: S::SIZE,
-                })
-            });
-            Ok(Self {
-                bytes,
-                shape: PhantomData,
-            })
-        }
-    }
-
-    impl<'a, D: MaterializableScalar, C: M + 'static, S: M + 'static> Load<&'a Checkpoint>
-        for Leaf<D, C, S>
-    {
-        fn load(cx: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
-            cx.checkpoint(from, |cx| {
-                let host = from.host::<D, S, m![{ C }, { S }]>(cx)?;
-                Self::load(cx, host)
-            })
-        }
-    }
-
-    impl<'a, D, C, S> Load<&'a Leaf<D, C, S>> for &'a Leaf<D, C, S> {
-        fn load(_: &mut Context<'_>, leaf: &'a Leaf<D, C, S>) -> Result<Self, LoadError> {
-            Ok(leaf)
-        }
-    }
-
-    impl<'a, D: MaterializableScalar, C: M + 'static, S: M + 'static, E: M>
-        Load<&'a dyn Fn() -> Result<HostTensor<D, E>, LoadError>> for Leaf<D, C, S>
-    {
-        fn load(
-            cx: &mut Context<'_>,
-            read: &'a dyn Fn() -> Result<HostTensor<D, E>, LoadError>,
-        ) -> Result<Self, LoadError> {
-            Self::load(cx, read()?)
-        }
-    }
 
     struct Borrow;
     impl<'a> Leaves<'a, Host, &'a Host> for Borrow {
@@ -450,7 +383,7 @@ mod tests {
                 for d in 0..128 {
                     let out = term * 128 + if term == 2 { d } else { paired(d) };
                     for column in [0, 31, 127, 128, 255] {
-                        let at = chip * qkv.elements_per_chip
+                        let at = chip * qkv.elements
                             + ((out / 32 * (256 / k) + column / k) * 32 + out % 32) * k
                             + column % k;
                         assert_eq!(
@@ -485,14 +418,11 @@ mod tests {
                     let local = chunk * 64 + feature;
                     for column in [0, 31, 63] {
                         assert_eq!(
-                            bf16_at(
-                                &weight,
-                                chip * weight.elements_per_chip + local * 64 + column
-                            ),
+                            bf16_at(&weight, chip * weight.elements + local * 64 + column),
                             bf16::from_f32(value(stored, column, 9))
                         );
                     }
-                    let at = chip * bias.elements_per_chip + local * 8;
+                    let at = chip * bias.elements + local * 8;
                     assert_eq!(f32_at(&bias, at), value(0, stored, 10));
                     for lane in 1..8 {
                         assert_eq!(f32_at(&bias, at + lane).to_bits(), 0);
@@ -517,10 +447,7 @@ mod tests {
                             let out = term * 512 + head * 128 + d;
                             for column in [0, 127, 255] {
                                 assert_eq!(
-                                    bf16_at(
-                                        &qkv,
-                                        chip * qkv.elements_per_chip + out * 256 + column
-                                    ),
+                                    bf16_at(&qkv, chip * qkv.elements + out * 256 + column),
                                     bf16::from_f32(value((head * 3 + term) * 128 + d, column, 1))
                                 );
                             }
@@ -536,7 +463,7 @@ mod tests {
             }
         }
         let norm = image("final_norm.weight");
-        assert_eq!(norm.elements_per_chip, 256);
+        assert_eq!(norm.elements, 256);
         for chip in 0..4 {
             for d in 0..256 {
                 assert_eq!(
