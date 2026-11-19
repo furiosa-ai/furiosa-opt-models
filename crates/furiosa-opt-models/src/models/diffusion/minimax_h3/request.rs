@@ -4,9 +4,13 @@ use super::embeddings::Chips;
 use super::packing::{
     AUDIO_ROWS, DEFAULT_MAX_TEXT, PARTS, Plan, ROW_BLOCK, TEXT_STRIP, VIDEO_ROWS,
 };
-use crate::ops::attention::full::{PackInputs, PackPlan};
+use crate::ops::attention::{
+    flash,
+    full::{PackInputs, PackPlan},
+};
 use crate::ops::collective::Pieces;
-use crate::ops::index::packed::{SpanPlan, live::SpanInputs};
+use crate::ops::index::packed::{RowInputs, SpanPlan, live::SpanInputs};
+use crate::ops::rotary::Rotation;
 use crate::tensor::{axis::Rows, live::BlockPrefix, scalar::Value};
 use furiosa_opt_std::prelude::*;
 use std::io;
@@ -162,6 +166,20 @@ impl<R: AxisName, K: AxisName> BlockCall<'_, R, K> {
     pub fn key_count(&self) -> &Value<Chips> {
         self.key_count
     }
+}
+
+/// Immutable numerical transport. A request's flight guard retains this complete owner rather
+/// than only aliases of individual readers; the entry decodes block and row plans once.
+#[derive(DeviceSend)]
+pub struct Inputs<R: AxisName, K: AxisName, T, A, V> {
+    /// Checked spans, initialized work and packed-key metadata.
+    pub blocks: BlockInputs<R, K>,
+    /// Checked text/audio/video row transfers.
+    pub rows: RowInputs<R, T, A, V, Chips>,
+    /// Paired rotary coefficients for the joined rows.
+    pub rotation: Rotation<flash::Head, Chips, Pieces<R, PARTS>>,
+    /// Attention visibility for the packed key spans.
+    pub visible: flash::Visible<K, Chips>,
 }
 
 #[cfg(test)]

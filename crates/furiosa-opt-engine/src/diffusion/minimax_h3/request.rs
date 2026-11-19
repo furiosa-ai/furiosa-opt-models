@@ -1,10 +1,9 @@
 //! Request-owned readers derived together from the checked packing geometry.
 
 use furiosa_opt_models::models::diffusion::minimax_h3::{
-    embeddings::Chips,
     packing::{Capacity, PARTS, Plan},
     positions::Positions,
-    request::{BlockInputs, BlockPlan},
+    request::BlockPlan,
 };
 use furiosa_opt_models::ops::{
     attention::flash,
@@ -14,6 +13,8 @@ use furiosa_opt_models::ops::{
 };
 use furiosa_opt_std::prelude::*;
 use std::io;
+
+pub(super) use furiosa_opt_models::models::diffusion::minimax_h3::request::Inputs;
 
 /// Host checks finish before the first transfer. Every numerical reader derives from `plan`;
 /// callers cannot mix another request's row transfers, modulation spans or packed-key order.
@@ -83,14 +84,4 @@ impl<R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName> Prepared<R
 pub(super) struct Request<R: AxisName, K: AxisName, T, A, V> {
     pub(super) plan: Plan,
     pub(super) inputs: Inputs<R, K, T, A, V>,
-}
-
-/// Immutable numerical transport. A request's flight guard retains this complete owner rather
-/// than only aliases of individual readers; the entry decodes block and row plans once.
-#[derive(DeviceSend)]
-pub(super) struct Inputs<R: AxisName, K: AxisName, T, A, V> {
-    pub(super) blocks: BlockInputs<R, K>,
-    pub(super) rows: RowInputs<R, T, A, V, Chips>,
-    pub(super) rotation: Rotation<flash::Head, Chips, Pieces<R, PARTS>>,
-    pub(super) visible: flash::Visible<K, Chips>,
 }
