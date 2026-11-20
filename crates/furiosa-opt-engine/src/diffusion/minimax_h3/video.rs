@@ -14,6 +14,46 @@ use furiosa_opt_models::tensor::memory::alias;
 use furiosa_opt_std::prelude::*;
 use std::{io, sync::Arc};
 
+/// Checked framework video options, borrowing one fixed-profile latent payload.
+pub(super) struct Input<'a> {
+    latents: video::tiling::Latents<'a>,
+    frames: video::tiling::FrameCount,
+}
+
+impl<'a> Input<'a> {
+    /// Validate raw layout, payload and options before admission or device work.
+    pub(super) fn new(
+        shape: &[usize],
+        values: &'a [f32],
+        frame_num: Option<usize>,
+        process_image: bool,
+    ) -> io::Result<Self> {
+        let invalid = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "decode_base requires float32 [1,24,37,48,84], frame_num in 1..=124 and process_image=False",
+            )
+        };
+        if shape != video::tiling::LATENT_SHAPE || process_image {
+            return Err(invalid());
+        }
+        Ok(Self {
+            latents: video::tiling::Latents::new(values).map_err(|_| invalid())?,
+            frames: video::tiling::FrameCount::try_from(
+                frame_num.unwrap_or(video::tiling::OUTPUT_SHAPE[2]),
+            )
+            .map_err(|_| invalid())?,
+        })
+    }
+
+    /// The returned channel-first shape with the checked tail-frame count.
+    pub(super) fn output_shape(&self) -> [usize; 5] {
+        let mut shape = video::tiling::OUTPUT_SHAPE;
+        shape[2] = self.frames.get();
+        shape
+    }
+}
+
 /// Internal component view; an exposed view additionally retains the complete pipeline owner.
 pub(super) struct Decoder {
     _owner: Component<video::Decoder>,
@@ -32,12 +72,6 @@ impl Decoder {
         owner: Component<video::Decoder>,
         device: SharedDevice,
     ) -> io::Result<Self> {
-        if device.placement().chips.len() != 4 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "H3 video decoding requires the pipeline's four-chip device",
-            ));
-        }
         device.admit(owner.resident())?.landed().await?;
         let context = device.with_device(|device| {
             kernel::embedding.load(device).map_err(io::Error::other)?;
@@ -71,12 +105,8 @@ impl Decoder {
     /// Refill the original two tile slots in turn. Submit the successor before waiting for
     /// and stitching its predecessor. A flight keeps every shared workspace owner alive until
     /// all accepted readers end, including cancellation and partial submission failure.
-    pub(super) async fn decode_frames(
-        &self,
-        values: &[f32],
-        frames: usize,
-    ) -> io::Result<Vec<f32>> {
-        let latents = video::tiling::Latents::new(values)?;
+    pub(super) async fn decode(&self, input: Input<'_>) -> io::Result<Vec<f32>> {
+        let Input { latents, frames } = input;
         self.context
             .rotation
             .low
@@ -341,5 +371,39 @@ mod kernel {
         input: &video::Normalized,
     ) -> video::Pixels {
         module.forward(device, context, state, input)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_video_decode_options_before_device_work() {
+        let shape = video::tiling::LATENT_SHAPE;
+        let values = vec![0.0; shape.into_iter().product()];
+        for frames in [None, Some(1), Some(124)] {
+            let input = Input::new(&shape, &values, frames, false).unwrap();
+            assert_eq!(
+                input.output_shape(),
+                [1, 3, frames.unwrap_or(124), 768, 1344]
+            );
+        }
+        for (shape, values, frames, process_image) in [
+            (&[1, 24, 37, 84, 48][..], &values[..], None, false),
+            (&shape, &values[..values.len() - 1], None, false),
+            (&shape, &values[..], Some(0), false),
+            (&shape, &values[..], Some(125), false),
+            (&shape, &values[..], None, true),
+        ] {
+            let error = Input::new(shape, values, frames, process_image)
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.to_string(),
+                "decode_base requires float32 [1,24,37,48,84], frame_num in 1..=124 and process_image=False"
+            );
+        }
     }
 }

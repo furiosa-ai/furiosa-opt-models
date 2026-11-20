@@ -122,12 +122,6 @@ impl<
         owner: Component<model::Denoiser>,
         device: SharedDevice,
     ) -> io::Result<Self> {
-        if device.placement().chips.len() != 4 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "H3 denoising requires the pipeline's four-chip device",
-            ));
-        }
         device.admit(owner.resident())?.landed().await?;
         device.with_device(|device| {
             Loadable::<(

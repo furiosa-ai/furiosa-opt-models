@@ -4,7 +4,7 @@
 //! adapter preserves the original component boundary and delegates every numerical call to the
 //! existing core. Component views must retain an `Arc<Pipeline>` and use this same owner.
 
-use super::{audio, cache, denoiser, layout::Layout, pipeline, text, weights};
+use super::{audio, cache, denoiser, layout::Layout, pipeline, text, video, weights};
 use crate::residency::{SharedDevice, block_on};
 use furiosa_opt_models::load::{Checkpoint, LoadError};
 use furiosa_opt_models::models::Class;
@@ -12,7 +12,6 @@ use furiosa_opt_models::models::diffusion::minimax_h3::{
     Inputs,
     embeddings::{Chips, Condition, Latent, Patch, Width},
     packing::{Capacity, DEFAULT_GATHER_ROWS, DEFAULT_MAX_TEXT, Modality},
-    video::tiling,
 };
 use furiosa_opt_models::tensor::axis::Rows;
 use furiosa_opt_std::prelude::*;
@@ -230,20 +229,10 @@ impl Pipeline {
         process_image: bool,
     ) -> io::Result<Decoded<5>> {
         let _state = self.state().await?;
-        if shape != tiling::LATENT_SHAPE
-            || values.len() != tiling::LATENT_SHAPE.into_iter().product::<usize>()
-            || frame_num.is_some_and(|frames| !(1..=tiling::OUTPUT_SHAPE[2]).contains(&frames))
-            || process_image
-        {
-            return Err(invalid(
-                "decode_base requires float32 [1,24,37,48,84], frame_num in 1..=124 and process_image=False",
-            ));
-        }
-        let frames = frame_num.unwrap_or(tiling::OUTPUT_SHAPE[2]);
-        let mut shape = tiling::OUTPUT_SHAPE;
-        shape[2] = frames;
+        let input = video::Input::new(shape, values, frame_num, process_image)?;
+        let shape = input.output_shape();
         Ok(Decoded {
-            values: self.core.decode_video_frames(values, frames).await?,
+            values: self.core.decode_video(input).await?,
             shape,
         })
     }
@@ -251,15 +240,9 @@ impl Pipeline {
     /// Decode channel-major stereo latents through the original audio component.
     pub async fn decode_audio(&self, shape: &[usize], values: &[f32]) -> io::Result<Decoded<3>> {
         let _state = self.state().await?;
-        if shape != audio::INPUT_SHAPE
-            || values.len() != audio::INPUT_SHAPE.into_iter().product::<usize>()
-        {
-            return Err(invalid(
-                "audio decode requires contiguous float32 [2,32,207]",
-            ));
-        }
+        let input = audio::Latents::new(shape, values)?;
         Ok(Decoded {
-            values: self.core.decode_audio(shape, values).await?,
+            values: self.core.decode_audio(input).await?,
             shape: audio::OUTPUT_SHAPE,
         })
     }

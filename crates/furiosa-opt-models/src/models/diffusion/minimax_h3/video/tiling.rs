@@ -113,6 +113,37 @@ impl TryFrom<usize> for GroupIndex {
     }
 }
 
+/// Number of tail frames returned by the fixed video profile, checked before allocation.
+#[derive(Clone, Copy, Debug)]
+pub struct FrameCount(usize);
+
+impl FrameCount {
+    /// The checked count in `1..=124`.
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl TryFrom<usize> for FrameCount {
+    type Error = io::Error;
+
+    fn try_from(frames: usize) -> io::Result<Self> {
+        if !(1..=OUTPUT_SHAPE[2]).contains(&frames) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "video frame_num must be in 1..=124",
+            ));
+        }
+        Ok(Self(frames))
+    }
+}
+
+impl Default for FrameCount {
+    fn default() -> Self {
+        Self(OUTPUT_SHAPE[2])
+    }
+}
+
 /// Bounded host state for one request; construction allocates all retained pixel buffers.
 /// Large buffers use fallible reservations. Accepted groups do not allocate another video,
 /// clip image, tile or fading buffer, and the original tile pixels are never blended in place.
@@ -126,18 +157,11 @@ impl Stitch {
     /// Reserve 28 reusable tiles, the 124-frame output, and one five-frame fading image.
     /// Their FP32 payloads total 2,214,395,904 bytes, excluding the caller's download buffer.
     pub fn new() -> io::Result<Self> {
-        Self::with_frames(OUTPUT_SHAPE[2])
+        Self::with_frames(FrameCount::default())
     }
 
-    /// Retain the last `frames` frames, as in the original decoder's `frame_num` argument.
-    /// Validate the count before reserving the large output or tile buffers.
-    pub fn with_frames(frames: usize) -> io::Result<Self> {
-        if !(1..=OUTPUT_SHAPE[2]).contains(&frames) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "video frame_num must be in 1..=124",
-            ));
-        }
+    /// Retain the checked tail count, as in the original decoder's `frame_num` argument.
+    pub fn with_frames(frames: FrameCount) -> io::Result<Self> {
         let mut tiles = Vec::new();
         tiles.try_reserve_exact(TILES).map_err(allocation)?;
         for _ in 0..TILES {
@@ -151,7 +175,7 @@ impl Stitch {
                 fade: 23..28,
             },
             CLIPS,
-            frames,
+            frames.get(),
             TILE_SHAPE,
         )?;
         Ok(Self {
@@ -503,7 +527,7 @@ mod tests {
             assert_eq!(video.values, expected[expected.len() - frames..]);
         }
         for frames in [0, OUTPUT_SHAPE[2] + 1] {
-            let error = Stitch::with_frames(frames).err().unwrap();
+            let error = FrameCount::try_from(frames).err().unwrap();
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         }
     }

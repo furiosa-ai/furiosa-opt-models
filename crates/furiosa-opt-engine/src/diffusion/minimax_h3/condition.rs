@@ -45,11 +45,6 @@ impl<const N: usize, T: AxisName + Send + Sync> Conditioner<N, T> {
         owner: Component<Denoiser>,
         device: SharedDevice,
     ) -> io::Result<Self> {
-        if device.placement().chips.len() != PARTS {
-            return Err(invalid(
-                "H3 conditioning requires the pipeline's four-chip device",
-            ));
-        }
         let capacity = Capacity::new(N)?;
         if N > DEFAULT_MAX_TEXT
             || !N.is_multiple_of(64)

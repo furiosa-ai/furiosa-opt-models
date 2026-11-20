@@ -203,22 +203,14 @@ impl<
     }
 
     /// A standalone framework decoder call shares admission with encoding and denoising.
-    pub(super) async fn decode_video_frames(
-        &self,
-        values: &[f32],
-        frames: usize,
-    ) -> io::Result<Vec<f32>> {
+    pub(super) async fn decode_video(&self, input: video::Input<'_>) -> io::Result<Vec<f32>> {
         let _lease = self.active.lock().await;
-        self.video.decode_frames(values, frames).await
+        self.video.decode(input).await
     }
 
-    pub(super) async fn decode_audio(
-        &self,
-        shape: &[usize],
-        values: &[f32],
-    ) -> io::Result<Vec<f32>> {
+    pub(super) async fn decode_audio(&self, input: audio::Latents<'_>) -> io::Result<Vec<f32>> {
         let _lease = self.active.lock().await;
-        self.audio.decode(shape, values).await
+        self.audio.decode(input).await
     }
 }
 

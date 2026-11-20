@@ -5,7 +5,7 @@
 
 use super::{flight::Flight, weights::Component};
 use crate::residency::{Resident, SharedDevice, block_on};
-use furiosa_opt_models::models::diffusion::minimax_h3::{audio, embeddings::Chips, packing::PARTS};
+use furiosa_opt_models::models::diffusion::minimax_h3::{audio, embeddings::Chips};
 use furiosa_opt_models::ops::convolution::{
     frames::{Stereo, Window},
     input::Latent as Channels,
@@ -35,11 +35,6 @@ impl Decoder {
         owner: Component<audio::Decoder>,
         device: SharedDevice,
     ) -> io::Result<Self> {
-        if device.placement().chips.len() != PARTS {
-            return Err(invalid(
-                "H3 audio decoding requires the pipeline's four-chip device",
-            ));
-        }
         device.admit(owner.resident())?.landed().await?;
         device.with_device(|device| kernel::decode.load(device).map_err(io::Error::other))?;
         let decoder = owner.resident().clone();
@@ -51,13 +46,13 @@ impl Decoder {
     }
 
     /// Decode contiguous FP32 `[2,32,207]` latents to channel-major `[2,1,165600]` samples.
-    /// Shape and payload length are checked before any DMA or execution. Input transposition
+    /// The input's constructor checks shape and payload length before this call. Transposition
     /// only copies FP32 values. No latent-statistics transform is introduced, and the existing
     /// Module tree retains every BF16 rounding boundary.
     /// The original caller reads the first of four identical waveform replicas and removes
     /// each channel's trailing allocation padding separately.
-    pub(super) async fn decode(&self, shape: &[usize], values: &[f32]) -> io::Result<Vec<f32>> {
-        let packed = Latents::new(shape, values)?.pack();
+    pub(super) async fn decode(&self, input: Latents<'_>) -> io::Result<Vec<f32>> {
+        let packed = input.pack();
         let input: audio::Input = self.device.with_device(|device| {
             // Complete the replicated upload while its host source is still owned. There is
             // no cancellation point between DMA submission and its completion.
@@ -123,15 +118,15 @@ impl Decoder {
 
 /// A checked architecture-layout view. Keeping construction separate from packing prevents a
 /// correctly sized payload with a different declared layout from reaching the compiled entry.
-struct Latents<'a> {
+pub(super) struct Latents<'a> {
     values: &'a [f32],
 }
 
 impl<'a> Latents<'a> {
-    fn new(shape: &[usize], values: &'a [f32]) -> io::Result<Self> {
+    pub(super) fn new(shape: &[usize], values: &'a [f32]) -> io::Result<Self> {
         if shape != INPUT_SHAPE || values.len() != INPUT_SHAPE.into_iter().product::<usize>() {
             return Err(invalid(
-                "audio decode requires contiguous float32 [2,32,207] with exactly 13248 values",
+                "audio decode requires contiguous float32 [2,32,207]",
             ));
         }
         Ok(Self { values })
