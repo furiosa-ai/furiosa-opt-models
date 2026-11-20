@@ -77,7 +77,7 @@ pub(super) mod tests {
     pub(crate) type Part<R = Rows, F = Features> = HbmTensor<bf16, Chips, m![R, F]>;
     pub(crate) type Host<R = Rows, F = Features> = HostTensor<bf16, m![{ Symbol<Shard<4>> }, R, F]>;
 
-    /// Preserve the repro's seeded values and conversion order for the original geometry.
+    /// Seeded BF16 operands include controlled equal and opposite values.
     pub(crate) fn terms(elements: usize) -> (Vec<bf16>, Vec<bf16>) {
         let count = 4 * elements;
         let left = crate::ops::normalization::tests::random(count, 7);
@@ -167,7 +167,7 @@ pub(super) mod tests {
     }
 
     /// Every element on every chip is its FP32 difference rounded to BF16 once, including a
-    /// single vector, a short window ending eight elements past 512, and the repro's three windows.
+    /// single vector, a short window ending eight elements past 512, and three full windows.
     #[tokio::test(flavor = "current_thread")]
     async fn rounds_each_difference_once() {
         let _lease = crate::tests::DEVICE.lock().await;

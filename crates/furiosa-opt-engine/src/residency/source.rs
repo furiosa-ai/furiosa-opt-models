@@ -7,7 +7,8 @@ use furiosa_opt_models::load::LoadError;
 use furiosa_opt_std::prelude::*;
 use std::{io, ops::Range, sync::Arc};
 
-/// Maximum allocation size of a pinned piece, matching the repro's transfer images.
+/// Chip images are split into pieces of at most 1 GiB, retaining each piece's byte offset.
+/// A replicated image's pieces are reused on every destination chip.
 const PIECE: usize = 1 << 30;
 
 /// A prepared tensor's bytes, retained on the host across placements and evictions.

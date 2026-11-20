@@ -513,7 +513,11 @@ mod tests {
         }
     }
 
-    /// Pins above-then-before blending from original neighbors with the original small example.
+    /// Checks above-then-before linear blending: `a * (1 - w) + b * w`.
+    /// Input pixels are `tile * 100 + 4 * y + x`. The two-pixel overlap gives weights
+    /// 0 and 1/2: expected entries select the original neighbor or average the two inputs.
+    /// At the shared corner, the horizontal blend uses the original left tile after the
+    /// vertical blend, so its nested average is derived directly from those input pixels.
     #[test]
     fn stitches_from_original_neighbors() {
         let grid = (0..4)
@@ -533,9 +537,48 @@ mod tests {
         assert_eq!(
             video.values,
             [
-                0., 1., 2., 52., 102., 103., 4., 5., 6., 56., 106., 107., 8., 9., 202., 156., 110.,
-                111., 108., 109., 206., 208., 210., 211., 208., 209., 210., 260., 310., 311., 212.,
-                213., 214., 264., 314., 315.,
+                // Output row 0.
+                0.,
+                1.,
+                2.,
+                (3. + 101.) / 2.,
+                102.,
+                103.,
+                // Output row 1.
+                4.,
+                5.,
+                6.,
+                (7. + 105.) / 2.,
+                106.,
+                107.,
+                // Output row 2: the vertical weight is zero.
+                8.,
+                9.,
+                202.,
+                (203. + 109.) / 2.,
+                110.,
+                111.,
+                // Output row 3: vertical and horizontal half blends meet.
+                (12. + 204.) / 2.,
+                (13. + 205.) / 2.,
+                206.,
+                (207. + (113. + 305.) / 2.) / 2.,
+                (114. + 306.) / 2.,
+                (115. + 307.) / 2.,
+                // Output row 4.
+                208.,
+                209.,
+                210.,
+                (211. + 309.) / 2.,
+                310.,
+                311.,
+                // Output row 5.
+                212.,
+                213.,
+                214.,
+                (215. + 313.) / 2.,
+                314.,
+                315.,
             ]
         );
     }

@@ -1,7 +1,9 @@
 //! K-grouped BF16 slabs for the register-resident row contraction.
 //!
-//! Adapted from the H3 repro: 32 outputs of a K group are contiguous, allowing
-//! the slab to land in longer runs while retaining the existing contraction.
+//! Coefficients use `[O / 32, I / K, O % 32, I % K]`, with `K` chosen for a
+//! 256-row projection. Each group holds 32 contiguous K-element output chunks;
+//! each pass lands its output-column slab in DM through TDMA. The contraction
+//! is shared with ordinary row projections.
 
 use super::{
     B, Blocked, Bs, Chunked, Cluster, Hr, KeptOutputs, Ks, Np, PassOutputs, Result, Rows, Sink,

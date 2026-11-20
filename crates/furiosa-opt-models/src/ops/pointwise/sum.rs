@@ -326,8 +326,8 @@ mod tests {
     }
 
     /// Every chip's rounded-difference L1 distance and L1 norm agree with independent FP64 sums
-    /// within the original FP32 accumulation tolerance. Only lane zero is part of each total's
-    /// contract. Cover the repro's three windows, a single vector, and a short vector-aligned tail.
+    /// within the FP32 accumulation tolerance. Only lane zero is part of each total's
+    /// contract. Cover three full windows, a single vector, and a short vector-aligned tail.
     #[tokio::test(flavor = "current_thread")]
     async fn sums_each_chips_magnitudes() {
         let _lease = crate::tests::DEVICE.lock().await;

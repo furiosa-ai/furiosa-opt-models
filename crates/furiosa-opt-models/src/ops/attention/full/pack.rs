@@ -422,10 +422,9 @@ fn encoded(value: usize) -> io::Result<i32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     //! Checked valid-run plans and transport through the production K/V transpose and finite padding.
 
-    use crate::models::diffusion::minimax_h3::packing::{Capacity, Modality, Plan};
     use crate::ops::attention::flash::{Duo, Head, HeadPairs, Span, Tokens};
     use crate::ops::attention::full::{PackInputs, PackKeys, PackPlan};
     use crate::tensor::axis::Rows;
@@ -439,27 +438,8 @@ mod tests {
     type Outputs<S, W> = (Output<S, W>, Output<S, W>);
     type Request<R, S> = PackInputs<R, S, Chips, 12>;
     type Checked<R, S> = PackPlan<R, S, 12>;
-    axes![
-        Width = 1792,
-        ToyWidth = 256,
-        Three = 3,
-        Nineteen = 19,
-        Twenty = 20
-    ];
-    type H3Rows = Rows<41984>;
+    axes![ToyWidth = 256, Three = 3];
     const POISON: u16 = 0x7fc1;
-
-    fn checked<R: AxisName, S: AxisName>(plan: Plan) -> Checked<R, S> {
-        assert_eq!(plan.capacity().query_capacity(), R::SIZE);
-        assert_eq!(plan.capacity().key_rows(), S::SIZE * Span::SIZE);
-        let pack = PackPlan::try_from_runs(
-            0..plan.query_rows(),
-            plan.key_runs().map(|run| (run.source(), run.destination())),
-        )
-        .unwrap();
-        assert_eq!(pack.key_count(), plan.key_count());
-        pack
-    }
 
     #[test]
     fn host_plan_rejects_invalid_prefixes_ranges_counts_and_overflow() {
@@ -504,33 +484,6 @@ mod tests {
         let empty = PackPlan::<Rows<8192>, Three, 4>::try_from_runs(8192..8192, []).unwrap();
         assert_eq!(empty.row_counts(), ([8192, 0, 0, 0], [[0, 0]; 4]));
         assert_eq!(empty.key_count(), 0);
-    }
-
-    #[test]
-    fn h3_valid_runs_fit_checked_key_capacity_and_copy_schedule() {
-        for (maximum, text) in [(2048, 77), (2048, 129), (2048, 2048), (1202, 1202)] {
-            let model = Capacity::new(maximum).unwrap().plan(text).unwrap();
-            let count = if maximum == 1202 {
-                checked::<H3Rows, Nineteen>(model).copy_count()
-            } else {
-                checked::<H3Rows, Twenty>(model).copy_count()
-            };
-            if text == 77 {
-                assert_eq!(count, 49);
-            }
-        }
-    }
-
-    // A different lookup from the transfer-run iterator: keys are semantic video/audio/text rows.
-    fn semantic_source(plan: Plan, key: usize) -> usize {
-        let (modality, row) = if key < 37296 {
-            (Modality::Video, key)
-        } else if key < 37710 {
-            (Modality::Audio, key - 37296)
-        } else {
-            (Modality::Text, key - 37710)
-        };
-        plan.locate(modality, row).unwrap().query_row()
     }
 
     // Exact finite BF16 payload, sensitive to chip, source row, head, feature and K/V plane.
@@ -641,14 +594,15 @@ mod tests {
         );
     }
 
-    async fn run_h3<S: AxisName>(device: &mut Device, texts: &[usize], maximum: usize) {
-        let mut outputs: Outputs<S, Width> = (output(device).await, output(device).await);
-        for &text in texts {
-            let model = Capacity::new(maximum).unwrap().plan(text).unwrap();
-            let plan = checked::<H3Rows, S>(model);
+    pub(crate) async fn run<R: AxisName, S: AxisName, W: AxisName>(
+        device: &mut Device,
+        plans: impl IntoIterator<Item = (PackPlan<R, S, 12>, Vec<usize>)>,
+    ) {
+        let mut outputs: Outputs<S, W> = (output(device).await, output(device).await);
+        for (plan, sources) in plans {
             let runs: Vec<_> = plan.runs().collect();
-            let query = input::<H3Rows, Width>(device, 0, &runs).await;
-            let value = input::<H3Rows, Width>(device, 1, &runs).await;
+            let query = input::<R, W>(device, 0, &runs).await;
+            let value = input::<R, W>(device, 1, &runs).await;
             let request = Request::upload(device, &plan).await.unwrap();
             launch(
                 pack_kv,
@@ -656,26 +610,14 @@ mod tests {
             )
             .await
             .unwrap();
-            let sources: Vec<_> = (0..model.key_count())
-                .map(|key| semantic_source(model, key))
-                .collect();
             // Retain the allocations across changing requests, so stale valid keys must be cleared.
             let (key, value) = outputs;
             let key = key.into_buffer();
             let value = value.into_buffer();
-            check::<S, Width>(device, key.alias(..).unwrap(), 0, &sources).await;
-            check::<S, Width>(device, value.alias(..).unwrap(), 1, &sources).await;
+            check::<S, W>(device, key.alias(..).unwrap(), 0, &sources).await;
+            check::<S, W>(device, value.alias(..).unwrap(), 1, &sources).await;
             outputs = (key.try_into().unwrap(), value.try_into().unwrap());
         }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    #[ignore = "requires four explicitly selected RNGD chips"]
-    async fn h3_valid_runs_pack_exactly_and_clear_stale_keys() {
-        let _lease = crate::tests::DEVICE.lock().await;
-        let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
-        run_h3::<Twenty>(&mut device, &[77, 2048, 129, 77], 2048).await;
-        run_h3::<Nineteen>(&mut device, &[1202], 1202).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -696,26 +638,10 @@ mod tests {
             .collect();
         let plan = Checked::<R, Three>::try_from_runs(13..8180, runs).unwrap();
         let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
-        let mut outputs: Outputs<Three, ToyWidth> =
-            (output(&mut device).await, output(&mut device).await);
-        for plan in [plan, Checked::try_from_runs(8192..8192, []).unwrap()] {
-            let runs: Vec<_> = plan.runs().collect();
-            let query = input::<R, ToyWidth>(&mut device, 0, &runs).await;
-            let value = input::<R, ToyWidth>(&mut device, 1, &runs).await;
-            let request = Request::upload(&mut device, &plan).await.unwrap();
-            launch(
-                pack_kv,
-                (&mut device, &request, (&query, &value), &mut outputs),
-            )
-            .await
-            .unwrap();
-            let sources: Vec<_> = runs.iter().flat_map(|(source, _)| source.clone()).collect();
-            let (key, value) = outputs;
-            let key = key.into_buffer();
-            let value = value.into_buffer();
-            check::<Three, ToyWidth>(&mut device, key.alias(..).unwrap(), 0, &sources).await;
-            check::<Three, ToyWidth>(&mut device, value.alias(..).unwrap(), 1, &sources).await;
-            outputs = (key.try_into().unwrap(), value.try_into().unwrap());
-        }
+        let plans = [plan, Checked::try_from_runs(8192..8192, []).unwrap()].map(|plan| {
+            let sources = plan.runs().flat_map(|(source, _)| source).collect();
+            (plan, sources)
+        });
+        run::<R, Three, ToyWidth>(&mut device, plans).await;
     }
 }

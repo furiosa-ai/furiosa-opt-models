@@ -577,6 +577,15 @@ mod tests {
         }
         canonical::<Block>();
         canonical::<Refiner>();
+        type Wrapped<X> =
+            crate::modules::diffusion::WithSpans<Block<Width, Attended, Expanded, Time, X>>;
+        let projected: Option<
+            <crate::modules::diffusion::WithSpans<Block> as Residency>::In<Host>,
+        > = None;
+        let _: Option<Wrapped<Host>> = projected;
+        let borrowed: Option<<crate::modules::diffusion::WithSpans<Block> as Residency>::In<&Hbm>> =
+            None;
+        let _: Option<Wrapped<&Hbm>> = borrowed;
         let cp = checkpoint(true);
         let tree = Joint::<Host>::load(&mut Context::new(None), &cp).unwrap();
         drop(cp);

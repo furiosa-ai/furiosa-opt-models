@@ -246,3 +246,51 @@ axes![
     K3 = 3,
     K11 = 11
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::Fifth as Wide;
+    use crate::Module;
+    use crate::modules::convolution::{
+        AntiAliased,
+        tests::{Case, KAISER},
+    };
+    use crate::ops::convolution::frames::{self, Frames, Stereo, Window};
+    use crate::tensor::parallel::Chip;
+    use crate::tests::DEVICE;
+    use furiosa_opt_std::prelude::*;
+    use furiosa_opt_std::runtime::launch;
+
+    axes![W = 512];
+
+    #[device(chip = 1)]
+    fn wide(
+        device: &mut Device,
+        input: &Frames<f32, W, Wide>,
+        module: &AntiAliased<W>,
+    ) -> Frames<bf16, W, Wide> {
+        module.forward(device, (), &mut (), input)
+    }
+
+    /// The same over 512 channels in 32 packets of sixteen, both filters the checkpoint's.
+    #[tokio::test(flavor = "current_thread")]
+    async fn wide_activation_matches_definition() {
+        let _lease = DEVICE.lock().await;
+        let mut device = Device::new(wide.topology()).unwrap();
+        let case = Case::new(Wide::SAMPLES, W::SIZE, (KAISER, KAISER));
+        let input = HostTensor::<f32, m![Stereo, { frames::FrameRows<Wide> }, W]>::from_vec(
+            case.frame::<Wide>(W::SIZE),
+        )
+        .to_hbm::<Chip, m![Stereo, { frames::FrameRows<Wide> }, W]>(&mut device.pdma)
+        .await
+        .unwrap();
+        let module: AntiAliased<W> = case.checkpoint().load(&mut device).unwrap();
+        let output = launch(wide, (&mut device, &input, &module)).await.unwrap();
+        let actual = output
+            .to_host::<m![Stereo, { frames::FrameRows<Wide> }, W]>(&mut device.pdma)
+            .await
+            .unwrap()
+            .into_vec();
+        case.check::<Wide>(&actual, W::SIZE, 37);
+    }
+}

@@ -397,7 +397,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod row_tests {
+pub(crate) mod row_tests {
     //! Checked row transfers against host addresses, independently for Join and Split.
     //!
     //! No checkpoint data is used. Sources outside the declared initialized intervals are NaN;
@@ -405,7 +405,6 @@ mod row_tests {
     //! their previous values. Head outputs initialize their aligned extensions.
 
     use crate::Op;
-    use crate::models::diffusion::minimax_h3::packing::Capacity;
     use crate::ops::index::packed::{Join, Materialize, RowInputs, RowPlan, Rows, Span, Split};
     use crate::tensor::{axis, parallel::Shard};
     use furiosa_opt_std::prelude::*;
@@ -423,10 +422,10 @@ mod row_tests {
     type AudioHead = axis::Rows<32>;
 
     #[derive(Clone, Debug)]
-    struct Case {
-        initialized: [Range<usize>; 3],
-        copies: [(Range<usize>, usize); 3],
-        work: usize,
+    pub(crate) struct Case {
+        pub(crate) initialized: [Range<usize>; 3],
+        pub(crate) copies: [(Range<usize>, usize); 3],
+        pub(crate) work: usize,
     }
 
     #[device(chip = 4)]
@@ -517,7 +516,7 @@ mod row_tests {
         }
     }
 
-    async fn cases<R: AxisName, T: AxisName, A: AxisName, V: AxisName>(
+    pub(crate) async fn cases<R: AxisName, T: AxisName, A: AxisName, V: AxisName>(
         device: &mut Device,
         cases: &[(Case, RowPlan<R, T, A, V>)],
     ) {
@@ -642,47 +641,6 @@ mod row_tests {
                 assert_bits(&actual, &expected, "independent Split", case_index);
             }
         }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    #[ignore = "requires four explicitly selected RNGD chips"]
-    async fn checked_join_split_preserve_addresses_and_work_guards() {
-        let _lease = crate::tests::DEVICE.lock().await;
-        type Transfers =
-            RowPlan<axis::Rows<10496>, axis::Rows<512>, axis::Rows<112>, axis::Rows<9328>>;
-        let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
-        let requests: Vec<_> = [77usize, 129, 2048, 1, 77]
-            .into_iter()
-            .map(|tokens| {
-                let text = tokens.div_ceil(64) * 16;
-                let work = (text + 112 + 9328).div_ceil(256) * 256;
-                let expected = Case {
-                    initialized: [0..text, 0..112, 0..9328],
-                    copies: [(0..text, 0), (0..112, text), (0..9328, text + 112)],
-                    work,
-                };
-                let plan = Capacity::default()
-                    .plan(tokens)
-                    .unwrap()
-                    .row_plan()
-                    .unwrap();
-                (expected, plan)
-            })
-            .chain([(
-                Case {
-                    initialized: [0..0, 0..0, 0..0],
-                    copies: [(0..0, 0), (0..0, 0), (0..0, 0)],
-                    work: 0,
-                },
-                Transfers::try_new([0..0, 0..0, 0..0], [(0..0, 0), (0..0, 0), (0..0, 0)], 0)
-                    .unwrap(),
-            )])
-            .collect();
-        cases::<axis::Rows<10496>, axis::Rows<512>, axis::Rows<112>, axis::Rows<9328>>(
-            &mut device,
-            &requests,
-        )
-        .await;
     }
 
     #[device(chip = 4)]

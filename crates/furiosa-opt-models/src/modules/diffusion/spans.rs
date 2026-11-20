@@ -204,16 +204,10 @@ mod tests {
     use super::*;
     use crate::Op;
     use crate::load::Named;
-    use crate::models::diffusion::minimax_h3::{embeddings, transformer};
     use crate::ops::index::packed::{Group, Table, live::SpanInputs};
     use crate::ops::normalization::adaptive::AdaptiveRms;
     use crate::ops::pointwise::gated;
-    use crate::tensor::{
-        axis,
-        form::Weight,
-        memory::{Hbm, Memory},
-        parallel::Chip,
-    };
+    use crate::tensor::{axis, form::Weight, parallel::Chip};
     use crate::tests::DEVICE;
     use furiosa_opt_std::runtime::launch;
 
@@ -301,24 +295,12 @@ mod tests {
 
     type W = axis::Rows<256>;
     type R = axis::Rows<1280>;
-    type H3Tree<X> = WithSpans<
-        transformer::Block<
-            embeddings::Width,
-            transformer::Attended,
-            transformer::Expanded,
-            embeddings::Time,
-            X,
-        >,
-    >;
-
     #[test]
-    fn named_h3_norms_delegate_explicit_operands_and_the_wrapped_tree_projects() {
-        type R = axis::Rows<10496>;
-        type W = embeddings::Width;
-        type C = embeddings::Chips;
+    fn named_norms_delegate_explicit_operands_and_the_wrapped_block_runs() {
+        type C = Chip;
         type Input = Hidden<R, W, C>;
-        type Norm1 = Named<"norm1", transformer::AdaptiveNorm>;
-        type Norm2 = Named<"norm2", transformer::AdaptiveNorm>;
+        type Norm1 = Named<"norm1", AdaptiveRms<W, EPSILON, C>>;
+        type Norm2 = Named<"norm2", AdaptiveRms<W, EPSILON, C>>;
         fn norm<N>()
         where
             for<'m, 'p, 'x, 't, 's> BoundSpans<'m, 'p, N, R, 16>:
@@ -327,8 +309,8 @@ mod tests {
         }
         norm::<Norm1>();
         norm::<Norm2>();
-        norm::<Named<"norm1", transformer::AdaptiveNorm<W, &Hbm>>>();
-        norm::<Named<"norm2", transformer::AdaptiveNorm<W, &Hbm>>>();
+        norm::<Named<"norm1", AdaptiveRms<W, EPSILON, C, &HbmTensor<bf16, C, m![W]>>>>();
+        norm::<Named<"norm2", AdaptiveRms<W, EPSILON, C, &HbmTensor<bf16, C, m![W]>>>>();
 
         fn module<T>()
         where
@@ -344,16 +326,6 @@ mod tests {
         {
         }
         module::<Fixture<W, C>>();
-
-        struct Shapes;
-        impl Memory for Shapes {
-            type Tensor<D: MaterializableScalar, C: M + 'static, S: M + 'static> = ();
-        }
-        let projected: Option<<WithSpans<transformer::Block> as Residency>::In<Shapes>> = None;
-        let _: Option<H3Tree<Shapes>> = projected;
-        // Borrowing retains precisely the same wrapper and named child types.
-        let borrowed: Option<<WithSpans<transformer::Block> as Residency>::In<&Hbm>> = None;
-        let _: Option<H3Tree<&Hbm>> = borrowed;
     }
 
     #[device(chip = 1)]

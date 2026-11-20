@@ -64,8 +64,9 @@ pub(super) fn parse(kwargs: &Bound<'_, PyDict>) -> PyResult<Input> {
         ));
     }
 
-    // Index and mask tensors retain the repro's logical flattening semantics; exporters with
-    // strides are copied in logical order by HostTensor, without changing dtype or values.
+    // Index lists and masks flatten all axes in row-major logical order (last axis fastest).
+    // HostTensor copies strided DLPack inputs into that order without converting element
+    // bytes; read checks each field's required dtype before indices or masks are interpreted.
     let rows = |name| indices(&field(&get(name)?, "position_ids")?, Dtype::I64);
     let text_rows = rows("text_pos_info")?;
     let audio_rows = rows("audio_pos_info")?;

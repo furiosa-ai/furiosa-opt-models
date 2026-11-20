@@ -1,7 +1,10 @@
 //! Row contractions over independently arriving collective tiles.
 //!
-//! Adapted from the repro's tiled grouped projection. The contraction is shared
-//! with ordinary row projections; tile boundaries retain the pending result.
+//! Each pass lands its coefficient slab once. The head supplies one block per part,
+//! followed by whole tiles of each part's blocks. A tile's first TDMA landing depends
+//! on that tile's transfer. Its final result stays pending until the next tile's first
+//! contraction is issued; the final tile's result is stored explicitly. The contraction
+//! is shared with ordinary row projections.
 
 use core::marker::PhantomData;
 

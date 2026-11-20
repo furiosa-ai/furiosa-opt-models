@@ -453,10 +453,37 @@ fn invalid(message: impl Into<String>) -> io::Error {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+    use crate::ops::attention::full::PackPlan;
     use crate::tensor::axis;
     use std::collections::BTreeSet;
+
+    pub(super) fn key_plan<S: AxisName>(model: Plan) -> PackPlan<axis::Rows<41984>, S, 12> {
+        assert_eq!(model.capacity().query_capacity(), 41984);
+        assert_eq!(model.capacity().key_rows(), S::SIZE * KEY_SPAN);
+        let pack = PackPlan::try_from_runs(
+            0..model.query_rows(),
+            model
+                .key_runs()
+                .map(|run| (run.source(), run.destination())),
+        )
+        .unwrap();
+        assert_eq!(pack.key_count(), model.key_count());
+        pack
+    }
+
+    // Keys use semantic video/audio/text order, independently of the transfer-run iterator.
+    pub(super) fn semantic_source(plan: Plan, key: usize) -> usize {
+        let (modality, row) = if key < VIDEO_TOKENS {
+            (Modality::Video, key)
+        } else if key < VIDEO_TOKENS + AUDIO_TOKENS {
+            (Modality::Audio, key - VIDEO_TOKENS)
+        } else {
+            (Modality::Text, key - VIDEO_TOKENS - AUDIO_TOKENS)
+        };
+        plan.locate(modality, row).unwrap().query_row()
+    }
 
     #[test]
     fn matches_the_77_token_row_order_and_distinguishes_storage_from_work() {
@@ -657,51 +684,34 @@ mod tests {
     }
 
     #[test]
-    fn key_runs_exclude_padding_when_valid_keys_exactly_fill_the_allocation() {
-        let plan = Capacity::default().plan(77).unwrap();
-        let runs: Vec<_> = plan.key_runs().collect();
-        assert_eq!(runs.len(), 11);
-        assert_eq!(runs[0].source(), 144..9472);
-        assert_eq!(runs[0].destination(), 0..9328);
-        assert_eq!(runs[3].source(), 28560..37872);
-        assert_eq!(runs[3].destination(), 27984..37296);
-        assert_eq!(runs[7].source(), 28448..28526);
-        assert_eq!(runs[7].destination(), 37632..37710);
-        assert_eq!(runs[10].source(), 18944..18957);
-        assert_eq!(runs[10].destination(), 37774..37787);
-
-        // With this supported capacity, all valid keys fit exactly. Copying the aligned text
-        // work instead would require 38926 rows and overrun the 38912-row destination.
-        let capacity = Capacity::new(1202).unwrap();
-        assert_eq!(capacity.key_rows(), 38912);
-        let plan = capacity.plan(1202).unwrap();
-        assert_eq!(plan.key_count(), capacity.key_rows());
-        assert_eq!(plan.text_rows_per_part() * PARTS + 37710, 38926);
-        let runs: Vec<_> = plan.key_runs().collect();
-        assert_eq!(runs.last().unwrap().destination(), 38622..38912);
-        assert_eq!(runs.last().unwrap().source(), 29952..30242);
-
-        for tokens in [1, 64, 77, 128, 129, 1153, 1202, 2048] {
-            let plan = Capacity::default().plan(tokens).unwrap();
+    fn valid_keys_fill_checked_transfers_without_modality_padding() {
+        fn check<S: AxisName>(model: Plan) {
+            let pack = key_plan::<S>(model);
+            let expected: Vec<_> = (0..model.key_count())
+                .map(|key| semantic_source(model, key))
+                .collect();
             let mut end = 0;
-            for run in plan.key_runs() {
-                assert_eq!(run.destination().start, end);
-                assert_eq!(run.source().len(), run.destination().len());
-                assert!(run.source().end <= plan.query_rows());
-                assert!(run.destination().end <= plan.capacity().key_rows());
-                end = run.destination().end;
-                for source in run.source() {
-                    let token = plan
-                        .token(
-                            source / plan.work_rows_per_part(),
-                            source % plan.work_rows_per_part(),
-                        )
-                        .expect("key transfers contain only semantic tokens");
-                    assert_eq!(token.query_row(), source);
-                }
+            let mut actual = Vec::new();
+            for (source, destination) in pack.runs() {
+                assert_eq!(destination.start, end);
+                assert_eq!(source.len(), destination.len());
+                assert!(source.end <= model.query_rows());
+                assert!(destination.end <= model.capacity().key_rows());
+                end = destination.end;
+                actual.extend(source);
             }
-            assert_eq!(end, plan.key_count());
+            assert_eq!(actual, expected);
+            assert_eq!(end, model.key_count());
+            if model.text_tokens() == 77 {
+                assert_eq!(pack.copy_count(), 49);
+            }
         }
+        for text in [1, 64, 77, 128, 129, 1153, 1202, 2048] {
+            check::<axis::Rows<20>>(Capacity::default().plan(text).unwrap());
+        }
+        let model = Capacity::new(1202).unwrap().plan(1202).unwrap();
+        assert_eq!(model.key_count(), model.capacity().key_rows());
+        check::<axis::Rows<19>>(model);
     }
 
     #[test]
@@ -743,5 +753,81 @@ mod tests {
         let huge_gather = usize::MAX / GATHER_BODY * GATHER_BODY + GATHER_HEAD;
         let error = Capacity::with_gather_rows(2048, huge_gather).unwrap_err();
         assert!(error.to_string().contains("overflows usize"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::{
+        Capacity,
+        tests::{key_plan, semantic_source},
+    };
+    use crate::ops::attention::full::pack::tests::run;
+    use crate::ops::index::packed::{
+        RowPlan,
+        row_tests::{Case, cases},
+    };
+    use crate::tensor::axis;
+    use furiosa_opt_std::prelude::*;
+
+    async fn run_keys<S: AxisName>(device: &mut Device, texts: &[usize], maximum: usize) {
+        let plans = texts.iter().map(|&text| {
+            let model = Capacity::new(maximum).unwrap().plan(text).unwrap();
+            let sources = (0..model.key_count())
+                .map(|key| semantic_source(model, key))
+                .collect();
+            (key_plan::<S>(model), sources)
+        });
+        run::<axis::Rows<41984>, S, axis::Rows<1792>>(device, plans).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires four explicitly selected RNGD chips"]
+    async fn h3_valid_runs_pack_exactly_and_clear_stale_keys() {
+        let _lease = crate::tests::DEVICE.lock().await;
+        let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
+        run_keys::<axis::Rows<20>>(&mut device, &[77, 2048, 129, 77], 2048).await;
+        run_keys::<axis::Rows<19>>(&mut device, &[1202], 1202).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires four explicitly selected RNGD chips"]
+    async fn checked_join_split_preserve_addresses_and_work_guards() {
+        let _lease = crate::tests::DEVICE.lock().await;
+        type Transfers =
+            RowPlan<axis::Rows<10496>, axis::Rows<512>, axis::Rows<112>, axis::Rows<9328>>;
+        let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
+        let requests: Vec<_> = [77usize, 129, 2048, 1, 77]
+            .into_iter()
+            .map(|tokens| {
+                let text = tokens.div_ceil(64) * 16;
+                let work = (text + 112 + 9328).div_ceil(256) * 256;
+                let expected = Case {
+                    initialized: [0..text, 0..112, 0..9328],
+                    copies: [(0..text, 0), (0..112, text), (0..9328, text + 112)],
+                    work,
+                };
+                let plan = Capacity::default()
+                    .plan(tokens)
+                    .unwrap()
+                    .row_plan()
+                    .unwrap();
+                (expected, plan)
+            })
+            .chain([(
+                Case {
+                    initialized: [0..0, 0..0, 0..0],
+                    copies: [(0..0, 0), (0..0, 0), (0..0, 0)],
+                    work: 0,
+                },
+                Transfers::try_new([0..0, 0..0, 0..0], [(0..0, 0), (0..0, 0), (0..0, 0)], 0)
+                    .unwrap(),
+            )])
+            .collect();
+        cases::<axis::Rows<10496>, axis::Rows<512>, axis::Rows<112>, axis::Rows<9328>>(
+            &mut device,
+            &requests,
+        )
+        .await;
     }
 }

@@ -718,8 +718,8 @@ mod prefix_tests {
         }
     }
 
-    /// Extend the repro's full-width grouped/static equality check to the runtime prefix that
-    /// failed compilation at 5376 -> 28672. Empty, odd and even work also preserve destination tails.
+    /// Check a 5376 -> 28672 runtime prefix against the static grouped projection.
+    /// Empty, odd and even work also preserve destination tails.
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "requires an RNGD device"]
     async fn full_width_prefix_matches_the_static_grouped_projection() {
