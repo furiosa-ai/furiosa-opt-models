@@ -3,12 +3,14 @@
 //! - The input projection is linear and the convolution after it zero-pads its input, so the two
 //!   fold into one convolution over the latent channels and a channel of ones that is zero on the
 //!   padding rows, which carries the projection's bias exactly at the edges too.
-//! - The latent's denormalization (`z * std + mean`) folds into the same coefficients.
+//! - Parameter loading decides whether an input normalization is folded into the coefficients;
+//!   this operation only prepares the lifted rows.
 use furiosa_opt_std::prelude::*;
 
 use super::frames::{self, Frames, Stereo, Window};
 use crate::Op;
 use crate::load::Load;
+use crate::tensor::memory::residency::Residency;
 use crate::tensor::parallel::Chip;
 
 axes![Latent = 32, Halves = 2];
@@ -26,7 +28,7 @@ impl AxisName for Lifted {
 pub type Rows<S, X = Chip> = HbmTensor<f32, X, m![Stereo, { Symbol<S> }, Latent]>;
 
 /// `[z, 1, 1, 0, ...]` on every live row, zero on the padding rows.
-#[derive(Clone, Copy, Debug, Default, DeviceSend, Load)]
+#[derive(Clone, Copy, Debug, Default, DeviceSend, Load, Residency)]
 pub struct Lift;
 
 impl<'x, S: Window, X: M> Op<&'x Rows<S, X>> for Lift {

@@ -11,13 +11,15 @@ use crate::ops::normalization::adaptive::{
 use crate::ops::normalization::{Chunk, FeatureSlices};
 use crate::tensor::form::Weight;
 use crate::tensor::form::split::{Sides, Stacked};
+use crate::tensor::memory::residency::Residency;
 use core::borrow::Borrow;
 use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
 
 /// BF16 rows projected by `weight` with a per-output FP32 `bias`, each FP32 sum plus its offset
 /// rounded once to BF16; both are held owned or borrowed.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(Matrix, Offset))]
 pub struct Biased<
     In: AxisName,
     Out: AxisName,
@@ -150,7 +152,8 @@ impl<Out, In> Stored<Out, In> {
 
 /// FP32 coefficients as stacked BF16 high and low parts, made from the checkpoint's FP32 `weight`,
 /// with FP32 offsets: one contraction makes the FP32 product within 2^-17 of each term.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(Matrix, Offset))]
 #[load(from = Stored<Out, In>)]
 pub struct Precise<
     In: AxisName,
@@ -289,7 +292,8 @@ where
 
 /// FP32 rows times FP32 coefficients plus offsets, rounded once, within 2^-17 of each term: rows as
 /// BF16 high and low parts, coefficients from FP32 `weight` as `[high | high]` and `[low | 0]`.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(Matrix, Offset))]
 #[load(from = Stored<Out, In>)]
 pub struct Embedding<
     In: AxisName,
@@ -426,73 +430,40 @@ where
     }
 }
 
-impl<'x, In: AxisName, Out: AxisName, R: AxisName, X: M, Matrix, Offset>
-    Op<&'x HbmTensor<f32, X, m![R, In]>> for Embedding<In, Out, X, Matrix, Offset>
+impl<'x, In: AxisName, Out: AxisName, R: AxisName, X: M, Coefficients, Offset>
+    Op<&'x HbmTensor<f32, X, m![R, In]>>
+    for Embedding<In, Out, X, Linear<Sides<In>, Stacked<Out>, X, Coefficients>, Offset>
 where
-    Matrix: for<'p, 'o> Op<
-            (
-                &'p Rows<R, Sides<In>, X>,
-                &'o mut HbmTensor<f32, X, m![R, { Symbol<Stacked<Out>> }]>,
-            ),
-            Output = (),
-        >,
+    Coefficients: Borrow<HbmTensor<bf16, X, m![{ Symbol<Stacked<Out>> }, { Symbol<Sides<In>> }]>>,
     Offset: Borrow<HbmTensor<f32, X, m![Out]>>,
 {
     type Output = Rows<R, Out, X>;
 
+    /// Retain coefficient chunks in data memory while FP32 input strips stream through the
+    /// split contractions. Each strip writes its completed BF16 output once.
     fn forward(
         &self,
         device: &mut Device,
         input: &'x HbmTensor<f32, X, m![R, In]>,
     ) -> Self::Output {
-        type Each = m![Strip % 32 # 256];
-        type Wide<Matrix, X> = DmTensor<f32, X, Half, Slices<Matrix>, m![Strip % 8, Matrix % 128]>;
-        // Each row's high and low parts, side by side.
-        let mut parts: Rows<R, Sides<In>, X> = HbmTensor::new();
-        for tile in 0..Strips::<R>::SIZE {
-            let rows: DmTensor<f32, X, Half, Each, m![In]> =
-                // SAFETY: the tiles split the rows in order.
-                unsafe { input.view().reshape::<X, Banded<R, In>>() }
-                    .tile::<m![{ Symbol<Strips<R>> }], 1, m![
-                        { Symbol<Strips<R>> } = 1 # ({ Symbol<Strips<R>> }),
-                        Strip,
-                        In
-                    ]>(tile)
-                    .to_dm(&mut device.tdma);
-            let high: DmTensor<bf16, X, Half, Each, m![In]> = device
-                .main
-                .begin(rows.view())
-                .fetch::<m![In / 8], m![In % 8]>()
-                .collect::<m![In / 8], m![In % 8]>()
-                .cast::<bf16, m![In % 8 # 16]>()
-                .commit_trim::<m![In % 8]>()
-                .commit();
-            let widened: VrfTensor<f32, X, Half, Each, m![In]> = device
-                .sub
-                .begin(high.view())
-                .fetch::<m![In / 8], m![In % 8]>()
-                .fetch_cast::<f32>()
-                .collect::<m![In / 8], m![In % 8]>()
-                .to_vrf();
-            let low: DmTensor<bf16, X, Half, Each, m![In]> = device
-                .main
-                .begin(rows.view())
-                .fetch::<m![In / 8], m![In % 8]>()
-                .collect::<m![In / 8], m![In % 8]>()
-                .vector_init()
-                .vector_intra_slice_tag(TagMode::Zero)
-                .vector_narrow_split::<m![In / 8, In % 8 / 4 % 2], m![In % 4]>()
-                .vector_fp_binary(FpBinaryOp::SubF, &widened)
-                .vector_widen_concat::<m![In / 8], m![In % 8]>()
-                .vector_final()
-                .cast::<bf16, m![In % 8 # 16]>()
-                .commit_trim::<m![In % 8]>()
-                .commit();
-            Sides::<In>::new().forward(&mut *device, (&high, &mut parts, (tile, 0)));
-            Sides::<In>::new().forward(&mut *device, (&low, &mut parts, (tile, 1)));
-        }
-        let mut sums: HbmTensor<f32, X, m![R, { Symbol<Stacked<Out>> }]> = HbmTensor::new();
-        self.weight.forward(&mut *device, (&parts, &mut sums));
+        type S<In> = Symbol<Sides<In>>;
+        type Chunked<D, Out, X, E> = DmTensor<D, X, Half, Slices<Out>, E>;
+        type Lanes<In, Out, X> =
+            TrfTensor<bf16, X, Half, Slices<Out>, m![Strip % 8], m![{ S<In> }]>;
+        // SAFETY: a stacked output is its sum's part, then its output.
+        let stacked = unsafe {
+            self.weight
+                .tensor()
+                .view()
+                .reshape::<X, m![Part, Out, { S<In> }]>()
+        };
+        let coefficients =
+            |device: &mut Device, part: usize| -> Chunked<bf16, Out, X, m![Out % 128, { S<In> }]> {
+                stacked
+                    .tile::<m![Part], 1, m![Part = 1 # 2, Out, { S<In> }]>(part)
+                    .to_dm(&mut device.tdma)
+            };
+        let (first, second) = (coefficients(device, 0), coefficients(device, 1));
         let bias: &HbmTensor<f32, X, m![Out]> = self.bias.borrow();
         let bias: Feature<f32, Out, X> = bias.view().to_dm(&mut device.tdma);
         let bias: Operand<Out, X> = device
@@ -501,30 +472,92 @@ where
             .fetch::<m![Out % 128 / 8], m![Out % 8]>()
             .collect::<m![Out % 128 / 8], m![Out % 8]>()
             .to_vrf();
-        // SAFETY: a row's stacked sums are its first sums, then its second, and the tiles split the
-        // rows in order.
-        let sums = unsafe {
-            sums.view()
-                .reshape::<X, m![{ Symbol<Strips<R>> }, Strip, Part, Out]>()
+        let sums = |device: &mut Device,
+                    coefficients: &Chunked<bf16, Out, X, m![Out % 128, { S<In> }]>,
+                    lanes: &Lanes<In, Out, X>|
+         -> Chunked<f32, Out, X, m![Strip % 8, Out % 128]> {
+            device
+                .main
+                .begin(coefficients.view())
+                .fetch::<m![Out % 128, { S<In> } / 16], m![{ S<In> } % 16]>()
+                .collect::<m![Out % 128, { S<In> } / 16], m![{ S<In> } % 16]>()
+                .contract_outer::<m![Out % 128, { S<In> } / 32], m![{ S<In> } % 32], _, _, _>(lanes)
+                .contract_packet::<m![1]>()
+                .contract_time::<m![Out % 128]>()
+                .contract_lane::<m![Out % 128], m![Strip % 8]>(LaneMode::Interleaved)
+                .vector_init()
+                .vector_inter_slice_reduce::<Slices<Out>, m![Out % 128]>(InterSliceReduceOpF32::Add)
+                .vector_final()
+                .transpose::<m![Out % 128 / 2, Strip % 8], m![Out % 2 # 8]>()
+                .commit_trim::<m![Out % 2]>()
+                .commit()
         };
         let mut output = HbmTensor::new();
         for tile in 0..Strips::<R>::SIZE {
-            let part = |device: &mut Device, part: usize| -> Wide<Out, X> {
-                sums.tile::<m![{ Symbol<Strips<R>> }], 1, m![
-                    { Symbol<Strips<R>> } = 1 # ({ Symbol<Strips<R>> }),
-                    Strip,
-                    Part,
-                    Out
-                ]>(tile)
-                    .tile::<m![Part], 1, m![
+            let rows: Chunked<f32, Out, X, m![Strip % 8, In]> =
+                // SAFETY: the tiles split the rows in order.
+                unsafe { input.view().reshape::<X, Banded<R, In>>() }
+                    .tile::<m![{ Symbol<Strips<R>> }], 1, m![
                         { Symbol<Strips<R>> } = 1 # ({ Symbol<Strips<R>> }),
                         Strip,
-                        Part = 1 # 2,
-                        Out
-                    ]>(part)
-                    .to_dm(&mut device.tdma)
+                        In
+                    ]>(tile)
+                    .to_dm(&mut device.tdma);
+            let mut parts: Chunked<bf16, Out, X, m![Strip % 8, Part, In]> = DmTensor::new();
+            device
+                .main
+                .begin(rows.view())
+                .fetch::<m![Strip % 8, In / 8], m![In % 8]>()
+                .collect::<m![Strip % 8, In / 8], m![In % 8]>()
+                .cast::<bf16, m![In % 8 # 16]>()
+                .commit_trim::<m![In % 8]>()
+                .commit_view(
+                    parts
+                        .view_mut()
+                        .tile::<m![Part], 1, m![Strip % 8, Part = 1 #{!} 2, In]>(0),
+                );
+            let widened: VrfTensor<f32, X, Half, Slices<Out>, m![Strip % 8, In]> = device
+                .sub
+                .begin(
+                    parts
+                        .view()
+                        .tile::<m![Part], 1, m![Strip % 8, Part = 1 # 2, In]>(0),
+                )
+                .fetch::<m![Strip % 8, In / 8], m![In % 8]>()
+                .fetch_cast::<f32>()
+                .collect::<m![Strip % 8, In / 8], m![In % 8]>()
+                .to_vrf();
+            device
+                .main
+                .begin(rows.view())
+                .fetch::<m![Strip % 8, In / 8], m![In % 8]>()
+                .collect::<m![Strip % 8, In / 8], m![In % 8]>()
+                .vector_init()
+                .vector_intra_slice_tag(TagMode::Zero)
+                .vector_narrow_split::<m![Strip % 8, In / 8, In % 8 / 4 % 2], m![In % 4]>()
+                .vector_fp_binary(FpBinaryOp::SubF, &widened)
+                .vector_widen_concat::<m![Strip % 8, In / 8], m![In % 8]>()
+                .vector_final()
+                .cast::<bf16, m![In % 8 # 16]>()
+                .commit_trim::<m![In % 8]>()
+                .commit_view(
+                    parts
+                        .view_mut()
+                        .tile::<m![Part], 1, m![Strip % 8, Part = 1 #{!} 2, In]>(1),
+                );
+            // SAFETY: a row's parts are its high part, then its low part.
+            let parts = unsafe {
+                parts
+                    .view()
+                    .reshape::<X, Half, Slices<Out>, m![Strip % 8, { S<In> }]>()
             };
-            let (first, second) = (part(device, 0), part(device, 1));
+            let lanes: Lanes<In, Out, X> = device
+                .sub
+                .begin(parts)
+                .fetch::<m![Strip % 8, { S<In> } / 16], m![{ S<In> } % 16]>()
+                .collect::<m![Strip % 8, { S<In> } / 16], m![{ S<In> } % 16]>()
+                .to_trf();
+            let (first, second) = (sums(device, &first, &lanes), sums(device, &second, &lanes));
             let second: VrfTensor<f32, X, Half, Slices<Out>, m![Strip % 8, Out % 128]> = device
                 .sub
                 .begin(second.view())
@@ -722,7 +755,8 @@ impl<In: AxisName, R: AxisName, X: M> Op<&HbmTensor<f32, X, m![R, In]>> for Side
 
 /// The time embedding of `t` in `[0, 1]`: `[cos | sin](t f)`, `f_j = 10000^(-j / 128)`, then FP32
 /// projection, SiLU and FP32 projection, each within 2^-17 of each term; a load places `f`.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(First, Second, Frequencies))]
 #[load(tree)]
 pub struct TimeEmbedding<
     Hidden: AxisName,

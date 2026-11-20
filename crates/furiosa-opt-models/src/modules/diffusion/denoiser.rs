@@ -3,6 +3,7 @@
 
 use crate::load::Load;
 use crate::tensor::image::Vector;
+use crate::tensor::memory::residency::Residency;
 use crate::{First, Layers, Module, Unrolled};
 use furiosa_opt_std::prelude::*;
 use std::marker::PhantomData;
@@ -566,7 +567,8 @@ where
 }
 
 /// Modulates the final norm from the condition and projects normalized hidden values to output.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(Modulation, Norm, Projection))]
 pub struct Head<Modulation, Norm, Projection> {
     #[load(rename = "")]
     pub modulation: Modulation,

@@ -8,8 +8,8 @@
 //!   checkpoint.
 //! - A load reads the whole model, or its media encoder alone, which the registry lists as an
 //!   implementation of its own.
-//! - Every implementation runs on one chip, caches keys and values in BF16 and loads whole; any
-//!   other choice is unsupported until the registry holds an implementation that makes it.
+//! - The registry chooses the implementation's chip count. Decoders use one chip and BF16 KV
+//!   caches; H3 uses four chips and returns a pipeline without a KV cache. Both load whole.
 //! - A batch-invariant load asks every implementation's calls to tile their attention fixed, which
 //!   they serve as an `Instance` of their decoder.
 //! - A quantization reads the checkpoint quantized, so an implementation whose projections a load
@@ -22,8 +22,10 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::str::FromStr;
 
+use crate::diffusion::minimax_h3;
 use crate::registry::{Implementation, Model};
 use furiosa_opt_models::load::{Checkpoint, Context, LoadError, Part};
+use furiosa_opt_models::models::diffusion::minimax_h3::Inputs;
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
 use furiosa_opt_models::tensor::form::fp8::Granularity;
 use furiosa_opt_std::prelude::Device;
@@ -67,6 +69,15 @@ pub struct Config {
     kv_cache: Dtype,
     chips: usize,
     tiling: Tiling,
+    execution: Execution,
+}
+
+/// The checked pipeline documents travel with the selected configuration, rather than being
+/// read again while preparing weights. Decoder configurations carry no pipeline documents.
+#[derive(Clone, Debug)]
+enum Execution {
+    Model,
+    MiniMaxH3(Box<Inputs>),
 }
 
 impl LoadOptions {
@@ -169,6 +180,26 @@ impl LoadOptions {
         })
     }
 
+    /// Prepare H3's strict host weights after checking every option and component document.
+    /// The caller then places this pipeline on its existing four-chip `SharedDevice`, without
+    /// holding that device's context lock across placement. Other registry models use `load`.
+    pub fn prepare_pipeline(
+        &self,
+        checkpoint: &Checkpoint,
+    ) -> Result<minimax_h3::Prepared, LoadError> {
+        self.read(checkpoint, |checkpoint| {
+            match self.select(checkpoint)?.execution {
+                Execution::MiniMaxH3(inputs) => {
+                    minimax_h3::Prepared::from_inputs(checkpoint, *inputs)
+                }
+                Execution::Model => Err(LoadError::Unsupported {
+                    name: "pipeline".into(),
+                    reason: "this implementation loads through LoadOptions::load".into(),
+                }),
+            }
+        })
+    }
+
     /// `visit` of `checkpoint` as the load reads it: for the part the options choose, quantized
     /// when they quantize it.
     fn read<R>(
@@ -208,11 +239,33 @@ impl LoadOptions {
             name: name.into(),
             reason: reason.into(),
         };
-        if self.chips.is_some_and(|chips| chips.get() != 1) {
+        let chips = implementation.chips();
+        if self.chips.is_some_and(|chosen| chosen.get() != chips) {
             return Err(unsupported(
                 "chips",
-                "every implementation runs on one chip",
+                if chips == 1 {
+                    "every implementation runs on one chip"
+                } else {
+                    "H3 runs on four chips"
+                },
             ));
+        }
+        if implementation.is_pipeline() {
+            if self.kv_cache.is_some() {
+                return Err(unsupported("kv_cache", "H3 has no KV cache"));
+            }
+            if self.quantization.is_some() {
+                return Err(unsupported(
+                    "quantization",
+                    "H3 loads its checkpoint precision",
+                ));
+            }
+            if self.tiling == Tiling::Fixed {
+                return Err(unsupported(
+                    "batch_invariant",
+                    "H3 uses its original attention tiling",
+                ));
+            }
         }
         if self.kv_cache.is_some_and(|dtype| dtype != Dtype::BF16) {
             return Err(unsupported(
@@ -255,8 +308,13 @@ impl LoadOptions {
                 _ => Dtype::F8_E4M3,
             },
             kv_cache: Dtype::BF16,
-            chips: 1,
+            chips,
             tiling: self.tiling,
+            execution: if implementation.is_pipeline() {
+                Execution::MiniMaxH3(Box::new(Inputs::read(checkpoint)?))
+            } else {
+                Execution::Model
+            },
         })
     }
 }
@@ -287,13 +345,18 @@ impl Config {
         self.precision
     }
 
-    /// The form its KV cache stores keys and values in.
+    /// The decoder's KV cache form. Pipelines (`is_pipeline()`) have no KV cache.
     pub fn kv_cache(&self) -> Dtype {
         self.kv_cache
     }
 
     pub fn chips(&self) -> usize {
         self.chips
+    }
+
+    /// Whether placement returns a pipeline retaining the original shared device context.
+    pub fn is_pipeline(&self) -> bool {
+        matches!(self.execution, Execution::MiniMaxH3(_))
     }
 
     /// How the implementation's calls tile each row's attention.
@@ -327,8 +390,9 @@ impl FromStr for Quantization {
 
 #[cfg(test)]
 mod tests {
-    use super::LoadOptions;
+    use super::{LoadOptions, Quantization};
     use furiosa_opt_models::load::{Checkpoint, LoadError};
+    use safetensors::Dtype;
     use serde_json::json;
 
     /// A config's architecture is the first of its `architectures`, then its `_class_name`, that the
@@ -365,6 +429,56 @@ mod tests {
             ),
         ] {
             assert_eq!(refusal(config), (kind, name.to_owned()));
+        }
+    }
+
+    /// H3-specific load choices fail before sidecars or weights are needed. The ordinary
+    /// decoder refusal contract remains covered at the Qwen3 checkpoint boundary.
+    #[test]
+    fn refuses_h3_decoder_options_before_documents_and_weights() {
+        let empty = tempfile::tempdir().unwrap();
+        let source = Checkpoint::new(
+            empty.path(),
+            Some(json!({"_class_name": "MiniMaxH3Pipeline"})),
+        )
+        .unwrap();
+        for (options, field) in [
+            (LoadOptions::new().chips(1).unwrap(), "chips"),
+            (LoadOptions::new().chips(8).unwrap(), "chips"),
+            (LoadOptions::new().kv_cache(Dtype::BF16), "kv_cache"),
+            (LoadOptions::new().layers(0..50), "layers"),
+            (LoadOptions::new().batch_invariant(), "batch_invariant"),
+            (
+                LoadOptions::new().quantization(Quantization::Fp8PerTensor),
+                "quantization",
+            ),
+            (LoadOptions::new().adapters(), "adapters"),
+            (LoadOptions::new().encoder(), "encoder"),
+        ] {
+            for error in [
+                options.parse(&source).err(),
+                options.prepare_pipeline(&source).err(),
+            ] {
+                match error.expect("a refused choice must not read absent files") {
+                    LoadError::Unsupported { name, reason } => {
+                        assert_eq!(name, field);
+                        let expected = match field {
+                            "chips" => "H3 runs on four chips",
+                            "kv_cache" => "H3 has no KV cache",
+                            "layers" => "every implementation loads whole",
+                            "batch_invariant" => "H3 uses its original attention tiling",
+                            "quantization" => "H3 loads its checkpoint precision",
+                            "adapters" => {
+                                "the MiniMaxH3Pipeline FL2VA implementation takes no adapter"
+                            }
+                            "encoder" => "H3 loads as one complete pipeline",
+                            _ => unreachable!(),
+                        };
+                        assert_eq!(reason, expected);
+                    }
+                    other => panic!("{field}: {other:?}"),
+                }
+            }
         }
     }
 }

@@ -5,6 +5,7 @@ use crate::Op;
 use crate::load::{Checkpoint, Context, Load, LoadError};
 use crate::modules::generic::schedule::{self, IntoStream, RowWise};
 use crate::tensor::form::Weight;
+use crate::tensor::memory::residency::Residency;
 use crate::tensor::{axis::Single, live::Live, scalar};
 use core::borrow::Borrow;
 use core::marker::PhantomData;
@@ -16,7 +17,8 @@ pub const EPSILON: usize = 1e-6_f32.to_bits() as usize;
 
 /// BF16 rows times learned weights, divided by sqrt(mean(x²) + epsilon).
 /// EPSILON stores the FP32 bit pattern in a usize const parameter.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(Parameter))]
 pub struct RmsNorm<
     Width: AxisName,
     const EPSILON: usize = { self::EPSILON },
@@ -240,8 +242,10 @@ where
     }
 }
 
-impl<Width: AxisName, const EPSILON: usize, Chips: M> Op<&HbmTensor<bf16, Chips, m![Width]>>
-    for RmsNorm<Width, EPSILON, Chips>
+impl<Width: AxisName, const EPSILON: usize, Chips: M, Parameter>
+    Op<&HbmTensor<bf16, Chips, m![Width]>> for RmsNorm<Width, EPSILON, Chips, Parameter>
+where
+    Parameter: Learned<Width, Chips>,
 {
     type Output = HbmTensor<bf16, Chips, m![Width]>;
 
@@ -809,7 +813,7 @@ mod tests {
         tests::{Head, KvHeads},
     };
     use crate::ops::normalization::{
-        RowMajor,
+        PerRow, RowMajor,
         tests::{random, residual},
     };
     use crate::tensor::{
@@ -889,8 +893,9 @@ mod tests {
         input: &Rows<Width, Count>,
         output: &mut Rows<Width, Count>,
     ) {
-        let input: super::Spread<Width, Count> = input.to_dm(&mut device.tdma);
-        norm.forward(&mut *device, &input)
+        let borrowed =
+            RmsNorm::<Width, { super::EPSILON }, Chip, _>::new(Weight::new(norm.weight().tensor()));
+        crate::Module::forward(&PerRow(borrowed), &mut *device, (), &mut (), input)
             .view()
             .to_hbm_view(&mut device.tdma, output.view_mut());
     }
@@ -933,12 +938,14 @@ mod tests {
     #[tokio::test]
     async fn matches_the_definition() {
         matches_the_definition_over::<Hidden<1024>, Eight>().await;
+        matches_the_definition_over::<Hidden<128>, crate::tensor::axis::Rows<2>>().await;
     }
 
     /// Sixteen rows preserve independent statistics across all 256 feature slices.
     #[tokio::test]
     async fn sixteen_rows_match_the_definition() {
         matches_the_definition_over::<Hidden<4096>, Sixteen>().await;
+        matches_the_definition_over::<Hidden<128>, Sixteen>().await;
     }
 
     #[device(chip = 1)]

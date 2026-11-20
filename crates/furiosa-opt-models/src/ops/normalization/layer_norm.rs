@@ -3,6 +3,7 @@
 use super::{Lines, Tile, TilePart, TileParts, TileRows};
 use crate::Op;
 use crate::load::{Checkpoint, Children, Context, Load, LoadError};
+use crate::tensor::memory::residency::Residency;
 use crate::tensor::scalar::F32;
 use furiosa_opt_std::prelude::*;
 
@@ -11,8 +12,9 @@ pub(crate) const EPSILON: usize = 1e-5_f32.to_bits() as usize;
 
 /// Per-row mean/variance normalization, then the checkpoint's `weight` scale and `bias`; `EPSILON`
 /// holds epsilon's FP32 bits, which a load places in the `Epsilon` leaf.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
 #[load(tree)]
+#[residency(children(Weight, Epsilon))]
 pub struct LayerNorm<Weight, Epsilon, const EPSILON: usize = { self::EPSILON }> {
     /// Learned scale per feature.
     pub weight: Weight,

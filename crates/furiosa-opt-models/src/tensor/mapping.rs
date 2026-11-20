@@ -1,6 +1,7 @@
 //! Row grouping and explicit copies between device tensor mappings.
 
 use crate::load::Load;
+use crate::tensor::memory::residency::Residency;
 use core::marker::PhantomData;
 
 use furiosa_opt_std::prelude::*;
@@ -90,7 +91,7 @@ impl<
 }
 
 /// Reinterpret contiguous axes as Output: by value shares storage, by reference copies HBM.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
 pub struct Reshape<Output>(PhantomData<Output>);
 
 impl<Output> Default for Reshape<Output> {

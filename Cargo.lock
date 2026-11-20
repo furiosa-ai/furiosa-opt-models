@@ -502,6 +502,7 @@ dependencies = [
 name = "furiosa-opt-engine"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "furiosa-opt-models",
  "furiosa-opt-std",
  "futures-executor",
@@ -564,6 +565,7 @@ dependencies = [
 name = "furiosa-opt-models"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "furiosa-opt-models-macros",
  "furiosa-opt-std",
  "futures-executor",

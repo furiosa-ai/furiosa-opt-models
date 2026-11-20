@@ -1,17 +1,22 @@
-//! Where the leaves of a weight tree live, typed tensors over device storage, and the storage dtype
-//! of a scalar type.
+//! Storage backends for weight trees, typed device tensors, and scalar storage dtypes.
 //!
 //! - A tree is generic over its memory `X: Memory`; its leaves are `X::Tensor<D, C, S>` (scalar
 //!   `D`, chip mapping `C`, element mapping `S`).
 //! - [`Hbm`] keeps every leaf in device memory; `&X` borrows the leaves of a tree in `X`. Kernels
-//!   run on `T<&Hbm>`. No tree lives on host: a load stages each tensor on host only until it is
-//!   in HBM.
+//!   run on `T<&Hbm>`. Ordinary eager loading stages each tensor on the host until upload,
+//!   then keeps the weight in HBM without retaining that staging storage.
+//! - [`residency`] maps and visits trees over other memory backends. An optional residency
+//!   backend can retain prepared host sources alongside device copies that may be evicted and
+//!   reloaded. That backend owns the retention and lifecycle policy; [`Memory`] itself supplies
+//!   neither and does not change ordinary eager loading.
 
 use furiosa_opt_std::prelude::{HbmTensor, M, MaterializableScalar, Scalar};
 use furiosa_opt_std::runtime::HbmBuffer as Buffer;
 pub use safetensors::Dtype;
 use std::io;
 use std::ops::RangeBounds;
+
+pub mod residency;
 
 /// Where every leaf of a tree lives.
 pub trait Memory {

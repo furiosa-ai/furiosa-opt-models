@@ -12,12 +12,14 @@ use super::frames::{Blocks, Phase, Row, Stereo, Upsampled, Window};
 use super::transpose::INTEGER;
 use crate::Op;
 use crate::load::{Checkpoint, Children, Context, Load, LoadError};
+use crate::tensor::memory::residency::Residency;
 use crate::tensor::parallel::Chip;
 
 /// Per-channel SnakeBeta parameters in the fixed-point forms its activation reads, from the
 /// checkpoint's log-scale `alpha` and `beta`, each held as `I` or `F`, owned or borrowed.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
 #[load(tree)]
+#[residency(children(I, F))]
 pub struct Snake<
     C: AxisName,
     X: M = Chip,

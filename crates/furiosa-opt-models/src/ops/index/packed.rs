@@ -13,6 +13,12 @@ use crate::ops::index::sequence::Sum;
 use furiosa_opt_std::prelude::*;
 use std::marker::PhantomData;
 
+pub use live::SpanPlan;
+pub use rows::{RowInputs, RowPlan};
+
+pub(crate) mod live;
+mod rows;
+
 axes![Group = 6, Timestep = 2, Modality = 3];
 
 /// Text, audio and video spans, in that order.
@@ -225,6 +231,7 @@ impl<
 
 /// A video and an audio span each in rows of its own, `Video` and `Audio` rows long: both are
 /// allocated, then the video span is written in the leading rows of the first, then the audio span.
+/// Any additional rows are initialized to positive zero before a head reads its full envelope.
 #[derive(DeviceSend, Load)]
 pub struct Materialize<Video, Audio>(PhantomData<(Video, Audio)>);
 
@@ -260,9 +267,18 @@ impl<
             Rows<Span<AUDIO_LIVE, AUDIO_ROWS>, W, Chips>,
         ),
     ) -> Self::Output {
+        const {
+            assert!(VIDEO_ROWS <= Video::SIZE && AUDIO_ROWS <= Audio::SIZE);
+        }
         let mut media: Self::Output = (HbmTensor::new(), HbmTensor::new());
         Span::<VIDEO_LIVE, VIDEO_ROWS>::new().forward(&mut *device, (video, (&mut media.0, 0)));
         Span::<AUDIO_LIVE, AUDIO_ROWS>::new().forward(&mut *device, (audio, (&mut media.1, 0)));
+        if const { Video::SIZE > VIDEO_ROWS } {
+            rows::clear(device, &mut media.0, VIDEO_ROWS, Video::SIZE - VIDEO_ROWS);
+        }
+        if const { Audio::SIZE > AUDIO_ROWS } {
+            rows::clear(device, &mut media.1, AUDIO_ROWS, Audio::SIZE - AUDIO_ROWS);
+        }
         media
     }
 }
@@ -273,12 +289,13 @@ impl Join {
     pub(crate) const fn spans<T: AxisName, A: AxisName, V: AxisName>() -> [(usize, usize, usize); 3]
     {
         let unit = Packed::<T, A, V>::STRIP;
-        let (text, audio) = (T::SIZE / unit, A::SIZE / unit);
-        [
-            (0, text, 1),
-            (text, audio, 5),
-            (text + audio, V::SIZE / unit, 0),
-        ]
+        Self::spans_in_strips([T::SIZE / unit, A::SIZE / unit, V::SIZE / unit])
+    }
+
+    /// The shared table ordering for static and checked runtime spans. Callers establish that
+    /// these strip counts sum without overflow and fit their row envelope.
+    const fn spans_in_strips([text, audio, video]: [usize; 3]) -> [(usize, usize, usize); 3] {
+        [(0, text, 1), (text, audio, 5), (text + audio, video, 0)]
     }
 }
 

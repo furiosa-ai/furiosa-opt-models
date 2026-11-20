@@ -19,6 +19,7 @@ use crate::{Each, First, Identity, Layers, Sequential, Then, Unrolled};
 pub mod autoencoder;
 pub mod dit;
 pub mod flux;
+pub mod minimax_h3;
 
 /// Source: vLLM-Omni `vllm_omni/diffusion/models/pi0/modeling_pi0.py`.
 /// Image/text embedding → cached PaliGemma layers → final norm. No vocabulary head.

@@ -13,7 +13,7 @@ use crate::{
     },
 };
 use furiosa_opt_std::prelude::*;
-pub use gather::{AllGather, Pieces};
+pub use gather::{AllGather, InTiles, Pieces, Tile as GatherTile, TileRows, Tiled, Whole};
 
 mod gather;
 
@@ -328,18 +328,63 @@ impl<'x, D: MaterializableScalar, S: AxisName, W: AxisName, const N: usize>
         device: &mut Device,
         input: &'x Rows<D, N, Pieces<S, N>, Part<W, N>>,
     ) -> Self::Output {
+        let mut output = HbmTensor::new();
+        self.write(device, input.view(), output.view_mut());
+        output
+    }
+}
+
+impl<const N: usize> Exchange<Parallel<N>> {
+    /// Exchange the first `N * S` initialized rows as `N` compact parts, writing the first
+    /// `S` destination rows. Both allocations retain capacity `C`; destination tails are untouched.
+    /// This interprets the input prefix at stride `S`, rather than selecting `S` rows from each
+    /// capacity-strided part. A caller selects a whole-transfer geometry for its actual work.
+    pub fn write_prefix<D: MaterializableScalar, S: AxisName, C: AxisName, W: AxisName>(
+        &self,
+        device: &mut Device,
+        input: &Rows<D, N, Pieces<C, N>, Part<W, N>>,
+        output: &mut Rows<D, N, C, W>,
+    ) {
+        const { assert!(N > 0 && W::SIZE > 0 && S::SIZE > 0 && S::SIZE <= C::SIZE) };
         type L<W, const N: usize> = Symbol<Part<W, N>>;
-        // SAFETY: the rows are the parts in chip order, each its rows in order.
-        let rows = unsafe {
-            input
+        // SAFETY: the first alias keeps the full physical extent and declares explicit outer
+        // padding. The second names only that initialized contiguous prefix, preserving byte
+        // order. Neither alias writes, and the original input owner stays borrowed throughout.
+        let padded: PaddedRows<D, N, S, C, W> = unsafe { input.view().alias() };
+        let compact: Rows<D, N, Pieces<S, N>, Part<W, N>> = unsafe { padded.view().alias() };
+        // SAFETY: the compact parts are in chip order, each its rows in order.
+        let source = unsafe {
+            compact
                 .view()
                 .reshape::<ChipMap<N>, m![{ O<N> }, S, { L<W, N> }]>()
         };
-        let mut output: HbmTensor<D, m![{ O<N> }], m![S, { Symbol<Shard<N>> }, { L<W, N> }]> =
-            HbmTensor::new();
-        rows.to_hbm_view(&mut device.tdma, output.view_mut());
+        // SAFETY: this declares only outer padding; the physical extent and row-major byte
+        // order remain C * W. The selected prefix keeps the original mutable borrow.
+        let destination = unsafe { output.view_mut().reshape::<ChipMap<N>, m![S # C, W]>() };
+        // SAFETY: a row's columns are the source chips' contiguous parts. Retain the outer
+        // allocation padding so the view keeps the original destination's writable provenance.
+        let destination = unsafe {
+            destination.reshape::<m![{ O<N> }], m![S # C, { Symbol<Shard<N>> }, { L<W, N> }]>()
+        };
+        source.to_hbm_view(&mut device.tdma, destination);
+    }
+
+    /// Exchange one whole, statically described set of parts into caller-owned storage.
+    /// Views can name compact root windows inside larger allocations. Their row stride must
+    /// describe the actual parts; cropping a capacity-strided tensor does not compact its rows.
+    pub fn write<D: MaterializableScalar, S: AxisName, W: AxisName>(
+        &self,
+        device: &mut Device,
+        input: RowsView<'_, D, N, Pieces<S, N>, Part<W, N>>,
+        output: HbmTensorViewMut<'_, D, ChipMap<N>, m![S, W]>,
+    ) {
+        type L<W, const N: usize> = Symbol<Part<W, N>>;
+        // SAFETY: the rows are the parts in chip order, each its rows in order.
+        let rows = unsafe { input.reshape::<ChipMap<N>, m![{ O<N> }, S, { L<W, N> }]>() };
         // SAFETY: chip `t` holds part `t` of the rows, its columns the parts in chip order.
-        unsafe { output.reshape() }
+        let target =
+            unsafe { output.reshape::<m![{ O<N> }], m![S, { Symbol<Shard<N>> }, { L<W, N> }]>() };
+        rows.to_hbm_view(&mut device.tdma, target);
     }
 }
 
@@ -347,6 +392,12 @@ axes![Two = 2];
 
 type ChipMap<const N: usize> = m![{ Symbol<Shard<N>> }];
 type Rows<D, const N: usize, R, W> = HbmTensor<D, ChipMap<N>, m![R, W]>;
+type RowsView<'a, D, const N: usize, R, W> = HbmTensorView<'a, D, ChipMap<N>, m![R, W]>;
+type PaddedRows<D, const N: usize, S, C, W> = HbmTensor<
+    D,
+    ChipMap<N>,
+    m![{ Symbol<Pieces<S, N>> } # ({ Symbol<Pieces<C, N>> }), { Symbol<Part<W, N>> }],
+>;
 type ReductionSlices<W> = m![W % 1024 / 128, W % 128 / 4];
 type Local<D, Chips, W> = DmTensor<D, Chips, m![1 # 2], ReductionSlices<W>, m![W / 1024, W % 4]>;
 /// A chip's rows in the sum's layout: each slice one part of every row.

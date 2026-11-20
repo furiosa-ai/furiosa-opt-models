@@ -12,6 +12,7 @@ pub use modulation::{
 };
 pub use pipeline::{Chunked, Pipeline};
 pub use self_conditioning::{ConditionedEmbedding, SelfConditioning};
+pub use spans::WithSpans;
 pub use stream::{Dual, JointFinal, Stream};
 pub use trajectory::{Cascade, Experts, Guider, Sampler, Step, Values, ddim, flow_match};
 
@@ -21,5 +22,6 @@ mod denoiser;
 mod modulation;
 mod pipeline;
 mod self_conditioning;
+mod spans;
 mod stream;
 mod trajectory;

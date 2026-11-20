@@ -60,6 +60,7 @@ fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     for (name, register, _) in model::FAMILIES {
         submodule(module, name, register)?;
     }
+    submodule(module, "minimax_h3", model::minimax_h3::register)?;
     Ok(())
 }
 
@@ -91,6 +92,12 @@ fn submodule(
 struct Context {
     device: Device,
     runtime: Runtime,
+}
+
+impl furiosa_opt_engine::residency::DeviceContext for Context {
+    fn device(&mut self) -> &mut Device {
+        &mut self.device
+    }
 }
 
 impl Context {

@@ -18,6 +18,7 @@ use crate::Op;
 use crate::load::{Checkpoint, Children, Context, Load, LoadError};
 use crate::specialize::convolution::{Narrow, Strategy};
 use crate::tensor::form::Weight;
+use crate::tensor::memory::residency::Residency;
 use crate::tensor::parallel::Chip;
 
 axes![Three = 3, Quad = 4, Half = 2];
@@ -99,8 +100,9 @@ pub trait Upsampled<const STRIDE: usize>: Window {
 
 /// torch's transposed convolution `y[o, t] = b[o] + sum_c sum_k w[c, o, k] x[c, (t + pad - k) /
 /// STRIDE]` over `STRIDE`-divisible `t + pad - k`; padding rows hold what `P` reads.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
 #[load(tree)]
+#[residency(children(W, B))]
 pub struct ConvolutionTranspose<W, B, const STRIDE: usize, P = ()> {
     pub weight: W,
     pub bias: B,

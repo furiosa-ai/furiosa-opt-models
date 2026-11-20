@@ -8,6 +8,7 @@ pub use layer_norm::LayerNorm;
 pub use normalize::Normalize;
 pub use rms_norm::{EPSILON, InDm, Learned, Rms, RmsNorm, Scaled, UnitRmsNorm};
 pub(crate) use rms_norm::{Lanes, Root, Scale, Squares};
+pub use rows::PerRow;
 
 use crate::specialize;
 use core::marker::PhantomData;
@@ -19,6 +20,7 @@ mod group_norm;
 mod layer_norm;
 mod normalize;
 mod rms_norm;
+mod rows;
 pub(crate) mod span;
 
 /// Feature slices retain every row in both clusters for the projections that consume them.

@@ -1,6 +1,6 @@
 //! Elementwise sums, in FP32 and rounded once.
 
-use super::{Flat, Float, Window};
+use super::{Flat, Float, Rows, Window};
 use crate::Op;
 use crate::load::Load;
 use crate::modules::generic::schedule::{Fill, IntoStream, Slot, Spill, Stream};
@@ -9,12 +9,13 @@ use crate::ops::normalization::{
     Blocked, Chunk, Cluster, Element, FeatureSlices, Offset, Spread, Tile, TilePart, TileRows,
 };
 use crate::ops::pointwise::gated;
+use crate::tensor::memory::residency::Residency;
 use crate::tensor::{axis::Single, live::Live};
 use core::task::Poll;
 use furiosa_opt_std::prelude::*;
 
 /// Elementwise sum of two tensors in the same layout.
-#[derive(Clone, Default, DeviceSend, Load)]
+#[derive(Clone, Default, DeviceSend, Load, Residency)]
 pub struct Add;
 
 /// FP32 partial sums in any common DM layout, streamed together without a VRF-sized
@@ -55,6 +56,19 @@ impl<'a, 'b, Chips: M, Cluster: M, Slice: M, E: M + 'static>
             .commit();
         // SAFETY: inverse of the local flattening above.
         unsafe { output.reshape() }
+    }
+}
+
+/// One ordinary pointwise window from each operand, preserving the HBM mapper's rounding.
+impl<D: Float, S: M + 'static, Chips: M> Op<&(Rows<D, S, Chips>, Rows<D, S, Chips>)> for Add {
+    type Output = Rows<D, S, Chips>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (left, right): &(Rows<D, S, Chips>, Rows<D, S, Chips>),
+    ) -> Self::Output {
+        Window::<S>::combine_tile::<D, false, Chips>(device, left, right)
     }
 }
 

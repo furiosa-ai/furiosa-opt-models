@@ -3,6 +3,7 @@
 
 use crate::Module;
 use crate::load::Load;
+use crate::tensor::memory::residency::Residency;
 pub use choice::Either;
 pub use collection::{Stacked, View};
 pub use each::Each;
@@ -12,6 +13,7 @@ pub use interleave::{Branch, Interleave};
 pub(crate) use layers::Collection;
 pub use layers::{Layers, Repeat, Rolled, Unrolled};
 pub(crate) use order::Order;
+pub use prefix::Prefix;
 pub use schedule::Scheduled;
 pub use sequential::{Sequential, Then};
 
@@ -31,7 +33,7 @@ impl<X, Env> Module<X, Env, &mut ()> for Identity {
 }
 
 /// Returns the first element of an input pair.
-#[derive(Clone, Default, DeviceSend, Load)]
+#[derive(Clone, Default, DeviceSend, Load, Residency)]
 pub struct First;
 
 impl<X, Y, Env> Module<(X, Y), Env, &mut ()> for First {
@@ -83,6 +85,8 @@ where
         (u, v, self.2.forward(device, env, third, z))
     }
 }
+
+mod prefix;
 
 mod sequential;
 
