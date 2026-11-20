@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager
+import tempfile
+from collections.abc import Callable, Generator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
-from typing import final
+from shutil import copyfile
+from typing import TYPE_CHECKING, final
 
 from torch import nn
 from typing_extensions import override
@@ -15,6 +17,9 @@ from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offloa
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 
 from .components import compose, construct
+
+if TYPE_CHECKING:
+    import furiosa_opt_engine as engine
 
 
 def build(*, od_config: OmniDiffusionConfig) -> nn.Module:
@@ -30,11 +35,12 @@ def build(*, od_config: OmniDiffusionConfig) -> nn.Module:
     remote = not Path(od_config.model).is_dir()
     if remote and od_config.model_class_name == "MiniMaxH3Pipeline":
         validate(od_config)
-    checkpoint = engine.Checkpoint(path)
     options = engine.LoadOptions()
     # Metadata suffices for registry selection and H3's component-document checks.
     # Preserve the registry's refusal for other architectures before fetching weights.
-    options.parse(checkpoint)
+    context = configured(path) if remote else nullcontext(engine.Checkpoint(path))
+    with context as checkpoint:
+        options.parse(checkpoint)
     if od_config.model_class_name != "MiniMaxH3Pipeline":
         raise NotImplementedError(f"{od_config.model_class_name}: the engine loads no pipeline")
     if remote:
@@ -148,6 +154,22 @@ def fetch(od_config: OmniDiffusionConfig, path: Path) -> None:
         od_config.revision,
         require_all=True,
     )
+
+
+@contextmanager
+def configured(path: Path) -> Generator[engine.Checkpoint, None, None]:
+    """The pipeline's JSON configuration, isolated from any cached weight files or indexes."""
+    import furiosa_opt_engine as engine
+
+    with tempfile.TemporaryDirectory() as temporary:
+        metadata = Path(temporary)
+        for document in path.rglob("*.json"):
+            if not document.is_file() or document.name.endswith(".safetensors.index.json"):
+                continue
+            target = metadata / document.relative_to(path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _ = copyfile(document, target)
+        yield engine.Checkpoint(metadata)
 
 
 def visible() -> list[int]:

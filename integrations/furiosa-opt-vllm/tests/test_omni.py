@@ -10,7 +10,9 @@ from furiosa_opt_vllm.omni.pipeline import build
 
 
 @pytest.fixture
-def remote_checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, list[str]]:
+def remote_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path, list[str]]:
     """Replace only Hub transfer; keep framework configuration, resolution and engine parsing."""
     from vllm_omni.model_executor.model_loader import weight_utils
 
@@ -62,7 +64,7 @@ def remote_checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[
         return str(snapshot)
 
     monkeypatch.setattr(weight_utils, "snapshot_download", download)
-    return repository, transferred
+    return repository, snapshot, transferred
 
 
 @pytest.mark.parametrize(
@@ -94,7 +96,7 @@ def remote_checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[
     ids=["workers", "sleep", "offload", "quantization", "lora", "cache", "eager"],
 )
 def test_refuses_remote_options_before_weights(
-    remote_checkpoint: tuple[Path, list[str]], overrides: dict[str, object], reason: str
+    remote_checkpoint: tuple[Path, Path, list[str]], overrides: dict[str, object], reason: str
 ) -> None:
     config = OmniDiffusionConfig(
         **{
@@ -108,15 +110,21 @@ def test_refuses_remote_options_before_weights(
     with pytest.raises(NotImplementedError) as refused:
         build(od_config=config)
     assert str(refused.value) == reason
-    _, transferred = remote_checkpoint
+    _, _, transferred = remote_checkpoint
     assert transferred  # Resolution may fetch metadata, but must never fetch weights.
 
 
 @pytest.mark.parametrize("model_class", ["FluxPipeline", "MiniMaxH3Pipeline"])
+@pytest.mark.parametrize("cached_index", [False, True], ids=["empty-cache", "partial-cache"])
 def test_preserves_remote_architecture_refusal(
-    remote_checkpoint: tuple[Path, list[str]], model_class: str
+    remote_checkpoint: tuple[Path, Path, list[str]], model_class: str, cached_index: bool
 ) -> None:
-    repository, transferred = remote_checkpoint
+    repository, snapshot, transferred = remote_checkpoint
+    if cached_index:
+        index = "FL2VA/transformer/model.safetensors.index.json"
+        target = snapshot / index
+        target.parent.mkdir(parents=True)
+        _ = copyfile(repository / index, target)
     # Both a root pipeline and a framework-resolved partition must keep the engine's reason.
     for name in ("model_index.json", "FL2VA/model_index.json"):
         _ = (repository / name).write_text(json.dumps({"_class_name": "FluxPipeline"}))
