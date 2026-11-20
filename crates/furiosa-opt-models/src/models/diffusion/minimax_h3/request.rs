@@ -1,7 +1,7 @@
 //! Bind the numerical consumers' work to one checked H3 request before uploading metadata.
 
 use super::packing::{
-    AUDIO_ROWS, Capacity, DEFAULT_MAX_TEXT, PARTS, Plan, ROW_BLOCK, TEXT_STRIP, VIDEO_ROWS,
+    AUDIO_ROWS, DEFAULT_MAX_TEXT, PARTS, Plan, ROW_BLOCK, TEXT_STRIP, VIDEO_ROWS,
 };
 use super::{embeddings::Chips, positions::Positions};
 use crate::ops::attention::{
@@ -182,14 +182,9 @@ impl<R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName> Prepared<R
         self.blocks.packing()
     }
 
-    /// Check joint geometry and positions before allocating any device storage.
-    pub fn new(
-        capacity: Capacity,
-        tokens: usize,
-        positions: &[[f64; 3]],
-        theta: f32,
-    ) -> io::Result<Self> {
-        let plan = capacity.plan(tokens)?;
+    /// Check joint geometry and positions from the caller's validated packing plan before
+    /// allocating any device storage.
+    pub fn new(plan: Plan, positions: &[[f64; 3]], theta: f32) -> io::Result<Self> {
         let blocks = BlockPlan::new(plan)?;
         let rows = plan.row_plan()?;
         let positions = Positions::new(plan, positions, theta)?;

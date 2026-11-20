@@ -147,7 +147,7 @@ impl Pipeline {
             state.memo = None;
             let request = self
                 .core
-                .prepare_encoded(key.text, &positions, &input.prompt)
+                .prepare_encoded(layout.plan(), &positions, &input.prompt)
                 .await?;
             state.memo = Some(Memo {
                 key,
@@ -295,12 +295,11 @@ struct Memo {
 
 /// Prompt equality is BIT equality, including NaNs. Finite position equality preserves the
 /// original FP64 comparison (including +0 == -0); padding positions participate in the key.
-/// Canonical modality row lists are wholly determined by text count, so need no second copy.
+/// The validated prompt length determines canonical modality rows, so need no second copy.
 #[derive(PartialEq)]
 struct Key {
     prompt: Vec<u16>,
     positions: Vec<[f64; 3]>,
-    text: usize,
 }
 
 /// Raw owned host input from the native binding. The binding additionally checks keyword
@@ -411,7 +410,6 @@ impl Checked {
         let key = Key {
             prompt: input.prompt.iter().map(|value| value.to_bits()).collect(),
             positions: std::mem::take(&mut input.positions),
-            text,
         };
         Ok(Self {
             layout,

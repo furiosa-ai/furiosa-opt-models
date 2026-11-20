@@ -6,7 +6,7 @@ use super::{
 };
 use crate::residency::{SharedDevice, block_on};
 use furiosa_opt_models::models::diffusion::minimax_h3::embeddings::{Chips, Condition, Width};
-use furiosa_opt_models::models::diffusion::minimax_h3::packing::{Capacity, PARTS};
+use furiosa_opt_models::models::diffusion::minimax_h3::packing::{Capacity, PARTS, Plan};
 use furiosa_opt_models::models::diffusion::minimax_h3::request::BlockPlan;
 use furiosa_opt_std::prelude::*;
 use std::{io, sync::Arc};
@@ -66,8 +66,7 @@ impl<
         let audio = audio::Decoder::from_resident(weights.audio(), device.clone()).await?;
         let reserved = device.with_device(|device| {
             let prepared = request::Prepared::<R, K, T, A, V>::new(
-                capacity,
-                N,
+                maximum,
                 &vec![[0.0; 3]; maximum.key_count()],
                 weights.inputs().transformer().rope_theta(),
             )?;
@@ -143,34 +142,27 @@ impl<
             .collect())
     }
 
-    /// The framework's transformer receives already encoded, contiguous BF16 prompt rows.
+    /// The framework boundary supplies one checked plan and contiguous BF16 prompt rows.
     /// Preserve that boundary without running the encoder again. One replicated upload supplies
     /// row views to the same conditioner used by token-ID preparation.
     pub(super) async fn prepare_encoded(
         self: &Arc<Self>,
-        tokens: usize,
+        plan: Plan,
         positions: &[[f64; 3]],
         encoded: &[bf16],
     ) -> io::Result<Request<N, R, K, T, A, V>> {
         let lease = Arc::clone(&self.active).lock_owned().await;
         let prepared = request::Prepared::<R, K, T, A, V>::new(
-            Capacity::new(N)?,
-            tokens,
+            plan,
             positions,
             self.weights.inputs().transformer().rope_theta(),
         )?;
-        if encoded.len() != tokens * Condition::SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "encoded prompt must contain one BF16 condition row per valid token",
-            ));
-        }
         let encoded = self.device.with_device(|device| {
             let source = HostBuffer::from(bf16::to_buf(encoded).repeat(PARTS));
             let buffer = block_on(source.to_hbm(&mut device.pdma).into_future())
                 .map_err(io::Error::other)?;
             let bytes = Condition::SIZE * std::mem::size_of::<bf16>();
-            (0..tokens)
+            (0..plan.text_tokens())
                 .map(|row| {
                     buffer
                         .alias(row * bytes..(row + 1) * bytes)
