@@ -178,24 +178,23 @@ mod tests {
     }
 
     #[test]
-    fn matches_known_reference_bits_and_preserves_unrotated_pairs() {
+    fn matches_independent_trigonometry_and_preserves_unrotated_pairs() {
         let plan = Capacity::new(128).unwrap().plan(2).unwrap();
         let supplied = vec![[1.0, 2.0, 3.0]; plan.key_count()];
-        let positions = Positions::new(plan, &supplied, 10_000.0).unwrap();
-        // Independent bit values from the Furiosa layout's synthetic [1,2,3] fixture.
-        assert_eq!(
-            [0, 1, 15, 16, 32, 64, 80, 96].map(|i| positions.low()[i].to_bits()),
-            [16138, 16217, 16256, 48853, 49021, 16215, 16233, 15889]
-        );
-        for pair in 0..48 {
-            assert_eq!(
-                positions.high()[pair].to_bits(),
-                positions.low()[64 + pair].to_bits() ^ 0x8000
-            );
-            assert_eq!(
-                positions.high()[64 + pair].to_bits(),
-                positions.low()[pair].to_bits()
-            );
+        let positions = Positions::new(plan, &supplied, 65_536.0).unwrap();
+        // With theta = 2^16, frequency j is exactly 2^-j. Evaluate the known
+        // coordinates in FP64 independently of the production FP32 frequency/trig path.
+        for (axis, coordinate) in [1.0_f64, 2.0, 3.0].into_iter().enumerate() {
+            for j in 0..16 {
+                let phase = coordinate / f64::from(1_u32 << j);
+                let cosine = bf16::from_f64(phase.cos());
+                let sine = bf16::from_f64(phase.sin());
+                let pair = axis * 16 + j;
+                assert_eq!(positions.low()[pair].to_bits(), cosine.to_bits());
+                assert_eq!(positions.low()[64 + pair].to_bits(), sine.to_bits());
+                assert_eq!(positions.high()[pair].to_bits(), (-sine).to_bits());
+                assert_eq!(positions.high()[64 + pair].to_bits(), cosine.to_bits());
+            }
         }
         for pair in 48..64 {
             assert_eq!(positions.low()[pair], bf16::ONE);

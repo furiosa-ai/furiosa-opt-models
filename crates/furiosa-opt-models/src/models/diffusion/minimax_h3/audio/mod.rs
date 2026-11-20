@@ -2,14 +2,13 @@
 //!
 //! Load relative to the audio component's physical checkpoint prefix. The folded input reads
 //! `dec_in_proj.*` and `decoder.conv_pre.*`; stages and waveform read the named children of
-//! `decoder`. No checkpoint prefix is ignored, and no latent statistics transform is applied:
-//! the preserved Furiosa loader accepted statistics but did not use them.
+//! `decoder`. No checkpoint prefix is ignored, and latent statistics do not transform decoder
+//! inputs or parameters.
 //!
 //! Each activation retains both of its stored filters through the ordinary `AntiAliased` loader.
-//! The preserved loader instead reused `decoder.activation_post.upsample.filter` everywhere.
 //! In checkpoint revision `42ed227ee7df40d41602854ae760620d6eb651fe`, all 254 stored activation
-//! filters were checked and are bit-identical to that reference filter. Each activation still
-//! loads its own filters, preserving stored differences in other checkpoints.
+//! filters were checked and are bit-identical to `decoder.activation_post.upsample.filter`.
+//! Each activation loads its own filters, retaining stored differences in other checkpoints.
 
 use furiosa_opt_std::prelude::*;
 
@@ -31,6 +30,8 @@ pub use input::{C1024, K7};
 
 pub mod input;
 
+/// Source: https://github.com/vllm-project/vllm-omni/blob/6daf5b30f07cc0b3db87766d22fdf433f8a1a7c9/vllm_omni/diffusion/models/minimax_h3/vae.py
+/// The upstream audio-decoder component contract, bound to the stereo latent geometry below.
 /// Lifted stereo latents, the folded input convolution, seven stages, then clamped FP32 samples.
 ///
 /// `X` selects the storage of every retained coefficient, bias, filter and SnakeBeta parameter;
@@ -180,7 +181,7 @@ pub type Input<C = Chips> = crate::ops::convolution::input::Rows<Latent, C>;
 /// Consumers trim each channel to `Samples::SAMPLES`, rather than concatenate padding as audio.
 pub type Output<C = Chips> = HbmTensor<f32, C, m![Stereo, { Symbol<Samples> }]>;
 
-/// The latent span and each successive upsampling span, exactly as in the preserved decoder.
+/// Allocated rows, slice block sizes and live samples at each successive upsampling stage.
 pub type Latent = Span<208, 8, 207>;
 pub type Fifth = Span<1040, 8, 1035>;
 pub type TwentyFifth = Span<5200, 40, 5175>;

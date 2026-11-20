@@ -1,8 +1,8 @@
-//! Video decoding on the pipeline's original four chips.
+//! Video decoding on the pipeline's shared four-chip device context.
 //!
-//! The retained compiler cannot lower the complete 36-layer entry. Separate entries retain
-//! its arithmetic and order, queued through local workspace buffers. Across the 49 groups,
-//! the next group's computation starts before downloading and stitching its predecessor.
+//! Embedding, each of 36 transformer layers, normalization and readout launch separately
+//! through the shared Module entry. Ordered launches reuse local workspace rows. Across the
+//! 49 groups, submit the next group's launches before downloading and stitching its predecessor.
 
 use super::{flight::Flight, weights::Component};
 use crate::residency::{Resident, SharedDevice, block_on};
@@ -10,7 +10,7 @@ use furiosa_opt_models::models::diffusion::minimax_h3::video::{
     Patch as PixelChannels, Rows as TileRows,
 };
 use furiosa_opt_models::models::diffusion::minimax_h3::{embeddings::Chips, video};
-use furiosa_opt_models::tensor::memory::alias;
+use furiosa_opt_models::tensor::memory::{Hbm, alias};
 use furiosa_opt_std::prelude::*;
 use std::{io, sync::Arc};
 
@@ -67,17 +67,45 @@ pub(super) struct Decoder {
 
 impl Decoder {
     /// Prime the stages and constant tile metadata before sizing the encoder's memory grant.
-    /// The pipeline has already placed these weights on this same original device.
+    /// The pipeline has already placed these weights on the shared device context.
     pub(super) async fn from_resident(
         owner: Component<video::Decoder>,
         device: SharedDevice,
     ) -> io::Result<Self> {
         device.admit(owner.resident())?.landed().await?;
         let context = device.with_device(|device| {
-            kernel::embedding.load(device).map_err(io::Error::other)?;
-            kernel::layer.load(device).map_err(io::Error::other)?;
-            kernel::norm.load(device).map_err(io::Error::other)?;
-            kernel::head.load(device).map_err(io::Error::other)?;
+            Loadable::<(
+                &mut Device,
+                &&video::Embedding<Chips, &Hbm>,
+                &video::Context,
+                &mut ((), ()),
+                &video::Latent,
+            )>::load(kernel::embedding, device)
+            .map_err(io::Error::other)?;
+            Loadable::<(
+                &mut Device,
+                &&video::Layer<Chips, &Hbm>,
+                &video::Context,
+                &mut (),
+                video::Residual,
+            )>::load(kernel::layer, device)
+            .map_err(io::Error::other)?;
+            Loadable::<(
+                &mut Device,
+                &&video::FinalNorm<Chips, &Hbm>,
+                &video::Context,
+                &mut (),
+                &video::Residual,
+            )>::load(kernel::norm, device)
+            .map_err(io::Error::other)?;
+            Loadable::<(
+                &mut Device,
+                &&video::Head<Chips, &Hbm>,
+                &video::Context,
+                &mut (),
+                &video::Normalized,
+            )>::load(kernel::head, device)
+            .map_err(io::Error::other)?;
             video::Context::load(&mut furiosa_opt_models::load::Context::new(Some(device)))
                 .map(Arc::new)
                 .map_err(io::Error::other)
@@ -101,8 +129,8 @@ impl Decoder {
         })
     }
 
-    /// Decode and stitch the complete group sequence with the original optional tail count.
-    /// Refill the original two tile slots in turn. Submit the successor before waiting for
+    /// Decode and stitch all 49 groups, retaining the checked number of frames from the tail.
+    /// Alternate two input and pixel-output slots. Submit the successor before waiting for
     /// and stitching its predecessor. A flight keeps every shared workspace owner alive until
     /// all accepted readers end, including cancellation and partial submission failure.
     pub(super) async fn decode(&self, input: Input<'_>) -> io::Result<Vec<f32>> {
@@ -129,7 +157,7 @@ impl Decoder {
                 .with_device(|device| Workspace::allocate(device, Arc::clone(&self.context)))?,
         );
         let mut stitch = video::tiling::Stitch::with_frames(frames)?;
-        // The original caller pins one pixel-group target for the complete decode. A failed
+        // Reuse one host pixel-group target for the complete decode. A failed
         // read ends this request, so its target is dropped before any later request can reuse it.
         let mut host = HostBuffer::zero(
             Chips::SIZE * TileRows::SIZE * PixelChannels::SIZE * std::mem::size_of::<f32>(),
@@ -182,7 +210,7 @@ impl Decoder {
             .map_err(io::Error::other)?
             .into_buffer();
         self.device.with_device(|device| {
-            // Own the original pixel allocation through the completed DMA. This synchronous
+            // Retain the device pixel allocation until DMA completes. This synchronous
             // boundary cannot be cancelled between submission and completion. The next copy
             // starts only after this group's scoped unpacking and blending have finished.
             block_on(
@@ -323,55 +351,12 @@ impl Workspace {
     }
 }
 
-/// Concrete four-chip bindings of the existing public Module implementations.
+/// Four-chip stage bindings for the shared Module entry.
 mod kernel {
-    use furiosa_opt_models::models::diffusion::minimax_h3::{embeddings::Chips, video};
-    use furiosa_opt_models::{Module, tensor::memory::Hbm};
-    use furiosa_opt_std::prelude::*;
-
-    #[device(chip = 4)]
-    pub(super) fn embedding(
-        device: &mut Device,
-        module: &&video::Embedding<Chips, &Hbm>,
-        context: &video::Context,
-        state: &mut ((), ()),
-        input: &video::Latent,
-    ) -> video::Residual {
-        module.forward(device, context, state, input)
-    }
-
-    #[device(chip = 4)]
-    pub(super) fn layer(
-        device: &mut Device,
-        module: &&video::Layer<Chips, &Hbm>,
-        context: &video::Context,
-        state: &mut (),
-        input: video::Residual,
-    ) -> video::Residual {
-        module.forward(device, context, state, input)
-    }
-
-    #[device(chip = 4)]
-    pub(super) fn norm(
-        device: &mut Device,
-        module: &&video::FinalNorm<Chips, &Hbm>,
-        context: &video::Context,
-        state: &mut (),
-        input: &video::Residual,
-    ) -> video::Normalized {
-        module.forward(device, context, state, input)
-    }
-
-    #[device(chip = 4)]
-    pub(super) fn head(
-        device: &mut Device,
-        module: &&video::Head<Chips, &Hbm>,
-        context: &video::Context,
-        state: &mut (),
-        input: &video::Normalized,
-    ) -> video::Pixels {
-        module.forward(device, context, state, input)
-    }
+    pub(super) use crate::forward_four as embedding;
+    pub(super) use crate::forward_four as head;
+    pub(super) use crate::forward_four as layer;
+    pub(super) use crate::forward_four as norm;
 }
 
 #[cfg(test)]

@@ -15,30 +15,63 @@ use crate::tensor::{axis::Rows, live::BlockPrefix, scalar::Value};
 use furiosa_opt_std::prelude::*;
 use std::io;
 
-/// At most one valid run per modality and part. Empty part spans contribute no run.
-pub const KEY_RUNS: usize = 3 * PARTS;
-
-/// Whole-transfer work extents inside the Live envelope, derived from the modality geometry.
-/// These are not token buckets: every valid text length still supplies its own keys and spans.
-#[derive(Clone, Debug)]
-pub(crate) struct Transfer<const STEP: usize>;
-
-impl<const STEP: usize> AxisName for Transfer<STEP> {
-    const NAME: Ident = Ident::new("JointTransfer");
-    const SIZE: usize = {
-        let first = (AUDIO_ROWS + VIDEO_ROWS + TEXT_STRIP).div_ceil(ROW_BLOCK) * ROW_BLOCK;
-        let text = DEFAULT_MAX_TEXT.div_ceil(PARTS * TEXT_STRIP) * TEXT_STRIP;
-        let last = (AUDIO_ROWS + VIDEO_ROWS + text).div_ceil(ROW_BLOCK) * ROW_BLOCK;
-        // The joint execution adapter dispatches these three whole-transfer geometries.
-        assert!(last - first == 2 * ROW_BLOCK && STEP <= 2);
-        first + STEP * ROW_BLOCK
-    };
+/// Host checks finish before the first transfer. Every numerical reader derives from `plan`;
+/// callers cannot mix another request's row transfers, modulation spans or packed-key order.
+pub struct Prepared<R, K, T, A, V> {
+    blocks: BlockPlan<R, K>,
+    rows: RowPlan<R, T, A, V>,
+    positions: Positions,
 }
 
-/// A block's local initialized work, within the compiled gather allocation.
-pub type Prefix<R> = BlockPrefix<(), R, Rows<ROW_BLOCK>>;
-/// Valid semantic K/V transfers from the compact joined projection.
-pub type Keys<R, K> = PackPlan<Pieces<R, PARTS>, K, KEY_RUNS>;
+impl<R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName> Prepared<R, K, T, A, V> {
+    /// Return the one packing plan shared by all prepared numerical inputs.
+    pub fn plan(&self) -> Plan {
+        self.blocks.packing()
+    }
+
+    /// Check joint geometry and positions from the caller's validated packing plan before
+    /// allocating any device storage.
+    pub fn new(plan: Plan, positions: &[[f64; 3]], theta: f32) -> io::Result<Self> {
+        let blocks = BlockPlan::new(plan)?;
+        let rows = plan.row_plan()?;
+        let positions = Positions::new(plan, positions, theta)?;
+        Ok(Self {
+            blocks,
+            rows,
+            positions,
+        })
+    }
+
+    /// Initial metadata upload has no kernel readers. The engine completes it before admitting
+    /// a launch and retains the resulting owner through all accepted request work.
+    pub async fn upload(self, device: &mut Device) -> io::Result<Inputs<R, K, T, A, V>> {
+        let (_, [low, high], visible) = self.positions.into_parts();
+        let blocks = self.blocks.upload(device).await?;
+        let rows = RowInputs::upload(device, &self.rows).await?;
+        let low = HostTensor::<bf16, m![{ Symbol<Pieces<R, PARTS>> }, { Symbol<flash::Head> }]>::from_vec(low.into_iter().map(|value| bf16::from_bits(value.to_bits())))
+            .to_hbm(&mut device.pdma)
+            .await
+            .map_err(io::Error::other)?;
+        let high = HostTensor::<bf16, m![{ Symbol<Pieces<R, PARTS>> }, { Symbol<flash::Head> }]>::from_vec(high.into_iter().map(|value| bf16::from_bits(value.to_bits())))
+            .to_hbm(&mut device.pdma)
+            .await
+            .map_err(io::Error::other)?;
+        let visible = HostTensor::<bf16, m![K, { Symbol<flash::Span> }]>::from_vec(
+            visible
+                .into_iter()
+                .map(|value| bf16::from_bits(value.to_bits())),
+        )
+        .to_hbm(&mut device.pdma)
+        .await
+        .map_err(io::Error::other)?;
+        Ok(Inputs {
+            blocks,
+            rows,
+            rotation: Rotation { low, high },
+            visible,
+        })
+    }
+}
 
 /// Host preparation for a single compiled local-row and key-span allocation.
 ///
@@ -119,6 +152,21 @@ impl<R: AxisName, K: AxisName> BlockPlan<R, K> {
     }
 }
 
+/// Immutable numerical transport. A request's flight guard retains this complete owner rather
+/// than only aliases of individual readers; the entry decodes block and row plans once.
+/// Constructed only through [`Prepared::upload`] from one checked request.
+#[derive(DeviceSend)]
+pub struct Inputs<R: AxisName, K: AxisName, T, A, V> {
+    /// Checked spans, initialized work and packed-key metadata.
+    pub(crate) blocks: BlockInputs<R, K>,
+    /// Checked text/audio/video row transfers.
+    pub(crate) rows: RowInputs<R, T, A, V, Chips>,
+    /// Paired rotary coefficients for the joined rows.
+    pub(crate) rotation: Rotation<flash::Head, Chips, Pieces<R, PARTS>>,
+    /// Attention visibility for the packed key spans.
+    pub(crate) visible: flash::Visible<K, Chips>,
+}
+
 /// Immutable block metadata owned by request state. Fields are private: construction is only
 /// through [`BlockPlan::upload`], and consumers receive shared readers.
 #[derive(DeviceSend)]
@@ -168,78 +216,30 @@ impl<R: AxisName, K: AxisName> BlockCall<'_, R, K> {
     }
 }
 
-/// Host checks finish before the first transfer. Every numerical reader derives from `plan`;
-/// callers cannot mix another request's row transfers, modulation spans or packed-key order.
-pub struct Prepared<R, K, T, A, V> {
-    blocks: BlockPlan<R, K>,
-    rows: RowPlan<R, T, A, V>,
-    positions: Positions,
+/// A block's local initialized work, within the compiled gather allocation.
+pub type Prefix<R> = BlockPrefix<(), R, Rows<ROW_BLOCK>>;
+/// Valid semantic K/V transfers from the compact joined projection.
+pub type Keys<R, K> = PackPlan<Pieces<R, PARTS>, K, KEY_RUNS>;
+
+/// Whole-transfer work extents inside the Live envelope, derived from the modality geometry.
+/// These are not token buckets: every valid text length still supplies its own keys and spans.
+#[derive(Clone, Debug)]
+pub(crate) struct Transfer<const STEP: usize>;
+
+impl<const STEP: usize> AxisName for Transfer<STEP> {
+    const NAME: Ident = Ident::new("JointTransfer");
+    const SIZE: usize = {
+        let first = (AUDIO_ROWS + VIDEO_ROWS + TEXT_STRIP).div_ceil(ROW_BLOCK) * ROW_BLOCK;
+        let text = DEFAULT_MAX_TEXT.div_ceil(PARTS * TEXT_STRIP) * TEXT_STRIP;
+        let last = (AUDIO_ROWS + VIDEO_ROWS + text).div_ceil(ROW_BLOCK) * ROW_BLOCK;
+        // The joint execution adapter dispatches these three whole-transfer geometries.
+        assert!(last - first == 2 * ROW_BLOCK && STEP <= 2);
+        first + STEP * ROW_BLOCK
+    };
 }
 
-impl<R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName> Prepared<R, K, T, A, V> {
-    /// Return the one packing plan shared by all prepared numerical inputs.
-    pub fn plan(&self) -> Plan {
-        self.blocks.packing()
-    }
-
-    /// Check joint geometry and positions from the caller's validated packing plan before
-    /// allocating any device storage.
-    pub fn new(plan: Plan, positions: &[[f64; 3]], theta: f32) -> io::Result<Self> {
-        let blocks = BlockPlan::new(plan)?;
-        let rows = plan.row_plan()?;
-        let positions = Positions::new(plan, positions, theta)?;
-        Ok(Self {
-            blocks,
-            rows,
-            positions,
-        })
-    }
-
-    /// Initial metadata upload has no kernel readers. The engine completes it before admitting
-    /// a launch and retains the resulting owner through all accepted request work.
-    pub async fn upload(self, device: &mut Device) -> io::Result<Inputs<R, K, T, A, V>> {
-        let (_, [low, high], visible) = self.positions.into_parts();
-        let blocks = self.blocks.upload(device).await?;
-        let rows = RowInputs::upload(device, &self.rows).await?;
-        let low = HostTensor::<bf16, m![{ Symbol<Pieces<R, PARTS>> }, { Symbol<flash::Head> }]>::from_vec(low.into_iter().map(|value| bf16::from_bits(value.to_bits())))
-            .to_hbm(&mut device.pdma)
-            .await
-            .map_err(io::Error::other)?;
-        let high = HostTensor::<bf16, m![{ Symbol<Pieces<R, PARTS>> }, { Symbol<flash::Head> }]>::from_vec(high.into_iter().map(|value| bf16::from_bits(value.to_bits())))
-            .to_hbm(&mut device.pdma)
-            .await
-            .map_err(io::Error::other)?;
-        let visible = HostTensor::<bf16, m![K, { Symbol<flash::Span> }]>::from_vec(
-            visible
-                .into_iter()
-                .map(|value| bf16::from_bits(value.to_bits())),
-        )
-        .to_hbm(&mut device.pdma)
-        .await
-        .map_err(io::Error::other)?;
-        Ok(Inputs {
-            blocks,
-            rows,
-            rotation: Rotation { low, high },
-            visible,
-        })
-    }
-}
-
-/// Immutable numerical transport. A request's flight guard retains this complete owner rather
-/// than only aliases of individual readers; the entry decodes block and row plans once.
-/// Constructed only through [`Prepared::upload`] from one checked request.
-#[derive(DeviceSend)]
-pub struct Inputs<R: AxisName, K: AxisName, T, A, V> {
-    /// Checked spans, initialized work and packed-key metadata.
-    pub(crate) blocks: BlockInputs<R, K>,
-    /// Checked text/audio/video row transfers.
-    pub(crate) rows: RowInputs<R, T, A, V, Chips>,
-    /// Paired rotary coefficients for the joined rows.
-    pub(crate) rotation: Rotation<flash::Head, Chips, Pieces<R, PARTS>>,
-    /// Attention visibility for the packed key spans.
-    pub(crate) visible: flash::Visible<K, Chips>,
-}
+/// At most one valid run per modality and part. Empty part spans contribute no run.
+pub const KEY_RUNS: usize = 3 * PARTS;
 
 #[cfg(test)]
 mod tests {

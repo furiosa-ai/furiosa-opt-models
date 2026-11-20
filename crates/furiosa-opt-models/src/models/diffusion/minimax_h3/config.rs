@@ -1,4 +1,4 @@
-//! Owned checkpoint schemas narrowed to the geometry of the preserved RNGD implementation.
+//! Owned checkpoint schemas checked against the supported H3 execution geometry.
 
 use crate::models::Family;
 use crate::models::config::{self as schema, Constant, Literal};

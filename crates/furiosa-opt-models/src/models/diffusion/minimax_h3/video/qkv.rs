@@ -1,4 +1,4 @@
-//! The preserved per-head `[query, key, value]` checkpoint split and partial-RoPE pairing.
+//! Per-head `[query, key, value]` checkpoint splitting and partial-RoPE pairing.
 
 use core::borrow::Borrow;
 use core::marker::PhantomData;

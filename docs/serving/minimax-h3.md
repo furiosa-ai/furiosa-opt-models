@@ -5,10 +5,12 @@ hide: [toc]
 # MiniMax H3
 
 MiniMax H3 generates video with stereo audio from text on four RNGD chips.
+This setup and integration guide covers a manually validated profile with private
+reference data.
 The profile below has passed local native, vLLM-Omni and HTTP lifecycle checks,
 including TeaCache. The original 77-token workload passes component, raw-output
-and served-output GPU reference checks. H3 is not in the published CI benchmark
-inventory.
+and served-output GPU reference checks. H3 has no CI coverage and is not in the
+published CI benchmark inventory.
 
 ## MiniMaxAI/MiniMax-H3
 
@@ -27,9 +29,9 @@ Text-to-video with audio · FL2VA · Four RNGD chips · One active request
 | Text | `Live` execution with maximum capacity 2048 tokens |
 | Validation workload | 50 denoising steps; not a compile-time step limit |
 
-The denoiser and video/audio decoders remain resident. The text encoder streams
-its first 50 layers across the same four chips and returns rows before final
-normalization. Text length counts tokens after tokenization and prompt formatting,
+The denoiser and video/audio decoders remain resident. The text encoder keeps a
+memory-sized prefix of its first 50 layers resident and streams the rest across
+the same four chips. It returns rows before final normalization. Text length counts tokens after tokenization and prompt formatting,
 before padding. Runtime valid lengths control visibility; requests exceeding the
 configured capacity are rejected.
 

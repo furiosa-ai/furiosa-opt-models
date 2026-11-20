@@ -1,4 +1,4 @@
-//! The original cache launch sequence, with accepted readers retained through completion.
+//! TeaCache launch sequencing with accepted readers and their storage retained through completion.
 
 use super::{
     Denoiser, Flight, Hidden, Retained, Statistics, Workspace,

@@ -15,7 +15,7 @@ use crate::tensor::memory::{Hbm, Memory};
 use crate::{Module, Op};
 use furiosa_opt_std::prelude::*;
 
-/// A source `[Out, In]` matrix and `[Out]` offset, rounded as the preserved Rust loader did.
+/// BF16 `[Out, In]` weights and a BF16-rounded FP32 `[Out]` bias.
 #[derive(DeviceSend, Load, Residency)]
 #[load(tree)]
 #[residency(children(T, B))]
@@ -427,7 +427,7 @@ fn norm_parameter<C: M>(
     Ok(HostTensor::from_vec(values.repeat(C::SIZE)))
 }
 
-/// Exact shapes and the preserved `Entry::rounded`: source FP32 → BF16 → FP32.
+/// Validate stored shapes, read FP32 values and round through BF16 back to FP32.
 pub(super) fn rounded(
     source: &Checkpoint,
     context: &mut Context<'_>,

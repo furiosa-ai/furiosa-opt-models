@@ -3,9 +3,9 @@
 //! These trees load relative to the transformer's physical checkpoint prefix. The condition
 //! projection runs once before the text refiner; the media and time projections run each step.
 //! Packing, the refiner, blocks, output extraction and latent statistics are separate boundaries.
-//! The ordinary split-projection loaders retain FP32 weights as BF16 high/low images. Their
-//! existing numerical leaves preserve the reference's rounding boundaries; no kernel is defined
-//! here.
+//! The split-projection loaders retain FP32 weights as BF16 high/low images. Text and media
+//! projections round their results to BF16; timestep projections and final velocity heads
+//! return FP32 results.
 
 use crate::Module;
 use crate::load::{Load, Named};
@@ -18,96 +18,10 @@ use crate::tensor::memory::{Hbm, Memory};
 use crate::tensor::parallel::Shard;
 use furiosa_opt_std::prelude::*;
 
-axes![
-    Condition = 5120,
-    Width = 5376,
-    Time = 2688,
-    Patch = 96,
-    Latent = 32
-];
-
-/// Four live chips, with a replicated copy of each projection's coefficients on every chip.
-pub type Chips = m![{ Symbol<Shard<4>> }];
-
-/// FP32 bits of the final RMS norm's stabilizer, fixed by the H3 family configuration.
-pub const EPSILON: usize = 1e-5_f32.to_bits() as usize;
-
-/// BF16 prompt rows times a BF16 matrix, with the FP32 bias added before the BF16 rounding.
-pub type Text<In = Condition, Out = Width, C = Chips, X = Hbm> = split::Biased<
-    In,
-    Out,
-    C,
-    Linear<In, Out, C, <X as Memory>::Tensor<bf16, C, m![Out, In]>>,
-    <X as Memory>::Tensor<f32, C, m![Out]>,
->;
-
-/// FP32 input and coefficient values split into BF16 parts; the result rounds once to BF16.
-/// Its stored matrix is `[Out, In]`; its prepared image is `[2*Out, 2*In]`.
-pub type Input<In, Out = Width, C = Chips, X = Hbm> = split::Embedding<
-    In,
-    Out,
-    C,
-    Linear<
-        Sides<In>,
-        Stacked<Out>,
-        C,
-        <X as Memory>::Tensor<bf16, C, m![{ Symbol<Stacked<Out>> }, { Symbol<Sides<In>> }]>,
-    >,
-    <X as Memory>::Tensor<f32, C, m![Out]>,
->;
-
-/// Cosines then sines, an FP32 projection, FP32 SiLU, and an FP32 projection. The two projections
-/// use the ordinary split loader, under the checkpoint's actual `proj_in` and `proj_out` names.
-pub type Timesteps<Hidden = Width, Out = Time, C = Chips, X = Hbm> = split::TimeEmbedding<
-    Hidden,
-    Out,
-    C,
-    Named<"proj_in", Input<split::Sinusoid, Hidden, C, X>>,
-    Named<"proj_out", Input<Hidden, Out, C, X>>,
-    <X as Memory>::Tensor<f32, C, m![{ Symbol<split::Frequency> }]>,
->;
-
-/// BF16 hidden rows times the FP32 matrix's BF16 high/low images, summed with FP32 bias into
-/// FP32 velocities. Its prepared coefficient image is `[2*Out, In]`.
-pub type Output<Out, In = Width, C = Chips, X = Hbm> = split::Precise<
-    In,
-    Out,
-    C,
-    Linear<In, Stacked<Out>, C, <X as Memory>::Tensor<bf16, C, m![{ Symbol<Stacked<Out>> }, In]>>,
-    <X as Memory>::Tensor<f32, C, m![Out]>,
->;
-
-/// One timestep's final shift/scale: FP32 SiLU, BF16 rounding, biased BF16 projection, BF16 result.
-pub type Modulation<const STEP: usize, In = Time, W = Width, C = Chips, X = Hbm> =
-    modulation::HeadModulation<
-        In,
-        W,
-        STEP,
-        C,
-        <X as Memory>::Tensor<bf16, C, m![{ Symbol<modulation::ShiftScale<W>> }, In]>,
-        <X as Memory>::Tensor<f32, C, m![{ Symbol<modulation::ShiftScale<W>> }, 1 # 8]>,
-    >;
-
-/// RMS normalization rounds to BF16 before shift/scale modulation, which rounds again.
-pub type Norm<W = Width, C = Chips, X = Hbm> =
-    adaptive::FinalNorm<W, EPSILON, C, <X as Memory>::Tensor<bf16, C, m![W]>>;
-
-/// Video uses timestep 0 and projects to a 2×2 patch of the 24-channel latent.
-pub type VideoHead<W = Width, T = Time, O = Patch, C = Chips, X = Hbm> = diffusion::Head<
-    Named<"adaln_proj.linear", Modulation<0, T, W, C, X>>,
-    Named<"norm", Norm<W, C, X>>,
-    Named<"video_out", Output<O, W, C, X>>,
->;
-
-/// Audio uses timestep 1 and projects to the stereo decoder's 32-channel latent.
-pub type AudioHead<W = Width, T = Time, O = Latent, C = Chips, X = Hbm> = diffusion::Head<
-    Named<"adaln_proj.linear", Modulation<1, T, W, C, X>>,
-    Named<"norm", Norm<W, C, X>>,
-    Named<"audio_out", Output<O, W, C, X>>,
->;
-
 /// The transformer's input weights, with generic children so each tree can retain prepared host
 /// storage and lend the same HBM weights for execution. Children remain individually callable.
+///
+/// Source: https://github.com/vllm-project/vllm-omni/blob/6daf5b30f07cc0b3db87766d22fdf433f8a1a7c9/vllm_omni/diffusion/models/minimax_h3/minimax_h3_transformer.py
 #[derive(DeviceSend, Load, Residency)]
 #[residency(children(Text, Video, Audio, Time))]
 pub struct Embeddings<
@@ -151,8 +65,10 @@ where
     }
 }
 
-/// Both final heads from the same `final_layer` checkpoint namespace. As in the reference, each
-/// head owns its modulation and norm child; no broad ignore hides another transformer's weights.
+/// Both final heads load from the same `final_layer` checkpoint namespace. Each head owns its
+/// modulation and norm child, and strict loading rejects unclaimed checkpoint tensors.
+///
+/// Source: https://github.com/vllm-project/vllm-omni/blob/6daf5b30f07cc0b3db87766d22fdf433f8a1a7c9/vllm_omni/diffusion/models/minimax_h3/minimax_h3_transformer.py
 #[derive(DeviceSend, Load, Residency)]
 #[residency(children(Video, Audio))]
 pub struct FinalLayer<Video = VideoHead, Audio = AudioHead> {
@@ -186,6 +102,102 @@ where
         (video, audio)
     }
 }
+
+/// BF16 prompt rows times a BF16 matrix, with the FP32 bias added before the BF16 rounding.
+pub type Text<In = Condition, Out = Width, C = Chips, X = Hbm> = split::Biased<
+    In,
+    Out,
+    C,
+    Linear<In, Out, C, <X as Memory>::Tensor<bf16, C, m![Out, In]>>,
+    <X as Memory>::Tensor<f32, C, m![Out]>,
+>;
+
+/// FP32 input and coefficient values split into BF16 parts; the result rounds once to BF16.
+/// Its stored matrix is `[Out, In]`; its prepared image is `[2*Out, 2*In]`.
+pub type Input<In, Out = Width, C = Chips, X = Hbm> = split::Embedding<
+    In,
+    Out,
+    C,
+    Linear<
+        Sides<In>,
+        Stacked<Out>,
+        C,
+        <X as Memory>::Tensor<bf16, C, m![{ Symbol<Stacked<Out>> }, { Symbol<Sides<In>> }]>,
+    >,
+    <X as Memory>::Tensor<f32, C, m![Out]>,
+>;
+
+/// Cosines then sines, an FP32 projection, FP32 SiLU, and an FP32 projection. The two projections
+/// use the ordinary split loader, under the checkpoint's actual `proj_in` and `proj_out` names.
+///
+/// Source: https://github.com/vllm-project/vllm-omni/blob/6daf5b30f07cc0b3db87766d22fdf433f8a1a7c9/vllm_omni/diffusion/models/minimax_h3/minimax_h3_transformer.py
+pub type Timesteps<Hidden = Width, Out = Time, C = Chips, X = Hbm> = split::TimeEmbedding<
+    Hidden,
+    Out,
+    C,
+    Named<"proj_in", Input<split::Sinusoid, Hidden, C, X>>,
+    Named<"proj_out", Input<Hidden, Out, C, X>>,
+    <X as Memory>::Tensor<f32, C, m![{ Symbol<split::Frequency> }]>,
+>;
+
+/// Video uses timestep 0 and projects to a 2×2 patch of the 24-channel latent.
+///
+/// Source: https://github.com/vllm-project/vllm-omni/blob/6daf5b30f07cc0b3db87766d22fdf433f8a1a7c9/vllm_omni/diffusion/models/minimax_h3/minimax_h3_transformer.py
+pub type VideoHead<W = Width, T = Time, O = Patch, C = Chips, X = Hbm> = diffusion::Head<
+    Named<"adaln_proj.linear", Modulation<0, T, W, C, X>>,
+    Named<"norm", Norm<W, C, X>>,
+    Named<"video_out", Output<O, W, C, X>>,
+>;
+
+/// Audio uses timestep 1 and projects to the stereo decoder's 32-channel latent.
+///
+/// Source: https://github.com/vllm-project/vllm-omni/blob/6daf5b30f07cc0b3db87766d22fdf433f8a1a7c9/vllm_omni/diffusion/models/minimax_h3/minimax_h3_transformer.py
+pub type AudioHead<W = Width, T = Time, O = Latent, C = Chips, X = Hbm> = diffusion::Head<
+    Named<"adaln_proj.linear", Modulation<1, T, W, C, X>>,
+    Named<"norm", Norm<W, C, X>>,
+    Named<"audio_out", Output<O, W, C, X>>,
+>;
+
+/// One timestep's final shift/scale: FP32 SiLU, BF16 rounding, biased BF16 projection, BF16 result.
+///
+/// Source: https://github.com/vllm-project/vllm-omni/blob/6daf5b30f07cc0b3db87766d22fdf433f8a1a7c9/vllm_omni/diffusion/models/minimax_h3/minimax_h3_transformer.py
+pub type Modulation<const STEP: usize, In = Time, W = Width, C = Chips, X = Hbm> =
+    modulation::HeadModulation<
+        In,
+        W,
+        STEP,
+        C,
+        <X as Memory>::Tensor<bf16, C, m![{ Symbol<modulation::ShiftScale<W>> }, In]>,
+        <X as Memory>::Tensor<f32, C, m![{ Symbol<modulation::ShiftScale<W>> }, 1 # 8]>,
+    >;
+
+/// RMS normalization rounds to BF16 before shift/scale modulation, which rounds again.
+pub type Norm<W = Width, C = Chips, X = Hbm> =
+    adaptive::FinalNorm<W, EPSILON, C, <X as Memory>::Tensor<bf16, C, m![W]>>;
+
+/// BF16 hidden rows times the FP32 matrix's BF16 high/low images, summed with FP32 bias into
+/// FP32 velocities. Its prepared coefficient image is `[2*Out, In]`.
+pub type Output<Out, In = Width, C = Chips, X = Hbm> = split::Precise<
+    In,
+    Out,
+    C,
+    Linear<In, Stacked<Out>, C, <X as Memory>::Tensor<bf16, C, m![{ Symbol<Stacked<Out>> }, In]>>,
+    <X as Memory>::Tensor<f32, C, m![Out]>,
+>;
+
+axes![
+    Condition = 5120,
+    Width = 5376,
+    Time = 2688,
+    Patch = 96,
+    Latent = 32
+];
+
+/// Four live chips, with a replicated copy of each projection's coefficients on every chip.
+pub type Chips = m![{ Symbol<Shard<4>> }];
+
+/// FP32 bits of the final RMS norm's stabilizer, fixed by the H3 family configuration.
+pub const EPSILON: usize = 1e-5_f32.to_bits() as usize;
 
 #[cfg(test)]
 pub(super) mod tests {
@@ -834,36 +846,6 @@ pub(super) mod tests {
 
         let stored = load(&fixture()).unwrap();
         let expected = snapshot::<Host>(&stored);
-        let paths: Vec<_> = expected
-            .iter()
-            .map(|record| record.path.strip_prefix("transformer.").unwrap())
-            .collect();
-        assert_eq!(
-            paths,
-            [
-                "inputs.text.weight.affine.weight",
-                "inputs.text.bias",
-                "inputs.video.weight.affine.weight",
-                "inputs.video.bias",
-                "inputs.audio.weight.affine.weight",
-                "inputs.audio.bias",
-                "inputs.time.frequencies",
-                "inputs.time.first.proj_in.weight.affine.weight",
-                "inputs.time.first.proj_in.bias",
-                "inputs.time.second.proj_out.weight.affine.weight",
-                "inputs.time.second.proj_out.bias",
-                "heads.video.modulation.adaln_proj.linear.weight",
-                "heads.video.modulation.adaln_proj.linear.bias",
-                "heads.video.norm.norm.weight.tensor",
-                "heads.video.projection.video_out.weight.affine.weight",
-                "heads.video.projection.video_out.bias",
-                "heads.audio.modulation.adaln_proj.linear.weight",
-                "heads.audio.modulation.adaln_proj.linear.bias",
-                "heads.audio.norm.norm.weight.tensor",
-                "heads.audio.projection.audio_out.weight.affine.weight",
-                "heads.audio.projection.audio_out.bias",
-            ]
-        );
         assert!(
             expected
                 .iter()

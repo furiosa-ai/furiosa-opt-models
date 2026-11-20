@@ -1,15 +1,11 @@
 //! H3's input projection folded into the audio decoder's first convolution.
 //!
-//! The preserved Furiosa loader uses a 32-to-2048 projection, then a 1024-output, seven-tap
-//! convolution. Weight normalization and projection folding run in FP64, then round through
-//! FP32 to BF16 in output, tap, lifted-input order. The projection bias weighs the lifted
-//! ones channel, which is zero on padding rows; the convolution bias remains FP32.
-//! Latent statistics are deliberately absent: the original loader ignored its statistics
-//! argument. The parent decoder supplies lifted rows and the physical audio checkpoint scope.
-//!
-//! Arithmetic ported from the preserved Furiosa Rust implementation in
-//! `furiosa-opt-engine/src/checkpoint/load/minimax_h3/audio/input.rs` (`Fold::apply`) and
-//! `audio.rs` (`WeightNorm::apply`), using the public convolution's identical normalization.
+//! A 32-to-2048 projection feeds a 1024-output, seven-tap convolution. Weight normalization
+//! and projection folding run in FP64, then round through FP32 to BF16 in output, tap,
+//! lifted-input order. The projection bias weighs the lifted ones channel, which is zero on
+//! padding rows; the convolution bias remains FP32.
+//! No latent statistics transform is applied. The parent decoder supplies lifted rows and
+//! the physical audio checkpoint scope.
 
 use core::borrow::Borrow;
 use core::marker::PhantomData;
@@ -170,7 +166,7 @@ struct Fold {
 }
 
 impl Fold {
-    /// Preserve the reference's middle-channel summation order, then narrow FP64 to FP32 once.
+    /// Sum projected channels in increasing index order, then narrow FP64 to FP32 once.
     fn apply(&self, pre: Vec<f64>) -> Vec<f32> {
         let mut lifted = vec![0.0_f64; PROJECTED * Lifted::SIZE];
         for row in 0..PROJECTED {
@@ -207,5 +203,5 @@ pub type BiasLayout = m![{ Symbol<Produced<C1024>> }];
 
 axes![C1024 = 1024, K7 = 7];
 
-/// The preserved audio loader and checked H3 audio configuration both fix this width at 2048.
+/// Width of the input projection and first convolution's shared intermediate channels.
 const PROJECTED: usize = 2048;

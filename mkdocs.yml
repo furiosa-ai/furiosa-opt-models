@@ -133,6 +133,7 @@ nav:
       - getting-started/quickstart.md
   - User guide:
       - serving/index.md
+      - serving/minimax-h3.md
       - engine/python.md
       - concepts.md
       - reference/troubleshooting.md
@@ -156,9 +157,6 @@ nav:
           - Qwen3:
               - models/qwen3-embedding.md
               - models/qwen3-reranker.md
-      - Video with audio:
-          - MiniMax H3:
-              - models/minimax-h3.md
   - Developer guide:
       - design/architecture.md
       - develop/compose.md

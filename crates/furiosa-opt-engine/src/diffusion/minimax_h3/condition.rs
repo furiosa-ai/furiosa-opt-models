@@ -1,4 +1,5 @@
-//! Original request-level conditioning sequence, with runtime prompt padding and distribution.
+//! Request-level conditioning with separate projection, refiner-layer and final-norm launches.
+//! Runtime prompt padding and distribution supply chip-local text rows for denoising.
 
 use super::{flight::Flight, kernel, weights::Component};
 use crate::residency::{Resident, SharedDevice, block_on};
@@ -39,8 +40,8 @@ pub(super) struct Conditioner<const N: usize, T: AxisName> {
 }
 
 impl<const N: usize, T: AxisName + Send + Sync> Conditioner<N, T> {
-    /// Borrow the existing stages; no additional weight owner or device is created. Prime each
-    /// original launch before measuring the encoder's resident-prefix memory grant.
+    /// Borrow the resident stages and shared device. Prime each stage's entry before measuring
+    /// the encoder's resident-prefix memory grant.
     pub(super) async fn from_resident(
         owner: Component<Denoiser>,
         device: SharedDevice,
@@ -108,9 +109,9 @@ impl<const N: usize, T: AxisName + Send + Sync> Conditioner<N, T> {
         })
     }
 
-    /// Preserve the original projection -> layer 0 -> layer 1 -> final norm sequence. As in the
-    /// repro caller, read the replicated result, clear padding and distribute text to the four
-    /// parts once per request. Checked Plan lookups replace its experimental 128-row constants.
+    /// Launch projection, refiner layer 0, refiner layer 1 and final normalization in order.
+    /// Read the first of four output replicas, zero non-token rows and distribute text to the
+    /// four parts once per request. The checked plan determines each part's valid text rows.
     pub(super) async fn prepare(&self, plan: Plan, rows: Vec<HbmBuffer>) -> io::Result<Text<T>> {
         let prepared = Prepared::<N>::new(plan, rows)?;
         let metadata = Arc::new(
@@ -185,8 +186,8 @@ impl<const N: usize, T: AxisName + Send + Sync> Conditioner<N, T> {
             .map(HostTensor::into_vec)
             .map_err(io::Error::other)
         })?;
-        // Every chip refines the same prompt. The original caller takes the first replica,
-        // zeroes every non-token row and splits its padded envelope into chip-local text parts.
+        // Every chip refines the same prompt. Copy valid tokens from the first replica into
+        // chip-local text parts, leaving every non-token row zero.
         let mut parts = vec![bf16::from_bits(0); PARTS * T::SIZE * Width::SIZE];
         for chip in 0..PARTS {
             let span = plan
@@ -243,7 +244,8 @@ async fn completed<T>(flight: Flight<T>) -> io::Result<HbmBuffer> {
     Ok(output)
 }
 
-/// The repro retains two refinement slots and a separate final output through all launches.
+/// Two alternating refinement slots and a separate final output remain owned through all
+/// accepted launches, together with their input rows and metadata.
 struct Workspace<const N: usize> {
     metadata: Arc<Metadata<N>>,
     hidden: [HbmBuffer; 2],

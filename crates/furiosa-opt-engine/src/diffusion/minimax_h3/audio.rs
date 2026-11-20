@@ -1,7 +1,7 @@
-//! Audio decoding on the pipeline's original four chips.
+//! Audio decoding on the pipeline's shared four-chip device context.
 //!
-//! The host adapter preserves the original channel-major latent boundary, one complete decoder
-//! launch and per-channel waveform trimming. Numerical work remains in the existing Module tree.
+//! The host adapter packs channel-major latents into time-major rows, launches the complete
+//! decoder once and trims waveform padding per channel. Numerical work stays in the Module tree.
 
 use super::{flight::Flight, weights::Component};
 use crate::residency::{Resident, SharedDevice, block_on};
@@ -10,7 +10,7 @@ use furiosa_opt_models::ops::convolution::{
     frames::{Stereo, Window},
     input::Latent as Channels,
 };
-use furiosa_opt_models::tensor::memory::alias;
+use furiosa_opt_models::tensor::memory::{Hbm, alias};
 use furiosa_opt_std::prelude::*;
 use std::io;
 
@@ -28,7 +28,7 @@ pub(super) struct Decoder {
 }
 
 impl Decoder {
-    /// Bind already placed weights and prime the original complete decoder entry before sizing
+    /// Bind placed weights and prime the shared four-chip decoder entry before sizing
     /// the encoder's resident-prefix grant. The cloned resident view shares the existing cells;
     /// this adapter neither opens a device nor loads or uploads a second weight tree.
     pub(super) async fn from_resident(
@@ -36,7 +36,16 @@ impl Decoder {
         device: SharedDevice,
     ) -> io::Result<Self> {
         device.admit(owner.resident())?.landed().await?;
-        device.with_device(|device| kernel::decode.load(device).map_err(io::Error::other))?;
+        device.with_device(|device| {
+            Loadable::<(
+                &mut Device,
+                &&audio::Decoder<Chips, &Hbm>,
+                (),
+                &mut kernel::State,
+                &audio::Input,
+            )>::load(kernel::decode, device)
+            .map_err(io::Error::other)
+        })?;
         let decoder = owner.resident().clone();
         Ok(Self {
             _owner: owner,
@@ -49,7 +58,7 @@ impl Decoder {
     /// The input's constructor checks shape and payload length before this call. Transposition
     /// only copies FP32 values. No latent-statistics transform is introduced, and the existing
     /// Module tree retains every BF16 rounding boundary.
-    /// The original caller reads the first of four identical waveform replicas and removes
+    /// Read the first of four identical waveform replicas and remove
     /// each channel's trailing allocation padding separately.
     pub(super) async fn decode(&self, input: Latents<'_>) -> io::Result<Vec<f32>> {
         let packed = input.pack();
@@ -76,7 +85,7 @@ impl Decoder {
                 &work.input,
                 &mut waveform,
             )?;
-            // Record immediately after acceptance. Flight retains the original input and
+            // Record immediately after acceptance. Flight retains the input and
             // output allocation through completion, cancellation and execution failure.
             flight.accepted(waveform.into_buffer(), accepted);
             Ok(())
@@ -87,8 +96,8 @@ impl Decoder {
             })?;
         let waveform = audio::Output::<Chips>::try_from(waveform).map_err(io::Error::other)?;
         let samples = self.device.with_device(|device| {
-            // Keep the original output allocation until the download ends, including errors.
-            // As in the repro, download all replicas, then consume only the first one below.
+            // Retain the waveform allocation until the download ends, including errors.
+            // Download all four replicas, then consume only the first replica below.
             block_on(
                 waveform
                     .to_host::<m![{ Chips }, Stereo, { Symbol<audio::Samples> }]>(&mut device.pdma)
@@ -172,7 +181,7 @@ fn invalid(message: &str) -> io::Error {
 mod tests {
     use super::*;
 
-    /// Preserve the repro's channel-major latent boundary and zero-padded final time row.
+    /// Check channel-major to time-major packing and the zero-padded final time row.
     #[test]
     fn preserves_audio_latents() {
         let values: Vec<f32> = (0..INPUT_SHAPE.into_iter().product::<usize>())
@@ -202,11 +211,9 @@ mod tests {
     }
 }
 
-/// Concrete binding of the unchanged complete decoder and its ordinary nested Module state.
+/// Four-chip launch binding and nested decoder state.
 mod kernel {
-    use furiosa_opt_models::models::diffusion::minimax_h3::{audio, embeddings::Chips};
-    use furiosa_opt_models::{Module, tensor::memory::Hbm};
-    use furiosa_opt_std::prelude::*;
+    pub(super) use crate::forward_four as decode;
 
     type UnitState = ((), ((), ()));
     type BlockState = (UnitState, (UnitState, UnitState));
@@ -223,15 +230,4 @@ mod kernel {
         ),
     );
     pub(super) type State = (((), ((), StagesState)), ((), ()));
-
-    #[device(chip = 4)]
-    pub(super) fn decode(
-        device: &mut Device,
-        module: &&audio::Decoder<Chips, &Hbm>,
-        env: (),
-        state: &mut State,
-        input: &audio::Input,
-    ) -> audio::Output {
-        module.forward(device, env, state, input)
-    }
 }

@@ -3,7 +3,7 @@
 use super::flight::Flight;
 use crate::residency::{Cells, Resident, SharedDevice, block_on};
 use furiosa_opt_models::models::diffusion::minimax_h3::{packing::DEFAULT_MAX_TEXT, text};
-use furiosa_opt_models::tensor::memory::alias;
+use furiosa_opt_models::tensor::memory::{Hbm, alias};
 use furiosa_opt_models::tensor::parallel::{Parallel, Parallelism};
 use furiosa_opt_std::prelude::*;
 use std::{io, sync::Arc};
@@ -55,8 +55,22 @@ impl Encoder {
         });
         owner.pin()?;
         device.with_device(|device| {
-            kernel::embedding.load(device).map_err(io::Error::other)?;
-            kernel::layer.load(device).map_err(io::Error::other)?;
+            Loadable::<(
+                &mut Device,
+                &&text::Embedding<P, &Hbm>,
+                (),
+                &mut (),
+                &HbmTensor<i32, Chips, m![1]>,
+            )>::load(kernel::embedding, device)
+            .map_err(io::Error::other)?;
+            Loadable::<(
+                &mut Device,
+                &kernel::Layer<'_, '_>,
+                &request::Row,
+                &mut Cache,
+                Hidden,
+            )>::load(kernel::layer, device)
+            .map_err(io::Error::other)?;
             Ok(())
         })?;
         let available = || device.with_device(|device| Ok(device.memory().usage().available));

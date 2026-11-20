@@ -70,7 +70,7 @@ impl Weights {
             children.ask(
                 context.field("video", layout.video_vae().tensor_prefix(), |cx| {
                     cx.checkpoint(source, |cx| {
-                        // The preserved pipeline decodes only. Keep the public physical prefix,
+                        // This pipeline decodes only. Keep the public physical prefix,
                         // including source_path, and account for just the unused encoder weights.
                         cx.ignore("encoder");
                         cx.ignore("quant_conv");
@@ -92,8 +92,8 @@ impl Weights {
             )?;
         let ((denoiser, video), audio) = children.node(denoiser.zip(video).zip(audio))?;
         Ok(Self {
-            // Retain sidecar statistics and schedule shifts without introducing a statistics
-            // fold: the existing decoder loaders preserve the reference arithmetic boundary.
+            // Retain sidecar statistics and schedule shifts as metadata. Decoder projections
+            // do not apply latent statistics to their weights or input values.
             inputs: inputs.clone(),
             resident: Resident::<Components>::new(Components {
                 denoiser,
@@ -153,7 +153,7 @@ pub(super) struct Components<D = Denoiser, V = video::Decoder, A = audio::Decode
 
 /// A callable subtree retaining all resident siblings and the checked inputs, without a reload.
 /// A future externally exposed component must additionally retain the complete pipeline owner,
-/// including its text controller and original device context.
+/// including its text controller and shared device context.
 pub(super) struct Component<T: Residency> {
     owner: Arc<Weights>,
     resident: Resident<T>,

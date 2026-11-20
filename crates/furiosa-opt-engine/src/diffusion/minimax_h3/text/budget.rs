@@ -1,4 +1,5 @@
-//! Resident-prefix selection from measured per-chip allocations, matching the streamed repro.
+//! Resident-prefix selection from measured per-chip allocations, with a three-layer streaming
+//! window and enough transient space for either encoding or another pipeline stage.
 
 use std::io;
 
@@ -55,7 +56,7 @@ const SLOTS: usize = 3;
 mod tests {
     use super::*;
 
-    /// Original repro budget boundaries: exact fit, one byte short, the other stage dominating,
+    /// Budget boundaries: exact fit, one byte short, the other stage dominating,
     /// and insufficient space for the streaming window. Values are bytes per chip.
     #[test]
     fn keeps_the_prefix_that_fits_beside_either_stage() {

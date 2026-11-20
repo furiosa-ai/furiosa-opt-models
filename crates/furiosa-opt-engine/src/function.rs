@@ -136,6 +136,20 @@ where
 }
 // --8<-- [end:entry]
 
+/// Runs a module on four chips, on the env, state and input its launch passes.
+/// The device macro requires a literal topology; `forward` remains the one-chip entry.
+#[device(chip = 4)]
+pub fn forward_four<M, I, E, S, O>(device: &mut Device, module: &M, env: E, state: S, input: I) -> O
+where
+    M: DeviceSend + Module<I, E, S, Output = O>,
+    I: DeviceSend,
+    E: DeviceSend,
+    S: DeviceSend,
+    O: DeviceOutput,
+{
+    module.forward(device, env, state, input)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,19 +189,6 @@ mod tests {
         module.forward(device, env, state, input)
     }
 
-    /// `forward` on four chips.
-    #[device(chip = 4)]
-    fn four<M, I, E, S, O>(device: &mut Device, module: &M, env: E, state: S, input: I) -> O
-    where
-        M: DeviceSend + Module<I, E, S, Output = O>,
-        I: DeviceSend,
-        E: DeviceSend,
-        S: DeviceSend,
-        O: DeviceOutput,
-    {
-        module.forward(device, env, state, input)
-    }
-
     /// A function launches a module with its env and state through the entry of each chip count.
     const _: () = {
         fn launches<A>(_: A)
@@ -198,7 +199,7 @@ mod tests {
         let _ = || {
             launches(Function::new(&Echo, forward));
             launches(Function::new(&Echo, two));
-            launches(Function::new(&Echo, four));
+            launches(Function::new(&Echo, forward_four));
         };
     };
 }

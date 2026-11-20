@@ -25,7 +25,7 @@ pub(super) struct Layout {
 
 impl Layout {
     /// Accept one text -> audio -> video request, followed only by upstream padding.
-    /// `bounds` is the original packed `[0, live, sequence]` contract, including its trailing
+    /// `bounds` must be the packed `[0, live, sequence]` triple, including its trailing
     /// entry when no padding is present. Conditioning references and batches are refused.
     /// Text length and the upstream sequence envelope come from the supplied capacity.
     pub(super) fn parse(
@@ -103,8 +103,8 @@ impl Layout {
 
     /// Select the actual canonical position triples for `request::Prepared::new` or
     /// `Positions::new`. Coordinates are never synthesized or reordered into attention-key
-    /// order here. As in the original framework parser, even padding coordinates must be finite;
-    /// `Positions` owns the additional FP32 phase/rotary validation of the valid triples.
+    /// order here. Every coordinate must be finite, including padding coordinates.
+    /// `Positions` additionally validates FP32 phases and rotation values for valid triples.
     pub(super) fn positions(&self, upstream: &[[f64; 3]]) -> io::Result<Vec<[f64; 3]>> {
         if upstream.len() != self.sequence {
             return Err(invalid("position triples must cover the upstream sequence"));

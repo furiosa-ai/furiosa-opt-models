@@ -56,7 +56,7 @@ A load of a vision-language model's media encoder alone (`LoadOptions.encoder()`
 A MiniMax H3 load returns one four-chip `Pipeline`. Its component views retain
 the same pipeline and device. Component calls take the framework's arguments and
 return completed host tensors; they do not use the decoder KV-cache API below.
-See the [H3 profile](../models/minimax-h3.md) for supported inputs and serving.
+See the [H3 profile](../serving/minimax-h3.md) for supported inputs and serving.
 
 ::: furiosa_opt_engine.minimax_h3.Component
 

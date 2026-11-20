@@ -1,4 +1,4 @@
-//! One tile's request metadata, ported from the preserved Furiosa Rust video rotation loader.
+//! Fixed per-tile rotary tables and attention visibility, separate from decoder weights.
 
 use super::{Chips, HeadWidth, LIVE, Rows, TOKENS};
 use crate::load::{self, Load, LoadError};
@@ -16,7 +16,7 @@ pub struct Context<C: M = Chips> {
 }
 
 impl<C: M + 'static> Context<C> {
-    /// Prepare the reference's constant tile tables once and upload them through ordinary Load.
+    /// Prepare constant tile tables once and upload them through ordinary Load.
     /// The load context selects the device; no model weights or checkpoint tensors are read.
     pub fn load(context: &mut load::Context<'_>) -> Result<Self, LoadError> {
         let (low, high) = tables();
@@ -39,7 +39,7 @@ impl<C: M + 'static> Context<C> {
     }
 }
 
-/// Original FP32 inverse-frequency bits, eight frequencies for each of time, height and width.
+/// FP32 inverse-frequency bit patterns, eight frequencies for each of time, height and width.
 const INVERSE: [u32; 8] = [
     0x3f80_0000,
     0x3f0f_f59a,

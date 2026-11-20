@@ -15,6 +15,7 @@ use furiosa_opt_std::prelude::DeviceSend;
 pub mod cache;
 pub mod launch;
 
+/// Source: https://github.com/vllm-project/vllm-omni/blob/6daf5b30f07cc0b3db87766d22fdf433f8a1a7c9/vllm_omni/diffusion/models/minimax_h3/minimax_h3_transformer.py
 /// The default four-chip weight tree, retaining each joint block as its own parameter owner.
 pub type Denoiser<X = Hbm> = Model<
     Embeddings<X>,
@@ -23,6 +24,7 @@ pub type Denoiser<X = Hbm> = Model<
     Heads<X>,
 >;
 
+/// Source: https://github.com/vllm-project/vllm-omni/blob/6daf5b30f07cc0b3db87766d22fdf433f8a1a7c9/vllm_omni/diffusion/models/minimax_h3/minimax_h3_transformer.py
 /// The same checkpoint-owned projections, also lent to a separately launched embedding stage.
 pub type Embeddings<X = Hbm> = embeddings::Embeddings<
     embeddings::Text<embeddings::Condition, embeddings::Width, embeddings::Chips, X>,
@@ -31,6 +33,7 @@ pub type Embeddings<X = Hbm> = embeddings::Embeddings<
     embeddings::Timesteps<embeddings::Width, embeddings::Time, embeddings::Chips, X>,
 >;
 
+/// Source: https://github.com/vllm-project/vllm-omni/blob/6daf5b30f07cc0b3db87766d22fdf433f8a1a7c9/vllm_omni/diffusion/models/minimax_h3/minimax_h3_transformer.py
 /// One ordinary adaptive block; host sequencing borrows each layer from the retained stack.
 pub type Block<X = Hbm> = WithSpans<
     transformer::Block<
@@ -42,6 +45,7 @@ pub type Block<X = Hbm> = WithSpans<
     >,
 >;
 
+/// Source: https://github.com/vllm-project/vllm-omni/blob/6daf5b30f07cc0b3db87766d22fdf433f8a1a7c9/vllm_omni/diffusion/models/minimax_h3/minimax_h3_transformer.py
 /// The same final projections, also lent to a separately launched readout stage.
 pub type Heads<X = Hbm> = embeddings::FinalLayer<
     embeddings::VideoHead<
@@ -60,6 +64,7 @@ pub type Heads<X = Hbm> = embeddings::FinalLayer<
     >,
 >;
 
+/// Source: https://github.com/vllm-project/vllm-omni/blob/6daf5b30f07cc0b3db87766d22fdf433f8a1a7c9/vllm_omni/diffusion/models/minimax_h3/minimax_h3_transformer.py
 /// Owning composition of the stages; all weight names stay relative to the transformer root.
 /// Callers borrow the children for separately launched embeddings, blocks and heads,
 /// including TeaCache's first-block probe, from this one weight tree.

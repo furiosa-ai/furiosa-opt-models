@@ -1,8 +1,8 @@
 //! Framework component calls sharing one H3 pipeline, prompt memo and pinned media staging.
 //!
 //! Tokenization, schedules, solver steps and media packaging belong to the framework. This
-//! adapter preserves the original component boundary and delegates every numerical call to the
-//! existing core. Component views must retain an `Arc<Pipeline>` and use this same owner.
+//! adapter delegates encoding, denoising and decoding to the core. Component views must retain
+//! an `Arc<Pipeline>` and use this same owner.
 
 use super::{audio, cache, denoiser, layout::Layout, pipeline, text, video, weights};
 use crate::residency::{SharedDevice, block_on};
@@ -31,8 +31,8 @@ impl Prepared {
         weights::Prepared::load_with_inputs(source, DEFAULT_MAX_TEXT, inputs).map(Self)
     }
 
-    /// Prime the original stages and measure their real allocations before encoder sizing.
-    /// `device` is the original four-chip context; this does not open additional devices.
+    /// Prime component entries and measure their allocations before sizing the encoder.
+    /// All components share the supplied four-chip `device` context.
     pub async fn place(self, device: SharedDevice) -> io::Result<Arc<Pipeline>> {
         if device.placement().chips.len() != Chips::SIZE || device.placement().pes != (0..8) {
             return Err(invalid(
@@ -63,7 +63,7 @@ impl Prepared {
     }
 }
 
-/// Original serialized framework component facade, retaining the complete four-chip core.
+/// Serialized framework component facade retaining the complete four-chip core.
 pub struct Pipeline {
     core: Arc<Core>,
     // Serialize every component while allowing concurrent async callers to wait without
@@ -95,7 +95,7 @@ impl Pipeline {
     }
 
     /// Completed host BF16 rows from the first 50 text layers, before final normalization.
-    /// Keep the previous prompt memo while encoding, as in the original streaming caller.
+    /// Retain the previous prompt's prepared data during encoding, but clear its cached rows.
     pub async fn encode(&self, tokens: &[i32]) -> io::Result<Vec<bf16>> {
         let mut state = self.state().await?;
         if let Some(memo) = &mut state.memo {
@@ -119,8 +119,8 @@ impl Pipeline {
             .await
     }
 
-    /// Device cache work with the framework's host decision. Scalars are the original BF16
-    /// means represented exactly as FP32; no GPU tensor or hidden allocation leaves the engine.
+    /// Device cache work with the framework's host decision. Scalars are BF16-rounded means
+    /// represented exactly as FP32; no GPU tensor or hidden allocation leaves the engine.
     /// A synchronous decision cannot reenter this pipeline on its own thread; such calls
     /// return an error instead of waiting for the decision's still-active evaluation.
     pub async fn forward_cached<F>(&self, input: Input, decide: F) -> io::Result<Output>
@@ -219,7 +219,7 @@ impl Pipeline {
         Ok(output)
     }
 
-    /// Decode the fixed profile, retaining the last requested frames as in the repro.
+    /// Decode the fixed profile and retain the requested number of frames from its tail.
     /// Shape and frame-count checks precede all device work.
     pub async fn decode_video(
         &self,
@@ -237,7 +237,7 @@ impl Pipeline {
         })
     }
 
-    /// Decode channel-major stereo latents through the original audio component.
+    /// Decode channel-major stereo latents through the pipeline's audio decoder.
     pub async fn decode_audio(&self, shape: &[usize], values: &[f32]) -> io::Result<Decoded<3>> {
         let _state = self.state().await?;
         let input = audio::Latents::new(shape, values)?;
@@ -293,8 +293,8 @@ struct Memo {
     cache: Option<Arc<cache::Retained<JointRows>>>,
 }
 
-/// Prompt equality is BIT equality, including NaNs. Finite position equality preserves the
-/// original FP64 comparison (including +0 == -0); padding positions participate in the key.
+/// Prompt equality compares BF16 bits, including NaNs. Finite positions use FP64 value
+/// equality, including +0 == -0; padding positions participate in the key.
 /// The validated prompt length determines canonical modality rows, so need no second copy.
 #[derive(PartialEq)]
 struct Key {
@@ -303,8 +303,8 @@ struct Key {
 }
 
 /// Raw owned host input from the native binding. The binding additionally checks keyword
-/// metadata and dtypes, derives media timesteps from tags/inverse_indices, and applies the
-/// original skip-mask override before populating these effective boolean masks.
+/// metadata and dtypes, derives media timesteps from tags/inverse_indices, and applies
+/// skip-mask overrides before populating these effective boolean masks.
 pub struct Input {
     pub text_rows: Vec<usize>,
     pub audio_rows: Vec<usize>,
@@ -335,7 +335,7 @@ pub struct Output {
     pub audio_shape: [usize; 2],
 }
 
-/// Completed decoder values in the component's original architecture layout.
+/// Completed decoder values with the component's explicit output shape.
 pub struct Decoded<const N: usize> {
     pub values: Vec<f32>,
     pub shape: [usize; N],
@@ -453,7 +453,7 @@ impl Staging {
         device: &SharedDevice,
     ) -> io::Result<HbmTensor<f32, Chips, m![R, W]>> {
         device.with_device(|device| {
-            // Allocate caller-owned storage as in the earlier H3 implementation's step code.
+            // Allocate the device target before copying from the reusable pinned host rows.
             // DMA completes synchronously with both source and target owners still alive.
             let mut target = HbmTensor::<f32, Chips, m![R, W]>::alloc(device)
                 .map_err(io::Error::other)?
@@ -510,7 +510,8 @@ fn pinned<R: AxisName, W: AxisName>() -> io::Result<HostBuffer> {
 }
 
 fn upload_times(device: &SharedDevice, times: [f32; 2]) -> io::Result<denoiser::Times> {
-    // Preserve the original [64,8] time table and video/audio rows 0/1; all other cells are zero.
+    // In the [64,8] time table, video and audio occupy column zero of rows 0 and 1.
+    // All other cells are zero.
     let mut values = vec![0.0_f32; 64 * 8];
     values[0] = times[0];
     values[8] = times[1];

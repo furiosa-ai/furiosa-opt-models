@@ -51,7 +51,7 @@ type Hidden<R> = HbmTensor<bf16, Chips, m![R, Width]>;
 pub(super) struct TimeBuffer(HbmBuffer);
 
 impl TimeBuffer {
-    /// Allocate the original FP32 timestep image on the pipeline's chips.
+    /// Allocate FP32 storage for the two embedded timesteps on the pipeline's chips.
     pub(super) fn allocate(device: &mut Device) -> io::Result<Self> {
         kernel::EmbeddedTime::alloc(device)
             .map(HbmTensor::into_buffer)
@@ -115,8 +115,8 @@ impl<
     V: AxisName + Send + Sync,
 > Denoiser<R, K, T, A, V>
 {
-    /// Borrow stages of the already placed tree. The original execution launches embeddings,
-    /// each block and heads separately; the same compiled block entry serves all 50 layers.
+    /// Borrow stages of the placed tree. Embeddings, each block and heads launch separately;
+    /// the same compiled block entry serves all 50 layers.
     /// Prime common and TeaCache entries before sizing the encoder's resident prefix.
     pub(super) async fn from_resident(
         owner: Component<model::Denoiser>,
@@ -168,7 +168,7 @@ impl<
         })
     }
 
-    /// Queue the original embeddings -> blocks -> heads sequence through two caller-owned
+    /// Queue embeddings, all blocks in order and heads through two caller-owned
     /// local row slots. Ordered launches reuse those slots; no shared returned intermediate or
     /// host wait is inserted between blocks. The flight drains every accepted reader before
     /// releasing the workspace on success, partial submission failure or cancellation.
@@ -355,7 +355,8 @@ impl<
     }
 }
 
-/// Original workspace owners stay here even when individual launches lend short-lived aliases.
+/// Own all step buffers and request state while individual launches borrow typed aliases.
+/// The flight retains this workspace until every accepted reader has finished.
 struct Workspace<R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName> {
     state: Arc<State<R, K, T, A, V>>,
     times: Times,

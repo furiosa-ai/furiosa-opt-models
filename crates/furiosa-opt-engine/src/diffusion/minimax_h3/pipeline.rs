@@ -11,7 +11,7 @@ use furiosa_opt_models::models::diffusion::minimax_h3::request::BlockPlan;
 use furiosa_opt_std::prelude::*;
 use std::{io, sync::Arc};
 
-/// Resident denoiser and decoder weights, the streamed encoder and the original device context.
+/// Resident denoiser and decoder weights, the streamed encoder and their shared device context.
 /// Compiled axes bound storage; each request still supplies its actual valid text count.
 /// Public component views must retain this owner, including when the caller drops its pipeline.
 pub(super) struct Pipeline<const N: usize, R, K, T: AxisName, A, V> {
@@ -34,9 +34,9 @@ impl<
     V: AxisName + Send + Sync,
 > Pipeline<N, R, K, T, A, V>
 {
-    /// Assemble already prepared weights on the original device. Every component's entries are
-    /// primed before selecting the encoder prefix. Measure actual call allocations and reserve
-    /// the maximum completed memo during encoder sizing, as in the repro's streaming caller.
+    /// Assemble prepared weights on the shared device. Prime every component's entries before
+    /// selecting the encoder prefix. Measure actual call allocations and reserve the maximum
+    /// completed prompt memo while sizing the encoder.
     /// `limits.beside` can additionally reserve a caller's larger external stage.
     /// Model loading and framework option parsing remain separate checked boundaries.
     pub(super) async fn from_prepared(
@@ -120,7 +120,7 @@ impl<
 
     /// The framework's text component returns completed BF16 rows on the host, before the
     /// encoder's final norm. Keep every row owner and pipeline admission through the one batched
-    /// download; as in the repro, the replicated output is read from its first chip.
+    /// download. Each row has four chip replicas; download only the first replica.
     pub(super) async fn encode(&self, tokens: &[i32]) -> io::Result<Vec<bf16>> {
         let _lease = self.active.lock().await;
         let rows = self.encoder.encode(tokens).await?;

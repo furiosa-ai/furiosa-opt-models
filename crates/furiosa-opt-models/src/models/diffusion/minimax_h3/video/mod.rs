@@ -1,9 +1,9 @@
 //! MiniMax H3's 36-layer video decoder over one 7 × 16 × 16 latent tile per chip.
 //!
 //! Weights load relative to the physical video component supplied by the parent. This family
-//! consumes `post_quant_conv.*` and the original decoder's weights. The unused
-//! `decoder.mask_token` is accounted for only at the model owner, preserving the original
-//! all-latents-visible decode. Unused encoders and `quant_conv` belong to the parent pipeline.
+//! consumes `post_quant_conv.*` and `decoder.*`. The unused `decoder.mask_token` is accounted
+//! for only at the model owner; every latent is visible during decoding. Unused encoders and
+//! `quant_conv` belong to the parent pipeline.
 //! Rotation and key visibility belong to the call's [`Context`], separately from the weight tree.
 //! The residual stream stays FP32; normalization and branch outputs round to BF16 before each
 //! learned FP32 scaled add. Output rows retain the registers and padding: only the first
@@ -32,6 +32,8 @@ pub mod registers;
 pub mod rotation;
 pub mod tiling;
 
+/// Source: https://github.com/vllm-project/vllm-omni/blob/6daf5b30f07cc0b3db87766d22fdf433f8a1a7c9/vllm_omni/diffusion/models/minimax_h3/vae.py
+/// The upstream video-decoder component contract, bound to one latent tile per chip.
 /// Input embedding, rolled transformer layers, final normalization and FP32 patch readout.
 /// `X` chooses retained storage; `&X` borrows those same leaves for execution.
 pub type Decoder<C = Chips, X = Hbm> =
@@ -226,7 +228,7 @@ pub type Linear<In, Out, C = Chips, X = Hbm> = parameters::Dense<
     <X as Memory>::Tensor<f32, C, m![Out]>,
 >;
 
-/// RMS normalization into BF16, with the reference's `1e-5` stabilizer.
+/// RMS normalization into BF16, with a `1e-5` stabilizer.
 pub type Norm<C = Chips, X = Hbm> =
     RmsNorm<Hidden, EPSILON, C, Weight<m![Hidden], C, <X as Memory>::Tensor<bf16, C, m![Hidden]>>>;
 

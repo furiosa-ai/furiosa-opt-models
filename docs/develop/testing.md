@@ -39,7 +39,7 @@ A test compares with it when that framework cannot run beside the test, as vLLM-
 It is never our own output, which would only pin today's behavior ([Assert against an oracle](../design/testing.md#assert-against-an-oracle)).
 
 H3 uses explicitly supplied private files instead of the release-download workflow
-below. Its [private reference tests](../models/minimax-h3.md#private-reference-tests)
+below. Its [private reference tests](../serving/minimax-h3.md#private-reference-tests)
 are opt-in and never fetch H3 reference assets from a public release.
 
 Each reference is a release of this repository, tagged `references/<org>--<name>@<revision>` with the first seven characters of the checkpoint revision.

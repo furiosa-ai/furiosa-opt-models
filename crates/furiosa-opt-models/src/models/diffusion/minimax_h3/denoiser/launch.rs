@@ -24,7 +24,7 @@ pub type Hidden<R> = HbmTensor<bf16, Chips, m![R, Width]>;
 pub type Video<R> = HbmTensor<f32, Chips, m![R, Patch]>;
 /// FP32 audio latents or velocities.
 pub type Audio<R> = HbmTensor<f32, Chips, m![R, Latent]>;
-/// The original timestep table, with video/audio values in rows zero and one.
+/// FP32 `[64, 8]` timesteps, with video and audio in column zero of rows zero and one.
 pub type Times = HbmTensor<f32, Chips, m![{ Symbol<Rows<64>> }, 1 # 8]>;
 
 /// Source offsets select actual encoder rows and a separately initialized zero row for padding.
@@ -56,7 +56,7 @@ impl<'i, R: AxisName> Module<EncoderRows<'i, R>, (), &mut ()> for Condition<'_, 
     }
 }
 
-/// The original refiner's independently launched layer, with all heads on every chip.
+/// An independently launched text-refiner layer with all attention heads on each chip.
 #[derive(DeviceSend)]
 pub struct RefinerLayer<'a, 'w: 'a> {
     /// Borrowed weights for one text-refiner layer.
@@ -147,7 +147,7 @@ impl<'i, 'e, R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName>
     }
 }
 
-/// One launch per original block. The request owns transport; the model owns only this layer.
+/// One launch per transformer block. The request owns transport; the model owns only this layer.
 #[derive(DeviceSend)]
 pub struct Block<'a, 'w: 'a> {
     /// Borrowed transformer block weights.

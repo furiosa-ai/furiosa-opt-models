@@ -22,40 +22,6 @@ use crate::{Module, Op};
 use furiosa_opt_std::prelude::*;
 use std::borrow::Borrow;
 
-type Local<R, W> = HbmTensor<bf16, Chips, m![R, W]>;
-type Joined<R> = Pieces<R, PARTS>;
-type Split<R, A> = Local<Joined<R>, Part<A, PARTS>>;
-
-/// Readers for one request, decoded once before the layer stack. Positions describe the compact
-/// joined query order, including initialized work padding; visibility describes the packed valid
-/// key prefix. All three operands must come from the same prepared request. The tensor's Live
-/// interval must start at zero and equal `call.prefix()`; the surrounding adaptive block and
-/// its branches retain that interval. Allocation tails are never part of initialized work.
-pub struct Context<'c, 'a, R: AxisName, K: AxisName> {
-    call: &'c BlockCall<'a, R, K>,
-    rotation: &'c Rotation<flash::Head, Chips, Joined<R>>,
-    visible: &'c flash::Visible<K, Chips>,
-}
-
-impl<'c, 'a, R: AxisName, K: AxisName> Context<'c, 'a, R, K> {
-    pub fn new(
-        call: &'c BlockCall<'a, R, K>,
-        rotation: &'c Rotation<flash::Head, Chips, Joined<R>>,
-        visible: &'c flash::Visible<K, Chips>,
-    ) -> Self {
-        Self {
-            call,
-            rotation,
-            visible,
-        }
-    }
-
-    /// The same prefix drives both the attention and the feed-forward branches.
-    pub fn environment(&self) -> (&Prefix<R>, &Self) {
-        (self.call.prefix(), self)
-    }
-}
-
 impl<'i, 'p, 'e, 'c, 'a, 's, R, K, W, A, Qkv, QkvState, Storage>
     Module<
         &'i Live<Local<R, W>, R>,
@@ -157,3 +123,37 @@ where
         }
     }
 }
+
+/// Readers for one request, decoded once before the layer stack. Positions describe the compact
+/// joined query order, including initialized work padding; visibility describes the packed valid
+/// key prefix. All three operands must come from the same prepared request. The tensor's Live
+/// interval must start at zero and equal `call.prefix()`; the surrounding adaptive block and
+/// its branches retain that interval. Allocation tails are never part of initialized work.
+pub struct Context<'c, 'a, R: AxisName, K: AxisName> {
+    call: &'c BlockCall<'a, R, K>,
+    rotation: &'c Rotation<flash::Head, Chips, Joined<R>>,
+    visible: &'c flash::Visible<K, Chips>,
+}
+
+impl<'c, 'a, R: AxisName, K: AxisName> Context<'c, 'a, R, K> {
+    pub fn new(
+        call: &'c BlockCall<'a, R, K>,
+        rotation: &'c Rotation<flash::Head, Chips, Joined<R>>,
+        visible: &'c flash::Visible<K, Chips>,
+    ) -> Self {
+        Self {
+            call,
+            rotation,
+            visible,
+        }
+    }
+
+    /// The same prefix drives both the attention and the feed-forward branches.
+    pub fn environment(&self) -> (&Prefix<R>, &Self) {
+        (self.call.prefix(), self)
+    }
+}
+
+type Local<R, W> = HbmTensor<bf16, Chips, m![R, W]>;
+type Joined<R> = Pieces<R, PARTS>;
+type Split<R, A> = Local<Joined<R>, Part<A, PARTS>>;

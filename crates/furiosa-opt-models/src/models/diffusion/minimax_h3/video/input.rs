@@ -1,11 +1,10 @@
 //! H3's video post-quantization convolution folded into the decoder input projection.
 //!
-//! Ported from the preserved Furiosa Rust `checkpoint/load/minimax_h3/video.rs`
-//! (`Embedding::load` and `Fold`). Each source value rounds through BF16 before the FP64
-//! affine fold. The folded coefficients narrow once to FP32, then split into BF16 parts
+//! Each source value rounds through BF16 before the FP64 affine fold.
+//! The folded coefficients narrow once to FP32, then split into BF16 parts
 //! `[w_hi | w_hi | w_lo | 0]` against the caller's `[z_hi | z_lo | z_hi | 0]` rows.
-//! The bias remains FP32. Latent statistics are deliberately absent: the original loader
-//! ignored its statistics argument. Register and class-token rows belong to the parent tree.
+//! The bias remains FP32. No latent statistics transform is applied.
+//! Register and class-token rows belong to the parent tree.
 
 use core::borrow::Borrow;
 use core::marker::PhantomData;
@@ -227,10 +226,10 @@ pub type BiasLayout = m![Hidden];
 // The video model re-exports these axes so its rows have the same nominal types.
 axes![Parts = 128, Hidden = 2048];
 
-/// The preserved video latent has 24 channels.
+/// Channel count of each video latent before post-quantization projection.
 const CHANNELS: usize = 24;
 
-/// Exact stored shapes, converted to FP32 and rounded as the preserved `Entry::rounded` did.
+/// Validate stored shapes, read FP32 values and round through BF16 back to FP32.
 fn rounded(
     source: &Checkpoint,
     context: &mut Context<'_>,

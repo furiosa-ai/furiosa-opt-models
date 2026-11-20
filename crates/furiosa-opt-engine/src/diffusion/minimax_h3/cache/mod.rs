@@ -1,4 +1,4 @@
-//! Request-owned TeaCache rows beside the original separately launched denoiser stages.
+//! Request-owned TeaCache probes and residuals beside separately launched denoiser stages.
 
 use super::{
     denoiser::{self, Denoiser, TimeBuffer},
@@ -38,15 +38,16 @@ impl<R: AxisName> Retained<R> {
     }
 }
 
-/// Original per-chip FP32 totals. The framework applies its BF16 means and cache policy.
+/// Per-chip FP32 L1 distance and norm totals, converted to BF16 means for the cache policy.
 pub(super) struct Statistics {
     pub(super) distance: [f32; 4],
     pub(super) norm: [f32; 4],
 }
 
 impl Statistics {
-    /// Preserve the repro's FP64 host sum, semantic element count, FP32 conversion and final
-    /// BF16 mean. The framework performs the ratio and rescaling on these BF16-valued scalars.
+    /// Sum chip totals in FP64 and divide by the semantic element count before rounding to
+    /// FP32, then BF16. Return exact FP32 representations of the BF16 means for the framework's
+    /// ratio and rescaling.
     pub(super) fn means(self, elements: usize) -> (f32, f32) {
         let mean = |totals: [f32; 4]| {
             let value = totals.into_iter().map(f64::from).sum::<f64>() / elements as f64;

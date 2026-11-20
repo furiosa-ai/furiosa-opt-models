@@ -27,11 +27,11 @@ pub struct LocalTables<'a, M> {
 
 pub type Modulation<'a, 'w> = LocalTables<'a, transformer::Modulation<Time, Width, &'w Hbm>>;
 
-/// A branch's `(shift, scale)` tables, each retaining its original BF16 boundary.
+/// A branch's `(shift, scale)` tables, stored at the modulation projection's BF16 precision.
 pub type NormTables = (Table<Width, Chips>, Table<Width, Chips>);
 /// A branch's `((shift, scale), gate)` tables.
 type BranchTables = (NormTables, Table<Width, Chips>);
-/// Attention then feed-forward tables, in the original modulation output order.
+/// Attention then feed-forward tables, matching the modulation projection's output order.
 pub type Modulations = (BranchTables, BranchTables);
 
 impl<'i, M> Module<&'i EmbeddedTime, (), &mut Modulations> for LocalTables<'_, M>

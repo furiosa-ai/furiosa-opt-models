@@ -10,32 +10,6 @@ use crate::tensor::{axis::Rows, live::BlockPrefix};
 use furiosa_opt_std::prelude::AxisName;
 use std::{io, ops::Range};
 
-pub const DEFAULT_MAX_TEXT: usize = 2048;
-pub const PARTS: usize = 4;
-pub const TEXT_STRIP: usize = 16;
-pub const ROW_BLOCK: usize = 256;
-pub const GATHER_HEAD: usize = ROW_BLOCK;
-pub const GATHER_BODY: usize = 1024;
-/// Compiled maximum-text profile: one short first tile, then ten body tiles.
-pub const DEFAULT_GATHER_TILES: usize = 11;
-/// Per-part allocation shared by the default planner, gather and engine row axis.
-pub const DEFAULT_GATHER_ROWS: usize = GATHER_HEAD + (DEFAULT_GATHER_TILES - 1) * GATHER_BODY;
-pub const KEY_SPAN: usize = 2048;
-pub const AUDIO_TOKENS: usize = 414;
-pub const VIDEO_TOKENS: usize = 37_296;
-pub const AUDIO_ROWS: usize = 112;
-pub const VIDEO_ROWS: usize = 9_328;
-
-/// One compiled allocation's row limits. A larger text limit changes geometry, not model choice.
-/// These host bounds do not establish executable kernel support for every configured limit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Capacity {
-    max_text: usize,
-    gather_rows: usize,
-    gathered_rows: usize,
-    key_rows: usize,
-}
-
 /// Checked runtime work within one capacity; valid text is counted before any padding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Plan {
@@ -44,155 +18,6 @@ pub struct Plan {
     work: Work,
     query_rows: usize,
     key_count: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Work {
-    text: usize,
-    packed: usize,
-    computed: usize,
-}
-
-/// One source of modality counts and offsets for both forward and reverse semantic lookups.
-struct Coordinates {
-    valid: usize,
-    stride: usize,
-    local_start: usize,
-    upstream_start: usize,
-    key_start: usize,
-}
-
-/// Semantic modality, independent of its physical or attention-key ordering.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Modality {
-    Text,
-    Audio,
-    Video,
-}
-
-/// One part's layout, derived from its request plan rather than a second inventory of its rows.
-#[derive(Clone, Copy, Debug)]
-pub struct Part<'a> {
-    plan: &'a Plan,
-    index: usize,
-}
-
-/// A modality's local storage interval with a valid prefix; padding is not a token.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Span {
-    start: usize,
-    rows: usize,
-    valid: usize,
-}
-
-/// One valid token's source position and compact query address.
-/// `upstream_row` indexes supplied positions in text/audio/video order. Packed key addresses
-/// come from [`Plan::key_runs`]. No rotary coordinates or coefficients are synthesized here.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Token {
-    modality_row: usize,
-    part: usize,
-    local_row: usize,
-    upstream_row: usize,
-    query_row: usize,
-}
-
-/// One contiguous valid run from compact joined Q/K/V rows into the packed key prefix.
-/// No modality padding or guard rows belong to either interval.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct KeyRun {
-    source: Range<usize>,
-    destination: Range<usize>,
-}
-
-impl Capacity {
-    /// Derive the smallest allocation holding a 256-row first gather and 1024-row bodies.
-    pub fn new(max_text: usize) -> io::Result<Self> {
-        Self::checked(max_text, None)
-    }
-
-    /// Check a caller's compiled per-part allocation against its maximum text limit and gather
-    /// equation. The allocation may exceed the minimum, but may not truncate computed rows.
-    #[cfg(test)]
-    pub(super) fn with_gather_rows(max_text: usize, gather_rows: usize) -> io::Result<Self> {
-        Self::checked(max_text, Some(gather_rows))
-    }
-
-    pub fn max_text(&self) -> usize {
-        self.max_text
-    }
-
-    /// Allocation envelope used for joined QKV/query tensors. Only a request's computed prefix
-    /// is initialized by compact stores; allocation capacity is not an active row count.
-    pub fn query_capacity(&self) -> usize {
-        self.gathered_rows
-    }
-
-    /// K/V allocation extent rounded to whole key spans; visibility uses the request's key count.
-    pub fn key_rows(&self) -> usize {
-        self.key_rows
-    }
-
-    pub fn key_spans(&self) -> usize {
-        self.key_rows / KEY_SPAN
-    }
-
-    /// Reject empty or over-capacity requests before deriving any row addresses.
-    pub fn plan(&self, text_tokens: usize) -> io::Result<Plan> {
-        if text_tokens == 0 || text_tokens > self.max_text {
-            return Err(invalid(format!(
-                "text_tokens: {text_tokens} is outside 1..={}",
-                self.max_text
-            )));
-        }
-        let work = Work::new(text_tokens)?;
-        Ok(Plan {
-            capacity: *self,
-            text_tokens,
-            work,
-            query_rows: multiply(PARTS, work.computed, "query work rows")?,
-            key_count: add(media_tokens(), text_tokens, "valid key count")?,
-        })
-    }
-
-    fn checked(max_text: usize, gather_rows: Option<usize>) -> io::Result<Self> {
-        if max_text == 0 {
-            return Err(invalid("max_text: must be greater than zero"));
-        }
-        let key_count = add(media_tokens(), max_text, "maximum valid key count")?;
-        let max_work = Work::new(max_text)?;
-        let bodies = round_up(
-            max_work.computed - GATHER_HEAD,
-            GATHER_BODY,
-            "gather bodies",
-        )?;
-        let minimum = add(GATHER_HEAD, bodies, "gather allocation rows")?;
-        let gather_rows = gather_rows.unwrap_or(minimum);
-        if gather_rows < max_work.computed {
-            return Err(invalid(format!(
-                "gather_rows: {gather_rows} cannot hold {} computed rows per part",
-                max_work.computed
-            )));
-        }
-        if !(gather_rows - GATHER_HEAD).is_multiple_of(GATHER_BODY) {
-            return Err(invalid(format!(
-                "gather_rows: {gather_rows} must be {GATHER_HEAD} + n * {GATHER_BODY}"
-            )));
-        }
-        Ok(Self {
-            max_text,
-            gather_rows,
-            gathered_rows: multiply(PARTS, gather_rows, "gathered allocation rows")?,
-            key_rows: round_up(key_count, KEY_SPAN, "key capacity")?,
-        })
-    }
-}
-
-impl Default for Capacity {
-    fn default() -> Self {
-        Self::checked(DEFAULT_MAX_TEXT, Some(DEFAULT_GATHER_ROWS))
-            .expect("the default packing capacity has bounded geometry")
-    }
 }
 
 impl Plan {
@@ -351,6 +176,113 @@ impl Plan {
     }
 }
 
+/// One compiled allocation's row limits. A larger text limit changes geometry, not model choice.
+/// These host bounds do not establish executable kernel support for every configured limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Capacity {
+    max_text: usize,
+    gather_rows: usize,
+    gathered_rows: usize,
+    key_rows: usize,
+}
+
+impl Capacity {
+    /// Derive the smallest allocation holding a 256-row first gather and 1024-row bodies.
+    pub fn new(max_text: usize) -> io::Result<Self> {
+        Self::checked(max_text, None)
+    }
+
+    /// Check a caller's compiled per-part allocation against its maximum text limit and gather
+    /// equation. The allocation may exceed the minimum, but may not truncate computed rows.
+    #[cfg(test)]
+    pub(super) fn with_gather_rows(max_text: usize, gather_rows: usize) -> io::Result<Self> {
+        Self::checked(max_text, Some(gather_rows))
+    }
+
+    pub fn max_text(&self) -> usize {
+        self.max_text
+    }
+
+    /// Allocation envelope used for joined QKV/query tensors. Only a request's computed prefix
+    /// is initialized by compact stores; allocation capacity is not an active row count.
+    pub fn query_capacity(&self) -> usize {
+        self.gathered_rows
+    }
+
+    /// K/V allocation extent rounded to whole key spans; visibility uses the request's key count.
+    pub fn key_rows(&self) -> usize {
+        self.key_rows
+    }
+
+    pub fn key_spans(&self) -> usize {
+        self.key_rows / KEY_SPAN
+    }
+
+    /// Reject empty or over-capacity requests before deriving any row addresses.
+    pub fn plan(&self, text_tokens: usize) -> io::Result<Plan> {
+        if text_tokens == 0 || text_tokens > self.max_text {
+            return Err(invalid(format!(
+                "text_tokens: {text_tokens} is outside 1..={}",
+                self.max_text
+            )));
+        }
+        let work = Work::new(text_tokens)?;
+        Ok(Plan {
+            capacity: *self,
+            text_tokens,
+            work,
+            query_rows: multiply(PARTS, work.computed, "query work rows")?,
+            key_count: add(media_tokens(), text_tokens, "valid key count")?,
+        })
+    }
+
+    fn checked(max_text: usize, gather_rows: Option<usize>) -> io::Result<Self> {
+        if max_text == 0 {
+            return Err(invalid("max_text: must be greater than zero"));
+        }
+        let key_count = add(media_tokens(), max_text, "maximum valid key count")?;
+        let max_work = Work::new(max_text)?;
+        let bodies = round_up(
+            max_work.computed - GATHER_HEAD,
+            GATHER_BODY,
+            "gather bodies",
+        )?;
+        let minimum = add(GATHER_HEAD, bodies, "gather allocation rows")?;
+        let gather_rows = gather_rows.unwrap_or(minimum);
+        if gather_rows < max_work.computed {
+            return Err(invalid(format!(
+                "gather_rows: {gather_rows} cannot hold {} computed rows per part",
+                max_work.computed
+            )));
+        }
+        if !(gather_rows - GATHER_HEAD).is_multiple_of(GATHER_BODY) {
+            return Err(invalid(format!(
+                "gather_rows: {gather_rows} must be {GATHER_HEAD} + n * {GATHER_BODY}"
+            )));
+        }
+        Ok(Self {
+            max_text,
+            gather_rows,
+            gathered_rows: multiply(PARTS, gather_rows, "gathered allocation rows")?,
+            key_rows: round_up(key_count, KEY_SPAN, "key capacity")?,
+        })
+    }
+}
+
+impl Default for Capacity {
+    fn default() -> Self {
+        Self::checked(DEFAULT_MAX_TEXT, Some(DEFAULT_GATHER_ROWS))
+            .expect("the default packing capacity has bounded geometry")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Work {
+    text: usize,
+    packed: usize,
+    computed: usize,
+}
+
 impl Work {
     fn new(text_tokens: usize) -> io::Result<Self> {
         let text = multiply(
@@ -365,6 +297,30 @@ impl Work {
             computed: round_up(packed, ROW_BLOCK, "computed rows per part")?,
         })
     }
+}
+
+/// One source of modality counts and offsets for both forward and reverse semantic lookups.
+struct Coordinates {
+    valid: usize,
+    stride: usize,
+    local_start: usize,
+    upstream_start: usize,
+    key_start: usize,
+}
+
+/// Semantic modality, independent of its physical or attention-key ordering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Modality {
+    Text,
+    Audio,
+    Video,
+}
+
+/// One part's layout, derived from its request plan rather than a second inventory of its rows.
+#[derive(Clone, Copy, Debug)]
+pub struct Part<'a> {
+    plan: &'a Plan,
+    index: usize,
 }
 
 impl Part<'_> {
@@ -385,6 +341,14 @@ impl Part<'_> {
     }
 }
 
+/// A modality's local storage interval with a valid prefix; padding is not a token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Span {
+    start: usize,
+    rows: usize,
+    valid: usize,
+}
+
 impl Span {
     pub fn rows(&self) -> Range<usize> {
         self.start..self.start + self.rows
@@ -393,6 +357,18 @@ impl Span {
     pub fn valid_rows(&self) -> Range<usize> {
         self.start..self.start + self.valid
     }
+}
+
+/// One valid token's source position and compact query address.
+/// `upstream_row` indexes supplied positions in text/audio/video order. Packed key addresses
+/// come from [`Plan::key_runs`]. No rotary coordinates or coefficients are synthesized here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Token {
+    modality_row: usize,
+    part: usize,
+    local_row: usize,
+    upstream_row: usize,
+    query_row: usize,
 }
 
 impl Token {
@@ -418,6 +394,14 @@ impl Token {
     }
 }
 
+/// One contiguous valid run from compact joined Q/K/V rows into the packed key prefix.
+/// No modality padding or guard rows belong to either interval.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyRun {
+    source: Range<usize>,
+    destination: Range<usize>,
+}
+
 impl KeyRun {
     /// Rows of the compact joined projection, before key feature/head transposition.
     pub fn source(&self) -> Range<usize> {
@@ -429,6 +413,22 @@ impl KeyRun {
         self.destination.clone()
     }
 }
+
+pub const DEFAULT_MAX_TEXT: usize = 2048;
+pub const PARTS: usize = 4;
+pub const TEXT_STRIP: usize = 16;
+pub const ROW_BLOCK: usize = 256;
+pub const GATHER_HEAD: usize = ROW_BLOCK;
+pub const GATHER_BODY: usize = 1024;
+/// Compiled maximum-text profile: one short first tile, then ten body tiles.
+pub const DEFAULT_GATHER_TILES: usize = 11;
+/// Per-part allocation shared by the default planner, gather and engine row axis.
+pub const DEFAULT_GATHER_ROWS: usize = GATHER_HEAD + (DEFAULT_GATHER_TILES - 1) * GATHER_BODY;
+pub const KEY_SPAN: usize = 2048;
+pub const AUDIO_TOKENS: usize = 414;
+pub const VIDEO_TOKENS: usize = 37_296;
+pub const AUDIO_ROWS: usize = 112;
+pub const VIDEO_ROWS: usize = 9_328;
 
 fn media_tokens() -> usize {
     AUDIO_TOKENS + VIDEO_TOKENS

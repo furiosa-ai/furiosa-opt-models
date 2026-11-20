@@ -1,9 +1,8 @@
 //! Host packing and stitching for H3's fixed four-chip video decode profile.
 //!
-//! Ported from the preserved Furiosa Rust `registry/minimax_h3/video.rs` and `pixels.rs`.
 //! A request borrows FP32 `[1,24,37,48,84]` latents, packs 49 groups in clip-major order,
 //! and accepts four decoded tiles per group. The caller owns decoder execution and the
-//! downloaded group buffer. No launch, device allocation or synchronization occurs here.
+//! downloaded group buffer. No launch, device allocation or device synchronization occurs here.
 //!
 //! Stitching retains 28 reusable `[3,28,256,256]` tiles, the final
 //! `[1,3,124,768,1344]` FP32 output and one `[3,5,768,1344]` fading buffer. Processing is
@@ -11,8 +10,8 @@
 //! above first and then before. All reads of the previous temporal fade finish before
 //! that buffer is overwritten.
 //! `finish` moves the output vector without copying the full video. Pixel values are
-//! neither clamped nor rescaled. Resolution and batch are fixed; the original optional frame
-//! count keeps the last 1..=124 frames without changing the 49 decoder calls.
+//! neither clamped nor rescaled. Resolution and batch are fixed; a checked frame count keeps
+//! the last 1..=124 frames without changing the 49 decoder calls.
 
 use core::ops::Range;
 use std::io;
@@ -46,7 +45,7 @@ impl<'a> Latents<'a> {
     /// Pack four spatial tiles of a clip, retaining the decoder's chip and row strides.
     /// Each live row is `[z_hi | z_lo | z_hi | 0]`; unused lanes and all rows after
     /// token 1,791 are finite positive zero, including register and class-token input rows.
-    /// Latent statistics are not applied here, matching the preserved Rust path.
+    /// Values are packed directly, without latent mean or standard-deviation transforms.
     pub fn pack(&self, group: GroupIndex) -> io::Result<Packed> {
         let mut values = filled(Chips::SIZE * Rows::SIZE * Parts::SIZE, bf16::from_f32(0.0))?;
         for chip in 0..Chips::SIZE {
@@ -160,7 +159,7 @@ impl Stitch {
         Self::with_frames(FrameCount::default())
     }
 
-    /// Retain the checked tail count, as in the original decoder's `frame_num` argument.
+    /// Allocate stitching buffers that retain the checked number of tail frames.
     pub fn with_frames(frames: FrameCount) -> io::Result<Self> {
         let mut tiles = Vec::new();
         tiles.try_reserve_exact(TILES).map_err(allocation)?;
@@ -241,7 +240,7 @@ impl Stitch {
     }
 }
 
-/// One reusable channel-major decoded tile; small private shapes also exercise the original math.
+/// One reusable decoded tile, stored in channel, frame, row, column order.
 struct Pixels {
     values: Vec<f32>,
     shape: [usize; 4],
@@ -270,7 +269,7 @@ impl Pixels {
     }
 }
 
-/// Private geometry of the preserved blend, with small original numerical examples in tests.
+/// Spatial tile origins and the frame ranges retained or faded between temporal clips.
 struct Tiling {
     tops: &'static [usize],
     lefts: &'static [usize],
@@ -314,7 +313,7 @@ impl Tiling {
     }
 }
 
-/// The original channel/frame output order and causal temporal fade, with reusable storage.
+/// Channel-major video output and causal temporal fading, with reusable storage.
 struct Video {
     tiling: Tiling,
     clips: usize,
@@ -442,39 +441,76 @@ mod tests {
     /// Pins latent channel order, low parts, four-chip tile order and finite input padding.
     #[test]
     fn preserves_video_latents() {
-        let latent: Vec<f32> = (0..LATENT_VALUES)
-            .map(|index| index as f32 * 0.001)
-            .collect();
+        let mut latent = vec![0.0; 24 * 37 * 48 * 84];
         assert!(Latents::new(&latent[..latent.len() - 1]).is_err());
         assert!(GroupIndex::try_from(GROUPS).is_err());
-        let rows = Latents::new(&latent)
-            .unwrap()
-            .pack(GroupIndex::try_from(0).unwrap())
-            .unwrap()
-            .into_vec();
-        assert_eq!(
-            [0, 1, 25, 49, 2048 * 128].map(|index| rows[index].to_bits()),
-            [0, 17173, 15932, 17173, 15412]
-        );
-        for chip in 0..4 {
-            let padding = (chip * Rows::SIZE + TOKENS) * Parts::SIZE;
-            let end = (chip + 1) * Rows::SIZE * Parts::SIZE;
-            assert!(rows[padding..end].iter().all(|value| value.to_bits() == 0));
+        // Chip, channel, local [time, y, x], and exact binary high/residual values.
+        // Each marker lies outside the other three tiles, so all other lanes stay zero.
+        let markers = [
+            (0, 0, [0, 0, 0], 1.0, 1.0 / 512.0),
+            (1, 1, [1, 15, 10], -2.0, -1.0 / 256.0),
+            (2, 7, [5, 7, 5], 4.0, 1.0 / 128.0),
+            (3, 23, [6, 14, 15], -8.0, 1.0 / 128.0),
+        ];
+        // Seven clips start five latent frames apart. The 4x7 spatial grid groups
+        // four consecutive tiles; these are first, middle, and final call coordinates.
+        for (group, first_frame, origins) in [
+            (0, 0, [[0, 0], [0, 11], [0, 22], [0, 33]]),
+            (24, 15, [[10, 56], [10, 68], [21, 0], [21, 11]]),
+            (48, 30, [[32, 33], [32, 44], [32, 56], [32, 68]]),
+        ] {
+            latent.fill(0.0);
+            let mut expected = vec![bf16::from_f32(0.0); 4 * 2048 * 128];
+            for (chip, channel, [time, y, x], high, residual) in markers {
+                let [top, left] = origins[chip];
+                let source = ((channel * 37 + first_frame + time) * 48 + top + y) * 84 + left + x;
+                latent[source] = high + residual;
+                // A clip is seven 16x16 latent planes; channels occupy 24-lane blocks.
+                let token = time * 16 * 16 + y * 16 + x;
+                let destination = (chip * 2048 + token) * 128 + channel;
+                expected[destination] = bf16::from_f32(high);
+                expected[destination + 24] = bf16::from_f32(residual);
+                expected[destination + 48] = bf16::from_f32(high);
+            }
+            let rows = Latents::new(&latent)
+                .unwrap()
+                .pack(GroupIndex::try_from(group).unwrap())
+                .unwrap()
+                .into_vec();
+            assert_eq!(rows.len(), expected.len());
+            for (index, (got, want)) in rows.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "group {group}, offset {index}"
+                );
+            }
         }
     }
 
     /// Pins the decoder's channel/frame/spatial patch order, without a full-video allocation.
     #[test]
     fn preserves_pixel_order() {
-        let source: Vec<f32> = (0..TOKENS * Patch::SIZE)
-            .map(|index| index as f32)
-            .collect();
+        let mut source: Vec<f32> = (0..1792 * 3072).map(|index| index as f32).collect();
+        source.resize(2048 * 3072, f32::NAN);
         let mut pixels = Pixels::tile().unwrap();
         pixels.unpack(&source);
-        assert_eq!(
-            [0, 16, 256, 65536, 1835008].map(|index| pixels.values[index]),
-            [0., 3072., 16., 256., 1024.]
-        );
+        assert_eq!(pixels.values.len(), 3 * 28 * 256 * 256);
+        for (index, &value) in pixels.values.iter().enumerate() {
+            let x = index % 256;
+            let y = index / 256 % 256;
+            let frame = index / (256 * 256) % 28;
+            let channel = index / (28 * 256 * 256);
+            // Invert the documented 3-channel, 4-frame, 16x16 patch mapping
+            // from semantic output coordinates, independently of unpack's run traversal.
+            let token = (frame / 4 * 16 + y / 16) * 16 + x / 16;
+            let patch = ((channel * 4 + frame % 4) * 16 + y % 16) * 16 + x % 16;
+            assert_eq!(
+                value,
+                (token * 3072 + patch) as f32,
+                "channel {channel}, frame {frame}, y {y}, x {x}"
+            );
+        }
     }
 
     /// Pins above-then-before blending from original neighbors with the original small example.

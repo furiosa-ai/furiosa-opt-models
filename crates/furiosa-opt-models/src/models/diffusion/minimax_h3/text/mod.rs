@@ -35,6 +35,8 @@ pub mod parameters;
 pub mod position;
 pub mod request;
 
+/// Source: https://github.com/vllm-project/vllm-omni/blob/6daf5b30f07cc0b3db87766d22fdf433f8a1a7c9/vllm_omni/diffusion/models/minimax_h3/encoder.py
+/// The upstream encoder contract reads the first 50 language layers, before final normalization.
 /// The encoder's language body, without final normalization or a vocabulary readout.
 /// Arrays retain independently loadable layers; `N` also permits a one-layer launch.
 pub type Body<P = Parallel<4>, X = Hbm, const N: usize = LAYERS> =
@@ -110,7 +112,7 @@ type Rows<In, Out, P, X> = parameters::Projection<
     <X as Memory>::Tensor<bf16, Chips<P>, m![Out, { Symbol<Local<P, In>> }]>,
 >;
 
-/// The same one-row, full-head rotation and paged causal attention geometry as the repro.
+/// One-row, full-head rotation and paged causal attention geometry.
 pub type Group =
     decoder::Group<KvHeads, Head, Groups, QueryWidth, KvWidth, Head, decoder::attention::Chunks>;
 pub type Hidden = crate::ops::attention::geometry::Hidden<5120>;
