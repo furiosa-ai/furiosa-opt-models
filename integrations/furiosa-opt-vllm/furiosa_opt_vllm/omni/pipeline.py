@@ -137,7 +137,7 @@ def directory(od_config: OmniDiffusionConfig) -> Path:
 
 
 def fetch(od_config: OmniDiffusionConfig, path: Path) -> None:
-    """Fetch the validated remote partition, leaving local checkpoints untouched."""
+    """Fetch the validated remote partition at its already resolved Hub commit."""
     from vllm_omni.model_executor.model_loader.weight_utils import (
         download_weights_from_hf_specific,
     )
@@ -151,7 +151,7 @@ def fetch(od_config: OmniDiffusionConfig, path: Path) -> None:
         od_config.model,
         None,
         [f"{relative}/**" if relative.parts else "**"],
-        od_config.revision,
+        snapshot.name,
         require_all=True,
     )
 

@@ -6,6 +6,7 @@ import os
 import sys
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import ExitStack
+from copy import copy
 from functools import partial
 from pathlib import Path
 from typing import ClassVar, Protocol, TypeAlias, cast, final
@@ -70,7 +71,8 @@ class Adapter(nn.Module):
 
 def construct(od_config: OmniDiffusionConfig, directory: Path, names: Iterable[str]) -> nn.Module:
     """Build the registry's pipeline of `directory` on meta tensors, the module of each component
-    in `names`, by its `model_index.json` name, without its weights."""
+    in `names`, by its `model_index.json` name, without its weights. Keep framework model
+    resolution on this local directory without changing the caller's configuration."""
     # TODO(upstream): pipelines take no prebuilt components; a component argument to their
     # constructor would replace this build-then-swap, the checkpoint-code stand-in and the check.
     with ExitStack() as stack:
@@ -87,7 +89,9 @@ def construct(od_config: OmniDiffusionConfig, directory: Path, names: Iterable[s
                 patch.object(remote, "from_pretrained", partial(skeleton, remote.from_pretrained))
             )
         _ = stack.enter_context(torch.device("meta"))
-        return initialize_model(od_config)
+        resolved = copy(od_config)
+        resolved.model = str(directory)
+        return initialize_model(resolved)
 
 
 def compose(pipeline: nn.Module, components: Mapping[str, Component]) -> nn.Module:

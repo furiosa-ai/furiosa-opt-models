@@ -6,7 +6,8 @@ from shutil import copyfile
 import pytest
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
-from furiosa_opt_vllm.omni.pipeline import build
+from furiosa_opt_vllm.omni.components import construct
+from furiosa_opt_vllm.omni.pipeline import build, directory, fetch
 
 
 @pytest.fixture
@@ -148,3 +149,93 @@ def test_refuses_pipelines(tmp_path: Path) -> None:
     with pytest.raises(NotImplementedError) as refused:
         build(od_config=config)
     assert str(refused.value) == "FluxPipeline: unsupported, no model type is implemented"
+
+
+@pytest.fixture
+def moving_checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    """The remote ref moves from A to B after metadata resolves; pinned commits stay fixed."""
+    from vllm_omni.model_executor.model_loader import weight_utils
+
+    snapshots = {commit: tmp_path / "snapshots" / commit for commit in ("a" * 40, "b" * 40)}
+    for snapshot in snapshots.values():
+        (snapshot / "FL2VA").mkdir(parents=True)
+        for path in (snapshot, snapshot / "FL2VA"):
+            _ = (path / "model_index.json").write_text(
+                json.dumps({"_class_name": "MiniMaxH3Pipeline"})
+            )
+    head = "a" * 40
+
+    def download(
+        repo_id: str,
+        *,
+        allow_patterns: str | list[str],
+        revision: str | None = None,
+        **_kwargs: object,
+    ) -> str:
+        nonlocal head
+        assert repo_id == "test-org/checkpoint"
+        snapshot = snapshots.get(revision or "", snapshots[head])
+        head = "b" * 40
+        if allow_patterns != ["*.json"]:
+            _ = (snapshot / "FL2VA" / "fetched").write_text(snapshot.name)
+        return str(snapshot)
+
+    monkeypatch.setattr(weight_utils, "snapshot_download", download)
+    return snapshots["a" * 40], snapshots["b" * 40]
+
+
+@pytest.mark.parametrize("revision", [None, "main", "release", "a" * 40])
+def test_downloads_weights_from_the_preflight_snapshot(
+    moving_checkpoint: tuple[Path, Path], revision: str | None
+) -> None:
+    config = OmniDiffusionConfig(
+        model="test-org/checkpoint",
+        model_class_name="MiniMaxH3Pipeline",
+        revision=revision,
+        enforce_eager=True,
+    )
+    path = directory(config)
+    fetch(config, path)
+    first, second = moving_checkpoint
+    assert (first / "FL2VA/fetched").read_text() == first.name
+    assert not (second / "FL2VA/fetched").exists()
+    assert config.model == "test-org/checkpoint" and config.revision == revision
+
+
+@pytest.mark.parametrize("revision", [None, "main", "release", "a" * 40])
+def test_framework_uses_the_preflight_snapshot(
+    moving_checkpoint: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    revision: str | None,
+) -> None:
+    from torch import nn
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        resolve_minimax_h3_diffusion_model_path,
+    )
+
+    from furiosa_opt_vllm.omni import components
+
+    config = OmniDiffusionConfig(
+        model="test-org/checkpoint",
+        model_class_name="MiniMaxH3Pipeline",
+        revision=revision,
+        enforce_eager=True,
+    )
+    loaded: list[Path] = []
+
+    def initialize(resolved: OmniDiffusionConfig) -> nn.Module:
+        assert resolved.model is not None
+        loaded.append(
+            Path(
+                resolve_minimax_h3_diffusion_model_path(
+                    resolved.model, resolved.revision, resolved.task_type
+                )
+            )
+        )
+        return nn.Identity()
+
+    monkeypatch.setattr(components, "initialize_model", initialize)
+    _ = construct(config, directory(config), [])
+    first, _ = moving_checkpoint
+    assert loaded == [first / "FL2VA"]
+    assert config.model == "test-org/checkpoint" and config.revision == revision
