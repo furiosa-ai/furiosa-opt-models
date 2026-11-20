@@ -14,6 +14,7 @@ use std::marker::PhantomData;
 pub(crate) use to_dm::ToDm;
 
 mod activation;
+pub mod channel;
 mod produce;
 mod sink;
 pub(crate) mod source;
@@ -48,7 +49,7 @@ pub type Stored<Hidden, Heads, Head> = HbmTensor<f8e4m3, Chip, Layout<Hidden, He
 pub type Weights<Hidden, Heads, Head, S = ()> =
     crate::tensor::form::fp8::Rows<m![Hidden], m![Heads, Head], Stored<Hidden, Heads, Head>, S>;
 /// The value projection's row scales, its heads' scales.
-pub type HeadScales<Heads, Head> = HbmTensor<f32, Chip, m![Heads, Head]>;
+pub type HeadScales<Heads, Head, D = f32> = HbmTensor<D, Chip, m![Heads, Head]>;
 /// A query or key projection's row scales: each head's square, for each row of a tile.
 pub type HeadSquares<Heads> = crate::tensor::form::fp8::Squares<Squared<Heads>>;
 /// Each head's squared scale, for each row of a tile.
@@ -63,10 +64,10 @@ pub(crate) type Lanes<Hidden, G, Heads> = TrfTensor<
     m![Tile % 8],
     m![G, Tile / 8, Hidden % 64],
 >;
-pub(crate) type ValueScale<Hidden, Heads, Head> =
-    DmTensor<f32, Chip, Cluster<Heads>, Slice<Hidden, Heads>, m![Heads % (Heads / 8), Head]>;
-pub(crate) type RowGroups<G, Heads> =
-    DmTensor<bf16, Chip, Cluster<Heads>, Reduced<G, Heads, <G as Group>::Copies>, m![Tile % 8]>;
+pub(crate) type ValueScale<Hidden, Heads, Head, D = f32> =
+    DmTensor<D, Chip, Cluster<Heads>, Slice<Hidden, Heads>, m![Heads % (Heads / 8), Head]>;
+pub(crate) type RowGroups<G, Heads, D = bf16> =
+    DmTensor<D, Chip, Cluster<Heads>, Reduced<G, Heads, <G as Group>::Copies>, m![Tile % 8]>;
 pub(crate) type HeadScale<G, Heads, Head> = VrfTensor<
     f32,
     Chip,

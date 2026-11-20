@@ -208,6 +208,30 @@ where
     }
 }
 
+/// Spill 64 rows per cluster half for the channel-scaled single-wave QKV input.
+pub(crate) fn spill_half_wave<Hidden: AxisName, Capacity: AxisName>(
+    context: &mut Device,
+    home: &mut Normalized<Hidden, Capacity>,
+    normalized: &Owned<Hidden, Span>,
+    start: usize,
+) {
+    const { assert!(Capacity::SIZE.is_multiple_of(Span::SIZE)) };
+    let span = home.view_mut().tile::<m![Capacity / 8], { Span::SIZE / 8 },
+            m![Capacity / 8 = { Span::SIZE / 8 } #{!} (Capacity / 8), Hidden / 16, Capacity % 8,
+                Hidden % 16]>(start / 8);
+    // SAFETY: the row groups retain their order when split into the two cluster halves.
+    let halves = unsafe {
+        span.reshape::<Chip, m![Span / (Span / 2) #{!} (Capacity / (Span / 2)),
+                    Span % (Span / 2) / 8, Hidden / 16, Span % 8, Hidden % 16]>()
+    };
+    normalized.view().tile::<m![Span % (Span / 2)], 64,
+                m![Span % (Span / 2) = 64 # (Span / 2), Hidden % 16]>(0)
+                .to_hbm_view(&mut context.tdma, halves.tile::<m![Span % (Span / 2) / 8], 8,
+                    m![Span / (Span / 2) #{!} (Capacity / (Span / 2)),
+                        Span % (Span / 2) / 8 = 8 #{!} (Span % (Span / 2) / 8), Hidden / 16,
+                        Span % 8, Hidden % 16]>(0));
+}
+
 /// The span rows a norm leaves, by groups of eight rows; the rows of a launch of at most eight
 /// rows, or of a span's single wave, move alone.
 impl<'r, Hidden: AxisName, Capacity: AxisName>

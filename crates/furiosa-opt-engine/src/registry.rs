@@ -184,6 +184,7 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
         "LlamaForCausalLM",
         &[
             Implementation::of::<llama::nvfp4::ForCausalLM>(),
+            Implementation::of::<llama::fp8::ForCausalLM>(),
             Implementation::of::<
                 llama::ForCausalLM<llama::Size<"8B">, form::Affine, Parallel<1>, cache::Bf16, Hbm>,
             >(),

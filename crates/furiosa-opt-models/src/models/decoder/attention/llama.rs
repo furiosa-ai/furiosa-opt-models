@@ -23,6 +23,7 @@ use crate::tensor::form::Weight;
 use crate::tensor::memory::Memory;
 use furiosa_opt_std::prelude::*;
 
+pub mod fp8;
 pub mod nvfp4;
 
 // 128256 rows leave each of a head's slices 4008, which split only into 167 passes of 24 rows; 131072

@@ -3,7 +3,7 @@
 //!
 //! - A spec lists pools, each the tokens a block holds and the bytes a block of one layer spans
 //!   (its page), and groups, each layers of one kind whose blocks come from one pool.
-//! - A `Cache` holds `blocks` pages of every layer of every group, one allocation a layer.
+//! - A `Cache` holds `blocks` pages of every layer of every group. Paged layers in a group occupy consecutive memory.
 //! - A cache serves the decoders whose spec it was allocated for. A decoder's first call builds
 //!   its views of the layers; every later call borrows them, one call at a time.
 
@@ -11,7 +11,6 @@ use super::Decoder;
 use furiosa_opt_std::prelude::{Device, HbmBuffer};
 use std::any::Any;
 use std::io;
-use std::iter;
 use std::mem;
 use std::ops::{Deref, DerefMut, Range};
 use std::sync::{Mutex, PoisonError};
@@ -64,14 +63,14 @@ impl CacheSpec {
         model.limits().cache
     }
 
-    /// Bytes of each layer's storage of `blocks` blocks, group by group. Refuses no blocks, a
+    /// Bytes one layer of each group occupies for `blocks` blocks. Refuses no blocks, a
     /// group of no pool, a pool of empty blocks, and a page whose byte offset passes I32.
     fn sizes(&self, blocks: usize) -> io::Result<Vec<usize>> {
         let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
         if blocks == 0 {
             return Err(invalid("cache blocks must be positive"));
         }
-        let groups = (self.groups.iter())
+        (self.groups.iter())
             .map(|group| {
                 let pool = (self.pools.get(group.pool))
                     .ok_or_else(|| invalid("cache group names no pool"))?;
@@ -82,10 +81,9 @@ impl CacheSpec {
                 let size = (blocks.checked_mul(pool.bytes))
                     .filter(|&size| size <= 1 << 31)
                     .ok_or_else(|| invalid("cache blocks pass I32 byte offsets"))?;
-                Ok(iter::repeat_n(size, group.layers.len()))
+                Ok(size)
             })
-            .collect::<io::Result<Vec<_>>>()?;
-        Ok(groups.into_iter().flatten().collect())
+            .collect()
     }
 }
 
@@ -114,9 +112,28 @@ impl Cache {
     /// `blocks` blocks of every layer `spec` lists, on `device`; block `j` of a layer is its bytes
     /// `j * page..(j + 1) * page`.
     pub fn new(device: &Device, spec: &CacheSpec, blocks: usize) -> io::Result<Self> {
-        let layers = (spec.sizes(blocks)?.into_iter())
-            .map(|size| HbmBuffer::alloc(device, size).map_err(io::Error::other))
-            .collect::<io::Result<_>>()?;
+        let mut layers = Vec::new();
+        for (group, size) in spec.groups.iter().zip(spec.sizes(blocks)?) {
+            let count = group.layers.len();
+            if group.kind == Kind::Paged && count > 1 {
+                // A layer entry offsets an indexed DMA from a single, constant-stride block table.
+                let bytes = size.checked_mul(count).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "paged cache size overflow")
+                })?;
+                let backing = HbmBuffer::alloc(device, bytes).map_err(io::Error::other)?;
+                for start in (0..bytes).step_by(size) {
+                    layers.push(
+                        backing
+                            .alias(start..start + size)
+                            .map_err(io::Error::other)?,
+                    );
+                }
+            } else {
+                for _ in 0..count {
+                    layers.push(HbmBuffer::alloc(device, size).map_err(io::Error::other)?);
+                }
+            }
+        }
         Ok(Self {
             layers,
             blocks,
@@ -242,7 +259,15 @@ mod tests {
             kind: Kind::State,
             window: None,
         });
-        assert_eq!(spec.sizes(3)?, [192, 192, 96]);
+        let device = Device::new(furiosa_opt_std::prelude::Topology { chips: 1, pes: 8 })
+            .map_err(io::Error::other)?;
+        let cache = Cache::new(&device, &spec, 3)?;
+        let layers = cache.layers();
+        assert_eq!(
+            layers.iter().map(HbmBuffer::size).collect::<Vec<_>>(),
+            [192, 192, 96]
+        );
+        assert_eq!(layers[0].addr() + layers[0].size(), layers[1].addr());
         Ok(())
     }
 

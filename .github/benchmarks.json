@@ -109,6 +109,15 @@
       "download": ["*.json", "*.safetensors"]
     },
     {
+      "id": "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8-dynamic", "tier": "nightly", "task": "text",
+      "doc": "llama3.1-8b-fp8", "revision": "442e7f522277df12f53d63e8384087af31fbfc4b",
+      "forward": "llama31_8b_fp8_forward",
+      "disable_radix_cache": true,
+      "quantization": {"weights": ["FP8"], "activations": ["FP8"]},
+      "serve": ["--kv-cache-dtype", "bfloat16", "--max-model-len", "40960", "--no-enable-prefix-caching"],
+      "download": ["*.json", "*.safetensors"]
+    },
+    {
       "id": "NousResearch/Meta-Llama-3-8B", "tier": "nightly",
       "task": "text",
       "doc": "llama3-8b",
