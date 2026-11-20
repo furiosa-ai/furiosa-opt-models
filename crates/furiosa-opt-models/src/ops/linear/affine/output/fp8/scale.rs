@@ -77,33 +77,7 @@ impl<
         context: &mut Device,
         (partial, (scales, channels), waves): Operands<'a, Hidden, QWidth, Capacity, D, S>,
     ) -> Self::Output {
-        let row: VrfTensor<
-            f32,
-            Chip,
-            Cluster<QWidth>,
-            m![Hidden / 16],
-            m![Capacity / (Capacity / 4), Capacity % (Capacity / 4)],
-        > = context
-            .sub
-            .begin(scales.view())
-            .fetch::<
-                m![Capacity / (Capacity / 4), Capacity % (Capacity / 4) / 8],
-                m![Capacity % 8],
-            >()
-            .fetch_cast::<f32>()
-            .collect::<
-                m![Capacity / (Capacity / 4), Capacity % (Capacity / 4) / 8],
-                m![Capacity % 8],
-            >()
-            .to_vrf();
-        let channel: VrfTensor<f32, Chip, Cluster<QWidth>, m![Hidden / 16], m![Hidden % 16]> =
-            context
-                .sub
-                .begin(channels.view())
-                .fetch::<m![Hidden % 16 / 8], m![Hidden % 8]>()
-                .fetch_cast::<f32>()
-                .collect::<m![Hidden % 16 / 8], m![Hidden % 8]>()
-                .to_vrf();
+        let (row, channel) = factors(context, scales, channels);
         let mut output = tiles::Partial::new();
         context
             .main
@@ -143,4 +117,68 @@ impl<
             .commit_prefix::<m![Capacity % (Capacity / 4) / 8], _, _>(output.view_mut(), waves);
         output
     }
+}
+
+fn factors<
+    H: AxisName,
+    Q: AxisName,
+    R: AxisName,
+    D: MaterializableScalar + FetchCast<f32>,
+    S: MaterializableScalar + FetchCast<f32>,
+>(
+    context: &mut Device,
+    scales: &Scales<H, Q, R, D>,
+    channels: &Channels<H, Q, S>,
+) -> (
+    VrfTensor<f32, Chip, Cluster<Q>, m![H / 16], m![R / (R / 4), R % (R / 4)]>,
+    VrfTensor<f32, Chip, Cluster<Q>, m![H / 16], m![H % 16]>,
+) {
+    let row: VrfTensor<f32, Chip, Cluster<Q>, m![H / 16], m![R / (R / 4), R % (R / 4)]> = context
+        .sub
+        .begin(scales.view())
+        .fetch::<m![R / (R / 4), R % (R / 4) / 8], m![R % 8]>()
+        .fetch_cast::<f32>()
+        .collect::<m![R / (R / 4), R % (R / 4) / 8], m![R % 8]>()
+        .to_vrf();
+    let channel: VrfTensor<f32, Chip, Cluster<Q>, m![H / 16], m![H % 16]> = context
+        .sub
+        .begin(channels.view())
+        .fetch::<m![H % 16 / 8], m![H % 8]>()
+        .fetch_cast::<f32>()
+        .collect::<m![H % 16 / 8], m![H % 8]>()
+        .to_vrf();
+    (row, channel)
+}
+
+pub(super) fn decode<H: AxisName, Q: AxisName, R: AxisName>(
+    device: &mut Device,
+    input: &channel::DecodePartial<H, Q, R>,
+    scales: &Scales<H, Q, R, f32>,
+    channels: &Channels<H, Q, bf16>,
+    waves: usize,
+) -> tiles::Partial<H, Q, R> {
+    let (row, channel) = factors(device, scales, channels);
+    // SAFETY: Wave is the outer local row coordinate in both views.
+    let partial = unsafe {
+        input.view().reshape::<Chip,Cluster<Q>,m![H/16],m![R%(R/4)/8,H%16,R/(R/4),R%8]>()
+    };
+    let mut output = tiles::Partial::new();
+    device
+        .main
+        .begin(partial)
+        .fetch::<m![R % (R / 4) / 8, R / (R / 4), H % 16], m![R % 8]>()
+        .fetch_cast::<f32>()
+        .collect::<m![R % (R / 4) / 8, R / (R / 4), H % 16], m![R % 8]>()
+        .vector_init()
+        .vector_intra_slice_tag(TagMode::Zero)
+        .vector_narrow_split::<m![R % (R / 4) / 8, R / (R / 4), H % 16, R % 8 / 4], m![R % 4]>()
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &row)
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), &channel)
+        .vector_widen_concat::<m![R % (R / 4) / 8, R / (R / 4), H % 16], m![R % 8]>()
+        .vector_final()
+        .cast::<bf16, m![R%8#16]>()
+        .transpose::<m![R % (R / 4) / 8, R / (R / 4), H % 16 / 4, R % 8], m![H%4#16]>()
+        .commit_trim::<m![H % 4]>()
+        .commit_prefix::<m![R % (R / 4) / 8], _, _>(output.view_mut(), waves);
+    output
 }

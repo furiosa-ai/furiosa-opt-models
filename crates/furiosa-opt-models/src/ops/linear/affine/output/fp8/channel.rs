@@ -40,6 +40,77 @@ pub(super) fn contract<H: AxisName, Q: AxisName, R: AxisName, const G: usize>(
                 m![R % (R / 4) / 8 = 1 #{!} (R / 32), R / (R / 4) = {G} #{!} 4, R % 8, H % 16]>(0));
 }
 
+axes![Wave = 16];
+pub(super) type DecodePartial<H, Q, R> =
+    DmTensor<bf16, Chip, Cluster<Q>, m![H / 16], m![Wave, H % 16, R / (R / 4), R % 8]>;
+
+/// Fetch weights once, broadcasting the token groups inside contraction time.
+fn decode_tile<H: AxisName, Q: AxisName, R: AxisName, const G: usize, const N: usize>(
+    device: &mut Device,
+    weight: &Weight<H, Q>,
+    input: &Source<H, Q, R>,
+    output: &mut DecodePartial<H, Q, R>,
+    offset: usize,
+) {
+    let input = input
+        .view()
+        .slice_tile::<m![R / (R / 4)], G, m![H/1024,R/(R/4)={G}#4,Q%2048/128]>(0)
+        .tile::<m![R % (R / 4) / 8], N, m![R%(R/4)/8={N}#(R/32),R%8,Q%128]>(offset);
+    // SAFETY: Wave names the unchanged local eight-row group coordinate.
+    let input = unsafe {
+        input.reshape::<Chip,Cluster<Q>,m![H/1024,R/(R/4)={G}#4,Q%2048/128],m![Wave={N}#16,R%8,Q%128]>()
+    };
+    let operand: TrfTensor<
+        f8e4m3,
+        Chip,
+        Cluster<Q>,
+        WeightSlices<H, Q>,
+        m![R % 8],
+        m![Wave = { N }, R / (R / 4) = { G }, Q % 128],
+    > = device
+        .sub
+        .begin(input)
+        .fetch::<m![R % 8, Wave = { N }], m![Q % 128]>()
+        .switch::<WeightSlices<H, Q>, m![R % 8, Wave = { N }, R / (R / 4) = { G }]>(
+            SwitchConfig::CustomBroadcast { ring_size: 64 },
+        )
+        .collect::<m![R % 8, Wave = { N }, R / (R / 4) = { G }, Q % 128 / 32], m![Q % 32]>()
+        .to_trf();
+    device.main.begin(weight.view())
+        .fetch::<m![H%256,Q%128/64],m![Q%64]>()
+        .collect::<m![H%256,Q%128/32],m![Q%32]>()
+        .contract_outer::<m![H%256,Q%128/64,Wave={N},R/(R/4)={G}],m![Q%64],_,_,_>(&operand)
+        .contract_packet::<m![1]>().contract_time::<m![H%256,Wave={N},R/(R/4)={G}]>()
+        .contract_lane::<m![H%256,Wave={N},R/(R/4)={G}],m![R%8]>(LaneMode::Interleaved)
+        .vector_init().vector_inter_slice_reduce::<m![H/16],m![H%16,Wave={N},R/(R/4)={G}]>(InterSliceReduceOpF32::Add)
+        .vector_final().cast::<bf16,m![R%8#16]>()
+        .commit_trim::<m![R%8]>()
+        .commit_view(output.view_mut().tile::<m![Wave],N,m![Wave={N}#{!}16,H%16,R/(R/4),R%8]>(offset)
+        .tile::<m![R/(R/4)],G,m![Wave={N}#{!}16,H%16,R/(R/4)={G}#{!}4,R%8]>(0));
+}
+pub(super) fn decode_wave<H: AxisName, Q: AxisName, R: AxisName>(
+    device: &mut Device,
+    weight: &Weight<H, Q>,
+    input: &Source<H, Q, R>,
+    output: &mut DecodePartial<H, Q, R>,
+    offset: usize,
+    rows: usize,
+) {
+    match rows.div_ceil(8) {
+        1 => decode_tile::<H, Q, R, 1, 1>(device, weight, input, output, offset),
+        2 => decode_tile::<H, Q, R, 2, 1>(device, weight, input, output, offset),
+        3 => decode_tile::<H, Q, R, 3, 1>(device, weight, input, output, offset),
+        4 => decode_tile::<H, Q, R, 4, 1>(device, weight, input, output, offset),
+        5..=8 => decode_tile::<H, Q, R, 4, 2>(device, weight, input, output, offset),
+        9..=12 => decode_tile::<H, Q, R, 4, 3>(device, weight, input, output, offset),
+        13..=16 => decode_tile::<H, Q, R, 4, 4>(device, weight, input, output, offset),
+        17..=20 => decode_tile::<H, Q, R, 4, 5>(device, weight, input, output, offset),
+        21..=24 => decode_tile::<H, Q, R, 4, 6>(device, weight, input, output, offset),
+        25..=28 => decode_tile::<H, Q, R, 4, 7>(device, weight, input, output, offset),
+        _ => decode_tile::<H, Q, R, 4, 8>(device, weight, input, output, offset),
+    }
+}
+
 pub(crate) fn quantize<Hidden: AxisName, QWidth: AxisName, Capacity: AxisName>(
     device: &mut Device,
     input: &InDm<Hidden, QWidth, Capacity>,

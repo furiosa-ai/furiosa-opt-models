@@ -232,25 +232,39 @@ fn end(
     let (gate_up, down) = mlp.0.parts();
     let tile = attended.with(());
     let gain = crate::Op::forward(&Stage, &mut *device, &norm.0);
-    let input = output
-        .0
-        .begin_span(device, landed, &attended.value().0, tile, |device| {
-            tile.with(super::rows::load::<S>(device, residual, tile))
-        });
-    let mut step = |device: &mut Device| {
-        output.forward(
+    let decode = call.context.0.read.items().rows() == call.live.rows();
+    let (input, ahead, projected) = if decode {
+        output.0.decode_span(
             device,
-            (),
-            &mut (),
-            (&mut *landed, &attended.value().0, tile),
+            landed,
+            &attended.value().0,
+            tile,
+            |device| tile.with(super::rows::load::<S>(device, residual, tile)),
+            |device| gate_up.forward(device, (), &mut (), Begin(())),
         )
+    } else {
+        let input = output
+            .0
+            .begin_span(device, landed, &attended.value().0, tile, |device| {
+                tile.with(super::rows::load::<S>(device, residual, tile))
+            });
+        let mut step = |device: &mut Device| {
+            output.forward(
+                device,
+                (),
+                &mut (),
+                (&mut *landed, &attended.value().0, tile),
+            )
+        };
+        let ahead = gate_up.forward(&mut *device, (), &mut (), Begin(()));
+        let _ = step(&mut *device);
+        let projected = match step(&mut *device) {
+            Poll::Ready(rows) => rows,
+            Poll::Pending => Owned::new(),
+        };
+        (input, ahead, projected)
     };
-    let ahead = gate_up.forward(&mut *device, (), &mut (), Begin(()));
-    let _ = step(&mut *device);
-    let projected = match step(&mut *device) {
-        Poll::Ready(rows) => tile.with(rows),
-        Poll::Pending => tile.with(Owned::new()),
-    };
+    let projected = tile.with(projected);
     let attended = sum.forward(&mut *device, (), &mut (), (&input, &projected));
     let normalized = gain.normalize_span(device, &attended, short_decode(call));
     let rows = tile.with(normalized.value());
@@ -260,7 +274,6 @@ fn end(
         });
     // Pure item launches retain product scales in DM at any span size. The MLP also
     // retains them for spans of at most 256 rows, including prompt and mixed launches.
-    let decode = call.context.0.read.items().rows() == call.live.rows();
     let staged = down.forward(
         &mut *device,
         (),
