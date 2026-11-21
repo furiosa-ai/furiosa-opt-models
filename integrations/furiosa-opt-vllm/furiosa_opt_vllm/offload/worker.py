@@ -16,7 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from time import monotonic
-from typing import TYPE_CHECKING, Protocol, final
+from typing import TYPE_CHECKING, final
 
 import torch
 from typing_extensions import override
@@ -39,7 +39,21 @@ from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 
 import furiosa_opt_engine as engine
-from furiosa_opt_vllm.cache import assigned, group_indices, runs
+from furiosa_opt_engine.cache_transfer import (
+    CachePageRoute,
+    PendingTransfer,
+    copy_bytes,
+    copy_cache_pages,
+    page_runs,
+    transfer_cache_pages,
+)
+from furiosa_opt_engine.cache_transfer import (
+    settle as settle_transfers,
+)
+from furiosa_opt_engine.cache_transfer import (
+    submit as submit_transfers,
+)
+from furiosa_opt_vllm.cache import assigned, group_indices
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -374,14 +388,26 @@ class Host(OffloadingWorker):
             if self.region is not None:
                 self.region.cleanup()
 
-    def transfers(self, groups: list[GroupWork], *, store: bool) -> Iterable[_Transfer]:
+    def transfers(self, groups: list[GroupWork], *, store: bool) -> Iterable[PendingTransfer]:
         """Copy selected logical groups to/from their engine subgroups and host chunk regions."""
         for work in groups:
             group_id = work.group_id
             for chunk_id, device_blocks, host_slots in work.chunks:
                 for route in self.routes[group_id]:
                     layer = self.layers[route.layer_id]
-                    for block, slot, run_length in runs(device_blocks, host_slots, self.chips):
+                    if route.mapping is None and self.region is None:
+                        host_pages = tuple(chunk_id * self.blocks + slot for slot in host_slots)
+                        yield from transfer_cache_pages(
+                            layer,
+                            self.rows[route.layer_id],
+                            device_blocks,
+                            host_pages,
+                            route.device_page_bytes,
+                            self.chips,
+                            to_host=store,
+                        )
+                        continue
+                    for block, slot, run_length in page_runs(device_blocks, host_slots, self.chips):
                         device_view = layer.slice(
                             block * route.device_page_bytes,
                             run_length * route.device_page_bytes,
@@ -425,7 +451,7 @@ class Host(OffloadingWorker):
                                 yield self._staged_transfer(
                                     run_length * route.host_page_bytes,
                                     device_view.to_host,
-                                    commit=lambda stage, destination=host_row: _copy_bytes(
+                                    commit=lambda stage, destination=host_row: copy_bytes(
                                         destination, stage
                                     ),
                                 )
@@ -433,7 +459,7 @@ class Host(OffloadingWorker):
                                 yield self._staged_transfer(
                                     run_length * route.host_page_bytes,
                                     lambda stage, device=device_view: stage.to_hbm(device),
-                                    prepare=lambda stage, source=host_row: _copy_bytes(
+                                    prepare=lambda stage, source=host_row: copy_bytes(
                                         stage, source
                                     ),
                                 )
@@ -441,7 +467,7 @@ class Host(OffloadingWorker):
     def _staged_transfer(
         self,
         size: int,
-        submit: Callable[[engine.HostBuffer], _Transfer],
+        submit: Callable[[engine.HostBuffer], PendingTransfer],
         *,
         prepare: Callable[[engine.HostBuffer], None] | None = None,
         commit: Callable[[engine.HostBuffer], None] | None = None,
@@ -586,22 +612,13 @@ class GroupWork:
     chunks: tuple[tuple[int, tuple[int, ...], tuple[int, ...]], ...]
 
 
-class _Transfer(Protocol):
-    """A submitted copy as a job follows it: `done` tells without waiting whether it ended, `wait`
-    waits for its end, and both raise a failed copy."""
-
-    def done(self) -> bool: ...
-
-    def wait(self) -> None: ...
-
-
 @final
 class _StagedTransfer:
     """A pinned staging buffer held until its DMA ends, then copied into shared primary memory."""
 
     def __init__(
         self,
-        transfer: _Transfer,
+        transfer: PendingTransfer,
         staging: engine.HostBuffer,
         commit: Callable[[], None] | None = None,
         release: Callable[[], None] | None = None,
@@ -648,21 +665,6 @@ class _StagedTransfer:
         self.settled = True
 
 
-def _byte_view(buffer: memoryview | engine.HostBuffer) -> memoryview:
-    return memoryview(buffer).cast("B")
-
-
-def _copy_bytes(
-    destination: memoryview | engine.HostBuffer,
-    source: memoryview | engine.HostBuffer,
-) -> None:
-    src = _byte_view(source)
-    dst = _byte_view(destination)
-    if len(src) != len(dst):
-        raise ValueError("staging and shared host ranges differ in size")
-    dst[:] = src
-
-
 def _copy_mapping(
     destination: memoryview | engine.HostBuffer,
     source: memoryview | engine.HostBuffer,
@@ -672,45 +674,36 @@ def _copy_mapping(
     local_page_stride: int,
     store: bool,
 ) -> None:
-    """Scatter/gather each local page using the upstream tiling-certified canonical runs."""
-    dst = _byte_view(destination)
-    src = _byte_view(source)
-    local_page = mapping.local_page_size_bytes
-    canonical_page = mapping.canonical_page_size_bytes
-    required_dst = page_count * (canonical_page if store else local_page_stride)
-    required_src = page_count * (local_page_stride if store else canonical_page)
-    if len(dst) < required_dst or len(src) < required_src:
-        raise ValueError("canonical mapping exceeds its local or host page buffer")
-    if not store:
-        dst[:required_dst] = bytes(required_dst)
-    for page_index in range(page_count):
-        local_base = page_index * local_page_stride
-        canonical_base = page_index * canonical_page
-        for run in mapping.runs:
-            for fragment in range(run.num_fragments):
-                local_offset = run.local_offset + fragment * run.local_stride
-                canonical_offset = run.canonical_offset + fragment * run.canonical_stride
-                local_end = local_offset + run.fragment_size
-                canonical_end = canonical_offset + run.fragment_size
-                if local_offset < 0 or local_end > local_page:
-                    raise ValueError("canonical mapping reads outside its local cache page")
-                if canonical_offset < 0 or canonical_end > canonical_page:
-                    raise ValueError("canonical mapping writes outside its primary cache page")
-                if store:
-                    dst[canonical_base + canonical_offset : canonical_base + canonical_end] = src[
-                        local_base + local_offset : local_base + local_end
-                    ]
-                else:
-                    dst[local_base + local_offset : local_base + local_end] = src[
-                        canonical_base + canonical_offset : canonical_base + canonical_end
-                    ]
+    """Apply vLLM's certified layout runs through the framework-neutral page router."""
+    routes = tuple(
+        CachePageRoute(
+            cache_offset=run.local_offset,
+            host_offset=run.canonical_offset,
+            fragment_bytes=run.fragment_size,
+            fragments=run.num_fragments,
+            cache_stride=run.local_stride,
+            host_stride=run.canonical_stride,
+        )
+        for run in mapping.runs
+    )
+    copy_cache_pages(
+        cache=source if store else destination,
+        host=destination if store else source,
+        routes=routes,
+        page_count=page_count,
+        cache_page_bytes=mapping.local_page_size_bytes,
+        cache_page_stride=local_page_stride,
+        host_page_bytes=mapping.canonical_page_size_bytes,
+        host_page_stride=mapping.canonical_page_size_bytes,
+        to_host=store,
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class Job:
     """A submitted store or load: its copies, their bytes and when they were submitted."""
 
-    transfers: tuple[_Transfer, ...]
+    transfers: tuple[PendingTransfer, ...]
     size: int
     started: float
 
@@ -720,13 +713,7 @@ class Job:
 
     def settle(self) -> Exception | None:
         """Wait until every copy ended, then return the first failure among them."""
-        failure: Exception | None = None
-        for transfer in self.transfers:
-            try:
-                transfer.wait()
-            except Exception as error:
-                failure = failure or error
-        return failure
+        return settle_transfers(self.transfers)
 
 
 @final
@@ -740,19 +727,12 @@ class Jobs:
     def __init__(self) -> None:
         self.running: dict[int, Job] = {}
 
-    def submit(self, job_id: int, transfers: Iterable[_Transfer], size: int) -> None:
+    def submit(self, job_id: int, transfers: Iterable[PendingTransfer], size: int) -> None:
         """Run job `job_id`, whose copies move `size` bytes: `transfers` submits each copy as it
         is read, and the job keeps it at once. A copy that fails to submit raises once the copies
         submitted before it ended."""
         started = monotonic()
-        submitted: list[_Transfer] = []
-        try:
-            for transfer in transfers:
-                submitted.append(transfer)
-        except Exception:
-            _ = Job(tuple(submitted), size, started).settle()
-            raise
-        self.running[job_id] = Job(tuple(submitted), size, started)
+        self.running[job_id] = Job(submit_transfers(transfers), size, started)
 
     def finished(self) -> list[TransferResult]:
         """The jobs whose copies ended since the last call, without waiting."""

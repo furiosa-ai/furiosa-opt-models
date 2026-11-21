@@ -68,6 +68,51 @@ def test_hierarchical_cache_refuses_other_slot_tensors(
         _ = offload.pages(torch.arange(16, 32, dtype=dtype).reshape(shape), 16)
 
 
+def test_file_storage_round_trips_engine_host_buffers() -> None:
+    from tempfile import TemporaryDirectory
+
+    import torch
+    from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+
+    import furiosa_opt_engine as engine
+    from furiosa_opt_sglang.offload import Host
+
+    host = Host.__new__(Host)
+    host.sizes = [2, 4]
+    host.chips = 2
+    host.page_size = 4
+    host.page_num = 2
+    host.dtype = torch.uint8
+    host.kv_buffer = [
+        engine.HostBuffer(bytes(range(1, 9))),
+        engine.HostBuffer(bytes(range(11, 27))),
+    ]
+
+    assert host.get_dummy_flat_data_page().numel() == 12
+    page = host.get_data_page(4)
+    assert page.tolist() == [5, 6, 7, 8, *range(19, 27)]
+    config = HiCacheStorageConfig(
+        tp_rank=0,
+        tp_size=1,
+        pp_rank=0,
+        pp_size=1,
+        attn_cp_rank=0,
+        attn_cp_size=1,
+        is_mla_model=False,
+        enable_storage_metrics=False,
+        is_page_first_layout=True,
+        model_name="engine-cache-test",
+    )
+    with TemporaryDirectory() as directory:
+        storage = HiCacheFile(config, file_path=directory)
+        assert storage.set("page-key", page)
+        host.set_from_flat_data_page(4, torch.zeros(12, dtype=torch.uint8))
+        restored = storage.get("page-key", host.get_dummy_flat_data_page())
+        assert restored is not None
+        host.set_from_flat_data_page(4, restored)
+        assert host.get_data_page(4).tolist() == page.tolist()
+
+
 @pytest.mark.parametrize(
     ("device", "host", "chips", "moved"),
     [
@@ -84,9 +129,9 @@ def test_hierarchical_cache_moves_adjacent_pages_in_one_copy(
 ) -> None:
     """Pages that follow each other on the device and on the host move in one copy on a cache of
     one chip, and one page a copy on more chips, whose copy writes chip after chip."""
-    from furiosa_opt_sglang import offload
+    from furiosa_opt_engine.cache_transfer import page_runs
 
-    assert offload.runs(device, host, chips) == moved
+    assert page_runs(device, host, chips) == tuple(moved)
 
 
 def test_mamba_pool_copies_and_restores_slots() -> None:

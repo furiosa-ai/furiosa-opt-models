@@ -13,7 +13,6 @@ engine's token pool, whose pages move to and from the engine cache's layers.
 
 from __future__ import annotations
 
-from itertools import pairwise
 from typing import TYPE_CHECKING, Final, cast, final
 
 import torch
@@ -31,6 +30,7 @@ from sglang.srt.runtime_context import get_memory
 from typing_extensions import override
 
 import furiosa_opt_engine as engine
+from furiosa_opt_engine.cache_transfer import copy_bytes, submit, transfer_cache_pages
 from furiosa_opt_sglang.cache import Cache
 from furiosa_opt_sglang.platform import Hierarchical
 
@@ -67,8 +67,10 @@ class Strategy(StackStrategy):
         enable_storage_metrics: bool = False,
     ) -> StackBuildResult:
         assert isinstance(kvcache, Cache)
-        # The platform refuses storage backends, and the plugin's speculation packs no draft pools.
-        assert storage_backend is None and not params.mtp_draft_device_pools
+        if storage_backend not in (None, "file"):
+            raise ValueError("the engine cache supports SGLang's file storage backend only")
+        if params.mtp_draft_device_pools:
+            raise ValueError("the engine cache does not support storage with draft pools")
         # The scheduler's cache parameters carry its tensor-parallel group.
         assert params.tp_cache_group is not None
         options = Hierarchical.parse(get_memory())
@@ -97,8 +99,10 @@ class Strategy(StackStrategy):
             pp_group=params.pp_cache_group,
             write_policy=options.hicache_write_policy,
             io_backend=options.hicache_io_backend,
+            storage_backend=storage_backend,
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
             transfer_layer_id_max=layers,
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=options.hicache_host_memory_mode,
@@ -122,6 +126,10 @@ class Host(HostKVCache):
         # Bytes one page of each layer takes on each chip.
         self.sizes = [len(layer) // cache.storage.blocks for layer in self.layers]
         self.chips = cache.pages.chips
+        item_bytes = torch.empty((), dtype=cache.dtype).element_size()
+        page_bytes = sum(self.sizes) * self.chips
+        if page_size <= 0 or page_bytes % (page_size * item_bytes):
+            raise ValueError("the host cache page must align to its token count and storage dtype")
         # SGLang's pool reads these while it allocates the pages.
         self.device_pool = cache
         self.layer_num = self.target_layer_num = cache.layer_num
@@ -155,15 +163,16 @@ class Host(HostKVCache):
         device_indices: torch.Tensor,
         io_backend: str,
     ) -> None:
-        device, host = pages(device_indices, self.page_size), pages(host_indices, self.page_size)
-        moved = runs(device, host, self.chips)
-        for layer, size, buffer in zip(self.layers, self.sizes, self.buffers, strict=True):
-            # Bytes of one host page.
-            stride = size * self.chips
-            for block, page, length in moved:
-                _ = layer.slice(block * size, length * size).to_host(
-                    buffer.slice(page * stride, length * stride)
-                )
+        device = pages(device_indices, self.page_size)
+        host = pages(host_indices, self.page_size)
+        transfers = (
+            transfer
+            for layer, size, buffer in zip(self.layers, self.sizes, self.buffers, strict=True)
+            for transfer in transfer_cache_pages(
+                layer, buffer, device, host, size, self.chips, to_host=True
+            )
+        )
+        _ = submit(transfers)
 
     @override
     def load_to_device_per_layer(
@@ -178,23 +187,53 @@ class Host(HostKVCache):
     ) -> None:
         layer, size, buffer = self.layers[layer_id], self.sizes[layer_id], self.buffers[layer_id]
         device, host = pages(device_indices, self.page_size), pages(host_indices, self.page_size)
-        stride = size * self.chips
-        for block, page, length in runs(device, host, self.chips):
-            _ = buffer.slice(page * stride, length * stride).to_hbm(
-                layer.slice(block * size, length * size)
-            )
+        _ = transfer_cache_pages(layer, buffer, device, host, size, self.chips, to_host=False)
 
     @override
     def get_data_page(self, index: int, flat: bool = True) -> torch.Tensor:
-        raise NotImplementedError("the engine's host pool serves no storage backend")
+        if not flat:
+            raise ValueError("the engine cache exposes opaque flat pages to storage")
+        page = self._page_index(index)
+        layers = [
+            torch.frombuffer(
+                memoryview(buffer.slice(page * size * self.chips, size * self.chips)),
+                dtype=torch.uint8,
+            )
+            for size, buffer in zip(self.sizes, self.buffers, strict=True)
+        ]
+        return torch.cat(layers).view(self.dtype)
 
     @override
     def get_dummy_flat_data_page(self) -> torch.Tensor:
-        raise NotImplementedError("the engine's host pool serves no storage backend")
+        item_bytes = torch.empty((), dtype=self.dtype).element_size()
+        return torch.empty(self._page_bytes // item_bytes, dtype=self.dtype, device="cpu")
 
     @override
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
-        raise NotImplementedError("the engine's host pool serves no storage backend")
+        if data_page.device.type != "cpu":
+            raise ValueError("the file storage backend returns host pages on CPU")
+        page = self._page_index(index)
+        source = memoryview(data_page.contiguous().view(torch.uint8).reshape(-1).numpy()).cast("B")
+        if len(source) != self._page_bytes:
+            raise ValueError("stored page size differs from the engine cache page")
+        offset = 0
+        for size, buffer in zip(self.sizes, self.buffers, strict=True):
+            layer_bytes = size * self.chips
+            destination = buffer.slice(page * layer_bytes, layer_bytes)
+            copy_bytes(destination, source[offset : offset + layer_bytes])
+            offset += layer_bytes
+
+    @property
+    def _page_bytes(self) -> int:
+        return sum(self.sizes) * self.chips
+
+    def _page_index(self, index: int) -> int:
+        if index < 0 or index % self.page_size:
+            raise ValueError("storage pages must start at an aligned token slot")
+        page = index // self.page_size
+        if page >= self.page_num:
+            raise ValueError("storage page is outside the engine host pool")
+        return page
 
     @property
     def buffers(self) -> list[engine.HostBuffer]:
@@ -219,19 +258,3 @@ def pages(indices: torch.Tensor, size: int) -> list[int]:
     if (first % size).any() or not torch.equal(rows - first, offsets):
         raise ValueError("a hierarchical cache page is a page's consecutive token slots")
     return PAGES.validate_python((first.flatten() // size).tolist())
-
-
-def runs(device: list[int], host: list[int], chips: int) -> list[tuple[int, int, int]]:
-    """`device` pages beside the `host` pages they move to or from, as `(block, page, length)`
-    runs that each move in one copy: pages that both step by one. A copy moves each chip's part of
-    its pages in turn while a host page holds every chip's part of one page, so on more than one
-    chip a run is one page."""
-    assert len(device) == len(host)
-    starts = [
-        i
-        for i in range(len(device))
-        if i == 0 or chips > 1 or (device[i] - device[i - 1], host[i] - host[i - 1]) != (1, 1)
-    ]
-    return [
-        (device[start], host[start], end - start) for start, end in pairwise([*starts, len(device)])
-    ]

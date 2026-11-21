@@ -24,7 +24,7 @@ The platform accepts these values:
 | `rope_parameters` or `rope_scaling` and `max_position_embeddings` in `--json-model-override-args` | A `rope_type` the engine computes, within the compiled window ([Extend the context](index.md#extend-the-context-past-the-trained-length)) |
 | `--mem-fraction-static` | Unset defaults to 0.9, leaving the headroom a model split over chips needs |
 | `--enable-deterministic-inference` | Off, or on to load the model [batch invariant](index.md#keep-outputs-independent-of-the-batch) with the radix cache on |
-| `--enable-hierarchical-cache` | A model without recurrent state, with the host tier sized by `--hicache-ratio` or `--hicache-size` and kept in memory: `--hicache-host-memory-mode cache`, `--hicache-io-backend kernel`, `--hicache-mem-layout page_first`, no `--hicache-storage-backend` and no memory saver |
+| `--enable-hierarchical-cache` | A model without recurrent state, with the host tier sized by `--hicache-ratio` or `--hicache-size`: `--hicache-host-memory-mode cache`, `--hicache-io-backend kernel`, `--hicache-mem-layout page_first`, `--hicache-storage-backend` unset or `file`, and no memory saver; file pages use SGLang's `HiCacheFile` |
 
 These features are not supported yet, and the plugin refuses them at startup rather than ignore them:
 
@@ -32,7 +32,7 @@ These features are not supported yet, and the plugin refuses them at startup rat
 - Speculative decoding with more than one candidate a position, adaptive speculation or an external n-gram corpus.
 - Watermarking (`--enable-watermark`) and strict thinking (`--enable-strict-thinking`), which change the scores of each step.
 - Quantization and quantization parameter files.
-- Hierarchical cache storage backends, HiSparse, unified memory, LMCache, FlexKV and the unified cache external linker.
+- Hierarchical cache storage backends other than `file`, HiSparse, unified memory, LMCache, FlexKV and the unified cache external linker.
 - The memory saver (`--enable-memory-saver`) with speculative decoding, whose worker and draft model keep device memory a release does not reach yet, and with the hierarchical cache, whose host tier copies the cache storage a release frees.
 - Per-layer embedding offload (`ple_offload_embedding`).
 - Returning hidden states, routed experts or indexer top-k.

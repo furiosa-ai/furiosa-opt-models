@@ -160,10 +160,11 @@ Both servers copy the cache blocks of computed prompts to a tier of host memory,
 === "SGLang"
 
     ```bash
-    python -m sglang.launch_server --model-path Qwen/Qwen3-1.7B --enable-hierarchical-cache --hicache-ratio 2
+    python -m sglang.launch_server --model-path Qwen/Qwen3-1.7B --enable-hierarchical-cache --hicache-ratio 2 --hicache-storage-backend file
     ```
 
     `--hicache-ratio` sizes the host tier as a multiple of the device cache, `--hicache-size` in GB; SGLang sizes it from the free host memory only for the device pools it builds itself, so one of them is required.
+    `--hicache-storage-backend file` persists host pages through SGLang's `HiCacheFile`; pass `--hicache-storage-backend-extra-config` to set its `file_storage_path`.
     The memory saver frees the cache storage the host tier copies, so startup refuses `--enable-memory-saver` beside the hierarchical cache.
     A `/generate` response reports reused tokens by tier in `meta_info.cached_tokens_details`.
 

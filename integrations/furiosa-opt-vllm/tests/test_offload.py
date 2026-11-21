@@ -31,6 +31,14 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_offload.base import CopyRun, GPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 
+from furiosa_opt_engine.cache_transfer import (
+    CachePageRoute,
+    copy_cache_pages,
+    page_runs,
+)
+from furiosa_opt_engine.cache_transfer import (
+    submit as submit_transfers,
+)
 from furiosa_opt_vllm import cache
 from furiosa_opt_vllm.offload import worker
 
@@ -172,6 +180,58 @@ def test_failed_submission_waits_for_submitted_copies() -> None:
     assert running.finished() == []
 
 
+def test_shared_core_submission_drains_copies_on_failure() -> None:
+    first = Copies()
+
+    def submitted() -> Iterator[Copies]:
+        yield first
+        raise RuntimeError("submission failed")
+
+    with pytest.raises(RuntimeError, match="submission failed"):
+        _ = submit_transfers(submitted())
+    assert first.waited
+
+
+def test_shared_core_routes_pages_in_both_directions() -> None:
+    route = CachePageRoute(
+        cache_offset=0,
+        host_offset=1,
+        fragment_bytes=1,
+        fragments=2,
+        cache_stride=2,
+        host_stride=3,
+    )
+    routes = (route,)
+    cache = bytearray([10, 11, 12, 99, 20, 21, 22, 99])
+    host = bytearray(10)
+    copy_cache_pages(
+        cache,
+        host,
+        routes,
+        page_count=2,
+        cache_page_bytes=3,
+        cache_page_stride=4,
+        host_page_bytes=5,
+        host_page_stride=5,
+        to_host=True,
+    )
+    assert host == bytearray([0, 10, 0, 0, 12, 0, 20, 0, 0, 22])
+
+    cache[:] = bytes([255]) * len(cache)
+    copy_cache_pages(
+        cache,
+        host,
+        routes,
+        page_count=2,
+        cache_page_bytes=3,
+        cache_page_stride=4,
+        host_page_bytes=5,
+        host_page_stride=5,
+        to_host=False,
+    )
+    assert cache == bytearray([10, 0, 12, 0, 20, 0, 22, 0])
+
+
 def test_raises_failed_copy() -> None:
     """A poll that finds a failed copy raises its error instead of reporting the job."""
     failure = RuntimeError("copy failed")
@@ -206,7 +266,7 @@ def test_moves_adjacent_blocks_in_one_copy(
 ) -> None:
     """Blocks whose host rows follow theirs move in one copy on a cache of one chip, and one block
     a copy on more chips, whose copy writes chip after chip."""
-    assert cache.runs(blocks, rows, chips) == moved
+    assert page_runs(blocks, rows, chips) == tuple(moved)
 
 
 def test_staged_transfer_commits_shared_bytes_after_dma_completion() -> None:

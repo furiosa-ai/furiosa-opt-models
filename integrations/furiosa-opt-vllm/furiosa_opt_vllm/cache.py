@@ -4,7 +4,6 @@ blocks a copy to or from host memory moves at once."""
 from __future__ import annotations
 
 from collections import defaultdict
-from itertools import pairwise
 from typing import TYPE_CHECKING, Final
 
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
@@ -60,18 +59,3 @@ def assigned(group: KVCacheGroupSpec, layer: str) -> KVCacheSpec:
             return specs[layer]
         case shared:
             return shared
-
-
-def runs(device: list[int], host: list[int], chips: int) -> list[tuple[int, int, int]]:
-    """`device` blocks beside the `host` rows they move to or from, as `(block, row, length)`
-    runs that each move in one copy: blocks and rows that both step by one. A copy moves each
-    chip's part of its blocks in turn while a row holds every chip's part of one block, so on more
-    than one chip a run is one block."""
-    starts = [
-        i
-        for i in range(len(device))
-        if i == 0 or chips > 1 or (device[i] - device[i - 1], host[i] - host[i - 1]) != (1, 1)
-    ]
-    return [
-        (device[start], host[start], end - start) for start, end in pairwise([*starts, len(device)])
-    ]
