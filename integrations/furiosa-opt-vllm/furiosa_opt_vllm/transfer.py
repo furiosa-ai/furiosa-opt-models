@@ -58,6 +58,27 @@ UNSTAGED: Final[Mapping[str, str]] = MappingProxyType(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class Offloading:
+    """What the contracts check of an offloading transfer config through `CONNECTOR`, with its
+    `kv_connector_extra_config` keys read as vLLM's offloading reads them."""
+
+    # No spec_name but vLLM's CPUOffloadingSpec, and no spec_module_path.
+    cpu_spec: bool
+    canonical_layout: bool
+    load_failure_policy: Literal["recompute", "fail"]
+
+    @classmethod
+    def of(cls, transfer: KVTransferConfig) -> Offloading:
+        extra: Mapping[str, object] = transfer.kv_connector_extra_config
+        return cls(
+            extra.get("spec_name", "CPUOffloadingSpec") == "CPUOffloadingSpec"
+            and "spec_module_path" not in extra,
+            bool(extra.get("canonical_layout")),
+            transfer.kv_load_failure_policy,
+        )
+
+
 def offload(config: VllmConfig) -> None:
     """Turn `--kv-offloading-size` into the transfer config vLLM derives from it for its own
     connector, naming `CONNECTOR` instead, and take the size: vLLM derives its config after the
@@ -78,27 +99,6 @@ def offload(config: VllmConfig) -> None:
     transfer.kv_connector_extra_config["cpu_bytes_to_use"] = cache.kv_offloading_size * (1 << 30)
     config.kv_transfer_config = transfer
     cache.kv_offloading_size = None
-
-
-@dataclass(frozen=True, slots=True)
-class Offloading:
-    """What the contracts check of an offloading transfer config through `CONNECTOR`, with its
-    `kv_connector_extra_config` keys read as vLLM's offloading reads them."""
-
-    # No spec_name but vLLM's CPUOffloadingSpec, and no spec_module_path.
-    cpu_spec: bool
-    canonical_layout: bool
-    load_failure_policy: Literal["recompute", "fail"]
-
-    @classmethod
-    def of(cls, transfer: KVTransferConfig) -> Offloading:
-        extra: Mapping[str, object] = transfer.kv_connector_extra_config
-        return cls(
-            extra.get("spec_name", "CPUOffloadingSpec") == "CPUOffloadingSpec"
-            and "spec_module_path" not in extra,
-            bool(extra.get("canonical_layout")),
-            transfer.kv_load_failure_policy,
-        )
 
 
 def connectors(transfer: KVTransferConfig | None) -> tuple[KVTransferConfig, ...]:
