@@ -93,7 +93,7 @@ class Cache:
 @typing.final
 class CacheSpec:
     r"""
-    The cache a loaded decoder's calls read: block formats and engine storage groups. `Cache(spec,
+    The cache a loaded decoder's calls read: page formats and engine storage groups. `Cache(spec,
     blocks)` allocates one storage buffer per model layer on the decoder's device.
     """
     @property
@@ -109,13 +109,13 @@ class CacheSpec:
     @property
     def groups(self) -> builtins.list[Group]:
         r"""
-        Engine storage groups. Groups with the same `vllm_group` share one logical block table.
+        Engine storage groups. Groups with the same logical vLLM group share one block table.
         """
 
 @typing.final
 class Group:
     r"""
-    Stable model layer IDs whose cache has one kind and takes its blocks from one pool.
+    Layers whose cache has one kind and takes its blocks from one pool.
     """
     @property
     def pool(self) -> builtins.int:
