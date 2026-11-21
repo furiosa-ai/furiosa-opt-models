@@ -95,7 +95,7 @@ LORA: Final = "serves no LoRA adapter; omit --enable-lora and --lora-paths"
 # SGLang's quantizations at load whose computation the engine serves: E4M3 weights restored to
 # BF16 before each product, the activations kept in BF16.
 Quantization = Literal["fp8"]
-QUANTIZATION: Final = (
+TARGET_QUANTIZATION: Final = (
     "quantizes a BF16 checkpoint at load only with --quantization fp8, one scale per output channel"
 )
 
@@ -113,7 +113,7 @@ class Resolved(Served):
     attn_dp_size: Literal[1] = Field(description="requires attn_dp_size=1")
     enable_lora: Unset = Field(description=LORA)
     lora_paths: Unset = Field(description=LORA)
-    quantization: Quantization | None = Field(description=QUANTIZATION)
+    quantization: Quantization | None = Field(description=TARGET_QUANTIZATION)
     quantization_param_path: Unset
     enable_hisparse: Unset
     enable_return_hidden_states: Unset
@@ -229,7 +229,9 @@ class Standalone(Speculation):
     # SGLang gives the draft the target's quantization unless the operator names the draft's own.
     speculative_draft_model_quantization: Quantization | None = Field(
         description=(
-            "quantizes a BF16 draft model at load only with fp8, one scale per output channel"
+            "--speculative-draft-model-quantization fp8 quantizes "
+            "a BF16 draft at load; unset inherits the target, "
+            "unquant loads the stored weights"
         )
     )
 

@@ -109,14 +109,32 @@ def test_generates_as_the_checkpoint_quantized_by_sglang(
 
 
 @pytest.mark.feature("Online quantization")
-def test_refuses_a_draft_inheriting_an_unserved_quantization(
-    tmp_path_factory: pytest.TempPathFactory, chips: Chips
+@pytest.mark.parametrize(
+    ("target_flags", "draft_flags"),
+    [
+        pytest.param(FP8, (), id="inherited"),
+        pytest.param(
+            (), ("--speculative-draft-model-quantization", "fp8"), id="draft-owned-fp8"
+        ),
+    ],
+)
+def test_refuses_a_draft_with_unserved_fp8(
+    tmp_path_factory: pytest.TempPathFactory,
+    chips: Chips,
+    target_flags: tuple[str, ...],
+    draft_flags: tuple[str, ...],
 ) -> None:
-    """A STANDALONE draft model takes the target's `fp8`, so a draft size with no FP8 form stops
-    the server with the engine's reason."""
-    row = {"id": "Qwen/Qwen3-1.7B", "task": "text", "flags": [*FP8, *STANDALONE, "Qwen/Qwen3-8B"]}
+    """An inherited or draft-owned `fp8` refuses a draft size with no FP8 form."""
+    row = {
+        "id": "Qwen/Qwen3-1.7B",
+        "task": "text",
+        "flags": [*target_flags, *STANDALONE, "Qwen/Qwen3-8B", *draft_flags],
+    }
     log = chips.refusal(tmp_path_factory, row)
-    assert "a load quantizes the checkpoint, the line holds BF16 projections" in log
+    assert (
+        "furiosa-opt-sglang a load quantizes the checkpoint, the line holds BF16 projections"
+        in log
+    )
 
 
 @pytest.mark.feature("Online quantization")

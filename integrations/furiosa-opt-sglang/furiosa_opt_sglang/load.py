@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from pydantic import JsonValue, TypeAdapter
 
@@ -61,16 +61,24 @@ def options(
 
 def quantization(
     method: str | None, config: Mapping[str, JsonValue] | PretrainedConfig
-) -> str | None:
+) -> Literal["fp8_per_channel"] | None:
     """The engine's quantization of a checkpoint of `config` that SGLang loads under `method`, the
     operator's or the checkpoint's own, or none: SGLang quantizes at load only with `fp8` and only a
     checkpoint whose config declares no quantization, each output channel of a projection under
-    its own scale."""
+    its own scale.
+
+    Raises:
+        ValueError: The checkpoint's quantization metadata is malformed.
+    """
     from sglang.srt.model_loader.checkpoint_quantization import resolve_checkpoint_quant_spec
 
-    if method == "fp8" and resolve_checkpoint_quant_spec(config) is None:
-        return "fp8_per_channel"
-    return None
+    if method != "fp8":
+        return None
+    try:
+        declared = resolve_checkpoint_quant_spec(config)
+    except TypeError as error:
+        raise ValueError(f"invalid checkpoint quantization metadata: {error}") from None
+    return "fp8_per_channel" if declared is None else None
 
 
 def bind(model_config: ModelConfig, first: int) -> Model:
