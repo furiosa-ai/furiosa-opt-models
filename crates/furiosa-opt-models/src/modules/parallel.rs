@@ -4,10 +4,9 @@
 
 use crate::Module;
 use crate::load::Load;
-use crate::ops::collective::prefix::{self, Extents, Prefix};
 use crate::ops::collective::{AllGather, AllReduce, Exchange, Pieces, Whole};
 use crate::tensor::axis::Rows;
-use crate::tensor::live::{BlockPrefix, Live};
+use crate::tensor::live::{BlockPrefix, Extents, Live, PrefixPlan};
 use crate::tensor::memory::residency::Residency;
 use crate::tensor::parallel::{Parallel, Parallelism as Placement, Part, Replicated, Shard};
 use furiosa_opt_std::prelude::*;
@@ -191,7 +190,7 @@ pub struct ExchangedPrefix<'a, L, G, const N: usize> {
 impl<I, L, G, const N: usize> !crate::Op<I> for ExchangedPrefix<'_, L, G, N> {}
 
 impl<'i, 'p, R: AxisName, W: AxisName, G: Extents, L, E, State, O, const N: usize>
-    Module<&'p Prefix<&'i Split<R, W, N>, R, G, Rows<256>>, E, State>
+    Module<&'p PrefixPlan<&'i Split<R, W, N>, R, G, Rows<256>>, E, State>
     for ExchangedPrefix<'_, L, G, N>
 where
     Parallel<N>: Placement,
@@ -209,12 +208,8 @@ where
         device: &mut Device,
         env: E,
         state: State,
-        input: &'p Prefix<&'i Split<R, W, N>, R, G, Rows<256>>,
+        input: &'p PrefixPlan<&'i Split<R, W, N>, R, G, Rows<256>>,
     ) -> Self::Output {
-        const {
-            assert!(R::SIZE.is_multiple_of(256));
-            assert!(prefix::aligned::<G>(256));
-        }
         let mut exchanged = Local::<R, W, N>::new();
         Exchange::<Parallel<N>>::default().write_prefix::<bf16, R, W, G, Rows<256>>(
             device,

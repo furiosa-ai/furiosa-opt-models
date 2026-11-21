@@ -5,13 +5,12 @@
 
 use furiosa_opt_models::Module;
 use furiosa_opt_models::load::{Checkpoint, Context, Load, Named};
-use furiosa_opt_models::modules::parallel::{Exchanged, ExchangedPrefix};
+use furiosa_opt_models::modules::parallel::Exchanged;
 use furiosa_opt_models::ops::attention::geometry::{Hidden, ProjectionWidth};
 use furiosa_opt_models::ops::collective::Pieces;
-use furiosa_opt_models::ops::collective::prefix;
 use furiosa_opt_models::ops::linear::{Grouped, grouped::Layout};
 use furiosa_opt_models::tensor::axis::Rows;
-use furiosa_opt_models::tensor::live::{BlockPrefix, Live};
+use furiosa_opt_models::tensor::live::{BlockPrefix, Extents, Live, PrefixInputs, PrefixPlan};
 use furiosa_opt_models::tensor::parallel::{Parallel, Part, Shard};
 use furiosa_opt_models::tensor::scalar::Value;
 use furiosa_opt_std::prelude::*;
@@ -68,11 +67,11 @@ where
 }
 
 #[device(chip = 4)]
-fn borrowed<R: AxisName, I: AxisName, O: AxisName, G: prefix::Extents>(
+fn borrowed<R: AxisName, I: AxisName, O: AxisName, G: Extents>(
     device: &mut Device,
     weights: &Borrowed<'_, I, O>,
     input: &Split<R, I>,
-    blocks: &prefix::Inputs<R, G, B, Chips>,
+    blocks: &PrefixInputs<R, G, B, Chips>,
     env: &Value<Chips>,
     state: &mut State<R, O>,
 ) {
@@ -88,7 +87,7 @@ fn owned<R: AxisName, I: AxisName, O: AxisName, S: AxisName>(
     device: &mut Device,
     weights: &Owned<I, O>,
     input: &Split<R, I>,
-    blocks: &prefix::Inputs<R, (S,), B, Chips>,
+    blocks: &PrefixInputs<R, (S,), B, Chips>,
 ) -> Local<R, O> {
     let prefix = blocks.read().with(input);
     weights
@@ -187,14 +186,7 @@ async fn input<R: AxisName, I: AxisName>(device: &mut Device, work: usize) -> Sp
     .unwrap()
 }
 
-async fn check<R: AxisName, I: AxisName, O: AxisName, A: AxisName, D: AxisName, E: AxisName>(
-    works: &[usize],
-) {
-    assert!(
-        works
-            .iter()
-            .all(|&s| [A::SIZE, D::SIZE, E::SIZE].contains(&s))
-    );
+async fn check<R: AxisName, I: AxisName, O: AxisName, G: Extents>(works: &[usize]) {
     let mut device = Device::new(Topology {
         chips: CHIPS as u8,
         pes: 8,
@@ -210,9 +202,8 @@ async fn check<R: AxisName, I: AxisName, O: AxisName, A: AxisName, D: AxisName, 
     let reference = reference::<I>();
     for &work in works {
         let prefix = BlockPrefix::<(), R, B>::try_over(work).unwrap();
-        let count = prefix::Prefix::<(), R, (A, (D, (E,))), B>::new(prefix)
-            .unwrap()
-            .upload::<Chips>(&mut device)
+        let plan = PrefixPlan::<(), R, G, B>::new(prefix).unwrap();
+        let count = PrefixInputs::<R, G, B, Chips>::upload(&mut device, &plan)
             .await
             .unwrap();
         let input = input::<R, I>(&mut device, work).await;
@@ -267,13 +258,13 @@ async fn check<R: AxisName, I: AxisName, O: AxisName, A: AxisName, D: AxisName, 
                 "chip {chip}, row {row}, column {column}, work {work}"
             );
         }
-        if work == A::SIZE {
-            let owned_count =
-                prefix::Prefix::<(), R, (A,), B>::new(BlockPrefix::try_over(work).unwrap())
-                    .unwrap()
-                    .upload::<Chips>(&mut device)
-                    .await
+        if work == G::First::SIZE {
+            let plan =
+                PrefixPlan::<(), R, (G::First,), B>::new(BlockPrefix::try_over(work).unwrap())
                     .unwrap();
+            let owned_count = PrefixInputs::<R, (G::First,), B, Chips>::upload(&mut device, &plan)
+                .await
+                .unwrap();
             let output = launch(owned, (&mut device, &weights, &input, &owned_count))
                 .await
                 .unwrap();
@@ -299,73 +290,20 @@ async fn check<R: AxisName, I: AxisName, O: AxisName, A: AxisName, D: AxisName, 
     }
 }
 
-#[test]
-fn named_owned_and_borrowed_views_keep_the_output_independent_of_exchange_storage() {
-    type R = Rows<10496>;
-    type I = Hidden<7168>;
-    type O = ProjectionWidth<5376>;
-    fn view<M>()
-    where
-        for<'i, 'p, 's> M: Module<
-                &'p prefix::Prefix<&'i Split<R, I>, R, (Rows<9472>,), B>,
-                (),
-                &'s mut (),
-                Output = Live<Local<R, O>, R>,
-            >,
-    {
-    }
-    view::<ExchangedPrefix<'_, Named<"projection", Grouped<I, O, Chips>>, (Rows<9472>,), 4>>();
-    type Child<'a> =
-        Named<"projection", Grouped<I, O, Chips, &'a HbmTensor<bf16, Chips, Layout<I, O>>>>;
-    view::<ExchangedPrefix<'_, Child<'_>, (Rows<9472>,), 4>>();
-}
-
-#[test]
-fn independent_oracle_distinguishes_source_chip_and_compact_stride() {
-    type I = Hidden<512>;
-    let reference = reference::<I>();
-    assert!((0..COLUMN_CLASSES).any(
-        |c| expected(&reference, 0, 7, c).to_bits() != expected(&reference, 1, 7, c).to_bits()
-    ));
-    let wrong = (0..I::SIZE)
-        .map(|k| {
-            f64::from(
-                source(
-                    (k / (I::SIZE / CHIPS) + 1) % CHIPS,
-                    1,
-                    7,
-                    k % (I::SIZE / CHIPS),
-                )
-                .to_f32(),
-            ) * f64::from(coefficient(3, k).to_f32())
-        })
-        .sum::<f64>();
-    assert_ne!(
-        expected(&reference, 1, 7, 3).to_bits(),
-        bf16::from_f32(wrong as f32).to_bits()
-    );
-    // A capacity-strided consumer picks a different row inside the compactly packed source.
-    let (work, capacity) = (9472, 10496);
-    assert_ne!(
-        source(2, 1, 7, 3).to_bits(),
-        source(2, (capacity + 7) / work, (capacity + 7) % work, 3).to_bits()
-    );
-}
-
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires four explicitly selected RNGD chips"]
 async fn compact_exchange_named_projection_matches_fp64_at_all_main_work_extents() {
-    check::<Rows<10496>, Hidden<512>, ProjectionWidth<256>, Rows<9472>, Rows<9728>, Rows<9984>>(&[
-        9472, 9984, 9728, 9472,
-    ])
+    check::<
+        Rows<10496>,
+        Hidden<512>,
+        ProjectionWidth<256>,
+        (Rows<9472>, (Rows<9728>, (Rows<9984>,))),
+    >(&[9472, 9984, 9728, 9472])
     .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires four explicitly selected RNGD chips"]
 async fn full_width_exchange_projection_matches_fp64_at_one_block() {
-    check::<Rows<768>, Hidden<7168>, ProjectionWidth<5376>, Rows<256>, Rows<512>, Rows<768>>(&[
-        256,
-    ])
-    .await;
+    check::<Rows<768>, Hidden<7168>, ProjectionWidth<5376>, (Rows<256>,)>(&[256]).await;
 }

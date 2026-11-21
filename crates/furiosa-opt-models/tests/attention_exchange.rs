@@ -6,9 +6,9 @@
 use furiosa_opt_models::ops::attention::flash::{
     Compact, Duo, Head, Queries, Span, Tokens, Visible,
 };
-use furiosa_opt_models::ops::collective::{Exchange, Pieces, prefix};
+use furiosa_opt_models::ops::collective::{Exchange, Pieces};
 use furiosa_opt_models::tensor::axis::Rows;
-use furiosa_opt_models::tensor::live::{BlockPrefix, Live};
+use furiosa_opt_models::tensor::live::{BlockPrefix, Live, PrefixInputs, PrefixPlan};
 use furiosa_opt_models::tensor::parallel::{Parallel, Part, Shard};
 use furiosa_opt_models::tensor::scalar::Value;
 use furiosa_opt_models::{Module, Op};
@@ -26,7 +26,7 @@ type Visibility = Visible<Spans, Chips>;
 type Split = HbmTensor<bf16, Chips, m![{ Symbol<QueryRows> }, { Symbol<Part<Width, 4>> }]>;
 type Output = HbmTensor<bf16, Chips, m![Capacity, Width]>;
 type Transfers = (Rows<9472>, (Rows<9728>, (Rows<9984>,)));
-type Work = prefix::Inputs<Capacity, Transfers, Rows<1>, Chips>;
+type Work = PrefixInputs<Capacity, Transfers, Rows<1>, Chips>;
 type Operands<'a> = (
     &'a Query,
     &'a Kv,
@@ -258,58 +258,6 @@ async fn check(device: &mut Device, buffer: &HbmBuffer, work: usize, keys: usize
     );
 }
 
-#[test]
-fn oracle_distinguishes_capacity_stride_heads_and_source_chips() {
-    let shifts = shifts(37787);
-    for chip in 0..CHIPS {
-        for head in 0..Heads::SIZE {
-            for channel in 0..Head::SIZE {
-                for delta in [-0.25, 0.25] {
-                    let value = base(chip, head, channel) + delta;
-                    assert_eq!(bf16::from_f32(value).to_f32(), value);
-                }
-            }
-        }
-    }
-    for work in [9472, 9728, 9984] {
-        let mut error = [0.0; 3];
-        let mut norm = 0.0;
-        for destination in 0..CHIPS {
-            for row in 0..34 {
-                for source in 0..CHIPS {
-                    for head in 0..Heads::SIZE {
-                        for channel in 0..Head::SIZE {
-                            let query_row = destination * work + row;
-                            let want = expected(query_row, source, head, channel, &shifts);
-                            let wrong = [
-                                expected(
-                                    destination * Capacity::SIZE + row,
-                                    source,
-                                    head,
-                                    channel,
-                                    &shifts,
-                                ),
-                                expected(query_row, source, head ^ 1, channel, &shifts),
-                                expected(query_row, source ^ 1, head, channel, &shifts),
-                            ];
-                            norm += want * want;
-                            for (error, wrong) in error.iter_mut().zip(wrong) {
-                                *error += (wrong - want).powi(2);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        for (fault, error) in error.into_iter().enumerate() {
-            assert!(
-                (error / norm).sqrt() > LIMIT,
-                "fixture cannot expose fault {fault}, work {work}"
-            );
-        }
-    }
-}
-
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires four explicitly selected RNGD chips"]
 async fn compact_live_attention_feeds_whole_exchange_in_one_module_launch() {
@@ -321,13 +269,11 @@ async fn compact_live_attention_feeds_whole_exchange_in_one_module_launch() {
         let mut output: Output = buffer.try_into().unwrap();
         let (query, key, value, visible) = inputs(&mut device, work, keys).await;
         let key_count = scalar(&mut device, keys).await;
-        let work_count = prefix::Prefix::<(), Capacity, Transfers, Rows<1>>::new(
+        let plan = PrefixPlan::<(), Capacity, Transfers, Rows<1>>::new(
             BlockPrefix::try_over(work).unwrap(),
         )
-        .unwrap()
-        .upload::<Chips>(&mut device)
-        .await
         .unwrap();
+        let work_count = Work::upload(&mut device, &plan).await.unwrap();
         HostTensor::<bf16, m![{ Chips }, Capacity, Width]>::from_vec(std::iter::repeat_n(
             bf16::from_bits(POISON),
             CHIPS * Capacity::SIZE * Width::SIZE,

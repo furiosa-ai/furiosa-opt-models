@@ -455,11 +455,12 @@ impl OutputScalar for bf16 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::tensor::{axis::Rows as Capacity, scalar::Value};
     use crate::tests::DEVICE;
-    use furiosa_opt_std::runtime::launch;
+    use furiosa_opt_std::runtime::{HbmBuffer, launch};
     use std::iter;
 
-    axes![Hidden = 5120, Attended = 7168];
+    axes![Hidden = 5120, Attended = 7168, Width = 7168, Narrow = 512];
 
     #[derive(Clone, Debug)]
     pub(crate) struct Part4<const ROWS: usize>;
@@ -472,6 +473,13 @@ pub(crate) mod tests {
     /// A chip's part of the rows.
     pub(crate) type Small = Part4<1024>;
     type Local = Part<Attended, 4>;
+
+    pub(super) type Chips = m![{ Symbol<Shard<4>> }];
+    pub(super) type Input<C, W> =
+        HbmTensor<bf16, Chips, m![{ Symbol<Pieces<C, 4>> }, { Symbol<Part<W, 4>> }]>;
+    pub(super) type Output<C, W> = HbmTensor<bf16, Chips, m![C, W]>;
+    type SourceRoots<A, B, E, W> = (Input<A, W>, Input<B, W>, Input<E, W>);
+    type DestinationRoots<A, B, E, W> = (Output<A, W>, Output<B, W>, Output<E, W>);
 
     /// Element `(row, column)` of the rows of every chip: a value each neighbor differs in.
     pub(crate) fn value(row: usize, column: usize) -> bf16 {
@@ -599,34 +607,12 @@ pub(crate) mod tests {
             }
         }
     }
-}
-
-#[cfg(test)]
-mod prefix_tests {
-    //! Whole TDMA exchange of compact parts inside capacity-backed allocations.
-
-    use crate::ops::collective::{Exchange, Pieces, prefix};
-    use crate::tensor::axis::Rows;
-    use crate::tensor::live::BlockPrefix;
-    use crate::tensor::parallel::{Parallel, Part, Shard};
-    use crate::tensor::scalar::Value;
-    use furiosa_opt_std::prelude::*;
-    use furiosa_opt_std::runtime::{HbmBuffer, launch};
-
-    axes![Width = 7168, Narrow = 512];
-
-    type Chips = m![{ Symbol<Shard<4>> }];
-    type Input<C, W> = HbmTensor<bf16, Chips, m![{ Symbol<Pieces<C, 4>> }, { Symbol<Part<W, 4>> }]>;
-    type Output<C, W> = HbmTensor<bf16, Chips, m![C, W]>;
-    type Inputs<A, B, E, W> = (Input<A, W>, Input<B, W>, Input<E, W>);
-    type Outputs<A, B, E, W> = (Output<A, W>, Output<B, W>, Output<E, W>);
-    type Work<C, A, B, E> = prefix::Inputs<C, (A, (B, (E,))), Rows<1>, Chips>;
 
     #[device(chip = 4)]
-    fn runtime_prefix<C: AxisName, W: AxisName, A: AxisName, B: AxisName, E: AxisName>(
+    fn root_windows<C: AxisName, W: AxisName, A: AxisName, B: AxisName, E: AxisName>(
         device: &mut Device,
-        input: &Inputs<A, B, E, W>,
-        output: &mut Outputs<A, B, E, W>,
+        input: &SourceRoots<A, B, E, W>,
+        output: &mut DestinationRoots<A, B, E, W>,
         rows: &Value<Chips>,
         _capacity: &std::marker::PhantomData<C>,
     ) {
@@ -641,86 +627,99 @@ mod prefix_tests {
         }
     }
 
-    #[device(chip = 4)]
-    fn device_prefix<C: AxisName, W: AxisName, A: AxisName, B: AxisName, E: AxisName>(
-        device: &mut Device,
-        input: &Input<C, W>,
-        output: &mut Output<C, W>,
-        rows: &Work<C, A, B, E>,
-        _geometries: &std::marker::PhantomData<(A, B, E)>,
-    ) {
-        let rows = rows.read();
-        Exchange::<Parallel<4>>::default().write_prefix::<bf16, C, W, (A, (B, (E,))), Rows<1>>(
-            device,
-            &rows.with(input),
-            output,
-        );
-    }
-
     fn coefficient(index: usize) -> bf16 {
         bf16::from_bits(0x3f00 | ((index * 131 + index / 17) % 1024) as u16)
     }
 
-    async fn check<C: AxisName, W: AxisName, A: AxisName, B: AxisName, E: AxisName>(
-        internal: bool,
-    ) {
-        let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
-        let geometry = std::marker::PhantomData::<C>;
-        let geometries = std::marker::PhantomData::<(A, B, E)>;
+    pub(super) async fn buffers<C: AxisName, W: AxisName>(
+        device: &mut Device,
+        work: usize,
+    ) -> (Input<C, W>, Output<C, W>) {
         let local_width = W::SIZE / 4;
         let input_per_chip = 4 * C::SIZE * local_width;
         let output_per_chip = C::SIZE * W::SIZE;
         let poison = bf16::from_bits(0x7fc1);
-        // Reuse one compiled entry and alternate work sizes; no per-length model or kernel reload.
+        let input: Input<C, W> = HostTensor::<
+            bf16,
+            m![{ Chips }, { Symbol<Pieces<C, 4>> }, { Symbol<Part<W, 4>> }],
+        >::from_vec((0..4 * input_per_chip).map(|index| {
+            if index % input_per_chip < 4 * work * local_width {
+                coefficient(index)
+            } else {
+                poison
+            }
+        }))
+        .to_hbm::<Chips, m![{ Symbol<Pieces<C, 4>> }, { Symbol<Part<W, 4>> }]>(&mut device.pdma)
+        .await
+        .unwrap();
+        let mut output: Output<C, W> = HbmBuffer::alloc_shared(device, output_per_chip * 2)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        HostTensor::<bf16, m![{ Chips }, C, W]>::from_vec(std::iter::repeat_n(
+            poison,
+            4 * output_per_chip,
+        ))
+        .to_hbm(&mut device.pdma)
+        .output(&mut output)
+        .await
+        .unwrap();
+        (input, output)
+    }
+
+    pub(super) async fn assert_output<C: AxisName, W: AxisName>(
+        device: &mut Device,
+        output: &Output<C, W>,
+        work: usize,
+    ) {
+        let local_width = W::SIZE / 4;
+        let input_per_chip = 4 * C::SIZE * local_width;
+        let output_per_chip = C::SIZE * W::SIZE;
+        let poison = bf16::from_bits(0x7fc1);
+        let result = output
+            .to_host::<m![{ Chips }, C, W]>(&mut device.pdma)
+            .await
+            .unwrap()
+            .into_vec();
+        for (index, actual) in result.into_iter().enumerate() {
+            let chip = index / output_per_chip;
+            let row = index / W::SIZE % C::SIZE;
+            let column = index % W::SIZE;
+            let expected = if row < work {
+                let source_chip = column / local_width;
+                let source_row = chip * work + row;
+                coefficient(
+                    source_chip * input_per_chip + source_row * local_width + column % local_width,
+                )
+            } else {
+                poison
+            };
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "work {work}, chip {chip}, row {row}, column {column}"
+            );
+        }
+    }
+
+    async fn check_root_windows<C: AxisName, W: AxisName, A: AxisName, B: AxisName, E: AxisName>() {
+        let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
+        let geometry = std::marker::PhantomData::<C>;
+        let local_width = W::SIZE / 4;
         for work in [A::SIZE, E::SIZE, B::SIZE, A::SIZE] {
-            let input: Input<C, W> = HostTensor::<
-                bf16,
-                m![{ Chips }, { Symbol<Pieces<C, 4>> }, { Symbol<Part<W, 4>> }],
-            >::from_vec((0..4 * input_per_chip).map(
-                |index| {
-                    if index % input_per_chip < 4 * work * local_width {
-                        coefficient(index)
-                    } else {
-                        poison
-                    }
-                },
-            ))
-            .to_hbm::<Chips, m![{ Symbol<Pieces<C, 4>> }, { Symbol<Part<W, 4>> }]>(&mut device.pdma)
-            .await
-            .unwrap();
-            let mut output: Output<C, W> = HbmBuffer::alloc_shared(&device, output_per_chip * 2)
-                .unwrap()
-                .try_into()
-                .unwrap();
-            HostTensor::<bf16, m![{ Chips }, C, W]>::from_vec(std::iter::repeat_n(
-                poison,
-                4 * output_per_chip,
-            ))
-            .to_hbm(&mut device.pdma)
-            .output(&mut output)
-            .await
-            .unwrap();
+            let (input, output) = buffers::<C, W>(&mut device, work).await;
             let rows: Value<Chips> = HostTensor::<i32, m![1]>::from_vec([work as i32])
                 .to_hbm(&mut device.pdma)
                 .await
                 .unwrap();
-            let checked_rows = prefix::Prefix::<(), C, (A, (B, (E,))), Rows<1>>::new(
-                BlockPrefix::try_over(work).unwrap(),
-            )
-            .unwrap()
-            .upload::<Chips>(&mut device)
-            .await
-            .unwrap();
             let input = input.into_buffer();
             let output = output.into_buffer();
-            let capacity_input: Input<C, W> = input.alias(..).unwrap().try_into().unwrap();
-            let mut capacity_output: Output<C, W> = output.alias(..).unwrap().try_into().unwrap();
-            // SAFETY: runtime_prefix reaches the destination through exactly one geometry in
+            // SAFETY: root_windows reaches the destination through exactly one geometry in
             // each launch. No full-capacity destination argument or concurrent writer is bound.
             unsafe { output.partition() };
             // Prepare alternative root windows on the host. Aliases share their backing allocation;
             // only the selected geometry writes during a launch. Retain every owner through completion.
-            let inputs: Inputs<A, B, E, W> = (
+            let inputs: SourceRoots<A, B, E, W> = (
                 input
                     .alias(..4 * A::SIZE * local_width * 2)
                     .unwrap()
@@ -737,7 +736,7 @@ mod prefix_tests {
                     .try_into()
                     .unwrap(),
             );
-            let mut outputs: Outputs<A, B, E, W> = (
+            let mut outputs: DestinationRoots<A, B, E, W> = (
                 output
                     .alias(..A::SIZE * W::SIZE * 2)
                     .unwrap()
@@ -754,57 +753,18 @@ mod prefix_tests {
                     .try_into()
                     .unwrap(),
             );
-            // Reuse the same destination across completed writes before checking its rows and tail.
+
+            // Reuse the same destination across completed writes, then check rows and tail.
             for _ in 0..2 {
-                if internal {
-                    launch(
-                        device_prefix,
-                        (
-                            &mut device,
-                            &capacity_input,
-                            &mut capacity_output,
-                            &checked_rows,
-                            &geometries,
-                        ),
-                    )
-                    .await
-                    .unwrap();
-                } else {
-                    launch(
-                        runtime_prefix,
-                        (&mut device, &inputs, &mut outputs, &rows, &geometry),
-                    )
-                    .await
-                    .unwrap();
-                }
+                launch(
+                    root_windows,
+                    (&mut device, &inputs, &mut outputs, &rows, &geometry),
+                )
+                .await
+                .unwrap();
             }
             let output: Output<C, W> = output.try_into().unwrap();
-            let result = output
-                .to_host::<m![{ Chips }, C, W]>(&mut device.pdma)
-                .await
-                .unwrap()
-                .into_vec();
-            for (index, actual) in result.into_iter().enumerate() {
-                let chip = index / output_per_chip;
-                let row = index / W::SIZE % C::SIZE;
-                let column = index % W::SIZE;
-                let expected = if row < work {
-                    let source_chip = column / local_width;
-                    let source_row = chip * work + row;
-                    coefficient(
-                        source_chip * input_per_chip
-                            + source_row * local_width
-                            + column % local_width,
-                    )
-                } else {
-                    poison
-                };
-                assert_eq!(
-                    actual.to_bits(),
-                    expected.to_bits(),
-                    "work {work}, chip {chip}, row {row}, column {column}"
-                );
-            }
+            assert_output(&mut device, &output, work).await;
         }
     }
 
@@ -813,16 +773,9 @@ mod prefix_tests {
     #[ignore = "requires four explicitly selected RNGD chips"]
     async fn compact_whole_exchange_preserves_prefix_and_capacity_tail() {
         let _lease = crate::tests::DEVICE.lock().await;
-        check::<Rows<1280>, Narrow, Rows<256>, Rows<768>, Rows<1280>>(false).await;
-        check::<Rows<10496>, Width, Rows<9472>, Rows<9728>, Rows<9984>>(false).await;
-    }
-
-    /// The same prefix can come from a preceding operation's capacity-shaped output inside a launch.
-    #[tokio::test(flavor = "current_thread")]
-    #[ignore = "requires four explicitly selected RNGD chips"]
-    async fn device_prefix_exchange_preserves_rows_and_capacity_tail() {
-        let _lease = crate::tests::DEVICE.lock().await;
-        check::<Rows<1280>, Narrow, Rows<256>, Rows<768>, Rows<1280>>(true).await;
-        check::<Rows<10496>, Width, Rows<9472>, Rows<9728>, Rows<9984>>(true).await;
+        check_root_windows::<Capacity<1280>, Narrow, Capacity<256>, Capacity<768>, Capacity<1280>>(
+        )
+        .await;
+        check_root_windows::<Capacity<10496>, Width, Capacity<9472>, Capacity<9728>, Capacity<9984>>().await;
     }
 }

@@ -6,10 +6,14 @@ use crate::ops::attention::{
     flash,
     full::{PackInputs, PackPlan},
 };
-use crate::ops::collective::{Pieces, prefix as exchange};
+use crate::ops::collective::Pieces;
 use crate::ops::index::packed::{RowInputs, RowPlan, SpanPlan, live::SpanInputs};
 use crate::ops::rotary::Rotation;
-use crate::tensor::{axis::Rows, live::BlockPrefix, scalar::Value};
+use crate::tensor::{
+    axis::Rows,
+    live::{BlockPrefix, PrefixInputs, PrefixPlan},
+    scalar::Value,
+};
 use furiosa_opt_std::prelude::*;
 use std::io;
 
@@ -79,7 +83,7 @@ impl<R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName> Prepared<R
 pub struct BlockPlan<R, K> {
     plan: Plan,
     spans: SpanPlan<R, TEXT_STRIP>,
-    prefix: ExchangePrefix<R>,
+    prefix: WorkPlan<R>,
     keys: Keys<R, K>,
 }
 
@@ -98,7 +102,7 @@ impl<R: AxisName, K: AxisName> BlockPlan<R, K> {
             ));
         }
         let spans = plan.span_plan::<R>()?;
-        let prefix = exchange::Prefix::new(plan.block_prefix::<R>()?)?;
+        let prefix = PrefixPlan::new(plan.block_prefix::<R>()?)?;
         let keys = Keys::try_from_runs(
             0..plan.query_rows(),
             plan.key_runs().map(|run| (run.source(), run.destination())),
@@ -133,7 +137,7 @@ impl<R: AxisName, K: AxisName> BlockPlan<R, K> {
     pub async fn upload(&self, device: &mut Device) -> io::Result<BlockInputs<R, K>> {
         let spans = SpanInputs::upload(device, &self.spans).await?;
         let keys = PackInputs::upload(device, &self.keys).await?;
-        let blocks = self.prefix.upload(device).await?;
+        let blocks = PrefixInputs::upload(device, &self.prefix).await?;
         Ok(BlockInputs {
             spans,
             blocks,
@@ -162,7 +166,7 @@ pub struct Inputs<R: AxisName, K: AxisName, T, A, V> {
 #[derive(DeviceSend)]
 pub struct BlockInputs<R, K> {
     spans: SpanInputs<R, Chips, TEXT_STRIP>,
-    blocks: exchange::Inputs<R, Transfers, Rows<ROW_BLOCK>, Chips>,
+    blocks: PrefixInputs<R, Transfers, Rows<ROW_BLOCK>, Chips>,
     keys: PackInputs<Pieces<R, PARTS>, K, Chips, KEY_RUNS>,
 }
 
@@ -183,7 +187,7 @@ impl<R: AxisName, K: AxisName> BlockInputs<R, K> {
 /// reference retains its request owner; this value does not own or initialize any hidden rows.
 pub struct BlockCall<'a, R, K> {
     spans: SpanPlan<R, TEXT_STRIP>,
-    prefix: ExchangePrefix<R>,
+    prefix: WorkPlan<R>,
     keys: Keys<R, K>,
     key_count: &'a Value<Chips>,
 }
@@ -197,7 +201,7 @@ impl<R: AxisName, K: AxisName> BlockCall<'_, R, K> {
         self.prefix.prefix()
     }
 
-    pub(crate) fn exchange_prefix(&self) -> &ExchangePrefix<R> {
+    pub(crate) fn prefix_plan(&self) -> &WorkPlan<R> {
         &self.prefix
     }
 
@@ -227,7 +231,7 @@ impl<const STEP: usize> AxisName for Transfer<STEP> {
 
 include!(concat!(env!("OUT_DIR"), "/h3_transfers.rs"));
 
-type ExchangePrefix<R> = exchange::Prefix<(), R, Transfers, Rows<ROW_BLOCK>>;
+type WorkPlan<R> = PrefixPlan<(), R, Transfers, Rows<ROW_BLOCK>>;
 
 /// At most one valid run per modality and part. Empty part spans contribute no run.
 pub const KEY_RUNS: usize = 3 * PARTS;

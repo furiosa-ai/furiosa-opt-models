@@ -2,109 +2,10 @@
 
 use super::{ChipMap, Exchange, O, Pieces, Rows};
 use crate::tensor::{
-    live::{BlockPrefix, Live},
+    live::{Extents, Live, PrefixPlan},
     parallel::{Parallel, Part, Shard},
-    scalar::Value,
 };
 use furiosa_opt_std::prelude::*;
-use std::{io, marker::PhantomData};
-
-/// A nonempty, increasing list of fixed DMA extents. `(S,)` is the final extent;
-/// `(S, Tail)` prepends one extent. The model supplies this type once for its envelope.
-pub trait Extents {
-    /// The first extent in this list.
-    type First: AxisName;
-    /// The remaining extents, or this same terminal list.
-    type Rest: Extents;
-    /// Whether this list contains only its final extent.
-    const LAST: bool;
-}
-
-impl<S: AxisName> Extents for (S,) {
-    type First = S;
-    type Rest = Self;
-    const LAST: bool = true;
-}
-
-impl<S: AxisName, Tail: Extents> Extents for (S, Tail) {
-    type First = S;
-    type Rest = Tail;
-    const LAST: bool = false;
-}
-
-/// Zero-based work whose row count belongs to `G`, in whole `B`-row blocks.
-/// Construct on the host before upload; device readers retain the same checked extent set.
-pub struct Prefix<X, R, G, B> {
-    prefix: BlockPrefix<X, R, B>,
-    extents: PhantomData<G>,
-}
-
-impl<R: AxisName, G: Extents, B: AxisName> Prefix<(), R, G, B> {
-    /// Refuse work outside the fixed extent set before allocating device metadata.
-    pub fn new(prefix: BlockPrefix<(), R, B>) -> io::Result<Self> {
-        const { assert!(valid::<R, G>()) };
-        if !contains::<G>(prefix.rows()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "exchange work is not one of the fixed transfer extents",
-            ));
-        }
-        i32::try_from(prefix.blocks()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "exchange blocks exceed I32")
-        })?;
-        Ok(Self {
-            prefix,
-            extents: PhantomData,
-        })
-    }
-
-    /// Upload the checked block count once; its immutable owner must outlive every reader.
-    pub async fn upload<Chips: M>(
-        &self,
-        device: &mut Device,
-    ) -> io::Result<Inputs<R, G, B, Chips>> {
-        let count = HostTensor::<i32, m![1]>::from_vec([self.prefix.blocks() as i32])
-            .to_hbm::<Chips, m![1]>(&mut device.pdma)
-            .await
-            .map_err(io::Error::other)?;
-        Ok(Inputs {
-            count,
-            shape: PhantomData,
-        })
-    }
-}
-
-impl<X, R: AxisName, G: Extents, B: AxisName> Prefix<X, R, G, B> {
-    /// Borrow the same zero-based work for consumers that do not select a DMA extent.
-    pub fn prefix(&self) -> &BlockPrefix<X, R, B> {
-        &self.prefix
-    }
-
-    /// Bind another value without changing the checked work or its extent set.
-    pub fn with<Y>(&self, value: Y) -> Prefix<Y, R, G, B> {
-        Prefix {
-            prefix: self.prefix.with(value),
-            extents: PhantomData,
-        }
-    }
-}
-
-/// Immutable uploaded metadata; only a checked [`Prefix`] can construct it.
-#[derive(DeviceSend)]
-pub struct Inputs<R, G, B, Chips: M> {
-    count: Value<Chips>,
-    shape: PhantomData<(R, G, B)>,
-}
-
-impl<R: AxisName, G: Extents, B: AxisName, Chips: M> Inputs<R, G, B, Chips> {
-    /// Decode the privately owned count once, retaining the host-checked extent set.
-    pub fn read(&self) -> Prefix<(), R, G, B> {
-        Prefix {
-            prefix: BlockPrefix::read(&self.count),
-            extents: PhantomData,
-        }
-    }
-}
 
 impl<const N: usize> Exchange<Parallel<N>> {
     /// Exchange one initialized prefix with one whole TDMA copy, preserving destination tails.
@@ -120,7 +21,7 @@ impl<const N: usize> Exchange<Parallel<N>> {
     >(
         &self,
         device: &mut Device,
-        input: &Prefix<&Split<D, N, C, W>, C, G, B>,
+        input: &PrefixPlan<&Split<D, N, C, W>, C, G, B>,
         output: &mut Rows<D, N, C, W>,
     ) {
         let prefix = input.prefix();
@@ -133,10 +34,6 @@ impl<const N: usize> Exchange<Parallel<N>> {
         input: &Live<&Split<D, N, C, W>, C>,
         output: &mut Rows<D, N, C, W>,
     ) {
-        const {
-            assert!(G::First::SIZE > 0 && G::First::SIZE <= C::SIZE);
-            assert!(G::LAST || G::First::SIZE < <G::Rest as Extents>::First::SIZE);
-        }
         if G::LAST || input.rows() == G::First::SIZE {
             self.write_extent::<D, G::First, C, W>(device, input.value(), output);
         } else {
@@ -183,39 +80,75 @@ type PaddedRows<D, const N: usize, S, C, W> = HbmTensor<
     m![{ Symbol<Pieces<S, N>> } # ({ Symbol<Pieces<C, N>> }), { Symbol<Part<W, N>> }],
 >;
 
-/// Whether every DMA extent preserves a consumer's block alignment.
-pub(crate) const fn aligned<G: Extents>(block: usize) -> bool {
-    G::First::SIZE.is_multiple_of(block) && (G::LAST || aligned::<G::Rest>(block))
-}
-
-const fn valid<C: AxisName, G: Extents>() -> bool {
-    G::First::SIZE > 0
-        && G::First::SIZE <= C::SIZE
-        && (G::LAST
-            || (G::First::SIZE < <G::Rest as Extents>::First::SIZE && valid::<C, G::Rest>()))
-}
-
-const fn contains<G: Extents>(rows: usize) -> bool {
-    rows == G::First::SIZE || (!G::LAST && contains::<G::Rest>(rows))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::tensor::axis::Rows;
+    //! Whole TDMA exchange of compact parts inside capacity-backed allocations.
 
-    #[test]
-    fn refuses_work_outside_the_transfer_extents_before_upload() {
-        type C = Rows<1280>;
-        type G = (Rows<256>, (Rows<768>, (Rows<1280>,)));
-        for rows in [0, 512, 1024] {
-            let prefix = BlockPrefix::<(), C, Rows<256>>::try_over(rows).unwrap();
-            let error = Prefix::<(), C, G, Rows<256>>::new(prefix).err().unwrap();
-            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-            assert_eq!(
-                error.to_string(),
-                "exchange work is not one of the fixed transfer extents"
-            );
+    use super::super::tests::{Chips, Input, Output, assert_output, buffers};
+    use crate::ops::collective::Exchange;
+    use crate::tensor::axis::Rows;
+    use crate::tensor::live::{BlockPrefix, PrefixInputs, PrefixPlan};
+    use crate::tensor::parallel::Parallel;
+    use furiosa_opt_std::prelude::*;
+    use furiosa_opt_std::runtime::launch;
+
+    axes![Width = 7168, Narrow = 512];
+
+    type Work<C, A, B, E> = PrefixInputs<C, (A, (B, (E,))), Rows<1>, Chips>;
+
+    #[device(chip = 4)]
+    fn device_prefix<C: AxisName, W: AxisName, A: AxisName, B: AxisName, E: AxisName>(
+        device: &mut Device,
+        input: &Input<C, W>,
+        output: &mut Output<C, W>,
+        rows: &Work<C, A, B, E>,
+        _geometries: &std::marker::PhantomData<(A, B, E)>,
+    ) {
+        let rows = rows.read();
+        Exchange::<Parallel<4>>::default().write_prefix::<bf16, C, W, (A, (B, (E,))), Rows<1>>(
+            device,
+            &rows.with(input),
+            output,
+        );
+    }
+
+    async fn check_device_prefix<
+        C: AxisName,
+        W: AxisName,
+        A: AxisName,
+        B: AxisName,
+        E: AxisName,
+    >() {
+        let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
+        let geometries = std::marker::PhantomData::<(A, B, E)>;
+        // One compiled entry serves alternating sizes, including a return to the first size.
+        for work in [A::SIZE, E::SIZE, B::SIZE, A::SIZE] {
+            let (input, mut output) = buffers::<C, W>(&mut device, work).await;
+            let plan = PrefixPlan::<(), C, (A, (B, (E,))), Rows<1>>::new(
+                BlockPrefix::try_over(work).unwrap(),
+            )
+            .unwrap();
+            let rows = Work::<C, A, B, E>::upload(&mut device, &plan)
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                launch(
+                    device_prefix,
+                    (&mut device, &input, &mut output, &rows, &geometries),
+                )
+                .await
+                .unwrap();
+            }
+            assert_output(&mut device, &output, work).await;
         }
+    }
+
+    /// The same prefix can come from a preceding operation's capacity-shaped output inside a launch.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires four explicitly selected RNGD chips"]
+    async fn device_prefix_exchange_preserves_rows_and_capacity_tail() {
+        let _lease = crate::tests::DEVICE.lock().await;
+        check_device_prefix::<Rows<1280>, Narrow, Rows<256>, Rows<768>, Rows<1280>>().await;
+        check_device_prefix::<Rows<10496>, Width, Rows<9472>, Rows<9728>, Rows<9984>>().await;
     }
 }

@@ -12,6 +12,7 @@
 use super::scalar::Value;
 use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
+use std::io;
 
 /// `value` and its live rows: `rows` rows from row `start` of an envelope of `R` rows, never past
 /// it. A leaf computes those rows of `value`; a row outside them is padding nothing reads.
@@ -100,6 +101,97 @@ impl<X, R: AxisName, B: AxisName> BlockPrefix<X, R, B> {
 
     pub fn into_value(self) -> X {
         self.value
+    }
+}
+
+/// A nonempty, increasing list of fixed row extents. `(S,)` is the final extent;
+/// `(S, Tail)` prepends one extent. A caller supplies this type once for its envelope.
+pub trait Extents {
+    /// The first extent in this list.
+    type First: AxisName;
+    /// The remaining extents, or this same terminal list.
+    type Rest: Extents;
+    /// Whether this list contains only its final extent.
+    const LAST: bool;
+}
+
+impl<S: AxisName> Extents for (S,) {
+    type First = S;
+    type Rest = Self;
+    const LAST: bool = true;
+}
+
+impl<S: AxisName, Tail: Extents> Extents for (S, Tail) {
+    type First = S;
+    type Rest = Tail;
+    const LAST: bool = false;
+}
+
+/// Zero-based work whose row count belongs to `G`, in whole `B`-row blocks.
+/// Construct on the host before upload; device readers retain the same checked extent set.
+pub struct PrefixPlan<X, R, G, B> {
+    prefix: BlockPrefix<X, R, B>,
+    extents: PhantomData<G>,
+}
+
+impl<R: AxisName, G: Extents, B: AxisName> PrefixPlan<(), R, G, B> {
+    /// Refuse work outside the fixed extent set before allocating device metadata.
+    pub fn new(prefix: BlockPrefix<(), R, B>) -> io::Result<Self> {
+        const { assert!(valid::<R, G, B>()) };
+        if !contains::<G>(prefix.rows()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "prefix work is not one of the fixed extents",
+            ));
+        }
+        Ok(Self {
+            prefix,
+            extents: PhantomData,
+        })
+    }
+}
+
+impl<X, R: AxisName, G: Extents, B: AxisName> PrefixPlan<X, R, G, B> {
+    /// Borrow the same bounded, aligned block prefix.
+    pub fn prefix(&self) -> &BlockPrefix<X, R, B> {
+        &self.prefix
+    }
+
+    /// Bind another value without changing the checked work or its extent set.
+    pub fn with<Y>(&self, value: Y) -> PrefixPlan<Y, R, G, B> {
+        PrefixPlan {
+            prefix: self.prefix.with(value),
+            extents: PhantomData,
+        }
+    }
+}
+
+/// Immutable uploaded metadata; only a checked [`PrefixPlan`] can construct it.
+#[derive(DeviceSend)]
+pub struct PrefixInputs<R, G, B, Chips: M> {
+    count: Value<Chips>,
+    shape: PhantomData<(R, G, B)>,
+}
+
+impl<R: AxisName, G: Extents, B: AxisName, Chips: M> PrefixInputs<R, G, B, Chips> {
+    /// Upload the checked block count once; its immutable owner must outlive every reader.
+    pub async fn upload(device: &mut Device, plan: &PrefixPlan<(), R, G, B>) -> io::Result<Self> {
+        let count = HostTensor::<i32, m![1]>::from_vec([plan.prefix.blocks() as i32])
+            .to_hbm::<Chips, m![1]>(&mut device.pdma)
+            .await
+            .map_err(io::Error::other)?;
+        Ok(PrefixInputs {
+            count,
+            shape: PhantomData,
+        })
+    }
+
+    /// Decode the privately owned count once, retaining the host-checked extent set.
+    pub fn read(&self) -> PrefixPlan<(), R, G, B> {
+        PrefixPlan {
+            prefix: BlockPrefix::read(&self.count),
+            extents: PhantomData,
+        }
     }
 }
 
@@ -328,10 +420,42 @@ pub(crate) trait OnTile<D, W> {
     fn run(&mut self, context: &mut D, index: usize);
 }
 
+const fn valid<R: AxisName, G: Extents, B: AxisName>() -> bool {
+    B::SIZE > 0
+        && R::SIZE.is_multiple_of(B::SIZE)
+        && R::SIZE / B::SIZE <= i32::MAX as usize
+        && G::First::SIZE > 0
+        && G::First::SIZE <= R::SIZE
+        && G::First::SIZE.is_multiple_of(B::SIZE)
+        && (G::LAST
+            || (G::First::SIZE < <G::Rest as Extents>::First::SIZE && valid::<R, G::Rest, B>()))
+}
+
+const fn contains<G: Extents>(rows: usize) -> bool {
+    rows == G::First::SIZE || (!G::LAST && contains::<G::Rest>(rows))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::tensor::axis::{Eight, Sixteen, SixtyFour};
+    use crate::tensor::axis::{Eight, Rows, Sixteen, SixtyFour};
+
+    #[test]
+    fn refuses_prefix_work_outside_the_fixed_extents_before_upload() {
+        type C = Rows<1280>;
+        type G = (Rows<256>, (Rows<768>, (Rows<1280>,)));
+        for rows in [0, 512, 1024] {
+            let prefix = BlockPrefix::<(), C, Rows<256>>::try_over(rows).unwrap();
+            let error = PrefixPlan::<(), C, G, Rows<256>>::new(prefix)
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.to_string(),
+                "prefix work is not one of the fixed extents"
+            );
+        }
+    }
 
     /// Block prefixes refuse nonaligned and oversized host counts instead of rounding them.
     #[test]
