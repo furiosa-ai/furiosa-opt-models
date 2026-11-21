@@ -240,6 +240,18 @@ def test_raises_failed_copy() -> None:
         _ = running.finished()
 
 
+def test_poll_drains_every_copy_of_a_failed_job() -> None:
+    """A poll that finds one failed copy waits for every submitted copy before it raises."""
+    copies = (Copies(), Copies(RuntimeError("copy failed")), Copies())
+    running = worker.Jobs()
+    running.submit(0, copies, 192)
+
+    with pytest.raises(RuntimeError, match="copy failed"):
+        _ = running.finished()
+
+    assert all(transfer.waited for transfer in copies)
+
+
 def test_shutdown_ends_every_job_then_raises() -> None:
     """Shutdown waits for every job, then raises the first failure among them."""
     copies = (Copies(RuntimeError("first")), Copies(), Copies(RuntimeError("second")))

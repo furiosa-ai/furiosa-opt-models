@@ -708,8 +708,19 @@ class Job:
     started: float
 
     def done(self) -> bool:
-        """Whether every copy ended, without waiting; a failed copy it reaches raises."""
-        return all(transfer.done() for transfer in self.transfers)
+        """Whether every copy ended; drains all copies before raising a failure."""
+        ended = True
+        failure: Exception | None = None
+        for transfer in self.transfers:
+            try:
+                ended = transfer.done() and ended
+            except Exception as error:
+                if failure is None:
+                    failure = error
+        if failure is not None:
+            failure = self.settle() or failure
+            raise failure
+        return ended
 
     def settle(self) -> Exception | None:
         """Wait until every copy ended, then return the first failure among them."""
