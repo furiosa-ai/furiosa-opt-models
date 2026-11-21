@@ -202,6 +202,10 @@ def test_quantizes_each_output_channel() -> None:
     "config",
     [
         pytest.param(
+            {"quantization_config": {"quant_method": "fp8"}, "text_config": []},
+            id="top-level-precedence",
+        ),
+        pytest.param(
             {"quantization_config": {"quant_method": "fp8"}}, id="top-level"
         ),
         pytest.param(
@@ -233,6 +237,23 @@ def test_refuses_malformed_checkpoint_quantization(config: dict[str, JsonValue])
 
     with pytest.raises(ValueError, match="invalid checkpoint quantization metadata"):
         _ = quantization("fp8", config)
+
+
+@pytest.mark.feature("Online quantization")
+def test_does_not_hide_checkpoint_resolver_type_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unexpected TypeError in SGLang's resolver remains visible as an internal failure."""
+    from sglang.srt.model_loader import checkpoint_quantization
+
+    from furiosa_opt_sglang.load import quantization
+
+    def raise_type_error(_config: object) -> None:
+        raise TypeError("resolver implementation bug")
+
+    monkeypatch.setattr(
+        checkpoint_quantization, "resolve_checkpoint_quant_spec", raise_type_error
+    )
+    with pytest.raises(TypeError, match="resolver implementation bug"):
+        _ = quantization("fp8", {})
 
 
 def test_accepts_embedding_offload_options_without_the_offload() -> None:
