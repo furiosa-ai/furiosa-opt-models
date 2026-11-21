@@ -3,7 +3,7 @@ refusal names.
 
 - `offload` makes `--kv-offloading-size` select the plugin's KV connector, `CONNECTOR`, before the
   platform checks `TRANSFER`.
-- `TRANSFER` checks one option each, as `(option, accepts, requirement)`; `admission` makes them
+- `TRANSFER` names each option, predicate, and refusal requirement; `admission` makes them
   contracts in its own order.
 """
 
@@ -19,6 +19,15 @@ from vllm import envs
 
 if TYPE_CHECKING:
     from vllm.config import KVTransferConfig, ModelConfig, VllmConfig
+
+
+@dataclass(frozen=True, slots=True)
+class TransferContract:
+    """One vLLM option's acceptance predicate and the refusal requirement it must meet."""
+
+    option: str
+    accepts: Callable[[VllmConfig], bool]
+    requirement: str
 
 
 # The KV connector `--kv-offloading-size` selects, by the class and module vLLM's factory loads.
@@ -138,112 +147,126 @@ def engine_cache(model: ModelConfig | None) -> bool:
     )
 
 
-TRANSFER: Final[tuple[tuple[str, Callable[[VllmConfig], bool], str], ...]] = (
-    (
-        "kv_offloading_backend",
-        lambda c: (
+TRANSFER: Final[tuple[TransferContract, ...]] = (
+    TransferContract(
+        option="kv_offloading_backend",
+        accepts=lambda c: (
             c.cache_config.kv_offloading_size is None
             or c.cache_config.kv_offloading_backend == "native"
         ),
-        "offloads the KV cache with kv_offloading_backend=native",
+        requirement="offloads the KV cache with kv_offloading_backend=native",
     ),
-    (
-        "VLLM_USE_SIMPLE_KV_OFFLOAD",
-        lambda c: c.cache_config.kv_offloading_size is None or not envs.VLLM_USE_SIMPLE_KV_OFFLOAD,
-        f"offloads through {CONNECTOR}, so it serves no VLLM_USE_SIMPLE_KV_OFFLOAD=1",
+    TransferContract(
+        option="VLLM_USE_SIMPLE_KV_OFFLOAD",
+        accepts=lambda c: (
+            c.cache_config.kv_offloading_size is None or not envs.VLLM_USE_SIMPLE_KV_OFFLOAD
+        ),
+        requirement=f"offloads through {CONNECTOR}, so it serves no VLLM_USE_SIMPLE_KV_OFFLOAD=1",
     ),
-    (
-        "kv_transfer_config",
-        lambda c: all(
+    TransferContract(
+        option="kv_transfer_config",
+        accepts=lambda c: all(
             t.kv_connector != "OffloadingConnector" for t in connectors(c.kv_transfer_config)
         ),
-        f"offloads through {CONNECTOR}, which --kv-offloading-size selects: vLLM's "
+        requirement=f"offloads through {CONNECTOR}, which --kv-offloading-size selects: vLLM's "
         + "OffloadingConnector copies through CUDA streams",
     ),
     *(
-        (
-            "kv_transfer_config",
-            lambda c, name=name: all(
+        TransferContract(
+            option="kv_transfer_config",
+            accepts=lambda c, name=name: all(
                 t.kv_connector != name for t in connectors(c.kv_transfer_config)
             ),
-            requirement,
+            requirement=requirement,
         )
         for name, requirement in UNSTAGED.items()
     ),
-    (
-        "kv_transfer_config",
-        lambda c: all(
+    TransferContract(
+        option="kv_transfer_config",
+        accepts=lambda c: all(
             is_nixl(t)
             or (t.kv_connector == CONNECTOR and t.kv_connector_module_path == CONNECTOR_MODULE)
             for t in connectors(c.kv_transfer_config)
         ),
-        f"serves no KV connector but {CONNECTOR}, which --kv-offloading-size selects, and vLLM's "
+        requirement=f"serves no KV connector but {CONNECTOR}, which --kv-offloading-size "
+        + "selects, and vLLM's "
         + f"own {', '.join(NIXL[:-1])} and {NIXL[-1]}, which stage blocks in host buffers, or "
         + "vLLM's MultiConnector of them",
     ),
     # The runner copies blocks between the engine cache and NIXL's host buffers; NIXL registers
     # only those.
-    (
-        "kv_transfer_config.kv_buffer_device",
-        lambda c: all(transfer.kv_buffer_device == "cpu" for transfer in nixl(c)),
-        "stages NIXL's blocks in host buffers, so it takes kv_buffer_device=cpu: NIXL cannot "
-        + "register device memory, which the engine does not map for it",
+    TransferContract(
+        option="kv_transfer_config.kv_buffer_device",
+        accepts=lambda c: all(transfer.kv_buffer_device == "cpu" for transfer in nixl(c)),
+        requirement="stages NIXL's blocks in host buffers, so it takes kv_buffer_device=cpu: "
+        + "NIXL cannot register device memory, which the engine does not map for it",
     ),
     # vLLM's scheduler takes a request's blocks as received once each rank's worker reports them,
     # and one worker drives every chip of the replica.
-    (
-        "tensor_parallel_size",
-        lambda c: not nixl(c) or c.parallel_config.tensor_parallel_size == 1,
-        "connects through NIXL at tensor_parallel_size=1: vLLM awaits each rank; one worker "
-        + "drives all chips",
+    TransferContract(
+        option="tensor_parallel_size",
+        accepts=lambda c: not nixl(c) or c.parallel_config.tensor_parallel_size == 1,
+        requirement="connects through NIXL at tensor_parallel_size=1: vLLM awaits each rank; "
+        + "one worker drives all chips",
     ),
-    (
-        "kv_transfer_config",
-        lambda c: not nixl(c) or engine_cache(c.model_config),
-        "connects the attention cache of a decoder, not recurrent state or encoder memory",
+    TransferContract(
+        option="kv_transfer_config",
+        accepts=lambda c: not nixl(c) or engine_cache(c.model_config),
+        requirement=(
+            "connects the attention cache of a decoder, not recurrent state or encoder memory"
+        ),
     ),
-    (
-        "kv_transfer_config",
-        lambda c: not nixl(c) or not c.is_mm_encoder_only,
-        "connects the attention cache of a decoder, which an encoder-only instance does not run",
+    TransferContract(
+        option="kv_transfer_config",
+        accepts=lambda c: not nixl(c) or not c.is_mm_encoder_only,
+        requirement=(
+            "connects the attention cache of a decoder, which an encoder-only instance does not run"
+        ),
     ),
-    (
-        "kv_connector_extra_config",
-        lambda c: all(settings.cpu_spec for settings in offloading(c)),
-        "keeps offloaded blocks in host memory by vLLM's CPUOffloadingSpec, so it takes no other "
-        + "spec_name or spec_module_path",
+    TransferContract(
+        option="kv_connector_extra_config",
+        accepts=lambda c: all(settings.cpu_spec for settings in offloading(c)),
+        requirement="keeps offloaded blocks in host memory by vLLM's CPUOffloadingSpec, so it "
+        + "takes no other spec_name or spec_module_path",
     ),
-    (
-        "kv_connector_extra_config",
-        lambda c: not any(settings.canonical_layout for settings in offloading(c)),
-        "keeps offloaded blocks in the device's order, so it takes no canonical_layout",
+    TransferContract(
+        option="kv_connector_extra_config",
+        accepts=lambda c: not any(settings.canonical_layout for settings in offloading(c)),
+        requirement="keeps offloaded blocks in the device's order, so it takes no canonical_layout",
     ),
     # A failed copy poisons the blocks and host rows it touched, so no request reruns on them.
-    (
-        "kv_load_failure_policy",
-        lambda c: all(settings.load_failure_policy == "fail" for settings in offloading(c)),
-        "stops the engine when an offloaded block fails to copy: kv_load_failure_policy=fail",
+    TransferContract(
+        option="kv_load_failure_policy",
+        accepts=lambda c: all(settings.load_failure_policy == "fail" for settings in offloading(c)),
+        requirement="stops the engine when an offloaded block fails to copy: "
+        + "kv_load_failure_policy=fail",
     ),
     # vLLM's offloading scheduler ends a job once each of its ranks' workers reports it, and one
     # worker drives every chip of the replica.
-    (
-        "tensor_parallel_size",
-        lambda c: not offloading(c) or c.parallel_config.tensor_parallel_size == 1,
-        "offloads at tensor_parallel_size=1: vLLM awaits each rank; one worker drives all chips",
+    TransferContract(
+        option="tensor_parallel_size",
+        accepts=lambda c: not offloading(c) or c.parallel_config.tensor_parallel_size == 1,
+        requirement="offloads at tensor_parallel_size=1: vLLM awaits each rank; "
+        + "one worker drives all chips",
     ),
-    (
-        "pipeline_parallel_size",
-        lambda c: not offloading(c) or c.parallel_config.pipeline_parallel_size == 1,
-        "offloads at pipeline_parallel_size=1: vLLM awaits each rank; one worker drives all chips",
+    TransferContract(
+        option="pipeline_parallel_size",
+        accepts=lambda c: not offloading(c) or c.parallel_config.pipeline_parallel_size == 1,
+        requirement="offloads at pipeline_parallel_size=1: vLLM awaits each rank; "
+        + "one worker drives all chips",
     ),
-    (
-        "kv_offloading_size",
-        lambda c: not offloading(c) or engine_cache(c.model_config),
-        "offloads the attention cache of a decoder, not recurrent state or encoder memory",
+    TransferContract(
+        option="kv_offloading_size",
+        accepts=lambda c: not offloading(c) or engine_cache(c.model_config),
+        requirement=(
+            "offloads the attention cache of a decoder, not recurrent state or encoder memory"
+        ),
     ),
-    (
-        "kv_offloading_size",
-        lambda c: not offloading(c) or not c.is_mm_encoder_only,
-        "offloads the attention cache of a decoder, which an encoder-only instance does not run",
+    TransferContract(
+        option="kv_offloading_size",
+        accepts=lambda c: not offloading(c) or not c.is_mm_encoder_only,
+        requirement=(
+            "offloads the attention cache of a decoder, which an encoder-only instance does not run"
+        ),
     ),
 )
