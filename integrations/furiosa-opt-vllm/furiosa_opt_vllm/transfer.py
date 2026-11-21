@@ -1,8 +1,8 @@
 """The vLLM KV transfer settings the plugin serves, each with the requirement the platform's
 refusal names.
 
-- `offload` makes `--kv-offloading-size` select the plugin's KV connector, `CONNECTOR`, before the
-  platform checks `TRANSFER`.
+- `offload` makes `--kv-offloading-size` configure `CONNECTOR`, preserving a NIXL connector beside
+  it in vLLM's `MultiConnector`, before the platform checks `TRANSFER`.
 - `TRANSFER` names each option, predicate, and refusal requirement; `admission` makes them
   contracts in its own order.
 """
@@ -63,26 +63,31 @@ class Offloading:
     """What the contracts check of an offloading transfer config through `CONNECTOR`, with its
     `kv_connector_extra_config` keys read as vLLM's offloading reads them."""
 
-    # No spec_name but vLLM's CPUOffloadingSpec, and no spec_module_path.
-    cpu_spec: bool
-    canonical_layout: bool
+    # vLLM's stock CPU spec, or stock tiering spec when secondary tiers are configured.
+    supported_spec: bool
     load_failure_policy: Literal["recompute", "fail"]
 
     @classmethod
     def of(cls, transfer: KVTransferConfig) -> Offloading:
         extra: Mapping[str, object] = transfer.kv_connector_extra_config
+        secondary_tiers = bool(extra.get("secondary_tiers"))
+        spec_name = extra.get("spec_name")
+        if spec_name is None:
+            spec_name = "TieringOffloadingSpec" if secondary_tiers else "CPUOffloadingSpec"
+        spec_module = extra.get("spec_module_path")
         return cls(
-            extra.get("spec_name", "CPUOffloadingSpec") == "CPUOffloadingSpec"
-            and "spec_module_path" not in extra,
-            bool(extra.get("canonical_layout")),
+            spec_module is None
+            and (
+                (spec_name == "CPUOffloadingSpec" and not secondary_tiers)
+                or spec_name == "TieringOffloadingSpec"
+            ),
             transfer.kv_load_failure_policy,
         )
 
 
 def offload(config: VllmConfig) -> None:
-    """Turn `--kv-offloading-size` into the transfer config vLLM derives from it for its own
-    connector, naming `CONNECTOR` instead, and take the size: vLLM derives its config after the
-    platform's check, from a size it still sees."""
+    """Configure `CONNECTOR` from `--kv-offloading-size`, preserving NIXL beside it when set, and
+    clear the size before vLLM derives its own transfer config after the platform's check."""
     from vllm.config import KVTransferConfig
 
     cache = config.cache_config
@@ -92,14 +97,85 @@ def offload(config: VllmConfig) -> None:
         or envs.VLLM_USE_SIMPLE_KV_OFFLOAD
     ):
         return
-    transfer = config.kv_transfer_config or KVTransferConfig()
-    transfer.kv_connector = CONNECTOR
-    transfer.kv_connector_module_path = CONNECTOR_MODULE
-    transfer.kv_role = "kv_both"
-    # Convert `kv_offloading_size` from GiB to the bytes `cpu_bytes_to_use` expects.
-    transfer.kv_connector_extra_config["cpu_bytes_to_use"] = cache.kv_offloading_size * (1 << 30)
-    config.kv_transfer_config = transfer
+    bytes_to_use = cache.kv_offloading_size * (1 << 30)
+    transfer = config.kv_transfer_config
+    if (
+        transfer is not None
+        and transfer.kv_connector == "MultiConnector"
+        and transfer.kv_connector_module_path is None
+    ):
+        extra = dict(transfer.kv_connector_extra_config)
+        entries = TypeAdapter(list[dict[str, object]]).validate_python(extra.get("connectors", []))
+        offload_entries = [
+            index
+            for index, entry in enumerate(entries)
+            if entry.get("kv_connector") == CONNECTOR
+            and entry.get("kv_connector_module_path") == CONNECTOR_MODULE
+        ]
+        if len(offload_entries) > 1:
+            raise ValueError("--kv-offloading-size can configure only one RNGDOffloadingConnector")
+        if offload_entries:
+            index = offload_entries[0]
+            entry = dict(entries[index])
+            entry["kv_connector_extra_config"] = _offloading_extra(
+                entry.get("kv_connector_extra_config", {}), bytes_to_use
+            )
+            entries[index] = entry
+        else:
+            entries.append(
+                {
+                    "kv_connector": CONNECTOR,
+                    "kv_connector_module_path": CONNECTOR_MODULE,
+                    "kv_role": "kv_both",
+                    "kv_connector_extra_config": _offloading_extra({}, bytes_to_use),
+                }
+            )
+        extra["connectors"] = entries
+        transfer.kv_connector_extra_config = extra
+    elif transfer is not None and is_nixl(transfer):
+        # Preserve a directly configured NIXL connector when offloading adds its own adapter.
+        entry = TypeAdapter(KVTransferConfig).dump_python(
+            transfer, mode="python", exclude_none=True
+        )
+        transfer = KVTransferConfig(
+            engine_id=transfer.engine_id,
+            kv_connector="MultiConnector",
+            kv_role=transfer.kv_role,
+            kv_connector_extra_config={
+                "connectors": [
+                    entry,
+                    {
+                        "kv_connector": CONNECTOR,
+                        "kv_connector_module_path": CONNECTOR_MODULE,
+                        "kv_role": "kv_both",
+                        "kv_connector_extra_config": _offloading_extra({}, bytes_to_use),
+                    },
+                ]
+            },
+        )
+        config.kv_transfer_config = transfer
+    else:
+        transfer = transfer or KVTransferConfig()
+        transfer.kv_connector = CONNECTOR
+        transfer.kv_connector_module_path = CONNECTOR_MODULE
+        transfer.kv_role = "kv_both"
+        transfer.kv_connector_extra_config = _offloading_extra(
+            transfer.kv_connector_extra_config, bytes_to_use
+        )
+        config.kv_transfer_config = transfer
     cache.kv_offloading_size = None
+
+
+def _offloading_extra(extra: object, bytes_to_use: int) -> dict[str, object]:
+    """vLLM's offloading options with its byte budget and stock tier inference."""
+    options = dict(TypeAdapter(dict[str, object]).validate_python(extra))
+    options["cpu_bytes_to_use"] = bytes_to_use
+    if options.get("spec_name") is None:
+        if options.get("secondary_tiers"):
+            options["spec_name"] = "TieringOffloadingSpec"
+        else:
+            options.pop("spec_name", None)
+    return options
 
 
 def connectors(transfer: KVTransferConfig | None) -> tuple[KVTransferConfig, ...]:
@@ -226,14 +302,14 @@ TRANSFER: Final[tuple[TransferContract, ...]] = (
     ),
     TransferContract(
         option="kv_connector_extra_config",
-        accepts=lambda c: all(settings.cpu_spec for settings in offloading(c)),
-        requirement="keeps offloaded blocks in host memory by vLLM's CPUOffloadingSpec, so it "
-        + "takes no other spec_name or spec_module_path",
+        accepts=lambda c: all(settings.supported_spec for settings in offloading(c)),
+        requirement="uses vLLM's CPUOffloadingSpec for host offload or stock "
+        + "TieringOffloadingSpec when secondary tiers are configured",
     ),
     TransferContract(
-        option="kv_connector_extra_config",
-        accepts=lambda c: not any(settings.canonical_layout for settings in offloading(c)),
-        requirement="keeps offloaded blocks in the device's order, so it takes no canonical_layout",
+        option="kv_transfer_config",
+        accepts=lambda c: len(offloading(c)) <= 1,
+        requirement=f"uses at most one {CONNECTOR} in a MultiConnector",
     ),
     # A failed copy poisons the blocks and host rows it touched, so no request reruns on them.
     TransferContract(
@@ -256,6 +332,13 @@ TRANSFER: Final[tuple[TransferContract, ...]] = (
         requirement="offloads at pipeline_parallel_size=1: vLLM awaits each rank; "
         + "one worker drives all chips",
     ),
+    # Each worker joins vLLM's process groups as rank 0 of 1, which data parallelism renumbers.
+    TransferContract(
+        option="data_parallel_size",
+        accepts=lambda c: not offloading(c) or c.parallel_config.data_parallel_size == 1,
+        requirement="offloads at data_parallel_size=1: vLLM ranks each replica's worker among "
+        + "all replicas",
+    ),
     TransferContract(
         option="kv_offloading_size",
         accepts=lambda c: not offloading(c) or engine_cache(c.model_config),
@@ -269,5 +352,15 @@ TRANSFER: Final[tuple[TransferContract, ...]] = (
         requirement=(
             "offloads the attention cache of a decoder, which an encoder-only instance does not run"
         ),
+    ),
+    # Sleep mode frees the cache storage and allocates new storage on waking, while the host tier
+    # keeps copying the storage it was built over.
+    TransferContract(
+        option="enable_sleep_mode",
+        accepts=lambda c: (
+            not offloading(c) or not (c.model_config and c.model_config.enable_sleep_mode)
+        ),
+        requirement="offloads the KV cache without sleep mode, which frees the cache its host tier "
+        + "copies",
     ),
 )

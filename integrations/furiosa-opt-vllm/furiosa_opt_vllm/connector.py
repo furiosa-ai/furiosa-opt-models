@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import chain
 from typing import TYPE_CHECKING, Literal, NoReturn, assert_never, final
 
 import torch
@@ -25,9 +24,11 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 import furiosa_opt_engine as engine
-from furiosa_opt_engine.cache_transfer import submit as submit_transfers
 from furiosa_opt_engine.cache_transfer import (
     settle as settle_transfers,
+)
+from furiosa_opt_engine.cache_transfer import submit as submit_transfers
+from furiosa_opt_engine.cache_transfer import (
     transfer_cache_pages,
 )
 from furiosa_opt_vllm import residency
@@ -92,21 +93,21 @@ class Layers:
     def __init__(self, runner: Runner, config: KVCacheConfig, length: int) -> None:
         self.runner = runner
         cache = residency.cache(runner)
-        # The engine lists each layer's storage group by group.
-        position = {
-            layer: index
-            for index, layer in enumerate(chain.from_iterable(g.layers for g in cache.spec.groups))
-        }
         self.layers: dict[str, Layer] = {}
         for group in config.kv_cache_groups:
             for name in group.layer_names:
                 spec = assigned(group, name)
                 # The runner pages only full-history attention.
                 assert isinstance(spec, FullAttentionSpec)
+                # Engine cache storage is indexed by stable model layer ID, even when groups are
+                # non-contiguous.
+                index = extract_layer_index(name)
+                if not 0 <= index < len(cache.layers):
+                    raise ValueError(f"engine cache has no storage for {name}")
                 # A copy moves the blocks of one request.
                 rows = min(cache.blocks, blocks_for_tokens(length, spec.block_size))
                 self.layers[name] = Layer(
-                    position[extract_layer_index(name)],
+                    index,
                     (spec.block_size, 2, spec.num_kv_heads, spec.head_size),
                     spec.dtype,
                     spec.page_size_bytes,
@@ -131,6 +132,10 @@ class Layers:
         """vLLM's `CopyBlocksOp`: blocks `src_ids` of each layer `src` names to blocks `dst_ids`,
         from the device to NIXL's host buffers (`d2h`) or back (`h2d`), ended once it returns; a
         failed copy raises once every copy it submitted ended."""
+        if len(src_ids) != len(dst_ids):
+            raise ValueError("source and destination block IDs have different lengths")
+        if set(src) != set(dst):
+            raise ValueError("source and destination layers differ")
         if not src_ids:
             return
         source, target = [int(i) for i in src_ids], [int(i) for i in dst_ids]

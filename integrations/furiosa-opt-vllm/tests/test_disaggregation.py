@@ -376,6 +376,32 @@ def test_registers_layers_as_blocks_of_heads(chip: Chip) -> None:
         assert view.shape == (BLOCKS, HEADS, TOKENS, 2 * WIDTH)
 
 
+def test_indexes_engine_cache_storage_by_stable_layer_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """NIXL layer routing uses stable engine IDs when cache groups list non-contiguous layers."""
+    monkeypatch.setattr(engine, "HostBuffer", lambda size: bytearray(size))
+    cache = SimpleNamespace(
+        blocks=BLOCKS,
+        layers=[None] * 4,
+        spec=Spec([Group(range(0, 4, 2)), Group(range(1, 4, 2))]),
+    )
+    config = KVCacheConfig(
+        num_blocks=BLOCKS,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["layers.0", "layers.2"], SPEC),
+            KVCacheGroupSpec(["layers.1", "layers.3"], SPEC),
+        ],
+    )
+    runner = SimpleNamespace(cache=cache)
+    adapter = connector.Layers(cast("Runner", cast("object", runner)), config, LENGTH)
+    assert {name: layer.index for name, layer in adapter.layers.items()} == {
+        "layers.0": 0,
+        "layers.1": 1,
+        "layers.2": 2,
+        "layers.3": 3,
+    }
+
+
 def test_sends_every_named_block_in_nixl_order(chip: Chip) -> None:
     """A send copies each named block of each layer, after its copies ended, into NIXL's host
     buffer of that layer in NIXL's order, and no other block."""
