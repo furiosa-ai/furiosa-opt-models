@@ -96,6 +96,7 @@ def offload(config: VllmConfig) -> None:
     transfer.kv_connector = CONNECTOR
     transfer.kv_connector_module_path = CONNECTOR_MODULE
     transfer.kv_role = "kv_both"
+    # Convert `kv_offloading_size` from GiB to the bytes `cpu_bytes_to_use` expects.
     transfer.kv_connector_extra_config["cpu_bytes_to_use"] = cache.kv_offloading_size * (1 << 30)
     config.kv_transfer_config = transfer
     cache.kv_offloading_size = None

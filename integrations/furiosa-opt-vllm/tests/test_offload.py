@@ -45,6 +45,8 @@ if TYPE_CHECKING:
 
 ANSWER: Final = 32
 BLOCK: Final = 16
+# Each stand-in cache block occupies this many bytes in transfer accounting.
+BYTES_PER_TEST_BLOCK: Final = 64
 # Whose home and hobby each prompt asks about; the first prompt ends inside a block, so a hit on
 # either tier leaves the same tokens to compute.
 NOTES: Final = (
@@ -123,10 +125,10 @@ class Copies:
 
 
 def jobs(*copies: Copies) -> worker.Jobs:
-    """Jobs 0, 1, ... each running one of `copies`, of 64 bytes."""
+    """Jobs 0, 1, ... each running one of `copies`, of `BYTES_PER_TEST_BLOCK` bytes."""
     running = worker.Jobs()
     for job_id, transfer in enumerate(copies):
-        running.submit(job_id, [transfer], 64)
+        running.submit(job_id, [transfer], BYTES_PER_TEST_BLOCK)
     return running
 
 
@@ -141,7 +143,11 @@ def test_reports_each_job_once_it_ends() -> None:
     assert running.finished() == []
     first.ended = True
     (result,) = running.finished()
-    assert (result.job_id, result.success, result.transfer_size) == (0, True, 64)
+    assert (result.job_id, result.success, result.transfer_size) == (
+        0,
+        True,
+        BYTES_PER_TEST_BLOCK,
+    )
     assert running.finished() == []
 
 
@@ -149,7 +155,7 @@ def test_reports_job_once_every_copy_ends() -> None:
     """A job's copies end in any order, and the job ends with the last of them."""
     first, middle, last = Copies(), Copies(), Copies()
     running = worker.Jobs()
-    running.submit(0, [first, middle, last], 192)
+    running.submit(0, [first, middle, last], 3 * BYTES_PER_TEST_BLOCK)
     last.ended = True
     assert running.finished() == []
     first.ended = True
@@ -172,7 +178,7 @@ def test_waits_for_each_copy_of_a_failed_job() -> None:
     failure."""
     copies = (Copies(RuntimeError("first")), Copies(), Copies(RuntimeError("third")))
     running = worker.Jobs()
-    running.submit(0, copies, 192)
+    running.submit(0, copies, 3 * BYTES_PER_TEST_BLOCK)
     with pytest.raises(RuntimeError, match="first"):
         running.wait({0})
     assert all(transfer.waited for transfer in copies)
@@ -190,7 +196,7 @@ def test_failed_submission_waits_for_submitted_copies() -> None:
 
     running = worker.Jobs()
     with pytest.raises(RuntimeError, match="submission failed"):
-        running.submit(0, submitted(), 192)
+        running.submit(0, submitted(), 3 * BYTES_PER_TEST_BLOCK)
     assert (first.waited, second.waited) == (True, True)
     assert running.finished() == []
 
