@@ -179,7 +179,10 @@ CONTRACTS: Final = (
         lambda c: not c.aux_output_config.enable_return_routed_experts,
         "returns no routed experts",
     ),
-    *(Contract(option, accepts, requirement) for option, accepts, requirement in TRANSFER),
+    *(
+        Contract(option=transfer.option, accepts=transfer.accepts, requirement=transfer.requirement)
+        for transfer in TRANSFER
+    ),
     # A consumer needs the checkpoint's language model, which the engine does not serve; of vLLM's
     # connectors, the example one saves a producer's host rows as they are.
     Contract(
