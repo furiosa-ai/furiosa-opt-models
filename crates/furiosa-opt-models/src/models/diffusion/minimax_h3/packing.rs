@@ -10,6 +10,11 @@ use crate::tensor::{axis::Rows, live::BlockPrefix};
 use furiosa_opt_std::prelude::AxisName;
 use std::{io, ops::Range};
 
+pub(crate) use geometry::TRANSFER_ROWS;
+pub use geometry::{AUDIO_ROWS, DEFAULT_MAX_TEXT, PARTS, ROW_BLOCK, TEXT_STRIP, VIDEO_ROWS};
+
+mod geometry;
+
 /// Checked runtime work within one capacity; valid text is counted before any padding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Plan {
@@ -414,10 +419,6 @@ impl KeyRun {
     }
 }
 
-pub const DEFAULT_MAX_TEXT: usize = 2048;
-pub const PARTS: usize = 4;
-pub const TEXT_STRIP: usize = 16;
-pub const ROW_BLOCK: usize = 256;
 pub const GATHER_HEAD: usize = ROW_BLOCK;
 pub const GATHER_BODY: usize = 1024;
 /// Compiled maximum-text profile: one short first tile, then ten body tiles.
@@ -427,8 +428,6 @@ pub const DEFAULT_GATHER_ROWS: usize = GATHER_HEAD + (DEFAULT_GATHER_TILES - 1) 
 pub const KEY_SPAN: usize = 2048;
 pub const AUDIO_TOKENS: usize = 414;
 pub const VIDEO_TOKENS: usize = 37_296;
-pub const AUDIO_ROWS: usize = 112;
-pub const VIDEO_ROWS: usize = 9_328;
 
 fn media_tokens() -> usize {
     AUDIO_TOKENS + VIDEO_TOKENS

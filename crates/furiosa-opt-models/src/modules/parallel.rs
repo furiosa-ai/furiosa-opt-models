@@ -4,6 +4,7 @@
 
 use crate::Module;
 use crate::load::Load;
+use crate::ops::collective::prefix::{self, Extents};
 use crate::ops::collective::{AllGather, AllReduce, Exchange, Pieces, Whole};
 use crate::tensor::axis::Rows;
 use crate::tensor::live::{BlockPrefix, Live};
@@ -132,18 +133,16 @@ impl<L, const N: usize> Exchanged<L, Parallel<N>>
 where
     Parallel<N>: Placement,
 {
-    /// Borrow this composition for one compiled compact exchange geometry.
+    /// Borrow this composition for Live compact work within the extent list `G`.
     ///
-    /// The model dispatches `S` from the checked request work: `S::SIZE` must equal the input
-    /// prefix's row count. The first `N * S::SIZE` source rows must be initialized and packed
-    /// at stride `S::SIZE`, rather than at the allocation capacity's stride. The view neither
-    /// rounds nor checks that dispatch on the device. Its Module implementation requires
-    /// positive, capacity-bounded work aligned to 256 rows at compilation.
+    /// The checked request's positive, 256-row-aligned work must be one of `G`'s extents.
+    /// Its source parts use that compact work stride within the allocation capacity.
+    /// One exchange kernel selects the DMA mapping; every request uses this same Module.
     ///
     /// The exchange allocates its usual destination, then lends the same checked prefix to the
     /// child. Environment and state pass through unchanged. The view holds no additional weight
     /// or state; the owning composition's loading and residency names stay unchanged.
-    pub fn prefix<S: AxisName>(&self) -> ExchangedPrefix<'_, L, S, N> {
+    pub fn prefix<G: Extents>(&self) -> ExchangedPrefix<'_, L, G, N> {
         ExchangedPrefix {
             operation: &self.operation,
             work: PhantomData,
@@ -179,21 +178,21 @@ where
     }
 }
 
-/// A borrowed [`Exchanged`] call at compact work stride `S`.
+/// A borrowed [`Exchanged`] call for the fixed extent list `G` and runtime compact work.
 ///
 /// Created by [`Exchanged::prefix`]. The input's [`BlockPrefix`] describes local work within
 /// capacity `R`; its tensor holds `N` compact parts of that work in a `Pieces<R,N>` allocation.
 /// The child's returned [`Live`] value cannot borrow the temporary exchange destination.
-pub struct ExchangedPrefix<'a, L, S, const N: usize> {
+pub struct ExchangedPrefix<'a, L, G, const N: usize> {
     operation: &'a L,
-    work: PhantomData<S>,
+    work: PhantomData<G>,
 }
 
-impl<I, L, S, const N: usize> !crate::Op<I> for ExchangedPrefix<'_, L, S, N> {}
+impl<I, L, G, const N: usize> !crate::Op<I> for ExchangedPrefix<'_, L, G, N> {}
 
-impl<'i, 'p, R: AxisName, W: AxisName, S: AxisName, L, E, State, O, const N: usize>
+impl<'i, 'p, R: AxisName, W: AxisName, G: Extents, L, E, State, O, const N: usize>
     Module<&'p BlockPrefix<&'i Split<R, W, N>, R, Rows<256>>, E, State>
-    for ExchangedPrefix<'_, L, S, N>
+    for ExchangedPrefix<'_, L, G, N>
 where
     Parallel<N>: Placement,
     L: for<'x, 'v> Module<
@@ -213,13 +212,13 @@ where
         input: &'p BlockPrefix<&'i Split<R, W, N>, R, Rows<256>>,
     ) -> Self::Output {
         const {
-            assert!(S::SIZE > 0 && S::SIZE <= R::SIZE);
-            assert!(S::SIZE.is_multiple_of(256) && R::SIZE.is_multiple_of(256));
+            assert!(R::SIZE.is_multiple_of(256));
+            assert!(prefix::aligned::<G>(256));
         }
         let mut exchanged = Local::<R, W, N>::new();
-        Exchange::<Parallel<N>>::default().write_prefix::<bf16, S, R, W>(
+        Exchange::<Parallel<N>>::default().write_prefix::<bf16, R, W, G>(
             device,
-            input.value(),
+            &input.interval().with(input.value()),
             &mut exchanged,
         );
         self.operation

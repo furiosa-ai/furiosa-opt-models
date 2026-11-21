@@ -70,15 +70,14 @@ impl<'a> Module<Operands<'a>, (), &'a mut Output> for AttentionExchange {
         // those axes gives the chip's 1792 columns; capacity and physical row order stay intact.
         let attended: Split = unsafe { attended.reshape() };
         let exchange = Exchange::<Parallel<4>>::default();
-        // The host supplies exactly these three work extents, within one query allocation and
-        // one compiled entry. The actual owned attention result feeds the exchange directly.
-        if work == 9472 {
-            exchange.write_prefix::<bf16, Rows<9472>, Capacity, Width>(device, &attended, output);
-        } else if work == 9728 {
-            exchange.write_prefix::<bf16, Rows<9728>, Capacity, Width>(device, &attended, output);
-        } else {
-            exchange.write_prefix::<bf16, Rows<9984>, Capacity, Width>(device, &attended, output);
-        }
+        // The actual owned attention result feeds one Live exchange, within one compiled entry.
+        exchange.write_prefix::<bf16, Capacity, Width, (Rows<9472>, (Rows<9728>, (Rows<9984>,)))>(
+            device,
+            &Live::<(), Capacity>::all()
+                .subrange(0, work)
+                .with(&attended),
+            output,
+        );
     }
 }
 

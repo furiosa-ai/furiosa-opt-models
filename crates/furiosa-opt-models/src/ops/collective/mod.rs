@@ -16,6 +16,7 @@ use furiosa_opt_std::prelude::*;
 pub use gather::{AllGather, InTiles, Pieces, Tile as GatherTile, TileRows, Tiled, Whole};
 
 mod gather;
+pub mod prefix;
 
 /// Sum chip-local vectors in a fixed pairwise f32 order and replicate the result on every chip.
 #[derive(DeviceSend)]
@@ -335,40 +336,6 @@ impl<'x, D: MaterializableScalar, S: AxisName, W: AxisName, const N: usize>
 }
 
 impl<const N: usize> Exchange<Parallel<N>> {
-    /// Exchange the first `N * S` initialized rows as `N` compact parts, writing the first
-    /// `S` destination rows. Both allocations retain capacity `C`; destination tails are untouched.
-    /// This interprets the input prefix at stride `S`, rather than selecting `S` rows from each
-    /// capacity-strided part. A caller selects a whole-transfer geometry for its actual work.
-    pub fn write_prefix<D: MaterializableScalar, S: AxisName, C: AxisName, W: AxisName>(
-        &self,
-        device: &mut Device,
-        input: &Rows<D, N, Pieces<C, N>, Part<W, N>>,
-        output: &mut Rows<D, N, C, W>,
-    ) {
-        const { assert!(N > 0 && W::SIZE > 0 && S::SIZE > 0 && S::SIZE <= C::SIZE) };
-        type L<W, const N: usize> = Symbol<Part<W, N>>;
-        // SAFETY: the first alias keeps the full physical extent and declares explicit outer
-        // padding. The second names only that initialized contiguous prefix, preserving byte
-        // order. Neither alias writes, and the original input owner stays borrowed throughout.
-        let padded: PaddedRows<D, N, S, C, W> = unsafe { input.view().alias() };
-        let compact: Rows<D, N, Pieces<S, N>, Part<W, N>> = unsafe { padded.view().alias() };
-        // SAFETY: the compact parts are in chip order, each its rows in order.
-        let source = unsafe {
-            compact
-                .view()
-                .reshape::<ChipMap<N>, m![{ O<N> }, S, { L<W, N> }]>()
-        };
-        // SAFETY: this declares only outer padding; the physical extent and row-major byte
-        // order remain C * W. The selected prefix keeps the original mutable borrow.
-        let destination = unsafe { output.view_mut().reshape::<ChipMap<N>, m![S # C, W]>() };
-        // SAFETY: a row's columns are the source chips' contiguous parts. Retain the outer
-        // allocation padding so the view keeps the original destination's writable provenance.
-        let destination = unsafe {
-            destination.reshape::<m![{ O<N> }], m![S # C, { Symbol<Shard<N>> }, { L<W, N> }]>()
-        };
-        source.to_hbm_view(&mut device.tdma, destination);
-    }
-
     /// Exchange one whole, statically described set of parts into caller-owned storage.
     /// Views can name compact root windows inside larger allocations. Their row stride must
     /// describe the actual parts; cropping a capacity-strided tensor does not compact its rows.
@@ -393,11 +360,6 @@ axes![Two = 2];
 type ChipMap<const N: usize> = m![{ Symbol<Shard<N>> }];
 type Rows<D, const N: usize, R, W> = HbmTensor<D, ChipMap<N>, m![R, W]>;
 type RowsView<'a, D, const N: usize, R, W> = HbmTensorView<'a, D, ChipMap<N>, m![R, W]>;
-type PaddedRows<D, const N: usize, S, C, W> = HbmTensor<
-    D,
-    ChipMap<N>,
-    m![{ Symbol<Pieces<S, N>> } # ({ Symbol<Pieces<C, N>> }), { Symbol<Part<W, N>> }],
->;
 type ReductionSlices<W> = m![W % 1024 / 128, W % 128 / 4];
 type Local<D, Chips, W> = DmTensor<D, Chips, m![1 # 2], ReductionSlices<W>, m![W / 1024, W % 4]>;
 /// A chip's rows in the sum's layout: each slice one part of every row.
@@ -645,6 +607,7 @@ mod prefix_tests {
 
     use crate::ops::collective::{Exchange, Pieces};
     use crate::tensor::axis::Rows;
+    use crate::tensor::live::Live;
     use crate::tensor::parallel::{Parallel, Part, Shard};
     use crate::tensor::scalar::Value;
     use furiosa_opt_std::prelude::*;
@@ -687,13 +650,11 @@ mod prefix_tests {
     ) {
         let rows = rows.extent::<m![C]>();
         let exchange = Exchange::<Parallel<4>>::default();
-        if rows == A::SIZE {
-            exchange.write_prefix::<bf16, A, C, W>(device, input, output);
-        } else if rows == B::SIZE {
-            exchange.write_prefix::<bf16, B, C, W>(device, input, output);
-        } else {
-            exchange.write_prefix::<bf16, E, C, W>(device, input, output);
-        }
+        exchange.write_prefix::<bf16, C, W, (A, (B, (E,)))>(
+            device,
+            &Live::<(), C>::all().subrange(0, rows).with(input),
+            output,
+        );
     }
 
     fn coefficient(index: usize) -> bf16 {

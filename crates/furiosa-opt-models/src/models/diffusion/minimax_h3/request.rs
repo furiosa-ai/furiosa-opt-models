@@ -1,8 +1,6 @@
 //! Bind the numerical consumers' work to one checked H3 request before uploading metadata.
 
-use super::packing::{
-    AUDIO_ROWS, DEFAULT_MAX_TEXT, PARTS, Plan, ROW_BLOCK, TEXT_STRIP, VIDEO_ROWS,
-};
+use super::packing::{DEFAULT_MAX_TEXT, PARTS, Plan, ROW_BLOCK, TEXT_STRIP, TRANSFER_ROWS};
 use super::{embeddings::Chips, positions::Positions};
 use crate::ops::attention::{
     flash,
@@ -228,15 +226,10 @@ pub(crate) struct Transfer<const STEP: usize>;
 
 impl<const STEP: usize> AxisName for Transfer<STEP> {
     const NAME: Ident = Ident::new("JointTransfer");
-    const SIZE: usize = {
-        let first = (AUDIO_ROWS + VIDEO_ROWS + TEXT_STRIP).div_ceil(ROW_BLOCK) * ROW_BLOCK;
-        let text = DEFAULT_MAX_TEXT.div_ceil(PARTS * TEXT_STRIP) * TEXT_STRIP;
-        let last = (AUDIO_ROWS + VIDEO_ROWS + text).div_ceil(ROW_BLOCK) * ROW_BLOCK;
-        // The joint execution adapter dispatches these three whole-transfer geometries.
-        assert!(last - first == 2 * ROW_BLOCK && STEP <= 2);
-        first + STEP * ROW_BLOCK
-    };
+    const SIZE: usize = TRANSFER_ROWS[STEP];
 }
+
+include!(concat!(env!("OUT_DIR"), "/h3_transfers.rs"));
 
 /// At most one valid run per modality and part. Empty part spans contribute no run.
 pub const KEY_RUNS: usize = 3 * PARTS;

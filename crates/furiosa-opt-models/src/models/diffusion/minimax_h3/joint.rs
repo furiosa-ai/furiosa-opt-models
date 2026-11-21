@@ -6,7 +6,7 @@
 
 use super::embeddings::Chips;
 use super::packing::{PARTS, ROW_BLOCK};
-use super::request::{BlockCall, Prefix, Transfer};
+use super::request::{BlockCall, Prefix, Transfers};
 use super::transformer::{Heads, SCALE};
 use crate::load::Named;
 use crate::modules::attention::Full;
@@ -102,25 +102,10 @@ where
         // SAFETY: inverse of the query view above; every row's head pairs remain consecutive.
         let attended: Split<R, A> = unsafe { attended.into_value().reshape() };
         let input = prefix.with(&attended);
-        // BlockPlan refuses capacities beyond the compiled maximum. Its positive text count
-        // therefore derives exactly one of these work extents, with no rounding or fallback
-        // to a larger text bucket. The final branch is the third checked whole-transfer shape.
-        if prefix.rows() == Transfer::<0>::SIZE {
-            self.output
-                .0
-                .prefix::<Transfer<0>>()
-                .forward(device, (), output_state, &input)
-        } else if prefix.rows() == Transfer::<1>::SIZE {
-            self.output
-                .0
-                .prefix::<Transfer<1>>()
-                .forward(device, (), output_state, &input)
-        } else {
-            self.output
-                .0
-                .prefix::<Transfer<2>>()
-                .forward(device, (), output_state, &input)
-        }
+        self.output
+            .0
+            .prefix::<Transfers>()
+            .forward(device, (), output_state, &input)
     }
 }
 

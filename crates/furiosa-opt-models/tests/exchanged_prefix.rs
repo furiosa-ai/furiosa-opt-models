@@ -78,21 +78,9 @@ fn borrowed<R: AxisName, I: AxisName, O: AxisName, A: AxisName, D: AxisName, E: 
 ) {
     let prefix = BlockPrefix::<(), R, B>::read(blocks).with(input);
     let model = Exchanged::<_, Parallel<4>>::new(Writing(&weights.operation));
-    // Host preparation accepts exactly these extents; the model owns this dispatch and binds
-    // S to the same prefix read once above. The reusable view has no model constants or asserts.
-    if prefix.rows() == A::SIZE {
-        model
-            .prefix::<A>()
-            .forward(device, Reader(env), state, &prefix);
-    } else if prefix.rows() == D::SIZE {
-        model
-            .prefix::<D>()
-            .forward(device, Reader(env), state, &prefix);
-    } else {
-        model
-            .prefix::<E>()
-            .forward(device, Reader(env), state, &prefix);
-    }
+    model
+        .prefix::<(A, (D, (E,)))>()
+        .forward(device, Reader(env), state, &prefix);
 }
 
 #[device(chip = 4)]
@@ -105,7 +93,7 @@ fn owned<R: AxisName, I: AxisName, O: AxisName, S: AxisName>(
 ) -> Local<R, O> {
     let prefix = BlockPrefix::<(), R, B>::read(blocks).with(input);
     weights
-        .prefix::<S>()
+        .prefix::<(S,)>()
         .forward(device, (), &mut (), &prefix)
         .into_value()
 }
@@ -328,10 +316,10 @@ fn named_owned_and_borrowed_views_keep_the_output_independent_of_exchange_storag
             >,
     {
     }
-    view::<ExchangedPrefix<'_, Named<"projection", Grouped<I, O, Chips>>, Rows<9472>, 4>>();
+    view::<ExchangedPrefix<'_, Named<"projection", Grouped<I, O, Chips>>, (Rows<9472>,), 4>>();
     type Child<'a> =
         Named<"projection", Grouped<I, O, Chips, &'a HbmTensor<bf16, Chips, Layout<I, O>>>>;
-    view::<ExchangedPrefix<'_, Child<'_>, Rows<9472>, 4>>();
+    view::<ExchangedPrefix<'_, Child<'_>, (Rows<9472>,), 4>>();
 }
 
 #[test]
@@ -378,7 +366,7 @@ async fn compact_exchange_named_projection_matches_fp64_at_all_main_work_extents
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires four explicitly selected RNGD chips"]
 async fn full_width_exchange_projection_matches_fp64_at_one_block() {
-    check::<Rows<768>, Hidden<7168>, ProjectionWidth<5376>, Rows<256>, Rows<256>, Rows<256>>(&[
+    check::<Rows<768>, Hidden<7168>, ProjectionWidth<5376>, Rows<256>, Rows<512>, Rows<768>>(&[
         256,
     ])
     .await;
