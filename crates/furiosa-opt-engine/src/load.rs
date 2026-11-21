@@ -8,8 +8,8 @@
 //!   checkpoint.
 //! - A load reads the whole model, or its media encoder alone, which the registry lists as an
 //!   implementation of its own.
-//! - The registry chooses the implementation's chip count. Decoders use one chip and BF16 KV
-//!   caches; H3 uses four chips and returns a pipeline without a KV cache. Both load whole.
+//! - The registry chooses the implementation's chip count. Decoders use BF16 KV caches;
+//!   pipelines prepare their host weights separately and have no KV cache. Both load whole.
 //! - A batch-invariant load asks every implementation's calls to tile their attention fixed, which
 //!   they serve as an `Instance` of their decoder.
 //! - A quantization reads the checkpoint quantized, so an implementation whose projections a load
@@ -22,10 +22,8 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::str::FromStr;
 
-use crate::diffusion::minimax_h3;
-use crate::registry::{Implementation, Model};
+use crate::registry::{Implementation, Model, Pipeline};
 use furiosa_opt_models::load::{Checkpoint, Context, LoadError, Part};
-use furiosa_opt_models::models::diffusion::minimax_h3::Inputs;
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
 use furiosa_opt_models::tensor::form::fp8::Granularity;
 use furiosa_opt_std::prelude::Device;
@@ -69,15 +67,6 @@ pub struct Config {
     kv_cache: Dtype,
     chips: usize,
     tiling: Tiling,
-    execution: Execution,
-}
-
-/// The checked pipeline documents travel with the selected configuration, rather than being
-/// read again while preparing weights. Decoder configurations carry no pipeline documents.
-#[derive(Clone, Debug)]
-enum Execution {
-    Model,
-    MiniMaxH3(Box<Inputs>),
 }
 
 impl LoadOptions {
@@ -161,7 +150,11 @@ impl LoadOptions {
     /// The implementation `checkpoint` loads as with these choices, from its config and its names
     /// alone: no weight is read and no device is needed.
     pub fn parse(&self, checkpoint: &Checkpoint) -> Result<Config, LoadError> {
-        self.read(checkpoint, |checkpoint| self.select(checkpoint))
+        self.read(checkpoint, |checkpoint| {
+            let config = self.configure(checkpoint)?;
+            config.implementation.check(checkpoint)?;
+            Ok(config)
+        })
     }
 
     /// The implementation `checkpoint` loads as with these choices, loaded strictly into HBM of
@@ -175,28 +168,28 @@ impl LoadOptions {
                 implementation,
                 tiling,
                 ..
-            } = self.select(checkpoint)?;
+            } = self.configure(checkpoint)?;
+            implementation.check(checkpoint)?;
             implementation.load(&mut Context::new(device), checkpoint, tiling)
         })
     }
 
-    /// Prepare H3's strict host weights after checking every option and component document.
-    /// The caller then places this pipeline on its existing four-chip `SharedDevice`, without
-    /// holding that device's context lock across placement. Other registry models use `load`.
-    pub fn prepare_pipeline(
+    /// Prepare a registered pipeline's strict host weights after checking every option and
+    /// component document. Its family places the prepared tree on the caller's retained device,
+    /// without holding that device's context lock across placement.
+    pub fn prepare_pipeline<P: Pipeline>(
         &self,
         checkpoint: &Checkpoint,
-    ) -> Result<minimax_h3::Prepared, LoadError> {
+    ) -> Result<P::Prepared, LoadError> {
         self.read(checkpoint, |checkpoint| {
-            match self.select(checkpoint)?.execution {
-                Execution::MiniMaxH3(inputs) => {
-                    minimax_h3::Prepared::from_inputs(checkpoint, *inputs)
-                }
-                Execution::Model => Err(LoadError::Unsupported {
+            let config = self.configure(checkpoint)?;
+            if !config.is_pipeline() || config.class() != P::CLASS || config.size() != P::SIZE {
+                return Err(LoadError::Unsupported {
                     name: "pipeline".into(),
-                    reason: "this implementation loads through LoadOptions::load".into(),
-                }),
+                    reason: "the selected implementation is not this pipeline type".into(),
+                });
             }
+            P::prepare(checkpoint, P::inputs(checkpoint)?)
         })
     }
 
@@ -218,7 +211,7 @@ impl LoadOptions {
     }
 
     /// The implementation the load of `checkpoint`, as it reads it, selects.
-    fn select(&self, checkpoint: &Checkpoint) -> Result<Config, LoadError> {
+    fn configure(&self, checkpoint: &Checkpoint) -> Result<Config, LoadError> {
         let config = checkpoint.config();
         let names: Vec<&str> = match self.architecture {
             Some(name) => vec![name],
@@ -240,33 +233,12 @@ impl LoadOptions {
             reason: reason.into(),
         };
         let chips = implementation.chips();
-        if self.chips.is_some_and(|chosen| chosen.get() != chips) {
-            return Err(unsupported(
-                "chips",
-                if chips == 1 {
-                    "every implementation runs on one chip"
-                } else {
-                    "H3 runs on four chips"
-                },
-            ));
-        }
-        if implementation.is_pipeline() {
-            if self.kv_cache.is_some() {
-                return Err(unsupported("kv_cache", "H3 has no KV cache"));
-            }
-            if self.quantization.is_some() {
-                return Err(unsupported(
-                    "quantization",
-                    "H3 loads its checkpoint precision",
-                ));
-            }
-            if self.tiling == Tiling::Fixed {
-                return Err(unsupported(
-                    "batch_invariant",
-                    "H3 uses its original attention tiling",
-                ));
-            }
-        }
+        implementation.options(
+            self.chips.map(NonZeroUsize::get),
+            self.kv_cache,
+            self.quantization,
+            self.tiling,
+        )?;
         if self.kv_cache.is_some_and(|dtype| dtype != Dtype::BF16) {
             return Err(unsupported(
                 "kv_cache",
@@ -310,11 +282,6 @@ impl LoadOptions {
             kv_cache: Dtype::BF16,
             chips,
             tiling: self.tiling,
-            execution: if implementation.is_pipeline() {
-                Execution::MiniMaxH3(Box::new(Inputs::read(checkpoint)?))
-            } else {
-                Execution::Model
-            },
         })
     }
 }
@@ -356,7 +323,7 @@ impl Config {
 
     /// Whether placement returns a pipeline retaining the original shared device context.
     pub fn is_pipeline(&self) -> bool {
-        matches!(self.execution, Execution::MiniMaxH3(_))
+        self.implementation.is_pipeline()
     }
 
     /// How the implementation's calls tile each row's attention.

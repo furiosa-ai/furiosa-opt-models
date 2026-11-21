@@ -29,7 +29,9 @@ fn refuses_h3_decoder_options_before_documents_and_weights() {
     ] {
         for error in [
             options.parse(&source).err(),
-            options.prepare_pipeline(&source).err(),
+            options
+                .prepare_pipeline::<furiosa_opt_engine::diffusion::minimax_h3::Pipeline>(&source)
+                .err(),
         ] {
             match error.expect("a refused choice must not read absent files") {
                 LoadError::Unsupported { name, reason } => {

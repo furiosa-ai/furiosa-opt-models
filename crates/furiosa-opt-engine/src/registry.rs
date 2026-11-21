@@ -13,6 +13,7 @@
 
 use crate::decoder::{Decoder, Instance, Served};
 use crate::diffusion::minimax_h3;
+use crate::load::Quantization;
 use crate::vision_language::Encoder;
 use furiosa_opt_models::load::{Checkpoint, Context, Load, LoadError, Part};
 use furiosa_opt_models::models::decoder::attention::{llama, qwen3};
@@ -23,6 +24,7 @@ use furiosa_opt_models::ops::attention::full::paged::Tiling;
 use furiosa_opt_models::tensor::cache;
 use furiosa_opt_models::tensor::memory::Hbm;
 use furiosa_opt_models::tensor::parallel::Parallel;
+use safetensors::Dtype;
 
 /// Every upstream architecture name, by family level, with the decoders that implement it; a
 /// refused name has none.
@@ -819,7 +821,10 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
     // Source: <https://github.com/vllm-project/vllm-omni/blob/6daf5b30f07cc0b3db87766d22fdf433f8a1a7c9/vllm_omni/model_executor/models/minicpmo_4_5/batched_token2wav.py>.
     ("MiniCPMO45Code2Wav", &[]),
     ("MiniCPMO45OmniForConditionalGeneration", &[]),
-    ("MiniMaxH3Pipeline", &[Implementation::minimax_h3()]),
+    (
+        "MiniMaxH3Pipeline",
+        &[Implementation::pipeline::<minimax_h3::Pipeline>()],
+    ),
     ("MiniMaxMusic3AcousticForConditionalGeneration", &[]),
     ("MossTTSCodecDecoder", &[]),
     ("NemotronVoiceChatCode2Wav", &[]),
@@ -904,8 +909,15 @@ pub struct Implementation {
 #[derive(Debug)]
 enum Loader {
     Model(fn(&mut Context<'_>, &Checkpoint, Tiling) -> Result<Model, LoadError>),
-    MiniMaxH3,
+    Pipeline {
+        chips: usize,
+        check: fn(&Checkpoint) -> Result<(), LoadError>,
+        options: PipelineOptions,
+    },
 }
+
+type PipelineOptions =
+    fn(Option<usize>, Option<Dtype>, Option<Quantization>, Tiling) -> Result<(), LoadError>;
 
 /// A model a load returns, as a framework serves it.
 pub enum Model {
@@ -935,6 +947,36 @@ pub trait Listed: Implements + for<'a> Load<&'a Checkpoint> + Sized + 'static {
 
     /// The type as a framework serves it, its calls attending tiled as `tiling` says.
     fn served(self, tiling: Tiling) -> Model;
+}
+
+/// A registered pipeline with checked component documents and a separately placed host tree.
+/// Its family keeps the concrete prepared type and places it on the caller's retained device.
+pub trait Pipeline: Implements {
+    /// The chip count required by this implementation.
+    const CHIPS: usize;
+
+    /// Checked component documents, read before any weight is loaded.
+    type Inputs;
+
+    /// Strictly loaded host weights, ready for placement by the family binding.
+    type Prepared;
+
+    /// Refuse a checkpoint part this pipeline does not read.
+    fn reads(part: Part) -> Result<(), LoadError>;
+
+    /// Refuse load choices the pipeline cannot serve, before reading component documents.
+    fn options(
+        chips: Option<usize>,
+        kv_cache: Option<Dtype>,
+        quantization: Option<Quantization>,
+        tiling: Tiling,
+    ) -> Result<(), LoadError>;
+
+    /// Read and validate the component documents without reading a weight.
+    fn inputs(source: &Checkpoint) -> Result<Self::Inputs, LoadError>;
+
+    /// Load strictly using those already checked documents, without rereading them.
+    fn prepare(source: &Checkpoint, inputs: Self::Inputs) -> Result<Self::Prepared, LoadError>;
 }
 
 /// A decoder reads a whole model and serves requests as an instance of the load's tiling.
@@ -973,27 +1015,21 @@ impl Implementation {
         }
     }
 
-    const fn minimax_h3() -> Self {
+    /// A pipeline implementation whose family owns its prepared type and placement.
+    pub const fn pipeline<P: Pipeline>() -> Self {
         Self {
-            size: "FL2VA",
-            class: minimax_h3::Pipeline::CLASS,
+            size: P::SIZE,
+            class: P::CLASS,
             scope: |source| {
-                if source.part() != Part::Whole {
-                    return Err(LoadError::Unsupported {
-                        name: "encoder".into(),
-                        reason: "H3 loads as one complete pipeline".into(),
-                    });
-                }
-                if source.config()["_class_name"].as_str() != Some("MiniMaxH3Pipeline") {
-                    return Err(LoadError::InvalidData {
-                        name: "config.json:_class_name".into(),
-                        reason: "expected MiniMaxH3Pipeline".into(),
-                    });
-                }
-                Ok("")
+                P::reads(source.part())?;
+                P::scope(source)
             },
             adapters: 0,
-            load: Loader::MiniMaxH3,
+            load: Loader::Pipeline {
+                chips: P::CHIPS,
+                check: |source| P::inputs(source).map(|_| ()),
+                options: P::options,
+            },
         }
     }
 
@@ -1001,12 +1037,40 @@ impl Implementation {
     pub fn chips(&self) -> usize {
         match self.load {
             Loader::Model(_) => 1,
-            Loader::MiniMaxH3 => minimax_h3::Pipeline::CHIPS,
+            Loader::Pipeline { chips, .. } => chips,
         }
     }
 
     pub(crate) fn is_pipeline(&self) -> bool {
-        matches!(self.load, Loader::MiniMaxH3)
+        matches!(self.load, Loader::Pipeline { .. })
+    }
+
+    /// Validate a pipeline's component documents before any weight is read.
+    pub(crate) fn check(&self, source: &Checkpoint) -> Result<(), LoadError> {
+        match self.load {
+            Loader::Model(_) => Ok(()),
+            Loader::Pipeline { check, .. } => check(source),
+        }
+    }
+
+    /// Check the implementation's load choices before any component document or weight read.
+    pub(crate) fn options(
+        &self,
+        chips: Option<usize>,
+        kv_cache: Option<Dtype>,
+        quantization: Option<Quantization>,
+        tiling: Tiling,
+    ) -> Result<(), LoadError> {
+        match self.load {
+            Loader::Pipeline { options, .. } => options(chips, kv_cache, quantization, tiling),
+            Loader::Model(_) if chips.is_some_and(|chosen| chosen != self.chips()) => {
+                Err(LoadError::Unsupported {
+                    name: "chips".into(),
+                    reason: "every implementation runs on one chip".into(),
+                })
+            }
+            Loader::Model(_) => Ok(()),
+        }
     }
 
     /// The first of `names` that `ARCHITECTURES` lists, as it spells it, with its implementations;
@@ -1071,9 +1135,9 @@ impl Implementation {
         let scope = (self.scope)(source)?;
         match self.load {
             Loader::Model(load) => context.field("", scope, |cx| load(cx, source, tiling)),
-            Loader::MiniMaxH3 => Err(LoadError::Unsupported {
+            Loader::Pipeline { .. } => Err(LoadError::Unsupported {
                 name: "device".into(),
-                reason: "H3 placement requires a retained SharedDevice; use LoadOptions::prepare_pipeline and Prepared::place".into(),
+                reason: "pipeline placement requires a retained SharedDevice; use LoadOptions::prepare_pipeline and the family's placement method".into(),
             }),
         }
     }

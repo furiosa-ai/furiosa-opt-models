@@ -47,6 +47,15 @@ type Family = (
 /// A decoder as an object of one class.
 type Constructor = fn(Decoder, Python<'_>) -> PyResult<Py<Decoder>>;
 
+/// A pipeline's class and its family's typed preparation and placement constructor.
+const PIPELINES: &[(Class, PipelineConstructor)] = &[(
+    engine::diffusion::minimax_h3::Pipeline::CLASS,
+    minimax_h3::load,
+)];
+
+type PipelineConstructor =
+    fn(Python<'_>, &engine::LoadOptions, &engine::Checkpoint, &Device) -> Result<Py<PyAny>, Error>;
+
 /// The tensors of a checkpoint directory, mapped or read into host memory, and the config of its
 /// model.
 #[gen_stub_pyclass]
@@ -210,20 +219,14 @@ impl LoadOptions {
     ) -> Result<Py<PyAny>, Error> {
         let config = self.0.parse(&checkpoint.0)?;
         if config.is_pipeline() {
-            let shared = py.detach(|| engine::residency::SharedDevice::bind(device.0.clone()));
-            if shared.placement().chips.len() != config.chips() || shared.placement().pes != (0..8)
-            {
-                return Err(LoadError::Unsupported {
-                    name: "placement".into(),
-                    reason: "H3 requires four chips with all eight PEs per chip".into(),
-                }
-                .into());
-            }
-            // Host preparation checks all documents and weights before placement. Bind the
-            // original context owner, and drive the pipeline WITHOUT holding its device lock.
-            let prepared = py.detach(|| self.0.prepare_pipeline(&checkpoint.0))?;
-            let pipeline = py.detach(|| engine::residency::block_on(prepared.place(shared)))?;
-            return Ok(minimax_h3::object(py, pipeline, device.0.clone())?.into_any());
+            let (_, constructor) = PIPELINES
+                .iter()
+                .find(|(class, _)| *class == config.class())
+                .ok_or_else(|| LoadError::Unsupported {
+                    name: config.architecture().into(),
+                    reason: "no Python class holds the pipeline yet".into(),
+                })?;
+            return constructor(py, &self.0, &checkpoint.0, device);
         }
         // A decoder's class is its model type's, found before a weight is read.
         let unbound = || LoadError::Unsupported {

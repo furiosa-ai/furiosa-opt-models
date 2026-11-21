@@ -24,6 +24,27 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+/// Prepare checked host weights, then place on the original context outside its device lock.
+pub(super) fn load(
+    py: Python<'_>,
+    options: &furiosa_opt_engine::LoadOptions,
+    checkpoint: &furiosa_opt_engine::Checkpoint,
+    device: &Device,
+) -> Result<Py<PyAny>, Error> {
+    let shared = py.detach(|| furiosa_opt_engine::residency::SharedDevice::bind(device.0.clone()));
+    if shared.placement().chips.len() != engine::Pipeline::CHIPS || shared.placement().pes != (0..8)
+    {
+        return Err(furiosa_opt_models::load::LoadError::Unsupported {
+            name: "placement".into(),
+            reason: "H3 requires four chips with all eight PEs per chip".into(),
+        }
+        .into());
+    }
+    let prepared = py.detach(|| options.prepare_pipeline::<engine::Pipeline>(checkpoint))?;
+    let pipeline = py.detach(|| block_on(prepared.place(shared)))?;
+    Ok(object(py, pipeline, device.0.clone())?.into_any())
+}
+
 pub(super) fn object(
     py: Python<'_>,
     pipeline: Arc<engine::Pipeline>,
