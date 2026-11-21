@@ -185,6 +185,77 @@ class Hbm:
         return self.chip.submit(lambda: np.copyto(host, self.data))
 
 
+class MultiCopy:
+    """A host-side transfer spanning one byte copy on each chip."""
+
+    def __init__(self, copies: list[Copy]) -> None:
+        self.copies = copies
+
+    def wait(self) -> None:
+        failure: RuntimeError | None = None
+        for copy in self.copies:
+            try:
+                copy.wait()
+            except RuntimeError as error:
+                failure = failure or error
+        if failure is not None:
+            raise failure
+
+    def done(self) -> bool:
+        return all(copy.done() for copy in self.copies)
+
+
+@dataclass(frozen=True)
+class MultiHbm:
+    """A cache layer with one byte array per chip and one logical block order."""
+
+    data: tuple[NDArray[np.uint8], ...]
+    chips: tuple[Chip, ...]
+
+    def __len__(self) -> int:
+        return len(self.data[0])
+
+    def slice(self, offset: int, size: int) -> MultiHbm:
+        assert offset % 8 == 0 and size % 8 == 0 and offset + size <= len(self)
+        return MultiHbm(tuple(data[offset : offset + size] for data in self.data), self.chips)
+
+    def to_host(self, host: MultiHost) -> MultiCopy:
+        assert len(host) == len(self) * len(self.chips)
+        copies = []
+        for index, (data, chip) in enumerate(zip(self.data, self.chips, strict=True)):
+            start = index * len(data)
+            target = host[start : start + len(data)]
+            copies.append(chip.submit(lambda target=target, data=data: np.copyto(target, data)))
+        return MultiCopy(copies)
+
+    def from_host(self, host: MultiHost) -> MultiCopy:
+        assert len(host) == len(self) * len(self.chips)
+        copies = []
+        for index, (data, chip) in enumerate(zip(self.data, self.chips, strict=True)):
+            start = index * len(data)
+            source = host[start : start + len(data)]
+            copies.append(chip.submit(lambda data=data, source=source: np.copyto(data, source)))
+        return MultiCopy(copies)
+
+
+class MultiHost(np.ndarray[tuple[int], np.dtype[np.uint8]]):
+    """A host row whose bytes hold each chip's part of its cache blocks."""
+
+    chips: tuple[Chip, ...] | None = None
+
+    @override
+    def __array_finalize__(self, obj: object) -> None:
+        self.chips = cast("tuple[Chip, ...] | None", getattr(obj, "chips", None))
+
+    def slice(self, offset: int, size: int) -> MultiHost:
+        assert 0 <= offset and size > 0 and offset + size <= len(self)
+        return cast("MultiHost", self[offset : offset + size])
+
+    def to_hbm(self, buffer: MultiHbm) -> MultiCopy:
+        assert self.chips == buffer.chips
+        return buffer.from_host(self)
+
+
 @dataclass(frozen=True)
 class Group:
     layers: range
@@ -214,11 +285,20 @@ class Cache:
         return data.view(BLOCKS, TOKENS, 2, HEADS, WIDTH)
 
 
+@dataclass(frozen=True)
+class MultiCache:
+    """A test cache with one storage array for every chip."""
+
+    layers: list[MultiHbm]
+    blocks: int = BLOCKS
+    spec: Spec = Spec([Group(range(LAYERS))])
+
+
 @dataclass
 class Holder:
     """A runner's part that the copy reads: the cache it holds now."""
 
-    cache: Cache | None
+    cache: Cache | MultiCache | None
 
 
 @pytest.fixture
@@ -234,6 +314,20 @@ def chip(monkeypatch: pytest.MonkeyPatch) -> Chip:
 
     monkeypatch.setattr(engine, "HostBuffer", allocate)
     return chip
+
+
+@pytest.fixture
+def two_chips(monkeypatch: pytest.MonkeyPatch) -> tuple[Chip, Chip]:
+    """Each engine host row has one segment for each stand-in chip."""
+    chips = Chip(), Chip()
+
+    def allocate(size: int) -> MultiHost:
+        host = np.zeros(size, np.uint8).view(MultiHost)
+        host.chips = chips
+        return host
+
+    monkeypatch.setattr(engine, "HostBuffer", allocate)
+    return chips
 
 
 def layers(holder: Holder) -> connector.Layers:
@@ -404,6 +498,55 @@ def test_host_tier_copies_the_cache_waking_allocates(chip: Chip) -> None:
     tier.wait({2})
     assert torch.equal(woken.blocks_of(0)[6], stored)
     assert not freed.layers[0].data.any()
+
+
+def test_host_tier_stores_and_loads_each_chip_through_its_row(
+    two_chips: tuple[Chip, Chip],
+) -> None:
+    """A host row holds each chip's part and restores it to that chip's requested block."""
+    size = SPEC.page_size_bytes
+    cache = MultiCache(
+        [
+            MultiHbm(
+                tuple(np.zeros(BLOCKS * size, np.uint8) for _ in two_chips), two_chips
+            )
+            for _ in NAMES
+        ]
+    )
+    for layer_index, layer in enumerate(cache.layers):
+        for chip_index, data in enumerate(layer.data):
+            for block in (4, 5):
+                value = 1 + layer_index * 64 + chip_index * 16 + block
+                data[block * size : (block + 1) * size].fill(value)
+
+    holder = Holder(cache)
+    tier = worker.Host(cast("Runner", cast("object", holder)), len(two_chips), 1, 2)
+    host_spec = CPULoadStoreSpec([0])
+    source_spec = GPULoadStoreSpec([4, 5], [2], [0])
+    _ = tier.submit_store(1, source_spec, host_spec)
+    tier.wait({1})
+
+    for layer_index, layer in enumerate(cache.layers):
+        for row, block in enumerate((4, 5)):
+            for chip_index, data in enumerate(layer.data):
+                start = row * size * len(two_chips) + chip_index * size
+                stored = tier.rows[layer_index][start : start + size]
+                expected = data[block * size : (block + 1) * size]
+                assert np.array_equal(stored, expected), (layer_index, chip_index, row)
+                data[(block + 2) * size : (block + 3) * size].fill(0)
+
+    target_spec = GPULoadStoreSpec([6, 7], [2], [0])
+    _ = tier.submit_load(2, host_spec, target_spec)
+    tier.wait({2})
+    for layer_index, layer in enumerate(cache.layers):
+        for row, target in enumerate((6, 7)):
+            source = row + 4
+            for chip_index, data in enumerate(layer.data):
+                actual = data[target * size : (target + 1) * size]
+                expected = np.full(size, 1 + layer_index * 64 + chip_index * 16 + source, np.uint8)
+                assert np.array_equal(actual, expected), (layer_index, chip_index, target)
+
+    assert all(chip.settled() for chip in two_chips)
 
 
 # Through vLLM's MultiConnector
