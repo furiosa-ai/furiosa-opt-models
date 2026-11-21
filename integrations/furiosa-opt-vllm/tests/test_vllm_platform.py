@@ -44,9 +44,35 @@ from furiosa_opt_vllm import offload
 from furiosa_opt_vllm.additional import Placement, Section
 from furiosa_opt_vllm.admission import Draft, Method, Refused, quantization
 from furiosa_opt_vllm.platform import FuriosaPlatform
+from furiosa_opt_vllm.transfer import CONNECTOR, CONNECTOR_MODULE
 
 # Every speculative method vLLM names.
 UPSTREAM: Final = frozenset(map(str, get_args(SpeculativeMethod)))
+
+
+@pytest.mark.parametrize(
+    ("registered_module", "raises"),
+    [(CONNECTOR_MODULE, False), ("another_connector", True)],
+    ids=["same-connector", "name-conflict"],
+)
+def test_pre_register_accepts_only_its_own_duplicate(
+    monkeypatch: pytest.MonkeyPatch, registered_module: str, raises: bool
+) -> None:
+    """Repeated hooks tolerate this connector's entry, and reject a conflicting class name."""
+    registered = type(CONNECTOR, (), {"__module__": registered_module})
+
+    def duplicate(*_: object) -> None:
+        raise ValueError(f"Connector '{CONNECTOR}' is already registered.")
+
+    monkeypatch.setattr(ModelRegistry, "register_model", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(KVConnectorFactory, "register_connector", duplicate)
+    monkeypatch.setattr(KVConnectorFactory, "get_connector_class", lambda *_args: registered)
+
+    if raises:
+        with pytest.raises(ValueError, match="already registered"):
+            FuriosaPlatform.pre_register_and_update()
+    else:
+        FuriosaPlatform.pre_register_and_update()
 
 
 @pytest.mark.usefixtures("platform_env")
