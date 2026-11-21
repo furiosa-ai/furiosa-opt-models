@@ -41,6 +41,11 @@ if TYPE_CHECKING:
     from furiosa_opt_vllm.runner import Runner
 
 
+def blocks_for_tokens(tokens: int, block_size: int) -> int:
+    """The number of fixed-size cache blocks needed to hold `tokens` tokens."""
+    return (tokens + block_size - 1) // block_size
+
+
 @final
 class Attention(AttentionBackend):
     """The attention backend of the engine's cache pages, which the engine attends to itself."""
@@ -99,7 +104,7 @@ class Layers:
                 # The runner pages only full-history attention.
                 assert isinstance(spec, FullAttentionSpec)
                 # A copy moves the blocks of one request.
-                rows = min(cache.blocks, -(-length // spec.block_size))
+                rows = min(cache.blocks, blocks_for_tokens(length, spec.block_size))
                 self.layers[name] = Layer(
                     position[extract_layer_index(name)],
                     (spec.block_size, 2, spec.num_kv_heads, spec.head_size),
