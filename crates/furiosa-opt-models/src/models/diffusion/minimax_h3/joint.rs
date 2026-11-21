@@ -101,7 +101,7 @@ where
         );
         // SAFETY: inverse of the query view above; every row's head pairs remain consecutive.
         let attended: Split<R, A> = unsafe { attended.into_value().reshape() };
-        let input = prefix.with(&attended);
+        let input = context.call.exchange_prefix().with(&attended);
         self.output
             .0
             .prefix::<Transfers>()

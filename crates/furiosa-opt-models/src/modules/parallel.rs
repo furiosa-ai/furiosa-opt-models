@@ -4,7 +4,7 @@
 
 use crate::Module;
 use crate::load::Load;
-use crate::ops::collective::prefix::{self, Extents};
+use crate::ops::collective::prefix::{self, Extents, Prefix};
 use crate::ops::collective::{AllGather, AllReduce, Exchange, Pieces, Whole};
 use crate::tensor::axis::Rows;
 use crate::tensor::live::{BlockPrefix, Live};
@@ -135,7 +135,7 @@ where
 {
     /// Borrow this composition for Live compact work within the extent list `G`.
     ///
-    /// The checked request's positive, 256-row-aligned work must be one of `G`'s extents.
+    /// The input's checked prefix restricts work to positive, 256-row-aligned extents in `G`.
     /// Its source parts use that compact work stride within the allocation capacity.
     /// One exchange kernel selects the DMA mapping; every request uses this same Module.
     ///
@@ -180,7 +180,7 @@ where
 
 /// A borrowed [`Exchanged`] call for the fixed extent list `G` and runtime compact work.
 ///
-/// Created by [`Exchanged::prefix`]. The input's [`BlockPrefix`] describes local work within
+/// Created by [`Exchanged::prefix`]. The checked input's [`BlockPrefix`] describes local work within
 /// capacity `R`; its tensor holds `N` compact parts of that work in a `Pieces<R,N>` allocation.
 /// The child's returned [`Live`] value cannot borrow the temporary exchange destination.
 pub struct ExchangedPrefix<'a, L, G, const N: usize> {
@@ -191,7 +191,7 @@ pub struct ExchangedPrefix<'a, L, G, const N: usize> {
 impl<I, L, G, const N: usize> !crate::Op<I> for ExchangedPrefix<'_, L, G, N> {}
 
 impl<'i, 'p, R: AxisName, W: AxisName, G: Extents, L, E, State, O, const N: usize>
-    Module<&'p BlockPrefix<&'i Split<R, W, N>, R, Rows<256>>, E, State>
+    Module<&'p Prefix<&'i Split<R, W, N>, R, G, Rows<256>>, E, State>
     for ExchangedPrefix<'_, L, G, N>
 where
     Parallel<N>: Placement,
@@ -209,19 +209,19 @@ where
         device: &mut Device,
         env: E,
         state: State,
-        input: &'p BlockPrefix<&'i Split<R, W, N>, R, Rows<256>>,
+        input: &'p Prefix<&'i Split<R, W, N>, R, G, Rows<256>>,
     ) -> Self::Output {
         const {
             assert!(R::SIZE.is_multiple_of(256));
             assert!(prefix::aligned::<G>(256));
         }
         let mut exchanged = Local::<R, W, N>::new();
-        Exchange::<Parallel<N>>::default().write_prefix::<bf16, R, W, G>(
+        Exchange::<Parallel<N>>::default().write_prefix::<bf16, R, W, G, Rows<256>>(
             device,
-            &input.interval().with(input.value()),
+            input,
             &mut exchanged,
         );
         self.operation
-            .forward(device, env, state, &input.with(&exchanged))
+            .forward(device, env, state, &input.prefix().with(&exchanged))
     }
 }

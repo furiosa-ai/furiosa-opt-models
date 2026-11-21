@@ -6,9 +6,9 @@
 use furiosa_opt_models::ops::attention::flash::{
     Compact, Duo, Head, Queries, Span, Tokens, Visible,
 };
-use furiosa_opt_models::ops::collective::{Exchange, Pieces};
+use furiosa_opt_models::ops::collective::{Exchange, Pieces, prefix};
 use furiosa_opt_models::tensor::axis::Rows;
-use furiosa_opt_models::tensor::live::Live;
+use furiosa_opt_models::tensor::live::{BlockPrefix, Live};
 use furiosa_opt_models::tensor::parallel::{Parallel, Part, Shard};
 use furiosa_opt_models::tensor::scalar::Value;
 use furiosa_opt_models::{Module, Op};
@@ -25,13 +25,15 @@ type Kv = Tokens<Spans, Pairs, Chips>;
 type Visibility = Visible<Spans, Chips>;
 type Split = HbmTensor<bf16, Chips, m![{ Symbol<QueryRows> }, { Symbol<Part<Width, 4>> }]>;
 type Output = HbmTensor<bf16, Chips, m![Capacity, Width]>;
+type Transfers = (Rows<9472>, (Rows<9728>, (Rows<9984>,)));
+type Work = prefix::Inputs<Capacity, Transfers, Rows<1>, Chips>;
 type Operands<'a> = (
     &'a Query,
     &'a Kv,
     &'a Kv,
     &'a Visibility,
     &'a Value<Chips>,
-    &'a Value<Chips>,
+    &'a Work,
 );
 
 const CHIPS: usize = 4;
@@ -58,7 +60,8 @@ impl<'a> Module<Operands<'a>, (), &'a mut Output> for AttentionExchange {
             assert!(Heads::SIZE == Pairs::SIZE * Duo::SIZE);
             assert!(Heads::SIZE * Head::SIZE == Part::<Width, 4>::SIZE);
         }
-        let work = work.extent::<m![Capacity]>();
+        let checked = work.read();
+        let work = checked.prefix().rows();
         let interval = Live::<(), QueryRows>::all().subrange(0, CHIPS * work);
         let attended = Op::forward(
             &Compact::<Heads, SCALE>::default(),
@@ -71,11 +74,9 @@ impl<'a> Module<Operands<'a>, (), &'a mut Output> for AttentionExchange {
         let attended: Split = unsafe { attended.reshape() };
         let exchange = Exchange::<Parallel<4>>::default();
         // The actual owned attention result feeds one Live exchange, within one compiled entry.
-        exchange.write_prefix::<bf16, Capacity, Width, (Rows<9472>, (Rows<9728>, (Rows<9984>,)))>(
+        exchange.write_prefix::<bf16, Capacity, Width, Transfers, Rows<1>>(
             device,
-            &Live::<(), Capacity>::all()
-                .subrange(0, work)
-                .with(&attended),
+            &checked.with(&attended),
             output,
         );
     }
@@ -320,7 +321,13 @@ async fn compact_live_attention_feeds_whole_exchange_in_one_module_launch() {
         let mut output: Output = buffer.try_into().unwrap();
         let (query, key, value, visible) = inputs(&mut device, work, keys).await;
         let key_count = scalar(&mut device, keys).await;
-        let work_count = scalar(&mut device, work).await;
+        let work_count = prefix::Prefix::<(), Capacity, Transfers, Rows<1>>::new(
+            BlockPrefix::try_over(work).unwrap(),
+        )
+        .unwrap()
+        .upload::<Chips>(&mut device)
+        .await
+        .unwrap();
         HostTensor::<bf16, m![{ Chips }, Capacity, Width]>::from_vec(std::iter::repeat_n(
             bf16::from_bits(POISON),
             CHIPS * Capacity::SIZE * Width::SIZE,

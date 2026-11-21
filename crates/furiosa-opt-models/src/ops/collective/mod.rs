@@ -605,9 +605,9 @@ pub(crate) mod tests {
 mod prefix_tests {
     //! Whole TDMA exchange of compact parts inside capacity-backed allocations.
 
-    use crate::ops::collective::{Exchange, Pieces};
+    use crate::ops::collective::{Exchange, Pieces, prefix};
     use crate::tensor::axis::Rows;
-    use crate::tensor::live::Live;
+    use crate::tensor::live::BlockPrefix;
     use crate::tensor::parallel::{Parallel, Part, Shard};
     use crate::tensor::scalar::Value;
     use furiosa_opt_std::prelude::*;
@@ -620,6 +620,7 @@ mod prefix_tests {
     type Output<C, W> = HbmTensor<bf16, Chips, m![C, W]>;
     type Inputs<A, B, E, W> = (Input<A, W>, Input<B, W>, Input<E, W>);
     type Outputs<A, B, E, W> = (Output<A, W>, Output<B, W>, Output<E, W>);
+    type Work<C, A, B, E> = prefix::Inputs<C, (A, (B, (E,))), Rows<1>, Chips>;
 
     #[device(chip = 4)]
     fn runtime_prefix<C: AxisName, W: AxisName, A: AxisName, B: AxisName, E: AxisName>(
@@ -645,14 +646,13 @@ mod prefix_tests {
         device: &mut Device,
         input: &Input<C, W>,
         output: &mut Output<C, W>,
-        rows: &Value<Chips>,
+        rows: &Work<C, A, B, E>,
         _geometries: &std::marker::PhantomData<(A, B, E)>,
     ) {
-        let rows = rows.extent::<m![C]>();
-        let exchange = Exchange::<Parallel<4>>::default();
-        exchange.write_prefix::<bf16, C, W, (A, (B, (E,)))>(
+        let rows = rows.read();
+        Exchange::<Parallel<4>>::default().write_prefix::<bf16, C, W, (A, (B, (E,))), Rows<1>>(
             device,
-            &Live::<(), C>::all().subrange(0, rows).with(input),
+            &rows.with(input),
             output,
         );
     }
@@ -704,6 +704,13 @@ mod prefix_tests {
                 .to_hbm(&mut device.pdma)
                 .await
                 .unwrap();
+            let checked_rows = prefix::Prefix::<(), C, (A, (B, (E,))), Rows<1>>::new(
+                BlockPrefix::try_over(work).unwrap(),
+            )
+            .unwrap()
+            .upload::<Chips>(&mut device)
+            .await
+            .unwrap();
             let input = input.into_buffer();
             let output = output.into_buffer();
             let capacity_input: Input<C, W> = input.alias(..).unwrap().try_into().unwrap();
@@ -756,7 +763,7 @@ mod prefix_tests {
                             &mut device,
                             &capacity_input,
                             &mut capacity_output,
-                            &rows,
+                            &checked_rows,
                             &geometries,
                         ),
                     )

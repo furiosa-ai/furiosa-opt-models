@@ -8,6 +8,7 @@ use furiosa_opt_models::load::{Checkpoint, Context, Load, Named};
 use furiosa_opt_models::modules::parallel::{Exchanged, ExchangedPrefix};
 use furiosa_opt_models::ops::attention::geometry::{Hidden, ProjectionWidth};
 use furiosa_opt_models::ops::collective::Pieces;
+use furiosa_opt_models::ops::collective::prefix;
 use furiosa_opt_models::ops::linear::{Grouped, grouped::Layout};
 use furiosa_opt_models::tensor::axis::Rows;
 use furiosa_opt_models::tensor::live::{BlockPrefix, Live};
@@ -67,19 +68,18 @@ where
 }
 
 #[device(chip = 4)]
-fn borrowed<R: AxisName, I: AxisName, O: AxisName, A: AxisName, D: AxisName, E: AxisName>(
+fn borrowed<R: AxisName, I: AxisName, O: AxisName, G: prefix::Extents>(
     device: &mut Device,
     weights: &Borrowed<'_, I, O>,
     input: &Split<R, I>,
-    blocks: &Value<Chips>,
+    blocks: &prefix::Inputs<R, G, B, Chips>,
     env: &Value<Chips>,
     state: &mut State<R, O>,
-    _geometries: &std::marker::PhantomData<(A, D, E)>,
 ) {
-    let prefix = BlockPrefix::<(), R, B>::read(blocks).with(input);
+    let prefix = blocks.read().with(input);
     let model = Exchanged::<_, Parallel<4>>::new(Writing(&weights.operation));
     model
-        .prefix::<(A, (D, (E,)))>()
+        .prefix::<G>()
         .forward(device, Reader(env), state, &prefix);
 }
 
@@ -88,10 +88,9 @@ fn owned<R: AxisName, I: AxisName, O: AxisName, S: AxisName>(
     device: &mut Device,
     weights: &Owned<I, O>,
     input: &Split<R, I>,
-    blocks: &Value<Chips>,
-    _geometry: &std::marker::PhantomData<S>,
+    blocks: &prefix::Inputs<R, (S,), B, Chips>,
 ) -> Local<R, O> {
-    let prefix = BlockPrefix::<(), R, B>::read(blocks).with(input);
+    let prefix = blocks.read().with(input);
     weights
         .prefix::<(S,)>()
         .forward(device, (), &mut (), &prefix)
@@ -209,10 +208,13 @@ async fn check<R: AxisName, I: AxisName, O: AxisName, A: AxisName, D: AxisName, 
         borrowed_weights.operation.0.tensor()
     ));
     let reference = reference::<I>();
-    let geometries = std::marker::PhantomData::<(A, D, E)>;
     for &work in works {
         let prefix = BlockPrefix::<(), R, B>::try_over(work).unwrap();
-        let count = scalar(&mut device, [prefix.blocks() as i32; CHIPS]).await;
+        let count = prefix::Prefix::<(), R, (A, (D, (E,))), B>::new(prefix)
+            .unwrap()
+            .upload::<Chips>(&mut device)
+            .await
+            .unwrap();
         let input = input::<R, I>(&mut device, work).await;
         let witness = [11, 19, 23, 31];
         let env = scalar(&mut device, witness).await;
@@ -233,7 +235,6 @@ async fn check<R: AxisName, I: AxisName, O: AxisName, A: AxisName, D: AxisName, 
                 &count,
                 &env,
                 &mut state,
-                &geometries,
             ),
         )
         .await
@@ -267,18 +268,15 @@ async fn check<R: AxisName, I: AxisName, O: AxisName, A: AxisName, D: AxisName, 
             );
         }
         if work == A::SIZE {
-            let output = launch(
-                owned,
-                (
-                    &mut device,
-                    &weights,
-                    &input,
-                    &count,
-                    &std::marker::PhantomData::<A>,
-                ),
-            )
-            .await
-            .unwrap();
+            let owned_count =
+                prefix::Prefix::<(), R, (A,), B>::new(BlockPrefix::try_over(work).unwrap())
+                    .unwrap()
+                    .upload::<Chips>(&mut device)
+                    .await
+                    .unwrap();
+            let output = launch(owned, (&mut device, &weights, &input, &owned_count))
+                .await
+                .unwrap();
             // Only the initialized prefix is read: owned allocation tails are unspecified.
             let bytes = output
                 .into_buffer()
@@ -309,7 +307,7 @@ fn named_owned_and_borrowed_views_keep_the_output_independent_of_exchange_storag
     fn view<M>()
     where
         for<'i, 'p, 's> M: Module<
-                &'p BlockPrefix<&'i Split<R, I>, R, B>,
+                &'p prefix::Prefix<&'i Split<R, I>, R, (Rows<9472>,), B>,
                 (),
                 &'s mut (),
                 Output = Live<Local<R, O>, R>,
