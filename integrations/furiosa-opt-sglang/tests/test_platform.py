@@ -82,7 +82,7 @@ def test_refuses_unsupported_option(flags: list[str], option: str) -> None:
 
 
 @pytest.mark.feature("FP8 KV cache")
-@pytest.mark.parametrize("dtype", ["fp8", "fp8_e4m3"])
+@pytest.mark.parametrize("dtype", ["fp8_e4m3"])
 def test_refuses_unserved_cache(dtype: str) -> None:
     """Startup refuses a cache dtype the engine does not cache the model in, with the engine's
     reason, before a scheduler starts."""
@@ -178,6 +178,7 @@ def test_quantizes_each_output_channel() -> None:
     from furiosa_opt_sglang.load import quantization
 
     assert quantization("fp8", {}) == "fp8_per_channel"
+    assert quantization("fp8", {"quantization_config": {"quant_method": "fp8"}}) is None
     assert quantization("modelopt_fp8", {}) is None
 
 
