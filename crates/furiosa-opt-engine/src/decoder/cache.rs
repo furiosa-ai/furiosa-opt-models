@@ -390,6 +390,7 @@ mod tests {
     #[test]
     fn sizes_each_layer_a_page_a_block() -> io::Result<()> {
         let mut spec = paged(64, 0..2);
+        spec.layer_count = 3;
         spec.pools.push(pool(16, 32));
         spec.groups.push(Group {
             pool: 1,

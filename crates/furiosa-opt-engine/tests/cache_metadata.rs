@@ -133,7 +133,9 @@ fn rejects_overlapping_or_mis_sized_page_formats() {
 fn refuses_recurrent_and_encoder_cache_kinds_for_serving() {
     for kind in [Kind::State, Kind::Cross { length: 32 }] {
         let mut cache = spec();
-        cache.groups[0].kind = kind;
+        for group in &mut cache.groups {
+            group.kind = kind;
+        }
         let error = cache.validate_for_serving().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
         assert_eq!(
