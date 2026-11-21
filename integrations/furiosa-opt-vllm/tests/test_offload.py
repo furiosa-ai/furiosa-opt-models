@@ -243,6 +243,7 @@ def test_raises_failed_copy() -> None:
 def test_poll_drains_every_copy_of_a_failed_job() -> None:
     """A poll that finds one failed copy waits for every submitted copy before it raises."""
     copies = (Copies(), Copies(RuntimeError("copy failed")), Copies())
+    copies[0].ended = True
     running = worker.Jobs()
     running.submit(0, copies, 192)
 
