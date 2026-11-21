@@ -346,6 +346,15 @@ def nixl_order(block: torch.Tensor) -> torch.Tensor:
     )
 
 
+@pytest.mark.parametrize(
+    ("tokens", "block_size", "expected"),
+    [(0, 8, 0), (1, 8, 1), (7, 8, 1), (8, 8, 1), (9, 8, 2), (16, 8, 2)],
+    ids=["empty", "one-token", "before-boundary", "at-boundary", "after-boundary", "multiple"],
+)
+def test_counts_blocks_needed_for_token_length(tokens: int, block_size: int, expected: int) -> None:
+    assert connector.blocks_for_tokens(tokens, block_size) == expected
+
+
 def random_blocks(seed: int, shape: tuple[int, ...]) -> torch.Tensor:
     generator = torch.Generator().manual_seed(seed)
     return torch.randn(shape, generator=generator).to(torch.bfloat16)
@@ -507,9 +516,7 @@ def test_host_tier_stores_and_loads_each_chip_through_its_row(
     size = SPEC.page_size_bytes
     cache = MultiCache(
         [
-            MultiHbm(
-                tuple(np.zeros(BLOCKS * size, np.uint8) for _ in two_chips), two_chips
-            )
+            MultiHbm(tuple(np.zeros(BLOCKS * size, np.uint8) for _ in two_chips), two_chips)
             for _ in NAMES
         ]
     )
