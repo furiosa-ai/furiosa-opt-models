@@ -207,9 +207,10 @@ impl<P: Panel> Gathered<P> {
     }
 }
 
-/// Each of `T` tiles' scores over a `P`-wide block, one row of 128 keys per panel.
+/// Each of `T` tiles' scaled scores over a `P`-wide block, one row of 128 keys per panel, in F32
+/// until their exponents, as a work item keeps them.
 pub(crate) type PanelScores<KvHeads, Groups, P, T> = DmTensor<
-    bf16,
+    f32,
     Chip,
     Cluster<KvHeads>,
     Slice<KvHeads, Groups>,
@@ -224,25 +225,58 @@ pub(crate) type Partials<KvHeads, Groups, Head, P, T> = DmTensor<
     m![{ Tiles<T> }, { Panels<P> }, Rows % 8, Head],
 >;
 
-/// Each of `T` tiles' scores over a `P`-wide block of staged keys.
-struct ScoreStaged<P>(PhantomData<P>);
+/// The score windows of a `P`-wide block: its 512-key windows, or the block when it is narrower.
+pub(crate) struct ScoreWindows<P>(PhantomData<fn() -> P>);
+
+impl<P> Clone for ScoreWindows<P> {
+    fn clone(&self) -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<P> std::fmt::Debug for ScoreWindows<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ScoreWindows")
+    }
+}
+
+impl<P: Panel> AxisName for ScoreWindows<P> {
+    // Each count its own name, as `Whole` names each width's block count.
+    const NAME: Ident = match Self::SIZE {
+        1 => Ident::new("ScoreWindow"),
+        2 => Ident::new("ScoreWindows2"),
+        _ => Ident::new("ScoreWindows4"),
+    };
+    const SIZE: usize =
+        <P::Keys as AxisName>::SIZE / <<P::Window as Panel>::Keys as AxisName>::SIZE;
+}
+
+type Windowed<P> = m![{ Symbol<ScoreWindows<P>> }];
+type WindowSlot<P> = m![{ Symbol<ScoreWindows<P>> } = 1 #{!} ({ Symbol<ScoreWindows<P>> })];
+
+/// Each of `T` tiles' probabilities over a `P`-wide block of staged keys, exponentiated against
+/// the tile's running lse. Each score window's scores stay F32 from their contraction to their
+/// exponents, so a block's scores take at most 512 F32 keys a row however wide the block.
+struct Probabilities<P>(PhantomData<P>);
 
 impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName>
     Op<(
         &Attention<KvHeads, Groups, Head>,
         &Staged<KvHeads, Head, P>,
         &Group<KvHeads, Groups, Head, T>,
-    )> for ScoreStaged<P>
+        &state::Running<KvHeads, Groups, T>,
+    )> for Probabilities<P>
 {
-    type Output = PanelScores<KvHeads, Groups, P, T>;
+    type Output = Keyed<KvHeads, Groups, P, T>;
 
     fn forward(
         &self,
         context: &mut Device,
-        (attention, keys, query): (
+        (attention, keys, query, running): (
             &Attention<KvHeads, Groups, Head>,
             &Staged<KvHeads, Head, P>,
             &Group<KvHeads, Groups, Head, T>,
+            &state::Running<KvHeads, Groups, T>,
         ),
     ) -> Self::Output {
         let fill = |context: &mut Device, s| {
@@ -252,65 +286,54 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName>
                 keys.view().tile::<Panels<P>, 1, KeyTile<Head, P>>(s),
             )
         };
-        let mut scores = PanelScores::<KvHeads, Groups, P, T>::new();
-        // Each panel's fill is issued before the previous panel's contractions, so the two overlap.
-        let first = fill(context, 0);
-        Op::forward(
-            &ScoreBlock::<P>(PhantomData),
-            context,
-            (attention, (first, fill), query, &mut scores),
-        );
-        scores
-    }
-}
-
-/// Each tile's scores exponentiated against the tile's running lse.
-struct Probabilities<P>(PhantomData<P>);
-
-impl<KvHeads: AxisName, Groups: AxisName, P: Panel, T: AxisName>
-    Op<(
-        &PanelScores<KvHeads, Groups, P, T>,
-        &state::Running<KvHeads, Groups, T>,
-    )> for Probabilities<P>
-{
-    type Output = Keyed<KvHeads, Groups, P, T>;
-
-    fn forward(
-        &self,
-        context: &mut Device,
-        (scores, running): (
-            &PanelScores<KvHeads, Groups, P, T>,
-            &state::Running<KvHeads, Groups, T>,
-        ),
-    ) -> Self::Output {
-        // SAFETY: the panel axis is outer to Cache, so each row keeps every key in its block order.
-        let rows = unsafe {
-            scores
-                .view()
-                .reshape::<
-                    Chip,
-                    Cluster<KvHeads>,
-                    Slice<KvHeads, Groups>,
-                    m![{ Tiles<T> }, Rows % 8, { Keys<P> }],
-                >()
-        };
         let mut probabilities = Keyed::<KvHeads, Groups, P, T>::new();
+        // One fill closure serves every window: a closure made inside an unrolled loop does not
+        // lower.
         #[unroll]
-        for t in 0..T::SIZE {
-            // The running lse replaces the block maximum as the shift: only a score 88 above
-            // overflows.
-            let top = Op::forward(
-                &state::Operand,
-                &mut *context,
-                running
-                    .view()
-                    .tile::<m![{ Symbol<T> }], 1, TileStatistic<T>>(t),
-            );
+        for w in 0..ScoreWindows::<P>::SIZE {
+            let first = w * <P::Window as Panel>::Span::SIZE;
+            let mut scores = PanelScores::<KvHeads, Groups, P::Window, T>::new();
+            // Each panel's fill is issued before the previous panel's contractions, so the two
+            // overlap.
+            let key = fill(context, first);
             Op::forward(
-                &panel::Exponents,
+                &ScoreBlock::<P::Window>(PhantomData),
                 &mut *context,
-                ((rows.clone(), &top), &mut probabilities, t),
+                (attention, (key, &fill, first), query, &mut scores),
             );
+            // SAFETY: the panel axis is outer to Cache, so each row keeps every key in its window's
+            // order.
+            let rows = unsafe {
+                scores.view().reshape::<Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>,
+                    m![{ Tiles<T> }, Rows % 8, { Keys<P::Window> }]>()
+            };
+            #[unroll]
+            for t in 0..T::SIZE {
+                // The running lse replaces the block maximum as the shift: only a score 88 above
+                // overflows.
+                let top = Op::forward(
+                    &state::Operand,
+                    &mut *context,
+                    running
+                        .view()
+                        .tile::<m![{ Symbol<T> }], 1, TileStatistic<T>>(t),
+                );
+                // SAFETY: a window's keys are consecutive in each row, the windows in key order.
+                let slot = unsafe {
+                    probabilities.view_mut()
+                    .reshape::<Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>,
+                        m![{ Tiles<T> }, Rows % 8, { Windowed<P> }, { Keys<P::Window> }]>()
+                    .tile::<m![{ Symbol<T> }], 1,
+                        m![{ TileSlot<T> }, Rows % 8, { Windowed<P> }, { Keys<P::Window> }]>(t)
+                    .tile::<Windowed<P>, 1,
+                        m![{ TileSlot<T> }, Rows % 8, { WindowSlot<P> }, { Keys<P::Window> }]>(w)
+                };
+                Op::forward(
+                    &panel::Exponents,
+                    &mut *context,
+                    ((rows.clone(), &top), slot, t),
+                );
+            }
         }
         probabilities
     }
@@ -427,15 +450,10 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName,
             .to_dm_view(&mut context.tdma, keys.view_mut());
         rows.tile::<m![KeyValue], 1, m![{ Panels<P> }, Cache % Block, KeyValue = 1 # 2, Head]>(1)
             .to_dm_view(&mut context.tdma, values.view_mut());
-        let scores = Op::forward(
-            &ScoreStaged::<P>(PhantomData),
-            &mut *context,
-            (attention, &keys, query),
-        );
         let probabilities = Op::forward(
             &Probabilities::<P>(PhantomData),
             &mut *context,
-            (&scores, &*running),
+            (attention, &keys, query, &*running),
         );
         let partials = Op::forward(
             &WeighBlock::<P>(PhantomData),
@@ -530,11 +548,6 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, T: AxisName>
             .to_dm_view(&mut context.tdma, keys.view_mut());
         rows.tile::<m![KeyValue], 1, m![Span1024, Cache % Block, KeyValue = 1 # 2, Head]>(1)
             .to_dm_view(&mut context.tdma, values.view_mut());
-        let scores = Op::forward(
-            &ScoreStaged::<Wide>(PhantomData),
-            &mut *context,
-            (attention, &keys, query),
-        );
         let mut transposed = DmTensor::<
             bf16,
             Chip,
@@ -577,17 +590,18 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, T: AxisName>
                 .collect::<m![Head % 8, Head % 16 / 8, Span1024, Cache / 16], m![Cache % 16]>()
                 .to_trf()
         };
-        // The first fill runs under the softmax, which leaves the register file idle.
+        // The values transpose under the first window's key fill; the first value fill follows the
+        // softmax, whose key fills hold the register file until then.
+        let probabilities = Op::forward(
+            &Probabilities::<Wide>(PhantomData),
+            &mut *context,
+            (attention, &keys, query, &*running),
+        );
         let mut value = fill_dims(
             context,
             transposed
                 .view()
                 .tile::<m![Head / 16], 1, DimsTile<Head>>(0),
-        );
-        let probabilities = Op::forward(
-            &Probabilities::<Wide>(PhantomData),
-            &mut *context,
-            (&scores, &*running),
         );
         // SAFETY: the inverse relabel of the score rows.
         let panels = unsafe {
@@ -675,13 +689,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName,
         &Attention<KvHeads, Groups, Head>,
         DmTensorView<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Q>,
         &fresh::Keys<KvHeads, Groups, Head>,
-        &mut DmTensor<
-            bf16,
-            Chip,
-            Cluster<KvHeads>,
-            Slice<KvHeads, Groups>,
-            m![{ Tiles<T> }, Rows % 8, { Panels<P> }, Cache],
-        >,
+        &mut PanelScores<KvHeads, Groups, P, T>,
         usize,
     )> for Score<P>
 {
@@ -694,13 +702,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName,
             &Attention<KvHeads, Groups, Head>,
             DmTensorView<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Q>,
             &fresh::Keys<KvHeads, Groups, Head>,
-            &mut DmTensor<
-                bf16,
-                Chip,
-                Cluster<KvHeads>,
-                Slice<KvHeads, Groups>,
-                m![{ Tiles<T> }, Rows % 8, { Panels<P> }, Cache],
-            >,
+            &mut PanelScores<KvHeads, Groups, P, T>,
             usize,
         ),
     ) {
@@ -719,7 +721,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName,
     }
 }
 
-/// One panel's scaled scores of the `T` tiles `query` holds, one contraction, into `scores`.
+/// One panel's scaled scores of the `T` tiles `query` holds in F32, one contraction, into `scores`.
 pub(crate) struct ScoreTiles<T>(pub(crate) PhantomData<T>);
 
 impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, T: AxisName, Q: M, E: M>
@@ -727,7 +729,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, T: AxisName, Q: M, E: 
         &Attention<KvHeads, Groups, Head>,
         DmTensorView<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Q>,
         &fresh::Keys<KvHeads, Groups, Head>,
-        DmTensorViewMut<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, E>,
+        DmTensorViewMut<'_, f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, E>,
     )> for ScoreTiles<T>
 {
     type Output = ();
@@ -739,7 +741,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, T: AxisName, Q: M, E: 
             &Attention<KvHeads, Groups, Head>,
             DmTensorView<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, Q>,
             &fresh::Keys<KvHeads, Groups, Head>,
-            DmTensorViewMut<'_, bf16, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, E>,
+            DmTensorViewMut<'_, f32, Chip, Cluster<KvHeads>, Slice<KvHeads, Groups>, E>,
         ),
     ) {
         context.main.begin(query)
@@ -762,7 +764,6 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, T: AxisName, Q: M, E: 
             m![Cache % 8]>()
         .vector_final()
         .commit_trim::<m![Cache % 8]>()
-        .commit_cast::<bf16>()
         .commit_view(scores);
     }
 }
@@ -955,8 +956,7 @@ impl<KvHeads: AxisName, Groups: AxisName> Op<(&Scores<KvHeads, Groups>, &TailMas
                         .view()
                         .tile::<m![Rows % 8], 1, m![Rows % 8 = 1 # 8, Cache]>(row),
                 )
-                .fetch::<m![Cache / 16], m![Cache % 16]>()
-                .fetch_cast::<f32>()
+                .fetch::<m![Cache / 8], m![Cache % 8]>()
                 .collect::<m![Cache / 8], m![Cache % 8]>()
                 .vector_init()
                 .vector_tagged(mask)
@@ -969,7 +969,6 @@ impl<KvHeads: AxisName, Groups: AxisName> Op<(&Scores<KvHeads, Groups>, &TailMas
                     Branched::imm(state::PRESENT, f32::NEG_INFINITY),
                 )
                 .vector_final()
-                .cast::<bf16, m![Cache % 8 # 16]>()
                 .commit_trim::<m![Cache % 8]>()
                 .commit_view(
                     output
