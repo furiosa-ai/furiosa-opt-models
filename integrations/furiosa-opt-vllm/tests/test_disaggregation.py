@@ -281,14 +281,16 @@ def test_sends_every_named_block_in_nixl_order(chip: Chip) -> None:
         _ = cache.blocks_of(index).copy_(random_blocks(index, (BLOCKS, TOKENS, 2, HEADS, WIDTH)))
     copier = layers(Holder(cache))
     sent = host_buffers(copier.views)
-    blocks = [5, 6, 2]
-    copier.copy(copier.views, sent, blocks, blocks, "d2h")
+    source_ids, target_ids = [5, 6, 2], [3, 0, 4]
+    copier.copy(copier.views, sent, source_ids, target_ids, "d2h")
     for index, name in enumerate(NAMES):
+        expected_by_target = {
+            target: nixl_order(cache.blocks_of(index)[source])
+            for source, target in zip(source_ids, target_ids, strict=True)
+        }
         for block in range(BLOCKS):
-            expected = (
-                nixl_order(cache.blocks_of(index)[block])
-                if block in blocks
-                else torch.zeros(HEADS, TOKENS, 2 * WIDTH, dtype=torch.bfloat16)
+            expected = expected_by_target.get(
+                block, torch.zeros(HEADS, TOKENS, 2 * WIDTH, dtype=torch.bfloat16)
             )
             assert torch.equal(sent[name][block], expected), (name, block)
 
@@ -302,16 +304,18 @@ def test_receives_every_named_block_before_returning(chip: Chip) -> None:
         name: random_blocks(index, (BLOCKS, HEADS, TOKENS, 2 * WIDTH))
         for index, name in enumerate(NAMES)
     }
-    blocks = [1, 2, 7]
-    copier.copy(received, copier.views, blocks, blocks, "h2d")
+    source_ids, target_ids = [1, 2, 7], [4, 0, 6]
+    copier.copy(received, copier.views, source_ids, target_ids, "h2d")
     assert chip.settled()
     for index, name in enumerate(NAMES):
+        expected_by_target = {
+            target: received[name][source]
+            for source, target in zip(source_ids, target_ids, strict=True)
+        }
         for block in range(BLOCKS):
             actual = nixl_order(cache.blocks_of(index)[block])
-            expected = (
-                received[name][block]
-                if block in blocks
-                else torch.zeros(HEADS, TOKENS, 2 * WIDTH, dtype=torch.bfloat16)
+            expected = expected_by_target.get(
+                block, torch.zeros(HEADS, TOKENS, 2 * WIDTH, dtype=torch.bfloat16)
             )
             assert torch.equal(actual, expected), (name, block)
 
