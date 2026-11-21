@@ -401,9 +401,26 @@ def connector(name: str, module: str | None = None) -> KVTransferConfig:
             Ignored(kv_offloading_size=1, kv_transfer_config=extra(blocks_per_chunk=2)),
             {"blocks_per_chunk": 2},
         ),
+        (
+            Ignored(
+                kv_offloading_size=1,
+                kv_transfer_config=extra(
+                    secondary_tiers=[{"type": "fs", "root_dir": "/cache"}],
+                    spec_name=None,
+                ),
+            ),
+            {
+                "secondary_tiers": [{"type": "fs", "root_dir": "/cache"}],
+                "spec_name": "TieringOffloadingSpec",
+            },
+        ),
+        (
+            Ignored(kv_offloading_size=1, kv_transfer_config=extra(canonical_layout=True)),
+            {"canonical_layout": True},
+        ),
         (Ignored(kv_transfer_config=connector("RNGDOffloadingConnector", offload.__name__)), {}),
     ],
-    ids=["size", "size-and-options", "connector"],
+    ids=["size", "size-and-options", "filesystem-tier", "canonical-layout", "connector"],
 )
 @pytest.mark.feature("KV cache offloading")
 def test_offloads_through_the_rngd_connector(
@@ -444,17 +461,10 @@ RANKS = "{}: vLLM awaits each rank; one worker drives all chips"
             + "selects",
         ),
         (
-            Ignored(
-                kv_offloading_size=1, kv_transfer_config=extra(spec_name="TieringOffloadingSpec")
-            ),
+            Ignored(kv_offloading_size=1, kv_transfer_config=extra(spec_name="ExampleSpec")),
             "kv_connector_extra_config",
-            "keeps offloaded blocks in host memory by vLLM's CPUOffloadingSpec, so it takes no "
-            + "other spec_name or spec_module_path",
-        ),
-        (
-            Ignored(kv_offloading_size=1, kv_transfer_config=extra(canonical_layout=True)),
-            "kv_connector_extra_config",
-            "keeps offloaded blocks in the device's order, so it takes no canonical_layout",
+            "uses vLLM's CPUOffloadingSpec for host offload or TieringOffloadingSpec when "
+            + "secondary_tiers are configured",
         ),
         (
             Ignored(
@@ -490,8 +500,7 @@ RANKS = "{}: vLLM awaits each rank; one worker drives all chips"
         "lmcache",
         "vllm-connector",
         "module",
-        "tiering",
-        "canonical",
+        "unsupported-spec",
         "recompute",
         "tp",
         "pp",

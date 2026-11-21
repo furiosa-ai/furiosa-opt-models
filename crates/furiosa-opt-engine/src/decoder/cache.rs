@@ -11,27 +11,93 @@ use super::Decoder;
 use furiosa_opt_std::prelude::{Device, HbmBuffer};
 use std::any::Any;
 use std::io;
-use std::iter;
 use std::mem;
-use std::ops::{Deref, DerefMut, Range};
+use std::ops::{Deref, DerefMut};
 use std::sync::{Mutex, PoisonError};
 
 /// The cache a decoder's calls read: block formats, and the groups of layers that use them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheSpec {
+    /// Number of decoder layers covered by the groups.
+    pub layer_count: usize,
     /// Block formats, which groups name by index.
     pub pools: Vec<Pool>,
-    /// The cached layers, a kind and a pool each; a request names its blocks of every group.
+    /// Engine storage groups. Groups with the same `vllm_group` use one logical vLLM block table.
     pub groups: Vec<Group>,
 }
 
 /// A block format.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pool {
     /// Tokens one block holds.
     pub block: usize,
     /// Bytes one block of one layer spans: a page.
     pub bytes: usize,
+    /// Logical page shape and byte strides, independent of the physical allocation address.
+    pub format: PageFormat,
+}
+
+/// The logical tensor format of one cache page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PageFormat {
+    /// Bytes occupied by one element.
+    pub element_bytes: usize,
+    /// Tensor dimensions, with the token-block dimension first.
+    pub shape: Vec<usize>,
+    /// Byte stride of each dimension.
+    pub strides: Vec<usize>,
+}
+
+impl PageFormat {
+    /// A contiguous row-major page format.
+    pub fn contiguous(shape: Vec<usize>, element_bytes: usize) -> Self {
+        let mut stride = element_bytes;
+        let mut strides = vec![0; shape.len()];
+        for (dim, item) in shape.iter().zip(strides.iter_mut()).rev() {
+            *item = stride;
+            stride = stride.saturating_mul(*dim);
+        }
+        Self {
+            element_bytes,
+            shape,
+            strides,
+        }
+    }
+
+    fn validate(&self, page_bytes: usize, block: usize) -> io::Result<()> {
+        let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+        if self.element_bytes == 0
+            || self.shape.is_empty()
+            || self.shape.len() != self.strides.len()
+        {
+            return Err(invalid("cache page format has malformed dimensions"));
+        }
+        if self.shape[0] != block || self.shape.iter().any(|&dim| dim == 0) {
+            return Err(invalid("cache page format does not match its token block"));
+        }
+        // Validate dimensions in physical stride order so axis permutations remain legal.
+        let mut axes: Vec<_> = (0..self.shape.len()).collect();
+        axes.sort_unstable_by_key(|&axis| self.strides[axis]);
+        let mut extent = self.element_bytes;
+        for axis in axes {
+            let dim = self.shape[axis];
+            let stride = self.strides[axis];
+            if stride % self.element_bytes != 0 {
+                return Err(invalid("cache page strides do not align to element size"));
+            }
+            if stride < extent {
+                return Err(invalid("cache page strides overlap logical elements"));
+            }
+            extent = (dim - 1)
+                .checked_mul(stride)
+                .and_then(|span| span.checked_add(extent))
+                .ok_or_else(|| invalid("cache page format byte span overflows"))?;
+        }
+        if extent != page_bytes {
+            return Err(invalid("cache page format span differs from its pool size"));
+        }
+        Ok(())
+    }
 }
 
 /// Layers whose cache has one kind and takes its blocks from one pool.
@@ -39,8 +105,10 @@ pub struct Pool {
 pub struct Group {
     /// Index of the pool in `CacheSpec::pools`.
     pub pool: usize,
-    /// The model layers the group caches.
-    pub layers: Range<usize>,
+    /// Stable model layer IDs held by this group; they need not be contiguous.
+    pub layers: Vec<usize>,
+    /// Logical vLLM block-table group this engine storage group belongs to.
+    pub vllm_group: usize,
     pub kind: Kind,
     /// Positions a row attends back to in a sliding window; `None` attends the whole history.
     pub window: Option<usize>,
@@ -64,34 +132,107 @@ impl CacheSpec {
         model.limits().cache
     }
 
-    /// Bytes of each layer's storage of `blocks` blocks, group by group. Refuses no blocks, a
-    /// group of no pool, a pool of empty blocks, and a page whose byte offset passes I32.
-    fn sizes(&self, blocks: usize) -> io::Result<Vec<usize>> {
+    /// Validate model-neutral layer, pool and logical-group metadata.
+    pub fn validate(&self) -> io::Result<()> {
         let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+        if self.layer_count == 0 || self.groups.is_empty() {
+            return Err(invalid("cache spec has no layers or groups"));
+        }
+        for pool in &self.pools {
+            if pool.block == 0 || pool.bytes == 0 {
+                return Err(invalid("cache pool has empty blocks"));
+            }
+            pool.format.validate(pool.bytes, pool.block)?;
+        }
+        let mut layer_owners = vec![None; self.layer_count];
+        let mut logical_groups = std::collections::BTreeMap::new();
+        for (index, group) in self.groups.iter().enumerate() {
+            let pool = self
+                .pools
+                .get(group.pool)
+                .ok_or_else(|| invalid("cache group names no pool"))?;
+            if group.layers.is_empty() {
+                return Err(invalid("cache group has no layers"));
+            }
+            match group.kind {
+                Kind::Paged if group.window.is_some_and(|window| window == 0) => {
+                    return Err(invalid("paged cache group has an empty sliding window"));
+                }
+                Kind::State | Kind::Cross { .. } if group.window.is_some() => {
+                    return Err(invalid("non-attention cache group has a sliding window"));
+                }
+                Kind::Paged | Kind::State | Kind::Cross { .. } => {}
+            }
+            for &layer in &group.layers {
+                let owner = layer_owners
+                    .get_mut(layer)
+                    .ok_or_else(|| invalid("cache group names an unknown layer"))?;
+                if owner.replace(index).is_some() {
+                    return Err(invalid("cache layer appears in more than one group"));
+                }
+            }
+            let semantics = (pool.block, group.kind, group.window);
+            if logical_groups
+                .insert(group.vllm_group, semantics)
+                .is_some_and(|previous| previous != semantics)
+            {
+                return Err(invalid(
+                    "engine groups of one vLLM group disagree on block size or attention kind",
+                ));
+            }
+        }
+        if layer_owners.iter().any(Option::is_none) {
+            return Err(invalid("cache spec does not cover every model layer"));
+        }
+        if logical_groups
+            .keys()
+            .copied()
+            .enumerate()
+            .any(|(expected, actual)| expected != actual)
+        {
+            return Err(invalid("vLLM cache group IDs are not contiguous"));
+        }
+        Ok(())
+    }
+
+    /// Validate metadata and reject cache kinds the decoder serving path cannot execute.
+    pub fn validate_for_serving(&self) -> io::Result<()> {
+        self.validate()?;
+        if self.groups.iter().any(|group| group.kind != Kind::Paged) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "decoder serving supports paged cache groups only",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Bytes of each layer's storage of `blocks` blocks. Refuses invalid metadata, no blocks, or
+    /// a page whose base-relative byte offset passes the signed-I32 range.
+    pub fn layer_sizes(&self, blocks: usize) -> io::Result<Vec<usize>> {
+        let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+        self.validate()?;
         if blocks == 0 {
             return Err(invalid("cache blocks must be positive"));
         }
-        let groups = (self.groups.iter())
-            .map(|group| {
-                let pool = (self.pools.get(group.pool))
-                    .ok_or_else(|| invalid("cache group names no pool"))?;
-                if pool.block == 0 || pool.bytes == 0 {
-                    return Err(invalid("cache pool has empty blocks"));
-                }
-                // A device table holds a page's byte offset within its layer as an I32.
-                let size = (blocks.checked_mul(pool.bytes))
-                    .filter(|&size| size <= 1 << 31)
-                    .ok_or_else(|| invalid("cache blocks pass I32 byte offsets"))?;
-                Ok(iter::repeat_n(size, group.layers.len()))
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        Ok(groups.into_iter().flatten().collect())
+        let mut sizes = vec![0; self.layer_count];
+        for group in &self.groups {
+            let pool = &self.pools[group.pool];
+            // A device table holds a page's byte offset within its layer as an I32.
+            let size = (blocks.checked_mul(pool.bytes))
+                .filter(|&size| size <= 1 << 31)
+                .ok_or_else(|| invalid("cache blocks pass I32 byte offsets"))?;
+            for &layer in &group.layers {
+                sizes[layer] = size;
+            }
+        }
+        Ok(sizes)
     }
 }
 
 /// The storage of a spec, with the views one decoder keeps of it.
 pub struct Cache {
-    /// Each layer's pages back to back, group by group in spec order.
+    /// Each model layer's pages back to back, indexed by stable model layer ID.
     layers: Vec<HbmBuffer>,
     /// Blocks per layer.
     blocks: usize,
@@ -114,7 +255,8 @@ impl Cache {
     /// `blocks` blocks of every layer `spec` lists, on `device`; block `j` of a layer is its bytes
     /// `j * page..(j + 1) * page`.
     pub fn new(device: &Device, spec: &CacheSpec, blocks: usize) -> io::Result<Self> {
-        let layers = (spec.sizes(blocks)?.into_iter())
+        spec.validate_for_serving()?;
+        let layers = (spec.layer_sizes(blocks)?.into_iter())
             .map(|size| HbmBuffer::alloc(device, size).map_err(io::Error::other))
             .collect::<io::Result<_>>()?;
         Ok(Self {
@@ -125,7 +267,7 @@ impl Cache {
         })
     }
 
-    /// Each layer's storage, group by group in spec order.
+    /// Each layer's storage, indexed by stable model layer ID.
     pub fn layers(&self) -> &[HbmBuffer] {
         &self.layers
     }
@@ -204,14 +346,26 @@ impl<V: Send + 'static> Drop for Lent<'_, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Range;
+
+    fn pool(block: usize, bytes: usize) -> Pool {
+        Pool {
+            block,
+            bytes,
+            format: PageFormat::contiguous(vec![block, bytes / block], 1),
+        }
+    }
 
     /// One pool of `bytes`-byte pages, one paged group over `layers`.
     fn paged(bytes: usize, layers: Range<usize>) -> CacheSpec {
+        let layer_count = layers.end;
         CacheSpec {
-            pools: vec![Pool { block: 16, bytes }],
+            layer_count,
+            pools: vec![pool(16, bytes)],
             groups: vec![Group {
                 pool: 0,
-                layers,
+                layers: layers.collect(),
+                vllm_group: 0,
                 kind: Kind::Paged,
                 window: None,
             }],
@@ -223,7 +377,11 @@ mod tests {
         Cache {
             layers: Vec::new(),
             blocks: 1,
-            spec: paged(64, 0..0),
+            spec: CacheSpec {
+                layer_count: 0,
+                pools: vec![pool(16, 64)],
+                groups: Vec::new(),
+            },
             views: Mutex::new(Views::Empty),
         }
     }
@@ -232,17 +390,15 @@ mod tests {
     #[test]
     fn sizes_each_layer_a_page_a_block() -> io::Result<()> {
         let mut spec = paged(64, 0..2);
-        spec.pools.push(Pool {
-            block: 16,
-            bytes: 32,
-        });
+        spec.pools.push(pool(16, 32));
         spec.groups.push(Group {
             pool: 1,
-            layers: 2..3,
+            layers: vec![2],
+            vllm_group: 1,
             kind: Kind::State,
             window: None,
         });
-        assert_eq!(spec.sizes(3)?, [192, 192, 96]);
+        assert_eq!(spec.layer_sizes(3)?, [192, 192, 96]);
         Ok(())
     }
 
@@ -270,11 +426,155 @@ mod tests {
             ),
         ];
         for (spec, blocks, message) in cases {
-            let error = spec.sizes(blocks).expect_err(message);
+            let error = spec.layer_sizes(blocks).expect_err(message);
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{message}");
             assert_eq!(error.to_string(), message);
         }
-        assert!(paged(64, 0..1).sizes(1 << 25).is_ok());
+        assert!(paged(64, 0..1).layer_sizes(1 << 25).is_ok());
+    }
+
+    /// Descriptors cover every stable model layer once, and logical vLLM groups have one block
+    /// size and attention kind even when multiple engine groups use different page formats.
+    #[test]
+    fn validates_layer_and_logical_group_mapping() {
+        let mut spec = CacheSpec {
+            layer_count: 3,
+            pools: vec![pool(16, 64), pool(16, 32)],
+            groups: vec![
+                Group {
+                    pool: 0,
+                    layers: vec![0, 2],
+                    vllm_group: 0,
+                    kind: Kind::Paged,
+                    window: None,
+                },
+                Group {
+                    pool: 1,
+                    layers: vec![1],
+                    vllm_group: 0,
+                    kind: Kind::Paged,
+                    window: None,
+                },
+            ],
+        };
+        assert!(spec.validate().is_ok());
+
+        spec.groups[0].window = Some(0);
+        assert_eq!(
+            spec.validate().unwrap_err().to_string(),
+            "paged cache group has an empty sliding window"
+        );
+        spec.groups[0].window = None;
+
+        spec.groups[1].layers = vec![2];
+        assert_eq!(
+            spec.validate().unwrap_err().to_string(),
+            "cache layer appears in more than one group"
+        );
+        spec.groups[1].layers = vec![1];
+        spec.groups[1].window = Some(8);
+        assert_eq!(
+            spec.validate().unwrap_err().to_string(),
+            "engine groups of one vLLM group disagree on block size or attention kind"
+        );
+        spec.groups[1].window = None;
+        spec.groups[1].vllm_group = 2;
+        assert_eq!(
+            spec.validate().unwrap_err().to_string(),
+            "vLLM cache group IDs are not contiguous"
+        );
+        spec.groups[1].vllm_group = 0;
+        spec.groups[1].layers.clear();
+        assert_eq!(
+            spec.validate().unwrap_err().to_string(),
+            "cache group has no layers"
+        );
+        spec.groups[1].layers = vec![1];
+        spec.layer_count = 4;
+        assert_eq!(
+            spec.validate().unwrap_err().to_string(),
+            "cache spec does not cover every model layer"
+        );
+    }
+
+    /// Page tensor metadata cannot alias elements or claim a span different from its pool page.
+    #[test]
+    fn validates_page_shapes_and_byte_strides() {
+        let mut spec = paged(64, 0..1);
+        spec.pools[0].format.shape = vec![16, 2];
+        spec.pools[0].format.strides = vec![1, 1];
+        assert_eq!(
+            spec.validate().unwrap_err().to_string(),
+            "cache page strides overlap logical elements"
+        );
+        spec.pools[0].format = PageFormat {
+            element_bytes: 2,
+            shape: vec![16, 2],
+            strides: vec![8, 2],
+        };
+        assert_eq!(
+            spec.validate().unwrap_err().to_string(),
+            "cache page format span differs from its pool size"
+        );
+        spec.pools[0].format = PageFormat {
+            element_bytes: 2,
+            shape: vec![8, 8],
+            strides: vec![16, 2],
+        };
+        assert_eq!(
+            spec.validate().unwrap_err().to_string(),
+            "cache page format does not match its token block"
+        );
+    }
+
+    /// A valid cache page can permute its physical axes without aliasing its logical elements.
+    #[test]
+    fn validates_permuted_page_strides() {
+        let shape = [4, 2, 3, 5];
+        let orders = [[0, 1, 2, 3], [0, 2, 1, 3], [1, 0, 2, 3]];
+        for order in orders {
+            let mut strides = [0; 4];
+            let mut stride = 2;
+            for axis in order.into_iter().rev() {
+                strides[axis] = stride;
+                stride *= shape[axis];
+            }
+            let spec = CacheSpec {
+                layer_count: 1,
+                pools: vec![Pool {
+                    block: shape[0],
+                    bytes: stride,
+                    format: PageFormat {
+                        element_bytes: 2,
+                        shape: shape.to_vec(),
+                        strides: strides.to_vec(),
+                    },
+                }],
+                groups: vec![Group {
+                    pool: 0,
+                    layers: vec![0],
+                    vllm_group: 0,
+                    kind: Kind::Paged,
+                    window: None,
+                }],
+            };
+            assert!(spec.validate().is_ok(), "order {order:?}");
+        }
+    }
+
+    /// Recurrent state and encoder cache kinds are rejected before allocation or call setup.
+    #[test]
+    fn refuses_unserved_cache_kinds() {
+        for kind in [Kind::State, Kind::Cross { length: 32 }] {
+            let mut spec = paged(64, 0..1);
+            spec.groups[0].kind = kind;
+            let error = spec.validate_for_serving().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert_eq!(
+                error.to_string(),
+                "decoder serving supports paged cache groups only"
+            );
+        }
     }
 
     /// The first loan of a type builds its views and later loans borrow them, one at a time; a

@@ -21,7 +21,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import build_offloading_config
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+    build_offloading_config,
+    get_offloading_group_ids,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
     OffloadPromMetrics,
@@ -29,7 +32,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
 )
+from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+from vllm.v1.kv_offload.factory import OffloadingSpecFactory
+from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
 
 from furiosa_opt_vllm.offload.worker import Host, Worker
 
@@ -65,7 +71,20 @@ class RNGDOffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig
     ) -> None:
         super().__init__(vllm_config, role, kv_cache_config)
-        self._spec = CPUOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+        self._vllm_config = vllm_config
+        transfer = vllm_config.kv_transfer_config
+        if transfer is not None:
+            extra = transfer.kv_connector_extra_config
+            if extra.get("spec_name") is None:
+                if extra.get("secondary_tiers"):
+                    extra["spec_name"] = "TieringOffloadingSpec"
+                else:
+                    extra.pop("spec_name", None)
+        offloading_config = build_offloading_config(vllm_config, kv_cache_config)
+        spec = OffloadingSpecFactory.create_spec(offloading_config)
+        if not isinstance(spec, CPUOffloadingSpec):
+            raise TypeError(f"unsupported vLLM offloading spec: {type(spec).__name__}")
+        self._spec: CPUOffloadingSpec = spec
         self._scheduler = (
             OffloadingConnectorScheduler(self._spec, vllm_config, kv_cache_config)
             if role == KVConnectorRole.SCHEDULER
@@ -79,7 +98,36 @@ class RNGDOffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         chunks = self._spec.num_chunks
         if chunks == 0:
             raise ValueError("kv_offloading_size must hold at least one chunk of cache blocks")
-        self._worker = Worker(Host(cache, chips, chunks, self._spec.blocks_per_chunk))
+        if self._worker is not None:
+            raise RuntimeError("the cache transfer worker is already registered")
+        region = None
+        if isinstance(self._spec, TieringOffloadingSpec):
+            parallel = self._spec.config.parallel
+            if parallel.world_size != 1 or parallel.rank != 0:
+                raise ValueError("the shared host tier requires one vLLM worker rank")
+            region = SharedOffloadRegion(
+                engine_id=self._spec.config.engine_id,
+                num_chunks=chunks,
+                rank=parallel.rank,
+                kv_bytes_per_chunk=self._spec.kv_bytes_per_chunk,
+                cpu_page_size=self._spec.cpu_page_size_per_worker,
+            )
+        try:
+            self._worker = Worker(
+                Host(
+                    cache,
+                    chips,
+                    self._spec,
+                    self._vllm_config,
+                    self._kv_cache_config,
+                    get_offloading_group_ids(self._kv_cache_config),
+                    mmap_region=region,
+                )
+            )
+        except Exception:
+            if region is not None:
+                region.cleanup()
+            raise
 
     @property
     def scheduler(self) -> OffloadingConnectorScheduler:

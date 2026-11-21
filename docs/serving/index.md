@@ -143,6 +143,15 @@ Both servers copy the cache blocks of computed prompts to a tier of host memory,
     `--kv-offloading-size` sets the host tier in GiB, as on a GPU.
     The platform serves it through the plugin's `RNGDOffloadingConnector` instead of vLLM's `OffloadingConnector`, which copies with CUDA streams; vLLM's scheduler still decides what to store, load and evict.
     Options of vLLM's CPU offloading, such as `blocks_per_chunk` and `eviction_policy`, go in `--kv-transfer-config '{"kv_connector_extra_config": {...}}'` beside the size.
+    To persist evicted chunks in vLLM's filesystem tier, add `secondary_tiers`; this selects vLLM's stock `TieringOffloadingSpec` and `FileSystemTierManager`:
+
+    ```bash
+    vllm serve Qwen/Qwen3-0.6B --kv-offloading-size 16 \
+      --kv-transfer-config '{"kv_connector_extra_config":{"secondary_tiers":[{"type":"fs","root_dir":"/mnt/kv-cache"}]}}'
+    ```
+
+    The filesystem tier uses vLLM's model/config namespace and token hashes. It has no size cap or automatic stale-directory cleanup; operators remove old directories. `canonical_layout` in `kv_connector_extra_config` requests vLLM's exact canonical mapping check; pages without a certified mapping stay opaque and rank/topology-specific.
+    vLLM uses `O_DIRECT` when the configured filesystem supports it, and falls back to buffered I/O otherwise.
     vLLM completes a transfer once the worker of each rank reports it, and one worker drives every chip, so offloading serves one chip a replica.
     It also serves one replica: with data parallelism vLLM ranks each replica's worker among all of them.
     Sleep mode frees the cache storage the host tier copies, so startup refuses `--enable-sleep-mode` beside offloading.

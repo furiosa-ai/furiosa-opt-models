@@ -282,8 +282,8 @@ impl PyStubType for Kept {
     }
 }
 
-/// The cache a loaded decoder's calls read: block formats, and the groups of layers that use
-/// them. `Cache(spec, blocks)` allocates its storage on the decoder's device.
+/// The cache a loaded decoder's calls read: page formats and engine storage groups. `Cache(spec,
+/// blocks)` allocates one storage buffer per model layer on the decoder's device.
 #[gen_stub_pyclass]
 #[pyclass(frozen, module = "engine.decoder")]
 pub(super) struct CacheSpec {
@@ -304,13 +304,19 @@ impl CacheSpec {
 #[gen_stub_pymethods]
 #[pymethods]
 impl CacheSpec {
+    /// Number of decoder layers covered by the cache groups.
+    #[getter]
+    fn layer_count(&self) -> usize {
+        self.inner.layer_count
+    }
+
     /// Block formats, which groups name by index.
     #[getter]
     fn pools(&self) -> Vec<Pool> {
-        self.inner.pools.iter().copied().map(Pool).collect()
+        self.inner.pools.iter().cloned().map(Pool).collect()
     }
 
-    /// The cached layers, a kind and a pool each; a request names its blocks of every group.
+    /// Engine storage groups. Groups with the same logical vLLM group share one block table.
     #[getter]
     fn groups(&self) -> Vec<Group> {
         self.inner.groups.iter().cloned().map(Group).collect()
@@ -336,6 +342,24 @@ impl Pool {
     fn bytes(&self) -> usize {
         self.0.bytes
     }
+
+    /// Bytes occupied by one logical page element.
+    #[getter]
+    fn element_bytes(&self) -> usize {
+        self.0.format.element_bytes
+    }
+
+    /// Logical page dimensions, with token block first.
+    #[getter]
+    fn shape(&self) -> Vec<usize> {
+        self.0.format.shape.clone()
+    }
+
+    /// Logical page byte strides.
+    #[getter]
+    fn strides(&self) -> Vec<usize> {
+        self.0.format.strides.clone()
+    }
 }
 
 /// Layers whose cache has one kind and takes its blocks from one pool.
@@ -352,12 +376,16 @@ impl Group {
         self.0.pool
     }
 
-    /// The model layers the group caches.
+    /// Stable model layer IDs the group caches; the list may be non-contiguous.
     #[getter]
-    #[gen_stub(override_return_type(type_repr = "range"))]
-    fn layers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyRange>> {
-        let layers = &self.0.layers;
-        PyRange::new(py, layers.start.try_into()?, layers.end.try_into()?)
+    fn layers(&self) -> Vec<usize> {
+        self.0.layers.clone()
+    }
+
+    /// Logical vLLM block-table group shared by this engine storage group.
+    #[getter]
+    fn vllm_group(&self) -> usize {
+        self.0.vllm_group
     }
 
     /// What the group's blocks hold.
@@ -422,7 +450,7 @@ impl Cache {
         self.inner.blocks()
     }
 
-    /// Each layer's storage, group by group, for host snapshots of assigned blocks; a copy to the
+    /// Each model layer's storage, indexed by stable layer ID, for host snapshots of assigned blocks; a copy to the
     /// host waits for the calls submitted before it that write these bytes.
     #[getter]
     fn layers(&self) -> Result<Vec<HbmBuffer>, Error> {

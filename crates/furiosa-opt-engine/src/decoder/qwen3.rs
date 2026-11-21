@@ -17,7 +17,9 @@
 //!   key and value rows out head-major, and a channel-scaled projection adds no update.
 
 use super::adapters::{self, SLOTS};
-use super::{Batch, CacheSpec, Decoder, Group, Kind, Limits, Output, Pool, Rows, Table};
+use super::{
+    Batch, CacheSpec, Decoder, Group, Kind, Limits, Output, PageFormat, Pool, Rows, Table,
+};
 use crate::{AsyncModule, Checkpoint, Function, LoadError, forward};
 use furiosa_opt_models::Module;
 use furiosa_opt_models::load::{Context, Load};
@@ -52,24 +54,35 @@ impl<R: AxisName, W: AxisName> AxisName for Tables<R, W> {
     const SIZE: usize = R::SIZE * W::SIZE * BlockIndex::SIZE;
 }
 
+/// Cache layout shared by every Qwen3-family launch shape.
+fn cache_spec<S: Geometry>() -> CacheSpec {
+    CacheSpec {
+        layer_count: S::LAYERS,
+        pools: vec![Pool {
+            block: Block::SIZE,
+            bytes: Blocks::<KvHeads, Head>::BLOCK_STRIDE as usize,
+            format: PageFormat::contiguous(
+                vec![Block::SIZE, 2, KvHeads::SIZE, Head::SIZE],
+                size_of::<bf16>(),
+            ),
+        }],
+        groups: vec![Group {
+            pool: 0,
+            layers: (0..S::LAYERS).collect(),
+            vllm_group: 0,
+            kind: Kind::Paged,
+            window: None,
+        }],
+    }
+}
+
 /// What a call of the size `S` holds: the compiled context, the size's rows, one paged group of
 /// every layer's blocks, and `adapters` adapters.
 fn limits<S: Geometry + Decode>(adapters: usize) -> Limits {
     Limits {
         window: S::Windows::SIZE * Window::SIZE,
         rows: S::Rows::SIZE,
-        cache: CacheSpec {
-            pools: vec![Pool {
-                block: Block::SIZE,
-                bytes: Blocks::<KvHeads, Head>::BLOCK_STRIDE as usize,
-            }],
-            groups: vec![Group {
-                pool: 0,
-                layers: 0..S::LAYERS,
-                kind: Kind::Paged,
-                window: None,
-            }],
-        },
+        cache: cache_spec::<S>(),
         adapters,
     }
 }
@@ -400,18 +413,7 @@ macro_rules! launches {
                 Limits {
                     window: launch::CONTEXT.min(<$size as Decode>::Positions::SIZE),
                     rows: launch::Capacity::<$size>::SIZE,
-                    cache: CacheSpec {
-                        pools: vec![Pool {
-                            block: Block::SIZE,
-                            bytes: Blocks::<KvHeads, Head>::BLOCK_STRIDE as usize,
-                        }],
-                        groups: vec![Group {
-                            pool: 0,
-                            layers: 0..<$size as Geometry>::LAYERS,
-                            kind: Kind::Paged,
-                            window: None,
-                        }],
-                    },
+                    cache: cache_spec::<$size>(),
                     adapters: Self::ADAPTERS,
                 }
             }

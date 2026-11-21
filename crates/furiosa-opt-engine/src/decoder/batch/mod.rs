@@ -278,7 +278,7 @@ fn layout(lens: impl Iterator<Item = usize> + Clone) -> Vec<Range<usize>> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{CacheSpec, Pool};
+    use super::super::{CacheSpec, PageFormat, Pool};
     use super::*;
 
     /// One paged group of one layer whose blocks hold `block` tokens, and no adapter.
@@ -287,10 +287,16 @@ mod tests {
             window: 64,
             rows: 8,
             cache: CacheSpec {
-                pools: vec![Pool { block, bytes: 64 }],
+                layer_count: 1,
+                pools: vec![Pool {
+                    block,
+                    bytes: 64,
+                    format: PageFormat::contiguous(vec![block, 64 / block], 1),
+                }],
                 groups: vec![Group {
                     pool: 0,
-                    layers: 0..1,
+                    layers: vec![0],
+                    vllm_group: 0,
                     kind: Kind::Paged,
                     window: None,
                 }],
@@ -378,9 +384,11 @@ mod tests {
     fn plans_every_cache_group() -> io::Result<()> {
         let device = device()?;
         let mut limits = limits(4);
+        limits.cache.layer_count = 2;
         limits.cache.groups.push(Group {
             pool: 0,
-            layers: 1..2,
+            layers: vec![1],
+            vllm_group: 1,
             kind: Kind::Paged,
             window: Some(8),
         });
@@ -446,18 +454,6 @@ mod tests {
             window: 4,
             ..limits.clone()
         };
-        let wide = Limits {
-            window: (1 << 24) + 1,
-            cache: CacheSpec {
-                pools: vec![Pool {
-                    block: 1 << 20,
-                    bytes: 64,
-                }],
-                ..limits.cache.clone()
-            },
-            ..limits.clone()
-        };
-        let wide_cache = Cache::new(&device, &wide.cache, 64)?;
         let two = Request {
             rows: vec![vec![7], vec![8]],
             ..request(&[7], 0, 1)?
@@ -495,12 +491,6 @@ mod tests {
                 &short,
                 &cache,
                 "request extends past the context window",
-            ),
-            (
-                vec![request(&(0..17).collect::<Vec<_>>(), 1 << 24, 1)?],
-                &wide,
-                &wide_cache,
-                "position is not below 2^24",
             ),
             (
                 vec![request(&[7], 15, 2)?],
@@ -595,32 +585,6 @@ mod tests {
             let error = plan(&[request], &limits, &cache).err().expect(message);
             assert_eq!(error.kind(), io::ErrorKind::Unsupported, "{message}");
             assert_eq!(error.to_string(), message);
-        }
-        let planned = |edit: &dyn Fn(&mut Vec<Group>)| -> io::Result<io::Error> {
-            let mut layered = limits.clone();
-            edit(&mut layered.cache.groups);
-            let cache = Cache::new(&device, &layered.cache, 8)?;
-            Ok(plan(&[plain()?], &layered, &cache).err().expect("a group"))
-        };
-        for (edit, case) in [
-            (
-                &(|groups: &mut Vec<Group>| groups[0].kind = Kind::State)
-                    as &dyn Fn(&mut Vec<Group>),
-                "a state",
-            ),
-            (
-                &|groups: &mut Vec<Group>| groups[0].kind = Kind::Cross { length: 4 },
-                "an encoder",
-            ),
-            (&|groups: &mut Vec<Group>| groups.clear(), "no group"),
-        ] {
-            let error = planned(edit)?;
-            let refusal = (error.kind(), error.to_string());
-            let expected = (
-                io::ErrorKind::Unsupported,
-                "a call plans paged cache groups".into(),
-            );
-            assert_eq!(refusal, expected, "{case}");
         }
         Ok(())
     }

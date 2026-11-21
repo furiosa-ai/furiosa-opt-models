@@ -21,7 +21,7 @@ mod qwen3;
 
 pub use adapters::{Adapter, Binding, Loader, SLOTS};
 pub use batch::{Batch, Rows, Staged, Table};
-pub use cache::{Cache, CacheSpec, Group, Kind, Pool};
+pub use cache::{Cache, CacheSpec, Group, Kind, PageFormat, Pool};
 
 use crate::{AsyncModule, Checkpoint, LoadError};
 use furiosa_opt_models::ops::attention::full::paged::Tiling;

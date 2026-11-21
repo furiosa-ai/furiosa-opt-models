@@ -98,7 +98,13 @@ def offload(config: VllmConfig) -> None:
     transfer.kv_connector = CONNECTOR
     transfer.kv_connector_module_path = CONNECTOR_MODULE
     transfer.kv_role = "kv_both"
-    transfer.kv_connector_extra_config["cpu_bytes_to_use"] = cache.kv_offloading_size * (1 << 30)
+    extra = transfer.kv_connector_extra_config
+    extra["cpu_bytes_to_use"] = cache.kv_offloading_size * (1 << 30)
+    if extra.get("spec_name") is None:
+        if extra.get("secondary_tiers"):
+            extra["spec_name"] = "TieringOffloadingSpec"
+        else:
+            extra.pop("spec_name", None)
     config.kv_transfer_config = transfer
     cache.kv_offloading_size = None
 
@@ -108,8 +114,9 @@ class Offloading:
     """What the contracts check of an offloading transfer config through `CONNECTOR`, with its
     `kv_connector_extra_config` keys read as vLLM's offloading reads them."""
 
-    # No spec_name but vLLM's CPUOffloadingSpec, and no spec_module_path.
-    cpu_spec: bool
+    # vLLM's stock CPU spec, or its stock tiering spec when a secondary tier is configured.
+    supported_spec: bool
+    tiering_spec: bool
     canonical_layout: bool
     load_failure_policy: Literal["recompute", "fail"]
 
@@ -120,9 +127,18 @@ def offloading(config: VllmConfig) -> Offloading | None:
     if transfer is None or transfer.kv_connector != CONNECTOR:
         return None
     extra: Mapping[str, object] = transfer.kv_connector_extra_config
+    spec_name = extra.get("spec_name")
+    if spec_name is None and extra.get("secondary_tiers"):
+        spec_name = "TieringOffloadingSpec"
+    elif spec_name is None:
+        spec_name = "CPUOffloadingSpec"
+    spec_module = extra.get("spec_module_path")
+    cpu_spec = spec_name == "CPUOffloadingSpec" and spec_module is None
+    tiering_spec = spec_name == "TieringOffloadingSpec" and spec_module is None
+    has_secondary_tiers = bool(extra.get("secondary_tiers"))
     return Offloading(
-        extra.get("spec_name", "CPUOffloadingSpec") == "CPUOffloadingSpec"
-        and "spec_module_path" not in extra,
+        (cpu_spec and not has_secondary_tiers) or tiering_spec,
+        tiering_spec,
         bool(extra.get("canonical_layout")),
         transfer.kv_load_failure_policy,
     )
@@ -274,14 +290,9 @@ CONTRACTS: Final = (
     ),
     Contract(
         "kv_connector_extra_config",
-        lambda c: (settings := offloading(c)) is None or settings.cpu_spec,
-        "keeps offloaded blocks in host memory by vLLM's CPUOffloadingSpec, so it takes no other "
-        + "spec_name or spec_module_path",
-    ),
-    Contract(
-        "kv_connector_extra_config",
-        lambda c: (settings := offloading(c)) is None or not settings.canonical_layout,
-        "keeps offloaded blocks in the device's order, so it takes no canonical_layout",
+        lambda c: (settings := offloading(c)) is None or settings.supported_spec,
+        "uses vLLM's CPUOffloadingSpec for host offload or TieringOffloadingSpec when "
+        + "secondary_tiers are configured",
     ),
     # A failed copy poisons the blocks and host rows it touched, so no request reruns on them.
     Contract(
