@@ -205,9 +205,7 @@ def test_quantizes_each_output_channel() -> None:
             {"quantization_config": {"quant_method": "fp8"}, "text_config": []},
             id="top-level-precedence",
         ),
-        pytest.param(
-            {"quantization_config": {"quant_method": "fp8"}}, id="top-level"
-        ),
+        pytest.param({"quantization_config": {"quant_method": "fp8"}}, id="top-level"),
         pytest.param(
             {"text_config": {"quantization_config": {"quant_method": "fp8"}}},
             id="text-config",
@@ -249,9 +247,7 @@ def test_does_not_hide_checkpoint_resolver_type_errors(monkeypatch: pytest.Monke
     def raise_type_error(_config: object) -> None:
         raise TypeError("resolver implementation bug")
 
-    monkeypatch.setattr(
-        checkpoint_quantization, "resolve_checkpoint_quant_spec", raise_type_error
-    )
+    monkeypatch.setattr(checkpoint_quantization, "resolve_checkpoint_quant_spec", raise_type_error)
     with pytest.raises(TypeError, match="resolver implementation bug"):
         _ = quantization("fp8", {})
 

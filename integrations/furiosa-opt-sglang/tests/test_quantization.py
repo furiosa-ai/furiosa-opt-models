@@ -113,9 +113,7 @@ def test_generates_as_the_checkpoint_quantized_by_sglang(
     ("target_flags", "draft_flags"),
     [
         pytest.param(FP8, (), id="inherited"),
-        pytest.param(
-            (), ("--speculative-draft-model-quantization", "fp8"), id="draft-owned-fp8"
-        ),
+        pytest.param((), ("--speculative-draft-model-quantization", "fp8"), id="draft-owned-fp8"),
     ],
 )
 def test_refuses_a_draft_with_unserved_fp8(
@@ -132,8 +130,7 @@ def test_refuses_a_draft_with_unserved_fp8(
     }
     log = chips.refusal(tmp_path_factory, row)
     assert (
-        "furiosa-opt-sglang a load quantizes the checkpoint, the line holds BF16 projections"
-        in log
+        "furiosa-opt-sglang a load quantizes the checkpoint, the line holds BF16 projections" in log
     )
 
 

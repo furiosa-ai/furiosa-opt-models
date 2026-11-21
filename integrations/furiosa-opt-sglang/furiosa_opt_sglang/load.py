@@ -103,9 +103,7 @@ def quantization(
     if method != "fp8":
         return None
     config_mapping = (
-        config
-        if isinstance(config, Mapping)
-        else cast("Mapping[str, JsonValue]", config.to_dict())
+        config if isinstance(config, Mapping) else cast("Mapping[str, JsonValue]", config.to_dict())
     )
     _validate_quantization_metadata(config_mapping)
     declared = resolve_checkpoint_quant_spec(config)
