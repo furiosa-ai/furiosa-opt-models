@@ -10,7 +10,9 @@ use furiosa_opt_models::ops::attention::geometry::{Hidden, ProjectionWidth};
 use furiosa_opt_models::ops::collective::Pieces;
 use furiosa_opt_models::ops::linear::{Grouped, grouped::Layout};
 use furiosa_opt_models::tensor::axis::Rows;
-use furiosa_opt_models::tensor::live::{BlockPrefix, Extents, Live, PrefixInputs, PrefixPlan};
+use furiosa_opt_models::tensor::live::{
+    BlockPrefix, ExtentRange, Extents, Live, PrefixInputs, PrefixPlan,
+};
 use furiosa_opt_models::tensor::parallel::{Parallel, Part, Shard};
 use furiosa_opt_models::tensor::scalar::Value;
 use furiosa_opt_std::prelude::*;
@@ -87,11 +89,11 @@ fn owned<R: AxisName, I: AxisName, O: AxisName, S: AxisName>(
     device: &mut Device,
     weights: &Owned<I, O>,
     input: &Split<R, I>,
-    blocks: &PrefixInputs<R, (S,), B, Chips>,
+    blocks: &PrefixInputs<R, ExtentRange<S, S, B>, B, Chips>,
 ) -> Local<R, O> {
     let prefix = blocks.read().with(input);
     weights
-        .prefix::<(S,)>()
+        .prefix::<ExtentRange<S, S, B>>()
         .forward(device, (), &mut (), &prefix)
         .into_value()
 }
@@ -259,10 +261,15 @@ async fn check<R: AxisName, I: AxisName, O: AxisName, G: Extents>(works: &[usize
             );
         }
         if work == G::First::SIZE {
-            let plan =
-                PrefixPlan::<(), R, (G::First,), B>::new(BlockPrefix::try_over(work).unwrap())
-                    .unwrap();
-            let owned_count = PrefixInputs::<R, (G::First,), B, Chips>::upload(&mut device, &plan)
+            let plan = PrefixPlan::<(), R, ExtentRange<G::First, G::First, B>, B>::new(
+                BlockPrefix::try_over(work).unwrap(),
+            )
+            .unwrap();
+            let owned_count =
+                PrefixInputs::<R, ExtentRange<G::First, G::First, B>, B, Chips>::upload(
+                    &mut device,
+                    &plan,
+                )
                 .await
                 .unwrap();
             let output = launch(owned, (&mut device, &weights, &input, &owned_count))
@@ -296,12 +303,15 @@ async fn compact_exchange_named_projection_matches_fp64_at_all_main_work_extents
         Rows<10496>,
         Hidden<512>,
         ProjectionWidth<256>,
-        (Rows<9472>, (Rows<9728>, (Rows<9984>,))),
+        ExtentRange<Rows<9472>, Rows<9984>, Rows<256>>,
     >(&[9472, 9984, 9728, 9472])
     .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn full_width_exchange_projection_matches_fp64_at_one_block() {
-    check::<Rows<768>, Hidden<7168>, ProjectionWidth<5376>, (Rows<256>,)>(&[256]).await;
+    check::<Rows<768>, Hidden<7168>, ProjectionWidth<5376>, ExtentRange<Rows<256>, Rows<256>, B>>(
+        &[256],
+    )
+    .await;
 }

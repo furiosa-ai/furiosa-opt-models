@@ -1,6 +1,8 @@
 //! Bind the numerical consumers' work to one checked H3 request before uploading metadata.
 
-use super::packing::{DEFAULT_MAX_TEXT, PARTS, Plan, ROW_BLOCK, TEXT_STRIP, TRANSFER_ROWS};
+use super::packing::{
+    DEFAULT_MAX_TEXT, FIRST_TRANSFER, LAST_TRANSFER, PARTS, Plan, ROW_BLOCK, TEXT_STRIP,
+};
 use super::{embeddings::Chips, positions::Positions};
 use crate::ops::attention::{
     flash,
@@ -11,7 +13,7 @@ use crate::ops::index::packed::{RowInputs, RowPlan, SpanPlan, live::SpanInputs};
 use crate::ops::rotary::Rotation;
 use crate::tensor::{
     axis::Rows,
-    live::{BlockPrefix, PrefixInputs, PrefixPlan},
+    live::{BlockPrefix, ExtentRange, PrefixInputs, PrefixPlan},
     scalar::Value,
 };
 use furiosa_opt_std::prelude::*;
@@ -221,15 +223,7 @@ pub type Keys<R, K> = PackPlan<Pieces<R, PARTS>, K, KEY_RUNS>;
 
 /// Whole-transfer work extents inside the Live envelope, derived from the modality geometry.
 /// These are not token buckets: every valid text length still supplies its own keys and spans.
-#[derive(Clone, Debug)]
-pub(crate) struct Transfer<const STEP: usize>;
-
-impl<const STEP: usize> AxisName for Transfer<STEP> {
-    const NAME: Ident = Ident::new("JointTransfer");
-    const SIZE: usize = TRANSFER_ROWS[STEP];
-}
-
-include!(concat!(env!("OUT_DIR"), "/h3_transfers.rs"));
+pub(crate) type Transfers = ExtentRange<Rows<FIRST_TRANSFER>, Rows<LAST_TRANSFER>, Rows<ROW_BLOCK>>;
 
 type WorkPlan<R> = PrefixPlan<(), R, Transfers, Rows<ROW_BLOCK>>;
 

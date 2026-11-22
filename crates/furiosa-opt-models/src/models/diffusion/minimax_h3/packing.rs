@@ -10,8 +10,8 @@ use crate::tensor::{axis::Rows, live::BlockPrefix};
 use furiosa_opt_std::prelude::AxisName;
 use std::{io, ops::Range};
 
-pub(crate) use geometry::TRANSFER_ROWS;
 pub use geometry::{AUDIO_ROWS, DEFAULT_MAX_TEXT, PARTS, ROW_BLOCK, TEXT_STRIP, VIDEO_ROWS};
+pub(crate) use geometry::{FIRST_TRANSFER, LAST_TRANSFER};
 
 mod geometry;
 

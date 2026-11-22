@@ -2,7 +2,7 @@
 
 use super::{ChipMap, Exchange, O, Pieces, Rows};
 use crate::tensor::{
-    live::{Extents, Live, PrefixPlan},
+    live::{Extents, Live, Next, PrefixPlan},
     parallel::{Parallel, Part, Shard},
 };
 use furiosa_opt_std::prelude::*;
@@ -25,19 +25,36 @@ impl<const N: usize> Exchange<Parallel<N>> {
         output: &mut Rows<D, N, C, W>,
     ) {
         let prefix = input.prefix();
-        self.write_selected::<D, C, W, G>(device, &prefix.interval().with(prefix.value()), output);
+        self.write_selected::<D, C, W, G::First, G::Last, G::Step>(
+            device,
+            &prefix.interval().with(prefix.value()),
+            output,
+        );
     }
 
-    fn write_selected<D: MaterializableScalar, C: AxisName, W: AxisName, G: Extents>(
+    fn write_selected<
+        D: MaterializableScalar,
+        C: AxisName,
+        W: AxisName,
+        Current: AxisName,
+        Last: AxisName,
+        Step: AxisName,
+    >(
         &self,
         device: &mut Device,
         input: &Live<&Split<D, N, C, W>, C>,
         output: &mut Rows<D, N, C, W>,
     ) {
-        if G::LAST || input.rows() == G::First::SIZE {
-            self.write_extent::<D, G::First, C, W>(device, input.value(), output);
+        if const { Current::SIZE < Last::SIZE } {
+            if input.rows() == Current::SIZE {
+                self.write_extent::<D, Current, C, W>(device, input.value(), output);
+            } else {
+                self.write_selected::<D, C, W, Next<Current, Step>, Last, Step>(
+                    device, input, output,
+                );
+            }
         } else {
-            self.write_selected::<D, C, W, G::Rest>(device, input, output);
+            self.write_extent::<D, Current, C, W>(device, input.value(), output);
         }
     }
 
@@ -87,46 +104,53 @@ mod tests {
     use super::super::tests::{Chips, Input, Narrow, Output, Width, assert_output, buffers};
     use crate::ops::collective::Exchange;
     use crate::tensor::axis::Rows;
-    use crate::tensor::live::{BlockPrefix, PrefixInputs, PrefixPlan};
+    use crate::tensor::live::{BlockPrefix, ExtentRange, PrefixInputs, PrefixPlan};
     use crate::tensor::parallel::Parallel;
     use furiosa_opt_std::prelude::*;
     use furiosa_opt_std::runtime::launch;
 
-    type Work<C, A, B, E> = PrefixInputs<C, (A, (B, (E,))), Rows<1>, Chips>;
+    type Work<C, First, Last, Step> =
+        PrefixInputs<C, ExtentRange<First, Last, Step>, Rows<1>, Chips>;
 
     #[device(chip = 4)]
-    fn device_prefix<C: AxisName, W: AxisName, A: AxisName, B: AxisName, E: AxisName>(
+    fn device_prefix<C: AxisName, W: AxisName, First: AxisName, Last: AxisName, Step: AxisName>(
         device: &mut Device,
         input: &Input<C, W>,
         output: &mut Output<C, W>,
-        rows: &Work<C, A, B, E>,
-        _geometries: &std::marker::PhantomData<(A, B, E)>,
+        rows: &Work<C, First, Last, Step>,
+        _geometries: &std::marker::PhantomData<(First, Last, Step)>,
     ) {
         let rows = rows.read();
-        Exchange::<Parallel<4>>::default().write_prefix::<bf16, C, W, (A, (B, (E,))), Rows<1>>(
-            device,
-            &rows.with(input),
-            output,
-        );
+        Exchange::<Parallel<4>>::default()
+            .write_prefix::<bf16, C, W, ExtentRange<First, Last, Step>, Rows<1>>(
+                device,
+                &rows.with(input),
+                output,
+            );
     }
 
     async fn check_device_prefix<
         C: AxisName,
         W: AxisName,
-        A: AxisName,
-        B: AxisName,
-        E: AxisName,
+        First: AxisName,
+        Last: AxisName,
+        Step: AxisName,
     >() {
         let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
-        let geometries = std::marker::PhantomData::<(A, B, E)>;
+        let geometries = std::marker::PhantomData::<(First, Last, Step)>;
         // One compiled entry serves alternating sizes, including a return to the first size.
-        for work in [A::SIZE, E::SIZE, B::SIZE, A::SIZE] {
+        for work in [
+            First::SIZE,
+            Last::SIZE,
+            First::SIZE + Step::SIZE,
+            First::SIZE,
+        ] {
             let (input, mut output) = buffers::<C, W>(&mut device, work).await;
-            let plan = PrefixPlan::<(), C, (A, (B, (E,))), Rows<1>>::new(
+            let plan = PrefixPlan::<(), C, ExtentRange<First, Last, Step>, Rows<1>>::new(
                 BlockPrefix::try_over(work).unwrap(),
             )
             .unwrap();
-            let rows = Work::<C, A, B, E>::upload(&mut device, &plan)
+            let rows = Work::<C, First, Last, Step>::upload(&mut device, &plan)
                 .await
                 .unwrap();
             for _ in 0..2 {
@@ -145,7 +169,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn device_prefix_exchange_preserves_rows_and_capacity_tail() {
         let _lease = crate::tests::DEVICE.lock().await;
-        check_device_prefix::<Rows<1280>, Narrow, Rows<256>, Rows<768>, Rows<1280>>().await;
-        check_device_prefix::<Rows<10496>, Width, Rows<9472>, Rows<9728>, Rows<9984>>().await;
+        check_device_prefix::<Rows<1280>, Narrow, Rows<256>, Rows<1280>, Rows<512>>().await;
+        check_device_prefix::<Rows<10496>, Width, Rows<9472>, Rows<9984>, Rows<256>>().await;
     }
 }

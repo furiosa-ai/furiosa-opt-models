@@ -8,7 +8,7 @@ use furiosa_opt_models::ops::attention::flash::{Duo, Head, Queries, Span, Tokens
 use furiosa_opt_models::ops::collective::{Exchange, Pieces};
 use furiosa_opt_models::specialize::attention::{Flash, Strategy};
 use furiosa_opt_models::tensor::axis::Rows;
-use furiosa_opt_models::tensor::live::{BlockPrefix, Live, PrefixInputs, PrefixPlan};
+use furiosa_opt_models::tensor::live::{BlockPrefix, ExtentRange, Live, PrefixInputs, PrefixPlan};
 use furiosa_opt_models::tensor::parallel::{Parallel, Part, Shard};
 use furiosa_opt_models::tensor::scalar::{F32, Value};
 use furiosa_opt_models::{Module, Op};
@@ -26,7 +26,7 @@ type Kv = Tokens<Spans, Pairs, Chips>;
 type Visibility = Visible<Spans, Chips>;
 type Split = HbmTensor<bf16, Chips, m![{ Symbol<QueryRows> }, { Symbol<Part<Width, 4>> }]>;
 type Output = HbmTensor<bf16, Chips, m![Capacity, Width]>;
-type Transfers = (Rows<9472>, (Rows<9728>, (Rows<9984>,)));
+type Transfers = ExtentRange<Rows<9472>, Rows<9984>, Rows<256>>;
 type Work = PrefixInputs<Capacity, Transfers, Rows<1>, Chips>;
 type Operands<'a> = (
     &'a Query,

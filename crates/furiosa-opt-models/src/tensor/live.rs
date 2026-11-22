@@ -104,27 +104,33 @@ impl<X, R: AxisName, B: AxisName> BlockPrefix<X, R, B> {
     }
 }
 
-/// A nonempty, increasing list of fixed row extents. `(S,)` is the final extent;
-/// `(S, Tail)` prepends one extent. A caller supplies this type once for its envelope.
+/// A nonempty, evenly spaced range of fixed row extents, including both endpoints.
+/// A caller supplies this type once for its envelope.
 pub trait Extents {
-    /// The first extent in this list.
+    /// The smallest extent.
     type First: AxisName;
-    /// The remaining extents, or this same terminal list.
-    type Rest: Extents;
-    /// Whether this list contains only its final extent.
-    const LAST: bool;
+    /// The largest extent.
+    type Last: AxisName;
+    /// The positive row increment between extents.
+    type Step: AxisName;
 }
 
-impl<S: AxisName> Extents for (S,) {
-    type First = S;
-    type Rest = Self;
-    const LAST: bool = true;
+/// Fixed row extents from `First` through `Last` in increments of `Step`.
+pub struct ExtentRange<First, Last, Step>(PhantomData<(First, Last, Step)>);
+
+impl<First: AxisName, Last: AxisName, Step: AxisName> Extents for ExtentRange<First, Last, Step> {
+    type First = First;
+    type Last = Last;
+    type Step = Step;
 }
 
-impl<S: AxisName, Tail: Extents> Extents for (S, Tail) {
-    type First = S;
-    type Rest = Tail;
-    const LAST: bool = false;
+/// The next fixed extent in a checked range.
+#[derive(Clone, Debug)]
+pub(crate) struct Next<Current, Step>(PhantomData<(Current, Step)>);
+
+impl<Current: AxisName, Step: AxisName> AxisName for Next<Current, Step> {
+    const NAME: Ident = Ident::new("PrefixExtent");
+    const SIZE: usize = Current::SIZE + Step::SIZE;
 }
 
 /// Zero-based work whose row count belongs to `G`, in whole `B`-row blocks.
@@ -425,14 +431,18 @@ const fn valid<R: AxisName, G: Extents, B: AxisName>() -> bool {
         && R::SIZE.is_multiple_of(B::SIZE)
         && R::SIZE / B::SIZE <= i32::MAX as usize
         && G::First::SIZE > 0
-        && G::First::SIZE <= R::SIZE
+        && G::First::SIZE <= G::Last::SIZE
+        && G::Last::SIZE <= R::SIZE
         && G::First::SIZE.is_multiple_of(B::SIZE)
-        && (G::LAST
-            || (G::First::SIZE < <G::Rest as Extents>::First::SIZE && valid::<R, G::Rest, B>()))
+        && G::Step::SIZE > 0
+        && G::Step::SIZE.is_multiple_of(B::SIZE)
+        && (G::Last::SIZE - G::First::SIZE).is_multiple_of(G::Step::SIZE)
 }
 
 const fn contains<G: Extents>(rows: usize) -> bool {
-    rows == G::First::SIZE || (!G::LAST && contains::<G::Rest>(rows))
+    rows >= G::First::SIZE
+        && rows <= G::Last::SIZE
+        && (rows - G::First::SIZE).is_multiple_of(G::Step::SIZE)
 }
 
 #[cfg(test)]
@@ -443,7 +453,7 @@ pub(crate) mod tests {
     #[test]
     fn refuses_prefix_work_outside_the_fixed_extents_before_upload() {
         type C = Rows<1280>;
-        type G = (Rows<256>, (Rows<768>, (Rows<1280>,)));
+        type G = ExtentRange<Rows<256>, Rows<1280>, Rows<512>>;
         for rows in [0, 512, 1024] {
             let prefix = BlockPrefix::<(), C, Rows<256>>::try_over(rows).unwrap();
             let error = PrefixPlan::<(), C, G, Rows<256>>::new(prefix)
