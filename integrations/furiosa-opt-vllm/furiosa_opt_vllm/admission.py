@@ -26,11 +26,6 @@ import torch
 from typing_extensions import override
 
 from furiosa_opt_vllm.contracts import Contract
-from furiosa_opt_vllm.offloading import (
-    direct_connector_contracts,
-    direct_offloadings,
-    offloading_contracts,
-)
 from furiosa_opt_vllm.transfer import TRANSFER
 
 if TYPE_CHECKING:
