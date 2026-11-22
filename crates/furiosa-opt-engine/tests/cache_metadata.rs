@@ -5,7 +5,7 @@ fn pool(block: usize, bytes: usize) -> Pool {
     Pool {
         block,
         bytes,
-        format: PageFormat::contiguous(vec![block, bytes / block], 1),
+        format: PageFormat::contiguous(vec![block, bytes / block], 1).unwrap(),
     }
 }
 
@@ -18,15 +18,13 @@ fn spec() -> CacheSpec {
                 pool: 0,
                 layers: vec![0, 2],
                 logical_group: 0,
-                kind: Kind::Paged,
-                window: None,
+                kind: Kind::Paged { window: None },
             },
             Group {
                 pool: 1,
                 layers: vec![1],
                 logical_group: 0,
-                kind: Kind::Paged,
-                window: None,
+                kind: Kind::Paged { window: None },
             },
         ],
     }
@@ -80,10 +78,10 @@ fn rejects_duplicate_and_missing_layer_coverage() {
 fn rejects_inconsistent_logical_group_metadata() {
     let mut cache = spec();
     cache.pools[1].block = 8;
-    cache.pools[1].format = PageFormat::contiguous(vec![8, 4], 1);
+    cache.pools[1].format = PageFormat::contiguous(vec![8, 4], 1).unwrap();
     assert_eq!(
         message(cache.validate().unwrap_err()),
-        "logical cache groups disagree on block size or attention kind"
+        "logical cache groups disagree on block size, attention kind, or window"
     );
 
     let mut cache = spec();
@@ -95,20 +93,14 @@ fn rejects_inconsistent_logical_group_metadata() {
 }
 
 #[test]
-fn rejects_invalid_sliding_window_metadata() {
+fn sliding_window_is_part_of_logical_group_metadata() {
     let mut cache = spec();
-    cache.groups[0].window = Some(0);
+    cache.groups[0].kind = Kind::Paged {
+        window: std::num::NonZeroUsize::new(16),
+    };
     assert_eq!(
         message(cache.validate().unwrap_err()),
-        "paged cache group has an empty sliding window"
-    );
-
-    let mut cache = spec();
-    cache.groups[0].kind = Kind::State;
-    cache.groups[0].window = Some(16);
-    assert_eq!(
-        message(cache.validate().unwrap_err()),
-        "non-attention cache group has a sliding window"
+        "logical cache groups disagree on block size, attention kind, or window"
     );
 }
 

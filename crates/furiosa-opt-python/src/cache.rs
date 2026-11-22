@@ -3,7 +3,7 @@
 //! A slot holds selected layer bytes for one cache block. Six workers submit transfers in chunks
 //! of two blocks, each chunk batching all routed layer copies into one runtime read or write.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::{c_int, c_void};
 use std::io;
 use std::ops::Range;
@@ -38,6 +38,7 @@ struct Core {
     context: Shared,
     layers: Vec<Layer>,
     groups: Vec<Vec<usize>>,
+    group_blocks: Vec<usize>,
     chips: usize,
     block_bytes: usize,
 }
@@ -194,10 +195,21 @@ impl PyCopier {
             return Err(PyValueError::new_err("cache layer host ranges overlap"));
         }
         let groups = core_groups.into_values().collect::<Vec<_>>();
+        let group_blocks = groups
+            .iter()
+            .map(|layers| {
+                layers
+                    .iter()
+                    .map(|&index| core_layers[index].blocks)
+                    .min()
+                    .unwrap_or(0)
+            })
+            .collect();
         let core = Arc::new(Core {
             context,
             layers: core_layers,
             groups,
+            group_blocks,
             chips,
             block_bytes: host_block_bytes,
         });
@@ -239,7 +251,7 @@ impl PyCopier {
 impl PyCopier {
     fn submit(
         &mut self,
-        pages: Vec<(usize, Vec<(usize, u32)>)>,
+        mut pages: Vec<(usize, Vec<(usize, u32)>)>,
         pool: &Arc<Pool>,
         loading: bool,
     ) -> PyResult<PyCopy> {
@@ -253,45 +265,61 @@ impl PyCopier {
                 "host cache was allocated for a different copier",
             ));
         }
-        let mut destinations = BTreeSet::new();
-        let mut host_slots = BTreeSet::new();
+        pages.sort_unstable_by_key(|(slot, _)| *slot);
+        for (_, routes) in &mut pages {
+            routes.sort_unstable_by_key(|&(group, _)| group);
+        }
+        if let Some(pair) = pages.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+            return Err(PyValueError::new_err(format!(
+                "cache transfer repeats host slot {}",
+                pair[0].0
+            )));
+        }
+
+        let mut reservations = Vec::new();
         for (slot, routes) in &pages {
-            if *slot >= pool.slots.len() || routes.is_empty() || !host_slots.insert(*slot) {
-                return Err(PyValueError::new_err(
-                    "cache pages need distinct valid host slots and nonempty routes",
-                ));
+            if *slot >= pool.slots.len() {
+                return Err(PyValueError::new_err(format!(
+                    "cache transfer names host slot {slot}, but host cache has {} slots",
+                    pool.slots.len()
+                )));
             }
-            let mut page_groups = BTreeSet::new();
+            if routes.is_empty() {
+                return Err(PyValueError::new_err(format!(
+                    "cache transfer for host slot {slot} has no device routes"
+                )));
+            }
+            reservations.push(TransferKey::Host(*slot));
+            if let Some(pair) = routes.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+                return Err(PyValueError::new_err(format!(
+                    "cache transfer for host slot {slot} repeats group {}",
+                    pair[0].0
+                )));
+            }
             for &(group, block) in routes {
-                let layers =
-                    self.core.groups.get(group).ok_or_else(|| {
-                        PyValueError::new_err("cache copy names an unknown group")
-                    })?;
-                if !page_groups.insert(group)
-                    || layers
-                        .iter()
-                        .any(|&index| block as usize >= self.core.layers[index].blocks)
-                {
-                    return Err(PyValueError::new_err(
-                        "cache page has a duplicate group or an out-of-range device block",
-                    ));
+                let blocks = self.core.group_blocks.get(group).ok_or_else(|| {
+                    PyValueError::new_err(format!("cache transfer names unknown group {group}"))
+                })?;
+                if block as usize >= *blocks {
+                    return Err(PyValueError::new_err(format!(
+                        "cache transfer for host slot {slot} names block {block} outside group {group}"
+                    )));
                 }
-                if loading && !destinations.insert(TransferKey::Device(group, block)) {
-                    return Err(PyValueError::new_err(
-                        "cache copy destinations must be distinct",
-                    ));
-                }
+                reservations.push(TransferKey::Device(group, block));
             }
         }
-        let mut reservations = BTreeSet::new();
-        for (slot, routes) in &pages {
-            reservations.insert(TransferKey::Host(*slot));
-            reservations.extend(
-                routes
-                    .iter()
-                    .map(|&(group, block)| TransferKey::Device(group, block)),
-            );
+        reservations.sort_unstable();
+        for pair in reservations.windows(2) {
+            if pair[0] != pair[1] || !loading {
+                continue;
+            }
+            if let TransferKey::Device(group, block) = pair[0] {
+                return Err(PyValueError::new_err(format!(
+                    "cache load writes group {group} block {block} more than once"
+                )));
+            }
         }
+        reservations.dedup();
         self.pending
             .check(&reservations, Some(Duration::ZERO))
             .map_err(crate::Error::from)?;
@@ -567,7 +595,7 @@ impl Chunk {
         loading: bool,
         completion: &Arc<Completion>,
     ) -> Vec<Self> {
-        let chunks = Self::groups(pages);
+        let chunks = Self::partition_pages(pages);
         if chunks.is_empty() {
             completion.mark_submitted(Ok(()));
             completion.finish(Ok(()));
@@ -590,24 +618,18 @@ impl Chunk {
             .collect()
     }
 
-    fn groups(pages: Vec<(usize, Vec<(usize, u32)>)>) -> Vec<Vec<TransferPage>> {
-        let mut chunks =
-            pages
-                .into_iter()
-                .fold(Vec::<Vec<_>>::new(), |mut chunks, (slot, mut routes)| {
-                    routes.sort_unstable_by_key(|&(group, _)| group);
-                    match chunks.last_mut() {
-                        Some(last) if last.len() < COPY_CHUNK_BLOCKS => {
-                            last.push(TransferPage { slot, routes });
-                        }
-                        _ => chunks.push(vec![TransferPage { slot, routes }]),
+    fn partition_pages(pages: Vec<(usize, Vec<(usize, u32)>)>) -> Vec<Vec<TransferPage>> {
+        pages
+            .into_iter()
+            .fold(Vec::<Vec<_>>::new(), |mut chunks, (slot, routes)| {
+                match chunks.last_mut() {
+                    Some(last) if last.len() < COPY_CHUNK_BLOCKS => {
+                        last.push(TransferPage { slot, routes });
                     }
-                    chunks
-                });
-        for chunk in &mut chunks {
-            chunk.sort_unstable_by_key(|page| page.slot);
-        }
-        chunks
+                    _ => chunks.push(vec![TransferPage { slot, routes }]),
+                }
+                chunks
+            })
     }
 
     fn run(self, executor: &tokio::runtime::Runtime, core: &Core) {
@@ -628,51 +650,54 @@ impl Chunk {
                     .map_err(|error| io::Error::other(error.to_string()))
             })
             .collect::<io::Result<Vec<_>>>()?;
-        let mut route_layers = Vec::new();
-        let mut aliases = Vec::new();
+        let route_count = self
+            .pages
+            .iter()
+            .flat_map(|page| &page.routes)
+            .map(|(group, _)| core.groups[*group].len())
+            .sum();
+        let mut page_layers = Vec::with_capacity(route_count);
         for (page_index, page) in self.pages.iter().enumerate() {
+            let first = page_layers.len();
             for &(group, block) in &page.routes {
                 for &layer_id in &core.groups[group] {
-                    let layer = &core.layers[layer_id];
-                    let start = usize::try_from(block)
-                        .map_err(io::Error::other)?
-                        .checked_mul(layer.page_bytes)
-                        .ok_or_else(|| io::Error::other("device page offset overflows"))?;
-                    let end = start
-                        .checked_add(layer.page_bytes)
-                        .ok_or_else(|| io::Error::other("device page end overflows"))?;
-                    aliases.push(layer.buffer.alias(start..end).map_err(io::Error::other)?);
-                    route_layers.push((page_index, group, layer_id));
+                    page_layers.push((page_index, block, layer_id));
                 }
             }
+            page_layers[first..]
+                .sort_unstable_by_key(|&(_, _, layer_id)| core.layers[layer_id].host_offset);
+        }
+        let mut aliases = Vec::with_capacity(route_count);
+        for &(_, block, layer_id) in &page_layers {
+            let layer = &core.layers[layer_id];
+            let start = usize::try_from(block)
+                .map_err(io::Error::other)?
+                .checked_mul(layer.page_bytes)
+                .ok_or_else(|| io::Error::other("device page offset overflows"))?;
+            let end = start
+                .checked_add(layer.page_bytes)
+                .ok_or_else(|| io::Error::other("device page end overflows"))?;
+            aliases.push(layer.buffer.alias(start..end).map_err(io::Error::other)?);
         }
 
         if self.loading {
-            let mut destinations = aliases
-                .iter_mut()
-                .map(|buffer| buffer.slice_mut(.., ..).map_err(io::Error::other))
-                .collect::<io::Result<Vec<_>>>()?;
-            let sources = route_layers
-                .iter()
-                .map(|&(page_index, _, layer_id)| {
-                    let layer = &core.layers[layer_id];
-                    let length = layer
-                        .page_bytes
-                        .checked_mul(core.chips)
-                        .ok_or_else(|| io::Error::other("host page size overflows"))?;
-                    let end = layer
-                        .host_offset
-                        .checked_add(length)
-                        .ok_or_else(|| io::Error::other("host page end overflows"))?;
-                    hosts[page_index]
-                        .slice(layer.host_offset..end)
-                        .map_err(io::Error::other)
-                })
-                .collect::<io::Result<Vec<_>>>()?;
-            let pairs = sources
-                .into_iter()
-                .zip(destinations.drain(..))
-                .collect::<Vec<_>>();
+            let mut pairs = Vec::with_capacity(route_count);
+            for (&(page_index, _, layer_id), destination) in page_layers.iter().zip(&mut aliases) {
+                let layer = &core.layers[layer_id];
+                let length = layer
+                    .page_bytes
+                    .checked_mul(core.chips)
+                    .ok_or_else(|| io::Error::other("host page size overflows"))?;
+                let end = layer
+                    .host_offset
+                    .checked_add(length)
+                    .ok_or_else(|| io::Error::other("host page end overflows"))?;
+                let source = hosts[page_index]
+                    .slice(layer.host_offset..end)
+                    .map_err(io::Error::other)?;
+                let destination = destination.slice_mut(.., ..).map_err(io::Error::other)?;
+                pairs.push((source, destination));
+            }
             let submitted = {
                 let mut context = core
                     .context
@@ -683,55 +708,41 @@ impl Chunk {
             self.job.submitted();
             executor.block_on(submitted).map_err(io::Error::other)
         } else {
-            let mut destinations_by_page = Vec::with_capacity(self.pages.len());
-            for (page, host) in self.pages.iter().zip(&mut hosts) {
-                // Split one host slot into disjoint layer ranges, including every routed group.
-                let routes = page
-                    .routes
-                    .iter()
-                    .flat_map(|&(group, _)| {
-                        core.groups[group]
-                            .iter()
-                            .map(move |&layer_id| (group, layer_id))
-                    })
-                    .map(|(group, layer_id)| {
-                        let layer = &core.layers[layer_id];
-                        let length = layer
-                            .page_bytes
-                            .checked_mul(core.chips)
-                            .ok_or_else(|| io::Error::other("host page size overflows"))?;
-                        Ok((group, layer_id, layer.host_offset, length))
-                    })
-                    .collect::<io::Result<Vec<_>>>()?;
-                let mut routes = routes;
-                routes.sort_unstable_by_key(|&(_, _, offset, _)| offset);
+            let mut pairs = Vec::with_capacity(route_count);
+            let mut route_index = 0;
+            for (page_index, host) in hosts.iter_mut().enumerate() {
                 let mut rest = host.slice_mut(..).map_err(io::Error::other)?;
                 let mut cursor = 0;
-                let mut by_layer = BTreeMap::new();
-                for (group, layer_id, offset, length) in routes {
-                    let (before, tail) =
-                        rest.split_at(offset - cursor).map_err(io::Error::other)?;
+                while let Some(&(route_page, _, layer_id)) = page_layers.get(route_index) {
+                    if route_page != page_index {
+                        break;
+                    }
+                    let layer = &core.layers[layer_id];
+                    let offset = layer.host_offset;
+                    let length = layer
+                        .page_bytes
+                        .checked_mul(core.chips)
+                        .ok_or_else(|| io::Error::other("host page size overflows"))?;
+                    let gap = offset
+                        .checked_sub(cursor)
+                        .ok_or_else(|| io::Error::other("host layer ranges overlap"))?;
+                    let (before, tail) = rest.split_at(gap).map_err(io::Error::other)?;
                     drop(before);
-                    let (page, tail) = tail.split_at(length).map_err(io::Error::other)?;
-                    by_layer.insert((group, layer_id), page);
+                    let (destination, tail) = tail.split_at(length).map_err(io::Error::other)?;
+                    let source = aliases[route_index]
+                        .slice(.., ..)
+                        .map_err(io::Error::other)?;
+                    pairs.push((source, destination));
                     rest = tail;
-                    cursor = offset + length;
+                    cursor = offset
+                        .checked_add(length)
+                        .ok_or_else(|| io::Error::other("host layer end overflows"))?;
+                    route_index += 1;
                 }
-                destinations_by_page.push(by_layer);
             }
-            let destinations = route_layers
-                .iter()
-                .map(|&(page_index, group, layer_id)| {
-                    destinations_by_page[page_index]
-                        .remove(&(group, layer_id))
-                        .ok_or_else(|| io::Error::other("missing host layer range"))
-                })
-                .collect::<io::Result<Vec<_>>>()?;
-            let sources = aliases
-                .iter()
-                .map(|buffer| buffer.slice(.., ..).map_err(io::Error::other))
-                .collect::<io::Result<Vec<_>>>()?;
-            let pairs = sources.into_iter().zip(destinations).collect::<Vec<_>>();
+            if route_index != page_layers.len() {
+                return Err(io::Error::other("cache transfer has unrouted host layers"));
+            }
             let submitted = {
                 let mut context = core
                     .context
@@ -769,11 +780,7 @@ impl Job {
 }
 
 impl Transfers {
-    fn check(
-        &mut self,
-        reservations: &BTreeSet<TransferKey>,
-        timeout: Option<Duration>,
-    ) -> io::Result<()> {
+    fn check(&mut self, reservations: &[TransferKey], timeout: Option<Duration>) -> io::Result<()> {
         for reservation in reservations {
             if let Some(copy) = self.0.get(reservation) {
                 if !copy.done(timeout)? {

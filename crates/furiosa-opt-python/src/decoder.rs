@@ -392,7 +392,7 @@ impl Group {
     #[getter]
     fn kind(&self) -> Kind {
         match self.0.kind {
-            decoder::Kind::Paged => Kind::Paged {},
+            decoder::Kind::Paged { .. } => Kind::Paged {},
             decoder::Kind::State => Kind::State {},
             decoder::Kind::Cross { length } => Kind::Cross { length },
         }
@@ -401,7 +401,10 @@ impl Group {
     /// Positions a row attends back to in a sliding window; `None` attends the whole history.
     #[getter]
     fn window(&self) -> Option<usize> {
-        self.0.window
+        match self.0.kind {
+            decoder::Kind::Paged { window } => window.map(std::num::NonZeroUsize::get),
+            decoder::Kind::State | decoder::Kind::Cross { .. } => None,
+        }
     }
 }
 

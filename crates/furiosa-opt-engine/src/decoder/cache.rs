@@ -12,6 +12,7 @@ use furiosa_opt_std::prelude::{Device, HbmBuffer};
 use std::any::Any;
 use std::io;
 use std::mem;
+use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Mutex, PoisonError};
 
@@ -50,18 +51,26 @@ pub struct PageFormat {
 
 impl PageFormat {
     /// A contiguous row-major page format.
-    pub fn contiguous(shape: Vec<usize>, element_bytes: usize) -> Self {
+    pub fn contiguous(shape: Vec<usize>, element_bytes: usize) -> io::Result<Self> {
+        let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+        if element_bytes == 0 || shape.is_empty() || shape.contains(&0) {
+            return Err(invalid(
+                "cache page format has empty dimensions or elements",
+            ));
+        }
         let mut stride = element_bytes;
         let mut strides = vec![0; shape.len()];
         for (dim, item) in shape.iter().zip(strides.iter_mut()).rev() {
             *item = stride;
-            stride = stride.saturating_mul(*dim);
+            stride = stride
+                .checked_mul(*dim)
+                .ok_or_else(|| invalid("cache page format byte span overflows"))?;
         }
-        Self {
+        Ok(Self {
             element_bytes,
             shape,
             strides,
-        }
+        })
     }
 
     fn validate(&self, page_bytes: usize, block: usize) -> io::Result<()> {
@@ -110,15 +119,14 @@ pub struct Group {
     /// Logical cache group this engine storage group belongs to.
     pub logical_group: usize,
     pub kind: Kind,
-    /// Positions a row attends back to in a sliding window; `None` attends the whole history.
-    pub window: Option<usize>,
 }
 
 /// What the blocks of a group hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     /// Keys and values of positions, a block of positions each, in the request's block order.
-    Paged,
+    /// `window` limits how many prior positions each row attends; `None` attends the full history.
+    Paged { window: Option<NonZeroUsize> },
     /// A recurrent state a block: the current one, then one for each draft position.
     State,
     /// Keys and values of `length` encoder positions, which a call writes once and later calls
@@ -154,15 +162,6 @@ impl CacheSpec {
             if group.layers.is_empty() {
                 return Err(invalid("cache group has no layers"));
             }
-            match group.kind {
-                Kind::Paged if group.window.is_some_and(|window| window == 0) => {
-                    return Err(invalid("paged cache group has an empty sliding window"));
-                }
-                Kind::State | Kind::Cross { .. } if group.window.is_some() => {
-                    return Err(invalid("non-attention cache group has a sliding window"));
-                }
-                Kind::Paged | Kind::State | Kind::Cross { .. } => {}
-            }
             for &layer in &group.layers {
                 let owner = layer_owners
                     .get_mut(layer)
@@ -171,7 +170,7 @@ impl CacheSpec {
                     return Err(invalid("cache layer appears in more than one group"));
                 }
             }
-            let semantics = (pool.block, group.kind, group.window);
+            let semantics = (pool.block, group.kind);
             if logical_groups
                 .insert(group.logical_group, semantics)
                 .is_some_and(|previous| previous != semantics)
@@ -198,7 +197,11 @@ impl CacheSpec {
     /// Validate metadata and reject cache kinds the decoder serving path cannot execute.
     pub fn validate_for_serving(&self) -> io::Result<()> {
         self.validate()?;
-        if self.groups.iter().any(|group| group.kind != Kind::Paged) {
+        if self
+            .groups
+            .iter()
+            .any(|group| !matches!(group.kind, Kind::Paged { .. }))
+        {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "decoder serving supports paged cache groups only",
@@ -210,8 +213,12 @@ impl CacheSpec {
     /// Bytes of each layer's storage of `blocks` blocks. Refuses invalid metadata, no blocks, or
     /// a page whose base-relative byte offset passes the signed-I32 range.
     pub fn layer_sizes(&self, blocks: usize) -> io::Result<Vec<usize>> {
-        let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
         self.validate()?;
+        self.layer_sizes_validated(blocks)
+    }
+
+    fn layer_sizes_validated(&self, blocks: usize) -> io::Result<Vec<usize>> {
+        let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
         if blocks == 0 {
             return Err(invalid("cache blocks must be positive"));
         }
@@ -256,7 +263,7 @@ impl Cache {
     /// `j * page..(j + 1) * page`.
     pub fn new(device: &Device, spec: &CacheSpec, blocks: usize) -> io::Result<Self> {
         spec.validate_for_serving()?;
-        let layers = (spec.layer_sizes(blocks)?.into_iter())
+        let layers = (spec.layer_sizes_validated(blocks)?.into_iter())
             .map(|size| HbmBuffer::alloc(device, size).map_err(io::Error::other))
             .collect::<io::Result<_>>()?;
         Ok(Self {
@@ -352,7 +359,7 @@ mod tests {
         Pool {
             block,
             bytes,
-            format: PageFormat::contiguous(vec![block, bytes / block], 1),
+            format: PageFormat::contiguous(vec![block, bytes / block], 1).unwrap(),
         }
     }
 
@@ -366,8 +373,7 @@ mod tests {
                 pool: 0,
                 layers: layers.collect(),
                 logical_group: 0,
-                kind: Kind::Paged,
-                window: None,
+                kind: Kind::Paged { window: None },
             }],
         }
     }
@@ -397,7 +403,6 @@ mod tests {
             layers: vec![2],
             logical_group: 1,
             kind: Kind::State,
-            window: None,
         });
         assert_eq!(spec.layer_sizes(3)?, [192, 192, 96]);
         Ok(())
@@ -446,26 +451,17 @@ mod tests {
                     pool: 0,
                     layers: vec![0, 2],
                     logical_group: 0,
-                    kind: Kind::Paged,
-                    window: None,
+                    kind: Kind::Paged { window: None },
                 },
                 Group {
                     pool: 1,
                     layers: vec![1],
                     logical_group: 0,
-                    kind: Kind::Paged,
-                    window: None,
+                    kind: Kind::Paged { window: None },
                 },
             ],
         };
         assert!(spec.validate().is_ok());
-
-        spec.groups[0].window = Some(0);
-        assert_eq!(
-            spec.validate().unwrap_err().to_string(),
-            "paged cache group has an empty sliding window"
-        );
-        spec.groups[0].window = None;
 
         spec.groups[1].layers = vec![2];
         assert_eq!(
@@ -473,12 +469,14 @@ mod tests {
             "cache layer appears in more than one group"
         );
         spec.groups[1].layers = vec![1];
-        spec.groups[1].window = Some(8);
+        spec.groups[1].kind = Kind::Paged {
+            window: NonZeroUsize::new(8),
+        };
         assert_eq!(
             spec.validate().unwrap_err().to_string(),
             "logical cache groups disagree on block size, attention kind, or window"
         );
-        spec.groups[1].window = None;
+        spec.groups[1].kind = Kind::Paged { window: None };
         spec.groups[1].logical_group = 2;
         assert_eq!(
             spec.validate().unwrap_err().to_string(),
@@ -555,8 +553,7 @@ mod tests {
                     pool: 0,
                     layers: vec![0],
                     logical_group: 0,
-                    kind: Kind::Paged,
-                    window: None,
+                    kind: Kind::Paged { window: None },
                 }],
             };
             assert!(spec.validate().is_ok(), "order {order:?}");

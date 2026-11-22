@@ -64,14 +64,14 @@ fn cache_spec<S: Geometry>() -> CacheSpec {
             format: PageFormat::contiguous(
                 vec![Block::SIZE, 2, KvHeads::SIZE, Head::SIZE],
                 size_of::<bf16>(),
-            ),
+            )
+            .expect("Qwen3 cache page dimensions fit usize"),
         }],
         groups: vec![Group {
             pool: 0,
             layers: (0..S::LAYERS).collect(),
             logical_group: 0,
-            kind: Kind::Paged,
-            window: None,
+            kind: Kind::Paged { window: None },
         }],
     }
 }

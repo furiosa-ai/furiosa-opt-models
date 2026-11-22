@@ -258,14 +258,13 @@ mod tests {
                     pools: vec![Pool {
                         block: 16,
                         bytes: 64,
-                        format: PageFormat::contiguous(vec![16, 4], 1),
+                        format: PageFormat::contiguous(vec![16, 4], 1).unwrap(),
                     }],
                     groups: vec![Group {
                         pool: 0,
                         layers: vec![0],
                         logical_group: 0,
-                        kind: Kind::Paged,
-                        window: None,
+                        kind: Kind::Paged { window: None },
                     }],
                 },
                 adapters: 0,

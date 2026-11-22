@@ -153,6 +153,7 @@ pub trait Decoder: Send + Sync {
     /// adapter tree, or `Infallible` for a decoder that runs none.
     type Adapter: Send + Sync + 'static;
 
+    /// Static call and cache limits, unchanged while this decoder serves requests.
     fn limits(&self) -> Limits;
 
     /// Views of `storage`, the layers of a cache allocated for this decoder.
@@ -182,12 +183,18 @@ pub trait Decoder: Send + Sync {
 /// tiling says, so no caller passes one.
 pub struct Instance<D> {
     decoder: D,
+    limits: Limits,
     tiling: Tiling,
 }
 
-impl<D> Instance<D> {
+impl<D: Decoder> Instance<D> {
     pub fn new(decoder: D, tiling: Tiling) -> Self {
-        Self { decoder, tiling }
+        let limits = decoder.limits();
+        Self {
+            decoder,
+            limits,
+            tiling,
+        }
     }
 
     pub fn decoder(&self) -> &D {
@@ -227,7 +234,7 @@ impl<'r, 'c, 'l, 'a, D: Decoder>
         (cache, adapters): (&'c Cache, &'l [Option<&'a D::Adapter>]),
         requests: &'r [Request],
     ) -> io::Result<D::Output> {
-        let batch = Batch::new(requests, &Decoder::limits(&self.decoder), cache, adapters)?;
+        let batch = Batch::new(requests, &self.limits, cache, adapters)?;
         let mut layers = cache.lend(D::layers)?;
         self.decoder
             .call(device, &mut layers, batch, self.tiling)
@@ -263,7 +270,7 @@ pub trait Served: Send + Sync {
 /// `Adapter`s.
 impl<D: Decoder> Served for Instance<D> {
     fn limits(&self) -> Limits {
-        Decoder::limits(&self.decoder)
+        self.limits.clone()
     }
 
     fn output(&self) -> Output {

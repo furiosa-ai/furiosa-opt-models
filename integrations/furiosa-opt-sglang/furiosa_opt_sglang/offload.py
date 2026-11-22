@@ -27,6 +27,8 @@ import furiosa_opt_engine as engine
 from furiosa_opt_sglang.cache import Cache
 from furiosa_opt_sglang.platform import Hierarchical
 
+ENGINE_CACHE_GROUP = 0
+
 if TYPE_CHECKING:
     from threading import Event
 
@@ -197,7 +199,10 @@ class Host(HostKVCache):
         host = pages(host_indices, self.page_size)
         if len(device) != len(host):
             raise ValueError("hierarchical cache backup source and destination pages differ")
-        transfers = [(target, [(0, source)]) for source, target in zip(device, host, strict=True)]
+        transfers = [
+            (target, [(ENGINE_CACHE_GROUP, source)])
+            for source, target in zip(device, host, strict=True)
+        ]
         copy = self.copier.copy_out(transfers, self.host_cache)
         copy.submitted()
 
@@ -225,7 +230,8 @@ class Host(HostKVCache):
         pending = self._pending_loads.get(key)
         if pending is None:
             transfers = [
-                (target, [(0, source)]) for source, target in zip(device, host, strict=True)
+                (target, [(ENGINE_CACHE_GROUP, source)])
+                for source, target in zip(device, host, strict=True)
             ]
             copy = self.copier.copy_in(transfers, self.host_cache)
             copy.submitted()

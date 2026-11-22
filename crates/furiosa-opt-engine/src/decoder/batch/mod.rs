@@ -114,7 +114,7 @@ impl<'a, A> Batch<'a, A> {
             .map(|group| match group {
                 Group {
                     pool,
-                    kind: Kind::Paged,
+                    kind: Kind::Paged { .. },
                     ..
                 } => Ok(limits.cache.pools[*pool].block),
                 _ => Err(unsupported("a call plans paged cache groups")),
@@ -291,14 +291,13 @@ mod tests {
                 pools: vec![Pool {
                     block,
                     bytes: 64,
-                    format: PageFormat::contiguous(vec![block, 64 / block], 1),
+                    format: PageFormat::contiguous(vec![block, 64 / block], 1).unwrap(),
                 }],
                 groups: vec![Group {
                     pool: 0,
                     layers: vec![0],
                     logical_group: 0,
-                    kind: Kind::Paged,
-                    window: None,
+                    kind: Kind::Paged { window: None },
                 }],
             },
             adapters: 0,
@@ -389,8 +388,9 @@ mod tests {
             pool: 0,
             layers: vec![1],
             logical_group: 1,
-            kind: Kind::Paged,
-            window: Some(8),
+            kind: Kind::Paged {
+                window: std::num::NonZeroUsize::new(8),
+            },
         });
         let cache = Cache::new(&device, &limits.cache, 8)?;
         let mut request = request(&device, &[7, 5], 3, 2)?;
