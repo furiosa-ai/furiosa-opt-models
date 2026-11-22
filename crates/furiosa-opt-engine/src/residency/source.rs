@@ -11,7 +11,8 @@ use std::{io, ops::Range};
 /// A replicated image's pieces are reused on every destination chip.
 const PIECE: usize = 1 << 30;
 
-/// A prepared tensor's bytes, retained on the host across placements and evictions.
+/// A prepared tensor's bytes, retained until a pinned image replaces them or the owner drops.
+/// Always owns the complete prepared payload; layout-only or empty placeholders are not sources.
 pub(super) struct Source {
     bytes: HostBuffer,
     len: usize,
@@ -75,7 +76,7 @@ impl Source {
     }
 
     /// Page-lock every chip's prepared bytes once, using the calling thread's NUMA policy.
-    /// Retaining the source is independent of retaining this image.
+    /// The caller replaces its source only after every piece has been prepared successfully.
     pub(super) fn pin(&self) -> io::Result<Image> {
         let mut pieces = Vec::new();
         for shard in 0..self.shards.unwrap_or(1) {
@@ -124,7 +125,7 @@ impl Source {
     }
 }
 
-/// Page-locked pieces of a prepared source, reusable across requests.
+/// Page-locked weight bytes and their layout, retained for streaming and reload across requests.
 pub(super) struct Image {
     pieces: Vec<Pinned>,
     len: usize,

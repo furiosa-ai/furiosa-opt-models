@@ -3,7 +3,9 @@
 //! Admission never waits; eviction closes it, drains admitted calls, and returns the copy with
 //! every upload and accepted reader to wait for. Initial host pinning and device placement each
 //! serialize their own callers, while transfers, allocation, and work waits run outside the
-//! state lock. Failed or unwinding preparation leaves the parameter retryable.
+//! state lock. Successful pinning replaces the prepared source; an overlapping pageable
+//! placement retains its own source until its copy ends. Failed or unwinding preparation
+//! leaves the parameter retryable.
 
 use super::Completion;
 use super::gate::Gate;
@@ -13,18 +15,24 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::{any::Any, io};
 
 pub(super) struct Parameter {
-    source: Source,
     state: Mutex<State>,
     changed: Condvar,
 }
 
-#[derive(Default)]
 struct State {
-    image: Option<Arc<Image>>,
+    host: Host,
     copy: Option<Placed>,
     evicting: bool,
     placing: bool,
     pinning: bool,
+}
+
+/// Host weights remain owned in one form. Pinning replaces the pageable payload with the
+/// required pinned bytes; it does not remove the host weights used by streaming and reload.
+#[derive(Clone)]
+enum Host {
+    Prepared(Arc<Source>),
+    Pinned(Arc<Image>),
 }
 
 struct Placed {
@@ -45,6 +53,7 @@ type Issued = (HbmBuffer, Option<Arc<Completion>>);
 
 /// Upload callbacks share the engine's real device, but do not run under a parameter lock.
 /// `place` completes its write; `issue` returns only after the pinned write is accepted.
+/// Pageable placement borrows a complete source; pinned placement uses the image's own layout.
 pub(super) struct Destination<'a> {
     pub(super) owner: Owner,
     pub(super) place: &'a dyn Fn(&Source) -> io::Result<HbmBuffer>,
@@ -75,15 +84,31 @@ struct Pinning<'a>(&'a Parameter);
 impl Parameter {
     pub(super) fn new(source: Source) -> Self {
         Self {
-            source,
-            state: Mutex::default(),
+            state: Mutex::new(State {
+                host: Host::Prepared(Arc::new(source)),
+                copy: None,
+                evicting: false,
+                placing: false,
+                pinning: false,
+            }),
             changed: Condvar::new(),
         }
     }
 
     #[cfg(test)]
-    pub(super) fn source(&self) -> &Source {
-        &self.source
+    pub(super) fn source(&self) -> Arc<Source> {
+        match &self.state().host {
+            Host::Prepared(source) => source.clone(),
+            Host::Pinned(_) => panic!("the pinned image replaced the prepared source"),
+        }
+    }
+
+    #[cfg(test)]
+    fn image(&self) -> Arc<Image> {
+        match &self.state().host {
+            Host::Pinned(image) => image.clone(),
+            Host::Prepared(_) => panic!("the source has not been pinned"),
+        }
     }
 
     pub(super) fn pin(&self) -> io::Result<()> {
@@ -212,19 +237,19 @@ impl Parameter {
                 format!("{path}: the tensor's chip count differs from the destination"),
             ));
         }
-        let image = {
+        let host = {
             let mut state = self.settled();
             if let Some(copy) = &mut state.copy {
                 copy.gate.reap();
                 return copy.owner.agrees(&destination.owner, path);
             }
             state.placing = true;
-            state.image.clone()
+            state.host.clone()
         };
         let placing = Placing(self);
-        let (buffer, upload) = match image {
-            None => (destination.place)(&self.source).map(|buffer| (buffer, None)),
-            Some(image) => (destination.issue)(&image),
+        let (buffer, upload) = match &host {
+            Host::Prepared(source) => (destination.place)(source).map(|buffer| (buffer, None)),
+            Host::Pinned(image) => (destination.issue)(image),
         }
         .map_err(|error| io::Error::new(error.kind(), format!("{path}: {error}")))?;
         // Validate an alias while retaining the original allocation. On a malformed issued
@@ -271,15 +296,21 @@ impl Parameter {
                 state.pinning
             })
             .unwrap_or_else(PoisonError::into_inner);
-        if state.image.is_some() {
-            return Ok(());
-        }
+        let source = match &state.host {
+            Host::Prepared(source) => source.clone(),
+            Host::Pinned(_) => return Ok(()),
+        };
         state.pinning = true;
         let pinning = Pinning(self);
         drop(state);
 
-        let image = Arc::new(prepare(&self.source)?);
-        self.state().image = Some(image);
+        let image = Arc::new(prepare(&source)?);
+        let prepared = {
+            let mut state = self.state();
+            std::mem::replace(&mut state.host, Host::Pinned(image))
+        };
+        drop(prepared);
+        drop(source);
         drop(pinning);
         Ok(())
     }
@@ -450,6 +481,7 @@ mod tests {
     /// establish that overlap without sleeps, pinned memory, or a device allocation.
     fn concurrent_pin_retry(unwind: bool) {
         let parameter = Arc::new(parameter());
+        let source = Arc::downgrade(&parameter.source());
         let calls = Arc::new(AtomicUsize::new(0));
         let active = Arc::new(AtomicUsize::new(0));
         let (entered, entering) = mpsc::channel();
@@ -561,7 +593,8 @@ mod tests {
         assert!(!state.pinning);
         assert!(!state.placing);
         assert!(!state.evicting);
-        assert!(state.image.is_none());
+        assert!(matches!(&state.host, Host::Prepared(_)));
+        assert!(source.upgrade().is_some());
         assert!(state.copy.is_none());
     }
 
@@ -607,10 +640,12 @@ mod tests {
     #[ignore = "requires page-locked host memory from /dev/dma_heap/system"]
     fn pinning_reuses_its_image_without_placing_a_copy() {
         let parameter = parameter();
+        let source = Arc::downgrade(&parameter.source());
         parameter.pin().unwrap();
-        let first = parameter.state().image.clone().unwrap();
+        assert!(source.upgrade().is_none());
+        let first = parameter.image();
         parameter.pin().unwrap();
-        let again = parameter.state().image.clone().unwrap();
+        let again = parameter.image();
         assert!(Arc::ptr_eq(&first, &again));
         assert!(parameter.owner().is_none());
         assert!(matches!(parameter.close(), Closing::Host));
@@ -715,11 +750,13 @@ mod tests {
     }
 
     /// Duplicate placements serialize without holding the state lock over the transfer callback.
+    /// Pinning can replace the prepared source while that callback retains its bytes.
     #[test]
-    #[ignore = "requires one explicitly selected RNGD chip"]
+    #[ignore = "requires one explicitly selected RNGD chip and page-locked host memory"]
     fn places_once_when_uploads_race() {
         let (device, owner) = hardware();
         let parameter = Arc::new(parameter());
+        let source = Arc::downgrade(&parameter.source());
         let count = Arc::new(AtomicUsize::new(0));
         let (entered, entering) = mpsc::channel();
         let (go, resume) = mpsc::channel();
@@ -751,6 +788,11 @@ mod tests {
         };
         let first = worker(parameter.clone());
         entering.recv_timeout(Duration::from_secs(5)).unwrap();
+        parameter.pin().unwrap();
+        assert!(
+            source.upgrade().is_some(),
+            "placement still reads its source"
+        );
         // This immediate refusal proves the transfer callback does not hold the state lock.
         assert_eq!(
             parameter
@@ -767,6 +809,7 @@ mod tests {
         first.join().unwrap().unwrap();
         second.join().unwrap().unwrap();
         assert_eq!(count.load(Ordering::Relaxed), 1);
+        assert!(source.upgrade().is_none());
         parameter.admit(&owner.device, "layer.weight").unwrap();
         parameter.release(&[]);
     }
@@ -914,7 +957,7 @@ mod tests {
             .unwrap(),
         );
         parameter.pin().unwrap();
-        let image = parameter.state().image.clone().unwrap();
+        let image = parameter.image();
         let place =
             |source: &Source| super::super::upload::place(&mut device.lock().unwrap(), source);
         let issue = |image: &Image| super::super::upload::issue(&mut device.lock().unwrap(), image);
@@ -955,10 +998,7 @@ mod tests {
             parameter.open();
             assert!(parameter.owner().is_none());
             parameter.pin().unwrap();
-            assert!(Arc::ptr_eq(
-                &image,
-                parameter.state().image.as_ref().unwrap()
-            ));
+            assert!(Arc::ptr_eq(&image, &parameter.image()));
         }
     }
 }
