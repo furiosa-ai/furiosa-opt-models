@@ -20,10 +20,12 @@ from furiosa_opt_vllm.offloading import (
     CONNECTOR_MODULE,
     Offloading,
     engine_cache,
-    offload as configure_offload,
     offloading_budget,
     offloading_contracts,
     offloading_extra,
+)
+from furiosa_opt_vllm.offloading import (
+    offload as configure_offload,
 )
 
 if TYPE_CHECKING:
