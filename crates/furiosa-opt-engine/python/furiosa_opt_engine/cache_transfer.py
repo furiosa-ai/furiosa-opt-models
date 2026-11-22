@@ -209,16 +209,13 @@ def page_runs(
     if len(device_pages) != len(host_pages):
         raise ValueError("device and host page lists must have the same length")
     starts: list[int] = []
-    for index, (device_page, host_page) in enumerate(
-        zip(device_pages, host_pages, strict=True)
-    ):
+    for index, (device_page, host_page) in enumerate(zip(device_pages, host_pages, strict=True)):
         if device_page < 0 or host_page < 0:
             raise ValueError("cache page indices cannot be negative")
         if (
             index == 0
             or chips > 1
-            or (device_page - device_pages[index - 1], host_page - host_pages[index - 1])
-            != (1, 1)
+            or (device_page - device_pages[index - 1], host_page - host_pages[index - 1]) != (1, 1)
         ):
             starts.append(index)
     return tuple(
@@ -250,10 +247,6 @@ def transfer_cache_pages(
         for device_page, host_page, count in page_runs(device_pages, host_pages, chips):
             device_range = layer.slice(device_page * page_bytes, count * page_bytes)
             host_range = host.slice(host_page * host_page_bytes, count * host_page_bytes)
-            yield (
-                device_range.to_host(host_range)
-                if to_host
-                else host_range.to_hbm(device_range)
-            )
+            yield (device_range.to_host(host_range) if to_host else host_range.to_hbm(device_range))
 
     return submit(transfers())
