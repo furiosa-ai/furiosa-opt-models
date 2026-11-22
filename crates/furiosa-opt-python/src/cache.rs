@@ -329,7 +329,15 @@ impl PyCopier {
                 for chunk in chunks {
                     chunk.fail(io::Error::other(error.to_string()));
                 }
-                let _ = completion.done(None);
+                let error = match completion.done(None) {
+                    Ok(_) => error,
+                    Err(drain_error) => io::Error::new(
+                        error.kind(),
+                        format!(
+                            "{error}; draining earlier cache copies also failed: {drain_error}"
+                        ),
+                    ),
+                };
                 self.pending.remove(&reservations);
                 return Err(crate::Error::from(error).into());
             }
