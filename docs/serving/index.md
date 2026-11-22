@@ -192,17 +192,29 @@ Both servers copy the cache blocks of computed prompts to a tier of host memory,
     A `/generate` response reports reused tokens by tier in `meta_info.cached_tokens_details`.
 
 Both adapters keep the framework's scheduling, keys, and tier lifecycle. Their host transfers
-share the engine's six-worker queue: each batch moves up to two pinned host slots, with all layer
-pages in one runtime DMA batch. Filesystem I/O uses `O_DIRECT` with a page-aligned, per-thread
-bounce buffer when supported; buffered fallback accesses pinned slots directly. Both paths issue
-one syscall per cache page, and vLLM keeps its chunk files with each page at its aligned offset.
-The engine waits only for earlier DMA chunks touching the same host slot or device page. A lease on
-a host slot keeps DMA out while Python uses its pinned bytes; transfers for other pages remain
-independent. SGLang submits these engine copies asynchronously; its completion events follow the
-finished copy. Each engine DMA batch includes every layer page for up to two host slots, avoiding
-separate runtime submissions per layer and preserving the engine's page-batched transfer schedule.
-SGLang normally exposes each restored layer as soon as it is ready; this adapter reports all
-layer-ready callbacks only after the full Copy request finishes. This gives up layer-by-layer
+share the engine's six-worker queue: each ordinary engine request groups up to two distinct pinned
+host slots and routes every requested layer page together. Filesystem I/O uses `O_DIRECT` with a
+page-aligned, per-thread bounce buffer when supported; buffered fallback accesses pinned slots
+directly. Both paths issue one syscall per cache page, and vLLM keeps its chunk files with each page
+at its aligned offset. The engine waits only for earlier DMA work touching the same host slot or
+device page. A lease on a host slot keeps DMA out while Python uses its pinned bytes; transfers for
+other pages remain independent.
+
+One engine request is not always one low-level runtime submission. The pinned runtime processes at
+most 64 page, layer, and chip pieces per transfer slot, then submits additional slots sequentially.
+For a single chip, an ordinary two-page request can split above 32 layers; coalesced copies can
+split above 64 layer segments. Multiple chips use the same 64-entry budget across their pieces and
+reach it sooner. The engine still transfers directly between pinned slots and the existing HBM
+pages. Opt-in coalescing uses one pinned staging buffer per chip, with CPU gather/scatter and DMA
+over contiguous layer ranges, as in #322. #322's pinned runtime groups those ranges differently,
+so large requests may incur extra submission and completion overhead here. The byte movement and
+coalescing algorithm match; lower-level submission batching does not. Removing that difference
+requires a shared engine/runtime API change that preserves access leases; the framework adapters
+cannot remove it. End-to-end performance impact has not been measured on NPU hardware.
+
+SGLang submits engine copies asynchronously and records completion events after the whole Copy
+request finishes. SGLang normally exposes each restored layer as soon as it is ready; this adapter
+reports all layer-ready callbacks only after the request finishes. This gives up layer-by-layer
 DMA/compute overlap during restore, which can delay the first layer's compute while later layers
 transfer. Splitting copies by layer could restore that overlap, but would add runtime submissions
 and change the selected all-layer DMA schedule.
