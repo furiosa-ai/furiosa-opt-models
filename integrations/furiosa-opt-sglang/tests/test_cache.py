@@ -186,7 +186,7 @@ def copy_blocks() -> None:
     config = AutoConfig.from_pretrained(directory)
     device = engine.Device(engine.Placement(chips(0, 1), PES))
     decoder = Decoder.load(
-        Location(directory, None), engine.LoadOptions(), device, config.vocab_size
+        Location(directory, None).mapped(), engine.LoadOptions(), device, config.vocab_size
     )
     assert decoder.model is not None
     heads, head = config.num_key_value_heads, config.head_dim
@@ -227,7 +227,7 @@ def follow_layout() -> None:
     device = engine.Device(engine.Placement(chips(0, 1), PES))
     # The base model's hidden rows tell apart attention over any other cache rows.
     options = engine.LoadOptions().architecture("Qwen3Model")
-    decoder = Decoder.load(Location(directory, None), options, device, config.vocab_size)
+    decoder = Decoder.load(Location(directory, None).mapped(), options, device, config.vocab_size)
     block, model = decoder.pool.block, decoder.model
     assert model is not None
     pages = Pages.parse(decoder, config.num_key_value_heads, config.head_dim)

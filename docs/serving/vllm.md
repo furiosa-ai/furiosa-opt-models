@@ -31,7 +31,7 @@ These features are not supported yet, and the plugin refuses them at startup rat
 - Expert parallelism.
 - KV connectors other than `RNGDOffloadingConnector` (`--kv-transfer-config`), among them vLLM's own `OffloadingConnector`, an encoder cache connector other than the encoder-only one above (`--ec-transfer-config`), and weight offloading to the host (`--cpu-offload-gb`, `--offload-group-size`).
 - KV offloading through LMCache (`--kv-offloading-backend lmcache`), the simple CPU connector (`VLLM_USE_SIMPLE_KV_OFFLOAD=1`), an offloading spec other than `CPUOffloadingSpec` or `canonical_layout` in `kv_connector_extra_config`, `kv_load_failure_policy` `recompute`, over several chips (`--tensor-parallel-size`, `--pipeline-parallel-size`) or replicas (`--data-parallel-size`), or with sleep mode (`--enable-sleep-mode`).
-- Quantizing at load: `--quantization` must name a quantized checkpoint's own method; a BF16 checkpoint takes only `fp8_per_tensor`, or `online` with `quantization_config.linear` `fp8_per_tensor`, without `ignore`, `targets` or an activation override.
+- Quantizing at load: `--quantization` must name a quantized checkpoint's own method; a BF16 checkpoint takes only `fp8_per_tensor`, or `online` with `quantization_config.linear` `fp8_per_tensor`, without `ignore`, `targets` or an activation override. The engine's BF16-activation subset is described in the [serving overview](index.md#quantize-a-bf16-checkpoint-at-load).
 - `--prefix-match-unit` for a hybrid model with `--mamba-cache-mode align`, because the plugin copies no cache blocks.
 
 Watermarking and requested prompt-token scoring are supported.

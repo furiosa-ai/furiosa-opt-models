@@ -215,8 +215,8 @@ fn layer<P: for<'a> Load<&'a Checkpoint>>(
 }
 
 /// Layer 0's projections, loaded alone from the checkpoint read quantized, hold torch's codes and
-/// scales: vLLM's tensor scale shared by the joined query, key and value rows and by gate and up,
-/// SGLang's channel scales.
+/// scales: vLLM's tensor scale shared by joined query/key/value rows and gate/up, and SGLang's
+/// channel scales on supported NVIDIA paths.
 #[test]
 #[ignore = "opens a device"]
 fn holds_the_codes_and_scales_of_each_quantizer() {

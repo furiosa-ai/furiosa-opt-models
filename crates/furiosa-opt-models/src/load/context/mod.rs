@@ -19,6 +19,8 @@ pub struct Context<'d> {
     device: Option<&'d mut Device>,
     cursor: Cursor,
     ties: Ties,
+    /// The largest FP32 magnitude for each fused projection group in the active checkpoint.
+    fused_maxima: BTreeMap<String, f32>,
     /// Every name read, in order: a rule read the names read since it started.
     read: Vec<String>,
     strict: Option<Strict>,
@@ -62,6 +64,7 @@ impl<'d> Context<'d> {
             device: device.into(),
             cursor: Cursor::default(),
             ties: Ties::default(),
+            fused_maxima: BTreeMap::new(),
             read: Vec::new(),
             strict: None,
             rules: Vec::new(),
@@ -101,6 +104,21 @@ impl<'d> Context<'d> {
     /// Marks `name` read: a strict traversal does not report it, and the current rule requires it.
     pub fn read(&mut self, name: &str) {
         self.read.push(name.into());
+    }
+
+    /// The fused FP32 maximum for this projection group, once per checkpoint traversal. `resolve`
+    /// runs on hits too, so each projection can record its sibling dependencies.
+    pub(crate) fn fused_projection_maximum(
+        &mut self,
+        group: &str,
+        resolve: impl FnOnce(&mut Self, Option<f32>) -> Result<f32, LoadError>,
+    ) -> Result<f32, LoadError> {
+        let cached = self.fused_maxima.get(group).copied();
+        let maximum = resolve(self, cached)?;
+        if cached.is_none() {
+            self.fused_maxima.insert(group.to_owned(), maximum);
+        }
+        Ok(maximum)
     }
 
     /// Runs `visit` one field down: `tree` and `checkpoint` segments, both restored after it. A
@@ -240,6 +258,7 @@ impl<'d> Context<'d> {
         if self.strict.is_some() {
             return visit(self);
         }
+        self.fused_maxima.clear();
         self.strict = Some(Strict {
             root: self.name(),
             start: self.read.len(),
@@ -438,5 +457,64 @@ impl<'d> Context<'d> {
             || name
                 .strip_prefix(prefix)
                 .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caches_a_fused_maximum_per_group_in_one_checkpoint_traversal() {
+        let checkpoint = Checkpoint::default();
+        let other = Checkpoint::default();
+        let group = "layer.q_proj";
+        let other_group = "layer.gate_proj";
+        let mut context = Context::new(None);
+        let mut resolutions = 0;
+        let mut computations = 0;
+
+        let first = context
+            .checkpoint(&checkpoint, |context| {
+                let first = context.fused_projection_maximum(group, |_, cached| {
+                    assert_eq!(cached, None);
+                    resolutions += 1;
+                    computations += 1;
+                    Ok(8.0)
+                })?;
+                let second = context.fused_projection_maximum(group, |_, cached| {
+                    assert_eq!(cached, Some(8.0));
+                    resolutions += 1;
+                    Ok(cached.unwrap())
+                })?;
+                let third = context.fused_projection_maximum(other_group, |_, cached| {
+                    assert_eq!(cached, None);
+                    resolutions += 1;
+                    computations += 1;
+                    Ok(3.0)
+                })?;
+                let fourth = context.fused_projection_maximum(other_group, |_, cached| {
+                    assert_eq!(cached, Some(3.0));
+                    resolutions += 1;
+                    Ok(cached.unwrap())
+                })?;
+                Ok((first, second, third, fourth))
+            })
+            .unwrap();
+        let other_checkpoint = context
+            .checkpoint(&other, |context| {
+                context.fused_projection_maximum(group, |_, cached| {
+                    assert_eq!(cached, None);
+                    resolutions += 1;
+                    computations += 1;
+                    Ok(4.0)
+                })
+            })
+            .unwrap();
+
+        assert_eq!(first, (8.0, 8.0, 3.0, 3.0));
+        assert_eq!(other_checkpoint, 4.0);
+        assert_eq!(resolutions, 5);
+        assert_eq!(computations, 3);
     }
 }

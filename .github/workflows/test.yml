@@ -50,3 +50,12 @@ jobs:
           [ ${#failed[@]} -eq 0 ] || { printf 'failed: %s\n' "${failed[@]}"; exit 1; }
         env:
           FURIOSA_OPT_PROFILE: info
+      - name: Test SGLang draft online FP8 on RNGD
+        working-directory: ${{ runner.temp }}
+        run: |
+          uv pip install --prerelease=allow \
+            "$GITHUB_WORKSPACE"/products/build-wheel/furiosa_opt_engine-*.whl \
+            "$GITHUB_WORKSPACE"/products/build-wheel/furiosa_opt_sglang-*.whl pytest
+          pytest -p no:cacheprovider \
+            "$GITHUB_WORKSPACE/integrations/furiosa-opt-sglang/tests/test_quantization.py" \
+            -k 'draft_owned_fp8_keeps_bf16_target_answers or (test_generates_with_sglang_fp8_weights and qwen306b)'

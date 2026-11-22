@@ -25,7 +25,7 @@ Install a plugin first ([Installation](../getting-started/installation.md)); [Qu
 | Automatic prefix caching | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Reuse cached prefixes](#reuse-cached-prefixes) |
 | FP8 KV cache | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Quantized checkpoints (FP8, NVFP4) | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
-| Online quantization | <span class="support support-yes">Supported</span> | <span class="support support-no">Not yet</span> | [Quantize a BF16 checkpoint at load](#quantize-a-bf16-checkpoint-at-load) |
+| Online FP8 weight quantization | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Quantize a BF16 checkpoint at load](#quantize-a-bf16-checkpoint-at-load) |
 | KV cache offloading | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Offload the KV cache to host memory](#offload-the-kv-cache-to-host-memory) |
 | Sleep mode | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> (without speculative decoding) | [Put the server to sleep](#put-the-server-to-sleep) |
 | Long contexts, up to the compiled window | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Serve long contexts](#serve-long-contexts) |
@@ -216,17 +216,32 @@ Without the copy, waking reads the checkpoint's files as they are then.
 
 ## Quantize a BF16 checkpoint at load
 
-vLLM's per-tensor online FP8 quantizes a Qwen3-0.6B, Qwen3-1.7B or Qwen3-4B BF16 checkpoint as it loads:
+For BF16 Qwen3-0.6B, 1.7B and 4B, both adapters select per-tensor weight scales for this backend. Fused query/key/value and gate/up weights each share one scale. SGLang 0.5.22 uses per-channel weights when its optimized channel-wise kernels are selected and explicitly falls back to tensor-wise `input_to_float8` otherwise ([dispatch and fallback](https://github.com/sgl-project/sglang/blob/v0.5.22/python/sglang/srt/layers/quantization/fp8.py#L482-L496), [conversion branch](https://github.com/sgl-project/sglang/blob/v0.5.22/python/sglang/srt/layers/quantization/fp8.py#L1077-L1097)). vLLM 0.31.0's `fp8_per_tensor` method uses a tensor-wise weight key directly ([method](https://github.com/vllm-project/vllm/blob/v0.31.0/vllm/model_executor/layers/quantization/online/fp8.py#L163-L180)). Each adapter resolves its framework option; the engine owns weight conversion and kernel selection.
 
-```bash
-vllm serve Qwen/Qwen3-0.6B --quantization fp8_per_tensor
-```
+The scale-layout match does not extend to activations. Both native methods dynamically quantize them: SGLang uses per-token scales ([activation path](https://github.com/sgl-project/sglang/blob/v0.5.22/python/sglang/srt/layers/quantization/fp8_utils.py#L2379-L2395)); vLLM selects per-tensor or per-token scales according to its active kernel path ([activation selection](https://github.com/vllm-project/vllm/blob/v0.31.0/vllm/model_executor/layers/quantization/online/fp8.py#L163-L180)). This engine path quantizes weights only and keeps BF16 activations, so it is a documented subset and outputs can differ. Full activation parity needs engine support for each framework's activation scale layout.
 
-The load stores each decoder projection's weight as E4M3 codes with FP32 scales, as vLLM's method computes them: one scale per projection, shared by the projections vLLM fuses into one matrix (a layer's query, key and value; its gate and up), the largest magnitude over 448.
-Each projection restores the codes to BF16 before its product, so the activations stay in BF16, as vLLM computes this method without an FP8 matrix unit; the embedding and the vocabulary head stay in BF16.
+=== "vLLM"
+
+    ```bash
+    vllm serve Qwen/Qwen3-0.6B --quantization fp8_per_tensor
+    ```
+
+    Startup refuses `--quantization` on a quantized checkpoint.
+
+=== "SGLang"
+
+    ```bash
+    python -m sglang.launch_server --model-path Qwen/Qwen3-0.6B --quantization fp8
+    ```
+
+    A STANDALONE draft model takes the target's quantization, as in SGLang; `--speculative-draft-model-quantization unquant` loads it as stored.
+    If a checkpoint declares its own quantization, `fp8` adds no conversion; the engine reads the stored form or refuses it if unsupported.
+    Waking from [sleep](#put-the-server-to-sleep) quantizes the BF16 weights again, so a woken server answers as before.
+
+The load stores each decoder projection's weights as E4M3 codes with FP32 scales. For each framework-defined group, the scale is that group's maximum absolute weight divided by 448.
+The engine restores those codes to BF16 before each product; the embedding and vocabulary head stay in BF16.
 Startup refuses Qwen3-8B, whose packed query, key and value projection has no FP8 form, before downloading its weights.
-Startup also refuses the other methods, which quantize the activations too (`fp8_per_channel`, `fp8_per_block`) or use other formats (MX, NVFP4), and `--quantization` on a quantized checkpoint.
-SGLang refuses `--quantization` for a BF16 checkpoint at startup.
+The adapters refuse vLLM's `fp8_per_channel` and `fp8_per_block`, and SGLang's `w8a8_fp8`, because these request weight or activation layouts outside the supported subset. They also refuse MX and NVFP4 because these online load paths do not encode those weight formats.
 
 ## Serve long contexts
 
@@ -388,7 +403,7 @@ Why each feature is not served yet:
 - **Multimodal inputs**: no served checkpoint answers about images, video or audio; Gemma 4 unified's media encoder runs [on an encoder-only instance](#embed-media-on-an-encoder-only-instance), but the engine serves no language model of it.
 - **Speculative methods other than ngram and suffix** (vLLM, which also has no draft model yet) or NGRAM and STANDALONE (SGLang).
 - **FP8 KV cache and quantized checkpoints**: the served checkpoints load BF16 weights and cache keys and values in BF16.
-- **Online quantization** with SGLang, and with vLLM any method but `fp8_per_tensor`: the other methods quantize the activations too or use other formats, and the SGLang plugin passes no quantization to the load.
+- **Other online quantization methods**: [Quantize a BF16 checkpoint at load](#quantize-a-bf16-checkpoint-at-load) lists accepted methods and explains why the adapters refuse others.
 - **Tensor, pipeline, expert and context parallelism**, and serving across nodes: each served checkpoint runs on one chip.
 - **LoRA with SGLang**: `--enable-lora` and `--lora-paths` are refused; the SGLang plugin runs no adapter yet.
 - **Disaggregated prefill, KV connectors and a disaggregated encoder**: no cache row moves to another instance, and of a disaggregated encoder only the [encoder-only instance](#embed-media-on-an-encoder-only-instance) runs.

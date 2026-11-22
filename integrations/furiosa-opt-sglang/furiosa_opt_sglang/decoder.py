@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Final
 
 import furiosa_opt_engine as engine
@@ -50,9 +50,24 @@ class Location:
     directory: str
     config: dict[str, JsonValue] | None
 
-    def mapped(self) -> engine.Checkpoint:
-        """The checkpoint's tensors, mapped from its files as they are now."""
-        return engine.Checkpoint(self.directory, config=self.config)
+    def mapped(self) -> MappedCheckpoint:
+        """The checkpoint's tensors, mapped from its files as they are now, with their location."""
+        return MappedCheckpoint(self)
+
+
+@dataclass(frozen=True, slots=True)
+class MappedCheckpoint:
+    """A mapped checkpoint and its location, which maps the same source again after release."""
+
+    location: Location
+    source: engine.Checkpoint = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "source",
+            engine.Checkpoint(self.location.directory, config=self.location.config),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +91,7 @@ class Decoder:
     @classmethod
     def load(
         cls,
-        checkpoint: Location,
+        checkpoint: MappedCheckpoint,
         options: engine.LoadOptions,
         device: engine.Device,
         vocabulary: int,
@@ -84,12 +99,12 @@ class Decoder:
         backup: bool = False,
     ) -> Decoder:
         """`checkpoint` loaded with `options` onto `device`, whose token IDs lie below `vocabulary`;
-        with `backup`, loaded from a copy of its tensors in host memory, which the decoder keeps.
+        `backup` keeps a host copy of the tensors.
         Refuses a decoder whose calls return scores or whose cache is not one paged full-history
         group."""
-        mapped = checkpoint.mapped()
-        copy = mapped.read() if backup else None
-        loaded = options.load(mapped if copy is None else copy, device)
+        source = checkpoint.source
+        copy = source.read() if backup else None
+        loaded = options.load(source if copy is None else copy, device)
         match loaded:
             case engine.Decoder(output=engine.decoder.Output.TOKENS | engine.decoder.Output.HIDDEN):
                 pass
@@ -99,7 +114,14 @@ class Decoder:
             case [engine.decoder.Group(kind=engine.decoder.Kind.Paged(), window=None) as group]:
                 pool = loaded.cache.pools[group.pool]
                 return cls(
-                    loaded, copy, checkpoint, options, device, vocabulary, pool, group.layers
+                    loaded,
+                    copy,
+                    checkpoint.location,
+                    options,
+                    device,
+                    vocabulary,
+                    pool,
+                    group.layers,
                 )
             case _:
                 raise NotImplementedError("the plugin pages only one full-history attention group")

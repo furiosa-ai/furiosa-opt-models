@@ -395,7 +395,7 @@ CONTRACTS: Final = (
 
 QUANTIZATION: Final = (
     "quantizes a BF16 checkpoint at load only with --quantization fp8_per_tensor: E4M3 weights "
-    "under one scale per tensor, which the projections restore to BF16"
+    "under one scale per tensor, restored to BF16 while this engine keeps activations in BF16"
 )
 
 
@@ -438,11 +438,12 @@ def quantization(config: ModelConfig, scope: str = "") -> Quantization | None:
         )
     if settings is None or settings.linear is None or weight != kFp8StaticTensorSym:
         raise Refused(f"{scope}quantization", QUANTIZATION)
-    # vLLM picks each online method's activation quantization itself; an override asks for FP8 ones.
+    # Without an override, vLLM's online method still dynamically quantizes activations; this
+    # engine intentionally keeps them in BF16. Reject explicit overrides the engine cannot apply.
     if settings.linear.activation is not None:
         raise Refused(
             f"{scope}quantization_config.linear.activation",
-            "takes no activation quantization; the projections take BF16 activations",
+            "does not support activation overrides; the engine keeps BF16 activations",
         )
     if config.is_moe and settings.moe is not None:
         raise Refused(f"{scope}quantization", "quantizes no routed experts at load")

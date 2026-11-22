@@ -87,7 +87,7 @@ impl Checkpoint {
     ) -> Result<Quantized<In, Out, C>, LoadError> {
         let granularity = self.quantization.expect("a load quantizes this checkpoint");
         let fused = match granularity {
-            Granularity::Tensor => self.fused(context)?,
+            Granularity::Tensor => self.fused_maximum(context, weight.largest())?,
             Granularity::Channel => 0.0,
         };
         let (codes, scales) = granularity.quantize(&weight, fused);
@@ -105,27 +105,36 @@ impl Checkpoint {
         ))
     }
 
-    /// The largest magnitude of the weights fused with the projection at the context's position,
-    /// each recorded as read; zero for a projection fused with none.
-    fn fused(&self, context: &mut Context<'_>) -> Result<f32, LoadError> {
+    /// The largest magnitude of the projection and its fused siblings, recorded as read and cached
+    /// for this checkpoint group; zero for a projection fused with none.
+    fn fused_maximum(&self, context: &mut Context<'_>, own_largest: f32) -> Result<f32, LoadError> {
         let name = context.name();
         let own = name.rsplit('.').next().unwrap_or_default();
         let group = FUSED.iter().find(|group| group.contains(&own));
-        let mut siblings = group
-            .into_iter()
-            .flat_map(|group| group.iter())
-            .filter(|&&part| part != own);
-        siblings.try_fold(0.0f32, |largest, part| {
-            let name = format!("{}.weight", context.sibling(part));
-            context.read(&name);
-            let view = (self.get(&name)).ok_or_else(|| LoadError::Missing(vec![name.clone()]))?;
-            let invalid = || LoadError::InvalidData {
-                name: name.clone(),
-                reason: format!("stored as {:?}, a load quantizes BF16", view.dtype()),
-            };
-            let values = Self::floats(&view).ok_or_else(invalid)?;
-            let inputs = view.shape().last().copied().unwrap_or(1).max(1);
-            Ok(largest.max(Self::finite(values, inputs, &name)?.largest()))
+        let Some(group) = group else {
+            return Ok(0.0);
+        };
+        let cache_key = context.sibling(group[0]);
+        context.fused_projection_maximum(&cache_key, |context, cached| {
+            let mut largest = own_largest;
+            for part in group.iter().copied().filter(|&part| part != own) {
+                let name = format!("{}.weight", context.sibling(part));
+                context.read(&name);
+                if cached.is_some() {
+                    // Keep this projection's update rule dependent on every fused sibling.
+                    continue;
+                }
+                let view =
+                    (self.get(&name)).ok_or_else(|| LoadError::Missing(vec![name.clone()]))?;
+                let invalid = || LoadError::InvalidData {
+                    name: name.clone(),
+                    reason: format!("stored as {:?}, a load quantizes BF16", view.dtype()),
+                };
+                let values = Self::floats(&view).ok_or_else(invalid)?;
+                let inputs = view.shape().last().copied().unwrap_or(1).max(1);
+                largest = largest.max(Self::finite(values, inputs, &name)?.largest());
+            }
+            Ok(cached.unwrap_or(largest))
         })
     }
 }
