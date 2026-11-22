@@ -82,14 +82,15 @@ class Decoder:
         vocabulary: int,
         *,
         backup: bool = False,
+        mapped: engine.Checkpoint | None = None,
     ) -> Decoder:
         """`checkpoint` loaded with `options` onto `device`, whose token IDs lie below `vocabulary`;
-        with `backup`, loaded from a copy of its tensors in host memory, which the decoder keeps.
+        `mapped` reuses a preflight file mapping. `backup` keeps a host copy of the tensors.
         Refuses a decoder whose calls return scores or whose cache is not one paged full-history
         group."""
-        mapped = checkpoint.mapped()
-        copy = mapped.read() if backup else None
-        loaded = options.load(mapped if copy is None else copy, device)
+        source = checkpoint.mapped() if mapped is None else mapped
+        copy = source.read() if backup else None
+        loaded = options.load(source if copy is None else copy, device)
         match loaded:
             case engine.Decoder(output=engine.decoder.Output.TOKENS | engine.decoder.Output.HIDDEN):
                 pass
