@@ -200,17 +200,15 @@ at its aligned offset. The engine waits only for earlier DMA work touching the s
 device page. A lease on a host slot keeps DMA out while Python uses its pinned bytes; transfers for
 other pages remain independent.
 
-One engine request is not always one low-level runtime submission. The pinned runtime processes at
-most 64 page, layer, and chip pieces per transfer slot, then submits additional slots sequentially.
-For a single chip, an ordinary two-page request can split above 32 layers; coalesced copies can
-split above 64 layer segments. Multiple chips use the same 64-entry budget across their pieces and
-reach it sooner. The engine still transfers directly between pinned slots and the existing HBM
-pages. Opt-in coalescing uses one pinned staging buffer per chip, with CPU gather/scatter and DMA
-over contiguous layer ranges, as in #322. #322's pinned runtime groups those ranges differently,
-so large requests may incur extra submission and completion overhead here. The byte movement and
-coalescing algorithm match; lower-level submission batching does not. Removing that difference
-requires a shared engine/runtime API change that preserves access leases; the framework adapters
-cannot remove it. End-to-end performance impact has not been measured on NPU hardware.
+The data-plane mechanism matches #322: the engine transfers directly between pinned slots and the
+existing HBM pages, and opt-in coalescing uses one pinned staging buffer per chip with CPU
+gather/scatter and DMA over contiguous layer ranges. The pinned runtime processes at most 64 page,
+layer, and chip pieces per transfer slot, then submits additional slots sequentially. For a single
+chip, an ordinary two-page request can span multiple slots above 32 layers; coalesced copies can
+span multiple slots above 64 layer segments. Multiple chips use the same 64-entry budget across
+their pieces and reach it sooner. This is internal runtime submission scheduling: it does not change
+the page-copy or coalescing algorithm, though it may add host-side submission and completion
+overhead for large requests. End-to-end performance impact has not been measured on NPU hardware.
 
 SGLang submits engine copies asynchronously and records completion events after the whole Copy
 request finishes. SGLang normally exposes each restored layer as soon as it is ready; this adapter
