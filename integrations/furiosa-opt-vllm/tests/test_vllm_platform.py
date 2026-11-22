@@ -480,6 +480,7 @@ NO_CONNECTOR: Final = (
     + "host buffers, or vLLM's MultiConnector of them"
 )
 
+
 @pytest.mark.usefixtures("platform_env")
 @pytest.mark.parametrize(
     ("ignored", "option", "requirement"),
