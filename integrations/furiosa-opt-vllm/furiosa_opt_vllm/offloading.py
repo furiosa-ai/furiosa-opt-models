@@ -22,10 +22,9 @@ CONNECTOR_MODULE: Final = "furiosa_opt_vllm.offload"
 
 @dataclass(frozen=True, slots=True)
 class Offloading:
-    """The supported spec, page layout, and load failure policy of one offload connector."""
+    """The supported spec and load failure policy of one offload connector."""
 
     supported_spec: bool
-    canonical_layout: bool
     load_failure_policy: Literal["recompute", "fail"]
 
     @classmethod
@@ -42,7 +41,6 @@ class Offloading:
         )
         return cls(
             supported_spec=supported_spec,
-            canonical_layout=bool(extra.get("canonical_layout")),
             load_failure_policy=transfer.kv_load_failure_policy,
         )
 
