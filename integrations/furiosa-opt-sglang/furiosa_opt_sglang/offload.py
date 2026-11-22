@@ -8,6 +8,7 @@ adapter tracks engine copies so SGLang's native events are recorded only after D
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from threading import Lock, local
 from typing import TYPE_CHECKING, Final, final
 
@@ -31,6 +32,17 @@ from furiosa_opt_sglang.platform import Hierarchical
 from furiosa_opt_sglang.transfer import AsyncL2TransferEngine
 
 ENGINE_CACHE_GROUP = 0
+
+
+@dataclass(frozen=True)
+class _LoadRoute:
+    """One SGLang page batch, reused by its per-layer callbacks."""
+
+    device_indices: torch.Tensor
+    host_indices: torch.Tensor
+    page_key: tuple[tuple[int, ...], tuple[int, ...]]
+    transfers: list[tuple[int, list[tuple[int, int]]]]
+
 
 if TYPE_CHECKING:
     from threading import Event
@@ -251,14 +263,32 @@ class Host(HostKVCache):
     ) -> None:
         if not 0 <= layer_id < self.layer_num:
             raise ValueError("hierarchical cache load names an unknown layer")
-        device = tuple(pages(device_indices, self.page_size))
-        host = tuple(pages(host_indices, self.page_size))
-        if len(device) != len(host):
-            raise ValueError("hierarchical cache load source and destination pages differ")
-        if not device:
+        copy_batch = getattr(self, "_copy_batch", None)
+        load_routes = None if copy_batch is None else getattr(copy_batch, "load_routes", None)
+        # SGLang reuses each transfer's tensors across its per-layer callbacks. Keeping the refs
+        # prevents id reuse while this batch memo avoids a CUDA-to-host sync for every layer.
+        route_id = (id(device_indices), id(host_indices))
+        route = None if load_routes is None else load_routes.get(route_id)
+        if (
+            route is None
+            or route.device_indices is not device_indices
+            or route.host_indices is not host_indices
+        ):
+            device = tuple(pages(device_indices, self.page_size))
+            host = tuple(pages(host_indices, self.page_size))
+            if len(device) != len(host):
+                raise ValueError("hierarchical cache load source and destination pages differ")
+            transfers = [
+                (target, [(ENGINE_CACHE_GROUP, source)])
+                for source, target in zip(device, host, strict=True)
+            ]
+            route = _LoadRoute(device_indices, host_indices, (device, host), transfers)
+            if load_routes is not None:
+                load_routes[route_id] = route
+        if not route.page_key[0]:
             return
 
-        key = (tuple(device), tuple(host))
+        key = route.page_key
         pending_loads_lock = getattr(self, "_pending_loads_lock", None)
         if pending_loads_lock is None:
             pending_loads_lock = self._pending_loads_lock = Lock()
@@ -274,12 +304,7 @@ class Host(HostKVCache):
 
         if new_copy:
             # SGLang calls once per layer; Copier moves every layer in one page batch.
-            transfers = [
-                (target, [(ENGINE_CACHE_GROUP, source)])
-                for source, target in zip(device, host, strict=True)
-            ]
-            copy = self._create_copy(self.copier.copy_in, transfers)
-            copy_batch = getattr(self, "_copy_batch", None)
+            copy = self._create_copy(self.copier.copy_in, route.transfers)
             if copy_batch is not None and hasattr(copy_batch, "load_keys"):
                 copy_batch.load_keys.append(key)
             try:
@@ -294,6 +319,7 @@ class Host(HostKVCache):
             raise RuntimeError("nested SGLang cache copy batch")
         self._copy_batch.copies = []
         self._copy_batch.load_keys = []
+        self._copy_batch.load_routes = {}
 
     def finish_async_copy_batch(self) -> list[engine.Copy]:
         batch = getattr(self, "_copy_batch", None)
@@ -303,6 +329,7 @@ class Host(HostKVCache):
         del batch.copies
         load_keys = batch.load_keys
         del batch.load_keys
+        del batch.load_routes
         with self._pending_loads_lock:
             for key in load_keys:
                 self._pending_loads.pop(key, None)
