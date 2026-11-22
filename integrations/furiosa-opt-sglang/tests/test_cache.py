@@ -49,14 +49,13 @@ def test_layer_load_callbacks_submit_one_engine_copy() -> None:
     class Copy:
         def __init__(self) -> None:
             self.submitted_count = 0
-            self.done_count = 0
+            self.wait_count = 0
 
         def submitted(self) -> None:
             self.submitted_count += 1
 
-        def done(self) -> bool:
-            self.done_count += 1
-            return False
+        def wait(self) -> None:
+            self.wait_count += 1
 
     class Copier:
         def __init__(self) -> None:
@@ -81,7 +80,7 @@ def test_layer_load_callbacks_submit_one_engine_copy() -> None:
 
     assert host.copier.calls == [([(2, [(0, 1)])], host.host_cache)]
     assert host.copier.copy.submitted_count == 1
-    assert host.copier.copy.done_count == 1
+    assert host.copier.copy.wait_count == 1
     assert host._pending_loads == {}
 
 

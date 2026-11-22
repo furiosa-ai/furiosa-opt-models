@@ -2,7 +2,8 @@
 
 Each pinned slot holds one whole page across all layers. Six native workers batch up to two slots,
 with every layer copy in one runtime DMA batch. SGLang keeps page selection and lifecycle; the
-adapter submits work asynchronously and reads storage through the same pinned slots.
+adapter submits stores asynchronously and reads storage through the same pinned slots. A load waits
+for its all-layer batch before returning, so SGLang's per-layer ready events follow completed DMA.
 """
 
 from __future__ import annotations
@@ -175,9 +176,7 @@ class Host(HostKVCache):
             offset,
         )
         self.host_cache = engine.HostCache(self.copier, self.page_num)
-        self._pending_loads: dict[
-            tuple[tuple[int, ...], tuple[int, ...]], tuple[set[int], engine.Copy]
-        ] = {}
+        self._pending_loads: dict[tuple[tuple[int, ...], tuple[int, ...]], set[int]] = {}
         return [self.host_cache]
 
     @override
@@ -233,8 +232,8 @@ class Host(HostKVCache):
             return
 
         key = (tuple(device), tuple(host))
-        pending = self._pending_loads.get(key)
-        if pending is None:
+        seen = self._pending_loads.get(key)
+        if seen is None:
             # SGLang calls once per layer; Copier moves every layer in one page batch.
             transfers = [
                 (target, [(ENGINE_CACHE_GROUP, source)])
@@ -242,11 +241,11 @@ class Host(HostKVCache):
             ]
             copy = self.copier.copy_in(transfers, self.host_cache)
             copy.submitted()
-            seen: set[int] = set()
-            self._pending_loads[key] = (seen, copy)
-        else:
-            seen, copy = pending
-            copy.done()
+            # SGLang records each layer-ready event as soon as this callback returns. The engine
+            # batches every layer into one DMA call, so wait for that call before signaling layer 0.
+            copy.wait()
+            seen = set()
+            self._pending_loads[key] = seen
         seen.add(layer_id)
         if len(seen) == self.layer_num:
             del self._pending_loads[key]

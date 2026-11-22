@@ -76,6 +76,31 @@ SERVED: Final = [
 ]
 
 
+def test_vllm_routes_preserve_transfer_page_order() -> None:
+    """The engine groups consecutive page pairs before sorting slots within each DMA batch."""
+    host = worker.Host.__new__(worker.Host)
+    host.blocks = 8
+    host.group_indices = {4: 0}
+    groups = [
+        worker.GroupWork(
+            group_id=4,
+            chunks=(
+                worker.ChunkWork(
+                    chunk_id=1,
+                    device_blocks=(9, 3, 7),
+                    host_slots=(2, 0, 1),
+                ),
+            ),
+        )
+    ]
+
+    assert host.routed_pages(groups) == [
+        (10, [(0, 9)]),
+        (8, [(0, 3)]),
+        (9, [(0, 7)]),
+    ]
+
+
 @final
 class Copies:
     """A stand-in for the engine's `Transfer` whose copies end, or fail, when the test says."""

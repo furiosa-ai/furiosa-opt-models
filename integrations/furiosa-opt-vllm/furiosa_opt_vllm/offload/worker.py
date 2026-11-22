@@ -411,7 +411,9 @@ class Host(OffloadingWorker):
                 for block, slot in zip(chunk.device_blocks, chunk.host_slots, strict=True):
                     host_slot = chunk.chunk_id * self.blocks + slot
                     pages.setdefault(host_slot, []).append((group_index, block))
-        return [(slot, routes) for slot, routes in sorted(pages.items())]
+        # Preserve the framework's page-pair order: the engine forms two-page DMA chunks from
+        # consecutive pairs, matching the cache transfer core's reference implementation.
+        return list(pages.items())
 
     def _groups(self, device: DeviceLoadStoreSpec, host: LoadStoreSpec) -> list[GroupWork]:
         if not isinstance(host, CPULoadStoreSpec):

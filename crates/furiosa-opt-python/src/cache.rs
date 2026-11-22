@@ -114,6 +114,7 @@ struct DmaSlot<'a> {
 }
 
 struct Queue {
+    core: Arc<Core>,
     sender: Option<mpsc::Sender<Chunk>>,
     workers: Vec<std::thread::JoinHandle<()>>,
 }
@@ -520,8 +521,7 @@ impl PyCopier {
         let (chunks, chunk_completions) = Chunk::split(pages, pool, loading, coalesce, &completion);
         let mut chunks = chunks.into_iter();
         while let Some(chunk) = chunks.next() {
-            if let Err((error, failed_chunk)) = self.queue.send(chunk) {
-                failed_chunk.fail(io::Error::other(error.to_string()));
+            if let Err(error) = self.queue.send(chunk) {
                 for chunk in chunks {
                     chunk.fail(io::Error::other(error.to_string()));
                 }
@@ -837,18 +837,51 @@ impl Queue {
             }
         }
         Ok(Self {
+            core,
             sender: Some(sender),
             workers,
         })
     }
 
-    fn send(&self, chunk: Chunk) -> Result<(), (io::Error, Chunk)> {
+    fn send(&self, chunk: Chunk) -> io::Result<()> {
         let Some(sender) = self.sender.as_ref() else {
-            return Err((io::Error::other("the cache copy queue is shut down"), chunk));
+            let error = io::Error::other("the cache copy queue is shut down");
+            chunk.fail(io::Error::other(error.to_string()));
+            return Err(error);
         };
-        sender
-            .send(chunk)
-            .map_err(|error| (io::Error::other("the cache copy workers stopped"), error.0))
+        if chunk.coalesced {
+            return self.send_coalesced(chunk);
+        }
+        sender.send(chunk).map_err(|send_error| {
+            let error = io::Error::other("the cache copy workers stopped");
+            send_error.0.fail(io::Error::other(error.to_string()));
+            error
+        })
+    }
+
+    fn send_coalesced(&self, chunk: Chunk) -> io::Result<()> {
+        // Match the reference data path: coalesced copies stage and submit on their own thread,
+        // outside the six-worker queue used for two-page copies.
+        let core = Arc::clone(&self.core);
+        let completion = Arc::clone(&chunk.completion);
+        let job = Arc::clone(&chunk.job);
+        let spawned = std::thread::Builder::new()
+            .name("kv-copy-later".into())
+            .spawn(
+                move || match tokio::runtime::Builder::new_current_thread().build() {
+                    Ok(executor) => chunk.run(&executor, &core),
+                    Err(error) => chunk.fail(error),
+                },
+            );
+        match spawned {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let message = error.to_string();
+                completion.finish(Err(io::Error::other(message.clone())));
+                job.finish(Err(io::Error::other(message)));
+                Err(error)
+            }
+        }
     }
 
     fn shutdown(&mut self) {
@@ -972,7 +1005,7 @@ impl Chunk {
         self.job.finish(result);
     }
 
-    fn fail(self, error: io::Error) {
+    fn fail(&self, error: io::Error) {
         self.completion
             .finish(Err(io::Error::new(error.kind(), error.to_string())));
         self.job.finish(Err(error));
