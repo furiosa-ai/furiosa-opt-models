@@ -27,29 +27,26 @@ fn refuses_h3_decoder_options_before_documents_and_weights() {
         (LoadOptions::new().adapters(), "adapters"),
         (LoadOptions::new().encoder(), "encoder"),
     ] {
-        for error in [
-            options.parse(&source).err(),
-            options
-                .prepare_pipeline::<furiosa_opt_engine::diffusion::minimax_h3::Pipeline>(&source)
-                .err(),
-        ] {
-            match error.expect("a refused choice must not read absent files") {
-                LoadError::Unsupported { name, reason } => {
-                    assert_eq!(name, field);
-                    let expected = match field {
-                        "chips" => "H3 runs on four chips",
-                        "kv_cache" => "H3 has no KV cache",
-                        "layers" => "every implementation loads whole",
-                        "batch_invariant" => "H3 uses its original attention tiling",
-                        "quantization" => "H3 loads its checkpoint precision",
-                        "adapters" => "the MiniMaxH3Pipeline FL2VA implementation takes no adapter",
-                        "encoder" => "H3 loads as one complete pipeline",
-                        _ => unreachable!(),
-                    };
-                    assert_eq!(reason, expected);
-                }
-                other => panic!("{field}: {other:?}"),
+        match options
+            .parse(&source)
+            .err()
+            .expect("a refused choice must not read absent files")
+        {
+            LoadError::Unsupported { name, reason } => {
+                assert_eq!(name, field);
+                let expected = match field {
+                    "chips" => "H3 runs on four chips",
+                    "kv_cache" => "H3 has no KV cache",
+                    "layers" => "every implementation loads whole",
+                    "batch_invariant" => "H3 uses its original attention tiling",
+                    "quantization" => "H3 loads its checkpoint precision",
+                    "adapters" => "the MiniMaxH3Pipeline FL2VA implementation takes no adapter",
+                    "encoder" => "H3 loads as one complete pipeline",
+                    _ => unreachable!(),
+                };
+                assert_eq!(reason, expected);
             }
+            other => panic!("{field}: {other:?}"),
         }
     }
 }

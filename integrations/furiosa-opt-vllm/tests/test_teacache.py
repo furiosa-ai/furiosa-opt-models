@@ -2,8 +2,10 @@
 
 import itertools
 from collections.abc import Callable
-from typing import cast, final
+from typing import Self, cast, final
 
+import numpy as np
+import numpy.typing as npt
 import pytest
 import torch
 from torch import nn
@@ -95,20 +97,27 @@ class Component:
         self.fail = False
         self.resets = 0
 
-    def __call__(self, *args: object, **kwargs: object) -> object:
-        raise AssertionError("the installed cache hook must call cached_forward")
+    def prepare(self, *args: object, **kwargs: object) -> Self:
+        del args, kwargs
+        return self
 
-    def cached_forward(
+    def forward(self) -> Self:
+        raise AssertionError("the installed cache hook must call forward_cached")
+
+    def forward_cached(
         self,
         decide: Callable[[tuple[float, float] | None], bool],
         /,
         **kwargs: object,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> Self:
         del kwargs
         self.decisions.append(decide(self.means))
         if self.fail:
             raise LookupError("native failure")
-        return torch.tensor([1.0]), torch.tensor([2.0])
+        return self
+
+    def to_host(self) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
+        return np.array([1.0], dtype=np.float32), np.array([2.0], dtype=np.float32)
 
     def reset_cache(self) -> None:
         self.resets += 1

@@ -72,7 +72,10 @@ impl<const N: usize, T: AxisName + Send + Sync> Conditioner<N, T> {
         device.with_device(|device| {
             Loadable::<(
                 &mut Device,
-                &kernel::Condition<'_, '_>,
+                (
+                    &kernel::Condition<'_, '_>,
+                    std::marker::PhantomData<[(); 4]>,
+                ),
                 (),
                 &mut (),
                 (
@@ -83,7 +86,10 @@ impl<const N: usize, T: AxisName + Send + Sync> Conditioner<N, T> {
             .map_err(io::Error::other)?;
             Loadable::<(
                 &mut Device,
-                &kernel::RefinerLayer<'_, '_>,
+                (
+                    &kernel::RefinerLayer<'_, '_>,
+                    std::marker::PhantomData<[(); 4]>,
+                ),
                 (&flash::Visible<RefinerKeys, Chips>, &Value<Chips>),
                 &mut (),
                 Hidden<N>,
@@ -91,7 +97,10 @@ impl<const N: usize, T: AxisName + Send + Sync> Conditioner<N, T> {
             .map_err(io::Error::other)?;
             Loadable::<(
                 &mut Device,
-                &kernel::RefinerNorm<'_, '_>,
+                (
+                    &kernel::RefinerNorm<'_, '_>,
+                    std::marker::PhantomData<[(); 4]>,
+                ),
                 (),
                 &mut (),
                 &Hidden<N>,
@@ -129,7 +138,7 @@ impl<const N: usize, T: AxisName + Send + Sync> Conditioner<N, T> {
         self.device.launch(ready, |launches, model| {
             let work = flight.held_mut();
             let mut output: Hidden<N> = alias(&work.hidden[0], ..)?;
-            let accepted = launches.forward_into_tracked(
+            let accepted = launches.on::<4>().forward_into_tracked(
                 kernel::Condition { model },
                 kernel::condition,
                 (),
@@ -146,7 +155,7 @@ impl<const N: usize, T: AxisName + Send + Sync> Conditioner<N, T> {
                 let work = flight.held_mut();
                 let input: Hidden<N> = alias(&work.hidden[at % 2], ..)?;
                 let mut output: Hidden<N> = alias(&work.hidden[(at + 1) % 2], ..)?;
-                let accepted = launches.forward_into_tracked(
+                let accepted = launches.on::<4>().forward_into_tracked(
                     kernel::RefinerLayer { model },
                     kernel::refine,
                     (&work.metadata.visible, &work.metadata.bound),
@@ -163,7 +172,7 @@ impl<const N: usize, T: AxisName + Send + Sync> Conditioner<N, T> {
             let work = flight.held_mut();
             let input: Hidden<N> = alias(&work.hidden[self.layers.len() % 2], ..)?;
             let mut output: Hidden<N> = alias(&work.refined, ..)?;
-            let accepted = launches.forward_into_tracked(
+            let accepted = launches.on::<4>().forward_into_tracked(
                 kernel::RefinerNorm { model },
                 kernel::refine_norm,
                 (),

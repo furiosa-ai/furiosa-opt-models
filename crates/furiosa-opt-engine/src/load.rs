@@ -9,7 +9,8 @@
 //! - A load reads the whole model, or its media encoder alone, which the registry lists as an
 //!   implementation of its own.
 //! - The registry chooses the implementation's chip count. Decoders use BF16 KV caches;
-//!   pipelines prepare their host weights separately and have no KV cache. Both load whole.
+//!   pipelines prepare host weights before shared-device placement and have no KV cache. Both
+//!   load whole.
 //! - A batch-invariant load asks every implementation's calls to tile their attention fixed, which
 //!   they serve as an `Instance` of their decoder.
 //! - A quantization reads the checkpoint quantized, so an implementation whose projections a load
@@ -18,11 +19,13 @@
 //!   them: BF16 Qwen3 of 0.6B to 4B.
 
 use std::fmt;
+use std::io;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::str::FromStr;
 
-use crate::registry::{Implementation, Model, Pipeline};
+use crate::registry::{Implementation, Model};
+use crate::residency::SharedDevice;
 use furiosa_opt_models::load::{Checkpoint, Context, LoadError, Part};
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
 use furiosa_opt_models::tensor::form::fp8::Granularity;
@@ -174,23 +177,25 @@ impl LoadOptions {
         })
     }
 
-    /// Prepare a registered pipeline's strict host weights after checking every option and
-    /// component document. Its family places the prepared tree on the caller's retained device,
-    /// without holding that device's context lock across placement.
-    pub fn prepare_pipeline<P: Pipeline>(
+    /// Load the selected decoder, encoder or pipeline on the caller's original shared device.
+    /// Options and component documents are checked before any weight is read. Pipelines prepare
+    /// their host tree before placement, which is awaited outside the device's context lock.
+    pub async fn load_shared(
         &self,
+        device: &SharedDevice,
         checkpoint: &Checkpoint,
-    ) -> Result<P::Prepared, LoadError> {
-        self.read(checkpoint, |checkpoint| {
-            let config = self.configure(checkpoint)?;
-            if !config.is_pipeline() || config.class() != P::CLASS || config.size() != P::SIZE {
-                return Err(LoadError::Unsupported {
-                    name: "pipeline".into(),
-                    reason: "the selected implementation is not this pipeline type".into(),
-                });
-            }
-            P::prepare(checkpoint, P::inputs(checkpoint)?)
-        })
+    ) -> io::Result<Model> {
+        let loading = self
+            .read(checkpoint, |checkpoint| {
+                let Config {
+                    implementation,
+                    tiling,
+                    ..
+                } = self.configure(checkpoint)?;
+                implementation.load_shared(device, checkpoint, tiling)
+            })
+            .map_err(io_error)?;
+        loading.await
     }
 
     /// `visit` of `checkpoint` as the load reads it: for the part the options choose, quantized
@@ -284,6 +289,18 @@ impl LoadOptions {
             tiling: self.tiling,
         })
     }
+}
+
+/// Preserve load refusals and their sources at the asynchronous engine boundary.
+pub(crate) fn io_error(error: LoadError) -> io::Error {
+    let kind = match &error {
+        LoadError::Missing(_) | LoadError::Unexpected(_) | LoadError::InvalidData { .. } => {
+            io::ErrorKind::InvalidData
+        }
+        LoadError::Unsupported { .. } => io::ErrorKind::Unsupported,
+        LoadError::Device { .. } => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, error)
 }
 
 impl Config {

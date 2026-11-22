@@ -37,12 +37,18 @@ impl<T> Flight<T> {
         self.work.push(work);
     }
 
-    /// A layer's completed rows can replace the previous input set without retaining a chain
-    /// of all prior layers. Cache storage may be reused only after these completions finish.
-    pub(super) async fn finish(mut self) -> io::Result<Vec<HbmBuffer>> {
+    /// Inspect accepted work without retiring its input, state or output owners.
+    pub(super) async fn wait(&self) -> io::Result<()> {
         for work in &self.work {
             work.ended().await.map_err(io::Error::other)?;
         }
+        Ok(())
+    }
+
+    /// A layer's completed rows can replace the previous input set without retaining a chain
+    /// of all prior layers. Cache storage may be reused only after these completions finish.
+    pub(super) async fn finish(mut self) -> io::Result<Vec<HbmBuffer>> {
+        self.wait().await?;
         Ok(std::mem::take(&mut self.rows))
     }
 }

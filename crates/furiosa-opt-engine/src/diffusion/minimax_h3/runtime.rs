@@ -4,7 +4,9 @@
 //! adapter delegates encoding, denoising and decoding to the core. Component views must retain
 //! an `Arc<Pipeline>` and use this same owner.
 
-use super::{audio, cache, denoiser, layout::Layout, pipeline, text, video, weights};
+use super::{
+    audio, cache, denoiser, flight::Flight, layout::Layout, pipeline, text, video, weights,
+};
 use crate::residency::{SharedDevice, block_on};
 use furiosa_opt_models::load::{Checkpoint, LoadError};
 use furiosa_opt_models::models::Class;
@@ -20,7 +22,7 @@ use std::{
     sync::{Arc, PoisonError},
     thread::{self, ThreadId},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 /// Strictly loaded host weights, before placement on the framework's existing device.
 pub struct Prepared(weights::Prepared);
@@ -57,7 +59,7 @@ impl Prepared {
         .await?;
         Ok(Arc::new(Pipeline {
             core,
-            state: Mutex::new(state),
+            state: Arc::new(Mutex::new(state)),
             decision: Decision::default(),
         }))
     }
@@ -68,7 +70,7 @@ pub struct Pipeline {
     core: Arc<Core>,
     // Serialize every component while allowing concurrent async callers to wait without
     // blocking the executor. The DeviceContext lock is never held across core await points.
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     decision: Decision,
 }
 
@@ -89,51 +91,14 @@ impl Pipeline {
     }
 
     /// Other threads queue normally; the synchronous policy must not wait on its own call.
-    async fn state(&self) -> io::Result<tokio::sync::MutexGuard<'_, State>> {
+    async fn state(&self) -> io::Result<OwnedMutexGuard<State>> {
         self.decision.check()?;
-        Ok(self.state.lock().await)
+        Ok(Arc::clone(&self.state).lock_owned().await)
     }
 
-    /// Completed host BF16 rows from the first 50 text layers, before final normalization.
-    /// Retain the previous prompt's prepared data during encoding, but clear its cached rows.
-    pub async fn encode(&self, tokens: &[i32]) -> io::Result<Vec<bf16>> {
-        let mut state = self.state().await?;
-        if let Some(memo) = &mut state.memo {
-            memo.cache = None;
-        }
-        self.core.encode(tokens).await
-    }
-
-    /// Release retained cache rows at a new generation boundary, keeping prepared prompt data.
-    pub async fn reset_cache(&self) -> io::Result<()> {
-        let mut state = self.state().await?;
-        if let Some(memo) = &mut state.memo {
-            memo.cache = None;
-        }
-        Ok(())
-    }
-
-    /// One uncached transformer evaluation on owned, framework-parsed host values.
-    pub async fn forward(&self, input: Input) -> io::Result<Output> {
-        self.forward_with::<fn(Option<(f32, f32)>) -> io::Result<bool>>(input, None)
-            .await
-    }
-
-    /// Device cache work with the framework's host decision. Scalars are BF16-rounded means
-    /// represented exactly as FP32; no GPU tensor or hidden allocation leaves the engine.
-    /// A synchronous decision cannot reenter this pipeline on its own thread; such calls
-    /// return an error instead of waiting for the decision's still-active evaluation.
-    pub async fn forward_cached<F>(&self, input: Input, decide: F) -> io::Result<Output>
-    where
-        F: FnMut(Option<(f32, f32)>) -> io::Result<bool> + Send,
-    {
-        self.forward_with(input, Some(decide)).await
-    }
-
-    async fn forward_with<F>(&self, input: Input, mut decide: Option<F>) -> io::Result<Output>
-    where
-        F: FnMut(Option<(f32, f32)>) -> io::Result<bool> + Send,
-    {
+    /// Check, pack and upload framework operands explicitly, under the same state and core
+    /// admission leases that remain owned by the consuming device call and its result.
+    pub async fn prepare(self: &Arc<Self>, input: Input) -> io::Result<PreparedStep> {
         let mut state = self.state().await?;
         let Checked {
             layout,
@@ -155,7 +120,7 @@ impl Pipeline {
                 cache: None,
             });
         }
-        let mut request = state
+        let request = state
             .memo
             .as_ref()
             .expect("completed memo above")
@@ -171,80 +136,75 @@ impl Pipeline {
         let times = upload_times(self.device(), input.times)?;
         let video = state.video.upload::<VideoRows, Patch>(self.device())?;
         let audio = state.audio.upload::<AudioRows, Latent>(self.device())?;
-        // Remove the published cache before any numerical cache launch. Failure/cancellation
-        // leaves it absent; the flight drains accepted work before retiring its storage.
-        let previous = state
-            .memo
-            .as_mut()
-            .expect("completed memo above")
-            .cache
-            .take();
-        let ((video, audio), next_cache) = if let Some(decide) = &mut decide {
-            let elements = layout.sequence() * Width::SIZE;
-            let (values, retained) = request
-                .forward_cached(times, video, audio, previous, |statistics| {
-                    self.decision
-                        .call(|| decide(statistics.map(|s| s.means(elements))))
-                })
-                .await?;
-            (values, Some(retained))
-        } else {
-            drop(previous);
-            (request.forward(times, video, audio).await?, None)
-        };
-        state.video.download(self.device(), video)?;
-        state.audio.download(self.device(), audio)?;
-        let video = layout.gather::<VideoRows>(
-            state.video.values()?,
-            Modality::Video,
-            Patch::SIZE,
-            &input.video_mask,
-        )?;
-        let audio = layout.gather::<AudioRows>(
-            state.audio.values()?,
-            Modality::Audio,
-            Latent::SIZE,
-            &input.audio_mask,
-        )?;
-        let output = Output {
+        Ok(PreparedStep {
+            call: StepLease {
+                request,
+                state,
+                owner: Arc::clone(self),
+                layout,
+                video_mask: input.video_mask,
+                audio_mask: input.audio_mask,
+            },
+            times,
             video,
-            video_shape: [layout.selected_video().len(), Patch::SIZE],
             audio,
-            audio_shape: [layout.rows(Modality::Audio).len(), Latent::SIZE],
-        };
-        // Release this call's admission, leaving only a non-admitted Retained in the memo.
-        drop(request);
-        // Downloads and output reconstruction must succeed before publishing the next cache.
-        state.memo.as_mut().expect("completed memo above").cache = next_cache;
-        Ok(output)
+        })
     }
 
-    /// Decode the fixed profile and retain the requested number of frames from its tail.
-    /// Shape and frame-count checks precede all device work.
-    pub async fn decode_video(
-        &self,
+    /// Check and upload formatted token IDs, retaining exclusive call admission.
+    pub async fn prepare_text(self: &Arc<Self>, tokens: &[i32]) -> io::Result<PreparedText> {
+        let mut state = self.state().await?;
+        if let Some(memo) = &mut state.memo {
+            memo.cache = None;
+        }
+        let (prepared, lease) = self.core.prepare_text(tokens).await?;
+        Ok(PreparedText {
+            prepared,
+            call: Call::new(self, state, lease),
+        })
+    }
+
+    /// Shape and frame-count refusals precede admission and the first group's upload.
+    pub async fn prepare_video(
+        self: &Arc<Self>,
         shape: &[usize],
-        values: &[f32],
+        values: Vec<f32>,
         frame_num: Option<usize>,
         process_image: bool,
-    ) -> io::Result<Decoded<5>> {
-        let _state = self.state().await?;
+    ) -> io::Result<PreparedVideo> {
+        let state = self.state().await?;
         let input = video::Input::new(shape, values, frame_num, process_image)?;
         let shape = input.output_shape();
-        Ok(Decoded {
-            values: self.core.decode_video(input).await?,
+        let (prepared, lease) = self.core.prepare_video(input).await?;
+        Ok(PreparedVideo {
+            prepared,
+            call: Call::new(self, state, lease),
             shape,
         })
     }
 
-    /// Decode channel-major stereo latents through the pipeline's audio decoder.
-    pub async fn decode_audio(&self, shape: &[usize], values: &[f32]) -> io::Result<Decoded<3>> {
-        let _state = self.state().await?;
+    /// Check and upload waveform latents before any decoder launch.
+    pub async fn prepare_audio(
+        self: &Arc<Self>,
+        shape: &[usize],
+        values: &[f32],
+    ) -> io::Result<PreparedAudio> {
+        let state = self.state().await?;
         let input = audio::Latents::new(shape, values)?;
-        Ok(Decoded {
-            values: self.core.decode_audio(input).await?,
-            shape: audio::OUTPUT_SHAPE,
+        let (prepared, lease) = self.core.prepare_audio(input).await?;
+        Ok(PreparedAudio {
+            prepared,
+            call: Call::new(self, state, lease),
         })
+    }
+
+    /// Release retained cache rows at a new generation boundary, keeping prepared prompt data.
+    pub async fn reset_cache(&self) -> io::Result<()> {
+        let mut state = self.state().await?;
+        if let Some(memo) = &mut state.memo {
+            memo.cache = None;
+        }
+        Ok(())
     }
 }
 
@@ -327,12 +287,283 @@ pub struct Input {
     pub audio_mask: Vec<bool>,
 }
 
-/// Completed FP32 velocities in exactly the framework's selected order and explicit shapes.
+/// Uploaded device operands and the exclusive call owner; consuming forward uploads no media.
+pub struct PreparedStep {
+    call: StepLease,
+    times: denoiser::Times,
+    video: denoiser::Video<VideoRows>,
+    audio: denoiser::Audio<AudioRows>,
+}
+
+// Retire core admission before unlocking staging, on every success/error/cancellation path.
+struct StepLease {
+    request: Request,
+    state: OwnedMutexGuard<State>,
+    owner: Arc<Pipeline>,
+    layout: Layout,
+    video_mask: Vec<bool>,
+    audio_mask: Vec<bool>,
+}
+
+impl PreparedStep {
+    pub async fn forward(self) -> io::Result<Output> {
+        self.forward_with::<fn(Option<(f32, f32)>) -> io::Result<bool>>(None)
+            .await
+    }
+
+    pub async fn forward_cached<F>(self, decide: F) -> io::Result<Output>
+    where
+        F: FnMut(Option<(f32, f32)>) -> io::Result<bool> + Send,
+    {
+        self.forward_with(Some(decide)).await
+    }
+
+    async fn forward_with<F>(self, mut decide: Option<F>) -> io::Result<Output>
+    where
+        F: FnMut(Option<(f32, f32)>) -> io::Result<bool> + Send,
+    {
+        let Self {
+            mut call,
+            times,
+            video,
+            audio,
+        } = self;
+        // Preparation can be discarded without invalidating the prior cache. Once numerical
+        // cache work begins, only successful explicit conversion may publish its replacement.
+        let previous = call
+            .state
+            .memo
+            .as_mut()
+            .expect("completed memo")
+            .cache
+            .take();
+        let (pending, next_cache) = if let Some(decide) = &mut decide {
+            let elements = call.layout.sequence() * Width::SIZE;
+            let (flight, retained) = call
+                .request
+                .forward_cached(times, video, audio, previous, |statistics| {
+                    call.owner
+                        .decision
+                        .call(|| decide(statistics.map(|s| s.means(elements))))
+                })
+                .await?;
+            (Pending::Cached(Box::new(flight)), Some(retained))
+        } else {
+            drop(previous);
+            (
+                Pending::Uncached(Box::new(call.request.forward(times, video, audio).await?)),
+                None,
+            )
+        };
+        Ok(Output {
+            pending,
+            call,
+            next_cache,
+        })
+    }
+}
+
+enum Pending {
+    Uncached(Box<Flight<denoiser::Workspace<JointRows, KeySpans, TextRows, AudioRows, VideoRows>>>),
+    Cached(Box<Flight<cache::Workspace<JointRows, KeySpans, TextRows, AudioRows, VideoRows>>>),
+}
+
+/// Accepted device velocities. Readiness never publishes TeaCache or releases the call lease.
 pub struct Output {
+    pending: Pending,
+    call: StepLease,
+    next_cache: Option<Arc<cache::Retained<JointRows>>>,
+}
+
+impl Output {
+    pub async fn wait(&self) -> io::Result<()> {
+        match &self.pending {
+            Pending::Uncached(flight) => flight.wait().await,
+            Pending::Cached(flight) => flight.wait().await,
+        }
+    }
+
+    /// Download video then audio and apply the original checked gather before committing cache.
+    pub async fn to_host(self) -> io::Result<HostOutput> {
+        let Self {
+            pending,
+            mut call,
+            next_cache,
+        } = self;
+        let rows = match pending {
+            Pending::Uncached(flight) => (*flight).finish().await?,
+            Pending::Cached(flight) => (*flight).finish().await?,
+        };
+        let [video, audio]: [HbmBuffer; 2] = rows
+            .try_into()
+            .map_err(|_| io::Error::other("H3 heads returned an invalid media output count"))?;
+        let video = denoiser::Video::<VideoRows>::try_from(video).map_err(io::Error::other)?;
+        let audio = denoiser::Audio::<AudioRows>::try_from(audio).map_err(io::Error::other)?;
+        call.state.video.download(call.owner.device(), video)?;
+        call.state.audio.download(call.owner.device(), audio)?;
+        let video = call.layout.gather::<VideoRows>(
+            call.state.video.values()?,
+            Modality::Video,
+            Patch::SIZE,
+            &call.video_mask,
+        )?;
+        let audio = call.layout.gather::<AudioRows>(
+            call.state.audio.values()?,
+            Modality::Audio,
+            Latent::SIZE,
+            &call.audio_mask,
+        )?;
+        let output = HostOutput {
+            video,
+            video_shape: [call.layout.selected_video().len(), Patch::SIZE],
+            audio,
+            audio_shape: [call.layout.rows(Modality::Audio).len(), Latent::SIZE],
+        };
+        drop(call.request);
+        call.state.memo.as_mut().expect("completed memo").cache = next_cache;
+        Ok(output)
+    }
+}
+
+/// Completed FP32 velocities in exactly the framework's selected order and shapes.
+pub struct HostOutput {
     pub video: Vec<f32>,
     pub video_shape: [usize; 2],
     pub audio: Vec<f32>,
     pub audio_shape: [usize; 2],
+}
+
+// Field order releases core admission before another call can acquire the staging/state owner.
+struct Call {
+    _lease: OwnedMutexGuard<()>,
+    _state: OwnedMutexGuard<State>,
+    owner: Arc<Pipeline>,
+}
+
+impl Call {
+    fn new(
+        owner: &Arc<Pipeline>,
+        state: OwnedMutexGuard<State>,
+        lease: OwnedMutexGuard<()>,
+    ) -> Self {
+        Self {
+            _lease: lease,
+            _state: state,
+            owner: Arc::clone(owner),
+        }
+    }
+}
+
+/// Uploaded text operands and the call lease consumed by encoding.
+pub struct PreparedText {
+    prepared: text::Prepared,
+    call: Call,
+}
+
+impl PreparedText {
+    pub async fn forward(self) -> io::Result<Encoded> {
+        let Self { prepared, call } = self;
+        let rows = call.owner.core.encode(prepared).await?;
+        Ok(Encoded { rows, call })
+    }
+}
+
+pub struct Encoded {
+    rows: text::Output,
+    call: Call,
+}
+
+impl Encoded {
+    pub async fn wait(&self) -> io::Result<()> {
+        self.rows.wait().await
+    }
+
+    pub async fn to_host(self) -> io::Result<Vec<bf16>> {
+        let Self { rows, call } = self;
+        call.owner.core.download_encoded(rows.finish().await?)
+    }
+}
+
+/// Uploaded audio latents and the call lease consumed by decoding.
+pub struct PreparedAudio {
+    prepared: audio::Prepared,
+    call: Call,
+}
+
+impl PreparedAudio {
+    pub async fn forward(self) -> io::Result<AudioOutput> {
+        let Self { prepared, call } = self;
+        let waveform = call.owner.core.decode_audio(prepared).await?;
+        Ok(AudioOutput { waveform, call })
+    }
+}
+
+pub struct AudioOutput {
+    waveform: audio::Output,
+    call: Call,
+}
+
+impl AudioOutput {
+    pub async fn wait(&self) -> io::Result<()> {
+        self.waveform.wait().await
+    }
+
+    pub async fn to_host(self) -> io::Result<Decoded<3>> {
+        let Self { waveform, call } = self;
+        Ok(Decoded {
+            values: waveform.to_host(call.owner.device()).await?,
+            shape: audio::OUTPUT_SHAPE,
+        })
+    }
+}
+
+/// The checked video input, first uploaded group and exclusive decoding lease.
+pub struct PreparedVideo {
+    prepared: video::Prepared,
+    call: Call,
+    shape: [usize; 5],
+}
+
+impl PreparedVideo {
+    pub async fn forward(self) -> io::Result<VideoDecoding> {
+        let Self {
+            prepared,
+            call,
+            shape,
+        } = self;
+        let stream = call.owner.core.decode_video(prepared).await?;
+        Ok(VideoDecoding {
+            stream,
+            call,
+            shape,
+        })
+    }
+}
+
+/// Ongoing two-slot decode; final frames exist only after its ordered CPU stitching completes.
+pub struct VideoDecoding {
+    stream: video::Decoding,
+    call: Call,
+    shape: [usize; 5],
+}
+
+impl VideoDecoding {
+    /// Wait for the current group only; this does not advance the decoding stream.
+    pub async fn wait(&self) -> io::Result<()> {
+        self.stream.wait().await
+    }
+
+    pub async fn to_host(self) -> io::Result<Decoded<5>> {
+        let Self {
+            stream,
+            call,
+            shape,
+        } = self;
+        Ok(Decoded {
+            values: call.owner.core.finish_video(stream).await?,
+            shape,
+        })
+    }
 }
 
 /// Completed decoder values with the component's explicit output shape.
@@ -350,6 +581,8 @@ type AudioRows = Rows<128>;
 type VideoRows = Rows<9344>;
 type Core =
     pipeline::Pipeline<{ DEFAULT_MAX_TEXT }, JointRows, KeySpans, TextRows, AudioRows, VideoRows>;
+type Request =
+    pipeline::Request<{ DEFAULT_MAX_TEXT }, JointRows, KeySpans, TextRows, AudioRows, VideoRows>;
 type Retained =
     pipeline::Retained<{ DEFAULT_MAX_TEXT }, JointRows, KeySpans, TextRows, AudioRows, VideoRows>;
 

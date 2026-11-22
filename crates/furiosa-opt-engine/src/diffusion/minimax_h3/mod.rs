@@ -1,10 +1,12 @@
 //! H3 execution on the pipeline's original four-chip device context.
 
+use crate::residency::SharedDevice;
 use furiosa_opt_models::load::{Checkpoint, LoadError, Part};
 use furiosa_opt_models::models::diffusion::minimax_h3::Inputs;
 use furiosa_opt_models::models::{Class, Implements};
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
 use safetensors::Dtype;
+use std::{io, sync::Arc};
 
 mod audio;
 mod cache;
@@ -21,7 +23,10 @@ pub(crate) mod text;
 mod video;
 mod weights;
 
-pub use runtime::{Decoded, Input, Output, Pipeline, Prepared};
+pub use runtime::{
+    AudioOutput, Decoded, Encoded, HostOutput, Input, Output, Pipeline, Prepared, PreparedAudio,
+    PreparedStep, PreparedText, PreparedVideo, VideoDecoding,
+};
 
 impl Implements for Pipeline {
     const SIZE: &'static str = "FL2VA";
@@ -90,5 +95,19 @@ impl crate::registry::Pipeline for Pipeline {
 
     fn prepare(source: &Checkpoint, inputs: Inputs) -> Result<Prepared, LoadError> {
         Prepared::from_inputs(source, inputs)
+    }
+
+    fn check_placement(placement: &furiosa_opt_std::Placement) -> Result<(), LoadError> {
+        if placement.chips.len() != Pipeline::CHIPS || placement.pes != (0..8) {
+            return Err(LoadError::Unsupported {
+                name: "placement".into(),
+                reason: "H3 requires four chips with all eight PEs per chip".into(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn place(prepared: Prepared, device: SharedDevice) -> io::Result<Arc<Self>> {
+        prepared.place(device).await
     }
 }

@@ -18,9 +18,11 @@ from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, Thread
-from typing import TYPE_CHECKING, TypeAlias
+from typing import TYPE_CHECKING, TypeAlias, cast
 from unittest.mock import patch
 
+import numpy as np
+import numpy.typing as npt
 import pytest
 import torch
 from torch import nn
@@ -29,7 +31,7 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.worker.utils import StepRequestState
 
-    from furiosa_opt_engine.minimax_h3 import AudioDecoder, TextEncoder, Transformer, VideoDecoder
+    import furiosa_opt_engine as engine
 
 pytestmark = [
     pytest.mark.h3,
@@ -54,10 +56,10 @@ class Golden:
 @dataclass(repr=False)
 class Loaded:
     model: MiniMaxH3Pipeline
-    transformer: Transformer
-    text: TextEncoder
-    video: VideoDecoder
-    audio: AudioDecoder
+    transformer: engine.minimax_h3.Transformer
+    text: engine.minimax_h3.TextEncoder
+    video: engine.minimax_h3.VideoDecoder
+    audio: engine.minimax_h3.AudioDecoder
 
 
 @dataclass(repr=False)
@@ -197,8 +199,8 @@ def h3_pipeline(h3_golden: Golden, h3_distributed: None) -> Iterator[Loaded]:
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.vllm_config import create_base_diffusion_vllm_config
 
-    from furiosa_opt_engine import minimax_h3
-    from furiosa_opt_vllm.omni.components import compose, construct
+    import furiosa_opt_engine as engine
+    from furiosa_opt_vllm.omni.components import Adapter, compose, construct
     from furiosa_opt_vllm.omni.pipeline import Runner, directory
 
     del h3_distributed
@@ -218,20 +220,22 @@ def h3_pipeline(h3_golden: Golden, h3_distributed: None) -> Iterator[Loaded]:
     model = runner.pipeline
     if not isinstance(model, MiniMaxH3Pipeline):
         pytest.fail("Runner did not load the H3 framework pipeline", pytrace=False)
-    loaded = Loaded(
-        model,
-        model.transformer.component,
-        model.text_encoder.component,
-        model.video_vae.model.component,
-        model.audio_vae.model.component,
+    # Composition replaced the modules described by the upstream pipeline's annotations.
+    views: tuple[object, ...] = (
+        model.transformer,
+        model.text_encoder,
+        model.video_vae.model,
+        model.audio_vae.model,
     )
+    transformer, text, video, audio = (cast(Adapter, view).component for view in views)
     if not (
-        isinstance(loaded.transformer, minimax_h3.Transformer)
-        and isinstance(loaded.text, minimax_h3.TextEncoder)
-        and isinstance(loaded.video, minimax_h3.VideoDecoder)
-        and isinstance(loaded.audio, minimax_h3.AudioDecoder)
+        isinstance(transformer, engine.minimax_h3.Transformer)
+        and isinstance(text, engine.minimax_h3.TextEncoder)
+        and isinstance(video, engine.minimax_h3.VideoDecoder)
+        and isinstance(audio, engine.minimax_h3.AudioDecoder)
     ):
         pytest.fail("Runner components are not the public H3 native bindings", pytrace=False)
+    loaded = Loaded(model, transformer, text, video, audio)
     device = loaded.transformer.device
     for component in (loaded.text, loaded.video, loaded.audio):
         if component.to_hbm(device) is not component:
@@ -350,10 +354,12 @@ def h3_forward(h3_pipeline: Loaded, h3_golden: Golden) -> Forward:
     return captured
 
 
-def finite_output(output: tuple[torch.Tensor, torch.Tensor]) -> None:
+def finite_output(
+    output: tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]],
+) -> None:
     for value in output:
-        if not isinstance(value, torch.Tensor) or not bool(torch.isfinite(value).all()):
-            pytest.fail("native H3 call returned no finite tensor", pytrace=False)
+        if not bool(np.isfinite(value).all()):
+            pytest.fail("native H3 conversion returned no finite tensor", pytrace=False)
 
 
 @pytest.fixture
@@ -375,11 +381,11 @@ def test_callback_refuses_same_pipeline_reentry(h3_pipeline: Loaded, h3_forward:
     audio = torch.zeros(2, 32, 207, dtype=torch.float32)
     calls: list[tuple[str, Callable[[], object]]] = [
         ("reset", native.reset_cache),
-        ("forward", lambda: native(**kwargs)),
-        ("cached_forward", lambda: native.cached_forward(lambda _: True, **kwargs)),
-        ("text", lambda: h3_pipeline.text.encode_ids(ids)),
-        ("video", lambda: h3_pipeline.video.decode_base(video, frame_num=1)),
-        ("audio", lambda: h3_pipeline.audio.decode(audio)),
+        ("forward", lambda: native.prepare(**kwargs)),
+        ("cached_forward", lambda: native.prepare(**kwargs).forward_cached(lambda _: True)),
+        ("text", lambda: h3_pipeline.text.prepare(ids)),
+        ("video", lambda: h3_pipeline.video.prepare(video, frame_num=1)),
+        ("audio", lambda: h3_pipeline.audio.prepare(audio)),
     ]
     invoked = False
 
@@ -393,12 +399,17 @@ def test_callback_refuses_same_pipeline_reentry(h3_pipeline: Loaded, h3_forward:
         return True
 
     native.reset_cache()
-    finite_output(native.cached_forward(decide, **kwargs))
+    finite_output(native.prepare(**kwargs).forward_cached(decide).to_host())
     if not invoked:
         pytest.fail("native H3 did not invoke its decision callback", pytrace=False)
     # The caught refusals leave the outer evaluation and subsequent ordinary calls usable.
-    finite_output(native(**kwargs))
-    _ = tensor(h3_pipeline.text.encode_ids(ids), (1, 5120), torch.bfloat16, "recovered encoder")
+    finite_output(native.prepare(**kwargs).forward().to_host())
+    _ = tensor(
+        torch.from_numpy(h3_pipeline.text.prepare(ids).forward().to_host()).view(torch.bfloat16),
+        (1, 5120),
+        torch.bfloat16,
+        "recovered encoder",
+    )
 
 
 @pytest.mark.parametrize("failure_kind", ["python", "reentry"])
@@ -408,7 +419,7 @@ def test_callback_exception_invalidates_cache(
 ) -> None:
     native, kwargs = h3_pipeline.transformer, h3_forward.kwargs
     native.reset_cache()
-    expected = native.cached_forward(lambda _: True, **kwargs)
+    expected = native.prepare(**kwargs).forward_cached(lambda _: True).to_host()
     failure = LookupError("opt H3 callback failure")
 
     def fail(means: Statistics) -> bool:
@@ -422,7 +433,7 @@ def test_callback_exception_invalidates_cache(
     kind = RuntimeError if failure_kind == "reentry" else LookupError
     reason = "cannot reenter" if failure_kind == "reentry" else "opt H3 callback failure"
     with pytest.raises(kind, match=reason) as caught:
-        _ = native.cached_forward(fail, **kwargs)
+        _ = native.prepare(**kwargs).forward_cached(fail).to_host()
     if failure_kind == "python" and caught.value is not failure:
         pytest.fail("native binding replaced the callback exception", pytrace=False)
 
@@ -431,12 +442,12 @@ def test_callback_exception_invalidates_cache(
             pytest.fail("failed callback left a published cache", pytrace=False)
         return True
 
-    actual = native.cached_forward(recover, **kwargs)
+    actual = native.prepare(**kwargs).forward_cached(recover).to_host()
     finite_output(actual)
-    if any(not torch.equal(left, right) for left, right in zip(actual, expected, strict=True)):
+    if any(not np.array_equal(left, right) for left, right in zip(actual, expected, strict=True)):
         pytest.fail("callback recovery changed a forced-compute output", pytrace=False)
     # The recovered anchor can also serve the cached branch on the next call.
-    finite_output(native.cached_forward(lambda _: False, **kwargs))
+    finite_output(native.prepare(**kwargs).forward_cached(lambda _: False).to_host())
 
 
 @pytest.mark.usefixtures("callback_deadline")
@@ -471,7 +482,7 @@ def test_callback_allows_queued_other_thread_reset(
 
     native.reset_cache()
     try:
-        finite_output(native.cached_forward(decide, **kwargs))
+        finite_output(native.prepare(**kwargs).forward_cached(decide).to_host())
     finally:
         # Never join inside the callback: the reset legitimately waits for this call to finish.
         if worker.ident is not None:
@@ -484,4 +495,4 @@ def test_callback_allows_queued_other_thread_reset(
             pytest.fail("queued reset did not invalidate the completed call's cache", pytrace=False)
         return True
 
-    finite_output(native.cached_forward(fresh, **kwargs))
+    finite_output(native.prepare(**kwargs).forward_cached(fresh).to_host())

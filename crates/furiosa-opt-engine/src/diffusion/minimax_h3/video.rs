@@ -14,17 +14,17 @@ use furiosa_opt_models::tensor::memory::{Hbm, alias};
 use furiosa_opt_std::prelude::*;
 use std::{io, sync::Arc};
 
-/// Checked framework video options, borrowing one fixed-profile latent payload.
-pub(super) struct Input<'a> {
-    latents: video::tiling::Latents<'a>,
+/// Checked framework video options owning one fixed-profile latent payload.
+pub(super) struct Input {
+    values: Vec<f32>,
     frames: video::tiling::FrameCount,
 }
 
-impl<'a> Input<'a> {
+impl Input {
     /// Validate raw layout, payload and options before admission or device work.
     pub(super) fn new(
         shape: &[usize],
-        values: &'a [f32],
+        values: Vec<f32>,
         frame_num: Option<usize>,
         process_image: bool,
     ) -> io::Result<Self> {
@@ -37,13 +37,18 @@ impl<'a> Input<'a> {
         if shape != video::tiling::LATENT_SHAPE || process_image {
             return Err(invalid());
         }
+        video::tiling::Latents::new(&values).map_err(|_| invalid())?;
         Ok(Self {
-            latents: video::tiling::Latents::new(values).map_err(|_| invalid())?,
+            values,
             frames: video::tiling::FrameCount::try_from(
                 frame_num.unwrap_or(video::tiling::OUTPUT_SHAPE[2]),
             )
             .map_err(|_| invalid())?,
         })
+    }
+
+    fn latents(&self) -> video::tiling::Latents<'_> {
+        video::tiling::Latents::new(&self.values).expect("checked owned video payload")
     }
 
     /// The returned channel-first shape with the checked tail-frame count.
@@ -76,7 +81,10 @@ impl Decoder {
         let context = device.with_device(|device| {
             Loadable::<(
                 &mut Device,
-                &&video::Embedding<Chips, &Hbm>,
+                (
+                    &&video::Embedding<Chips, &Hbm>,
+                    std::marker::PhantomData<[(); 4]>,
+                ),
                 &video::Context,
                 &mut ((), ()),
                 &video::Latent,
@@ -84,7 +92,10 @@ impl Decoder {
             .map_err(io::Error::other)?;
             Loadable::<(
                 &mut Device,
-                &&video::Layer<Chips, &Hbm>,
+                (
+                    &&video::Layer<Chips, &Hbm>,
+                    std::marker::PhantomData<[(); 4]>,
+                ),
                 &video::Context,
                 &mut (),
                 video::Residual,
@@ -92,7 +103,10 @@ impl Decoder {
             .map_err(io::Error::other)?;
             Loadable::<(
                 &mut Device,
-                &&video::FinalNorm<Chips, &Hbm>,
+                (
+                    &&video::FinalNorm<Chips, &Hbm>,
+                    std::marker::PhantomData<[(); 4]>,
+                ),
                 &video::Context,
                 &mut (),
                 &video::Residual,
@@ -100,7 +114,10 @@ impl Decoder {
             .map_err(io::Error::other)?;
             Loadable::<(
                 &mut Device,
-                &&video::Head<Chips, &Hbm>,
+                (
+                    &&video::Head<Chips, &Hbm>,
+                    std::marker::PhantomData<[(); 4]>,
+                ),
                 &video::Context,
                 &mut (),
                 &video::Normalized,
@@ -129,12 +146,9 @@ impl Decoder {
         })
     }
 
-    /// Decode and stitch all 49 groups, retaining the checked number of frames from the tail.
-    /// Alternate two input and pixel-output slots. Submit the successor before waiting for
-    /// and stitching its predecessor. A flight keeps every shared workspace owner alive until
-    /// all accepted readers end, including cancellation and partial submission failure.
-    pub(super) async fn decode(&self, input: Input<'_>) -> io::Result<Vec<f32>> {
-        let Input { latents, frames } = input;
+    /// Allocate the original two-slot workspace and upload the checked first group. Later
+    /// groups are packed and uploaded as the decoding stream consumes their predecessors.
+    pub(super) async fn prepare(&self, input: Input) -> io::Result<Prepared> {
         self.context
             .rotation
             .low
@@ -156,28 +170,31 @@ impl Decoder {
             self.device
                 .with_device(|device| Workspace::allocate(device, Arc::clone(&self.context)))?,
         );
-        let mut stitch = video::tiling::Stitch::with_frames(frames)?;
+        let stitch = video::tiling::Stitch::with_frames(input.frames)?;
         // Reuse one host pixel-group target for the complete decode. A failed
         // read ends this request, so its target is dropped before any later request can reuse it.
-        let mut host = HostBuffer::zero(
+        let host = HostBuffer::zero(
             Chips::SIZE * TileRows::SIZE * PixelChannels::SIZE * std::mem::size_of::<f32>(),
         );
-        let mut previous = None;
-        for index in 0..video::tiling::GROUPS {
-            let group = video::tiling::GroupIndex::try_from(index)?;
-            let slot = index % 2;
-            self.upload(latents.pack(group)?, &workspace.inputs[slot])?;
-            // Both input/output slots coexist, while the device's ordered launches reuse the
-            // same scratch. A slot is refilled only after its earlier pixels were absorbed.
-            let flight = self.submit(Arc::clone(&workspace), slot).await?;
-            if let Some((group, prior)) = previous.take() {
-                self.absorb(group, prior, &mut host, &mut stitch).await?;
-            }
-            previous = Some((group, flight));
-        }
-        let (group, flight) = previous.expect("the fixed profile contains groups");
-        self.absorb(group, flight, &mut host, &mut stitch).await?;
-        stitch.finish()
+        let first = video::tiling::GroupIndex::try_from(0)?;
+        self.upload(input.latents().pack(first)?, &workspace.inputs[0])?;
+        Ok(Prepared {
+            input,
+            workspace,
+            stitch,
+            host,
+        })
+    }
+
+    /// Submit the prepared first group. Remaining groups are explicitly prepared and submitted
+    /// as the host consumes the stream; the two reusable slots cannot hold final video frames.
+    pub(super) async fn decode(&self, prepared: Prepared) -> io::Result<Decoding> {
+        let first = video::tiling::GroupIndex::try_from(0)?;
+        let flight = self.submit(Arc::clone(&prepared.workspace), 0).await?;
+        Ok(Decoding {
+            previous: Some((first, flight)),
+            prepared,
+        })
     }
 
     fn upload(&self, packed: video::tiling::Packed, target: &HbmBuffer) -> io::Result<()> {
@@ -249,7 +266,7 @@ impl Decoder {
             let work = flight.held_mut();
             let input: video::Latent = alias(&work.inputs[slot], ..)?;
             let mut output: video::Residual = alias(&work.rows[0], ..)?;
-            let accepted = launches.forward_into_tracked(
+            let accepted = launches.on::<4>().forward_into_tracked(
                 model,
                 kernel::embedding,
                 work.context.as_ref(),
@@ -266,7 +283,7 @@ impl Decoder {
                 let work = flight.held_mut();
                 let input: video::Residual = alias(&work.rows[at % 2], ..)?;
                 let mut output: video::Residual = alias(&work.rows[(at + 1) % 2], ..)?;
-                let accepted = launches.forward_into_tracked(
+                let accepted = launches.on::<4>().forward_into_tracked(
                     model,
                     kernel::layer,
                     work.context.as_ref(),
@@ -283,7 +300,7 @@ impl Decoder {
             let work = flight.held_mut();
             let input: video::Residual = alias(&work.rows[video::DEPTH % 2], ..)?;
             let mut output: video::Normalized = alias(&work.normalized, ..)?;
-            let accepted = launches.forward_into_tracked(
+            let accepted = launches.on::<4>().forward_into_tracked(
                 model,
                 kernel::norm,
                 work.context.as_ref(),
@@ -299,7 +316,7 @@ impl Decoder {
             let work = flight.held_mut();
             let input: video::Normalized = alias(&work.normalized, ..)?;
             let mut output: video::Pixels = alias(&work.pixels[slot], ..)?;
-            let accepted = launches.forward_into_tracked(
+            let accepted = launches.on::<4>().forward_into_tracked(
                 model,
                 kernel::head,
                 work.context.as_ref(),
@@ -311,6 +328,60 @@ impl Decoder {
             Ok(())
         })?;
         Ok(flight)
+    }
+}
+
+/// Checked host latents, the original workspace and the uploaded first group's operands.
+pub(super) struct Prepared {
+    input: Input,
+    workspace: Arc<Workspace>,
+    stitch: video::tiling::Stitch,
+    host: HostBuffer,
+}
+
+/// A two-slot decoding stream, not a tensor of final frames. Drain accepted readers before
+/// releasing workspace storage, including a conversion failure after submitting a successor.
+pub(super) struct Decoding {
+    previous: Option<(video::tiling::GroupIndex, Flight<Arc<Workspace>>)>,
+    prepared: Prepared,
+}
+
+impl Decoding {
+    /// Wait for the currently submitted group without advancing or consuming the stream.
+    pub(super) async fn wait(&self) -> io::Result<()> {
+        self.previous
+            .as_ref()
+            .expect("submitted group")
+            .1
+            .wait()
+            .await
+    }
+
+    pub(super) async fn to_host(mut self, decoder: &Decoder) -> io::Result<Vec<f32>> {
+        for index in 1..video::tiling::GROUPS {
+            let group = video::tiling::GroupIndex::try_from(index)?;
+            let slot = index % 2;
+            let work = &mut self.prepared;
+            decoder.upload(
+                work.input.latents().pack(group)?,
+                &work.workspace.inputs[slot],
+            )?;
+            let flight = decoder.submit(Arc::clone(&work.workspace), slot).await?;
+            let (prior_group, prior) = self.previous.take().expect("submitted predecessor");
+            decoder
+                .absorb(prior_group, prior, &mut work.host, &mut work.stitch)
+                .await?;
+            self.previous = Some((group, flight));
+        }
+        let (group, flight) = self
+            .previous
+            .take()
+            .expect("the fixed profile contains groups");
+        let work = &mut self.prepared;
+        decoder
+            .absorb(group, flight, &mut work.host, &mut work.stitch)
+            .await?;
+        self.prepared.stitch.finish()
     }
 }
 
@@ -353,10 +424,10 @@ impl Workspace {
 
 /// Four-chip stage bindings for the shared Module entry.
 mod kernel {
-    pub(super) use crate::forward_four as embedding;
-    pub(super) use crate::forward_four as head;
-    pub(super) use crate::forward_four as layer;
-    pub(super) use crate::forward_four as norm;
+    pub(super) use crate::forward as embedding;
+    pub(super) use crate::forward as head;
+    pub(super) use crate::forward as layer;
+    pub(super) use crate::forward as norm;
 }
 
 #[cfg(test)]
@@ -368,7 +439,7 @@ mod tests {
         let shape = video::tiling::LATENT_SHAPE;
         let values = vec![0.0; shape.into_iter().product()];
         for frames in [None, Some(1), Some(124)] {
-            let input = Input::new(&shape, &values, frames, false).unwrap();
+            let input = Input::new(&shape, values.clone(), frames, false).unwrap();
             assert_eq!(
                 input.output_shape(),
                 [1, 3, frames.unwrap_or(124), 768, 1344]
@@ -381,7 +452,7 @@ mod tests {
             (&shape, &values[..], Some(125), false),
             (&shape, &values[..], None, true),
         ] {
-            let error = Input::new(shape, values, frames, process_image)
+            let error = Input::new(shape, values.to_vec(), frames, process_image)
                 .err()
                 .unwrap();
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);

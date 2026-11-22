@@ -486,7 +486,7 @@ macro_rules! launches {
                         DeviceOutput::alloc(device).map_err(io::Error::other)?;
                     let mut places = (((hidden, slots), ()), tokens);
                     let state: launch::State<'_, '_, $size> = &mut places;
-                    launch(forward, (&mut *device, model, (), state, &mut input))
+                    launch(forward, (&mut *device, (model, PhantomData::<[(); 1]>), (), state, &mut input))
                         .output(&mut ())
                         .submit()
                         .accepted()

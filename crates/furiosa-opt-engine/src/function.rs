@@ -1,13 +1,13 @@
 //! Run modules of loaded trees on the device: a `Function` binds a borrowed tree to the compiled
 //! entry that runs it, and its `forward` launches that entry.
 //!
-//! - The entry: `forward`, which runs any module on one chip.
+//! - The entry: `forward`, which runs any module on the chip count its argument type selects.
 //! - A call returns once the runtime accepted its launch. A refusal at submission is the call's
 //!   error; a failure after that surfaces where a result is read, which waits for the launch.
 //! - Nothing loads an entry before a call, and loading a tree binds none, so a binary that only
 //!   loads reaches no kernel.
 
-use std::io;
+use std::{io, marker::PhantomData};
 
 use furiosa_opt_models::Module;
 use furiosa_opt_std::prelude::{Device, DeviceFn, DeviceSend, device, launch};
@@ -30,15 +30,25 @@ pub trait AsyncModule<I, E, S> {
 }
 
 /// A borrowed tree and the entry that runs it on the device.
-pub struct Function<M, F> {
+pub struct Function<M, F, const CHIPS: usize = 1> {
     module: M,
     entry: F,
 }
 
 impl<M, F> Function<M, F> {
-    /// `module` run by `entry`.
+    /// `module` run by `entry` on one chip.
     pub fn new(module: M, entry: F) -> Self {
         Self { module, entry }
+    }
+}
+
+impl<M, F, const CHIPS: usize> Function<M, F, CHIPS> {
+    /// Run the same module and entry on `N` chips.
+    pub fn on<const N: usize>(self) -> Function<M, F, N> {
+        Function {
+            module: self.module,
+            entry: self.entry,
+        }
     }
 
     /// Submit a call and retain its completion for weight residency. Submission refusal returns
@@ -60,7 +70,12 @@ impl<M, F> Function<M, F> {
         E: DeviceSend + Send,
         S: DeviceSend + Send,
         O: DeviceOutput,
-        F: Copy + Sync + for<'d, 'm> DeviceFn<(&'d mut Device, &'m M, E, S, I), Output = O>,
+        F: Copy
+            + Sync
+            + for<'d, 'm> DeviceFn<
+                (&'d mut Device, (&'m M, PhantomData<[(); CHIPS]>), E, S, I),
+                Output = O,
+            >,
     {
         let mut output = O::alloc(device).map_err(io::Error::other)?;
         let work = self.forward_into_tracked(device, env, state, input, &mut output)?;
@@ -85,25 +100,44 @@ impl<M, F> Function<M, F> {
         E: DeviceSend + Send,
         S: DeviceSend + Send,
         O: DeviceOutput,
-        F: Copy + Sync + for<'d, 'm> DeviceFn<(&'d mut Device, &'m M, E, S, I), Output = O>,
+        F: Copy
+            + Sync
+            + for<'d, 'm> DeviceFn<
+                (&'d mut Device, (&'m M, PhantomData<[(); CHIPS]>), E, S, I),
+                Output = O,
+            >,
     {
-        let accepted = launch(self.entry, (device, &self.module, env, state, input))
-            .output(output)
-            .submit()
-            .accepted()
-            .map_err(io::Error::other)?;
+        let accepted = launch(
+            self.entry,
+            (
+                device,
+                (&self.module, PhantomData::<[(); CHIPS]>),
+                env,
+                state,
+                input,
+            ),
+        )
+        .output(output)
+        .submit()
+        .accepted()
+        .map_err(io::Error::other)?;
         Ok(crate::residency::Completion::new(accepted))
     }
 }
 
-impl<M, F, I, E, S, O> AsyncModule<I, E, S> for Function<M, F>
+impl<M, F, I, E, S, O, const CHIPS: usize> AsyncModule<I, E, S> for Function<M, F, CHIPS>
 where
     M: DeviceSend + Module<I, E, S, Output = O> + Sync,
     I: DeviceSend + Send,
     E: DeviceSend + Send,
     S: DeviceSend + Send,
     O: DeviceOutput,
-    F: Copy + Sync + for<'d, 'm> DeviceFn<(&'d mut Device, &'m M, E, S, I), Output = O>,
+    F: Copy
+        + Sync
+        + for<'d, 'm> DeviceFn<
+            (&'d mut Device, (&'m M, PhantomData<[(); CHIPS]>), E, S, I),
+            Output = O,
+        >,
 {
     type Output = O;
 
@@ -111,20 +145,35 @@ where
         // The output takes new memory before the launch, as a launch into returned storage does,
         // so the call returns it at acceptance instead of at completion.
         let mut output = O::alloc(device).map_err(io::Error::other)?;
-        launch(self.entry, (device, &self.module, env, state, input))
-            .output(&mut output)
-            .submit()
-            .accepted()
-            .map(drop)
-            .map_err(io::Error::other)?;
+        launch(
+            self.entry,
+            (
+                device,
+                (&self.module, PhantomData::<[(); CHIPS]>),
+                env,
+                state,
+                input,
+            ),
+        )
+        .output(&mut output)
+        .submit()
+        .accepted()
+        .map(drop)
+        .map_err(io::Error::other)?;
         Ok(output)
     }
 }
 
 // --8<-- [start:entry]
-/// Runs a module on one chip, on the env, state and input its launch passes.
-#[device(chip = 1)]
-pub fn forward<M, I, E, S, O>(device: &mut Device, module: &M, env: E, state: S, input: I) -> O
+/// Runs a module on `CHIPS` chips, on the env, state and input its launch passes.
+#[device(chip = CHIPS)]
+pub fn forward<const CHIPS: usize, M, I, E, S, O>(
+    device: &mut Device,
+    module: (&M, PhantomData<[(); CHIPS]>),
+    env: E,
+    state: S,
+    input: I,
+) -> O
 where
     M: DeviceSend + Module<I, E, S, Output = O>,
     I: DeviceSend,
@@ -132,28 +181,14 @@ where
     S: DeviceSend,
     O: DeviceOutput,
 {
-    module.forward(device, env, state, input)
+    module.0.forward(device, env, state, input)
 }
 // --8<-- [end:entry]
-
-/// Runs a module on four chips, on the env, state and input its launch passes.
-/// The device macro requires a literal topology; `forward` remains the one-chip entry.
-#[device(chip = 4)]
-pub fn forward_four<M, I, E, S, O>(device: &mut Device, module: &M, env: E, state: S, input: I) -> O
-where
-    M: DeviceSend + Module<I, E, S, Output = O>,
-    I: DeviceSend,
-    E: DeviceSend,
-    S: DeviceSend,
-    O: DeviceOutput,
-{
-    module.forward(device, env, state, input)
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use furiosa_opt_std::prelude::{Broadcast, HbmTensor, m};
+    use furiosa_opt_std::prelude::{Broadcast, HbmTensor, Topology, m};
 
     type Scalar = HbmTensor<f32, m![1], m![1]>;
 
@@ -175,31 +210,36 @@ mod tests {
         }
     }
 
-    // One entry per chip count, since `#[device]` takes a literal.
-    /// `forward` on two chips.
-    #[device(chip = 2)]
-    fn two<M, I, E, S, O>(device: &mut Device, module: &M, env: E, state: S, input: I) -> O
-    where
-        M: DeviceSend + Module<I, E, S, Output = O>,
-        I: DeviceSend,
-        E: DeviceSend,
-        S: DeviceSend,
-        O: DeviceOutput,
-    {
-        module.forward(device, env, state, input)
-    }
-
-    /// A function launches a module with its env and state through the entry of each chip count.
-    const _: () = {
-        fn launches<A>(_: A)
+    /// The shared entry's topology follows the function's selected chip count.
+    #[test]
+    fn topology_follows_chip_count() {
+        fn topology<F, const CHIPS: usize>(_: Function<Echo, F, CHIPS>) -> Topology
         where
-            A: AsyncModule<&'static Scalar, &'static Scalar, &'static mut Scalar, Output = Scalar>,
+            F: DeviceFn<
+                    (
+                        &'static mut Device,
+                        (&'static Echo, PhantomData<[(); CHIPS]>),
+                        &'static Scalar,
+                        &'static mut Scalar,
+                        &'static Scalar,
+                    ),
+                    Output = Scalar,
+                >,
         {
+            F::TOPOLOGY
         }
-        let _ = || {
-            launches(Function::new(&Echo, forward));
-            launches(Function::new(&Echo, two));
-            launches(Function::new(&Echo, forward_four));
-        };
-    };
+
+        assert_eq!(
+            topology(Function::new(Echo, forward)),
+            Topology { chips: 1, pes: 8 }
+        );
+        assert_eq!(
+            topology(Function::new(Echo, forward).on::<2>()),
+            Topology { chips: 2, pes: 8 }
+        );
+        assert_eq!(
+            topology(Function::new(Echo, forward).on::<4>()),
+            Topology { chips: 4, pes: 8 }
+        );
+    }
 }

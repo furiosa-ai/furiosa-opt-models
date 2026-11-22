@@ -39,7 +39,10 @@ impl Decoder {
         device.with_device(|device| {
             Loadable::<(
                 &mut Device,
-                &&audio::Decoder<Chips, &Hbm>,
+                (
+                    &&audio::Decoder<Chips, &Hbm>,
+                    std::marker::PhantomData<[(); 4]>,
+                ),
                 (),
                 &mut kernel::State,
                 &audio::Input,
@@ -54,13 +57,9 @@ impl Decoder {
         })
     }
 
-    /// Decode contiguous FP32 `[2,32,207]` latents to channel-major `[2,1,165600]` samples.
-    /// The input's constructor checks shape and payload length before this call. Transposition
-    /// only copies FP32 values. No latent-statistics transform is introduced, and the existing
-    /// Module tree retains every BF16 rounding boundary.
-    /// Read the first of four identical waveform replicas and remove
-    /// each channel's trailing allocation padding separately.
-    pub(super) async fn decode(&self, input: Latents<'_>) -> io::Result<Vec<f32>> {
+    /// Pack and upload checked contiguous FP32 `[2,32,207]` latents without changing values
+    /// or folding latent statistics. Allocate the same waveform workspace before admission.
+    pub(super) async fn prepare(&self, input: Latents<'_>) -> io::Result<Prepared> {
         let packed = input.pack();
         let input: audio::Input = self.device.with_device(|device| {
             // Complete the replicated upload while its host source is still owned. There is
@@ -71,13 +70,18 @@ impl Decoder {
         let workspace = self
             .device
             .with_device(|device| Workspace::allocate(device, input))?;
-        let mut flight = Flight::new(workspace, 1);
+        Ok(Prepared(workspace))
+    }
+
+    /// Consume uploaded device operands and return as soon as the decoder launch is accepted.
+    pub(super) async fn decode(&self, input: Prepared) -> io::Result<Output> {
+        let mut flight = Flight::new(input.0, 1);
         let ready = self.device.admit(&self.decoder)?.landed().await?;
         self.device.launch(ready, |launches, model| {
             let work = flight.held_mut();
             let mut waveform: audio::Output = alias(&work.waveform, ..)?;
             let mut state: kernel::State = Default::default();
-            let accepted = launches.forward_into_tracked(
+            let accepted = launches.on::<4>().forward_into_tracked(
                 model,
                 kernel::decode,
                 (),
@@ -90,12 +94,38 @@ impl Decoder {
             flight.accepted(waveform.into_buffer(), accepted);
             Ok(())
         })?;
+        Ok(Output(flight))
+    }
+
+    /// The same typed input and output allocations as a call; the entry is already primed.
+    pub(super) fn workspace_bytes(&self) -> io::Result<usize> {
+        self.device.with_device(|device| {
+            super::memory::measure(device, |device| {
+                let input = audio::Input::<Chips>::alloc(device).map_err(io::Error::other)?;
+                Workspace::allocate(device, input)
+            })
+        })
+    }
+}
+
+/// Uploaded, checked decoder operands; no latent upload occurs in `decode`.
+pub(super) struct Prepared(Workspace);
+
+/// Accepted decoder work retaining its device operands until conversion or cancellation.
+pub(super) struct Output(Flight<Workspace>);
+
+impl Output {
+    pub(super) async fn wait(&self) -> io::Result<()> {
+        self.0.wait().await
+    }
+
+    pub(super) async fn to_host(self, device: &SharedDevice) -> io::Result<Vec<f32>> {
         let [waveform]: [HbmBuffer; 1] =
-            flight.finish().await?.try_into().map_err(|_| {
+            self.0.finish().await?.try_into().map_err(|_| {
                 io::Error::other("H3 audio decoder returned an invalid output count")
             })?;
         let waveform = audio::Output::<Chips>::try_from(waveform).map_err(io::Error::other)?;
-        let samples = self.device.with_device(|device| {
+        let samples = device.with_device(|device| {
             // Retain the waveform allocation until the download ends, including errors.
             // Download all four replicas, then consume only the first replica below.
             block_on(
@@ -112,16 +142,6 @@ impl Decoder {
             output.extend_from_slice(&samples[start..start + audio::Samples::SAMPLES]);
         }
         Ok(output)
-    }
-
-    /// The same typed input and output allocations as a call; the entry is already primed.
-    pub(super) fn workspace_bytes(&self) -> io::Result<usize> {
-        self.device.with_device(|device| {
-            super::memory::measure(device, |device| {
-                let input = audio::Input::<Chips>::alloc(device).map_err(io::Error::other)?;
-                Workspace::allocate(device, input)
-            })
-        })
     }
 }
 
@@ -213,7 +233,7 @@ mod tests {
 
 /// Four-chip launch binding and nested decoder state.
 mod kernel {
-    pub(super) use crate::forward_four as decode;
+    pub(super) use crate::forward as decode;
 
     type UnitState = ((), ((), ()));
     type BlockState = (UnitState, (UnitState, UnitState));

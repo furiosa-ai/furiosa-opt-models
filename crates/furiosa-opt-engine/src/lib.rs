@@ -27,7 +27,7 @@ pub mod registry;
 pub mod residency;
 pub mod vision_language;
 
-pub use function::{AsyncModule, Function, forward, forward_four};
+pub use function::{AsyncModule, Function, forward};
 pub use furiosa_opt_models::load::{Checkpoint, Load, LoadError};
 pub use furiosa_opt_models::ops::attention::full::paged::Tiling;
 pub use furiosa_opt_models::tensor::memory::Hbm;

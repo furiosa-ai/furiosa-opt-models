@@ -5,15 +5,26 @@ import builtins
 import collections.abc
 import typing
 
+import numpy
+import numpy.typing
+
 import furiosa_opt_engine as engine
 
 __all__ = [
     "AudioDecoder",
+    "AudioOutput",
     "Component",
+    "Encoded",
+    "Output",
     "Pipeline",
+    "PreparedAudio",
+    "PreparedStep",
+    "PreparedText",
+    "PreparedVideo",
     "TextEncoder",
     "Transformer",
     "VideoDecoder",
+    "VideoDecoding",
 ]
 
 @typing.final
@@ -21,11 +32,19 @@ class AudioDecoder(Component):
     r"""
     The original stereo audio decoder, returning channel-major FP32 waveform samples.
     """
-    def decode(self, z: typing.Any) -> typing.Any: ...
+    def prepare(self, z: typing.Any) -> PreparedAudio: ...
+
+@typing.final
+class AudioOutput:
+    r"""
+    Accepted device waveform; host conversion removes only the original per-channel padding.
+    """
+    def wait(self) -> None: ...
+    def to_host(self) -> numpy.typing.NDArray[numpy.float32]: ...
 
 class Component:
     r"""
-    Shared ownership and placement of a pipeline or any of its callable component views.
+    Shared ownership and placement of a pipeline or any of its component views.
     """
     @property
     def device(self) -> engine.Device:
@@ -43,6 +62,30 @@ class Component:
     def pin(self) -> typing.Self:
         r"""
         The pipeline has already prepared and pinned its streamed host sources.
+        """
+
+@typing.final
+class Encoded:
+    r"""
+    Device encoder rows, before final normalization.
+    """
+    def wait(self) -> None: ...
+    def to_host(self) -> numpy.typing.NDArray[numpy.uint16]:
+        r"""
+        Consume into a uint16 NumPy tensor of BF16 bits, preserving every bit for the framework.
+        """
+
+@typing.final
+class Output:
+    r"""
+    Accepted device velocities; waiting retains both staging admission and unpublished cache.
+    """
+    def wait(self) -> None: ...
+    def to_host(
+        self,
+    ) -> tuple[numpy.typing.NDArray[numpy.float32], numpy.typing.NDArray[numpy.float32]]:
+        r"""
+        Consume device results into host FP32 NumPy tensors using the Rust gather contract.
         """
 
 @typing.final
@@ -66,12 +109,36 @@ class Pipeline(Component):
     def audio_vae(self) -> AudioDecoder: ...
 
 @typing.final
+class PreparedAudio:
+    def forward(self) -> AudioOutput: ...
+
+@typing.final
+class PreparedStep:
+    r"""
+    Uploaded transformer operands. Each prepared call can be consumed exactly once.
+    """
+    def forward(self) -> Output: ...
+    def forward_cached(
+        self, decide: collections.abc.Callable[[tuple[float, float] | None], bool], /
+    ) -> Output:
+        r"""
+        Callback errors retain their Python identity and leave no published cache.
+        """
+
+@typing.final
+class PreparedText:
+    def forward(self) -> Encoded: ...
+
+@typing.final
+class PreparedVideo:
+    def forward(self) -> VideoDecoding: ...
+
+@typing.final
 class TextEncoder(Component):
     r"""
     The first 50 text layers before final normalization, on the pipeline's same four chips.
     """
-    def __call__(self, input_ids: typing.Any, **media: typing.Any) -> typing.Any: ...
-    def encode_ids(self, input_ids: typing.Any, **media: typing.Any) -> typing.Any: ...
+    def prepare(self, input_ids: typing.Any, **media: typing.Any) -> PreparedText: ...
     def load_to_device(self) -> None:
         r"""
         Streaming places each layer before its call; the framework has nothing to move here.
@@ -82,24 +149,13 @@ class Transformer(Component):
     r"""
     Transformer evaluations and optional retained rows, with solver updates in the framework.
     """
-    def __call__(
-        self, *args: typing.Any, **kwargs: typing.Any
-    ) -> tuple[typing.Any, typing.Any]: ...
-    def cached_forward(
-        self,
-        decide: collections.abc.Callable[[tuple[float, float] | None], bool],
-        /,
-        **kwargs: typing.Any,
-    ) -> tuple[typing.Any, typing.Any]:
+    def prepare(self, *args: typing.Any, **kwargs: typing.Any) -> PreparedStep:
         r"""
-        Compute a probe, ask the framework's policy, and read out computed or cached rows.
-        Retained rows stay inside this pipeline; callback exceptions leave no published cache.
-        Calls into the same pipeline from `decide` on its thread raise `RuntimeError`.
-        Calls from other threads remain serialized.
+        Check framework arguments and upload operands explicitly, retaining exclusive staging.
         """
     def reset_cache(self) -> None:
         r"""
-        Start a new generation without retaining an earlier generation's probe or residual.
+        Start a new generation after the preceding call/result has retired.
         """
 
 @typing.final
@@ -107,9 +163,20 @@ class VideoDecoder(Component):
     r"""
     The original video decoder, tile order and stitching, with optional last-frame trimming.
     """
-    def decode_base(
+    def prepare(
         self,
         z: typing.Any,
         frame_num: builtins.int | None = None,
         process_image: builtins.bool = False,
-    ) -> typing.Any: ...
+    ) -> PreparedVideo: ...
+
+@typing.final
+class VideoDecoding:
+    r"""
+    Ongoing two-slot video decoding. Final frames require ordered CPU download and stitching.
+    """
+    def wait(self) -> None:
+        r"""
+        Wait for the currently submitted group; this does not produce or advance final frames.
+        """
+    def to_host(self) -> numpy.typing.NDArray[numpy.float32]: ...

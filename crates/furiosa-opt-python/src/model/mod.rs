@@ -17,13 +17,14 @@ use furiosa_opt_engine::registry::Model;
 use furiosa_opt_engine::vision_language;
 use furiosa_opt_models::load::{LoadError, Part};
 use furiosa_opt_models::models::Class;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyRange, PyRangeMethods};
 use pyo3::{PyClass, PyClassInitializer};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
+use std::any::Any;
 use std::path::PathBuf;
-use std::sync::PoisonError;
+use std::sync::{Arc, PoisonError};
 
 mod llama;
 pub(super) mod minimax_h3;
@@ -47,14 +48,19 @@ type Family = (
 /// A decoder as an object of one class.
 type Constructor = fn(Decoder, Python<'_>) -> PyResult<Py<Decoder>>;
 
-/// A pipeline's class and its family's typed preparation and placement constructor.
+/// A pipeline's class and the constructor of its already loaded owner.
 const PIPELINES: &[(Class, PipelineConstructor)] = &[(
     engine::diffusion::minimax_h3::Pipeline::CLASS,
-    minimax_h3::load,
+    |py, owner, context| {
+        let owner = owner
+            .downcast::<engine::diffusion::minimax_h3::Pipeline>()
+            .map_err(|_| PyRuntimeError::new_err("the loaded pipeline does not match its class"))?;
+        Ok(minimax_h3::object(py, owner, context)?.into_any())
+    },
 )];
 
 type PipelineConstructor =
-    fn(Python<'_>, &engine::LoadOptions, &engine::Checkpoint, &Device) -> Result<Py<PyAny>, Error>;
+    fn(Python<'_>, Arc<dyn Any + Send + Sync>, Shared) -> Result<Py<PyAny>, Error>;
 
 /// The tensors of a checkpoint directory, mapped or read into host memory, and the config of its
 /// model.
@@ -218,32 +224,36 @@ impl LoadOptions {
         device: &Device,
     ) -> Result<Py<PyAny>, Error> {
         let config = self.0.parse(&checkpoint.0)?;
-        if config.is_pipeline() {
-            let (_, constructor) = PIPELINES
-                .iter()
-                .find(|(class, _)| *class == config.class())
-                .ok_or_else(|| LoadError::Unsupported {
-                    name: config.architecture().into(),
-                    reason: "no Python class holds the pipeline yet".into(),
-                })?;
-            return constructor(py, &self.0, &checkpoint.0, device);
-        }
+        let pipeline_class = if config.is_pipeline() {
+            Some(
+                PIPELINES
+                    .iter()
+                    .find(|(class, _)| *class == config.class())
+                    .ok_or_else(|| LoadError::Unsupported {
+                        name: config.architecture().into(),
+                        reason: "no Python class holds the pipeline yet".into(),
+                    })?
+                    .1,
+            )
+        } else {
+            None
+        };
         // A decoder's class is its model type's, found before a weight is read.
         let unbound = || LoadError::Unsupported {
             name: config.architecture().into(),
             reason: "no Python class holds the model yet".into(),
         };
-        let class = match config.part() {
-            Part::Encoder => None,
-            Part::Whole => Some(Decoder::class(config.class()).ok_or_else(unbound)?),
+        let class = match (pipeline_class, config.part()) {
+            (Some(_), _) | (_, Part::Encoder) => None,
+            (None, Part::Whole) => Some(Decoder::class(config.class()).ok_or_else(unbound)?),
         };
         let model = py.detach(|| {
-            let mut context = device.0.lock().unwrap_or_else(PoisonError::into_inner);
-            self.0.load(&mut context.device, &checkpoint.0)
+            let shared = engine::residency::SharedDevice::bind(device.0.clone());
+            engine::residency::block_on(self.0.load_shared(&shared, &checkpoint.0))
         })?;
         let context = device.0.clone();
-        Ok(match (model, class) {
-            (Model::Decoder(served), Some(class)) => {
+        Ok(match (model, class, pipeline_class) {
+            (Model::Decoder(served), Some(class), None) => {
                 let decoder = Decoder {
                     served,
                     config,
@@ -251,11 +261,12 @@ impl LoadOptions {
                 };
                 class(decoder, py)?.into_any()
             }
-            (Model::Encoder(encoder), None) => {
+            (Model::Encoder(encoder), None, None) => {
                 Py::new(py, Encoder { encoder, context })?.into_any()
             }
+            (Model::Pipeline(owner), None, Some(class)) => class(py, owner, context)?,
             _ => {
-                unreachable!("a load of the encoder alone serves a media encoder, others a decoder")
+                unreachable!("the loaded model matches its selected constructor")
             }
         })
     }

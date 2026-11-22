@@ -57,7 +57,10 @@ impl Encoder {
         device.with_device(|device| {
             Loadable::<(
                 &mut Device,
-                &&text::Embedding<P, &Hbm>,
+                (
+                    &&text::Embedding<P, &Hbm>,
+                    std::marker::PhantomData<[(); 4]>,
+                ),
                 (),
                 &mut (),
                 &HbmTensor<i32, Chips, m![1]>,
@@ -65,7 +68,7 @@ impl Encoder {
             .map_err(io::Error::other)?;
             Loadable::<(
                 &mut Device,
-                &kernel::Layer<'_, '_>,
+                (&kernel::Layer<'_, '_>, std::marker::PhantomData<[(); 4]>),
                 &request::Row,
                 &mut Cache,
                 Hidden,
@@ -112,16 +115,23 @@ impl Encoder {
         })
     }
 
-    /// Read exactly the actual formatted prompt, through layer 50 and before the final norm.
-    /// The single cache is reused only after all of the preceding layer's readers have ended.
-    pub(crate) async fn encode(&self, tokens: &[i32]) -> io::Result<Vec<HbmBuffer>> {
+    /// Check the actual formatted prompt and upload its metadata with the original KV backing.
+    /// Device execution consumes these operands without another prompt transfer.
+    pub(crate) fn prepare(&self, tokens: &[i32]) -> io::Result<Prepared> {
         let prepared = request::Prepared::new(tokens, self.capacity)?;
         let request = Arc::new(self.device.with_device(|device| {
             // This initial transfer has no kernel readers yet. No dependent kernel or weight
             // completion is waited under this lock.
             block_on(prepared.upload(device))
         })?);
-        let mut window = Window::new(&self.layers[self.fit.resident..]);
+        Ok(Prepared(request))
+    }
+
+    /// Consume uploaded prompt operands. The last flight and eviction window belong to the
+    /// result, so a wait observes readiness without releasing the pipeline's request lease.
+    pub(crate) async fn encode(self: &Arc<Self>, prepared: Prepared) -> io::Result<Output> {
+        let request = prepared.0;
+        let window = Window::new(Arc::clone(self));
         if self.fit.resident == 0 {
             self.device.upload(&self.layers[0])?;
         }
@@ -129,7 +139,7 @@ impl Encoder {
         let mut flight = Flight::new(Arc::clone(&request), request.rows().len());
         self.device.launch(ready, |launches, embedding| {
             for row in request.rows() {
-                let (output, work) = launches.forward_tracked(
+                let (output, work) = launches.on::<4>().forward_tracked(
                     embedding,
                     kernel::embedding,
                     (),
@@ -161,7 +171,7 @@ impl Encoder {
                 for (at, row) in request.rows().iter().enumerate() {
                     let (rows, _, cache) = flight.held_mut();
                     let input: Hidden = alias(&rows[at], ..)?;
-                    let (output, work) = launches.forward_tracked(
+                    let (output, work) = launches.on::<4>().forward_tracked(
                         kernel::Layer { layer, positions },
                         kernel::layer,
                         row,
@@ -176,36 +186,61 @@ impl Encoder {
             if at > self.fit.resident {
                 self.layers[at - 1].to_host()?;
             }
+            if at + 1 == text::LAYERS {
+                return Ok(Output { flight, window });
+            }
             rows = flight.finish().await?;
         }
-        if self.fit.resident < text::LAYERS {
-            self.layers[text::LAYERS - 1].to_host()?;
+        unreachable!("the encoder contains layers")
+    }
+}
+
+/// Prompt metadata and cache backing storage uploaded at the explicit preparation boundary.
+pub(crate) struct Prepared(Arc<text::request::Request>);
+
+/// Device rows plus their final readers and streamed-weight retirement. Field order drains
+/// readers before the eviction window is dropped, including a partially read result.
+pub(crate) struct Output {
+    flight: Flight<(Vec<HbmBuffer>, Arc<text::request::Request>, Cache)>,
+    window: Window,
+}
+
+impl Output {
+    pub(crate) async fn wait(&self) -> io::Result<()> {
+        self.flight.wait().await
+    }
+
+    pub(crate) async fn finish(self) -> io::Result<Vec<HbmBuffer>> {
+        let Self { flight, mut window } = self;
+        let rows = flight.finish().await?;
+        if window.owner.fit.resident < text::LAYERS {
+            window.owner.layers[text::LAYERS - 1].to_host()?;
         }
         window.finished = true;
         Ok(rows)
     }
 }
 
-/// On cancellation or partial failure, retire all possibly prefetched copies. This guard is
-/// declared before any Flight, so its blocking drain follows request-reader cleanup on unwind.
-struct Window<'a> {
-    layers: &'a [Resident<text::Layer>],
+/// On cancellation or partial failure, retire all possibly prefetched copies. The owner keeps
+/// resident cells alive; declare this guard before a Flight so reader cleanup runs first.
+struct Window {
+    owner: Arc<Encoder>,
     finished: bool,
 }
 
-impl<'a> Window<'a> {
-    fn new(layers: &'a [Resident<text::Layer>]) -> Self {
+impl Window {
+    fn new(owner: Arc<Encoder>) -> Self {
         Self {
-            layers,
+            owner,
             finished: false,
         }
     }
 }
 
-impl Drop for Window<'_> {
+impl Drop for Window {
     fn drop(&mut self) {
         if !self.finished {
-            for layer in self.layers {
+            for layer in &self.owner.layers[self.owner.fit.resident..] {
                 let _ = layer.to_host();
             }
         }

@@ -133,11 +133,6 @@ mod tests {
         }
     }
 
-    #[device(chip = 4)]
-    fn copied(device: &mut Device, module: &Copy, _: (), _: &mut (), input: &Values) -> Values {
-        Op::forward(module, device, input)
-    }
-
     #[test]
     #[ignore = "requires four explicitly selected RNGD chips and pinned host memory"]
     fn residency_uses_and_retains_the_original_framework_context() {
@@ -175,9 +170,9 @@ mod tests {
                     if caller_output {
                         let mut output =
                             Values::alloc(launches.device()).map_err(io::Error::other)?;
-                        launches.forward_into_tracked(
+                        launches.on::<4>().forward_into_tracked(
                             Copy,
-                            copied,
+                            crate::forward,
                             (),
                             &mut (),
                             *input,
@@ -185,7 +180,9 @@ mod tests {
                         )?;
                         Ok(output)
                     } else {
-                        launches.forward(Copy, copied, (), &mut (), *input)
+                        launches
+                            .on::<4>()
+                            .forward(Copy, crate::forward, (), &mut (), *input)
                     }
                 })
                 .unwrap();

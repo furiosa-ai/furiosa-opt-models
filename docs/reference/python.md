@@ -53,9 +53,12 @@ A load of a vision-language model's media encoder alone (`LoadOptions.encoder()`
 
 ## Diffusion pipelines
 
-A MiniMax H3 load returns one four-chip `Pipeline`. Its component views retain
-the same pipeline and device. Component calls take the framework's arguments and
-return completed host tensors; they do not use the decoder KV-cache API below.
+A MiniMax H3 load returns one four-chip `Pipeline` whose component views retain the same pipeline and device.
+A component's `prepare` checks and uploads framework operands, and its prepared call's `forward` submits device work and returns an owned result.
+Use `wait` to wait without converting, or `to_host` to consume the result into NumPy arrays; the framework adapter converts those arrays into framework tensors.
+The video result is an ongoing two-buffer decode: `wait` waits for the current group, while `to_host` advances the remaining groups and performs the original ordered stitching.
+Consume or drop a prepared call and its result before preparing another call on the same pipeline.
+These calls do not use the decoder KV-cache API below.
 See the [H3 profile](../serving/minimax-h3.md) for supported inputs and serving.
 
 ::: furiosa_opt_engine.minimax_h3.Component
@@ -69,6 +72,22 @@ See the [H3 profile](../serving/minimax-h3.md) for supported inputs and serving.
 ::: furiosa_opt_engine.minimax_h3.VideoDecoder
 
 ::: furiosa_opt_engine.minimax_h3.AudioDecoder
+
+::: furiosa_opt_engine.minimax_h3.PreparedStep
+
+::: furiosa_opt_engine.minimax_h3.Output
+
+::: furiosa_opt_engine.minimax_h3.PreparedText
+
+::: furiosa_opt_engine.minimax_h3.Encoded
+
+::: furiosa_opt_engine.minimax_h3.PreparedVideo
+
+::: furiosa_opt_engine.minimax_h3.VideoDecoding
+
+::: furiosa_opt_engine.minimax_h3.PreparedAudio
+
+::: furiosa_opt_engine.minimax_h3.AudioOutput
 
 ## Requests and cache
 

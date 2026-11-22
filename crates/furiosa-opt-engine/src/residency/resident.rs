@@ -6,7 +6,7 @@ use super::parameter::{Closing, Destination, Owner, Parameter};
 use furiosa_opt_models::tensor::memory::Hbm;
 use furiosa_opt_models::tensor::memory::residency::{Leaves, Path, Residency, Visit};
 use furiosa_opt_std::prelude::*;
-use std::{collections::BTreeSet, convert::Infallible, io, sync::Arc};
+use std::{collections::BTreeSet, convert::Infallible, io, marker::PhantomData, sync::Arc};
 
 pub(crate) struct Resident<T: Residency> {
     tree: T::In<Cells>,
@@ -49,7 +49,7 @@ struct Lend<'a> {
 struct Borrow;
 
 /// The only device access a scoped reader receives: each accepted launch is recorded at once.
-pub(crate) struct Launches<'a> {
+pub(crate) struct Launches<'a, const CHIPS: usize = 1> {
     device: &'a mut Device,
     launched: &'a mut Vec<Arc<Completion>>,
 }
@@ -222,7 +222,15 @@ impl<T: Residency> Ready<'_, T> {
     }
 }
 
-impl Launches<'_> {
+impl<const CHIPS: usize> Launches<'_, CHIPS> {
+    /// Reborrow the submission scope for the entry's compile-time chip count.
+    pub(crate) fn on<const N: usize>(&mut self) -> Launches<'_, N> {
+        Launches {
+            device: self.device,
+            launched: self.launched,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn device(&self) -> &Device {
         self.device
@@ -243,7 +251,12 @@ impl Launches<'_> {
         E: DeviceSend + Send,
         S: DeviceSend + Send,
         O: furiosa_opt_std::runtime::DeviceOutput,
-        F: Copy + Sync + for<'d, 'm> DeviceFn<(&'d mut Device, &'m M, E, S, I), Output = O>,
+        F: Copy
+            + Sync
+            + for<'d, 'm> DeviceFn<
+                (&'d mut Device, (&'m M, PhantomData<[(); CHIPS]>), E, S, I),
+                Output = O,
+            >,
     {
         let (output, _) = self.forward_tracked(module, entry, env, state, input)?;
         Ok(output)
@@ -265,10 +278,16 @@ impl Launches<'_> {
         E: DeviceSend + Send,
         S: DeviceSend + Send,
         O: furiosa_opt_std::runtime::DeviceOutput,
-        F: Copy + Sync + for<'d, 'm> DeviceFn<(&'d mut Device, &'m M, E, S, I), Output = O>,
+        F: Copy
+            + Sync
+            + for<'d, 'm> DeviceFn<
+                (&'d mut Device, (&'m M, PhantomData<[(); CHIPS]>), E, S, I),
+                Output = O,
+            >,
     {
-        let (output, work) =
-            crate::Function::new(module, entry).forward_tracked(self.device, env, state, input)?;
+        let (output, work) = crate::Function::new(module, entry)
+            .on::<CHIPS>()
+            .forward_tracked(self.device, env, state, input)?;
         let work = Arc::new(work);
         self.launched.push(Arc::clone(&work));
         Ok((output, work))
@@ -291,15 +310,18 @@ impl Launches<'_> {
         E: DeviceSend + Send,
         S: DeviceSend + Send,
         O: furiosa_opt_std::runtime::DeviceOutput,
-        F: Copy + Sync + for<'d, 'm> DeviceFn<(&'d mut Device, &'m M, E, S, I), Output = O>,
+        F: Copy
+            + Sync
+            + for<'d, 'm> DeviceFn<
+                (&'d mut Device, (&'m M, PhantomData<[(); CHIPS]>), E, S, I),
+                Output = O,
+            >,
     {
-        let work = Arc::new(crate::Function::new(module, entry).forward_into_tracked(
-            self.device,
-            env,
-            state,
-            input,
-            output,
-        )?);
+        let work = Arc::new(
+            crate::Function::new(module, entry)
+                .on::<CHIPS>()
+                .forward_into_tracked(self.device, env, state, input, output)?,
+        );
         self.launched.push(Arc::clone(&work));
         Ok(work)
     }
@@ -474,18 +496,6 @@ mod tests {
         second: B,
     }
 
-    #[device(chip = 4)]
-    fn four<M, I, E, S, O>(device: &mut Device, module: &M, env: E, state: S, input: I) -> O
-    where
-        M: DeviceSend + Module<I, E, S, Output = O>,
-        I: DeviceSend,
-        E: DeviceSend,
-        S: DeviceSend,
-        O: furiosa_opt_std::runtime::DeviceOutput,
-    {
-        module.forward(device, env, state, input)
-    }
-
     fn weight(value: f32) -> Weight<Cells> {
         Weight {
             weight: Load::load(
@@ -569,7 +579,9 @@ mod tests {
                 futures_executor::block_on(resident.admit(&owner).unwrap().landed()).unwrap();
             let output = ready
                 .launch(&mut device.lock().unwrap(), |launches, tree| {
-                    launches.forward(tree, four, (), &mut (), ())
+                    launches
+                        .on::<4>()
+                        .forward(tree, crate::forward, (), &mut (), ())
                 })
                 .unwrap();
             view.to_host().unwrap();

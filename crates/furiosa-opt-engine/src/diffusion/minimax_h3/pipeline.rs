@@ -17,7 +17,7 @@ use std::{io, sync::Arc};
 pub(super) struct Pipeline<const N: usize, R, K, T: AxisName, A, V> {
     weights: Arc<weights::Weights>,
     device: SharedDevice,
-    encoder: text::Encoder,
+    encoder: Arc<text::Encoder>,
     conditioner: Conditioner<N, T>,
     denoiser: denoiser::Denoiser<R, K, T, A, V>,
     video: video::Decoder,
@@ -100,7 +100,7 @@ impl<
         };
         // This real allocation set subtracts the memo's cost while the encoder chooses its
         // prefix. It is retired before returning; later framework calls retain the real memo.
-        let encoder = text::Encoder::from_prepared(text, device.clone(), limits).await?;
+        let encoder = Arc::new(text::Encoder::from_prepared(text, device.clone(), limits).await?);
         drop(reserved);
         Ok(Arc::new(Self {
             weights,
@@ -118,12 +118,21 @@ impl<
         &self.device
     }
 
-    /// The framework's text component returns completed BF16 rows on the host, before the
-    /// encoder's final norm. Keep every row owner and pipeline admission through the one batched
-    /// download. Each row has four chip replicas; download only the first replica.
-    pub(super) async fn encode(&self, tokens: &[i32]) -> io::Result<Vec<bf16>> {
-        let _lease = self.active.lock().await;
-        let rows = self.encoder.encode(tokens).await?;
+    /// Claim admission before the checked prompt metadata upload.
+    pub(super) async fn prepare_text(
+        &self,
+        tokens: &[i32],
+    ) -> io::Result<(text::Prepared, tokio::sync::OwnedMutexGuard<()>)> {
+        let lease = Arc::clone(&self.active).lock_owned().await;
+        Ok((self.encoder.prepare(tokens)?, lease))
+    }
+
+    pub(super) async fn encode(&self, prepared: text::Prepared) -> io::Result<text::Output> {
+        self.encoder.encode(prepared).await
+    }
+
+    /// One batched download of the first replica, after final readers and streamed copies retire.
+    pub(super) fn download_encoded(&self, rows: Vec<HbmBuffer>) -> io::Result<Vec<bf16>> {
         let bytes_per_row = Condition::SIZE * std::mem::size_of::<bf16>();
         let mut bytes = vec![0_u8; rows.len() * bytes_per_row];
         self.device.with_device(|device| {
@@ -194,14 +203,32 @@ impl<
         })
     }
 
-    /// A standalone framework decoder call shares admission with encoding and denoising.
-    pub(super) async fn decode_video(&self, input: video::Input<'_>) -> io::Result<Vec<f32>> {
-        let _lease = self.active.lock().await;
+    /// Standalone component preparation holds the same admission through explicit conversion.
+    pub(super) async fn prepare_video(
+        &self,
+        input: video::Input,
+    ) -> io::Result<(video::Prepared, tokio::sync::OwnedMutexGuard<()>)> {
+        let lease = Arc::clone(&self.active).lock_owned().await;
+        Ok((self.video.prepare(input).await?, lease))
+    }
+
+    pub(super) async fn decode_video(&self, input: video::Prepared) -> io::Result<video::Decoding> {
         self.video.decode(input).await
     }
 
-    pub(super) async fn decode_audio(&self, input: audio::Latents<'_>) -> io::Result<Vec<f32>> {
-        let _lease = self.active.lock().await;
+    pub(super) async fn finish_video(&self, stream: video::Decoding) -> io::Result<Vec<f32>> {
+        stream.to_host(&self.video).await
+    }
+
+    pub(super) async fn prepare_audio(
+        &self,
+        input: audio::Latents<'_>,
+    ) -> io::Result<(audio::Prepared, tokio::sync::OwnedMutexGuard<()>)> {
+        let lease = Arc::clone(&self.active).lock_owned().await;
+        Ok((self.audio.prepare(input).await?, lease))
+    }
+
+    pub(super) async fn decode_audio(&self, input: audio::Prepared) -> io::Result<audio::Output> {
         self.audio.decode(input).await
     }
 }
@@ -252,7 +279,7 @@ impl<
 > Request<N, R, K, T, A, V>
 {
     /// Keep completed preparation across framework calls without blocking sibling components.
-    /// All accepted readers from a preparation or step have ended before that call returns.
+    /// Preparation has completed before this conversion; pending step results retain the request.
     pub(super) fn retain(self) -> Retained<N, R, K, T, A, V> {
         let Self {
             owner,
@@ -268,15 +295,15 @@ impl<
         times: denoiser::Times,
         video: denoiser::Video<V>,
         audio: denoiser::Audio<A>,
-    ) -> io::Result<(denoiser::Video<V>, denoiser::Audio<A>)> {
+    ) -> io::Result<super::flight::Flight<denoiser::Workspace<R, K, T, A, V>>> {
         self.owner
             .denoiser
             .forward(Arc::clone(&self.state), times, video, audio)
             .await
     }
 
-    /// The cache owns only completed rows. The framework supplies its policy after the probe;
-    /// caller ownership and admission remain identical to ordinary denoising.
+    /// The policy follows the completed probe. The result retains pending cache readers, and
+    /// the runtime publishes its cache only after successful host conversion.
     pub(super) async fn forward_cached<
         F: FnMut(Option<cache::Statistics>) -> io::Result<bool> + Send,
     >(
@@ -287,7 +314,7 @@ impl<
         previous: Option<Arc<cache::Retained<R>>>,
         decide: F,
     ) -> io::Result<(
-        (denoiser::Video<V>, denoiser::Audio<A>),
+        super::flight::Flight<cache::Workspace<R, K, T, A, V>>,
         Arc<cache::Retained<R>>,
     )> {
         self.owner

@@ -5,13 +5,15 @@ from __future__ import annotations
 import os
 import sys
 from collections.abc import Callable, Iterable, Mapping
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from copy import copy
 from functools import partial
 from pathlib import Path
-from typing import ClassVar, Protocol, TypeAlias, cast, final
+from typing import TYPE_CHECKING, ClassVar, Protocol, TypeAlias, cast, final
 from unittest.mock import patch
 
+import numpy as np
+import numpy.typing as npt
 import safetensors
 import safetensors.torch
 import torch
@@ -25,8 +27,27 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.registry import initialize_model
 
-# A component takes the arguments that the framework passes to the module it replaces.
-Component: TypeAlias = Callable[..., object]
+if TYPE_CHECKING:
+    import furiosa_opt_engine as engine
+
+Array: TypeAlias = npt.NDArray[np.float32] | npt.NDArray[np.uint16]
+
+
+class DeviceResult(Protocol):
+    """An owned native result whose explicit conversion completes its host contract."""
+
+    def to_host(self) -> Array | tuple[Array, Array]: ...
+
+
+class PreparedCall(Protocol):
+    def forward(self) -> DeviceResult: ...
+
+
+class Component(Protocol):
+    """Native checked preparation of the framework module's arguments and uploads."""
+
+    @property
+    def prepare(self) -> Callable[..., PreparedCall]: ...
 
 
 class Pretrained(Protocol):
@@ -55,7 +76,46 @@ class Adapter(nn.Module):
 
     @override
     def forward(self, *args: object, **kwargs: object) -> object:
-        return self.component(*args, **kwargs)
+        result = self.component.prepare(*args, **kwargs).forward()
+        return self._host(result)
+
+    def encode_ids(self, input_ids: object, **media: object) -> object:
+        return self.forward(input_ids, **media)
+
+    def decode_base(
+        self, z: object, frame_num: int | None = None, process_image: bool = False
+    ) -> object:
+        return self.forward(z, frame_num=frame_num, process_image=process_image)
+
+    def decode(self, z: object) -> object:
+        return self.forward(z)
+
+    def cached_forward(
+        self, decide: Callable[[tuple[float, float] | None], bool], /, **kwargs: object
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        component = cast("engine.minimax_h3.Transformer", self.component)
+        result = component.prepare(**kwargs).forward_cached(decide)
+        try:
+            return cast(tuple[torch.Tensor, torch.Tensor], self._host(result))
+        except BaseException:
+            # The framework conversion follows native cache publication. Clear those rows if
+            # conversion fails, preserving the original exception.
+            with suppress(Exception):
+                component.reset_cache()
+            raise
+
+    def reset_cache(self) -> None:
+        cast("engine.minimax_h3.Transformer", self.component).reset_cache()
+
+    def _host(self, result: DeviceResult) -> object:
+        def tensor(value: Array) -> torch.Tensor:
+            output = torch.from_numpy(value)
+            return output.view(torch.bfloat16) if value.dtype == np.uint16 else output
+
+        host = result.to_host()
+        if isinstance(host, tuple):
+            return tensor(host[0]), tensor(host[1])
+        return tensor(host)
 
     # The engine answers architecture calls; the skeleton keeps host state such as a processor.
     @override

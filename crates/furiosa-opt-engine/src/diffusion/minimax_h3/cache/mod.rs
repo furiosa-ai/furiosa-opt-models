@@ -69,7 +69,10 @@ pub(super) fn prime<
 ) -> io::Result<()> {
     Loadable::<(
         &mut Device,
-        &kernel::Modulation<'_, '_>,
+        (
+            &kernel::Modulation<'_, '_>,
+            std::marker::PhantomData<[(); 4]>,
+        ),
         (),
         &mut kernel::Modulations,
         &stage::EmbeddedTime,
@@ -77,7 +80,7 @@ pub(super) fn prime<
     .map_err(io::Error::other)?;
     Loadable::<(
         &mut Device,
-        &kernel::Norm<'_, '_>,
+        (&kernel::Norm<'_, '_>, std::marker::PhantomData<[(); 4]>),
         &request::Inputs<R, K, T, A, V>,
         &mut Hidden<R>,
         (&Hidden<R>, &kernel::NormTables),
@@ -85,7 +88,7 @@ pub(super) fn prime<
     .map_err(io::Error::other)?;
     Loadable::<(
         &mut Device,
-        &kernel::L1,
+        (&kernel::L1, std::marker::PhantomData<[(); 4]>),
         &request::Inputs<R, K, T, A, V>,
         &mut (),
         (&Hidden<R>, &Hidden<R>),
@@ -93,7 +96,7 @@ pub(super) fn prime<
     .map_err(io::Error::other)?;
     Loadable::<(
         &mut Device,
-        &rows::Add,
+        (&rows::Add, std::marker::PhantomData<[(); 4]>),
         &request::Inputs<R, K, T, A, V>,
         &mut (),
         (&Hidden<R>, &Hidden<R>),
@@ -101,7 +104,7 @@ pub(super) fn prime<
     .map_err(io::Error::other)?;
     Loadable::<(
         &mut Device,
-        &rows::Subtract,
+        (&rows::Subtract, std::marker::PhantomData<[(); 4]>),
         &request::Inputs<R, K, T, A, V>,
         &mut (),
         (&Hidden<R>, &Hidden<R>),
@@ -109,7 +112,7 @@ pub(super) fn prime<
     .map_err(io::Error::other)?;
     Loadable::<(
         &mut Device,
-        &rows::Copy,
+        (&rows::Copy, std::marker::PhantomData<[(); 4]>),
         &request::Inputs<R, K, T, A, V>,
         &mut Hidden<R>,
         &Hidden<R>,
@@ -147,7 +150,7 @@ impl<
 /// Preserve the embedding separately while two slots carry the block chain. Reusing that
 /// embedding would destroy the original residual's right operand. Probe rows have their own
 /// slot; the previous probe and residual remain in `cache` until their readers finish.
-struct Workspace<R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName> {
+pub(super) struct Workspace<R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName> {
     state: Arc<denoiser::State<R, K, T, A, V>>,
     cache: Arc<Retained<R>>,
     times: denoiser::Times,

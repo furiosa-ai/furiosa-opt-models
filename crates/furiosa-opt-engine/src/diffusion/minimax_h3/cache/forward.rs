@@ -22,7 +22,7 @@ impl<
 {
     /// Invoke the host decision exactly once after the probe's readers finish. A first call
     /// always computes. The caller removes `previous` from its memo before this call: only a
-    /// successful return publishes retained rows again, after every accepted reader has ended.
+    /// successful host conversion publishes retained rows again, after all readers have ended.
     pub(in crate::diffusion::minimax_h3) async fn forward_cached<
         F: FnMut(Option<Statistics>) -> io::Result<bool> + Send,
     >(
@@ -33,7 +33,7 @@ impl<
         video: Video<V>,
         audio: Audio<A>,
         mut decide: F,
-    ) -> io::Result<((Video<V>, Audio<A>), Arc<Retained<R>>)> {
+    ) -> io::Result<(Flight<Workspace<R, K, T, A, V>>, Arc<Retained<R>>)> {
         times.ready().await.map_err(io::Error::other)?;
         video.ready().await.map_err(io::Error::other)?;
         audio.ready().await.map_err(io::Error::other)?;
@@ -65,7 +65,7 @@ impl<
             .with_first_block(|launches, first| {
                 let work = flight.held_mut();
                 let time: stage::EmbeddedTime = alias(work.time.buffer(), ..)?;
-                let accepted = launches.forward_into_tracked(
+                let accepted = launches.on::<4>().forward_into_tracked(
                     kernel::Modulation {
                         model: &first.0.modulation.0,
                     },
@@ -80,7 +80,7 @@ impl<
                 let work = flight.held_mut();
                 let embedded: Hidden<R> = alias(&work.embedded, ..)?;
                 let mut probe: Hidden<R> = alias(&work.probe, ..)?;
-                let accepted = launches.forward_into_tracked(
+                let accepted = launches.on::<4>().forward_into_tracked(
                     kernel::Norm {
                         model: &first.0.norm.0,
                     },
@@ -102,14 +102,17 @@ impl<
                 let work = flight.held_mut();
                 let probe: Hidden<R> = alias(&work.probe, ..)?;
                 let previous: Hidden<R> = alias(&work.cache.probe, ..)?;
-                let accepted =
-                    Arc::new(Function::new(kernel::L1, kernel::l1).forward_into_tracked(
-                        device,
-                        &work.state.request.inputs,
-                        &mut (),
-                        (&probe, &previous),
-                        &mut work.totals,
-                    )?);
+                let accepted = Arc::new(
+                    Function::new(kernel::L1, kernel::l1)
+                        .on::<4>()
+                        .forward_into_tracked(
+                            device,
+                            &work.state.request.inputs,
+                            &mut (),
+                            (&probe, &previous),
+                            &mut work.totals,
+                        )?,
+                );
                 flight.submitted(Arc::clone(&accepted));
                 Ok(accepted)
             })?;
@@ -171,13 +174,15 @@ impl<
                 let embedded: Hidden<R> = alias(&work.embedded, ..)?;
                 let mut residual: Hidden<R> = alias(&work.cache.residual, ..)?;
                 let accepted = Arc::new(
-                    Function::new(rows::Subtract, rows::subtract).forward_into_tracked(
-                        device,
-                        &work.state.request.inputs,
-                        &mut (),
-                        (&result, &embedded),
-                        &mut residual,
-                    )?,
+                    Function::new(rows::Subtract, rows::subtract)
+                        .on::<4>()
+                        .forward_into_tracked(
+                            device,
+                            &work.state.request.inputs,
+                            &mut (),
+                            (&result, &embedded),
+                            &mut residual,
+                        )?,
                 );
                 flight.submitted(accepted);
                 Ok(())
@@ -190,13 +195,17 @@ impl<
                 let embedded: Hidden<R> = alias(&work.embedded, ..)?;
                 let residual: Hidden<R> = alias(&work.cache.residual, ..)?;
                 let mut output: Hidden<R> = alias(&work.hidden[0], ..)?;
-                let accepted = Arc::new(Function::new(rows::Add, rows::add).forward_into_tracked(
-                    device,
-                    &work.state.request.inputs,
-                    &mut (),
-                    (&embedded, &residual),
-                    &mut output,
-                )?);
+                let accepted = Arc::new(
+                    Function::new(rows::Add, rows::add)
+                        .on::<4>()
+                        .forward_into_tracked(
+                            device,
+                            &work.state.request.inputs,
+                            &mut (),
+                            (&embedded, &residual),
+                            &mut output,
+                        )?,
+                );
                 flight.submitted(accepted);
                 Ok(())
             })?;
@@ -207,13 +216,17 @@ impl<
             let work = flight.held_mut();
             let probe: Hidden<R> = alias(&work.probe, ..)?;
             let mut retained: Hidden<R> = alias(&work.cache.probe, ..)?;
-            let accepted = Arc::new(Function::new(rows::Copy, rows::copy).forward_into_tracked(
-                device,
-                &work.state.request.inputs,
-                &mut retained,
-                &probe,
-                &mut (),
-            )?);
+            let accepted = Arc::new(
+                Function::new(rows::Copy, rows::copy)
+                    .on::<4>()
+                    .forward_into_tracked(
+                        device,
+                        &work.state.request.inputs,
+                        &mut retained,
+                        &probe,
+                        &mut (),
+                    )?,
+            );
             flight.submitted(accepted);
             Ok(())
         })?;
@@ -226,15 +239,6 @@ impl<
             audio: &mut work.velocities.1,
         })
         .await?;
-        let [video, audio]: [HbmBuffer; 2] = flight.finish().await?.try_into().map_err(|_| {
-            io::Error::other("H3 cached heads returned an invalid media output count")
-        })?;
-        Ok((
-            (
-                Video::try_from(video).map_err(io::Error::other)?,
-                Audio::try_from(audio).map_err(io::Error::other)?,
-            ),
-            cache,
-        ))
+        Ok((flight, cache))
     }
 }

@@ -44,7 +44,7 @@ class _CachedTransformer(Protocol):
 def _component(module: nn.Module) -> _CachedTransformer:
     if not isinstance(module, Adapter):
         raise TypeError("engine TeaCache requires an Adapter")
-    return cast(_CachedTransformer, module.component)
+    return cast(_CachedTransformer, module)
 
 
 @final

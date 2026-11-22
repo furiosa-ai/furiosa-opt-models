@@ -126,7 +126,7 @@ impl<
         device.with_device(|device| {
             Loadable::<(
                 &mut Device,
-                &kernel::Embed<'_, '_>,
+                (&kernel::Embed<'_, '_>, std::marker::PhantomData<[(); 4]>),
                 &request::Inputs<R, K, T, A, V>,
                 &mut (),
                 (&Times, (&Video<V>, &Audio<A>), &Hidden<T>),
@@ -134,7 +134,7 @@ impl<
             .map_err(io::Error::other)?;
             Loadable::<(
                 &mut Device,
-                &kernel::Block<'_, '_>,
+                (&kernel::Block<'_, '_>, std::marker::PhantomData<[(); 4]>),
                 &request::Inputs<R, K, T, A, V>,
                 &mut (),
                 (Hidden<R>, &kernel::EmbeddedTime),
@@ -142,7 +142,7 @@ impl<
             .map_err(io::Error::other)?;
             Loadable::<(
                 &mut Device,
-                &kernel::Heads<'_, '_>,
+                (&kernel::Heads<'_, '_>, std::marker::PhantomData<[(); 4]>),
                 &request::Inputs<R, K, T, A, V>,
                 &mut (),
                 (&Hidden<R>, &kernel::EmbeddedTime),
@@ -178,7 +178,7 @@ impl<
         times: Times,
         video: Video<V>,
         audio: Audio<A>,
-    ) -> io::Result<(Video<V>, Audio<A>)> {
+    ) -> io::Result<Flight<Workspace<R, K, T, A, V>>> {
         times.ready().await.map_err(io::Error::other)?;
         video.ready().await.map_err(io::Error::other)?;
         audio.ready().await.map_err(io::Error::other)?;
@@ -220,15 +220,7 @@ impl<
             audio: &mut work.velocities.1,
         })
         .await?;
-        let [video, audio]: [HbmBuffer; 2] = flight
-            .finish()
-            .await?
-            .try_into()
-            .map_err(|_| io::Error::other("H3 heads returned an invalid media output count"))?;
-        Ok((
-            Video::try_from(video).map_err(io::Error::other)?,
-            Audio::try_from(audio).map_err(io::Error::other)?,
-        ))
+        Ok(flight)
     }
 
     /// Borrow the bound device for TeaCache's stateless submissions and sizing.
@@ -254,7 +246,7 @@ impl<
             } = slots(flight.held_mut());
             let mut output: (Hidden<R>, kernel::EmbeddedTime) =
                 (alias(hidden, ..)?, alias(time.buffer(), ..)?);
-            let accepted = launches.forward_into_tracked(
+            let accepted = launches.on::<4>().forward_into_tracked(
                 kernel::Embed { model },
                 kernel::embed,
                 &state.request.inputs,
@@ -285,7 +277,7 @@ impl<
                 let input: Hidden<R> = alias(input, ..)?;
                 let time: kernel::EmbeddedTime = alias(time.buffer(), ..)?;
                 let mut output: Hidden<R> = alias(output, ..)?;
-                let accepted = launches.forward_into_tracked(
+                let accepted = launches.on::<4>().forward_into_tracked(
                     kernel::Block { model },
                     kernel::block,
                     &state.request.inputs,
@@ -318,7 +310,7 @@ impl<
             let input: Hidden<R> = alias(input, ..)?;
             let time: kernel::EmbeddedTime = alias(time.buffer(), ..)?;
             let mut output: (Video<V>, Audio<A>) = (alias(video, ..)?, alias(audio, ..)?);
-            let accepted = launches.forward_into_tracked(
+            let accepted = launches.on::<4>().forward_into_tracked(
                 kernel::Heads { model },
                 kernel::heads,
                 &state.request.inputs,
@@ -357,7 +349,7 @@ impl<
 
 /// Own all step buffers and request state while individual launches borrow typed aliases.
 /// The flight retains this workspace until every accepted reader has finished.
-struct Workspace<R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName> {
+pub(super) struct Workspace<R: AxisName, K: AxisName, T: AxisName, A: AxisName, V: AxisName> {
     state: Arc<State<R, K, T, A, V>>,
     times: Times,
     video: Video<V>,
