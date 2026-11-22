@@ -243,7 +243,7 @@ One worker drives every chip while vLLM awaits each tensor-parallel rank, so a c
 Only the attention cache moves, so startup refuses a connector for a model with recurrent state or encoder memory and on an encoder-only instance.
 Mooncake and MoRIIO register the cache's device memory, which the engine does not map for them, and LMCache copies the cache's torch tensors itself, so startup refuses them.
 
-vLLM's `MultiConnector` runs a NIXL connector and offloading together; the offloading entry names the plugin's connector and its module, since `--kv-offloading-size` replaces any other connector:
+vLLM's `MultiConnector` runs a NIXL connector and local offloading together. With a direct NIXL config, `--kv-offloading-size` preserves NIXL and adds the plugin's `RNGDOffloadingConnector`; it does not replace NIXL. Use an explicit `MultiConnector` when you want to choose connector order yourself:
 
 ```bash
 VLLM_NIXL_SIDE_CHANNEL_PORT=5601 vllm serve Qwen/Qwen3-0.6B --port 8200 --kv-transfer-config '{
@@ -253,8 +253,9 @@ VLLM_NIXL_SIDE_CHANNEL_PORT=5601 vllm serve Qwen/Qwen3-0.6B --port 8200 --kv-tra
      "kv_role": "kv_both", "kv_connector_extra_config": {"cpu_bytes_to_use": 17179869184}}]}}'
 ```
 
-vLLM loads a request's blocks from the first of its connectors that has them and stores them through each; each connector takes the settings it takes alone. Storing through both writes the KV to NIXL's host buffer and the engine's L3 slot separately, adding device-to-host traffic and host-memory bandwidth use; the adapters do not share a buffer.
-The NIXL entry may be `NixlPushConnector`, and the entries may come in either order.
+vLLM looks up a request's blocks in connector order and uses the first connector with a hit. It sends store hooks to each connector, which applies its own scheduling and eviction policy. Keep NIXL first for remote-first lookup, or put offloading first for local-first lookup.
+The NIXL entry may be `NixlPushConnector`.
+NIXL's registered CPU buffer and vLLM's offloading host region or filesystem tier have separate ownership and lifetimes. A request stored by both paths can therefore copy the same KV blocks twice, using extra host bandwidth and capacity; a hit in one tier does not reuse the other's copy.
 NIXL alone supports data-parallel replicas and sleep mode. When offloading is combined with NIXL, offloading still requires data-parallel degree 1 and does not support sleep mode.
 With NIXL data-parallel replicas, route a request's reloads to the replica that decoded it (`X-data-parallel-rank`).
 
