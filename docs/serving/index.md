@@ -216,7 +216,9 @@ Without the copy, waking reads the checkpoint's files as they are then.
 
 ## Quantize a BF16 checkpoint at load
 
-For BF16 Qwen3-0.6B, 1.7B and 4B, Furiosa's best compatible online FP8 mappings preserve each framework's weight-scale layout. Activations stay in BF16; where SGLang uses FP8 matrix units, its `fp8` path dynamically quantizes activations per token, so outputs can differ.
+For BF16 Qwen3-0.6B, 1.7B and 4B, the closest shared-engine online FP8 mappings preserve each framework's weight-scale layout. Each adapter resolves its framework option and selects that scale layout; the engine owns weight conversion and kernel selection.
+
+This online path quantizes weights only; products still use BF16 activations. SGLang's native `fp8` path also dynamically quantizes activations per token, so this is a weight-only subset and outputs can differ. Full SGLang parity needs engine support for this per-channel-weight and per-token-activation combination.
 
 === "vLLM"
 
