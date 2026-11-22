@@ -140,7 +140,7 @@ class AlignedFileIO:
             raise ValueError("file transfers must contain bytes")
         capacity = getattr(self.local, "capacity", 0)
         if capacity < size:
-            aligned = ((size + self.alignment - 1) // self.alignment) * self.alignment
+            aligned = self.aligned_size(size)
             previous = getattr(self.local, "buffer", None)
             if previous is not None:
                 previous.close()

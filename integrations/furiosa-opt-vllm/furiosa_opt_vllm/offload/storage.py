@@ -86,18 +86,18 @@ class _LoadProgress:
         self.job_id = job_id
         self.failed = [False] * files
         self.remaining = [pages] * files
+        self.prefix = 0
         self.lock = Lock()
 
     def page_done(self, progress: dict[int, int], file_index: int, succeeded: bool) -> None:
         with self.lock:
             self.failed[file_index] |= not succeeded
             self.remaining[file_index] -= 1
-            prefix = 0
-            for remaining, failed in zip(self.remaining, self.failed, strict=True):
-                if remaining or failed:
+            while self.prefix < len(self.remaining):
+                if self.remaining[self.prefix] or self.failed[self.prefix]:
                     break
-                prefix += 1
-            progress[self.job_id] = prefix
+                self.prefix += 1
+            progress[self.job_id] = self.prefix
 
 
 class FuriosaFileSystemTierManager(FileSystemTierManager):
