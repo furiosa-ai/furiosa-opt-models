@@ -45,6 +45,8 @@ impl<const N: usize> Exchange<Parallel<N>> {
         input: &Live<&Split<D, N, C, W>, C>,
         output: &mut Rows<D, N, C, W>,
     ) {
+        // Keep `if const`: the pinned compiler prunes the recursive arm at `Last` before
+        // instantiating `Next`. A plain `if` keeps growing the type and hits the recursion limit.
         if const { Current::SIZE < Last::SIZE } {
             if input.rows() == Current::SIZE {
                 self.write_extent::<D, Current, C, W>(device, input.value(), output);

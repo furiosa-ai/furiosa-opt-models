@@ -76,8 +76,8 @@ class Adapter(nn.Module):
 
     @override
     def forward(self, *args: object, **kwargs: object) -> object:
-        result = self.component.prepare(*args, **kwargs).forward()
-        return self._host(result)
+        host = self.component.prepare(*args, **kwargs).forward().to_host()
+        return self._host(host)
 
     def encode_ids(self, input_ids: object, **media: object) -> object:
         return self.forward(input_ids, **media)
@@ -94,9 +94,9 @@ class Adapter(nn.Module):
         self, decide: Callable[[tuple[float, float] | None], bool], /, **kwargs: object
     ) -> tuple[torch.Tensor, torch.Tensor]:
         component = cast("engine.minimax_h3.Transformer", self.component)
-        result = component.prepare(**kwargs).forward_cached(decide)
+        host = component.prepare(**kwargs).forward_cached(decide).to_host()
         try:
-            return cast(tuple[torch.Tensor, torch.Tensor], self._host(result))
+            return cast(tuple[torch.Tensor, torch.Tensor], self._host(host))
         except BaseException:
             # The framework conversion follows native cache publication. Clear those rows if
             # conversion fails, preserving the original exception.
@@ -107,12 +107,11 @@ class Adapter(nn.Module):
     def reset_cache(self) -> None:
         cast("engine.minimax_h3.Transformer", self.component).reset_cache()
 
-    def _host(self, result: DeviceResult) -> object:
+    def _host(self, host: Array | tuple[Array, Array]) -> object:
         def tensor(value: Array) -> torch.Tensor:
             output = torch.from_numpy(value)
             return output.view(torch.bfloat16) if value.dtype == np.uint16 else output
 
-        host = result.to_host()
         if isinstance(host, tuple):
             return tensor(host[0]), tensor(host[1])
         return tensor(host)

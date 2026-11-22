@@ -467,14 +467,17 @@ mod tests {
     use furiosa_opt_engine::registry::{ARCHITECTURES, Implementation};
     use pyo3::types::PyDict;
 
-    /// Every implementation the registry lists loads as a class: a decoder as the class its
-    /// family's submodule lists under its name, a media encoder as `Encoder`.
+    /// Every implementation loads as a class: its family's decoder or pipeline, or `Encoder`.
     #[test]
     fn binds_a_class_to_every_listed_implementation() {
         let unbound: Vec<_> = (ARCHITECTURES.iter())
             .flat_map(|&(_, implementations)| implementations)
             .map(Implementation::class)
-            .filter(|class| class.name != "Encoder" && Decoder::class(*class).is_none())
+            .filter(|class| {
+                class.name != "Encoder"
+                    && Decoder::class(*class).is_none()
+                    && !PIPELINES.iter().any(|(bound, _)| bound == class)
+            })
             .collect();
         assert!(unbound.is_empty(), "{unbound:?}");
     }

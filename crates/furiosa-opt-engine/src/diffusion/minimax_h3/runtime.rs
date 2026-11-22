@@ -468,6 +468,8 @@ impl PreparedText {
     }
 }
 
+/// Separate device rows retaining final readers, streamed-layer cleanup and call admission.
+/// Conversion or drop retires those owners before another component can reuse the pipeline.
 pub struct Encoded {
     rows: text::Output,
     call: Call,
