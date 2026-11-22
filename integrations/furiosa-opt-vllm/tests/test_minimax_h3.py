@@ -392,9 +392,13 @@ def test_callback_refuses_same_pipeline_reentry(h3_pipeline: Loaded, h3_forward:
         nonlocal invoked
         del means
         invoked = True
-        for _, call in calls:
-            with pytest.raises(RuntimeError, match="cannot reenter"):
-                _ = call()
+        for name, call in calls:
+            try:
+                with pytest.raises(RuntimeError, match="cannot reenter"):
+                    _ = call()
+            except BaseException as error:
+                error.add_note(f"H3 callback reentry case: {name}")
+                raise
         return True
 
     native.reset_cache()
