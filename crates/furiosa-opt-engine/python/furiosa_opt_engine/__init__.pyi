@@ -65,9 +65,11 @@ class Checkpoint:
 @typing.final
 class Copier:
     r"""
-    Python handle for asynchronous device-cache copies. `copy_in` and `copy_out` return a `Copy`
-    handle without waiting for its DMA. Reusing a host slot or device page may first wait for
-    conflicting earlier copies.
+    Thread-safe Python handle for asynchronous device-cache copies.
+
+    `copy_in` and `copy_out` return a `Copy` handle without waiting for its DMA. Reusing a host slot
+    or device page may first wait for conflicting earlier copies. Python serializes queue mutation
+    under the GIL; completions can move to framework worker threads.
     """
     def __new__(
         cls,
