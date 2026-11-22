@@ -2203,11 +2203,16 @@ mod tests {
     /// `gain` times `query_value`, over `keys` keys, with a stable F32 softmax.
     fn reference(gain: f32, (j, head, group): (usize, usize, usize), keys: usize) -> f32 {
         let score = |k| gain * query_value(j, head, group) * kv(k, head) * 128.0 / 128.0f32.sqrt();
-        let max = (0..keys).fold(f32::NEG_INFINITY, |max, k| max.max(score(k)));
-        let (sum, weighted) = (0..keys).fold((0.0f32, 0.0f32), |(sum, weighted), k| {
-            let weight = (score(k) - max).exp();
-            (sum + weight, weighted + weight * value(k, head))
-        });
+        let scores: Vec<_> = (0..keys).map(score).collect();
+        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let (sum, weighted) =
+            scores
+                .iter()
+                .enumerate()
+                .fold((0.0f32, 0.0f32), |(sum, weighted), (k, score)| {
+                    let weight = (*score - max).exp();
+                    (sum + weight, weighted + weight * value(k, head))
+                });
         weighted / sum
     }
 
