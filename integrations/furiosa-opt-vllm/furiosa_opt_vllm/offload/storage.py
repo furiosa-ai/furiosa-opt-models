@@ -84,22 +84,17 @@ class _LoadProgress:
 
     def __init__(self, job_id: int, files: int, pages: int) -> None:
         self.job_id = job_id
-        self.loaded = [[False] * pages for _ in range(files)]
+        self.failed = [False] * files
         self.remaining = [pages] * files
-        self.complete = [False] * files
         self.lock = Lock()
 
-    def page_done(
-        self, progress: dict[int, int], file_index: int, page_index: int, succeeded: bool
-    ) -> None:
+    def page_done(self, progress: dict[int, int], file_index: int, succeeded: bool) -> None:
         with self.lock:
-            self.loaded[file_index][page_index] = succeeded
+            self.failed[file_index] |= not succeeded
             self.remaining[file_index] -= 1
-            if self.remaining[file_index] == 0:
-                self.complete[file_index] = all(self.loaded[file_index])
             prefix = 0
-            for complete in self.complete:
-                if not complete:
+            for remaining, failed in zip(self.remaining, self.failed, strict=True):
+                if remaining or failed:
                     break
                 prefix += 1
             progress[self.job_id] = prefix
@@ -220,4 +215,4 @@ class FuriosaFileSystemTierManager(FileSystemTierManager):
                     logger.debug("Could not remove short cache file %s", path)
             raise
         finally:
-            progress.page_done(self._load_progress, file_index, page_index, succeeded)
+            progress.page_done(self._load_progress, file_index, succeeded)
