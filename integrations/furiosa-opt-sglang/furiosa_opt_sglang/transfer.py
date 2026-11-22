@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from threading import Condition, Lock, Thread, current_thread
+from queue import Queue
+from threading import Event, Lock, Thread
 from typing import Any
 
 from sglang.srt.mem_cache.l2_transfer import (
@@ -66,53 +67,59 @@ class _CompletionEvent:
 class _TransferLane:
     """Keep one SGLang stream's submissions and completion events in call order."""
 
-    def __init__(self) -> None:
-        self._condition = Condition()
-        self._next_sequence = 0
-        self._submitting = 0
-        self._completing = 0
+    def __init__(self, name: str) -> None:
+        self._submissions: Queue[Any] = Queue()
+        self._completions: Queue[Any] = Queue()
+        self._shutdown_lock = Lock()
+        self._shutdown = False
+        self._submit_thread = Thread(
+            target=self._submit_loop,
+            name=f"furiosa-sglang-{name}-submit",
+            daemon=True,
+        )
+        self._completion_thread = Thread(
+            target=self._completion_loop,
+            name=f"furiosa-sglang-{name}-complete",
+            daemon=True,
+        )
+        self._submit_thread.start()
+        self._completion_thread.start()
 
-    def reserve(self) -> int:
-        with self._condition:
-            sequence = self._next_sequence
-            self._next_sequence += 1
-            return sequence
+    def submit(self, operation: _TransferOperation) -> None:
+        self._submissions.put(operation)
 
-    def cancel(self, sequence: int) -> None:
-        with self._condition:
-            if self._next_sequence != sequence + 1 or self._submitting > sequence:
-                raise RuntimeError("cannot cancel an active SGLang transfer sequence")
-            self._next_sequence -= 1
+    def shutdown(self) -> None:
+        with self._shutdown_lock:
+            if self._shutdown:
+                return
+            self._shutdown = True
+            self._submissions.put(None)
+            self._submit_thread.join()
+            self._completions.put(None)
+            self._completion_thread.join()
 
-    def wait_to_submit(self, sequence: int) -> None:
-        with self._condition:
-            self._condition.wait_for(lambda: self._submitting == sequence)
+    def _submit_loop(self) -> None:
+        while (operation := self._submissions.get()) is not None:
+            try:
+                operation.submit()
+            except BaseException as error:
+                operation.fail(error)
+            self._completions.put(operation)
 
-    def submitted(self, sequence: int) -> None:
-        with self._condition:
-            if self._submitting != sequence:
-                raise RuntimeError("SGLang transfer submissions completed out of order")
-            self._submitting += 1
-            self._condition.notify_all()
-
-    def wait_to_complete(self, sequence: int) -> None:
-        with self._condition:
-            self._condition.wait_for(lambda: self._completing == sequence)
-
-    def completed(self, sequence: int) -> None:
-        with self._condition:
-            if self._completing != sequence:
-                raise RuntimeError("SGLang transfer completions finished out of order")
-            self._completing += 1
-            self._condition.notify_all()
+    def _completion_loop(self) -> None:
+        while (operation := self._completions.get()) is not None:
+            try:
+                operation.complete()
+            except BaseException as error:
+                operation.fail(error)
+            finally:
+                operation.mark_completed()
 
 
 class _TransferOperation:
     def __init__(
         self,
         engine: L2TransferEngine,
-        lane: _TransferLane,
-        sequence: int,
         transfers: list[Any],
         stream: Any,
         ready_event: Any,
@@ -125,8 +132,6 @@ class _TransferOperation:
         on_finish: Callable[[_TransferOperation], None],
     ) -> None:
         self.engine = engine
-        self.lane = lane
-        self.sequence = sequence
         self.transfers = transfers
         self.stream = stream
         self.ready_event = ready_event
@@ -135,33 +140,39 @@ class _TransferOperation:
         self.loading = loading
         self.transfer_layer_id_max = transfer_layer_id_max
         self.on_layer_done = on_layer_done
-        self.result = _TransferResult()
         self._on_finish = on_finish
-        self._thread = Thread(
-            target=self._run,
-            name="furiosa-sglang-cache-copy",
-            daemon=True,
-        )
+        self.result = _TransferResult()
+        self._completed = Event()
+        self._domains = []
+        self._prepared = []
+        self._copies = []
+        self._failure = None
 
     def synchronize(self) -> None:
-        if self._thread is not current_thread():
-            self._thread.join()
+        self._completed.wait()
         self.result.raise_if_failed()
 
-    def _run(self) -> None:
-        self.lane.wait_to_submit(self.sequence)
-        domains = []
-        acquired_domains = []
+    def fail(self, error: BaseException) -> None:
+        self._failure = _combine_errors(self._failure, error)
+
+    def mark_completed(self) -> None:
+        if self._failure is not None:
+            self.result.fail(self._failure)
+        self._completed.set()
+        self._on_finish(self)
+
+    def submit(self) -> None:
         opened_batches = []
-        prepared = []
-        copies = []
-        failure = None
 
         try:
-            domains = shared_host_layout_domains(transfer.host_pool for transfer in self.transfers)
+            self._domains = shared_host_layout_domains(
+                transfer.host_pool for transfer in self.transfers
+            )
+            domains = self._domains
+            self._domains = []
             for domain in domains:
                 domain.acquire_layout()
-                acquired_domains.append(domain)
+                self._domains.append(domain)
             self.ready_event.synchronize()
 
             seen_hosts = set()
@@ -176,66 +187,61 @@ class _TransferOperation:
                     opened_batches.append(host)
 
             with device_module.stream(self.stream):
-                prepared = self.engine._prepare_transfers(self.transfers)
+                self._prepared = self.engine._prepare_transfers(self.transfers)
                 self.start_event.record()
                 if self.loading:
-                    self._load_layers(prepared)
+                    self._load_layers(self._prepared)
                 else:
-                    self._store_pages(prepared)
+                    self._store_pages(self._prepared)
         except BaseException as error:
-            failure = error
+            self.fail(error)
             try:
                 self.stream.synchronize()
             except BaseException as drain_error:
-                failure = _combine_errors(failure, drain_error)
+                self.fail(drain_error)
         finally:
             for host in opened_batches:
                 try:
-                    copies.extend(host.finish_async_copy_batch())
+                    self._copies.extend(host.finish_async_copy_batch())
                 except BaseException as error:
-                    failure = _combine_errors(failure, error)
-            self.lane.submitted(self.sequence)
-            copy_error = settle_transfers(copies)
-            if copy_error is not None:
-                failure = _combine_errors(failure, copy_error)
+                    self.fail(error)
 
-            self.lane.wait_to_complete(self.sequence)
+    def complete(self) -> None:
+        copy_error = settle_transfers(self._copies)
+        if copy_error is not None:
+            self.fail(copy_error)
+
+        if self._failure is None and self.loading and self.on_layer_done is not None:
             try:
-                if failure is None and self.loading and self.on_layer_done is not None:
-                    try:
-                        with device_module.stream(self.stream):
-                            for layer_id in range(self.transfer_layer_id_max):
-                                self.on_layer_done(layer_id)
-                    except BaseException as error:
-                        failure = error
-
-                try:
-                    with device_module.stream(self.stream):
-                        self.engine._record_stream(self.transfers + prepared, self.stream)
-                except BaseException as error:
-                    failure = _combine_errors(failure, error)
-
-                if failure is not None:
-                    # Copies are drained before the failure becomes visible to SGLang.
-                    self.result.fail(failure)
                 with device_module.stream(self.stream):
-                    self.finish_event.record()
+                    for layer_id in range(self.transfer_layer_id_max):
+                        self.on_layer_done(layer_id)
             except BaseException as error:
-                self.result.fail(_combine_errors(failure, error))
-            finally:
-                for domain in reversed(acquired_domains):
-                    try:
-                        domain.release_layout(
-                            self.finish_event,
-                            (
-                                id(self.engine),
-                                "host_to_device" if self.loading else "device_to_host",
-                            ),
-                        )
-                    except BaseException as error:
-                        self.result.fail(_combine_errors(failure, error))
-                self.lane.completed(self.sequence)
-                self._on_finish(self)
+                self.fail(error)
+
+        try:
+            with device_module.stream(self.stream):
+                self.engine._record_stream(self.transfers + self._prepared, self.stream)
+        except BaseException as error:
+            self.fail(error)
+
+        try:
+            with device_module.stream(self.stream):
+                self.finish_event.record()
+        except BaseException as error:
+            self.fail(error)
+        finally:
+            for domain in reversed(self._domains):
+                try:
+                    domain.release_layout(
+                        self.finish_event,
+                        (
+                            id(self.engine),
+                            "host_to_device" if self.loading else "device_to_host",
+                        ),
+                    )
+                except BaseException as error:
+                    self.fail(error)
 
     def _load_layers(self, transfers: list[Any]) -> None:
         primary = transfers[0] if transfers else None
@@ -281,8 +287,8 @@ class AsyncL2TransferEngine:
         self.host_to_device_stream = engine.host_to_device_stream
         self._lock = Lock()
         self._operations: set[_TransferOperation] = set()
-        self._device_to_host_lane = _TransferLane()
-        self._host_to_device_lane = _TransferLane()
+        self._device_to_host_lane = _TransferLane("device-to-host")
+        self._host_to_device_lane = _TransferLane("host-to-device")
         self._closed = False
 
     def submit_device_to_host(self, transfers: list[Any]) -> TransferCompletion:
@@ -333,13 +339,10 @@ class AsyncL2TransferEngine:
                 # Preserve SGLang's producer and load-fence ordering before Furiosa DMA.
                 start_event.wait(stream)
                 ready.record()
-            sequence = lane.reserve()
             operation = None
             try:
                 operation = _TransferOperation(
                     self._engine,
-                    lane,
-                    sequence,
                     transfers,
                     stream,
                     ready,
@@ -351,11 +354,10 @@ class AsyncL2TransferEngine:
                     on_finish=self._forget,
                 )
                 self._operations.add(operation)
-                operation._thread.start()
+                lane.submit(operation)
             except BaseException:
                 if operation is not None:
                     self._operations.discard(operation)
-                lane.cancel(sequence)
                 raise
         return TransferCompletion(
             _CompletionEvent(start, operation),
@@ -371,6 +373,8 @@ class AsyncL2TransferEngine:
         with self._lock:
             self._closed = True
             operations = tuple(self._operations)
+        self._device_to_host_lane.shutdown()
+        self._host_to_device_lane.shutdown()
         first_error = None
         for operation in operations:
             try:

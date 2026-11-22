@@ -200,9 +200,12 @@ The engine waits only for earlier DMA chunks touching the same host slot or devi
 a host slot keeps DMA out while Python uses its pinned bytes; transfers for other pages remain
 independent. SGLang submits these engine copies asynchronously; its completion events follow the
 finished copy. Each engine DMA batch includes every layer page for up to two host slots, avoiding
-separate runtime submissions per layer. The adapter therefore reports SGLang's per-layer
-readiness only after its full Copy request finishes. Splitting copies per layer could overlap
-earlier layers with later transfers, at the cost of more runtime submissions.
+separate runtime submissions per layer and preserving the engine's page-batched transfer schedule.
+SGLang normally exposes each restored layer as soon as it is ready; this adapter reports all
+layer-ready callbacks only after the full Copy request finishes. This gives up layer-by-layer
+DMA/compute overlap during restore, which can delay the first layer's compute while later layers
+transfer. Splitting copies by layer could restore that overlap, but would add runtime submissions
+and change the selected all-layer DMA schedule.
 
 Only the attention cache moves, so both servers refuse offloading at startup for a model with recurrent state, and vLLM also for one with encoder memory; the [vLLM](vllm.md#options) and [SGLang](sglang.md#options) option pages name the other refused settings.
 A failed copy poisons the memory it touched, and neither server recovers once it observes the failure, so vLLM's `kv_load_failure_policy` takes only `fail`.
