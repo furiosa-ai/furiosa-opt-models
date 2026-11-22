@@ -401,13 +401,12 @@ impl Chunk {
             };
         }
         let mut chunks = Vec::<Vec<TransferPage>>::new();
+        let mut seen_slots = HashSet::new();
         for (slot, routes) in pages {
             let page = TransferPage { slot, routes };
+            let first_occurrence = seen_slots.insert(slot);
             match chunks.last_mut() {
-                Some(last)
-                    if last.len() < COPY_CHUNK_BLOCKS
-                        && last.iter().all(|page| page.slot != slot) =>
-                {
+                Some(last) if first_occurrence && last.len() < COPY_CHUNK_BLOCKS => {
                     last.push(page);
                 }
                 _ => chunks.push(vec![page]),

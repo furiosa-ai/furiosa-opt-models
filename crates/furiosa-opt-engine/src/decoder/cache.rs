@@ -413,12 +413,14 @@ mod tests {
     fn refuses_unallocatable_caches() {
         let mut orphan = paged(64, 0..1);
         orphan.groups[0].pool = 1;
+        let mut empty_pool = paged(64, 0..1);
+        empty_pool.pools[0].bytes = 0;
         let mut tokenless = paged(64, 0..1);
         tokenless.pools[0].block = 0;
         let cases = [
             (paged(64, 0..1), 0, "cache blocks must be positive"),
             (orphan, 1, "cache group names no pool"),
-            (paged(0, 0..1), 1, "cache pool has empty blocks"),
+            (empty_pool, 1, "cache pool has empty blocks"),
             (tokenless, 1, "cache pool has empty blocks"),
             (
                 paged(64, 0..1),
