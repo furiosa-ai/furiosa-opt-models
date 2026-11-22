@@ -126,10 +126,6 @@ impl<R: AxisName, S: AxisName, const N: usize> PackPlan<R, S, N> {
     pub fn key_count(&self) -> usize {
         self.keys
     }
-    pub fn run_count(&self) -> usize {
-        self.count
-    }
-
     /// Host inspection of the exact source/destination runs in their transfer order.
     pub fn runs(&self) -> impl Iterator<Item = (Range<usize>, Range<usize>)> + '_ {
         self.runs.iter().take(self.count).map(|run| {
@@ -138,17 +134,6 @@ impl<R: AxisName, S: AxisName, const N: usize> PackPlan<R, S, N> {
                 run.destination..run.destination + run.rows,
             )
         })
-    }
-
-    /// Number of valid-row TDMA operations per plane, excluding zero-span stores.
-    pub fn copy_count(&self) -> usize {
-        self.runs
-            .iter()
-            .take(self.count)
-            .map(|run| {
-                run.rows / flash::Span::SIZE + (run.rows % flash::Span::SIZE).count_ones() as usize
-            })
-            .sum()
     }
 
     /// `[source_start, source_rows, run_count, key_count]` and `[source_start, valid_rows]` per slot.

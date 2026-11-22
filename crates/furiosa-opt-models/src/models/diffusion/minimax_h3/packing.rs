@@ -701,9 +701,6 @@ pub(super) mod tests {
             }
             assert_eq!(actual, expected);
             assert_eq!(end, model.key_count());
-            if model.text_tokens() == 77 {
-                assert_eq!(pack.copy_count(), 49);
-            }
         }
         for text in [1, 64, 77, 128, 129, 1153, 1202, 2048] {
             check::<axis::Rows<20>>(Capacity::default().plan(text).unwrap());

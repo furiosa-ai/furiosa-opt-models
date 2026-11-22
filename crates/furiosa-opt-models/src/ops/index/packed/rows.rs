@@ -114,11 +114,6 @@ impl<R: AxisName, T: AxisName, A: AxisName, V: AxisName> RowPlan<R, T, A, V> {
         Live::all().subrange(0, self.work)
     }
 
-    /// Allocation rows that Join neither reads nor writes.
-    pub fn allocation_tail(&self) -> Range<usize> {
-        self.work..R::SIZE
-    }
-
     /// The four gaps surrounding the three copies, including empty gaps.
     pub fn gaps(&self) -> [Live<(), R>; 4] {
         let text_end = self.destination[0] + self.rows[0];
@@ -306,28 +301,6 @@ impl<R: AxisName, T: AxisName, A: AxisName, V: AxisName, W: AxisName, C: M>
         let mut output = HbmTensor::new();
         self.forward(device, (media, text, &mut output, plan));
         plan.work().with(output)
-    }
-}
-
-/// PackedEmbedding passes its text operand through unchanged. Carry its request plan alongside
-/// the text, so the existing composition can use runtime packing without another weight owner.
-impl<R: AxisName, T: AxisName, A: AxisName, V: AxisName, W: AxisName, C: M>
-    Op<(
-        &(Rows<V, W, C>, Rows<A, W, C>),
-        (&Rows<T, W, C>, &RowPlan<R, T, A, V>),
-    )> for Join
-{
-    type Output = Live<Rows<R, W, C>, R>;
-
-    fn forward(
-        &self,
-        device: &mut Device,
-        (media, (text, plan)): (
-            &(Rows<V, W, C>, Rows<A, W, C>),
-            (&Rows<T, W, C>, &RowPlan<R, T, A, V>),
-        ),
-    ) -> Self::Output {
-        self.forward(device, (media, text, plan))
     }
 }
 

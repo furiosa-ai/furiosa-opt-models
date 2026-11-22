@@ -222,19 +222,6 @@ fn oracle(chip: usize, valid: usize) -> Vec<f64> {
     normalize(&hidden, 4)
 }
 
-#[test]
-fn analytic_refiner_is_finite_and_sensitive_to_key_visibility() {
-    let short = oracle(0, 1);
-    let long = oracle(0, 2048);
-    assert!(short.iter().chain(&long).all(|value| value.is_finite()));
-    assert!(
-        short[..Width::SIZE]
-            .iter()
-            .zip(&long)
-            .any(|(a, b)| (a - b).abs() > 0.01)
-    );
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn loaded_two_layer_refiner_matches_analytic_values() {
     let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();

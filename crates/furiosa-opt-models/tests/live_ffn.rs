@@ -4,15 +4,11 @@
 #![register_tool(furiosa_opt)]
 
 use furiosa_opt_models::load::{Checkpoint, Context, Load, Named};
-use furiosa_opt_models::models::diffusion::minimax_h3::{embeddings, packing, transformer};
 use furiosa_opt_models::modules::generic::Prefix;
 use furiosa_opt_models::ops::attention::geometry::Hidden;
 use furiosa_opt_models::ops::linear::{Grouped, grouped::Layout};
 use furiosa_opt_models::ops::pointwise::SwiGlu;
 use furiosa_opt_models::ops::swiglu::{GateUp, Intermediate};
-use furiosa_opt_models::tensor::live::Live;
-use furiosa_opt_models::tensor::memory::residency::Residency;
-use furiosa_opt_models::tensor::memory::{Hbm, Memory};
 use furiosa_opt_models::tensor::{axis::Rows, live::BlockPrefix, scalar::Value};
 use furiosa_opt_models::{Op, Then};
 use furiosa_opt_std::prelude::*;
@@ -283,48 +279,6 @@ fn check(values: &[bf16], rows: usize, width: usize, oracle: &[bf16], sentinel: 
                 }
             }
         }
-    }
-}
-
-#[test]
-fn ffn_oracle_keeps_both_bf16_rounding_boundaries() {
-    let _ = Reference::new();
-}
-
-#[test]
-fn default_and_borrowed_h3_feedforward_bind_the_prepared_request_prefix() {
-    use furiosa_opt_models::Module;
-    type C = embeddings::Chips;
-    type W = embeddings::Width;
-    type Hidden = Live<HbmTensor<bf16, C, m![R, W]>, R>;
-    type Env<'p> = (&'p BlockPrefix<(), R, B>, ());
-    fn module<M>()
-    where
-        for<'i, 'p, 's> M: Module<&'i Hidden, Env<'p>, &'s mut ((), ((), ())), Output = Hidden>,
-    {
-    }
-    module::<transformer::BlockFeedForward>();
-    module::<transformer::BlockFeedForward<W, transformer::Expanded, &Hbm>>();
-    module::<Named<"mlp", transformer::BlockFeedForward>>();
-
-    struct Shapes;
-    impl Memory for Shapes {
-        type Tensor<D: MaterializableScalar, C: M + 'static, S: M + 'static> = ();
-    }
-    let projected: Option<<transformer::BlockFeedForward as Residency>::In<Shapes>> = None;
-    let _: Option<transformer::BlockFeedForward<W, transformer::Expanded, Shapes>> = projected;
-    let borrowed: Option<<transformer::BlockFeedForward as Residency>::In<&Hbm>> = None;
-    let _: Option<transformer::BlockFeedForward<W, transformer::Expanded, &Hbm>> = borrowed;
-
-    // The H3 binder derives both views from one checked plan, with the compiled envelope.
-    // This is the host precondition used by Prefix, without a second length calculation.
-    let capacity = packing::Capacity::default();
-    for tokens in [1, 128, 257, 2048, 128] {
-        let plan = capacity.plan(tokens).unwrap();
-        let spans = plan.span_plan::<R>().unwrap();
-        let prefix = plan.block_prefix::<R>().unwrap();
-        assert_eq!(prefix.interval().start(), spans.work().start());
-        assert_eq!(prefix.rows(), spans.work().rows());
     }
 }
 

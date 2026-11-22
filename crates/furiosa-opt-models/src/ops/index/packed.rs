@@ -448,7 +448,7 @@ pub(crate) mod row_tests {
         header: &Header<R, T, A, V>,
     ) -> Rows<R, Width, Chips> {
         let plan = header.read();
-        Join.forward(device, (media, (text, &plan))).into_value()
+        Join.forward(device, (media, text, &plan)).into_value()
     }
 
     #[device(chip = 4)]

@@ -89,23 +89,19 @@ fn image<In: AxisName, Out: AxisName, WI: AxisName, WO: AxisName, C: M>(
                 || (WO::SIZE == Out::SIZE && WI::SIZE == In::SIZE * C::SIZE)
         );
     }
+    context.compare(source)?;
     let whole = source
         .host::<bf16, m![WO, WI], m![WO, WI]>(context)?
         .into_vec();
-    let mut local = Vec::with_capacity(C::SIZE * Out::SIZE * In::SIZE);
+    if const { WI::SIZE == In::SIZE } {
+        // Output partitions are consecutive rows in the checkpoint.
+        return Ok(HostTensor::from_vec(whole));
+    }
+    // Column partitions retain contiguous runs of each input row.
+    let mut local = Vec::with_capacity(whole.len());
     for chip in 0..C::SIZE {
         for row in 0..Out::SIZE {
-            let whole_row = if WO::SIZE == Out::SIZE {
-                row
-            } else {
-                chip * Out::SIZE + row
-            };
-            let column = if WI::SIZE == In::SIZE {
-                0
-            } else {
-                chip * In::SIZE
-            };
-            let at = whole_row * WI::SIZE + column;
+            let at = row * WI::SIZE + chip * In::SIZE;
             local.extend_from_slice(&whole[at..at + In::SIZE]);
         }
     }

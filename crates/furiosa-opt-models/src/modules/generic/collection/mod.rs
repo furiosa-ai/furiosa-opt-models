@@ -635,7 +635,7 @@ mod residency_tests {
     use crate::tensor::memory::residency::{Leaves, Path, Residency, Visit};
     use crate::tensor::memory::{Hbm, Memory};
     use crate::tensor::parallel::Shard;
-    use crate::{Layers, Module, Sequential, Then};
+    use crate::{Layers, Sequential, Then};
     use furiosa_opt_std::prelude::*;
     use safetensors::Dtype;
     use std::{convert::Infallible, marker::PhantomData, sync::Arc};
@@ -794,18 +794,9 @@ mod residency_tests {
     }
 
     /// Loads real numerical modules, traverses and shares their array-backed tree, and lends
-    /// that tree without an HBM allocation. The same borrowed composition implements Module.
+    /// that tree without an HBM allocation.
     #[test]
     fn actual_array_layers_load_map_and_borrow_with_strict_ties() {
-        type Input = HbmTensor<bf16, Chips, m![{ Symbol<crate::tensor::axis::Rows<4>> }, Width]>;
-        type State = ((), [((), ()); 2]);
-        fn computes<M>()
-        where
-            for<'i, 's> M: Module<&'i Input, (), &'s mut State, Output = Input>,
-        {
-        }
-        let _ = computes::<Network<&'static Hbm>>;
-
         let mut source = Checkpoint::default();
         let norm = bf16::from_f32(1.25)
             .to_bits()
