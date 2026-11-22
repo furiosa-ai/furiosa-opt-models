@@ -15,7 +15,7 @@ The platform accepts these values:
 | `--device` | Unset or `cpu` (framework tensors stay on the host; the model runs on RNGD) |
 | `--attention-backend`, `--prefill-attention-backend`, `--decode-attention-backend` | Unset or `torch_native` (the engine runs attention) |
 | `startup_weight_load_mode` | `serial` |
-| `disaggregation_mode` | `null` |
+| `disaggregation_mode` | `null`, `prefill` or `decode`; uses `--disaggregation-transfer-backend nixl` and requires `SGLANG_DISAGG_STAGING_BUFFER=1` |
 | Attention data, expert, context parallelism (`attn_dp_size`, `ep_size`, `dcp_size`, `attn_cp_size`) and `nnodes` | 1 |
 | `--tp-size` | A chip count the model is compiled for; one scheduler drives every chip, so `/server_info` reports `tp_size` 1 |
 | `--dp-size` | Any, or 1 with speculative decoding; replica `i` runs on the `--tp-size` chips from position `i` × `--tp-size` of `FURIOSA_VISIBLE_CHIPS`, or of every installed chip when it is unset |
@@ -50,6 +50,41 @@ The platform disables CUDA graphs and piecewise CUDA graphs, and sets the schedu
 
 A model that keeps recurrent state also requires `mamba_ssm_dtype` unset or `float32` and `mamba_radix_cache_strategy` `auto` or `no_buffer`, and does not support `enable_int8_mamba_checkpoint`, `enable_linear_replayssm` or `enable_linear_replayssm_spec` yet.
 [Integrating frameworks](../engine/frameworks.md#sglang-specifics) explains the overlap schedule and mixed chunks.
+
+## Disaggregated serving
+
+The plugin supports SGLang prefill/decode disaggregation with NIXL. It uses SGLang's bounded
+staging requests, decode ring allocator, watermarks and transfer completion lifecycle. The prefill
+side pins one chunk per native transfer worker; the decode ring size is controlled by
+`SGLANG_DISAGG_STAGING_POOL_SIZE_MB` (SGLang's default is 4096 MiB). This uses bounded host memory,
+not a cache-capacity-sized mirror; ring pressure follows SGLang's watermark backpressure.
+
+NIXL reads the registered host staging buffers because the engine does not expose NPU HBM for
+external registration. Each chunk therefore makes an engine HBM-to-host DMA before NIXL and a
+host-to-HBM DMA after NIXL. These DMA copies add per-chunk latency, while the bounded ring avoids
+pinning a second full KV cache. SGLang keeps its scheduler TP metadata at 1; the engine owns the
+model's chip topology. The adapter enables the staging lifecycle for this same-TP path while
+preserving TP metadata sent through SGLang's protocol.
+
+Set the staging environment variable on both roles and launch them with the same model, engine chip
+topology (`--tp-size`) and cache page geometry. This adapter transfers raw engine pages and does not
+convert between different attention-TP layouts:
+
+```bash
+SGLANG_DISAGG_STAGING_BUFFER=1 python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-1.7B --disaggregation-mode prefill \
+  --disaggregation-transfer-backend nixl
+
+SGLANG_DISAGG_STAGING_BUFFER=1 python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-1.7B --disaggregation-mode decode \
+  --disaggregation-transfer-backend nixl
+```
+
+This path requires an installed NIXL backend and uses SGLang's NIXL network and bootstrap
+configuration. Decode host receive is not enabled; received pages land in the engine cache after
+NIXL completes. Filesystem HiCache remains a separate tier with separate host buffers: if both are
+enabled, a page may also be copied for the L3 tier, adding host bandwidth and memory use. The NIXL
+ring remains bounded; HiCache does not reuse its transient staging regions.
 
 ## Speculative decoding
 
