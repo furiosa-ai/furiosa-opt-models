@@ -1,4 +1,4 @@
-"""SGLang's `--quantization fp8` uses the non-CUDA per-tensor weight fallback."""
+"""SGLang's `--quantization fp8` uses the per-tensor weight fallback on this backend."""
 
 from collections.abc import Callable
 from http.client import HTTPResponse
@@ -81,7 +81,7 @@ def assert_quantized(checkpoint: str, prompts: list[list[int]], answers: list[li
                     [sibling.weight.float().abs().amax() for sibling in siblings]
                 ).amax()
             maxima[name] = maxima[key]
-        # SGLang fuses Q/K/V and gate/up into projection tensors before its non-CUDA fallback.
+        # SGLang fuses Q/K/V and gate/up into projection tensors before applying its fallback.
         for name, module in linears.items():
             _ = module.weight.copy_(quantized(module.weight, maxima[name]))
         for prompt, answer in zip(prompts, answers, strict=True):
@@ -97,25 +97,25 @@ def assert_quantized(checkpoint: str, prompts: list[list[int]], answers: list[li
 @pytest.mark.parametrize(
     ("checkpoint", "flags"),
     [
-        pytest.param("Qwen/Qwen3-0.6B", (), id="0.6B"),
-        pytest.param("Qwen/Qwen3-1.7B", (), id="1.7B"),
-        pytest.param("Qwen/Qwen3-4B", (), id="4B"),
-        pytest.param("Qwen/Qwen3-1.7B", NGRAM, id="1.7B-ngram"),
-        pytest.param("Qwen/Qwen3-1.7B", DRAFT, id="1.7B-inherited-draft"),
+        pytest.param("Qwen/Qwen3-0.6B", (), id="qwen306b"),
+        pytest.param("Qwen/Qwen3-1.7B", (), id="qwen317b"),
+        pytest.param("Qwen/Qwen3-4B", (), id="qwen34b"),
+        pytest.param("Qwen/Qwen3-1.7B", NGRAM, id="qwen317b-ngram"),
+        pytest.param("Qwen/Qwen3-1.7B", DRAFT, id="qwen317b-inherited-draft"),
         pytest.param(
             "Qwen/Qwen3-1.7B",
             (*DRAFT, "--speculative-draft-model-quantization", "unquant"),
-            id="1.7B-unquantized-draft",
+            id="qwen317b-unquantized-draft",
         ),
     ],
 )
-def test_generates_with_sglang_non_cuda_fp8_weights(
+def test_generates_with_sglang_fp8_weights(
     tmp_path_factory: pytest.TempPathFactory,
     chips: Chips,
     checkpoint: str,
     flags: tuple[str, ...],
 ) -> None:
-    """Greedy tokens match the BF16 model with SGLang's non-CUDA tensor-wise FP8 weight fallback."""
+    """Greedy tokens match the BF16 model with SGLang's tensor-wise FP8 fallback on this backend."""
     row = {"id": checkpoint, "task": "text", "flags": [*FP8, *flags]}
     with chips.serve(tmp_path_factory, row) as send:
         prompts, answers = generate(send)

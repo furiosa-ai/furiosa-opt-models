@@ -96,7 +96,7 @@ LORA: Final = "serves no LoRA adapter; omit --enable-lora and --lora-paths"
 # BF16 before each product, while native SGLang dynamically quantizes activations.
 Quantization = Literal["fp8"]
 QUANTIZATION: Final = (
-    "quantizes BF16 weights with --quantization fp8; on the non-CUDA path, "
+    "quantizes BF16 weights with --quantization fp8; on this backend, "
     "one scale covers each fused projection tensor"
 )
 

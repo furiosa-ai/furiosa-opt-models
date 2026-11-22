@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Final
 
 import furiosa_opt_engine as engine
@@ -52,7 +52,7 @@ class Location:
 
     def mapped(self) -> MappedCheckpoint:
         """The checkpoint's tensors, mapped from its files as they are now, with their location."""
-        return MappedCheckpoint(self, engine.Checkpoint(self.directory, config=self.config))
+        return MappedCheckpoint(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,7 +60,14 @@ class MappedCheckpoint:
     """A mapped checkpoint and its location, which maps the same source again after release."""
 
     location: Location
-    source: engine.Checkpoint
+    source: engine.Checkpoint = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "source",
+            engine.Checkpoint(self.location.directory, config=self.location.config),
+        )
 
 
 @dataclass(frozen=True, slots=True)

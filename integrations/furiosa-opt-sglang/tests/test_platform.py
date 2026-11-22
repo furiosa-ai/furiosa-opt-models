@@ -1,6 +1,8 @@
 """The plugin rejects unsupported server options before a scheduler loads the model."""
 
 import pickle
+from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -187,8 +189,8 @@ def test_schedules_the_resolved_draft_quantization(
 
 
 @pytest.mark.feature("Online quantization")
-def test_uses_sglangs_non_cuda_fp8_fallback() -> None:
-    """SGLang's non-CUDA `fp8` fallback uses one scale per fused projection tensor; a checkpoint's
+def test_uses_sglangs_fp8_fallback() -> None:
+    """On this backend SGLang's `fp8` uses one scale per fused projection tensor; a checkpoint's
     own method, such as ModelOpt, quantizes nothing again at load."""
     from furiosa_opt_sglang.load import quantization
 
@@ -205,26 +207,95 @@ def test_uses_sglangs_non_cuda_fp8_fallback() -> None:
     ],
 )
 def test_applies_draft_quantization_to_load_options(
-    draft_method: str, expected: str | None
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    draft_method: str,
+    expected: str | None,
 ) -> None:
-    """A BF16 target leaves its weights as stored; the draft's own method sets its load options."""
-    from furiosa_opt_sglang.load import quantized_options
+    """Draft passes its own resolved quantization to the engine load, or leaves weights stored."""
+    from furiosa_opt_sglang.speculative import standalone
 
     class LoadOptions:
-        def __init__(self) -> None:
-            self.quantizations: list[str] = []
+        def __init__(self, quantizations: tuple[str, ...] = ()) -> None:
+            self.quantizations = quantizations
+
+        def chips(self, _parallel: int) -> "LoadOptions":
+            return LoadOptions(self.quantizations)
 
         def quantization(self, name: str) -> "LoadOptions":
-            self.quantizations.append(name)
+            return LoadOptions((*self.quantizations, name))
+
+        def parse(self, _source: object) -> "LoadOptions":
             return self
 
-    target = LoadOptions()
-    draft = LoadOptions()
-    _ = quantized_options(target, None, {})
-    _ = quantized_options(draft, draft_method, {})
+    class Location:
+        def __init__(self, _directory: str, _config: None) -> None:
+            pass
 
-    assert target.quantizations == []
-    assert draft.quantizations == ([] if expected is None else [expected])
+        def mapped(self) -> SimpleNamespace:
+            return SimpleNamespace(source=object())
+
+    loads: list[LoadOptions] = []
+
+    tokens = object()
+    monkeypatch.setattr(
+        standalone,
+        "engine",
+        SimpleNamespace(
+            LoadOptions=LoadOptions,
+            decoder=SimpleNamespace(Output=SimpleNamespace(TOKENS=tokens)),
+        ),
+    )
+
+    def load(
+        _checkpoint: object, options: LoadOptions, _device: object, vocabulary: int
+    ) -> SimpleNamespace:
+        loads.append(options)
+        return SimpleNamespace(
+            model=SimpleNamespace(
+                output=tokens,
+                window=4096,
+            ),
+            vocabulary=vocabulary,
+            pool=SimpleNamespace(block=16),
+        )
+
+    monkeypatch.setattr(standalone, "Location", Location)
+    monkeypatch.setattr(standalone.Decoder, "load", staticmethod(load))
+    monkeypatch.setattr(
+        standalone,
+        "get_serving",
+        lambda: SimpleNamespace(
+            tokenizer_mode=None, tokenizer_backend=None, tokenizer_path="target"
+        ),
+    )
+    monkeypatch.setattr(
+        standalone, "get_model", lambda: SimpleNamespace(trust_remote_code=False, revision=None)
+    )
+    monkeypatch.setattr(
+        standalone,
+        "get_tokenizer",
+        lambda *_args, **_kwargs: SimpleNamespace(get_vocab=lambda: {}),
+    )
+    monkeypatch.setattr(standalone, "checkout", lambda _path, _revision: str(tmp_path))
+    (tmp_path / "config.json").write_text('{"vocab_size": 32}', encoding="utf-8")
+
+    target = SimpleNamespace(
+        model=SimpleNamespace(parallel=1),
+        device=object(),
+        vocabulary=32,
+        pool=SimpleNamespace(block=16),
+    )
+    options = SimpleNamespace(
+        speculative_draft_model_path="draft",
+        speculative_draft_model_revision=None,
+        speculative_draft_model_quantization=draft_method,
+    )
+    _ = standalone.Draft(options, target, context=128)
+
+    assert [load_options.quantizations for load_options in loads] == [
+        () if expected is None else (expected,)
+    ]
 
 
 @pytest.mark.feature("Online quantization")

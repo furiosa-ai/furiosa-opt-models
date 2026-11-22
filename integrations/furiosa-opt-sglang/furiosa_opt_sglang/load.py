@@ -3,9 +3,9 @@
 - `options` is the engine's options of the load of SGLang's checkpoint, which the platform checks
   at startup and the scheduler loads with, so the engine alone decides which chips, cache dtypes,
   quantizations and models load.
-- `quantization` is the engine's quantization of a load SGLang quantizes, of the served checkpoint
-  and of a draft model alike.
-- `quantized_options` applies that quantization to engine load options.
+- `quantization` resolves SGLang's online weight quantization setting to an engine load method for
+  target and draft checkpoints.
+- `quantized_options` applies that method to engine load options.
 - `bind` loads the checkpoint onto a scheduler's chips.
 """
 
@@ -63,8 +63,8 @@ def quantization(
 ) -> Literal["fp8_per_tensor"] | None:
     """The engine's quantization of a checkpoint of `config` that SGLang loads under `method`, the
     operator's or the checkpoint's own, or none: SGLang quantizes at load only with `fp8` and only a
-    checkpoint whose config declares no quantization. On this non-CUDA backend, SGLang falls back
-    to one scale for each fused projection tensor.
+    checkpoint whose config declares no quantization. When SGLang's optimized channel-wise kernels
+    are unavailable, its fallback uses one scale for each fused projection tensor.
 
     Raises:
         ValueError: The checkpoint's quantization metadata is malformed.

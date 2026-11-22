@@ -49,9 +49,10 @@ pub struct LoadOptions {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Quantization {
     /// One scale per fused projection tensor (a layer's query, key and value; its gate and up):
-    /// vLLM's `fp8_per_tensor` and SGLang's non-CUDA `fp8` fallback.
+    /// vLLM's `fp8_per_tensor` and SGLang's `fp8` fallback when optimized channel-wise kernels are
+    /// unavailable.
     Fp8PerTensor,
-    /// One scale per output channel: SGLang's `fp8` on its supported NVIDIA paths.
+    /// One scale per output channel: SGLang's `fp8` when optimized channel-wise kernels are used.
     Fp8PerChannel,
 }
 
