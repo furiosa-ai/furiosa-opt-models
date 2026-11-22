@@ -381,8 +381,7 @@ def test_callback_refuses_same_pipeline_reentry(h3_pipeline: Loaded, h3_forward:
     audio = torch.zeros(2, 32, 207, dtype=torch.float32)
     calls: list[tuple[str, Callable[[], object]]] = [
         ("reset", native.reset_cache),
-        ("forward", lambda: native.prepare(**kwargs)),
-        ("cached_forward", lambda: native.prepare(**kwargs).forward_cached(lambda _: True)),
+        ("transformer", lambda: native.prepare(**kwargs)),
         ("text", lambda: h3_pipeline.text.prepare(ids)),
         ("video", lambda: h3_pipeline.video.prepare(video, frame_num=1)),
         ("audio", lambda: h3_pipeline.audio.prepare(audio)),
