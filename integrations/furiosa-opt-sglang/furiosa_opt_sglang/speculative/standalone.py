@@ -69,11 +69,12 @@ class Draft:
                 name := quantization(options.speculative_draft_model_quantization, stored)
             ) is not None:
                 loads = loads.quantization(name)
-            loads.parse(checkpoint.mapped())
+            mapped = checkpoint.mapped()
+            loads.parse(mapped)
         except (NotImplementedError, ValueError) as error:
             raise Refused("speculative_draft_model_path", str(error)) from None
         # The draft shares the target's chips, whose memory the target's token pool then sizes.
-        draft = Decoder.load(checkpoint, loads, target.device, config.vocab_size)
+        draft = Decoder.load(checkpoint, loads, target.device, config.vocab_size, mapped=mapped)
         if not (
             draft.model is not None
             and draft.model.output == engine.decoder.Output.TOKENS

@@ -58,35 +58,6 @@ def options(
     return loads
 
 
-def _metadata_mapping(value: JsonValue, source: str) -> Mapping[str, JsonValue]:
-    if isinstance(value, Mapping):
-        return cast("Mapping[str, JsonValue]", value)
-    raise ValueError(
-        f"invalid checkpoint quantization metadata: {source} must be a mapping, "
-        f"got {type(value).__name__}"
-    )
-
-
-def _validate_quantization_metadata(config: Mapping[str, JsonValue]) -> None:
-    # Match SGLang's lookup precedence, validating only the metadata it will inspect.
-    quantization_config = config.get("quantization_config")
-    if quantization_config is not None:
-        _metadata_mapping(quantization_config, "quantization_config")
-        return
-
-    text_config = config.get("text_config")
-    if text_config is not None:
-        text_config_mapping = _metadata_mapping(text_config, "text_config")
-        quantization_config = text_config_mapping.get("quantization_config")
-        if quantization_config is not None:
-            _metadata_mapping(quantization_config, "text_config.quantization_config")
-            return
-
-    compression_config = config.get("compression_config")
-    if compression_config is not None:
-        _metadata_mapping(compression_config, "compression_config")
-
-
 def quantization(
     method: str | None, config: Mapping[str, JsonValue] | PretrainedConfig
 ) -> Literal["fp8_per_channel"] | None:
@@ -166,3 +137,32 @@ def bind(model_config: ModelConfig, first: int) -> Model:
             )
         case _:
             return text(decoder)
+
+
+def _metadata_mapping(value: JsonValue, source: str) -> Mapping[str, JsonValue]:
+    if isinstance(value, Mapping):
+        return cast("Mapping[str, JsonValue]", value)
+    raise ValueError(
+        f"invalid checkpoint quantization metadata: {source} must be a mapping, "
+        f"got {type(value).__name__}"
+    )
+
+
+def _validate_quantization_metadata(config: Mapping[str, JsonValue]) -> None:
+    # Match SGLang's lookup precedence, validating only the metadata it will inspect.
+    quantization_config = config.get("quantization_config")
+    if quantization_config is not None:
+        _metadata_mapping(quantization_config, "quantization_config")
+        return
+
+    text_config = config.get("text_config")
+    if text_config is not None:
+        text_config_mapping = _metadata_mapping(text_config, "text_config")
+        quantization_config = text_config_mapping.get("quantization_config")
+        if quantization_config is not None:
+            _metadata_mapping(quantization_config, "text_config.quantization_config")
+            return
+
+    compression_config = config.get("compression_config")
+    if compression_config is not None:
+        _metadata_mapping(compression_config, "compression_config")

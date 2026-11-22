@@ -61,7 +61,7 @@ def generate(send: Callable[..., HTTPResponse]) -> tuple[list[list[int]], list[l
 def assert_quantized(checkpoint: str, prompts: list[list[int]], answers: list[list[int]]) -> None:
     """Each greedy token is within 5% of the top probability of Transformers on `checkpoint` as
     SGLang quantizes it."""
-    reference = AutoModelForCausalLM.from_pretrained(checkpoint, dtype=torch.float32)
+    reference = AutoModelForCausalLM.from_pretrained(checkpoint, dtype=torch.bfloat16)
     head = reference.get_output_embeddings()
     with torch.inference_mode():
         # SGLang quantizes each linear layer but the vocabulary head row by row, so its fused q/k/v
