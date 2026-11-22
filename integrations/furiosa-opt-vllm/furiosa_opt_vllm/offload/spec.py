@@ -104,9 +104,17 @@ class FuriosaOffloadingSpec(CPUOffloadingSpec):
                     )
                 )
             self._manager = TieringOffloadingManager(primary, secondary_tiers)
-        except Exception:
-            for tier in reversed(secondary_tiers):
-                tier.shutdown()
-            primary.shutdown()
+        except BaseException as error:
+            cleanup_errors = []
+            for resource in (*reversed(secondary_tiers), primary):
+                try:
+                    resource.shutdown()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            if cleanup_errors:
+                error.add_note(
+                    "offloading setup cleanup failed: "
+                    + "; ".join(repr(cleanup_error) for cleanup_error in cleanup_errors)
+                )
             raise
         return self._manager
