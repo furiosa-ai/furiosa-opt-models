@@ -92,11 +92,12 @@ class Requested(Served):
 
 
 LORA: Final = "serves no LoRA adapter; omit --enable-lora and --lora-paths"
-# SGLang's quantizations at load whose computation the engine serves: E4M3 weights restored to
-# BF16 before each product, the activations kept in BF16.
+# SGLang's quantization option the engine serves as a weight-only subset: E4M3 weights restored to
+# BF16 before each product, while native SGLang dynamically quantizes activations.
 Quantization = Literal["fp8"]
 QUANTIZATION: Final = (
-    "quantizes a BF16 checkpoint at load only with --quantization fp8, one scale per output channel"
+    "quantizes BF16 weights with --quantization fp8; on the non-CUDA path, "
+    "one scale covers each fused projection tensor"
 )
 
 

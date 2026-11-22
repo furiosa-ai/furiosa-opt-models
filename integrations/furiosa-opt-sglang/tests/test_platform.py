@@ -187,13 +187,12 @@ def test_schedules_the_resolved_draft_quantization(
 
 
 @pytest.mark.feature("Online quantization")
-def test_quantizes_each_output_channel() -> None:
-    """SGLang's `fp8` of a BF16 checkpoint scales each output channel of a projection by its own
-    scale, which the engine names `fp8_per_channel`; any other method SGLang resolves, such as a
-    ModelOpt checkpoint's own, quantizes nothing at load."""
+def test_uses_sglangs_non_cuda_fp8_fallback() -> None:
+    """SGLang's non-CUDA `fp8` fallback uses one scale per fused projection tensor; a checkpoint's
+    own method, such as ModelOpt, quantizes nothing again at load."""
     from furiosa_opt_sglang.load import quantization
 
-    assert quantization("fp8", {}) == "fp8_per_channel"
+    assert quantization("fp8", {}) == "fp8_per_tensor"
     assert quantization("modelopt_fp8", {}) is None
 
 
@@ -201,7 +200,7 @@ def test_quantizes_each_output_channel() -> None:
 @pytest.mark.parametrize(
     ("draft_method", "expected"),
     [
-        pytest.param("fp8", "fp8_per_channel", id="draft-owned-fp8"),
+        pytest.param("fp8", "fp8_per_tensor", id="draft-owned-fp8"),
         pytest.param("unquant", None, id="unquant"),
     ],
 )

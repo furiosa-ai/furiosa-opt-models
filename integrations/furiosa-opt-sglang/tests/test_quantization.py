@@ -1,4 +1,4 @@
-"""SGLang's `--quantization fp8` serves a BF16 checkpoint as SGLang quantizes it at load."""
+"""SGLang's `--quantization fp8` uses the non-CUDA per-tensor weight fallback."""
 
 from collections.abc import Callable
 from http.client import HTTPResponse
@@ -15,8 +15,7 @@ from typing_extensions import TypedDict
 
 FP8: Final = ("--quantization", "fp8")
 DRAFT: Final = (*STANDALONE, "Qwen/Qwen3-0.6B")
-# Prompts on which each size's BF16 weights, and its weights under one scale a tensor, answer apart
-# from SGLang's FP8 ones, so the tests fail when the load ignores the quantization or its scales.
+# Prompts exercise the tensor-wise FP8 reference and shared scales for fused projections.
 PROMPTS: Final = (
     "The first rule of programming is",
     "The quick brown fox",
@@ -37,12 +36,11 @@ TOKENIZED: Final = TypeAdapter(Tokenized)
 ANSWERS: Final = TypeAdapter(list[Generated])
 
 
-def quantized(weight: torch.Tensor) -> torch.Tensor:
-    """`weight` restored to BF16 from the E4M3 codes SGLang's `fp8` gives a BF16 projection: one
-    FP32 scale per output channel, its largest magnitude over 448, each code its value times the
-    scale's reciprocal, saturated, as SGLang's per-token FP8 kernel computes them."""
+def quantized(weight: torch.Tensor, maximum: torch.Tensor | None = None) -> torch.Tensor:
+    """`weight` restored to BF16 from E4M3 using one FP32 scale, its maximum over 448."""
     largest = torch.finfo(torch.float8_e4m3fn).max
-    scale = weight.float().abs().amax(dim=1, keepdim=True) / largest
+    maximum = weight.float().abs().amax() if maximum is None else maximum
+    scale = maximum / largest
     inverse = torch.where(scale == 0, 0.0, 1.0 / scale)
     codes = (weight.float() * inverse).clamp(-largest, largest).to(torch.float8_e4m3fn)
     return (codes.float() * scale).to(torch.bfloat16)
@@ -59,16 +57,33 @@ def generate(send: Callable[..., HTTPResponse]) -> tuple[list[list[int]], list[l
 
 
 def assert_quantized(checkpoint: str, prompts: list[list[int]], answers: list[list[int]]) -> None:
-    """Each greedy token is within 5% of the top probability of Transformers on `checkpoint` as
-    SGLang quantizes it."""
+    """Each greedy token is within 5% of Transformers with tensor-wise FP8 weights and BF16 acts."""
     reference = AutoModelForCausalLM.from_pretrained(checkpoint, dtype=torch.bfloat16)
     head = reference.get_output_embeddings()
     with torch.inference_mode():
-        # SGLang quantizes each linear layer but the vocabulary head row by row, so its fused q/k/v
-        # and gate/up quantize as their parts do.
-        for module in reference.modules():
-            if isinstance(module, torch.nn.Linear) and module is not head:
-                _ = module.weight.copy_(quantized(module.weight))
+        linears = {
+            name: module
+            for name, module in reference.named_modules()
+            if isinstance(module, torch.nn.Linear) and module is not head
+        }
+        fused = (("q_proj", "k_proj", "v_proj"), ("gate_proj", "up_proj"))
+        maxima: dict[str, torch.Tensor] = {}
+        for name, module in linears.items():
+            parent, projection = name.rsplit(".", 1)
+            group = next((group for group in fused if projection in group), None)
+            if group is None:
+                maxima[name] = module.weight.float().abs().amax()
+                continue
+            key = f"{parent}:{','.join(group)}"
+            if key not in maxima:
+                siblings = [linears[f"{parent}.{part}"] for part in group]
+                maxima[key] = torch.stack(
+                    [sibling.weight.float().abs().amax() for sibling in siblings]
+                ).amax()
+            maxima[name] = maxima[key]
+        # SGLang fuses Q/K/V and gate/up into projection tensors before its non-CUDA fallback.
+        for name, module in linears.items():
+            _ = module.weight.copy_(quantized(module.weight, maxima[name]))
         for prompt, answer in zip(prompts, answers, strict=True):
             assert len(answer) == TOKENS
             logits: torch.Tensor = reference(torch.tensor([prompt + answer])).logits
@@ -94,14 +109,13 @@ def assert_quantized(checkpoint: str, prompts: list[list[int]], answers: list[li
         ),
     ],
 )
-def test_generates_as_the_checkpoint_quantized_by_sglang(
+def test_generates_with_sglang_non_cuda_fp8_weights(
     tmp_path_factory: pytest.TempPathFactory,
     chips: Chips,
     checkpoint: str,
     flags: tuple[str, ...],
 ) -> None:
-    """Greedy tokens of a BF16 checkpoint served with `--quantization fp8`, alone or verifying the
-    drafts of a speculative algorithm, are those of the checkpoint as SGLang quantizes it."""
+    """Greedy tokens match the BF16 model with SGLang's non-CUDA tensor-wise FP8 weight fallback."""
     row = {"id": checkpoint, "task": "text", "flags": [*FP8, *flags]}
     with chips.serve(tmp_path_factory, row) as send:
         prompts, answers = generate(send)
@@ -156,8 +170,7 @@ def test_refuses_a_draft_with_unserved_fp8(
 def test_wakes_to_the_quantized_answers(
     tmp_path_factory: pytest.TempPathFactory, chips: Chips, backup: bool
 ) -> None:
-    """Weights released by the memory saver resume quantized: the answers after a release and a
-    resume are those of before, which are the checkpoint's as SGLang quantizes it."""
+    """Weights released by the memory saver resume quantized and preserve the answers."""
     checkpoint = "Qwen/Qwen3-0.6B"
     saver = ("--enable-memory-saver", *(("--enable-weights-cpu-backup",) if backup else ()))
     row = {"id": checkpoint, "task": "text", "flags": [*FP8, *saver]}

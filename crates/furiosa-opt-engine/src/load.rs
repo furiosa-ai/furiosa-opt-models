@@ -48,10 +48,10 @@ pub struct LoadOptions {
 /// over 448, each value times its scale's reciprocal rounded to nearest even.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Quantization {
-    /// One scale per projection, shared by the projections of one input that vLLM fuses (a layer's
-    /// query, key and value; its gate and up): vLLM's `fp8_per_tensor`.
+    /// One scale per fused projection tensor (a layer's query, key and value; its gate and up):
+    /// vLLM's `fp8_per_tensor` and SGLang's non-CUDA `fp8` fallback.
     Fp8PerTensor,
-    /// One scale per output channel: SGLang's `fp8` on a BF16 checkpoint.
+    /// One scale per output channel: SGLang's `fp8` on its supported NVIDIA paths.
     Fp8PerChannel,
 }
 

@@ -60,11 +60,11 @@ def options(
 
 def quantization(
     method: str | None, config: Mapping[str, JsonValue] | PretrainedConfig
-) -> Literal["fp8_per_channel"] | None:
+) -> Literal["fp8_per_tensor"] | None:
     """The engine's quantization of a checkpoint of `config` that SGLang loads under `method`, the
     operator's or the checkpoint's own, or none: SGLang quantizes at load only with `fp8` and only a
-    checkpoint whose config declares no quantization, each output channel of a projection under
-    its own scale.
+    checkpoint whose config declares no quantization. On this non-CUDA backend, SGLang falls back
+    to one scale for each fused projection tensor.
 
     Raises:
         ValueError: The checkpoint's quantization metadata is malformed.
@@ -78,7 +78,7 @@ def quantization(
     )
     _validate_quantization_metadata(config_mapping)
     declared = resolve_checkpoint_quant_spec(config)
-    return "fp8_per_channel" if declared is None else None
+    return "fp8_per_tensor" if declared is None else None
 
 
 def quantized_options(

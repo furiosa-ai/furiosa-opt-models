@@ -216,9 +216,9 @@ Without the copy, waking reads the checkpoint's files as they are then.
 
 ## Quantize a BF16 checkpoint at load
 
-For BF16 Qwen3-0.6B, 1.7B and 4B, the closest shared-engine online FP8 mappings preserve each framework's weight-scale layout. Each adapter resolves its framework option and selects that scale layout; the engine owns weight conversion and kernel selection.
+For BF16 Qwen3-0.6B, 1.7B and 4B, both frameworks use per-tensor weight scales on the non-CUDA path this plugin targets. SGLang's `fp8` method falls back to per-tensor weights when its per-channel kernels are unavailable; vLLM's `fp8_per_tensor` uses them directly. Each adapter resolves its framework option, and the engine owns weight conversion and kernel selection.
 
-This online path quantizes weights only; products still use BF16 activations. SGLang's native `fp8` path also dynamically quantizes activations per token, so this is a weight-only subset and outputs can differ. Full SGLang parity needs engine support for this per-channel-weight and per-token-activation combination.
+This online path quantizes weights only; products still use BF16 activations. Both native methods dynamically quantize activations: SGLang uses per-token scales, while vLLM uses per-tensor scales without CUTLASS and per-token scales with it. This is a weight-only subset, so outputs can differ. Full activation parity needs engine support for each framework's activation scale layout.
 
 === "vLLM"
 
@@ -235,7 +235,7 @@ This online path quantizes weights only; products still use BF16 activations. SG
     python -m sglang.launch_server --model-path Qwen/Qwen3-0.6B --quantization fp8
     ```
 
-    Each output channel of a projection has its own scale, so the projections SGLang fuses into one matrix keep the scales of their own rows.
+    On SGLang's non-CUDA path, one scale covers each fused projection tensor (query, key and value; gate and up). Its supported NVIDIA paths use per-output-channel scales instead.
     A STANDALONE draft model takes the target's quantization, as in SGLang; `--speculative-draft-model-quantization unquant` loads it as stored.
     If a checkpoint declares its own quantization, `fp8` adds no conversion; the engine reads the stored form or refuses it if unsupported.
     Waking from [sleep](#put-the-server-to-sleep) quantizes the BF16 weights again, so a woken server answers as before.
@@ -243,7 +243,7 @@ This online path quantizes weights only; products still use BF16 activations. SG
 The load stores each decoder projection's weights as E4M3 codes with FP32 scales. For each framework-defined group, the scale is that group's maximum absolute weight divided by 448.
 The engine restores those codes to BF16 before each product; the embedding and vocabulary head stay in BF16.
 Startup refuses Qwen3-8B, whose packed query, key and value projection has no FP8 form, before downloading its weights.
-The adapters refuse vLLM's `fp8_per_channel` and `fp8_per_block`, and SGLang's `w8a8_fp8`, because these methods quantize activations. They also refuse MX and NVFP4 because these online load paths do not encode those weight formats.
+The adapters refuse vLLM's `fp8_per_channel` and `fp8_per_block`, and SGLang's `w8a8_fp8`, because these request weight or activation layouts outside the supported subset. They also refuse MX and NVFP4 because these online load paths do not encode those weight formats.
 
 ## Serve long contexts
 
