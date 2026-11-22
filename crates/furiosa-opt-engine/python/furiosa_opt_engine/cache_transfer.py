@@ -212,7 +212,10 @@ def settle(transfers: Iterable[PendingTransfer]) -> Exception | None:
 def page_runs(
     device_pages: Sequence[int], host_pages: Sequence[int], chips: int
 ) -> tuple[tuple[int, int, int], ...]:
-    """Group adjacent page pairs when one DMA can represent them without changing shard order."""
+    """Group adjacent page pairs without changing device shard order.
+
+    `chips` counts physical chips in the engine topology, not a framework setting.
+    """
     if chips <= 0:
         raise ValueError("cache transfers require at least one chip")
     if len(device_pages) != len(host_pages):

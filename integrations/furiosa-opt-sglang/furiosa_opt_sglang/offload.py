@@ -63,9 +63,15 @@ class Strategy(StackStrategy):
     ) -> StackBuildResult:
         assert isinstance(kvcache, Cache)
         if storage_backend not in (None, "file"):
-            raise ValueError("the engine cache supports SGLang's file storage backend only")
+            raise ValueError(
+                "the Furiosa engine cache supports SGLang HiCache storage only "
+                "with its file backend"
+            )
         if params.mtp_draft_device_pools:
-            raise ValueError("the engine cache does not support storage with draft pools")
+            raise ValueError(
+                "Furiosa HiCache cannot offload SGLang MTP draft pools: its host pool covers only "
+                "the engine-owned target-model KV layers"
+            )
         # The scheduler's cache parameters carry its tensor-parallel group.
         assert params.tp_cache_group is not None
         options = Hierarchical.parse(get_memory())
@@ -229,6 +235,7 @@ class Host(HostKVCache):
         key = (tuple(device), tuple(host))
         pending = self._pending_loads.get(key)
         if pending is None:
+            # SGLang calls once per layer; Copier moves every layer in one page batch.
             transfers = [
                 (target, [(ENGINE_CACHE_GROUP, source)])
                 for source, target in zip(device, host, strict=True)
@@ -292,6 +299,8 @@ PAGES: Final = TypeAdapter(list[int], config=ConfigDict(strict=True))
 
 def pages(indices: torch.Tensor, size: int) -> list[int]:
     """The pages of `size` token slots whose slots `indices` lists, each page whole and in order."""
+    if size <= 0:
+        raise ValueError("hierarchical cache page size must be positive")
     if indices.dim() != 1 or indices.dtype not in SLOTS:
         raise ValueError("hierarchical cache transfers name token slots by a 1-D integer tensor")
     if len(indices) % size:

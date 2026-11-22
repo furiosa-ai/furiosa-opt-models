@@ -67,13 +67,24 @@ def test_aligned_file_io_reports_short_reads(tmp_path, monkeypatch) -> None:
     ("device_pages", "host_pages", "chips", "expected"),
     [
         ([4, 5, 6, 7], [0, 1, 2, 3], 1, ((4, 0, 4),)),
+        ([4, 5, 6], [10, 11, 12], 1, ((4, 10, 3),)),
+        ([4, 5, 7, 8], [0, 1, 2, 3], 1, ((4, 0, 2), (7, 2, 2))),
         ([4, 5, 6, 7], [0, 1, 3, 4], 1, ((4, 0, 2), (6, 3, 2))),
         ([4, 5, 6], [0, 1, 3], 1, ((4, 0, 2), (6, 3, 1))),
         ([6, 5, 4], [0, 1, 2], 1, ((6, 0, 1), (5, 1, 1), (4, 2, 1))),
         ([4, 5], [0, 1], 2, ((4, 0, 1), (5, 1, 1))),
         ([], [], 1, ()),
     ],
-    ids=["adjacent", "device-gap", "host-gap", "descending", "multi-chip", "empty"],
+    ids=[
+        "adjacent",
+        "nonzero-host-base",
+        "device-gap",
+        "host-gap",
+        "host-gap-short-tail",
+        "descending",
+        "multi-chip",
+        "empty",
+    ],
 )
 def test_page_runs_preserve_device_and_host_order(
     device_pages: list[int],

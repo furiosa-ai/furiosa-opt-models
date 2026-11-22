@@ -21,6 +21,7 @@ use crate::tensor::HbmBuffer as PyHbmBuffer;
 use crate::{Context, Shared};
 
 mod huge;
+mod staging;
 
 const ALLOCATORS: usize = 8;
 const ALLOCATION_GROUP_BYTES: usize = 256 << 20;
@@ -121,6 +122,7 @@ struct Chunk {
     pages: Vec<TransferPage>,
     pool: Arc<Pool>,
     loading: bool,
+    coalesced: bool,
     completion: Arc<ChunkCompletion>,
     job: Arc<Job>,
 }
@@ -378,23 +380,31 @@ impl PyCopier {
     }
 
     /// Submit device-to-host copies for host slots and their `(group, device_block)` routes.
+    /// Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
+    /// transient pinned memory for one batched runtime transfer.
+    #[pyo3(signature = (pages, host, *, coalesce=false))]
     fn copy_out(
         &mut self,
         py: Python<'_>,
         pages: Vec<(usize, Vec<(usize, u32)>)>,
         host: PyRef<'_, PyHostCache>,
+        coalesce: bool,
     ) -> PyResult<PyCopy> {
-        self.submit(py, pages, &host.pool, false)
+        self.submit(py, pages, &host.pool, false, coalesce)
     }
 
     /// Submit host-to-device copies for host slots and their `(group, device_block)` routes.
+    /// Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
+    /// transient pinned memory for one batched runtime transfer.
+    #[pyo3(signature = (pages, host, *, coalesce=false))]
     fn copy_in(
         &mut self,
         py: Python<'_>,
         pages: Vec<(usize, Vec<(usize, u32)>)>,
         host: PyRef<'_, PyHostCache>,
+        coalesce: bool,
     ) -> PyResult<PyCopy> {
-        self.submit(py, pages, &host.pool, true)
+        self.submit(py, pages, &host.pool, true, coalesce)
     }
 
     /// Wait for every submitted copy and stop the workers.
@@ -413,6 +423,7 @@ impl PyCopier {
         mut pages: Vec<(usize, Vec<(usize, u32)>)>,
         pool: &Arc<Pool>,
         loading: bool,
+        coalesce: bool,
     ) -> PyResult<PyCopy> {
         if pool.block_bytes != self.core.block_bytes
             || !pool
@@ -496,7 +507,7 @@ impl PyCopier {
         }
 
         let completion = Arc::new(Completion::default());
-        let (chunks, chunk_completions) = Chunk::split(pages, pool, loading, &completion);
+        let (chunks, chunk_completions) = Chunk::split(pages, pool, loading, coalesce, &completion);
         let mut chunks = chunks.into_iter();
         while let Some(chunk) = chunks.next() {
             if let Err((error, failed_chunk)) = self.queue.send(chunk) {
@@ -849,9 +860,10 @@ impl Chunk {
         pages: Vec<(usize, Vec<(usize, u32)>)>,
         pool: &Arc<Pool>,
         loading: bool,
+        coalesced: bool,
         completion: &Arc<Completion>,
     ) -> (Vec<Self>, Vec<(TransferKey, Arc<ChunkCompletion>)>) {
-        let chunks = Self::partition_pages(pages);
+        let chunks = Self::partition_pages(pages, coalesced);
         if chunks.is_empty() {
             completion.mark_submitted(Ok(()));
             completion.finish(Ok(()));
@@ -897,6 +909,7 @@ impl Chunk {
                 pages,
                 pool: Arc::clone(pool),
                 loading,
+                coalesced,
                 completion,
                 job: Arc::clone(&job),
             })
@@ -904,7 +917,21 @@ impl Chunk {
         (chunks, pending)
     }
 
-    fn partition_pages(pages: Vec<(usize, Vec<(usize, u32)>)>) -> Vec<Vec<TransferPage>> {
+    fn partition_pages(
+        pages: Vec<(usize, Vec<(usize, u32)>)>,
+        coalesced: bool,
+    ) -> Vec<Vec<TransferPage>> {
+        if coalesced {
+            let pages = pages
+                .into_iter()
+                .map(|(slot, routes)| TransferPage { slot, routes })
+                .collect::<Vec<_>>();
+            return if pages.is_empty() {
+                Vec::new()
+            } else {
+                vec![pages]
+            };
+        }
         pages
             .into_iter()
             .fold(Vec::<Vec<_>>::new(), |mut chunks, (slot, routes)| {
@@ -939,6 +966,9 @@ impl Chunk {
             .iter()
             .map(|page| self.pool.slots[page.slot].acquire_dma())
             .collect::<io::Result<Vec<_>>>()?;
+        if self.coalesced {
+            return self.transfer_coalesced(executor, core, &mut hosts);
+        }
         let route_count = self
             .pages
             .iter()
@@ -1043,6 +1073,139 @@ impl Chunk {
             executor.block_on(submitted).map_err(io::Error::other)
         }
     }
+
+    fn transfer_coalesced(
+        &self,
+        executor: &tokio::runtime::Runtime,
+        core: &Core,
+        hosts: &mut [DmaSlot<'_>],
+    ) -> io::Result<()> {
+        let layers = core
+            .layers
+            .iter()
+            .map(|layer| staging::LayerLayout {
+                page_bytes: layer.page_bytes,
+                host_offset: layer.host_offset,
+            })
+            .collect::<Vec<_>>();
+        let layout = staging::Layout::new(&self.pages, &core.groups, &layers)?;
+        if layout.bytes == 0 {
+            self.job.submitted();
+            return Ok(());
+        }
+        let mut stages = (0..core.chips)
+            .map(|_| HostBuffer::zero(layout.bytes))
+            .collect::<Vec<_>>();
+        if stages.iter().any(|stage| !stage.is_pinned()) {
+            return Err(io::Error::other(
+                "coalesced cache copies require pinned staging buffers",
+            ));
+        }
+
+        if self.loading {
+            for item in &layout.items {
+                for (chip, stage) in stages.iter_mut().enumerate() {
+                    let source = hosts[item.page].slice(..).map_err(io::Error::other)?;
+                    let source = source.bytes().map_err(io::Error::other)?;
+                    let mut destination = stage
+                        .slice_mut(..)
+                        .and_then(|slice| slice.into_bytes())
+                        .map_err(io::Error::other)?;
+                    item.place(chip, &source, &mut destination)?;
+                }
+            }
+        }
+
+        if self.loading {
+            let mut aliases = staging_aliases(&layout, core)?;
+            let mut pairs = Vec::with_capacity(layout.segments.len() * core.chips);
+            for (chip, (stage, aliases)) in stages.iter().zip(&mut aliases).enumerate() {
+                for (segment, alias) in layout.segments.iter().zip(aliases) {
+                    let source = stage
+                        .slice(segment.stage.clone())
+                        .map_err(io::Error::other)?;
+                    let destination = alias
+                        .slice_mut(chip, segment.device.clone())
+                        .map_err(io::Error::other)?;
+                    pairs.push((source, destination));
+                }
+            }
+            let submitted = {
+                let mut context = core
+                    .context
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                context.device.pdma.to_hbm(pairs).submit()
+            };
+            self.job.submitted();
+            executor.block_on(submitted).map_err(io::Error::other)?;
+        } else {
+            let mut aliases = staging_aliases(&layout, core)?;
+            let mut pairs = Vec::with_capacity(layout.segments.len() * core.chips);
+            for (chip, (stage, aliases)) in stages.iter_mut().zip(&mut aliases).enumerate() {
+                let mut rest = stage.slice_mut(..).map_err(io::Error::other)?;
+                let mut cursor = 0;
+                for (segment, alias) in layout.segments.iter().zip(aliases) {
+                    let source = alias
+                        .slice(chip, segment.device.clone())
+                        .map_err(io::Error::other)?;
+                    let gap = segment
+                        .stage
+                        .start
+                        .checked_sub(cursor)
+                        .ok_or_else(|| io::Error::other("cache staging segments overlap"))?;
+                    let (before, tail) = rest.split_at(gap).map_err(io::Error::other)?;
+                    drop(before);
+                    let size = segment.stage.len();
+                    let (destination, tail) = tail.split_at(size).map_err(io::Error::other)?;
+                    rest = tail;
+                    cursor = segment.stage.end;
+                    pairs.push((source, destination));
+                }
+                if cursor != layout.bytes {
+                    return Err(io::Error::other("cache staging has unrouted bytes"));
+                }
+            }
+            let submitted = {
+                let mut context = core
+                    .context
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                context.device.pdma.to_host(pairs).submit()
+            };
+            self.job.submitted();
+            executor.block_on(submitted).map_err(io::Error::other)?;
+
+            for item in &layout.items {
+                for (chip, stage) in stages.iter().enumerate() {
+                    let source = stage.slice(..).map_err(io::Error::other)?;
+                    let source = source.bytes().map_err(io::Error::other)?;
+                    let mut destination = hosts[item.page]
+                        .slice_mut(..)
+                        .and_then(|slice| slice.into_bytes())
+                        .map_err(io::Error::other)?;
+                    item.take(chip, &source, &mut destination)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn staging_aliases(
+    layout: &staging::Layout,
+    core: &Core,
+) -> io::Result<Vec<Vec<prelude::HbmBuffer>>> {
+    (0..core.chips)
+        .map(|_| {
+            layout
+                .segments
+                .iter()
+                .map(|segment| core.layers[segment.layer].buffer.alias(..))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(io::Error::other)
+        })
+        .collect()
 }
 
 impl Job {
@@ -1251,6 +1414,7 @@ mod tests {
             vec![(0, vec![(0, 4)]), (1, vec![(0, 4)]), (2, vec![(0, 4)])],
             &pool,
             false,
+            false,
             &job,
         );
         assert_eq!(chunks.len(), 2);
@@ -1270,6 +1434,26 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn coalesced_copies_keep_all_pages_in_one_stage_batch() {
+        let pool = Arc::new(Pool {
+            slots: Vec::new(),
+            block_bytes: 0,
+            core: Weak::new(),
+        });
+        let job = Arc::new(Completion::default());
+        let (chunks, _) = Chunk::split(
+            (0..7).map(|slot| (slot, vec![(0, slot as u32)])).collect(),
+            &pool,
+            true,
+            true,
+            &job,
+        );
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].pages.len(), 7);
+        assert!(chunks[0].coalesced);
     }
 
     #[test]

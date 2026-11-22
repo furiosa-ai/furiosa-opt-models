@@ -86,9 +86,14 @@ class Copier:
             tuple[builtins.int, typing.Sequence[tuple[builtins.int, builtins.int]]]
         ],
         host: HostCache,
+        *,
+        coalesce: builtins.bool = False,
     ) -> Copy:
         r"""
         Submit device-to-host copies for host slots and their `(group, device_block)` routes.
+
+        Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
+        transient pinned memory for one batched runtime transfer.
         """
     def copy_in(
         self,
@@ -96,9 +101,14 @@ class Copier:
             tuple[builtins.int, typing.Sequence[tuple[builtins.int, builtins.int]]]
         ],
         host: HostCache,
+        *,
+        coalesce: builtins.bool = False,
     ) -> Copy:
         r"""
         Submit host-to-device copies for host slots and their `(group, device_block)` routes.
+
+        Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
+        transient pinned memory for one batched runtime transfer.
         """
     def shutdown(self) -> None:
         r"""

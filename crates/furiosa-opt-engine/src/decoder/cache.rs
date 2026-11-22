@@ -439,6 +439,28 @@ mod tests {
         assert!(paged(64, 0..1).layer_sizes(1 << 25).is_ok());
     }
 
+    /// A cache spec without model layers or storage groups is invalid before allocation.
+    #[test]
+    fn refuses_cache_specs_without_layers_or_groups() {
+        let cases = [
+            CacheSpec {
+                layer_count: 0,
+                pools: Vec::new(),
+                groups: Vec::new(),
+            },
+            CacheSpec {
+                layer_count: 1,
+                pools: vec![pool(16, 64)],
+                groups: Vec::new(),
+            },
+        ];
+        for spec in cases {
+            let error = spec.validate().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(error.to_string(), "cache spec has no layers or groups");
+        }
+    }
+
     /// Descriptors cover every stable model layer once, and logical groups have one block size,
     /// attention kind, and window even when engine groups use different page formats.
     #[test]

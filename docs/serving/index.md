@@ -154,11 +154,15 @@ Both servers copy the cache blocks of computed prompts to a tier of host memory,
 
     vLLM keeps its scheduler, LRU policy, file naming and lookup; the plugin stores pages in the engine's pinned host slots and uses aligned `O_DIRECT` I/O when the filesystem supports it, with buffered fallback otherwise. The filesystem tier has no size cap or automatic stale-directory cleanup; operators remove old directories.
     If `canonical_layout` is enabled, startup succeeds only when vLLM's canonical mapping is
-    byte-for-byte identical to the engine's page layout and each vLLM worker drives one engine
-    chip. The adapter raises an error for non-identity mappings instead of converting page
-    fragments. With `canonical_layout` disabled, it uses the worker's local page layout.
-    Cross-topology reuse still requires another reader to understand the same canonical layout
-    and block keys.
+    byte-for-byte identical to the engine's page layout. The adapter raises an error for
+    non-identity mappings instead of converting page fragments. With `canonical_layout` disabled,
+    it uses the worker's local page layout.
+    A block key names cached token content, while its page bytes encode the worker's tensor-parallel
+    shards. Direct restore is correct only when the reader maps that key to the same canonical byte
+    sequence; otherwise heads land in the wrong shards. Each engine page is one chip's shard, so a
+    worker spanning chips would need those shards gathered into the canonical page. Translating
+    layouts also requires scattering or reshaping page fragments. This adapter keeps direct DMA, so
+    it accepts only identity mappings and one engine chip per worker.
     vLLM completes a transfer once the worker of each rank reports it, and one worker drives every chip, so offloading serves one chip a replica.
     It also serves one replica: with data parallelism vLLM ranks each replica's worker among all of them.
     Sleep mode frees the cache storage the host tier copies, so startup refuses `--enable-sleep-mode` beside offloading.
@@ -171,7 +175,12 @@ Both servers copy the cache blocks of computed prompts to a tier of host memory,
     ```
 
     `--hicache-ratio` sizes the host tier as a multiple of the device cache, `--hicache-size` in GB; SGLang sizes it from the free host memory only for the device pools it builds itself, so one of them is required.
-    `--hicache-storage-backend file` persists host pages through SGLang's `HiCacheFile`; pass `--hicache-storage-backend-extra-config` to set its `file_storage_path`.
+    `--hicache-storage-backend file` persists host pages through SGLang's file storage interface;
+    pass `--hicache-storage-backend-extra-config` to set its `file_storage_path`.
+    Furiosa loads its file adapter through SGLang's `dynamic` storage-backend factory while
+    retaining SGLang's file-tier keys and lifecycle. Other storage backends need their own host
+    buffer integration. MTP draft pools are packed draft layers; this host pool transfers only the
+    engine-owned target-model KV pages, so startup rejects that combination.
     The memory saver frees the cache storage the host tier copies, so startup refuses `--enable-memory-saver` beside the hierarchical cache.
     A `/generate` response reports reused tokens by tier in `meta_info.cached_tokens_details`.
 

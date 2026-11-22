@@ -32,6 +32,59 @@ def test_hierarchical_cache_moves_whole_pages(slots: Sequence[int], pages: list[
     assert offload.pages(torch.tensor(list(slots), dtype=torch.int64), 16) == pages
 
 
+def test_hierarchical_cache_requires_positive_page_size() -> None:
+    import torch
+
+    from furiosa_opt_sglang import offload
+
+    with pytest.raises(ValueError, match="page size must be positive"):
+        _ = offload.pages(torch.empty(0, dtype=torch.int64), 0)
+
+
+def test_layer_load_callbacks_submit_one_engine_copy() -> None:
+    import torch
+
+    from furiosa_opt_sglang.offload import Host
+
+    class Copy:
+        def __init__(self) -> None:
+            self.submitted_count = 0
+            self.done_count = 0
+
+        def submitted(self) -> None:
+            self.submitted_count += 1
+
+        def done(self) -> bool:
+            self.done_count += 1
+            return False
+
+    class Copier:
+        def __init__(self) -> None:
+            self.calls = []
+            self.copy = Copy()
+
+        def copy_in(self, pages, host_cache):
+            self.calls.append((pages, host_cache))
+            return self.copy
+
+    host = Host.__new__(Host)
+    host.page_size = 2
+    host.layer_num = 2
+    host.host_cache = object()
+    host.copier = Copier()
+    host._pending_loads = {}
+    host_indices = torch.tensor([4, 5], dtype=torch.int64)
+    device_indices = torch.tensor([2, 3], dtype=torch.int64)
+
+    host.load_to_device_per_layer(None, host_indices, device_indices, 0, "cpu")
+    host.load_to_device_per_layer(None, host_indices, device_indices, 1, "cpu")
+
+    assert host.copier.calls == [([(2, [(0, 1)])], host.host_cache)]
+    assert host.copier.copy.submitted_count == 1
+    assert host.copier.copy.done_count == 1
+    assert host._pending_loads == {}
+
+
 @pytest.mark.parametrize(
     ("slots", "reason"),
     [

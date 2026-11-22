@@ -2,7 +2,8 @@
 
 - `Worker` starts a step's stores in the next step, ends the stores a step flushes before its calls,
   and reports a load's request once the load landed.
-- `Host` keeps one pinned engine slot per GPU block, including all selected cache-group page ranges.
+- `Host` keeps one pinned engine slot per device block, including all selected cache-group page
+  ranges.
   Six native workers submit two-slot DMA batches, each batching every routed layer into one runtime
   call.
 - Copies return after submission so later device work can queue behind them. `Jobs` keeps each copy
