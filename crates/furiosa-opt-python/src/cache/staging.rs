@@ -1,24 +1,36 @@
+//! Staging layout for coalesced cache copies.
+
 use std::io;
 use std::ops::Range;
 
-use super::TransferPage;
+use super::queue::TransferPage;
 
 #[derive(Clone, Copy)]
+/// Per-layer byte size and offset in a host cache slot.
 pub(super) struct LayerLayout {
+    /// Bytes in one layer page on one chip.
     pub(super) page_bytes: usize,
+    /// Byte offset of this layer's page in the host slot.
     pub(super) host_offset: usize,
 }
 
 #[derive(Debug, Eq, PartialEq)]
+/// One layer page's source slot and destination range in a chip's stage buffer.
 pub(super) struct Item {
+    /// Index of the source page in the transfer batch.
     pub(super) page: usize,
+    /// Index of the layer in the copier.
     pub(super) layer: usize,
+    /// Bytes copied for this page on one chip.
     pub(super) page_bytes: usize,
+    /// Offset of the page in its host slot.
     pub(super) host_offset: usize,
+    /// Range reserved for this page in each chip's stage buffer.
     pub(super) stage: Range<usize>,
 }
 
 impl Item {
+    /// Copy this chip's bytes from a host slot into its stage range.
     pub(super) fn place(&self, chip: usize, host: &[u8], stage: &mut [u8]) -> io::Result<()> {
         let host_range = self.host_range(chip)?;
         let source = host
@@ -31,6 +43,7 @@ impl Item {
         Ok(())
     }
 
+    /// Copy this chip's stage range back into its host slot.
     pub(super) fn take(&self, chip: usize, stage: &[u8], host: &mut [u8]) -> io::Result<()> {
         let source = stage
             .get(self.stage.clone())
@@ -42,6 +55,7 @@ impl Item {
         Ok(())
     }
 
+    /// Return this chip's byte range within the concatenated host page.
     fn host_range(&self, chip: usize) -> io::Result<Range<usize>> {
         let start = self
             .host_offset
@@ -58,21 +72,29 @@ impl Item {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+/// Adjacent bytes copied between one layer's stage and device buffers.
 pub(super) struct Segment {
+    /// Index of the layer in the copier.
     pub(super) layer: usize,
+    /// Contiguous range in each chip's stage buffer.
     pub(super) stage: Range<usize>,
+    /// Contiguous byte range in the layer's device buffer.
     pub(super) device: Range<usize>,
 }
 
 #[derive(Debug)]
+/// Coalesced copy layout shared by every chip in the device topology.
 pub(super) struct Layout {
+    /// Individual pages used to gather from or scatter to host slots.
     pub(super) items: Vec<Item>,
+    /// Contiguous layer ranges submitted to PDMA.
     pub(super) segments: Vec<Segment>,
+    /// Total bytes required for one chip's stage buffer.
     pub(super) bytes: usize,
 }
 
 impl Layout {
-    /// Each chip's stage, with device-adjacent pages in one segment per layer.
+    /// Build per-chip stage ranges and merge device-adjacent pages within each layer.
     pub(super) fn new(
         pages: &[TransferPage],
         groups: &[Vec<usize>],
@@ -154,6 +176,7 @@ mod tests {
     use super::*;
 
     #[test]
+    /// Routes host pages into stage buffers and merges adjacent device pages.
     fn lays_out_layer_pages_and_merges_adjacent_device_ranges() {
         let pages = [
             TransferPage {
@@ -224,6 +247,7 @@ mod tests {
     }
 
     #[test]
+    /// Rejects a repeated destination page in the transfer routes.
     fn rejects_duplicate_device_layer_pages() {
         let pages = [
             TransferPage {
@@ -251,6 +275,7 @@ mod tests {
     }
 
     #[test]
+    /// Gathers and restores each chip's slice of the host pages.
     fn places_and_takes_each_chip_layer_page() {
         let pages = [
             TransferPage {
@@ -307,6 +332,7 @@ mod tests {
     }
 
     #[test]
+    /// Orders staging pages by device block while preserving disjoint ranges.
     fn sorts_host_pages_by_device_block_and_keeps_gaps_separate() {
         let pages = [
             TransferPage {

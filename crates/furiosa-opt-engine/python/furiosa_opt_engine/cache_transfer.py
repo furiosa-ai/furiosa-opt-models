@@ -197,13 +197,13 @@ def submit(transfers: Iterable[TransferT]) -> tuple[TransferT, ...]:
     return tuple(submitted)
 
 
-def settle(transfers: Iterable[PendingTransfer]) -> Exception | None:
+def settle(transfers: Iterable[PendingTransfer]) -> BaseException | None:
     """Wait for every submitted copy and return the first failure after draining the rest."""
     failure = None
     for transfer in transfers:
         try:
             transfer.wait()
-        except Exception as error:
+        except BaseException as error:
             if failure is None:
                 failure = error
     return failure

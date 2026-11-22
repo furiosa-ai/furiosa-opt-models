@@ -65,7 +65,9 @@ class Checkpoint:
 @typing.final
 class Copier:
     r"""
-    Python handle for the device cache's copy queue.
+    Python handle for asynchronous device-cache copies. `copy_in` and `copy_out` return a `Copy`
+    handle without waiting for its DMA. Reusing a host slot or device page may first wait for
+    conflicting earlier copies.
     """
     def __new__(
         cls,
@@ -91,7 +93,10 @@ class Copier:
         coalesce: builtins.bool = False,
     ) -> Copy:
         r"""
-        Submit device-to-host copies for host slots and their `(group, device_block)` routes.
+        Submit device-to-host copies without waiting for their DMA to finish.
+
+        `pages` names host slots and their `(group, device_block)` routes. Reusing a host slot or
+        device page may first wait for conflicting earlier copies.
         Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
         transient pinned memory for one batched runtime transfer.
         """
@@ -105,7 +110,10 @@ class Copier:
         coalesce: builtins.bool = False,
     ) -> Copy:
         r"""
-        Submit host-to-device copies for host slots and their `(group, device_block)` routes.
+        Submit host-to-device copies without waiting for their DMA to finish.
+
+        `pages` names host slots and their `(group, device_block)` routes. Reusing a host slot or
+        device page may first wait for conflicting earlier copies.
         Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
         transient pinned memory for one batched runtime transfer.
         """
@@ -117,10 +125,16 @@ class Copier:
 @typing.final
 class Copy:
     r"""
-    Completion of a queued cache copy.
+    Completion handle for asynchronous cache copies.
     """
-    def done(self, timeout: builtins.float | None = 0.0) -> builtins.bool: ...
-    def wait(self) -> None: ...
+    def done(self, timeout: builtins.float | None = 0.0) -> builtins.bool:
+        r"""
+        Return whether the copy finished before `timeout` elapsed.
+        """
+    def wait(self) -> None:
+        r"""
+        Wait until every copy in the request completes, raising its transfer error if any.
+        """
     def submitted(self) -> None:
         r"""
         Wait until every runtime batch was submitted, without waiting for DMA completion.

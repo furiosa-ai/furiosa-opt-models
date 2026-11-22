@@ -2,12 +2,13 @@
 
 Each pinned slot holds one whole page across all layers. Six native workers batch up to two slots,
 with every layer copy in one runtime DMA batch. SGLang keeps page selection and lifecycle; the
-adapter submits stores asynchronously and reads storage through the same pinned slots. A load waits
-for its all-layer batch before returning, so SGLang's per-layer ready events follow completed DMA.
+adapter tracks engine copies so SGLang's native events are recorded only after DMA completion.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from threading import Lock, local
 from typing import TYPE_CHECKING, Final, final
 
 import torch
@@ -27,6 +28,7 @@ from typing_extensions import override
 import furiosa_opt_engine as engine
 from furiosa_opt_sglang.cache import Cache
 from furiosa_opt_sglang.platform import Hierarchical
+from furiosa_opt_sglang.transfer import AsyncL2TransferEngine
 
 ENGINE_CACHE_GROUP = 0
 
@@ -117,6 +119,9 @@ class Strategy(StackStrategy):
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=options.hicache_host_memory_mode,
         )
+        transfer_engine = AsyncL2TransferEngine(controller.l2_transfer_engine)
+        controller.l2_transfer_engine = transfer_engine
+        host.transfer_engine = transfer_engine
         return StackBuildResult(
             host_pool_group=group,
             cache_controller=controller,
@@ -143,6 +148,7 @@ class Host(HostKVCache):
         # SGLang's pool reads these while it allocates the pages.
         self.device_pool = cache
         self.layer_num = self.target_layer_num = cache.layer_num
+        self.transfer_engine = None
         super().__init__(
             dtype=cache.dtype,
             device_capacity_tokens=cache.size,
@@ -177,6 +183,9 @@ class Host(HostKVCache):
         )
         self.host_cache = engine.HostCache(self.copier, self.page_num)
         self._pending_loads: dict[tuple[tuple[int, ...], tuple[int, ...]], set[int]] = {}
+        self._pending_loads_lock = Lock()
+        self._copier_lock = Lock()
+        self._copy_batch = local()
         return [self.host_cache]
 
     @override
@@ -185,12 +194,30 @@ class Host(HostKVCache):
 
     @override
     def destroy(self) -> None:
+        transfer_engine = self.transfer_engine
+        failure = None
+        try:
+            if transfer_engine is not None:
+                transfer_engine.shutdown()
+        except BaseException as error:
+            failure = error
         copier = getattr(self, "copier", None)
-        if copier is not None:
-            copier.shutdown()
+        try:
+            if copier is not None:
+                copier.shutdown()
+        except BaseException as error:
+            if failure is None:
+                failure = error
+            else:
+                failure = RuntimeError(
+                    f"{failure}; shutting down the cache copier also failed: {error}"
+                )
+        self.transfer_engine = None
         self.host_cache = None
         self.copier = None
         super().destroy()
+        if failure is not None:
+            raise failure
 
     @override
     def backup_from_device_all_layer(
@@ -208,8 +235,8 @@ class Host(HostKVCache):
             (target, [(ENGINE_CACHE_GROUP, source)])
             for source, target in zip(device, host, strict=True)
         ]
-        copy = self.copier.copy_out(transfers, self.host_cache)
-        copy.submitted()
+        copy = self._create_copy(self.copier.copy_out, transfers)
+        self._submit_copy(copy)
 
     @override
     def load_to_device_per_layer(
@@ -232,24 +259,74 @@ class Host(HostKVCache):
             return
 
         key = (tuple(device), tuple(host))
-        seen = self._pending_loads.get(key)
-        if seen is None:
+        pending_loads_lock = getattr(self, "_pending_loads_lock", None)
+        if pending_loads_lock is None:
+            pending_loads_lock = self._pending_loads_lock = Lock()
+        with pending_loads_lock:
+            seen = self._pending_loads.get(key)
+            new_copy = seen is None
+            if seen is None:
+                seen = set()
+                self._pending_loads[key] = seen
+            seen.add(layer_id)
+            if len(seen) == self.layer_num:
+                del self._pending_loads[key]
+
+        if new_copy:
             # SGLang calls once per layer; Copier moves every layer in one page batch.
             transfers = [
                 (target, [(ENGINE_CACHE_GROUP, source)])
                 for source, target in zip(device, host, strict=True)
             ]
-            copy = self.copier.copy_in(transfers, self.host_cache)
-            copy.submitted()
-            # SGLang records layer-ready and allocator-finish events as soon as this callback
-            # returns; neither event is ordered with the engine's PDMA queue. The engine batches
-            # every layer into one DMA call, so wait for it before SGLang may consume or reuse pages.
-            copy.wait()
-            seen = set()
-            self._pending_loads[key] = seen
-        seen.add(layer_id)
-        if len(seen) == self.layer_num:
-            del self._pending_loads[key]
+            copy = self._create_copy(self.copier.copy_in, transfers)
+            copy_batch = getattr(self, "_copy_batch", None)
+            if copy_batch is not None and hasattr(copy_batch, "load_keys"):
+                copy_batch.load_keys.append(key)
+            try:
+                self._submit_copy(copy)
+            except BaseException:
+                with pending_loads_lock:
+                    self._pending_loads.pop(key, None)
+                raise
+
+    def begin_async_copy_batch(self) -> None:
+        if hasattr(self._copy_batch, "copies"):
+            raise RuntimeError("nested SGLang cache copy batch")
+        self._copy_batch.copies = []
+        self._copy_batch.load_keys = []
+
+    def finish_async_copy_batch(self) -> list[engine.Copy]:
+        batch = getattr(self, "_copy_batch", None)
+        copies = None if batch is None else getattr(batch, "copies", None)
+        if copies is None:
+            return []
+        del batch.copies
+        load_keys = batch.load_keys
+        del batch.load_keys
+        with self._pending_loads_lock:
+            for key in load_keys:
+                self._pending_loads.pop(key, None)
+        return copies
+
+    def _submit_copy(self, copy: engine.Copy) -> None:
+        batch = getattr(self, "_copy_batch", None)
+        copies = None if batch is None else getattr(batch, "copies", None)
+        if copies is not None:
+            copies.append(copy)
+            return
+        copy.submitted()
+        copy.wait()
+
+    def _create_copy(
+        self,
+        submit: Callable[[list[tuple[int, list[tuple[int, int]]]], engine.HostCache], engine.Copy],
+        transfers: list[tuple[int, list[tuple[int, int]]]],
+    ) -> engine.Copy:
+        copier_lock = getattr(self, "_copier_lock", None)
+        if copier_lock is None:
+            return submit(transfers, self.host_cache)
+        with copier_lock:
+            return submit(transfers, self.host_cache)
 
     @override
     def get_data_page(self, index: int, flat: bool = True) -> torch.Tensor:
