@@ -435,7 +435,6 @@ impl PyCopier {
                 "host cache was allocated for a different copier",
             ));
         }
-        pages.sort_unstable_by_key(|(slot, _)| *slot);
         for (_, routes) in &mut pages {
             routes.sort_unstable_by_key(|&(group, _)| group);
         }
@@ -932,17 +931,24 @@ impl Chunk {
                 vec![pages]
             };
         }
-        pages
-            .into_iter()
-            .fold(Vec::<Vec<_>>::new(), |mut chunks, (slot, routes)| {
-                match chunks.last_mut() {
-                    Some(last) if last.len() < COPY_CHUNK_BLOCKS => {
-                        last.push(TransferPage { slot, routes });
-                    }
-                    _ => chunks.push(vec![TransferPage { slot, routes }]),
+        let mut chunks = Vec::<Vec<TransferPage>>::new();
+        for (slot, routes) in pages {
+            let page = TransferPage { slot, routes };
+            match chunks.last_mut() {
+                Some(last)
+                    if last.len() < COPY_CHUNK_BLOCKS
+                        && last.iter().all(|page| page.slot != slot) =>
+                {
+                    last.push(page);
                 }
-                chunks
-            })
+                _ => chunks.push(vec![page]),
+            }
+        }
+        // Keep input chunk boundaries; order each chunk's host locks to prevent lock cycles.
+        for chunk in &mut chunks {
+            chunk.sort_unstable_by_key(|page| page.slot);
+        }
+        chunks
     }
 
     fn run(self, executor: &tokio::runtime::Runtime, core: &Core) {
@@ -1454,6 +1460,25 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].pages.len(), 7);
         assert!(chunks[0].coalesced);
+    }
+
+    #[test]
+    fn page_batches_match_the_reference_queue_partition() {
+        let pages = vec![
+            (9, vec![(0, 9)]),
+            (3, vec![(0, 3)]),
+            (1, vec![(0, 1)]),
+            (3, vec![(0, 30)]),
+            (8, vec![(0, 8)]),
+        ];
+
+        let chunks = Chunk::partition_pages(pages, false);
+        let slots: Vec<Vec<_>> = chunks
+            .iter()
+            .map(|chunk| chunk.iter().map(|page| page.slot).collect())
+            .collect();
+
+        assert_eq!(slots, [vec![3, 9], vec![1], vec![3, 8]]);
     }
 
     #[test]

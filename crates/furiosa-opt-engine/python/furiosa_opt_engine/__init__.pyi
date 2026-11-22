@@ -25,6 +25,7 @@ __all__ = [
     "HostBuffer",
     "HostCache",
     "HostSlot",
+    "HostSlotAccess",
     "HostTensor",
     "LoadOptions",
     "Placement",
@@ -91,7 +92,6 @@ class Copier:
     ) -> Copy:
         r"""
         Submit device-to-host copies for host slots and their `(group, device_block)` routes.
-
         Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
         transient pinned memory for one batched runtime transfer.
         """
@@ -106,7 +106,6 @@ class Copier:
     ) -> Copy:
         r"""
         Submit host-to-device copies for host slots and their `(group, device_block)` routes.
-
         Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
         transient pinned memory for one batched runtime transfer.
         """
@@ -419,12 +418,12 @@ class HostCache:
 @typing.final
 class HostSlot:
     r"""
-    A zero-copy view of one pinned host slot. Direct exports fail while DMA owns or waits for it.
+    A zero-copy view of one pinned host slot.
     """
     def __len__(self) -> builtins.int: ...
     def access(self) -> HostSlotAccess:
         r"""
-        Wait for DMA; lease the slot while this object or its exported buffers remain alive.
+        Wait for DMA, then lease the slot while this object or its exported buffers remain alive.
         """
 
 @typing.final
