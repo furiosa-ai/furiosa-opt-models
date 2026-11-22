@@ -353,21 +353,22 @@ class Host(OffloadingWorker):
             host_pool.unregister(self.engine_id, self.host_cache)
 
     def transfers(self, groups: list[GroupWork], *, store: bool) -> Iterable[PendingTransfer]:
-        """Copy two-page DMA batches between engine layers and pinned host slots."""
+        """Route each pinned host slot across its cache groups in two-page DMA batches."""
+        pages: dict[int, list[tuple[int, int]]] = {}
         for work in groups:
             group_index = self.group_indices[work.group_id]
             for chunk in work.chunks:
-                host_indices = tuple(
-                    chunk.chunk_id * self.blocks + slot for slot in chunk.host_slots
-                )
-                pairs = list(zip(chunk.device_blocks, host_indices, strict=True))
-                transfer = (
-                    self.copier.copy_out(pairs, self.host_cache, group_index)
-                    if store
-                    else self.copier.copy_in(pairs, self.host_cache, group_index)
-                )
-                transfer.submitted()
-                yield transfer
+                for block, slot in zip(chunk.device_blocks, chunk.host_slots, strict=True):
+                    host_slot = chunk.chunk_id * self.blocks + slot
+                    pages.setdefault(host_slot, []).append((group_index, block))
+        routed_pages = [(slot, routes) for slot, routes in sorted(pages.items())]
+        transfer = (
+            self.copier.copy_out(routed_pages, self.host_cache)
+            if store
+            else self.copier.copy_in(routed_pages, self.host_cache)
+        )
+        transfer.submitted()
+        yield transfer
 
     def _groups(self, device: GPULoadStoreSpec, host: LoadStoreSpec) -> list[GroupWork]:
         if not isinstance(host, CPULoadStoreSpec):

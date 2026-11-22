@@ -24,13 +24,11 @@ from typing import TYPE_CHECKING, Final, Literal, TypeAlias, assert_never, final
 
 import torch
 from typing_extensions import override
-from vllm import envs
 
 from furiosa_opt_vllm.contracts import Contract
 from furiosa_opt_vllm.offloading import (
     direct_connector_contracts,
     direct_offloadings,
-    offload,
     offloading_contracts,
 )
 

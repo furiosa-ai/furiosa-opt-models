@@ -352,15 +352,17 @@ class Copier:
     ) -> Copier: ...
     def copy_in(
         self,
-        pairs: collections.abc.Sequence[tuple[builtins.int, builtins.int]],
+        pages: collections.abc.Sequence[
+            tuple[builtins.int, collections.abc.Sequence[tuple[builtins.int, builtins.int]]]
+        ],
         host: HostCache,
-        group: builtins.int,
     ) -> Copy: ...
     def copy_out(
         self,
-        pairs: collections.abc.Sequence[tuple[builtins.int, builtins.int]],
+        pages: collections.abc.Sequence[
+            tuple[builtins.int, collections.abc.Sequence[tuple[builtins.int, builtins.int]]]
+        ],
         host: HostCache,
-        group: builtins.int,
     ) -> Copy: ...
     def shutdown(self) -> None: ...
 

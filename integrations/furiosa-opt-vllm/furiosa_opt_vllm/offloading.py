@@ -155,14 +155,20 @@ def offloading_contracts(
             lambda config: (
                 not settings_for(config) or config.parallel_config.tensor_parallel_size == 1
             ),
-            "offloads at tensor_parallel_size=1: vLLM awaits each rank; one worker drives all chips",
+            (
+                "offloads at tensor_parallel_size=1: vLLM awaits each rank; "
+                "one worker drives all chips"
+            ),
         ),
         Contract(
             "pipeline_parallel_size",
             lambda config: (
                 not settings_for(config) or config.parallel_config.pipeline_parallel_size == 1
             ),
-            "offloads at pipeline_parallel_size=1: vLLM awaits each rank; one worker drives all chips",
+            (
+                "offloads at pipeline_parallel_size=1: vLLM awaits each rank; "
+                "one worker drives all chips"
+            ),
         ),
         Contract(
             "data_parallel_size",
@@ -173,15 +179,16 @@ def offloading_contracts(
         ),
         Contract(
             "kv_offloading_size",
-            lambda config: (
-                not settings_for(config) or engine_cache(config.model_config)
-            ),
+            lambda config: not settings_for(config) or engine_cache(config.model_config),
             "offloads the attention cache of a decoder, not recurrent state or encoder memory",
         ),
         Contract(
             "kv_offloading_size",
             lambda config: not settings_for(config) or not config.is_mm_encoder_only,
-            "offloads the attention cache of a decoder, which an encoder-only instance does not run",
+            (
+                "offloads the attention cache of a decoder, which an encoder-only "
+                "instance does not run"
+            ),
         ),
         Contract(
             "enable_sleep_mode",
@@ -196,6 +203,7 @@ def offloading_contracts(
 
 def direct_connector_contracts() -> tuple[Contract, ...]:
     """The connectors accepted by the filesystem offload adapter without composition."""
+
     def direct_offloading(config: VllmConfig) -> bool:
         transfer = config.kv_transfer_config
         return transfer is None or (

@@ -197,8 +197,8 @@ class Host(HostKVCache):
         host = pages(host_indices, self.page_size)
         if len(device) != len(host):
             raise ValueError("hierarchical cache backup source and destination pages differ")
-        pairs = [(source, target) for source, target in zip(device, host, strict=True)]
-        copy = self.copier.copy_out(pairs, self.host_cache, 0)
+        transfers = [(target, [(0, source)]) for source, target in zip(device, host, strict=True)]
+        copy = self.copier.copy_out(transfers, self.host_cache)
         copy.submitted()
 
     @override
@@ -224,8 +224,10 @@ class Host(HostKVCache):
         key = (tuple(device), tuple(host))
         pending = self._pending_loads.get(key)
         if pending is None:
-            pairs = [(source, target) for source, target in zip(device, host, strict=True)]
-            copy = self.copier.copy_in(pairs, self.host_cache, 0)
+            transfers = [
+                (target, [(0, source)]) for source, target in zip(device, host, strict=True)
+            ]
+            copy = self.copier.copy_in(transfers, self.host_cache)
             copy.submitted()
             seen: set[int] = set()
             self._pending_loads[key] = (seen, copy)
