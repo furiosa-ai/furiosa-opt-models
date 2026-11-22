@@ -8,7 +8,8 @@ import mmap
 import os
 import threading
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from itertools import pairwise
 from typing import Protocol, TypeAlias, TypeVar, cast
 
 from typing_extensions import Buffer
@@ -197,3 +198,62 @@ def settle(transfers: Iterable[PendingTransfer]) -> Exception | None:
             if failure is None:
                 failure = error
     return failure
+
+
+def page_runs(
+    device_pages: Sequence[int], host_pages: Sequence[int], chips: int
+) -> tuple[tuple[int, int, int], ...]:
+    """Group adjacent page pairs when one DMA can represent them without changing shard order."""
+    if chips <= 0:
+        raise ValueError("cache transfers require at least one chip")
+    if len(device_pages) != len(host_pages):
+        raise ValueError("device and host page lists must have the same length")
+    starts: list[int] = []
+    for index, (device_page, host_page) in enumerate(
+        zip(device_pages, host_pages, strict=True)
+    ):
+        if device_page < 0 or host_page < 0:
+            raise ValueError("cache page indices cannot be negative")
+        if (
+            index == 0
+            or chips > 1
+            or (device_page - device_pages[index - 1], host_page - host_pages[index - 1])
+            != (1, 1)
+        ):
+            starts.append(index)
+    return tuple(
+        (device_pages[start], host_pages[start], end - start)
+        for start, end in pairwise((*starts, len(device_pages)))
+    )
+
+
+def transfer_cache_pages(
+    layer: engine.HbmBuffer,
+    host: engine.HostBuffer,
+    device_pages: Sequence[int],
+    host_pages: Sequence[int],
+    page_bytes: int,
+    chips: int,
+    *,
+    to_host: bool,
+) -> tuple[engine.Transfer, ...]:
+    """Move one layer's cache pages through the supplied pinned host rows.
+
+    This serves adapters, such as NIXL, that own their host buffers separately from the L3
+    HostCache. L3 filesystem transfers use the batched Copier queue instead.
+    """
+    if page_bytes <= 0:
+        raise ValueError("cache pages must contain bytes")
+    host_page_bytes = page_bytes * chips
+
+    def transfers() -> Iterable[engine.Transfer]:
+        for device_page, host_page, count in page_runs(device_pages, host_pages, chips):
+            device_range = layer.slice(device_page * page_bytes, count * page_bytes)
+            host_range = host.slice(host_page * host_page_bytes, count * host_page_bytes)
+            yield (
+                device_range.to_host(host_range)
+                if to_host
+                else host_range.to_hbm(device_range)
+            )
+
+    return submit(transfers())
