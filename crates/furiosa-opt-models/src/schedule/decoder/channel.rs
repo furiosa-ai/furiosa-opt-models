@@ -75,7 +75,7 @@ fn short_decode(call: Launched<'_, '_>) -> bool {
     call.live.rows() <= 8 && call.context.0.read.items().rows() == call.live.rows()
 }
 
-/// Q and K read the same period coefficients in their respective head layouts.
+/// Rotate Q immediately, spill it between K and V, then rotate and spill K with V.
 fn store_period<G: Group>(
     device: &mut Device,
     positions: &rotary::Rotary<Head>,
@@ -89,21 +89,21 @@ fn store_period<G: Group>(
     >,
     stored: &mut Stored,
     start: usize,
-    (q, k, v): (
-        query::Queries<G, QueryHeads<S>, Head>,
-        query::Pairs<G, KvHeads, Head>,
-        query::Pairs<G, KvHeads, Head>,
-    ),
+    q: query::Queries<G, QueryHeads<S>, Head>,
+    project_key: impl FnOnce(&mut Device) -> query::Pairs<G, KvHeads, Head>,
+    project_value: impl FnOnce(&mut Device) -> query::Pairs<G, KvHeads, Head>,
 ) {
     let qr = crate::Op::forward(&group::Stage, device, coefficients);
+    let q = crate::Op::forward(positions, device, (&q, &qr));
+    let k = project_key(device);
+    stored.queries.spill(device, &q, start);
+    let v = project_value(device);
     let kr = crate::Op::forward(
         &group::Stage,
         device,
         (coefficients, PhantomData::<KvHeads>),
     );
-    let q = crate::Op::forward(positions, device, (&q, &qr));
     let k = crate::Op::forward(positions, device, (&k, &kr));
-    stored.queries.spill(device, &q, start);
     stored.retained.spill(device, (&k, &v), start);
 }
 
@@ -157,17 +157,15 @@ fn start(
                         output.forward(device, (), &mut (), &mut *projecting);
                     }
                 });
-            let k: query::Pairs<TilePair, KvHeads, Head> =
-                current.project(device, &front.key, &operand);
-            let v: query::Pairs<TilePair, KvHeads, Head> =
-                current.project(device, &front.value, &operand);
             store_period::<TilePair>(
                 device,
                 positions,
                 &coefficients,
                 stored,
                 at.start(),
-                (q, k, v),
+                q,
+                |device| current.project(device, &front.key, &operand),
+                |device| current.project(device, &front.value, &operand),
             );
             current = next;
         }
@@ -199,20 +197,20 @@ fn start(
                     output.forward(device, (), &mut (), &mut *projecting);
                 }
             });
-        if !early {
-            key_channels = period.channels(device, &front.key);
-        }
-        let k: query::Pairs<Tiles<1>, KvHeads, Head> =
-            period.project_ready(device, &front.key, &operand, key_channels);
-        let v: query::Pairs<Tiles<1>, KvHeads, Head> =
-            period.project(device, &front.value, &operand);
         store_period::<Tiles<1>>(
             device,
             positions,
             &coefficients,
             stored,
             at.start(),
-            (q, k, v),
+            q,
+            |device| {
+                if !early {
+                    key_channels = period.channels(device, &front.key);
+                }
+                period.project_ready(device, &front.key, &operand, key_channels)
+            },
+            |device| period.project(device, &front.value, &operand),
         );
     }
 }
