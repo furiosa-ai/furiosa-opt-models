@@ -199,9 +199,10 @@ one syscall per cache page, and vLLM keeps its chunk files with each page at its
 The engine waits only for earlier DMA chunks touching the same host slot or device page. A lease on
 a host slot keeps DMA out while Python uses its pinned bytes; transfers for other pages remain
 independent. SGLang submits these engine copies asynchronously; its completion events follow the
-finished copy. Each engine DMA batch includes every layer page for up to two host slots. The
-adapter reports SGLang's per-layer readiness only after its full Copy request finishes, so this
-path does not expose layer-by-layer load/compute overlap.
+finished copy. Each engine DMA batch includes every layer page for up to two host slots, avoiding
+separate runtime submissions per layer. The adapter therefore reports SGLang's per-layer
+readiness only after its full Copy request finishes. Splitting copies per layer could overlap
+earlier layers with later transfers, at the cost of more runtime submissions.
 
 Only the attention cache moves, so both servers refuse offloading at startup for a model with recurrent state, and vLLM also for one with encoder memory; the [vLLM](vllm.md#options) and [SGLang](sglang.md#options) option pages name the other refused settings.
 A failed copy poisons the memory it touched, and neither server recovers once it observes the failure, so vLLM's `kv_load_failure_policy` takes only `fail`.
