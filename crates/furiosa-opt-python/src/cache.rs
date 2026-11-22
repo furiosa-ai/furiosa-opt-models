@@ -1,7 +1,7 @@
 //! The pinned host cache and its asynchronous HBM transfer queue.
 //!
-//! A slot holds every selected layer's bytes for one cache block. Six workers submit transfers in
-//! chunks of two blocks, each chunk batching all its layer copies into one runtime read or write.
+//! A slot holds selected layer bytes for one cache block. Six workers submit transfers in chunks
+//! of two blocks, each chunk batching all routed layer copies into one runtime read or write.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{c_int, c_void};
