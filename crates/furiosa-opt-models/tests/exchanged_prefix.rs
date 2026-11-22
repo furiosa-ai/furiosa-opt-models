@@ -1,4 +1,4 @@
-//! Compact whole exchange and bounded grouped projection through a borrowed Module view.
+//! Whole exchange of compact parts and bounded grouped projection through a borrowed Module view.
 
 #![feature(register_tool, negative_impls)]
 #![register_tool(furiosa_opt)]
@@ -291,7 +291,6 @@ async fn check<R: AxisName, I: AxisName, O: AxisName, G: Extents>(works: &[usize
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires four explicitly selected RNGD chips"]
 async fn compact_exchange_named_projection_matches_fp64_at_all_main_work_extents() {
     check::<
         Rows<10496>,
@@ -303,7 +302,6 @@ async fn compact_exchange_named_projection_matches_fp64_at_all_main_work_extents
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires four explicitly selected RNGD chips"]
 async fn full_width_exchange_projection_matches_fp64_at_one_block() {
     check::<Rows<768>, Hidden<7168>, ProjectionWidth<5376>, (Rows<256>,)>(&[256]).await;
 }

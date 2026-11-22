@@ -42,12 +42,7 @@ struct Field {
     /// The local a destructuring binds the field to.
     binding: Ident,
     ty: Type,
-    part: Part,
-}
-
-/// How a field takes part in the projection.
-enum Part {
-    Projected(Segment),
+    segment: Segment,
 }
 
 /// The path segment a projected field adds to its weights' paths.
@@ -299,22 +294,14 @@ struct Walk<'a> {
 impl Walk<'_> {
     fn map(&self, field: &Field, source: &TokenStream2) -> TokenStream2 {
         let residency = &self.paths.residency;
-        match &field.part {
-            Part::Projected(segment) => {
-                let (ty, segment) = (self.projected(&field.ty), self.segment(segment));
-                quote!(<#ty as #residency>::map(#source, __leaves, #segment)?)
-            }
-        }
+        let (ty, segment) = (self.projected(&field.ty), self.segment(&field.segment));
+        quote!(<#ty as #residency>::map(#source, __leaves, #segment)?)
     }
 
     fn visit(&self, field: &Field, source: &TokenStream2) -> TokenStream2 {
         let residency = &self.paths.residency;
-        match &field.part {
-            Part::Projected(segment) => {
-                let (ty, segment) = (self.projected(&field.ty), self.segment(segment));
-                quote!(<#ty as #residency>::visit(#source, __visitor, #segment)?;)
-            }
-        }
+        let (ty, segment) = (self.projected(&field.ty), self.segment(&field.segment));
+        quote!(<#ty as #residency>::visit(#source, __visitor, #segment)?;)
     }
 
     fn segment(&self, segment: &Segment) -> TokenStream2 {
@@ -366,7 +353,7 @@ impl Variant {
                     member,
                     binding,
                     ty: field.ty.clone(),
-                    part: part(&field.attrs, segment)?,
+                    segment: field_segment(&field.attrs, segment)?,
                 })
             })
             .collect::<syn::Result<_>>()?;
@@ -457,7 +444,7 @@ pub(crate) fn derive(input: &DeriveInput) -> syn::Result<TokenStream2> {
 }
 
 /// What a field's `#[residency(..)]` attributes make it, by default projected under `segment`.
-fn part(attributes: &[Attribute], segment: Segment) -> syn::Result<Part> {
+fn field_segment(attributes: &[Attribute], segment: Segment) -> syn::Result<Segment> {
     let mut segment = segment;
     let mut declared = false;
     for attribute in residency_attributes(attributes) {
@@ -478,7 +465,7 @@ fn part(attributes: &[Attribute], segment: Segment) -> syn::Result<Part> {
             Ok(())
         })?;
     }
-    Ok(Part::Projected(segment))
+    Ok(segment)
 }
 
 fn residency_attributes(attributes: &[Attribute]) -> impl Iterator<Item = &Attribute> {

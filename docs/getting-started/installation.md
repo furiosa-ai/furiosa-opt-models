@@ -83,7 +83,7 @@ python -c "import furiosa_opt_engine as engine; print(engine.LoadOptions())"
 
 !!! note
     The first build compiles every model function, including H3 even when you intend to serve another model.
-    Build time depends on the kernel cache and available parallelism; H3's incremental CI build cost has not been measured.
+    Build time depends on the kernel cache and available parallelism; H3's share of build time has not been measured.
     Add `-v` to see its progress.
 
 uv builds each install in a fresh Python environment, so reinstalling recompiles pyo3 and the engine.

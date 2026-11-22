@@ -411,7 +411,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[ignore = "requires an explicitly selected RNGD chip"]
     async fn runtime_spans_preserve_values_guards_and_allocation_tails() {
         let _lease = DEVICE.lock().await;
         let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();

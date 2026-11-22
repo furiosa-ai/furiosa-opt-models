@@ -38,11 +38,9 @@ A reference output is what the upstream framework returns for one fixed request,
 A test compares with it when that framework cannot run beside the test, as vLLM-Omni's GPU pipeline cannot run beside an RNGD test.
 It is never our own output, which would only pin today's behavior ([Assert against an oracle](../design/testing.md#assert-against-an-oracle)).
 
-H3's reference tests use explicitly supplied private files instead of the release-download workflow
-below. Its [private reference tests](../serving/minimax-h3.md#private-reference-tests)
-are opt-in and never fetch H3 reference assets from a public release.
-Its data-free Rust kernel tests and their current CI gap are described in
-[H3 kernel tests and CI coverage](../serving/minimax-h3.md#rust-kernel-tests-and-ci-coverage).
+H3's reference tests use explicitly supplied private files instead of the release-download workflow below.
+Its [private reference tests](../serving/minimax-h3.md#private-reference-tests) are opt-in and never fetch H3 reference assets from a public release.
+Its data-free Rust device tests run in the normal models test suite and require up to four chips; see [H3 kernel tests and CI coverage](../serving/minimax-h3.md#rust-kernel-tests-and-ci-coverage).
 
 Each reference is a release of this repository, tagged `references/<org>--<name>@<revision>` with the first seven characters of the checkpoint revision.
 An inventory row names it in `reference`.

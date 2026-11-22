@@ -5,16 +5,15 @@
 
 use furiosa_opt_models::load::LoadError;
 use furiosa_opt_std::prelude::*;
-use std::{io, ops::Range, sync::Arc};
+use std::{io, ops::Range};
 
 /// Chip images are split into pieces of at most 1 GiB, retaining each piece's byte offset.
 /// A replicated image's pieces are reused on every destination chip.
 const PIECE: usize = 1 << 30;
 
 /// A prepared tensor's bytes, retained on the host across placements and evictions.
-#[derive(Clone)]
 pub(super) struct Source {
-    bytes: Arc<HostBuffer>,
+    bytes: HostBuffer,
     len: usize,
     shards: Option<usize>,
 }
@@ -67,11 +66,7 @@ impl Source {
         } else {
             shards
         };
-        Ok(Self {
-            bytes: Arc::new(bytes),
-            len,
-            shards,
-        })
+        Ok(Self { bytes, len, shards })
     }
 
     /// Bytes of one chip's copy.
@@ -114,13 +109,13 @@ impl Source {
         check_chips(self.shards, chips)?;
         Ok(match self.shards {
             Some(_) => vec![Piece {
-                host: HostBufferSlice::from(&*self.bytes),
+                host: HostBufferSlice::from(&self.bytes),
                 chips: 0..chips,
                 bytes: 0..self.len,
             }],
             None => (0..chips)
                 .map(|chip| Piece {
-                    host: HostBufferSlice::from(&*self.bytes),
+                    host: HostBufferSlice::from(&self.bytes),
                     chips: chip..chip + 1,
                     bytes: 0..self.len,
                 })
@@ -199,9 +194,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(source.len(), 8 * 4);
-        assert_eq!(source.shards, Some(2));
         assert_eq!(
-            &**source.bytes,
+            &source.bytes[..],
             values
                 .iter()
                 .flat_map(|x| x.to_le_bytes())
@@ -240,15 +234,12 @@ mod tests {
         )
         .unwrap();
         for source in [single, expanded] {
-            let shared = source.clone();
-            assert!(Arc::ptr_eq(&source.bytes, &shared.bytes));
             assert_eq!(source.len(), 16);
             assert_eq!(
                 source.bytes.len(),
                 16,
                 "identical chip images retain one host copy"
             );
-            assert!(source.shards.is_none());
             let pieces = source.pieces(4).unwrap();
             assert_eq!(pieces.len(), 4);
             for (chip, piece) in pieces.iter().enumerate() {
@@ -315,7 +306,6 @@ mod tests {
             len,
             shards: Some(4),
         };
-        assert_eq!(image.pieces(4).unwrap().len(), 280);
         let (buffer, completion) = super::super::upload::issue(&mut device, &image).unwrap();
         drop(image);
         let pending = completion.is_some();

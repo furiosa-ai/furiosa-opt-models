@@ -91,7 +91,6 @@ fn input(index: usize) -> bf16 {
 
 /// Replicated checkpoint coefficients read all four source chips after the whole TDMA exchange.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires four explicitly selected RNGD chips"]
 async fn exchanged_grouped_projection_preserves_rows_and_columns() {
     let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
     let weights: Vec<_> = (0..O::SIZE * H::SIZE).map(coefficient).collect();
@@ -150,7 +149,6 @@ async fn exchanged_grouped_projection_preserves_rows_and_columns() {
 
 /// Loaded packed gate/up and down projections preserve the composition and its BF16 boundaries.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires four explicitly selected RNGD chips"]
 async fn grouped_mlp_matches_an_independent_reference() {
     let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
     let gate_up: Vec<_> = (0..2 * I::SIZE * H::SIZE).map(coefficient).collect();

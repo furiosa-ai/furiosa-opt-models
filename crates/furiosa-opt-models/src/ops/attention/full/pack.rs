@@ -228,7 +228,7 @@ impl<R: AxisName, S: AxisName, C: M, const N: usize> PackInputs<R, S, C, N> {
         })
     }
 
-    /// The same immutable row-count tensor may supply Compact's visible-key limit.
+    /// The same immutable row-count tensor may supply attention's visible-key limit.
     pub fn key_count(&self) -> &Value<C> {
         &self.keys
     }
@@ -621,7 +621,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[ignore = "requires four explicitly selected RNGD chips"]
     async fn unaligned_runs_cross_spans_and_empty_plan_clears_every_key() {
         let _lease = crate::tests::DEVICE.lock().await;
         type R = Rows<8192>;

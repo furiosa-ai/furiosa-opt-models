@@ -209,7 +209,6 @@ mod tests {
     /// Every tap in isolation checks orientation, stereo order, slice seams, and both padded
     /// edges. A signed multichannel case then checks accumulation and both clamp boundaries.
     #[tokio::test(flavor = "current_thread")]
-    #[ignore = "requires an RNGD device"]
     async fn waveform_matches_independent_convolution_and_clamp() {
         let _lease = crate::tests::DEVICE.lock().await;
         let mut device = Device::new(waveform.topology()).unwrap();

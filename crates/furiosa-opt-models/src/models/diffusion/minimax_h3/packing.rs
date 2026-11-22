@@ -781,7 +781,6 @@ mod device_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[ignore = "requires four explicitly selected RNGD chips"]
     async fn h3_valid_runs_pack_exactly_and_clear_stale_keys() {
         let _lease = crate::tests::DEVICE.lock().await;
         let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
@@ -790,7 +789,6 @@ mod device_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[ignore = "requires four explicitly selected RNGD chips"]
     async fn checked_join_split_preserve_addresses_and_work_guards() {
         let _lease = crate::tests::DEVICE.lock().await;
         type Transfers =

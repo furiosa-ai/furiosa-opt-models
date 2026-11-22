@@ -813,7 +813,7 @@ mod tests {
         tests::{Head, KvHeads},
     };
     use crate::ops::normalization::{
-        PerRow, RowMajor,
+        RowMajor,
         tests::{random, residual},
     };
     use crate::tensor::{
@@ -893,9 +893,8 @@ mod tests {
         input: &Rows<Width, Count>,
         output: &mut Rows<Width, Count>,
     ) {
-        let borrowed =
-            RmsNorm::<Width, { super::EPSILON }, Chip, _>::new(Weight::new(norm.weight().tensor()));
-        crate::Module::forward(&PerRow(borrowed), &mut *device, (), &mut (), input)
+        let input: super::Spread<Width, Count> = input.to_dm(&mut device.tdma);
+        norm.forward(&mut *device, &input)
             .view()
             .to_hbm_view(&mut device.tdma, output.view_mut());
     }

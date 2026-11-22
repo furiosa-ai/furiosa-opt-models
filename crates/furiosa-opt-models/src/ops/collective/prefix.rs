@@ -84,15 +84,13 @@ type PaddedRows<D, const N: usize, S, C, W> = HbmTensor<
 mod tests {
     //! Whole TDMA exchange of compact parts inside capacity-backed allocations.
 
-    use super::super::tests::{Chips, Input, Output, assert_output, buffers};
+    use super::super::tests::{Chips, Input, Narrow, Output, Width, assert_output, buffers};
     use crate::ops::collective::Exchange;
     use crate::tensor::axis::Rows;
     use crate::tensor::live::{BlockPrefix, PrefixInputs, PrefixPlan};
     use crate::tensor::parallel::Parallel;
     use furiosa_opt_std::prelude::*;
     use furiosa_opt_std::runtime::launch;
-
-    axes![Width = 7168, Narrow = 512];
 
     type Work<C, A, B, E> = PrefixInputs<C, (A, (B, (E,))), Rows<1>, Chips>;
 
@@ -145,7 +143,6 @@ mod tests {
 
     /// The same prefix can come from a preceding operation's capacity-shaped output inside a launch.
     #[tokio::test(flavor = "current_thread")]
-    #[ignore = "requires four explicitly selected RNGD chips"]
     async fn device_prefix_exchange_preserves_rows_and_capacity_tail() {
         let _lease = crate::tests::DEVICE.lock().await;
         check_device_prefix::<Rows<1280>, Narrow, Rows<256>, Rows<768>, Rows<1280>>().await;

@@ -378,7 +378,6 @@ async fn check(device: &mut Device, buffers: Outputs, start: usize, count: usize
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires four explicitly selected RNGD chips"]
 async fn live_hbm_norm_and_rope_match_fp64_and_preserve_unwritten_rows() {
     let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
     let module = module(&mut device).await;

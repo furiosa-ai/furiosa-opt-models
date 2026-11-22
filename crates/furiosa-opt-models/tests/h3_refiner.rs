@@ -236,7 +236,6 @@ fn analytic_refiner_is_finite_and_sensitive_to_key_visibility() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires four explicitly selected RNGD chips"]
 async fn loaded_two_layer_refiner_matches_analytic_values() {
     let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
     let model: Model = checkpoint().load(&mut device).unwrap();

@@ -329,7 +329,6 @@ fn default_and_borrowed_h3_feedforward_bind_the_prepared_request_prefix() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires an explicitly selected RNGD chip"]
 async fn checked_ffn_prefixes_preserve_rounding_values_zero_rows_and_tails() {
     let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
     let (_directory, source) = checkpoint();

@@ -11,16 +11,18 @@ use super::transformer::{Heads, SCALE};
 use crate::load::Named;
 use crate::modules::attention::Full;
 use crate::modules::parallel::Exchanged;
-use crate::ops::attention::{flash, full::PackKeys};
+use crate::ops::attention::{Attention, flash, full::PackKeys};
 use crate::ops::collective::Pieces;
 use crate::ops::linear::{Grouped, grouped::Layout};
 use crate::ops::rotary::{Rotary, Rotation};
+use crate::specialize::attention::{Flash, Strategy};
 use crate::tensor::axis::Rows;
 use crate::tensor::live::{BlockPrefix, Live};
 use crate::tensor::parallel::{Parallel, Part};
+use crate::tensor::scalar::F32;
 use crate::{Module, Op};
 use furiosa_opt_std::prelude::*;
-use std::borrow::Borrow;
+use std::{borrow::Borrow, marker::PhantomData};
 
 impl<'i, 'p, 'e, 'c, 'a, 's, R, K, W, A, Qkv, QkvState, Storage>
     Module<
@@ -30,7 +32,12 @@ impl<'i, 'p, 'e, 'c, 'a, 's, R, K, W, A, Qkv, QkvState, Storage>
     >
     for Full<
         Qkv,
-        flash::Compact<Heads<Part<A, PARTS>>, SCALE>,
+        Attention<
+            PhantomData<Heads<Part<A, PARTS>>>,
+            F32<SCALE>,
+            { Strategy::Items },
+            { Flash::SinglePass },
+        >,
         Named<"out_proj", Exchanged<Grouped<A, W, Chips, Storage>, Parallel<PARTS>>>,
     >
 where
@@ -56,7 +63,7 @@ where
         input: &'i Live<Local<R, W>, R>,
     ) -> Self::Output {
         const {
-            // Compact projection initializes only joined work. Both following tiled consumers
+            // Packed projection initializes only joined work. Both following tiled consumers
             // must end on that boundary, rather than read an uninitialized allocation suffix.
             assert!(
                 (PARTS * ROW_BLOCK).is_multiple_of(

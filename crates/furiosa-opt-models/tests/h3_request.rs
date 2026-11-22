@@ -194,7 +194,6 @@ async fn run<K: AxisName>(
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires four explicitly selected RNGD chips"]
 async fn prepared_request_metadata_drives_all_three_consumers() {
     let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
     let weight = HostTensor::<bf16, m![Width]>::from_vec(vec![bf16::from_f32(1.); Width::SIZE])

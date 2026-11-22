@@ -721,7 +721,6 @@ mod prefix_tests {
     /// Check a 5376 -> 28672 runtime prefix against the static grouped projection.
     /// Empty, odd and even work also preserve destination tails.
     #[tokio::test(flavor = "current_thread")]
-    #[ignore = "requires an RNGD device"]
     async fn full_width_prefix_matches_the_static_grouped_projection() {
         let _lease = crate::tests::DEVICE.lock().await;
         let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
@@ -802,7 +801,6 @@ mod prefix_tests {
     /// The empty and short cases also exercise prefetch bounds. The borrowed
     /// load shares the exact owned weight; both public output forms match independent FP64 dots.
     #[tokio::test(flavor = "current_thread")]
-    #[ignore = "requires an explicitly selected RNGD chip"]
     async fn loaded_grouped_prefixes_match_fp64_and_preserve_allocation_tails() {
         let _lease = crate::tests::DEVICE.lock().await;
         let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();

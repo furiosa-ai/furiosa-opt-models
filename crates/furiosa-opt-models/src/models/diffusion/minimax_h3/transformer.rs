@@ -14,16 +14,18 @@ use crate::modules::parallel::{Exchanged, Gathered};
 use crate::modules::residual::Residual;
 use crate::modules::{attention, diffusion, feedforward};
 use crate::ops::attention::flash;
-use crate::ops::attention::{full, geometry};
+use crate::ops::attention::{Attention, full, geometry};
 use crate::ops::collective::InTiles;
 use crate::ops::linear::{self, Linear, modulation};
 use crate::ops::normalization::{AdaptiveRms, RmsNorm};
 use crate::ops::pointwise::{SwiGlu, add::Add, gated};
 use crate::ops::swiglu::GateUp;
+use crate::specialize::attention::{Flash, Strategy};
 use crate::tensor::form::Weight;
 use crate::tensor::memory::residency::Residency;
 use crate::tensor::memory::{Hbm, Memory};
 use crate::tensor::parallel::{Parallel, Part};
+use crate::tensor::scalar::F32;
 use crate::{First, Layers, Module, Sequential, Then, Unrolled};
 use furiosa_opt_std::prelude::*;
 use std::marker::PhantomData;
@@ -41,7 +43,7 @@ pub type Block<W = Width, A = Attended, F = Expanded, T = Time, X = Hbm, Tiles =
         Named<"norm2", AdaptiveNorm<W, X>>,
     >;
 
-/// Compact joined QKV, explicit head norms, optimized attention and whole head-to-row exchange.
+/// Packed joined QKV, explicit head norms, optimized attention and whole head-to-row exchange.
 /// The Live call uses [`super::joint::Context`]; the adaptive block also binds request spans
 /// through [`diffusion::WithSpans`]. Loading alone does not validate the numerical call.
 ///
@@ -71,7 +73,12 @@ pub type BlockAttention<W = Width, A = Attended, X = Hbm, Tiles = GatherTiles> =
             Named<"k_norm", HeadNorm<Rotated, X>>,
         >,
     >,
-    flash::Compact<Heads<Part<A, 4>>, SCALE>,
+    Attention<
+        PhantomData<Heads<Part<A, 4>>>,
+        F32<SCALE>,
+        { Strategy::Items },
+        { Flash::SinglePass },
+    >,
     Named<"out_proj", Exchanged<Grouped<A, W, X>, Parallel<4>>>,
 >;
 
@@ -135,7 +142,7 @@ pub type RefinerAttention<W = Width, A = Attended, X = Hbm> = attention::Full<
             Named<"k_norm", HeadNorm<Unrotated, X>>,
         >,
     >,
-    flash::Compact<Heads<A>, SCALE>,
+    Attention<PhantomData<Heads<A>>, F32<SCALE>, { Strategy::Items }, { Flash::SinglePass }>,
     Named<"out_proj", Dense<A, W, X>>,
 >;
 

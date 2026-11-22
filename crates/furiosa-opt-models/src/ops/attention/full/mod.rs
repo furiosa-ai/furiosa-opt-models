@@ -14,6 +14,7 @@ use crate::ops::linear::Linear;
 use crate::ops::normalization;
 use crate::ops::rotary;
 use crate::ops::rotary::Rotary;
+use crate::specialize::attention::{Flash, Strategy};
 use crate::tensor::memory::residency::Residency;
 use crate::tensor::parallel::Chip;
 use crate::tensor::scalar;
@@ -746,7 +747,7 @@ impl<
     }
 }
 
-/// The same finite text-envelope preparation, with Compact selected explicitly.
+/// The same finite text-envelope preparation, with the single-pass flash strategy selected explicitly.
 impl<
     const LIVE: usize,
     const ROWS: usize,
@@ -761,7 +762,7 @@ impl<
         &Rows<bf16, Text<LIVE, ROWS>, W, Chips>,
         &Rows<bf16, Text<LIVE, ROWS>, W, Chips>,
         (&flash::Visible<K, Chips>, &scalar::Value<Chips>),
-    )> for flash::Compact<Heads, BITS>
+    )> for Attention<PhantomData<Heads>, F32<BITS>, { Strategy::Items }, { Flash::SinglePass }>
 {
     type Output = Rows<bf16, Text<LIVE, ROWS>, W, Chips>;
 
@@ -2512,7 +2513,7 @@ mod tests {
         live: &Value,
     ) -> Rows<bf16, Envelope, PairWidth> {
         Op::forward(
-            &Attention {
+            &Attention::<_, _> {
                 heads: PhantomData::<Two>,
                 scale: F32::<INVERSE_ROOT>,
             },
@@ -2620,14 +2621,15 @@ mod tests {
 mod envelope_tests {
     //! Replicated refiner attention with one 2048-row envelope and explicit scattered key visibility.
     //!
-    //! Synthetic finite Q/K/V exercise all 56 heads on every chip. Both Compact and ordinary
+    //! Synthetic finite Q/K/V exercise all 56 heads on every chip. Both single-pass and ordinary
     //! attention use the shared envelope preparation and are checked against independent FP64
     //! softmax values. This is an attention boundary contract, not an owning-refiner execution test.
 
     use crate::Op;
     use crate::ops::attention::Attention;
-    use crate::ops::attention::flash::{Compact, Head, Span, Visible};
+    use crate::ops::attention::flash::{Head, Span, Visible};
     use crate::ops::index::packed;
+    use crate::specialize::attention::{Flash, Strategy};
     use crate::tensor::parallel::Shard;
     use crate::tensor::scalar::{F32, Value};
     use furiosa_opt_std::prelude::*;
@@ -2646,7 +2648,7 @@ mod envelope_tests {
     const SCALE: usize = (std::f32::consts::FRAC_1_SQRT_2 / 8.).to_bits() as usize;
     const KEY_BOUND: usize = 6144;
     const CLASSES: usize = 7;
-    // Existing permanent Compact attention gates use a 1e-2 relative RMS bound.
+    // Existing permanent attention gates use a 1e-2 relative RMS bound.
     const LIMIT: f64 = 1e-2;
 
     #[derive(Clone, Copy, Debug)]
@@ -2788,7 +2790,6 @@ mod envelope_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[ignore = "requires four explicitly selected RNGD chips"]
     async fn compact_and_ordinary_refiner_envelopes_preserve_masks_and_values() {
         let _lease = crate::tests::DEVICE.lock().await;
         const {
@@ -2805,7 +2806,12 @@ mod envelope_tests {
             .to_hbm(&mut device.pdma)
             .await
             .unwrap();
-        let compact = Compact::<Heads, SCALE>::default();
+        let single_pass = Attention::<
+            PhantomData<Heads>,
+            F32<SCALE>,
+            { Strategy::Items },
+            { Flash::SinglePass },
+        >::default();
         let ordinary = Ordinary::default();
         let mut cases: Vec<_> = [128, 129, 511, 1025, 2047, 2048, 1, 128, 2048, 129, 128]
             .into_iter()
@@ -2838,12 +2844,19 @@ mod envelope_tests {
             .unwrap();
             let expected = oracle(case);
             // Alternate variant order while reusing the rewritten operands and mask.
-            for use_compact in [index % 2 == 0, index % 2 != 0] {
-                let variant = if use_compact { "Compact" } else { "ordinary" };
-                let output = if use_compact {
-                    launch(attend, (&mut device, &compact, (&q, &k, &v, &mask, &bound)))
-                        .await
-                        .unwrap()
+            for use_single_pass in [index % 2 == 0, index % 2 != 0] {
+                let variant = if use_single_pass {
+                    "single-pass"
+                } else {
+                    "ordinary"
+                };
+                let output = if use_single_pass {
+                    launch(
+                        attend,
+                        (&mut device, &single_pass, (&q, &k, &v, &mask, &bound)),
+                    )
+                    .await
+                    .unwrap()
                 } else {
                     launch(
                         attend,

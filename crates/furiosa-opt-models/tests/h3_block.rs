@@ -305,7 +305,6 @@ fn oracle(tokens: usize) -> BTreeMap<Class, Vec<f64>> {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires four explicitly selected RNGD chips"]
 async fn loaded_live_joint_block_matches_analytic_values_across_alternating_requests() {
     let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
     let model: Model = checkpoint().load(&mut device).unwrap();

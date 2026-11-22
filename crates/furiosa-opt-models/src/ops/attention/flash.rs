@@ -18,15 +18,12 @@ use furiosa_opt_std::prelude::*;
 use crate::Op;
 use crate::ops::attention::Attention;
 use crate::specialize::SLICES;
-use crate::tensor::live::Live;
 use crate::tensor::parallel::Chip;
 use crate::tensor::scalar;
 use crate::tensor::scalar::Value;
 use core::marker::PhantomData;
 
-pub use compact::Compact;
-
-mod compact;
+mod single_pass;
 
 axes![
     Rows = 4096,
@@ -228,7 +225,6 @@ trait Visibility<Spans: AxisName, Chips: M = Chip>: Sized {
         ),
         keys: usize,
         output: &mut Queries<R, Pairs, Chips>,
-        rows: Live<(), R>,
     );
 
     /// `value`, span `span`'s values, channel-major into the value and mass channels of
@@ -260,7 +256,6 @@ impl<Spans: AxisName, Chips: M> Visibility<Spans, Chips> for Visible<Spans, Chip
         ),
         keys: usize,
         output: &mut Queries<R, Pairs, Chips>,
-        rows: Live<(), R>,
     ) {
         // Spelled out, so the device compiler bounds the span loop by the live keys' extent.
         let live = (keys + Span::SIZE - 1) / Span::SIZE;
@@ -273,7 +268,7 @@ impl<Spans: AxisName, Chips: M> Visibility<Spans, Chips> for Visible<Spans, Chip
                 live,
                 last: PhantomData,
             }
-            .forward(device, (query, output, rows));
+            .forward(device, (query, output));
         } else {
             Sweep::<_, _, _, _, SCALE> {
                 key,
@@ -282,7 +277,7 @@ impl<Spans: AxisName, Chips: M> Visibility<Spans, Chips> for Visible<Spans, Chip
                 live,
                 last: PhantomData,
             }
-            .forward(device, (query, output, rows));
+            .forward(device, (query, output));
         }
     }
 
@@ -317,7 +312,6 @@ impl<Spans: AxisName, Chips: M> Visibility<Spans, Chips> for Scattered<'_, Spans
         ),
         keys: usize,
         output: &mut Queries<R, Pairs, Chips>,
-        rows: Live<(), R>,
     ) {
         Sweep::<_, _, _, _, SCALE> {
             key,
@@ -326,7 +320,7 @@ impl<Spans: AxisName, Chips: M> Visibility<Spans, Chips> for Scattered<'_, Spans
             live: (keys + Span::SIZE - 1) / Span::SIZE,
             last: PhantomData,
         }
-        .forward(device, (query, output, rows));
+        .forward(device, (query, output));
     }
 
     fn stage(
@@ -554,12 +548,8 @@ impl<
     L: AxisName,
     const LAST: usize,
     const WIDTH: usize,
->
-    crate::Op<(
-        &Queries<R, Pairs, Chips>,
-        &mut Queries<R, Pairs, Chips>,
-        Live<(), R>,
-    )> for Sweep<'_, Spans, Pairs, V, Chips, SCALE, L, LAST, WIDTH>
+> crate::Op<(&Queries<R, Pairs, Chips>, &mut Queries<R, Pairs, Chips>)>
+    for Sweep<'_, Spans, Pairs, V, Chips, SCALE, L, LAST, WIDTH>
 {
     /// softmax(scale * QKᵀ)V of each `query` row over the visible keys of the first `live` spans
     /// into `output`, 4,096 rows a tile, each tile arriving as the last one scores.
@@ -568,40 +558,28 @@ impl<
     fn forward(
         &self,
         device: &mut Device,
-        (query, output, live): (
-            &Queries<R, Pairs, Chips>,
-            &mut Queries<R, Pairs, Chips>,
-            Live<(), R>,
-        ),
+        (query, output): (&Queries<R, Pairs, Chips>, &mut Queries<R, Pairs, Chips>),
     ) {
-        const {
-            assert!(
-                R::SIZE >= Rows::SIZE,
-                "the query envelope holds one whole tile"
-            )
-        };
         let (key, value, visible) = (self.key, self.value, self.visible);
-        // A short interval uses one whole tile containing it. Only the returned live interval
-        // is observed; surrounding rows are padding in the newly allocated output.
-        let rows = live.rows().max(Rows::SIZE);
-        let start = live.start().min(R::SIZE - rows);
+        let rows = R::SIZE;
         // A quarter tile left over is the tail of four head pairs at once; any other remainder is a
         // last tile that ends at the last row and repeats rows the tile before it attended.
-        let tail = rows % Rows::SIZE == TailRows::SIZE
-            && const { Pairs::SIZE >= <Tail as Unit<Pairs>>::PAIRS };
+        let tail = const {
+            R::SIZE % Rows::SIZE == TailRows::SIZE && Pairs::SIZE >= <Tail as Unit<Pairs>>::PAIRS
+        };
         let tiles = if tail {
             rows / Rows::SIZE
         } else {
             rows.div_ceil(Rows::SIZE)
         };
         let pairs = const { Pairs::SIZE };
-        let first_row = |tile: usize| start + (tile * Rows::SIZE).min(rows - Rows::SIZE);
+        let first_row = |tile: usize| (tile * Rows::SIZE).min(rows - Rows::SIZE);
         let mut transposed = ChannelMajor::<Chips>::new();
         transposed
             .view_mut()
             .tile::<m![Channel], 16, m![Channel = 16 #{!} Channel, Span % 64]>(Head::SIZE)
             .memset(const { bf16::from_f32(1.0) }, &mut device.sub);
-        let in_dm = ToDm::<Whole>(PhantomData).forward(device, ((query, key, value), start, 0));
+        let in_dm = ToDm::<Whole>(PhantomData).forward(device, ((query, key, value), 0, 0));
         let mut ready = {
             let InDm {
                 rows,
@@ -672,7 +650,7 @@ impl<
             Whole::store(device, attended, (&mut *output, from), last)
         };
         if tail {
-            let at = start + rows - TailRows::SIZE;
+            let at = rows - TailRows::SIZE;
             ready = UnitSweep::<Whole, _>(PhantomData, self).forward(
                 device,
                 (
@@ -2013,64 +1991,8 @@ impl<
             (query, key, value),
             keys.extent::<m![Spans, Span]>(),
             &mut output,
-            Live::all(),
         );
         output
-    }
-}
-
-/// Attend a runtime query interval inside one compiled envelope. Query work uses whole tiles
-/// and an eligible quarter-tile tail, retaining the interval in the result. An interval shorter
-/// than one whole tile computes its surrounding padding too; only its live rows are returned.
-/// The envelope holds at least 4096 rows. Empty intervals issue no attention work and do not
-/// read the key count. Nonempty intervals use the same key-count contract as fixed queries.
-impl<
-    R: AxisName,
-    Spans: AxisName,
-    Pairs: AxisName,
-    Heads: AxisName,
-    Chips: M,
-    V: Visibility<Spans, Chips>,
-    const BITS: usize,
->
-    crate::Op<(
-        Live<&Queries<R, Pairs, Chips>, R>,
-        &Tokens<Spans, Pairs, Chips>,
-        &Tokens<Spans, Pairs, Chips>,
-        (&V, &Value<Chips>),
-    )> for Attention<PhantomData<Heads>, scalar::F32<BITS>>
-{
-    type Output = Live<Queries<R, Pairs, Chips>, R>;
-
-    fn forward(
-        &self,
-        device: &mut Device,
-        (query, key, value, (visible, keys)): (
-            Live<&Queries<R, Pairs, Chips>, R>,
-            &Tokens<Spans, Pairs, Chips>,
-            &Tokens<Spans, Pairs, Chips>,
-            (&V, &Value<Chips>),
-        ),
-    ) -> Self::Output {
-        const {
-            assert!(
-                Heads::SIZE == 2 * Pairs::SIZE,
-                "a chip attends its heads in pairs"
-            )
-        };
-        let rows = query.with(());
-        let mut output = HbmTensor::new();
-        if rows.rows() == 0 {
-            return rows.with(output);
-        }
-        visible.sweep::<R, Pairs, BITS>(
-            device,
-            (*query.value(), key, value),
-            keys.extent::<m![Spans, Span]>(),
-            &mut output,
-            rows,
-        );
-        rows.with(output)
     }
 }
 
@@ -2385,6 +2307,7 @@ mod tests {
     use super::{Duo, Head, Queries, Rows, Span, Tokens, Visible};
     use crate::ops::attention::Attention;
     use crate::ops::normalization::tests::random;
+    use crate::specialize::attention::{Flash, Strategy};
     use crate::tensor::axis::Single;
     use crate::tensor::live::{Live, tests::count};
     use crate::tensor::scalar::F32;
@@ -2416,16 +2339,21 @@ mod tests {
         visible: &Visible<Spans>,
         keys: &Value,
         output: &mut Queries<Rows, Pairs>,
-        compact: &Value,
+        single_pass: &Value,
     ) {
         // Through the catalog leaf, as a model calls it.
-        let attention = Attention {
+        let attention = Attention::<_, _> {
             heads: PhantomData::<Heads<Pairs>>,
             scale: F32::<INVERSE_ROOT>,
         };
-        let result = if compact.extent::<m![2]>() != 0 {
-            super::Compact::<Heads<Pairs>, INVERSE_ROOT>::default()
-                .forward(device, (query, key, value, (visible, keys)))
+        let result = if single_pass.extent::<m![2]>() != 0 {
+            Attention::<
+                PhantomData<Heads<Pairs>>,
+                F32<INVERSE_ROOT>,
+                { Strategy::Items },
+                { Flash::SinglePass },
+            >::default()
+            .forward(device, (query, key, value, (visible, keys)))
         } else {
             attention.forward(device, (query, key, value, (visible, keys)))
         };
@@ -2445,46 +2373,28 @@ mod tests {
         queries: &Value,
         start: &Value,
         scattered: &Value,
-        compact: &Value,
     ) -> Queries<R, Seven> {
-        let attention = Attention {
-            heads: PhantomData::<Heads<Seven>>,
-            scale: F32::<INVERSE_ROOT>,
-        };
         let rows = Live::<(), R>::all()
             .subrange(start.extent::<m![R]>(), Live::<(), R>::read(queries).rows());
-        if compact.extent::<m![2]>() != 0 {
-            let op = super::Compact::<Heads<Seven>, INVERSE_ROOT>::default();
-            if scattered.extent::<m![2]>() != 0 {
-                op.forward(
-                    device,
-                    (
-                        rows.with(query),
-                        key,
-                        value,
-                        (&super::Scattered(visible), keys),
-                    ),
-                )
-                .into_value()
-            } else {
-                op.forward(device, (rows.with(query), key, value, (visible, keys)))
-                    .into_value()
-            }
-        } else if scattered.extent::<m![2]>() != 0 {
-            attention
-                .forward(
-                    device,
-                    (
-                        rows.with(query),
-                        key,
-                        value,
-                        (&super::Scattered(visible), keys),
-                    ),
-                )
-                .into_value()
+        let op = Attention::<
+            PhantomData<Heads<Seven>>,
+            F32<INVERSE_ROOT>,
+            { Strategy::Items },
+            { Flash::SinglePass },
+        >::default();
+        if scattered.extent::<m![2]>() != 0 {
+            op.forward(
+                device,
+                (
+                    rows.with(query),
+                    key,
+                    value,
+                    (&super::Scattered(visible), keys),
+                ),
+            )
+            .into_value()
         } else {
-            attention
-                .forward(device, (rows.with(query), key, value, (visible, keys)))
+            op.forward(device, (rows.with(query), key, value, (visible, keys)))
                 .into_value()
         }
     }
@@ -2492,7 +2402,6 @@ mod tests {
     /// Zero scores give a uniform softmax. Visible pairs' alternating +/-1/4 values cancel,
     /// leaving an exact head/channel constant; masked values of 8 must contribute nothing.
     #[tokio::test(flavor = "current_thread")]
-    #[ignore = "requires an explicitly selected RNGD chip"]
     async fn runtime_queries_preserve_tail_and_visibility() {
         use crate::tensor::axis;
         type Capacity = axis::Rows<8192>;
@@ -2539,75 +2448,68 @@ mod tests {
             .to_hbm(&mut device.pdma)
             .await
             .unwrap();
-            for compact in [false, true] {
-                let variant = count(usize::from(compact))
+            for (start, rows) in [
+                (0, 128),
+                (0, 2048),
+                (0, 4096),
+                (0, 5120),
+                (0, 6144),
+                (0, 8192),
+                (512, 5120),
+                (8064, 128),
+                (0, 0),
+                (0, 128),
+            ] {
+                // Empty work must not inspect even a zero key count.
+                let keys = count(if rows == 0 { 0 } else { live_keys })
                     .to_hbm(&mut device.pdma)
                     .await
                     .unwrap();
-                for (start, rows) in [
-                    (0, 128),
-                    (0, 2048),
-                    (0, 4096),
-                    (0, 5120),
-                    (0, 6144),
-                    (0, 8192),
-                    (512, 5120),
-                    (8064, 128),
-                    (0, 0),
-                    (0, 128),
-                ] {
-                    // Empty work must not inspect even a zero key count.
-                    let keys = count(if rows == 0 { 0 } else { live_keys })
-                        .to_hbm(&mut device.pdma)
-                        .await
-                        .unwrap();
-                    let queries = count(rows).to_hbm(&mut device.pdma).await.unwrap();
-                    let origin = count(start).to_hbm(&mut device.pdma).await.unwrap();
-                    let output = launch(
-                        attend_live_heads,
-                        (
-                            &mut device,
-                            &query,
-                            &key,
-                            &value,
-                            &visible,
-                            &keys,
-                            &queries,
-                            &origin,
-                            &mode,
-                            &variant,
-                        ),
-                    )
+                let queries = count(rows).to_hbm(&mut device.pdma).await.unwrap();
+                let origin = count(start).to_hbm(&mut device.pdma).await.unwrap();
+                let output = launch(
+                    attend_live_heads,
+                    (
+                        &mut device,
+                        &query,
+                        &key,
+                        &value,
+                        &visible,
+                        &keys,
+                        &queries,
+                        &origin,
+                        &mode,
+                    ),
+                )
+                .await
+                .unwrap();
+                if rows == 0 {
+                    continue;
+                }
+                let storage = output.into_buffer();
+                let row_bytes = 14 * Head::SIZE * 2;
+                let bytes = storage
+                    .slice(.., start * row_bytes..(start + rows) * row_bytes)
+                    .unwrap()
+                    .to_host(&mut device.pdma)
                     .await
                     .unwrap();
-                    if rows == 0 {
-                        continue;
-                    }
-                    let storage = output.into_buffer();
-                    let row_bytes = 14 * Head::SIZE * 2;
-                    let bytes = storage
-                        .slice(.., start * row_bytes..(start + rows) * row_bytes)
-                        .unwrap()
-                        .to_host(&mut device.pdma)
-                        .await
-                        .unwrap();
-                    for (at, bytes) in bytes.chunks_exact(2).enumerate() {
-                        let actual = u16::from_le_bytes([bytes[0], bytes[1]]);
-                        let (head, channel) = (at / Head::SIZE % 14, at % Head::SIZE);
-                        assert_eq!(
-                            actual,
-                            bf16::from_f32(base(head, channel)).to_bits(),
-                            "scattered {scattered}, keys {live_keys}, row {}, head {head}, channel {channel}",
-                            start + at / (14 * Head::SIZE)
-                        );
-                    }
+                for (at, bytes) in bytes.chunks_exact(2).enumerate() {
+                    let actual = u16::from_le_bytes([bytes[0], bytes[1]]);
+                    let (head, channel) = (at / Head::SIZE % 14, at % Head::SIZE);
+                    assert_eq!(
+                        actual,
+                        bf16::from_f32(base(head, channel)).to_bits(),
+                        "scattered {scattered}, keys {live_keys}, row {}, head {head}, channel {channel}",
+                        start + at / (14 * Head::SIZE)
+                    );
                 }
             }
         }
     }
 
     #[device(chip = 1)]
-    fn attend_compact_long_prefix<R: AxisName>(
+    fn attend_single_pass_long_prefix<R: AxisName>(
         device: &mut Device,
         query: &Queries<R, Seven>,
         key: &Tokens<Twenty, Seven>,
@@ -2619,9 +2521,14 @@ mod tests {
     ) -> Queries<R, Seven> {
         let rows = Live::<(), R>::all()
             .subrange(start.extent::<m![R]>(), Live::<(), R>::read(queries).rows());
-        super::Compact::<Heads<Seven>, INVERSE_ROOT>::default()
-            .forward(device, (rows.with(query), key, value, (visible, keys)))
-            .into_value()
+        Attention::<
+            PhantomData<Heads<Seven>>,
+            F32<INVERSE_ROOT>,
+            { Strategy::Items },
+            { Flash::SinglePass },
+        >::default()
+        .forward(device, (rows.with(query), key, value, (visible, keys)))
+        .into_value()
     }
 
     /// Two key classes with uniform scores within each class have a closed-form softmax.
@@ -2629,8 +2536,7 @@ mod tests {
     /// incorrect final-key mask.
     /// NaN query padding may be computed by a surrounding tile but must not reach live rows.
     #[tokio::test(flavor = "current_thread")]
-    #[ignore = "requires an explicitly selected RNGD chip"]
-    async fn compact_runtime_long_queries_preserve_rows_and_key_tails() {
+    async fn single_pass_runtime_long_queries_preserve_rows_and_key_tails() {
         use crate::tensor::axis;
         type Capacity = axis::Rows<41984>;
         const HEADS: usize = Seven::SIZE * Duo::SIZE;
@@ -2727,7 +2633,7 @@ mod tests {
                 let queries = count(rows).to_hbm(&mut device.pdma).await.unwrap();
                 let origin = count(start).to_hbm(&mut device.pdma).await.unwrap();
                 let output = launch(
-                    attend_compact_long_prefix,
+                    attend_single_pass_long_prefix,
                     (
                         &mut device,
                         &query,
@@ -2767,7 +2673,7 @@ mod tests {
                         let expected = base(head, channel) + shift;
                         assert!(
                             actual.is_finite(),
-                            "compact keys {live_keys}, row {row}, head {head}, channel {channel}: {actual}"
+                            "single_pass keys {live_keys}, row {row}, head {head}, channel {channel}: {actual}"
                         );
                         error += (actual - expected).powi(2);
                         norm += expected.powi(2);
@@ -2776,7 +2682,7 @@ mod tests {
                 }
                 let relative = (error / norm).sqrt();
                 eprintln!(
-                    "compact live long attention keys {live_keys}, start {start}, rows {rows}: relative L2 {relative:.3e}, worst {worst:.3e}"
+                    "single_pass live long attention keys {live_keys}, start {start}, rows {rows}: relative L2 {relative:.3e}, worst {worst:.3e}"
                 );
                 assert!(relative < 1e-2, "relative L2 {relative}");
             }
@@ -2800,7 +2706,7 @@ mod tests {
     async fn run<Spans: AxisName, Pairs: AxisName>(
         (q, k, v): (&[bf16], &[bf16], &[bf16]),
         live: usize,
-        compact: bool,
+        single_pass: bool,
     ) -> Vec<bf16> {
         let heads = Pairs::SIZE * Duo::SIZE;
         let keys = Spans::SIZE * Span::SIZE;
@@ -2829,7 +2735,7 @@ mod tests {
         .to_hbm(&mut device.pdma)
         .await
         .unwrap();
-        let variant = count(usize::from(compact))
+        let variant = count(usize::from(single_pass))
             .to_hbm(&mut device.pdma)
             .await
             .unwrap();
@@ -2887,8 +2793,8 @@ mod tests {
                 bf16::from_f32(x.to_f32() * if absent { 4.0 } else { 1.0 })
             })
             .collect();
-        for compact in [false, true] {
-            let got = run::<Spans, Pairs>((&q, &k, &v), live, compact).await;
+        for single_pass in [false, true] {
+            let got = run::<Spans, Pairs>((&q, &k, &v), live, single_pass).await;
             let scale = f32::from_bits(INVERSE_ROOT as u32) as f64;
             let (mut error, mut norm, mut worst) = (0.0f64, 0.0f64, 0.0f64);
             for row in (0..Rows::SIZE).step_by(stride) {

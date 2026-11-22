@@ -18,24 +18,14 @@ use furiosa_opt_std::prelude::*;
 
 use super::{Duo, Head, Queries, Rows, Scattered, Span, TailRows, Term, Tokens, Visible};
 use crate::Op;
-use crate::load::Load;
+use crate::ops::attention::Attention;
+use crate::specialize::attention::{Flash, Strategy};
 use crate::tensor::live::Live;
-use crate::tensor::memory::residency::Residency;
 use crate::tensor::parallel::Chip;
+use crate::tensor::scalar::F32;
 use crate::tensor::scalar::Value as Count;
 
 mod half;
-
-/// Flash attention with eight mass channels and a single-pass running-maximum update.
-/// Its query/key layouts match the default flash kernel; callers select this variant explicitly.
-#[derive(DeviceSend, Load, Residency)]
-pub struct Compact<Heads, const BITS: usize>(std::marker::PhantomData<Heads>);
-
-impl<Heads, const BITS: usize> Default for Compact<Heads, BITS> {
-    fn default() -> Self {
-        Self(std::marker::PhantomData)
-    }
-}
 
 axes![Channel = 136];
 
@@ -1268,7 +1258,13 @@ impl<
         &Tokens<Spans, Pairs, Chips>,
         &Tokens<Spans, Pairs, Chips>,
         (&V, &Count<Chips>),
-    )> for Compact<Heads, BITS>
+    )>
+    for Attention<
+        std::marker::PhantomData<Heads>,
+        F32<BITS>,
+        { Strategy::Items },
+        { Flash::SinglePass },
+    >
 {
     type Output = Queries<R, Pairs, Chips>;
 
@@ -1304,7 +1300,13 @@ impl<
         &Tokens<Spans, Pairs, Chips>,
         &Tokens<Spans, Pairs, Chips>,
         (&V, &Count<Chips>),
-    )> for Compact<Heads, BITS>
+    )>
+    for Attention<
+        std::marker::PhantomData<Heads>,
+        F32<BITS>,
+        { Strategy::Items },
+        { Flash::SinglePass },
+    >
 {
     type Output = Live<Queries<R, Pairs, Chips>, R>;
 

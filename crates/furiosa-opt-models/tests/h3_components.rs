@@ -260,7 +260,6 @@ fn check_time(got: &[f32]) {
 
 /// Real named-tree loading and borrowed Module execution, including the complete step composition.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires four explicitly selected RNGD chips"]
 async fn loaded_input_components_match_independent_sparse_references() {
     let _lease = DEVICE.lock().await;
     let source = input_checkpoint();
@@ -478,7 +477,6 @@ fn check_heads(got: &[f32], audio: bool) {
 
 /// Actual final-head Module, sensitive to both RMS roundings and the two timestep selectors.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires four explicitly selected RNGD chips"]
 async fn loaded_final_heads_preserve_rounding_and_timestep_selection() {
     let _lease = DEVICE.lock().await;
     // Establish that this analytic fixture would fail a fused RMS+modulation or the wrong STEP.

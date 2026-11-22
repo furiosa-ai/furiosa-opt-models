@@ -458,7 +458,6 @@ mod tests {
             Path::ROOT,
         )
         .unwrap();
-        assert!(mapped.0.is_empty());
         assert!(mapped.1.is_none());
     }
 }

@@ -460,7 +460,6 @@ async fn check<
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires four explicitly selected RNGD chips"]
 async fn tiled_gather_preserves_fused_projection() {
     let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
     check::<Hidden<128>, ProjectionWidth<512>, Rows<768>, 512, 2, 256>(&mut device).await;
@@ -470,7 +469,6 @@ async fn tiled_gather_preserves_fused_projection() {
 
 /// Exercises a larger aligned sequence; full long-text model validation is separate.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires four explicitly selected RNGD chips"]
 async fn larger_gather_preserves_fused_projection() {
     let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
     check::<Hidden<5376>, ProjectionWidth<1792>, Rows<9984>, 512, 20, 256>(&mut device).await;
@@ -479,7 +477,6 @@ async fn larger_gather_preserves_fused_projection() {
 /// One first/body gather envelope serves the runtime work extents required through 2048 text
 /// tokens. This checks compact projection placement; full model packing is validated separately.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires four explicitly selected RNGD chips"]
 async fn joined_gather_prefixes_preserve_projection() {
     let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
     check::<Hidden<5376>, ProjectionWidth<1792>, Rows<10496>, 1024, 11, 256>(&mut device).await;

@@ -373,7 +373,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[ignore = "requires an explicitly selected RNGD chip"]
     async fn named_adaptive_block_routes_spans_and_env_without_exposing_guards_or_tails() {
         let _lease = DEVICE.lock().await;
         let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();

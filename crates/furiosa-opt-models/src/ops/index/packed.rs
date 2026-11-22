@@ -686,7 +686,6 @@ pub(crate) mod row_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[ignore = "requires four explicitly selected RNGD chips"]
     async fn materialize_preserves_source_padding_and_initializes_head_extensions() {
         let _lease = crate::tests::DEVICE.lock().await;
         let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();

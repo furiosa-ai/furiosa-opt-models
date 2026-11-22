@@ -455,7 +455,7 @@ impl OutputScalar for bf16 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::tensor::{axis::Rows as Capacity, scalar::Value};
+    use crate::tensor::{axis, scalar::Value};
     use crate::tests::DEVICE;
     use furiosa_opt_std::runtime::{HbmBuffer, launch};
     use std::iter;
@@ -770,12 +770,23 @@ pub(crate) mod tests {
 
     /// Root windows must describe compact parts rather than retain capacity-strided coordinates.
     #[tokio::test(flavor = "current_thread")]
-    #[ignore = "requires four explicitly selected RNGD chips"]
     async fn compact_whole_exchange_preserves_prefix_and_capacity_tail() {
         let _lease = crate::tests::DEVICE.lock().await;
-        check_root_windows::<Capacity<1280>, Narrow, Capacity<256>, Capacity<768>, Capacity<1280>>(
-        )
+        check_root_windows::<
+            axis::Rows<1280>,
+            Narrow,
+            axis::Rows<256>,
+            axis::Rows<768>,
+            axis::Rows<1280>,
+        >()
         .await;
-        check_root_windows::<Capacity<10496>, Width, Capacity<9472>, Capacity<9728>, Capacity<9984>>().await;
+        check_root_windows::<
+            axis::Rows<10496>,
+            Width,
+            axis::Rows<9472>,
+            axis::Rows<9728>,
+            axis::Rows<9984>,
+        >()
+        .await;
     }
 }

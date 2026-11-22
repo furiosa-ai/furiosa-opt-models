@@ -309,7 +309,6 @@ fn buffers((query, key, value): Qkv) -> Buffers {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires four explicitly selected RNGD chips"]
 async fn runtime_gather_matches_static_work_and_partial_rotary() {
     let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
     let (directory, source) = checkpoint();

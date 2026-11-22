@@ -30,7 +30,7 @@ pub(crate) struct Ready<'r, T: Residency> {
 #[derive(Default)]
 struct Holds {
     parameters: Vec<Arc<Parameter>>,
-    uploads: Vec<Arc<Completion>>,
+    uploads: Vec<(String, Arc<Completion>)>,
     launched: Vec<Arc<Completion>>,
 }
 
@@ -115,9 +115,12 @@ impl<T: Residency> Resident<T> {
             let upload = parameter.admit(&owner.device, &path)?;
             holds.parameters.push(parameter);
             if let Some(upload) = upload
-                && !holds.uploads.iter().any(|kept| Arc::ptr_eq(kept, &upload))
+                && !holds
+                    .uploads
+                    .iter()
+                    .any(|(_, kept)| Arc::ptr_eq(kept, &upload))
             {
-                holds.uploads.push(upload);
+                holds.uploads.push((path, upload));
             }
         }
         Ok(Admitted {
@@ -161,8 +164,11 @@ impl<T: Residency> Clone for Resident<T> {
 impl<'r, T: Residency> Admitted<'r, T> {
     /// Consuming admission makes cancellation release its holds, including a cancelled upload wait.
     pub(crate) async fn landed(self) -> io::Result<Ready<'r, T>> {
-        for upload in &self.holds.uploads {
-            upload.ended().await.map_err(io::Error::other)?;
+        for (path, upload) in &self.holds.uploads {
+            upload
+                .ended()
+                .await
+                .map_err(|error| io::Error::other(format!("{path}: its upload failed: {error}")))?;
         }
         Ok(Ready {
             resident: self.resident,

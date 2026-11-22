@@ -223,9 +223,10 @@ impl Parameter {
         };
         let placing = Placing(self);
         let (buffer, upload) = match image {
-            None => ((destination.place)(&self.source)?, None),
-            Some(image) => (destination.issue)(&image)?,
-        };
+            None => (destination.place)(&self.source).map(|buffer| (buffer, None)),
+            Some(image) => (destination.issue)(&image),
+        }
+        .map_err(|error| io::Error::new(error.kind(), format!("{path}: {error}")))?;
         // Validate an alias while retaining the original allocation. On a malformed issued
         // destination, accepted work must finish before either that copy or its image is freed.
         match buffer.alias(..).and_then(HbmTensor::<D, C, S>::try_from) {
@@ -530,7 +531,7 @@ mod tests {
         let error = parameter
             .upload::<f32, m![1], m![Width]>(&destination, "weight")
             .unwrap_err();
-        assert_eq!(error.to_string(), "independent placement failed");
+        assert_eq!(error.to_string(), "weight: independent placement failed");
         assert_eq!(place_calls.get(), 1);
         assert!(!parameter.state().placing);
         assert!(matches!(parameter.close(), Closing::Host));

@@ -1,19 +1,20 @@
-//! Compact Live attention and whole prefix exchange in one four-chip module call.
+//! Live attention with single-pass maximum updates and whole prefix exchange in one four-chip module call.
 
 #![feature(register_tool)]
 #![register_tool(furiosa_opt)]
 
-use furiosa_opt_models::ops::attention::flash::{
-    Compact, Duo, Head, Queries, Span, Tokens, Visible,
-};
+use furiosa_opt_models::ops::attention::Attention;
+use furiosa_opt_models::ops::attention::flash::{Duo, Head, Queries, Span, Tokens, Visible};
 use furiosa_opt_models::ops::collective::{Exchange, Pieces};
+use furiosa_opt_models::specialize::attention::{Flash, Strategy};
 use furiosa_opt_models::tensor::axis::Rows;
 use furiosa_opt_models::tensor::live::{BlockPrefix, Live, PrefixInputs, PrefixPlan};
 use furiosa_opt_models::tensor::parallel::{Parallel, Part, Shard};
-use furiosa_opt_models::tensor::scalar::Value;
+use furiosa_opt_models::tensor::scalar::{F32, Value};
 use furiosa_opt_models::{Module, Op};
 use furiosa_opt_std::prelude::*;
 use furiosa_opt_std::runtime::{HbmBuffer, launch};
+use std::marker::PhantomData;
 
 axes![Pairs = 7, Heads = 14, Spans = 20, Width = 7168];
 
@@ -63,12 +64,18 @@ impl<'a> Module<Operands<'a>, (), &'a mut Output> for AttentionExchange {
         let checked = work.read();
         let work = checked.prefix().rows();
         let interval = Live::<(), QueryRows>::all().subrange(0, CHIPS * work);
-        let attended = Op::forward(
-            &Compact::<Heads, SCALE>::default(),
-            device,
-            (interval.with(query), key, value, (visible, keys)),
-        )
-        .into_value();
+        let attended =
+            Op::forward(
+                &Attention::<
+                    PhantomData<Heads>,
+                    F32<SCALE>,
+                    { Strategy::Items },
+                    { Flash::SinglePass },
+                >::default(),
+                device,
+                (interval.with(query), key, value, (visible, keys)),
+            )
+            .into_value();
         // SAFETY: every query row contains seven consecutive pairs of 128-wide heads. Folding
         // those axes gives the chip's 1792 columns; capacity and physical row order stay intact.
         let attended: Split = unsafe { attended.reshape() };
@@ -259,7 +266,6 @@ async fn check(device: &mut Device, buffer: &HbmBuffer, work: usize, keys: usize
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires four explicitly selected RNGD chips"]
 async fn compact_live_attention_feeds_whole_exchange_in_one_module_launch() {
     let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
     let module = AttentionExchange;
