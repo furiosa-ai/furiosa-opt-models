@@ -238,7 +238,7 @@ Each copy ends before NIXL sends the blocks or reports them received, and a fail
 The decode server's `vllm:external_prefix_cache_hits` counts the prompt tokens it took from its connector, and `vllm:nixl_bytes_transferred` the bytes NIXL moved.
 
 Both servers take the same model, quantization and speculative method, which NIXL's handshake compares; a request's LoRA adapter is named on both.
-Data-parallel replicas and sleep mode are served with a connector.
+NIXL supports data-parallel replicas and sleep mode.
 One worker drives every chip while vLLM awaits each tensor-parallel rank, so a connector serves one chip a replica.
 Only the attention cache moves, so startup refuses a connector for a model with recurrent state or encoder memory and on an encoder-only instance.
 Mooncake and MoRIIO register the cache's device memory, which the engine does not map for them, and LMCache copies the cache's torch tensors itself, so startup refuses them.
@@ -254,7 +254,9 @@ VLLM_NIXL_SIDE_CHANNEL_PORT=5601 vllm serve Qwen/Qwen3-0.6B --port 8200 --kv-tra
 ```
 
 vLLM loads a request's blocks from the first of its connectors that has them and stores them through each; each connector takes the settings it takes alone. Storing through both writes the KV to NIXL's host buffer and the engine's L3 slot separately, adding device-to-host traffic and host-memory bandwidth use; the adapters do not share a buffer.
-The NIXL entry may be `NixlPushConnector`, the entries may come in either order, and the decode server may run data-parallel replicas or sleep mode; each replica keeps its own host tier, so route a request's reloads to the replica that decoded it (`X-data-parallel-rank`).
+The NIXL entry may be `NixlPushConnector`, and the entries may come in either order.
+NIXL alone supports data-parallel replicas and sleep mode. When offloading is combined with NIXL, offloading still requires data-parallel degree 1 and does not support sleep mode.
+With NIXL data-parallel replicas, route a request's reloads to the replica that decoded it (`X-data-parallel-rank`).
 
 ## Put the server to sleep
 
