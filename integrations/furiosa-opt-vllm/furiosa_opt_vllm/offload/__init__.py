@@ -30,10 +30,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
 )
-from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 
 from furiosa_opt_vllm.offload.worker import Host, Worker
+
+from .spec import FuriosaOffloadingSpec
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -85,9 +86,10 @@ class RNGDOffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             extra["spec_module_path"] = "furiosa_opt_vllm.offload.spec"
         offloading_config = build_offloading_config(vllm_config, kv_cache_config)
         spec = OffloadingSpecFactory.create_spec(offloading_config)
-        if not isinstance(spec, CPUOffloadingSpec):
+        if not isinstance(spec, FuriosaOffloadingSpec):
             raise TypeError(f"unsupported vLLM offloading spec: {type(spec).__name__}")
-        self._spec: CPUOffloadingSpec = spec
+        self._spec = spec
+        self._coalescing = spec.coalescing
         self._scheduler = (
             OffloadingConnectorScheduler(self._spec, vllm_config, kv_cache_config)
             if role == KVConnectorRole.SCHEDULER
@@ -114,7 +116,8 @@ class RNGDOffloadingConnector(KVConnectorBase_V1, SupportsHMA):
                 self._vllm_config,
                 self._kv_cache_config,
                 get_offloading_group_ids(self._kv_cache_config),
-            )
+            ),
+            coalescing=self._coalescing,
         )
 
     @property

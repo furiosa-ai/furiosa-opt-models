@@ -143,6 +143,13 @@ Both servers copy the cache blocks of computed prompts to a tier of host memory,
     `--kv-offloading-size` sets the host tier in GiB, as on a GPU.
     The platform serves it through the plugin's `RNGDOffloadingConnector` instead of vLLM's `OffloadingConnector`, which copies with CUDA streams; vLLM's scheduler still decides what to store, load and evict.
     Options of vLLM's CPU offloading, such as `blocks_per_chunk` and `eviction_policy`, go in `--kv-transfer-config '{"kv_connector_extra_config": {...}}'` beside the size.
+    Cross-job load coalescing is opt-in with `coalescing: true` in the same config. It batches every load job started for a worker step into one engine staging transfer, with no job-count cap, while vLLM still tracks each job separately; transient pinned staging memory grows with that step's aggregate load size. The default is `false`:
+
+    ```bash
+    vllm serve Qwen/Qwen3-0.6B --kv-offloading-size 16 \
+      --kv-transfer-config '{"kv_connector_extra_config":{"coalescing":true}}'
+    ```
+
     This uses vLLM's native `TieringOffloadingSpec`: `secondary_tiers` is its documented
     `kv_connector_extra_config` field, and vLLM owns tier lookup and lifecycle. Furiosa supplies
     the filesystem-tier manager so file I/O uses engine-pinned slots:

@@ -438,7 +438,18 @@ impl PyCopier {
         for (_, routes) in &mut pages {
             routes.sort_unstable_by_key(|&(group, _)| group);
         }
-        if let Some(pair) = pages.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        if coalesce {
+            if !loading {
+                let mut host_slots = HashSet::new();
+                for (slot, _) in &pages {
+                    if !host_slots.insert(*slot) {
+                        return Err(PyValueError::new_err(format!(
+                            "cache transfer repeats host slot {slot}"
+                        )));
+                    }
+                }
+            }
+        } else if let Some(pair) = pages.windows(2).find(|pair| pair[0].0 == pair[1].0) {
             return Err(PyValueError::new_err(format!(
                 "cache transfer repeats host slot {}",
                 pair[0].0
@@ -921,10 +932,11 @@ impl Chunk {
         coalesced: bool,
     ) -> Vec<Vec<TransferPage>> {
         if coalesced {
-            let pages = pages
+            let mut pages = pages
                 .into_iter()
                 .map(|(slot, routes)| TransferPage { slot, routes })
                 .collect::<Vec<_>>();
+            pages.sort_unstable_by_key(|page| page.slot);
             return if pages.is_empty() {
                 Vec::new()
             } else {
@@ -967,14 +979,28 @@ impl Chunk {
     }
 
     fn transfer(&self, executor: &tokio::runtime::Runtime, core: &Core) -> io::Result<()> {
+        if self.coalesced {
+            let mut hosts = Vec::new();
+            let mut host_indices = BTreeMap::new();
+            let mut page_hosts = Vec::with_capacity(self.pages.len());
+            for page in &self.pages {
+                let host_index = if let Some(&index) = host_indices.get(&page.slot) {
+                    index
+                } else {
+                    let index = hosts.len();
+                    hosts.push(self.pool.slots[page.slot].acquire_dma()?);
+                    host_indices.insert(page.slot, index);
+                    index
+                };
+                page_hosts.push(host_index);
+            }
+            return self.transfer_coalesced(executor, core, &mut hosts, &page_hosts);
+        }
         let mut hosts = self
             .pages
             .iter()
             .map(|page| self.pool.slots[page.slot].acquire_dma())
             .collect::<io::Result<Vec<_>>>()?;
-        if self.coalesced {
-            return self.transfer_coalesced(executor, core, &mut hosts);
-        }
         let route_count = self
             .pages
             .iter()
@@ -1085,6 +1111,7 @@ impl Chunk {
         executor: &tokio::runtime::Runtime,
         core: &Core,
         hosts: &mut [DmaSlot<'_>],
+        page_hosts: &[usize],
     ) -> io::Result<()> {
         let layers = core
             .layers
@@ -1111,7 +1138,9 @@ impl Chunk {
         if self.loading {
             for item in &layout.items {
                 for (chip, stage) in stages.iter_mut().enumerate() {
-                    let source = hosts[item.page].slice(..).map_err(io::Error::other)?;
+                    let source = hosts[page_hosts[item.page]]
+                        .slice(..)
+                        .map_err(io::Error::other)?;
                     let source = source.bytes().map_err(io::Error::other)?;
                     let mut destination = stage
                         .slice_mut(..)
@@ -1186,7 +1215,7 @@ impl Chunk {
                 for (chip, stage) in stages.iter().enumerate() {
                     let source = stage.slice(..).map_err(io::Error::other)?;
                     let source = source.bytes().map_err(io::Error::other)?;
-                    let mut destination = hosts[item.page]
+                    let mut destination = hosts[page_hosts[item.page]]
                         .slice_mut(..)
                         .and_then(|slice| slice.into_bytes())
                         .map_err(io::Error::other)?;

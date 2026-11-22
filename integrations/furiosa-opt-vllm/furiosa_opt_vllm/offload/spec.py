@@ -54,6 +54,14 @@ class _PinnedPrimaryTier(CPUPrimaryTierOffloadingManager):
 class FuriosaOffloadingSpec(CPUOffloadingSpec):
     """Keep vLLM's scheduler policy while the worker uses Furiosa's transfer queue."""
 
+    @property
+    def coalescing(self) -> bool:
+        """Whether one vLLM step's loads share an engine staging batch."""
+        value = self.extra_config.get("coalescing", False)
+        if type(value) is not bool:
+            raise ValueError("coalescing must be a boolean")
+        return value
+
     @classmethod
     @override
     def build_metric_definitions(

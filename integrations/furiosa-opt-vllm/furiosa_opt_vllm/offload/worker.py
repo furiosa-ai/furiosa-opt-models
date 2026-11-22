@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from time import monotonic
-from typing import TYPE_CHECKING, final
+from typing import TYPE_CHECKING, TypeAlias, final
 
 import torch
 from typing_extensions import override
@@ -53,13 +53,18 @@ if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import CanonicalPageMapping
 
 
+# vLLM's runner-side block descriptor is GPU-named, while this adapter runs on the NPU.
+DeviceLoadStoreSpec: TypeAlias = GPULoadStoreSpec
+
+
 @final
 class Worker:
     """The connector's worker side over `host`, as vLLM's offloading worker runs it: a step's
     stores start in the next step, after the step's tokens are read."""
 
-    def __init__(self, host: Host) -> None:
+    def __init__(self, host: Host, *, coalescing: bool = False) -> None:
         self.host = host
+        self.coalescing = coalescing
         self.deferred: list[tuple[int, TransferJob]] = []
         # job_id -> the request whose blocks the load fills.
         self.loads: dict[int, str] = {}
@@ -80,8 +85,16 @@ class Worker:
     def start(self, metadata: OffloadingConnectorMetadata) -> None:
         """Submit the deferred stores, then the loads of `metadata`."""
         self.submit()
+        if self.coalescing and metadata.load_jobs:
+            jobs: list[tuple[int, LoadStoreSpec, DeviceLoadStoreSpec]] = []
+            for job_id, job in metadata.load_jobs.items():
+                assert isinstance(job.dst_spec, DeviceLoadStoreSpec)
+                jobs.append((job_id, job.src_spec, job.dst_spec))
+            self.host.submit_loads(jobs)
+            self.loads.update((job_id, job.req_id) for job_id, job in metadata.load_jobs.items())
+            return
         for job_id, job in metadata.load_jobs.items():
-            assert isinstance(job.dst_spec, GPULoadStoreSpec)
+            assert isinstance(job.dst_spec, DeviceLoadStoreSpec)
             self.loads[job_id] = job.req_id
             _ = self.host.submit_load(job_id, job.src_spec, job.dst_spec)
 
@@ -91,7 +104,7 @@ class Worker:
 
     def submit(self) -> None:
         for job_id, job in self.deferred:
-            assert isinstance(job.src_spec, GPULoadStoreSpec)
+            assert isinstance(job.src_spec, DeviceLoadStoreSpec)
             _ = self.host.submit_store(job_id, job.src_spec, job.dst_spec)
         self.deferred.clear()
 
@@ -330,17 +343,35 @@ class Host(OffloadingWorker):
 
     @override
     def submit_store(
-        self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
+        self, job_id: int, src_spec: DeviceLoadStoreSpec, dst_spec: LoadStoreSpec
     ) -> bool:
         groups = self._groups(src_spec, dst_spec)
         self.jobs.submit(job_id, self.transfers(groups, store=True), self._size(groups))
         return True
 
     @override
-    def submit_load(self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec) -> bool:
+    def submit_load(
+        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: DeviceLoadStoreSpec
+    ) -> bool:
         groups = self._groups(dst_spec, src_spec)
         self.jobs.submit(job_id, self.transfers(groups, store=False), self._size(groups))
         return True
+
+    def submit_loads(
+        self,
+        jobs: Iterable[tuple[int, LoadStoreSpec, DeviceLoadStoreSpec]],
+    ) -> None:
+        """Coalesce every step load into one engine copy while retaining each vLLM job."""
+        grouped = [
+            (job_id, self._groups(dst_spec, src_spec)) for job_id, src_spec, dst_spec in jobs
+        ]
+        pages = [page for _, groups in grouped for page in self.routed_pages(groups)]
+        transfer = self.copier.copy_in(pages, self.host_cache, coalesce=True)
+        transfer.submitted()
+        self.jobs.submit_batch(
+            ((job_id, self._size(groups)) for job_id, groups in grouped),
+            (transfer,),
+        )
 
     @override
     def get_finished(self) -> list[TransferResult]:
@@ -362,14 +393,7 @@ class Host(OffloadingWorker):
 
     def transfers(self, groups: list[GroupWork], *, store: bool) -> Iterable[PendingTransfer]:
         """Route each pinned host slot across its cache groups in two-page DMA batches."""
-        pages: dict[int, list[tuple[int, int]]] = {}
-        for work in groups:
-            group_index = self.group_indices[work.group_id]
-            for chunk in work.chunks:
-                for block, slot in zip(chunk.device_blocks, chunk.host_slots, strict=True):
-                    host_slot = chunk.chunk_id * self.blocks + slot
-                    pages.setdefault(host_slot, []).append((group_index, block))
-        routed_pages = [(slot, routes) for slot, routes in sorted(pages.items())]
+        routed_pages = self.routed_pages(groups)
         transfer = (
             self.copier.copy_out(routed_pages, self.host_cache)
             if store
@@ -378,7 +402,18 @@ class Host(OffloadingWorker):
         transfer.submitted()
         yield transfer
 
-    def _groups(self, device: GPULoadStoreSpec, host: LoadStoreSpec) -> list[GroupWork]:
+    def routed_pages(self, groups: list[GroupWork]) -> list[tuple[int, list[tuple[int, int]]]]:
+        """Route each job's host slots across its selected cache groups."""
+        pages: dict[int, list[tuple[int, int]]] = {}
+        for work in groups:
+            group_index = self.group_indices[work.group_id]
+            for chunk in work.chunks:
+                for block, slot in zip(chunk.device_blocks, chunk.host_slots, strict=True):
+                    host_slot = chunk.chunk_id * self.blocks + slot
+                    pages.setdefault(host_slot, []).append((group_index, block))
+        return [(slot, routes) for slot, routes in sorted(pages.items())]
+
+    def _groups(self, device: DeviceLoadStoreSpec, host: LoadStoreSpec) -> list[GroupWork]:
         if not isinstance(host, CPULoadStoreSpec):
             raise TypeError(f"expected CPULoadStoreSpec, got {type(host).__name__}")
         group_sizes = device.group_sizes
@@ -509,6 +544,17 @@ class Jobs:
         submitted before it ended."""
         started = monotonic()
         self.running[job_id] = Job(submit_transfers(transfers), size, started)
+
+    def submit_batch(
+        self,
+        jobs: Iterable[tuple[int, int]],
+        transfers: Iterable[PendingTransfer],
+    ) -> None:
+        """Submit one shared copy completion for several independently reported jobs."""
+        started = monotonic()
+        copies = submit_transfers(transfers)
+        for job_id, size in jobs:
+            self.running[job_id] = Job(copies, size, started)
 
     def finished(self) -> list[TransferResult]:
         """The jobs whose copies ended since the last call, without waiting."""
