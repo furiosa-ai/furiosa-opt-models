@@ -191,6 +191,16 @@ def _identity_mapping(mapping: CanonicalPageMapping, page_bytes: int) -> bool:
     )
 
 
+def _require_identity_mapping(
+    mapping: CanonicalPageMapping | None, layer_name: str, page_bytes: int
+) -> None:
+    """Refuse canonical pages that would need a gather or scatter before DMA."""
+    if mapping is None or not _identity_mapping(mapping, page_bytes):
+        raise ValueError(
+            f"vLLM canonical page for {layer_name} is not the engine page byte-for-byte"
+        )
+
+
 @final
 class Host(OffloadingWorker):
     """Pinned slots for vLLM blocks and the engine queue that copies cache pages."""
@@ -283,11 +293,7 @@ class Host(OffloadingWorker):
                         f"vLLM page size for {name} differs from the engine allocation"
                     )
                 if spec.config.canonical_layout:
-                    mapping = mappings.get(name)
-                    if mapping is None or not _identity_mapping(mapping, page_bytes):
-                        raise ValueError(
-                            f"vLLM canonical page for {name} is not the engine page byte-for-byte"
-                        )
+                    _require_identity_mapping(mappings.get(name), name, page_bytes)
                 layer_routes.append(
                     LayerRoute(layer_id, page_bytes, host_page_bytes, group_offset + layer_offset)
                 )

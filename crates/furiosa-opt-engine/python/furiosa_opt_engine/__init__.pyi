@@ -409,7 +409,18 @@ class HostCache:
 @typing.final
 class HostSlot:
     r"""
-    A zero-copy view of one pinned host slot.
+    A zero-copy view of one pinned host slot. Direct exports fail while DMA owns or waits for it.
+    """
+    def __len__(self) -> builtins.int: ...
+    def access(self) -> HostSlotAccess:
+        r"""
+        Wait for DMA; lease the slot while this object or its exported buffers remain alive.
+        """
+
+@typing.final
+class HostSlotAccess:
+    r"""
+    A host slot lease held for the lifetime of exported Python buffers.
     """
     def __len__(self) -> builtins.int: ...
 

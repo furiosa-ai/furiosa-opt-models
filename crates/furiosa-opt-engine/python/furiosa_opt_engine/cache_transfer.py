@@ -33,7 +33,7 @@ TransferT = TypeVar("TransferT", bound=PendingTransfer)
 
 
 class AlignedFileIO:
-    """Use a page-aligned per-thread bounce buffer; O_DIRECT cannot use dma-buf slots directly."""
+    """Use page-aligned bounce buffers for O_DIRECT and pinned slots directly for buffered I/O."""
 
     def __init__(self, directory: str, *, use_direct: bool | None = None) -> None:
         self.alignment = mmap.PAGESIZE
@@ -71,7 +71,7 @@ class AlignedFileIO:
         os.close(descriptor)
 
     def write_page(self, path: str, index: int, source: ByteBuffer) -> None:
-        """Write one page at its aligned file offset through the thread-local bounce buffer."""
+        """Write one page at its aligned file offset, bouncing only for direct I/O."""
         source_view = _byte_view(source)
         try:
             self._write_page(path, index, source_view)
@@ -79,7 +79,7 @@ class AlignedFileIO:
             source_view.release()
 
     def read_page(self, path: str, index: int, destination: ByteBuffer) -> None:
-        """Read one page from its aligned file offset through the thread-local bounce buffer."""
+        """Read one page from its aligned file offset, bouncing only for direct I/O."""
         destination_view = _byte_view(destination)
         try:
             self._read_page(path, index, destination_view)
@@ -89,37 +89,43 @@ class AlignedFileIO:
     def _write_page(self, path: str, index: int, source: memoryview) -> None:
         page_bytes = len(source)
         stride = self.aligned_size(page_bytes)
-        target = self._buffer(stride)
+        bounce = self.use_direct
+        target = self._buffer(stride) if bounce else source
         try:
-            source_address = ctypes.addressof(ctypes.c_ubyte.from_buffer(source))
-            ctypes.memmove(self.local.address, source_address, page_bytes)
-            target[page_bytes:] = bytes(stride - page_bytes)
+            if bounce:
+                source_address = ctypes.addressof(ctypes.c_ubyte.from_buffer(source))
+                ctypes.memmove(self.local.address, source_address, page_bytes)
+                target[page_bytes:] = bytes(stride - page_bytes)
             descriptor = os.open(path, os.O_WRONLY | self._direct_flag())
             try:
                 written = os.pwrite(descriptor, target, index * stride)
-                if written != stride:
-                    raise OSError(f"short write of {path}: {written} of {stride} bytes")
+                if written != len(target):
+                    raise OSError(f"short write of {path}: {written} of {len(target)} bytes")
             finally:
                 os.close(descriptor)
         finally:
-            target.release()
+            if bounce:
+                target.release()
 
     def _read_page(self, path: str, index: int, destination: memoryview) -> None:
         page_bytes = len(destination)
         stride = self.aligned_size(page_bytes)
-        source = self._buffer(stride)
+        bounce = self.use_direct
+        source = self._buffer(stride) if bounce else destination
         try:
             descriptor = os.open(path, os.O_RDONLY | self._direct_flag())
             try:
                 read = os.preadv(descriptor, [source], index * stride)
-                if read != stride:
-                    raise OSError(f"short read of {path}: {read} of {stride} bytes")
+                if read != len(source):
+                    raise OSError(f"short read of {path}: {read} of {len(source)} bytes")
             finally:
                 os.close(descriptor)
-            destination_address = ctypes.addressof(ctypes.c_ubyte.from_buffer(destination))
-            ctypes.memmove(destination_address, self.local.address, page_bytes)
+            if bounce:
+                destination_address = ctypes.addressof(ctypes.c_ubyte.from_buffer(destination))
+                ctypes.memmove(destination_address, self.local.address, page_bytes)
         finally:
-            source.release()
+            if bounce:
+                source.release()
 
     def _direct_flag(self) -> int:
         return getattr(os, "O_DIRECT", 0) if self.use_direct else 0
@@ -171,6 +177,9 @@ def _probe_o_direct(directory: str) -> bool:
 
 def _byte_view(buffer: ByteBuffer) -> memoryview:
     """Export the engine buffer protocol, which Python 3.11 cannot express in a type stub."""
+    if isinstance(buffer, engine.HostSlot):
+        # The lease keeps DMA out until this view and any derived views are released.
+        return memoryview(cast(Buffer, buffer.access())).cast("B")
     return memoryview(cast(Buffer, buffer)).cast("B")
 
 

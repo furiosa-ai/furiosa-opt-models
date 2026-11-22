@@ -177,9 +177,12 @@ Both servers copy the cache blocks of computed prompts to a tier of host memory,
 
 Both adapters keep the framework's scheduling, keys, and tier lifecycle. Their host transfers
 share the engine's six-worker queue: each batch moves up to two pinned host slots, with all layer
-pages in one runtime DMA batch. Filesystem I/O uses one page-aligned, per-thread bounce buffer
-and one aligned syscall per cache page; `O_DIRECT` is used when supported, with buffered fallback
-otherwise. vLLM keeps its chunk files and writes each page at its own aligned offset.
+pages in one runtime DMA batch. Filesystem I/O uses `O_DIRECT` with a page-aligned, per-thread
+bounce buffer when supported; buffered fallback accesses pinned slots directly. Both paths issue
+one syscall per cache page, and vLLM keeps its chunk files with each page at its aligned offset.
+The engine waits only for earlier DMA chunks touching the same host slot or device page. A lease on
+a host slot keeps DMA out while Python uses its pinned bytes; transfers for other pages remain
+independent.
 
 Only the attention cache moves, so both servers refuse offloading at startup for a model with recurrent state, and vLLM also for one with encoder memory; the [vLLM](vllm.md#options) and [SGLang](sglang.md#options) option pages name the other refused settings.
 A failed copy poisons the memory it touched, and neither server recovers once it observes the failure, so vLLM's `kv_load_failure_policy` takes only `fail`.

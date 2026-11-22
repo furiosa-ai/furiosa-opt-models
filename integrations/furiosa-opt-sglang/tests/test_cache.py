@@ -68,14 +68,27 @@ def test_hierarchical_cache_refuses_other_slot_tensors(
         _ = offload.pages(torch.arange(16, 32, dtype=dtype).reshape(shape), 16)
 
 
-def test_file_storage_round_trips_engine_host_buffers() -> None:
-    from tempfile import TemporaryDirectory
-
+def test_file_storage_round_trips_engine_host_slots(tmp_path) -> None:
     import torch
-    from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+    from sglang.srt.mem_cache.hicache_storage import (
+        HiCacheStorageConfig,
+        PoolName,
+        PoolTransfer,
+    )
 
-    import furiosa_opt_engine as engine
     from furiosa_opt_sglang.offload import Host
+    from furiosa_opt_sglang.storage import FuriosaHiCacheFile
+
+    class HostSlot(bytearray):
+        def access(self):
+            return self
+
+    class HostSlots:
+        def __init__(self) -> None:
+            self.pages = [HostSlot(12), HostSlot(12)]
+
+        def slot(self, index: int) -> HostSlot:
+            return self.pages[index]
 
     host = Host.__new__(Host)
     host.sizes = [2, 4]
@@ -83,14 +96,13 @@ def test_file_storage_round_trips_engine_host_buffers() -> None:
     host.page_size = 4
     host.page_num = 2
     host.dtype = torch.uint8
-    host.kv_buffer = [
-        engine.HostBuffer(bytes(range(1, 9))),
-        engine.HostBuffer(bytes(range(11, 27))),
-    ]
+    host.host_cache = HostSlots()
+    expected = bytes(range(1, 13))
+    host.host_cache.slot(1)[:] = expected
 
     assert host.get_dummy_flat_data_page().numel() == 12
     page = host.get_data_page(4)
-    assert page.tolist() == [5, 6, 7, 8, *range(19, 27)]
+    assert page.tolist() == list(expected)
     config = HiCacheStorageConfig(
         tp_rank=0,
         tp_size=1,
@@ -102,15 +114,23 @@ def test_file_storage_round_trips_engine_host_buffers() -> None:
         enable_storage_metrics=False,
         is_page_first_layout=True,
         model_name="engine-cache-test",
+        extra_config={"file_storage_path": str(tmp_path)},
     )
-    with TemporaryDirectory() as directory:
-        storage = HiCacheFile(config, file_path=directory)
-        assert storage.set("page-key", page)
-        host.set_from_flat_data_page(4, torch.zeros(12, dtype=torch.uint8))
-        restored = storage.get("page-key", host.get_dummy_flat_data_page())
-        assert restored is not None
-        host.set_from_flat_data_page(4, restored)
-        assert host.get_data_page(4).tolist() == page.tolist()
+    storage = FuriosaHiCacheFile(config)
+    storage.register_mem_host_pool_v2(host, PoolName.KV)
+    transfer = PoolTransfer(
+        name=PoolName.KV,
+        host_indices=torch.tensor([4, 5, 6, 7]),
+        keys=["page-key"],
+    )
+    try:
+        assert storage.batch_set_v2([transfer]) == {PoolName.KV: [True]}
+        host.host_cache.slot(1)[:] = bytes(12)
+        assert storage.batch_get_v2([transfer]) == {PoolName.KV: [True]}
+        assert bytes(host.host_cache.slot(1)) == expected
+    finally:
+        storage._read_io.shutdown()
+        storage._write_io.shutdown()
 
 
 def test_mamba_pool_copies_and_restores_slots() -> None:

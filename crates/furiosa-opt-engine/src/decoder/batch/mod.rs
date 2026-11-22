@@ -454,6 +454,10 @@ mod tests {
             window: 4,
             ..limits.clone()
         };
+        let wide = Limits {
+            window: (1 << 24) + 1,
+            ..limits.clone()
+        };
         let two = Request {
             rows: vec![vec![7], vec![8]],
             ..request(&[7], 0, 1)?
@@ -491,6 +495,12 @@ mod tests {
                 &short,
                 &cache,
                 "request extends past the context window",
+            ),
+            (
+                vec![request(&[7], 1 << 24, 1)?],
+                &wide,
+                &cache,
+                "position is not below 2^24",
             ),
             (
                 vec![request(&[7], 15, 2)?],

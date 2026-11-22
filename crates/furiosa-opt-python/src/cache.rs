@@ -3,16 +3,16 @@
 //! A slot holds selected layer bytes for one cache block. Six workers submit transfers in chunks
 //! of two blocks, each chunk batching all routed layer copies into one runtime read or write.
 
-use std::collections::BTreeMap;
-use std::ffi::{c_int, c_void};
+use std::collections::{BTreeMap, HashSet};
+use std::ffi::c_int;
 use std::io;
-use std::ops::Range;
+use std::ops::{DerefMut, Range};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 use furiosa_opt_std::prelude::{self, HostBuffer};
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyBufferError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
@@ -62,10 +62,18 @@ pub(crate) struct PyHostCache {
 /// A zero-copy view of one pinned host slot.
 #[gen_stub_pyclass]
 #[pyclass(name = "HostSlot", module = "engine", frozen)]
+#[derive(Clone)]
 pub(crate) struct PyHostSlot {
     pool: Arc<Pool>,
     slot: usize,
     bytes: Range<usize>,
+}
+
+/// A host slot lease held for the lifetime of exported Python buffers.
+#[gen_stub_pyclass]
+#[pyclass(name = "HostSlotAccess", module = "engine", frozen)]
+pub(crate) struct PyHostSlotAccess {
+    slot: PyHostSlot,
 }
 
 /// Completion of a queued cache copy.
@@ -75,9 +83,33 @@ pub(crate) struct PyHostSlot {
 pub(crate) struct PyCopy(Arc<Completion>);
 
 struct Pool {
-    slots: Vec<Mutex<HostBuffer>>,
+    slots: Vec<Slot>,
     block_bytes: usize,
     core: Weak<Core>,
+}
+
+struct Slot {
+    buffer: Mutex<HostBuffer>,
+    access: SlotAccess,
+}
+
+// Python buffer leases and DMA share one gate, so DMA cannot race a live host view.
+#[derive(Default)]
+struct SlotAccess {
+    state: Mutex<SlotAccessState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct SlotAccessState {
+    dma: bool,
+    exported_views: usize,
+    waiting_dma: usize,
+}
+
+struct DmaSlot<'a> {
+    slot: &'a Slot,
+    buffer: std::sync::MutexGuard<'a, HostBuffer>,
 }
 
 struct Queue {
@@ -89,6 +121,7 @@ struct Chunk {
     pages: Vec<TransferPage>,
     pool: Arc<Pool>,
     loading: bool,
+    completion: Arc<ChunkCompletion>,
     job: Arc<Job>,
 }
 
@@ -111,6 +144,11 @@ struct Completion {
     submission_changed: Condvar,
 }
 
+struct ChunkCompletion {
+    result: Mutex<Option<Result<(), String>>>,
+    changed: Condvar,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum TransferKey {
     Device(usize, u32),
@@ -118,7 +156,125 @@ enum TransferKey {
 }
 
 #[derive(Default)]
-struct Transfers(BTreeMap<TransferKey, Arc<Completion>>);
+// Each key retains only DMA chunks touching that page, not their whole framework job.
+struct Transfers(BTreeMap<TransferKey, Vec<Arc<ChunkCompletion>>>);
+
+impl Slot {
+    fn acquire_dma(&self) -> io::Result<DmaSlot<'_>> {
+        self.access.acquire_dma()?;
+        let buffer = match self.buffer.lock() {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                self.access.release_dma();
+                return Err(io::Error::other(error.to_string()));
+            }
+        };
+        Ok(DmaSlot { slot: self, buffer })
+    }
+}
+
+impl SlotAccess {
+    fn acquire_dma(&self) -> io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.waiting_dma = state
+            .waiting_dma
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("too many pending host slot transfers"))?;
+        while state.dma || state.exported_views != 0 {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.waiting_dma -= 1;
+        state.dma = true;
+        Ok(())
+    }
+
+    fn release_dma(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.dma = false;
+        self.changed.notify_all();
+    }
+
+    fn acquire_view(&self) -> io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        while state.dma || state.waiting_dma != 0 {
+            state = self
+                .changed
+                .wait(state)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+        }
+        state.exported_views = state
+            .exported_views
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("too many active host slot views"))?;
+        Ok(())
+    }
+
+    fn try_acquire_view(&self) -> io::Result<bool> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        if state.dma || state.waiting_dma != 0 {
+            return Ok(false);
+        }
+        state.exported_views = state
+            .exported_views
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("too many active host slot views"))?;
+        Ok(true)
+    }
+
+    fn release_view(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(state.exported_views > 0);
+        if state.exported_views > 0 {
+            state.exported_views -= 1;
+        }
+        self.changed.notify_all();
+    }
+}
+
+impl std::ops::Deref for DmaSlot<'_> {
+    type Target = HostBuffer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.buffer
+    }
+}
+
+impl DerefMut for DmaSlot<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buffer
+    }
+}
+
+impl Drop for DmaSlot<'_> {
+    fn drop(&mut self) {
+        // DMA is complete; the buffer mutex still serializes access until this guard drops.
+        self.slot.access.release_dma();
+    }
+}
+
+impl Drop for PyHostSlotAccess {
+    fn drop(&mut self) {
+        self.slot.pool.slots[self.slot.slot].access.release_view();
+    }
+}
 
 #[gen_stub_pymethods]
 #[pymethods]
@@ -224,19 +380,21 @@ impl PyCopier {
     /// Submit device-to-host copies for host slots and their `(group, device_block)` routes.
     fn copy_out(
         &mut self,
+        py: Python<'_>,
         pages: Vec<(usize, Vec<(usize, u32)>)>,
         host: PyRef<'_, PyHostCache>,
     ) -> PyResult<PyCopy> {
-        self.submit(pages, &host.pool, false)
+        self.submit(py, pages, &host.pool, false)
     }
 
     /// Submit host-to-device copies for host slots and their `(group, device_block)` routes.
     fn copy_in(
         &mut self,
+        py: Python<'_>,
         pages: Vec<(usize, Vec<(usize, u32)>)>,
         host: PyRef<'_, PyHostCache>,
     ) -> PyResult<PyCopy> {
-        self.submit(pages, &host.pool, true)
+        self.submit(py, pages, &host.pool, true)
     }
 
     /// Wait for every submitted copy and stop the workers.
@@ -251,6 +409,7 @@ impl PyCopier {
 impl PyCopier {
     fn submit(
         &mut self,
+        py: Python<'_>,
         mut pages: Vec<(usize, Vec<(usize, u32)>)>,
         pool: &Arc<Pool>,
         loading: bool,
@@ -320,30 +479,42 @@ impl PyCopier {
             }
         }
         reservations.dedup();
-        self.pending
-            .check(&reservations, Some(Duration::ZERO))
-            .map_err(crate::Error::from)?;
+        // Reuse waits for only prior DMA batches that share a host slot or device page.
+        let previous = self.pending.conflicts(&reservations);
+        if !previous.is_empty() {
+            let result = py.detach(move || {
+                let mut first_error = None;
+                for copy in previous {
+                    if let Err(error) = copy.wait() {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                first_error.map_or(Ok(()), Err)
+            });
+            self.pending.remove(&reservations);
+            result.map_err(crate::Error::from)?;
+        }
 
         let completion = Arc::new(Completion::default());
-        let chunks = Chunk::split(pages, pool, loading, &completion);
+        let (chunks, chunk_completions) = Chunk::split(pages, pool, loading, &completion);
         let mut chunks = chunks.into_iter();
         while let Some(chunk) = chunks.next() {
-            let job = Arc::clone(&chunk.job);
-            if self.queue.send(chunk).is_err() {
-                let remaining = 1 + chunks.count();
-                let error = io::Error::other("the cache copy workers stopped");
-                for _ in 0..remaining {
-                    job.finish(Err(io::Error::other(error.to_string())));
+            if let Err((error, failed_chunk)) = self.queue.send(chunk) {
+                failed_chunk.fail(io::Error::other(error.to_string()));
+                for chunk in chunks {
+                    chunk.fail(io::Error::other(error.to_string()));
                 }
                 let _ = completion.done(None);
+                self.pending.remove(&reservations);
                 return Err(crate::Error::from(error).into());
             }
         }
-        self.pending.0.extend(
-            reservations
-                .into_iter()
-                .map(|key| (key, Arc::clone(&completion))),
-        );
+        for (key, completion) in chunk_completions {
+            let entries = self.pending.0.entry(key).or_default();
+            if !entries.iter().any(|entry| Arc::ptr_eq(entry, &completion)) {
+                entries.push(completion);
+            }
+        }
         Ok(PyCopy(completion))
     }
 }
@@ -357,17 +528,12 @@ impl PyHostCache {
         if slots == 0 {
             return Err(PyValueError::new_err("host cache needs at least one slot"));
         }
-        if block_bytes > 64 << 20 {
-            return Err(PyValueError::new_err(
-                "a host cache block cannot exceed 64 MiB",
-            ));
-        }
         let total = slots
             .checked_mul(block_bytes)
             .ok_or_else(|| PyValueError::new_err("host cache allocation size overflows"))?;
         let group_bytes = (ALLOCATION_GROUP_BYTES / block_bytes).max(1);
         let next = AtomicUsize::new(0);
-        let allocate = || -> io::Result<Vec<(usize, Vec<Mutex<HostBuffer>>)>> {
+        let allocate = || -> io::Result<Vec<(usize, Vec<Slot>)>> {
             let mut groups = Vec::new();
             loop {
                 let first = next.fetch_add(group_bytes, Ordering::Relaxed);
@@ -385,7 +551,10 @@ impl PyHostCache {
                                 "the runtime did not provide page-locked host memory",
                             ));
                         }
-                        Ok(Mutex::new(buffer))
+                        Ok(Slot {
+                            buffer: Mutex::new(buffer),
+                            access: SlotAccess::default(),
+                        })
                     })
                     .collect::<io::Result<Vec<_>>>()?;
                 groups.push((first, pinned));
@@ -447,6 +616,14 @@ impl PyHostSlot {
         self.bytes.len()
     }
 
+    /// Wait for DMA, then lease the slot while this object or its exported buffers remain alive.
+    fn access(&self, py: Python<'_>) -> PyResult<PyHostSlotAccess> {
+        let slot = &self.pool.slots[self.slot];
+        py.detach(|| slot.access.acquire_view())
+            .map_err(crate::Error::from)?;
+        Ok(PyHostSlotAccess { slot: self.clone() })
+    }
+
     /// Writable buffer access without copying.
     #[gen_stub(skip)]
     unsafe fn __getbuffer__(
@@ -454,27 +631,105 @@ impl PyHostSlot {
         view: *mut ffi::Py_buffer,
         flags: c_int,
     ) -> PyResult<()> {
-        let (pointer, length) = {
-            let slot = &slf.get().pool.slots[slf.get().slot];
-            let mut buffer = slot
-                .lock()
-                .map_err(|error| io::Error::other(error.to_string()))?;
-            let range = slf.get().bytes.clone();
-            let mut bytes = buffer
-                .slice_mut(range.clone())
-                .and_then(|slice| slice.into_bytes())
-                .map_err(crate::Error::from)?;
-            (
-                bytes.as_mut_ptr().cast::<c_void>(),
-                ffi::Py_ssize_t::try_from(range.len())
-                    .map_err(|_| PyValueError::new_err("host slot is too large for Python"))?,
-            )
-        };
-        // SAFETY: the Python view holds `slf`, which keeps the pinned allocation alive.
-        match unsafe { ffi::PyBuffer_FillInfo(view, slf.as_ptr(), pointer, length, 0, flags) } {
-            0 => Ok(()),
-            _ => Err(PyErr::fetch(slf.py())),
+        let host_slot = &slf.get().pool.slots[slf.get().slot];
+        if !host_slot
+            .access
+            .try_acquire_view()
+            .map_err(crate::Error::from)?
+        {
+            return Err(PyBufferError::new_err(
+                "host slot has pending DMA; call access() to wait for it",
+            ));
         }
+        match unsafe {
+            fill_slot_buffer(
+                slf.py(),
+                slf.as_ptr(),
+                &host_slot.buffer,
+                slf.get().bytes.clone(),
+                view,
+                flags,
+            )
+        } {
+            Ok(()) => {
+                // SAFETY: `view` remains live until `__releasebuffer__` frees this token.
+                unsafe {
+                    (*view).internal = Box::into_raw(Box::new(slf.get().slot)).cast();
+                }
+                Ok(())
+            }
+            Err(error) => {
+                host_slot.access.release_view();
+                Err(error)
+            }
+        }
+    }
+
+    #[gen_stub(skip)]
+    unsafe fn __releasebuffer__(slf: Bound<'_, Self>, view: *mut ffi::Py_buffer) {
+        // SAFETY: `__getbuffer__` stores one slot index in this view's internal field.
+        let internal = unsafe { (*view).internal };
+        if internal.is_null() {
+            return;
+        }
+        // SAFETY: this token was allocated by `__getbuffer__` and is released exactly once here.
+        let slot = unsafe { *Box::from_raw(internal.cast::<usize>()) };
+        unsafe { (*view).internal = std::ptr::null_mut() };
+        slf.get().pool.slots[slot].access.release_view();
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyHostSlotAccess {
+    fn __len__(&self) -> usize {
+        self.slot.bytes.len()
+    }
+
+    #[gen_stub(skip)]
+    unsafe fn __getbuffer__(
+        slf: Bound<'_, Self>,
+        view: *mut ffi::Py_buffer,
+        flags: c_int,
+    ) -> PyResult<()> {
+        let slot = &slf.get().slot;
+        let host_slot = &slot.pool.slots[slot.slot];
+        unsafe {
+            fill_slot_buffer(
+                slf.py(),
+                slf.as_ptr(),
+                &host_slot.buffer,
+                slot.bytes.clone(),
+                view,
+                flags,
+            )
+        }
+    }
+}
+
+unsafe fn fill_slot_buffer(
+    py: Python<'_>,
+    object: *mut ffi::PyObject,
+    buffer: &Mutex<HostBuffer>,
+    range: Range<usize>,
+    view: *mut ffi::Py_buffer,
+    flags: c_int,
+) -> PyResult<()> {
+    let mut buffer = buffer
+        .lock()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut bytes = buffer
+        .slice_mut(range.clone())
+        .and_then(|slice| slice.into_bytes())
+        .map_err(crate::Error::from)?;
+    let length = ffi::Py_ssize_t::try_from(range.len())
+        .map_err(|_| PyValueError::new_err("host slot is too large for Python"))?;
+    // SAFETY: caller holds a slot lease and `object` keeps the pinned allocation alive.
+    match unsafe {
+        ffi::PyBuffer_FillInfo(view, object, bytes.as_mut_ptr().cast(), length, 0, flags)
+    } {
+        0 => Ok(()),
+        _ => Err(PyErr::fetch(py)),
     }
 }
 
@@ -566,12 +821,13 @@ impl Queue {
         })
     }
 
-    fn send(&self, chunk: Chunk) -> io::Result<()> {
-        self.sender
-            .as_ref()
-            .ok_or_else(|| io::Error::other("the cache copy queue is shut down"))?
+    fn send(&self, chunk: Chunk) -> Result<(), (io::Error, Chunk)> {
+        let Some(sender) = self.sender.as_ref() else {
+            return Err((io::Error::other("the cache copy queue is shut down"), chunk));
+        };
+        sender
             .send(chunk)
-            .map_err(|_| io::Error::other("the cache copy workers stopped"))
+            .map_err(|error| (io::Error::other("the cache copy workers stopped"), error.0))
     }
 
     fn shutdown(&mut self) {
@@ -594,28 +850,58 @@ impl Chunk {
         pool: &Arc<Pool>,
         loading: bool,
         completion: &Arc<Completion>,
-    ) -> Vec<Self> {
+    ) -> (Vec<Self>, Vec<(TransferKey, Arc<ChunkCompletion>)>) {
         let chunks = Self::partition_pages(pages);
         if chunks.is_empty() {
             completion.mark_submitted(Ok(()));
             completion.finish(Ok(()));
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
+        let chunk_keys = chunks
+            .iter()
+            .map(|pages| {
+                let mut keys = Vec::new();
+                for page in pages {
+                    keys.push(TransferKey::Host(page.slot));
+                    keys.extend(
+                        page.routes
+                            .iter()
+                            .map(|&(group, block)| TransferKey::Device(group, block)),
+                    );
+                }
+                keys.sort_unstable();
+                keys.dedup();
+                keys
+            })
+            .collect::<Vec<_>>();
+        let completions = (0..chunks.len())
+            .map(|_| Arc::new(ChunkCompletion::default()))
+            .collect::<Vec<_>>();
+        let pending = chunk_keys
+            .iter()
+            .zip(&completions)
+            .flat_map(|(keys, completion)| {
+                keys.iter().map(move |&key| (key, Arc::clone(completion)))
+            })
+            .collect();
         let job = Arc::new(Job {
             left: AtomicUsize::new(chunks.len()),
             submit_left: AtomicUsize::new(chunks.len()),
             failure: Mutex::new(None),
             completion: Arc::clone(completion),
         });
-        chunks
+        let chunks = chunks
             .into_iter()
-            .map(|pages| Self {
+            .zip(completions)
+            .map(|(pages, completion)| Self {
                 pages,
                 pool: Arc::clone(pool),
                 loading,
+                completion,
                 job: Arc::clone(&job),
             })
-            .collect()
+            .collect();
+        (chunks, pending)
     }
 
     fn partition_pages(pages: Vec<(usize, Vec<(usize, u32)>)>) -> Vec<Vec<TransferPage>> {
@@ -637,18 +923,21 @@ impl Chunk {
             self.transfer(executor, core)
         }))
         .unwrap_or_else(|_| Err(io::Error::other("cache copy worker panicked")));
+        self.completion.finish(clone_result(&result));
         self.job.finish(result);
+    }
+
+    fn fail(self, error: io::Error) {
+        self.completion
+            .finish(Err(io::Error::new(error.kind(), error.to_string())));
+        self.job.finish(Err(error));
     }
 
     fn transfer(&self, executor: &tokio::runtime::Runtime, core: &Core) -> io::Result<()> {
         let mut hosts = self
             .pages
             .iter()
-            .map(|page| {
-                self.pool.slots[page.slot]
-                    .lock()
-                    .map_err(|error| io::Error::other(error.to_string()))
-            })
+            .map(|page| self.pool.slots[page.slot].acquire_dma())
             .collect::<io::Result<Vec<_>>>()?;
         let route_count = self
             .pages
@@ -780,25 +1069,31 @@ impl Job {
 }
 
 impl Transfers {
-    fn check(&mut self, reservations: &[TransferKey], timeout: Option<Duration>) -> io::Result<()> {
+    fn conflicts(&self, reservations: &[TransferKey]) -> Vec<Arc<ChunkCompletion>> {
+        let mut seen = HashSet::new();
+        reservations
+            .iter()
+            .filter_map(|reservation| self.0.get(reservation))
+            .flatten()
+            .filter(|copy| seen.insert(Arc::as_ptr(copy) as usize))
+            .cloned()
+            .collect()
+    }
+
+    fn remove(&mut self, reservations: &[TransferKey]) {
         for reservation in reservations {
-            if let Some(copy) = self.0.get(reservation) {
-                if !copy.done(timeout)? {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "cache block has an unfinished transfer",
-                    ));
-                }
-                self.0.remove(reservation);
-            }
+            self.0.remove(reservation);
         }
-        Ok(())
     }
 
     fn drain(&mut self) -> io::Result<()> {
         let mut first_error = None;
-        for copy in self.0.values() {
-            if let Err(error) = copy.done(None) {
+        let mut seen = HashSet::new();
+        for copy in self.0.values().flatten() {
+            if !seen.insert(Arc::as_ptr(copy) as usize) {
+                continue;
+            }
+            if let Err(error) = copy.wait() {
                 first_error.get_or_insert(error);
             }
         }
@@ -891,5 +1186,99 @@ impl Default for Completion {
             submission: Mutex::new(None),
             submission_changed: Condvar::new(),
         }
+    }
+}
+
+impl ChunkCompletion {
+    fn finish(&self, result: io::Result<()>) {
+        *self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(result.map_err(|error| error.to_string()));
+        self.changed.notify_all();
+    }
+
+    fn wait(&self) -> io::Result<()> {
+        let mut result = self
+            .result
+            .lock()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        loop {
+            if let Some(result) = &*result {
+                return result
+                    .as_ref()
+                    .map(|()| ())
+                    .map_err(|error| io::Error::other(error.clone()));
+            }
+            result = self
+                .changed
+                .wait(result)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+        }
+    }
+}
+
+impl Default for ChunkCompletion {
+    fn default() -> Self {
+        Self {
+            result: Mutex::new(None),
+            changed: Condvar::new(),
+        }
+    }
+}
+
+fn clone_result(result: &io::Result<()>) -> io::Result<()> {
+    result
+        .as_ref()
+        .map(|()| ())
+        .map_err(|error| io::Error::new(error.kind(), error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_reservations_track_only_chunks_that_touch_them() {
+        let pool = Arc::new(Pool {
+            slots: Vec::new(),
+            block_bytes: 0,
+            core: Weak::new(),
+        });
+        let job = Arc::new(Completion::default());
+        let (chunks, reservations) = Chunk::split(
+            vec![(0, vec![(0, 4)]), (1, vec![(0, 4)]), (2, vec![(0, 4)])],
+            &pool,
+            false,
+            &job,
+        );
+        assert_eq!(chunks.len(), 2);
+
+        let mut transfers = Transfers::default();
+        for (key, completion) in reservations {
+            transfers.0.entry(key).or_default().push(completion);
+        }
+        let page = transfers.conflicts(&[TransferKey::Device(0, 4)]);
+        assert_eq!(page.len(), 2);
+        let finished_chunk = Arc::clone(&chunks[0].completion);
+        finished_chunk.finish(Ok(()));
+        assert!(finished_chunk.wait().is_ok());
+        assert_eq!(
+            page.iter()
+                .filter(|completion| completion.result.lock().unwrap().is_none())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn host_slot_views_and_dma_exclude_each_other() {
+        let access = SlotAccess::default();
+        access.acquire_dma().unwrap();
+        assert!(!access.try_acquire_view().unwrap());
+        access.release_dma();
+        assert!(access.try_acquire_view().unwrap());
+        access.release_view();
     }
 }

@@ -249,7 +249,8 @@ class Host(HostKVCache):
         if not flat:
             raise ValueError("the engine cache exposes opaque flat pages to storage")
         page = self._page_index(index)
-        return torch.frombuffer(self.host_cache.slot(page), dtype=torch.uint8).view(self.dtype)
+        slot = self.host_cache.slot(page).access()
+        return torch.frombuffer(slot, dtype=torch.uint8).view(self.dtype)
 
     @override
     def get_dummy_flat_data_page(self) -> torch.Tensor:
@@ -264,7 +265,12 @@ class Host(HostKVCache):
         source = memoryview(data_page.contiguous().view(torch.uint8).reshape(-1).numpy()).cast("B")
         if len(source) != self._page_bytes:
             raise ValueError("stored page size differs from the engine cache page")
-        memoryview(self.host_cache.slot(page)).cast("B")[:] = source
+        slot = self.host_cache.slot(page).access()
+        destination = memoryview(slot).cast("B")
+        try:
+            destination[:] = source
+        finally:
+            destination.release()
 
     @property
     def _page_bytes(self) -> int:

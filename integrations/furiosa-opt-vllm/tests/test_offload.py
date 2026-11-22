@@ -30,7 +30,6 @@ from vllm.v1.kv_cache_interface import (
 from furiosa_opt_engine.cache_transfer import (
     submit as submit_transfers,
 )
-from furiosa_opt_vllm import cache
 from furiosa_opt_vllm.offload import worker
 
 if TYPE_CHECKING:
@@ -240,8 +239,8 @@ def test_canonical_mapping_uses_metadata_views_and_fails_closed(
         kv_cache_tensors=[],
         kv_cache_groups=[KVCacheGroupSpec(layer_names=["layers.0"], kv_cache_spec=layer_spec)],
     )
-    group_indices = cache.group_indices(cache_instance.spec, cache_config.kv_cache_groups)
-    view = worker._metadata_cache_views(cache_instance, cache_config, group_indices)["layers.0"]
+    layer_owner = {0: (0, 0)}
+    view = worker._metadata_cache_views(cache_instance, cache_config, layer_owner)["layers.0"]
     assert view.device.type == "meta"
     assert tuple(view.shape) == (4, 2, 2, 1, 2)
     assert tuple(view.stride()) == (8, strides[1], strides[0], strides[2], strides[3])
@@ -261,6 +260,146 @@ def test_canonical_mapping_uses_metadata_views_and_fails_closed(
     mapping = mappings["layers.0"]
     assert (mapping.local_page_size_bytes, mapping.canonical_page_size_bytes) == (8, 8)
     assert mapping.parallelism_agnostic is portable
+
+
+def test_canonical_layout_requires_an_identity_page_mapping(monkeypatch) -> None:
+    class FakeCopier:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def shutdown(self) -> None:
+            pass
+
+    class FakeHostCache:
+        def __init__(self, _copier: FakeCopier, _slots: int) -> None:
+            pass
+
+    monkeypatch.setattr(worker.engine, "Copier", FakeCopier)
+    monkeypatch.setattr(worker.engine, "HostCache", FakeHostCache)
+    monkeypatch.setattr(worker.host_pool, "register", lambda *_args: None)
+    monkeypatch.setattr(worker.host_pool, "unregister", lambda *_args: None)
+
+    group = KVCacheGroupSpec(
+        layer_names=["layers.0"],
+        kv_cache_spec=FullAttentionSpec(
+            block_size=2,
+            num_kv_heads=1,
+            head_size=2,
+            dtype=torch.uint8,
+        ),
+    )
+    cache_config = KVCacheConfig(num_blocks=4, kv_cache_tensors=[], kv_cache_groups=[group])
+    pool = SimpleNamespace(
+        block=2,
+        bytes=8,
+        element_bytes=1,
+        shape=[2, 2, 1, 2],
+        strides=[4, 2, 2, 1],
+    )
+    cache = SimpleNamespace(
+        blocks=4,
+        layers=[bytearray(32)],
+        spec=SimpleNamespace(
+            pools=[pool],
+            groups=[SimpleNamespace(pool=0, layers=[0], logical_group=0)],
+        ),
+    )
+    spec = SimpleNamespace(
+        blocks_per_chunk=2,
+        num_chunks=2,
+        kv_bytes_per_chunk=16,
+        config=SimpleNamespace(
+            canonical_layout=True,
+            parallel=SimpleNamespace(is_parallelism_agnostic=False),
+            engine_id="canonical-layout-test",
+        ),
+    )
+
+    def canonical_mapping(canonical_offset: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            local_page_size_bytes=8,
+            canonical_page_size_bytes=8,
+            num_writers=1,
+            writer_index=0,
+            runs=[
+                SimpleNamespace(
+                    local_offset=0,
+                    canonical_offset=canonical_offset,
+                    local_stride=1,
+                    canonical_stride=1,
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        worker,
+        "derive_canonical_mappings",
+        lambda *_args: {"layers.0": canonical_mapping(0)},
+    )
+    host = worker.Host(cache, 1, spec, SimpleNamespace(), cache_config, (0,))
+    host.shutdown()
+
+    monkeypatch.setattr(
+        worker,
+        "derive_canonical_mappings",
+        lambda *_args: {"layers.0": canonical_mapping(1)},
+    )
+    with pytest.raises(ValueError, match="not the engine page byte-for-byte"):
+        worker.Host(cache, 1, spec, SimpleNamespace(), cache_config, (0,))
+
+
+def test_vllm_tiering_uses_engine_owned_primary_layout(tmp_path) -> None:
+    from vllm.v1.kv_offload.tiering.manager import TieringOffloadingManager
+
+    from furiosa_opt_vllm.offload.spec import _PinnedPrimaryTier
+    from furiosa_opt_vllm.offload.storage import FuriosaFileSystemTierManager
+
+    config = SimpleNamespace(
+        canonical_layout=False,
+        replicated_layout=False,
+        model=SimpleNamespace(name="engine-cache-test", dtype="bfloat16"),
+        cache=SimpleNamespace(tokens_per_hash=16),
+        groups=[],
+        parallel=SimpleNamespace(
+            tp_size=1,
+            pp_size=1,
+            pcp_size=1,
+            dcp_size=1,
+            rank=0,
+            is_parallelism_agnostic=False,
+        ),
+        engine_id="engine-cache-test",
+    )
+    spec = SimpleNamespace(
+        num_chunks=2,
+        kv_bytes_per_chunk=4096,
+        eviction_policy="lru",
+        cache_policy_module_path=None,
+        kv_events_config=SimpleNamespace(enable_kv_cache_events=False),
+        blocks_per_chunk=2,
+        config=config,
+    )
+    primary = _PinnedPrimaryTier(spec)
+    storage = None
+    try:
+        view = primary.get_kv_memoryview()
+        assert view.strides == (4096, 1)
+
+        storage = FuriosaFileSystemTierManager(
+            spec,
+            view,
+            "fs",
+            root_dir=str(tmp_path),
+        )
+        manager = TieringOffloadingManager(primary, [storage])
+
+        assert manager.primary_tier is primary
+        assert storage._primary_kv_view is view
+        assert storage.block_size_bytes == 4096
+    finally:
+        if storage is not None:
+            storage.shutdown()
+        primary.shutdown()
 
 
 def ask(tokenizer: PreTrainedTokenizerBase, people: tuple[tuple[str, str, str], ...]) -> list[int]:
