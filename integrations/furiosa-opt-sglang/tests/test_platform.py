@@ -157,7 +157,7 @@ def test_refuses_unserved_quantization(checkpoint: str, reason: str) -> None:
     with pytest.raises(Refused) as error:
         arguments.resolve_once()
     assert error.value.option == "model_path"
-    assert reason in error.value.requirement
+    assert error.value.requirement == reason
 
 
 @pytest.mark.feature("Online quantization")

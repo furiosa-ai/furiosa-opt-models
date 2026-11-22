@@ -216,7 +216,7 @@ Without the copy, waking reads the checkpoint's files as they are then.
 
 ## Quantize a BF16 checkpoint at load
 
-For BF16 Qwen3-0.6B, 1.7B and 4B, both adapters select per-tensor weight scales for this backend. SGLang 0.5.22 uses per-channel weights when its optimized channel-wise kernels are selected and explicitly falls back to tensor-wise `input_to_float8` otherwise ([dispatch and fallback](https://github.com/sgl-project/sglang/blob/v0.5.22/python/sglang/srt/layers/quantization/fp8.py#L482-L496), [conversion branch](https://github.com/sgl-project/sglang/blob/v0.5.22/python/sglang/srt/layers/quantization/fp8.py#L1077-L1097)). vLLM 0.31.0's `fp8_per_tensor` method uses a tensor-wise weight key directly ([method](https://github.com/vllm-project/vllm/blob/v0.31.0/vllm/model_executor/layers/quantization/online/fp8.py#L163-L180)). Each adapter resolves its framework option; the engine owns weight conversion and kernel selection.
+For BF16 Qwen3-0.6B, 1.7B and 4B, both adapters select per-tensor weight scales for this backend. Fused query/key/value and gate/up weights each share one scale. SGLang 0.5.22 uses per-channel weights when its optimized channel-wise kernels are selected and explicitly falls back to tensor-wise `input_to_float8` otherwise ([dispatch and fallback](https://github.com/sgl-project/sglang/blob/v0.5.22/python/sglang/srt/layers/quantization/fp8.py#L482-L496), [conversion branch](https://github.com/sgl-project/sglang/blob/v0.5.22/python/sglang/srt/layers/quantization/fp8.py#L1077-L1097)). vLLM 0.31.0's `fp8_per_tensor` method uses a tensor-wise weight key directly ([method](https://github.com/vllm-project/vllm/blob/v0.31.0/vllm/model_executor/layers/quantization/online/fp8.py#L163-L180)). Each adapter resolves its framework option; the engine owns weight conversion and kernel selection.
 
 The scale-layout match does not extend to activations. Both native methods dynamically quantize them: SGLang uses per-token scales ([activation path](https://github.com/sgl-project/sglang/blob/v0.5.22/python/sglang/srt/layers/quantization/fp8_utils.py#L2379-L2395)); vLLM selects per-tensor or per-token scales according to its active kernel path ([activation selection](https://github.com/vllm-project/vllm/blob/v0.31.0/vllm/model_executor/layers/quantization/online/fp8.py#L163-L180)). This engine path quantizes weights only and keeps BF16 activations, so it is a documented subset and outputs can differ. Full activation parity needs engine support for each framework's activation scale layout.
 
@@ -226,7 +226,6 @@ The scale-layout match does not extend to activations. Both native methods dynam
     vllm serve Qwen/Qwen3-0.6B --quantization fp8_per_tensor
     ```
 
-    Each projection has one scale, shared by the projections vLLM fuses into one matrix (a layer's query, key and value; its gate and up).
     Startup refuses `--quantization` on a quantized checkpoint.
 
 === "SGLang"
@@ -235,7 +234,6 @@ The scale-layout match does not extend to activations. Both native methods dynam
     python -m sglang.launch_server --model-path Qwen/Qwen3-0.6B --quantization fp8
     ```
 
-    This backend follows SGLang's explicit fallback: one scale covers each fused projection tensor (query, key and value; gate and up). SGLang uses per-output-channel scales when its optimized channel-wise kernels are selected.
     A STANDALONE draft model takes the target's quantization, as in SGLang; `--speculative-draft-model-quantization unquant` loads it as stored.
     If a checkpoint declares its own quantization, `fp8` adds no conversion; the engine reads the stored form or refuses it if unsupported.
     Waking from [sleep](#put-the-server-to-sleep) quantizes the BF16 weights again, so a woken server answers as before.

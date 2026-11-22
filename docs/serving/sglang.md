@@ -26,7 +26,7 @@ The platform accepts these values:
 | `--enable-deterministic-inference` | Off, or on to load the model [batch invariant](index.md#keep-outputs-independent-of-the-batch) with the radix cache on |
 | `--enable-hierarchical-cache` | A model without recurrent state, with the host tier sized by `--hicache-ratio` or `--hicache-size` and kept in memory: `--hicache-host-memory-mode cache`, `--hicache-io-backend kernel`, `--hicache-mem-layout page_first`, no `--hicache-storage-backend` and no memory saver |
 | `--quantization` | Unset, or `fp8` to [quantize a BF16 checkpoint at load](index.md#quantize-a-bf16-checkpoint-at-load) |
-| `--speculative-draft-model-quantization` | Unset, which takes the target's, `unquant`, or `fp8` |
+| `--speculative-draft-model-quantization` | Unset (inherits the target's quantization), `unquant` (loads stored weights), or `fp8` (quantizes BF16 weights at load) |
 
 These features are not supported yet, and the plugin refuses them at startup rather than ignore them:
 
