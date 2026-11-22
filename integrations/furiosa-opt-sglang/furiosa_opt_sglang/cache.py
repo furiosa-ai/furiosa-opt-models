@@ -97,6 +97,26 @@ class Cache(KVCache):
         total = sum(len(layer) for layer in self.storage.layers)
         return total // 2, total // 2
 
+    def get_contiguous_buf_infos(self) -> tuple[list[int], list[int], list[int]]:
+        """Describe the two logical KV halves to SGLang's NIXL control plane.
+
+        The pointers are protocol placeholders: the adapter registers bounded host staging
+        buffers, never these engine-owned HBM pages. Each advertised item has the byte size of
+        half a page across all chips, matching SGLang's K/V item geometry.
+        """
+        if self.storage is None:
+            raise RuntimeError(RELEASED)
+        page_bytes = self.pages.pool.bytes * self.pages.chips
+        if page_bytes % 2:
+            raise ValueError(f"engine KV page size {page_bytes} cannot split into K and V")
+        item_bytes = page_bytes // 2
+        entries = 2 * len(self.storage.layers)
+        return (
+            [0] * entries,
+            [item_bytes * self.storage.blocks] * entries,
+            [item_bytes] * entries,
+        )
+
     @override
     def get_cpu_copy(
         self,

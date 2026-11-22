@@ -33,7 +33,7 @@ def register() -> None:
     from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
     from transformers import AutoConfig
 
-    from furiosa_opt_sglang import speculative
+    from furiosa_opt_sglang import nixl, speculative
     from furiosa_opt_sglang.generation import Sampled
     from furiosa_opt_sglang.offload import Strategy
     from furiosa_opt_sglang.paging import assign
@@ -127,6 +127,32 @@ def register() -> None:
 
     manager = f"{SchedulerWeightUpdaterManager.__module__}.{SchedulerWeightUpdaterManager.__name__}"
     for target, kind, function in (
+        # Keep SGLang's NIXL sender/receiver protocol, but route engine KV through bounded staging.
+        (
+            "sglang.srt.disaggregation.decode.get_kv_class",
+            HookType.AROUND,
+            nixl.select_manager,
+        ),
+        (
+            "sglang.srt.disaggregation.prefill.get_kv_class",
+            HookType.AROUND,
+            nixl.select_manager,
+        ),
+        (
+            "sglang.srt.disaggregation.decode.DecodeTransferQueue._init_kv_manager",
+            HookType.AROUND,
+            nixl.attach_after_init,
+        ),
+        (
+            "sglang.srt.disaggregation.prefill.PrefillBootstrapQueue._init_kv_manager",
+            HookType.AROUND,
+            nixl.attach_after_init,
+        ),
+        (
+            "sglang.srt.disaggregation.common.staging_handler.DecodeStagingHandler",
+            HookType.REPLACE,
+            nixl.EngineDecodeStagingHandler,
+        ),
         # The engine executes the scheduled batches.
         ("sglang.srt.managers.tp_worker.TpModelWorker", HookType.REPLACE, Worker),
         # SGLang's speculative workers run torch draft models; the engine drafts and verifies.

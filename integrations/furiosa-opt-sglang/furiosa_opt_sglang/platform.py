@@ -132,7 +132,13 @@ class Resolved(Served):
     # The engine places every weight it loads; SGLang's per-layer embedding offload moves tables of
     # its own model, and its backend and directory options take effect only with it.
     ple_offload_embedding: Unset
-    disaggregation_mode: Literal["null"] = Field(description="requires disaggregation_mode=null")
+    disaggregation_mode: Literal["null", "prefill", "decode"]
+    disaggregation_transfer_backend: str
+    disaggregation_enable_kv_checksum: Unset
+    disaggregation_decode_enable_offload_kvcache: Unset
+    disaggregation_decode_host_receive_threshold: Literal[1.0] = Field(
+        description="uses bounded NIXL staging; omit host receive"
+    )
     startup_weight_load_mode: Literal["serial"] = Field(
         description="requires startup_weight_load_mode=serial"
     )
@@ -320,6 +326,24 @@ class Platform(SRTPlatform):
         _ = Requested.parse(raw)
         resolved = Resolved.parse(server_args)
         speculative = Speculations.parse(server_args) is not None
+        if resolved.disaggregation_mode != "null":
+            if resolved.disaggregation_transfer_backend != "nixl":
+                raise Refused(
+                    "disaggregation_transfer_backend",
+                    "requires disaggregation_transfer_backend=nixl",
+                )
+            from sglang.srt.environ import envs
+
+            if not envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+                raise Refused(
+                    "SGLANG_DISAGG_STAGING_BUFFER",
+                    "requires SGLANG_DISAGG_STAGING_BUFFER=1 for bounded NIXL staging",
+                )
+            if speculative:
+                raise Refused(
+                    "disaggregation_mode",
+                    "does not support speculative decoding with disaggregation",
+                )
         # One scheduler drives every chip of a split model, as SGLang's would drive one rank;
         # the engine reads the operator's degree, which SGLang's ranks would each load whole.
         # Each data-parallel replica's first chip then lies that many chips past the last one's.
@@ -333,6 +357,13 @@ class Platform(SRTPlatform):
         server_args.device = "cpu"
         server_args.dtype = "bfloat16"
         model_config = model_config_of(server_args)
+        if resolved.disaggregation_mode != "null" and recurrent(
+            cast("PretrainedConfig", model_config.hf_config).model_type
+        ):
+            raise Refused(
+                "disaggregation_mode",
+                "requires a full-history attention cache without recurrent state",
+            )
         # The engine refuses from the config alone, before a scheduler starts or a weight downloads,
         # what the scheduler's load of these options would.
         from furiosa_opt_sglang.checkpoint import configured
