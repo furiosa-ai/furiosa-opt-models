@@ -132,9 +132,7 @@ def bind(model_config: ModelConfig, first: int) -> Model:
     # Only the memory saver releases the weights, so only it keeps the backup they resume from.
     backup = cast("bool", features.enable_memory_saver and features.enable_weights_cpu_backup)
     try:
-        decoder = Decoder.load(
-            mapped, loads, device, model_config.vocab_size, backup=backup
-        )
+        decoder = Decoder.load(mapped, loads, device, model_config.vocab_size, backup=backup)
     except NotImplementedError as error:
         raise Refused("model_path", str(error)) from None
     match decoder.model:

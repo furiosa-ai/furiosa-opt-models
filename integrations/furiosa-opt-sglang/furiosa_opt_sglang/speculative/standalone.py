@@ -65,9 +65,7 @@ class Draft:
             raise RuntimeError(RELEASED)
         try:
             loads = engine.LoadOptions().chips(target.model.parallel)
-            loads = quantized_options(
-                loads, options.speculative_draft_model_quantization, stored
-            )
+            loads = quantized_options(loads, options.speculative_draft_model_quantization, stored)
             mapped = checkpoint.mapped()
             loads.parse(mapped.source)
         except (NotImplementedError, ValueError) as error:
