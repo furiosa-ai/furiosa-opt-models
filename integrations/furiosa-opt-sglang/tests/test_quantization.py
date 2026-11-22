@@ -109,6 +109,22 @@ def test_generates_as_the_checkpoint_quantized_by_sglang(
 
 
 @pytest.mark.feature("Online quantization")
+@pytest.mark.feature("Speculative decoding (ngram, suffix, draft model)")
+def test_draft_owned_fp8_keeps_bf16_target_answers(
+    tmp_path_factory: pytest.TempPathFactory, chips: Chips
+) -> None:
+    """A draft's online FP8 leaves its BF16 target's greedy answers unchanged."""
+    checkpoint = "Qwen/Qwen3-1.7B"
+    with chips.serve(tmp_path_factory, {"id": checkpoint, "task": "text"}) as send:
+        expected = generate(send)
+    flags = (*DRAFT, "--speculative-draft-model-quantization", "fp8")
+    row = {"id": checkpoint, "task": "text", "flags": flags}
+    with chips.serve(tmp_path_factory, row) as send:
+        actual = generate(send)
+    assert actual == expected
+
+
+@pytest.mark.feature("Online quantization")
 @pytest.mark.parametrize(
     ("target_flags", "draft_flags"),
     [

@@ -18,10 +18,9 @@ concurrency:
 
 permissions: {contents: read}
 
-# The RNGD runners are shared, so a pull request runs its tests and only a `bench`-labeled one its
-# measurements, which the nightly run takes otherwise. The merge queue lints only, as a pull
-# request built and tested the tree before it queued; its skipped jobs still report the statuses
-# the branch requires.
+# The RNGD runners are shared. A pull request runs tests and a focused serving contract; a
+# `bench`-labeled one also measures, which nightly otherwise does. The merge queue lints only: its
+# pull request tested the tree before queueing, and skipped jobs report the statuses branch requires.
 jobs:
   build:
     if: >-
@@ -30,7 +29,9 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       build: ${{ github.event_name != 'merge_group' }}
-      wheel: ${{ contains(github.event.pull_request.labels.*.name, 'bench') }}
+      # PR serving contracts install the plugin wheels; `bench` also measures them.
+      wheel: >-
+        ${{ github.event_name == 'pull_request' || contains(github.event.pull_request.labels.*.name, 'bench') }}
     permissions: {actions: read, contents: write}
 
   lint:

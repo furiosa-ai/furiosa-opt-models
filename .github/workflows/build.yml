@@ -8,7 +8,7 @@ on:
         type: boolean
         default: true
       wheel:
-        description: Build the engine and plugin wheels, which only serving measurements install.
+        description: Build the engine and plugin wheels, which serving contracts and measurements install.
         type: boolean
         default: true
 
