@@ -316,7 +316,7 @@ impl CacheSpec {
         self.inner.pools.iter().cloned().map(Pool).collect()
     }
 
-    /// Engine storage groups. Groups with the same logical vLLM group share one block table.
+    /// Engine storage groups. Groups with the same logical cache group share one block table.
     #[getter]
     fn groups(&self) -> Vec<Group> {
         self.inner.groups.iter().cloned().map(Group).collect()
@@ -382,10 +382,10 @@ impl Group {
         self.0.layers.clone()
     }
 
-    /// Logical vLLM block-table group shared by this engine storage group.
+    /// Logical cache group shared by this engine storage group.
     #[getter]
-    fn vllm_group(&self) -> usize {
-        self.0.vllm_group
+    fn logical_group(&self) -> usize {
+        self.0.logical_group
     }
 
     /// What the group's blocks hold.

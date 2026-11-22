@@ -62,7 +62,7 @@ def bind(runner: Runner, *, load_dummy_weights: bool = False) -> None:
     cache = model.cache
     block_sizes: dict[int, set[int]] = {}
     for group in cache.groups:
-        block_sizes.setdefault(group.vllm_group, set()).add(cache.pools[group.pool].block)
+        block_sizes.setdefault(group.logical_group, set()).add(cache.pools[group.pool].block)
     if len(block_sizes) == 1:
         (group_block_sizes,) = block_sizes.values()
         if len(group_block_sizes) != 1:

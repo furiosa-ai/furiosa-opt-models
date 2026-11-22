@@ -17,14 +17,14 @@ fn spec() -> CacheSpec {
             Group {
                 pool: 0,
                 layers: vec![0, 2],
-                vllm_group: 0,
+                logical_group: 0,
                 kind: Kind::Paged,
                 window: None,
             },
             Group {
                 pool: 1,
                 layers: vec![1],
-                vllm_group: 0,
+                logical_group: 0,
                 kind: Kind::Paged,
                 window: None,
             },
@@ -83,14 +83,14 @@ fn rejects_inconsistent_logical_group_metadata() {
     cache.pools[1].format = PageFormat::contiguous(vec![8, 4], 1);
     assert_eq!(
         message(cache.validate().unwrap_err()),
-        "engine groups of one vLLM group disagree on block size or attention kind"
+        "logical cache groups disagree on block size or attention kind"
     );
 
     let mut cache = spec();
-    cache.groups[1].vllm_group = 2;
+    cache.groups[1].logical_group = 2;
     assert_eq!(
         message(cache.validate().unwrap_err()),
-        "vLLM cache group IDs are not contiguous"
+        "logical cache group IDs are not contiguous"
     );
 }
 

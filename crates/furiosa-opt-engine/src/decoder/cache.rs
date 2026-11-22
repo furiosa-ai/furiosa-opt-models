@@ -22,7 +22,7 @@ pub struct CacheSpec {
     pub layer_count: usize,
     /// Block formats, which groups name by index.
     pub pools: Vec<Pool>,
-    /// Engine storage groups. Groups with the same `vllm_group` use one logical vLLM block table.
+    /// Engine storage groups. Groups with the same `logical_group` use one logical block table.
     pub groups: Vec<Group>,
 }
 
@@ -107,8 +107,8 @@ pub struct Group {
     pub pool: usize,
     /// Stable model layer IDs held by this group; they need not be contiguous.
     pub layers: Vec<usize>,
-    /// Logical vLLM block-table group this engine storage group belongs to.
-    pub vllm_group: usize,
+    /// Logical cache group this engine storage group belongs to.
+    pub logical_group: usize,
     pub kind: Kind,
     /// Positions a row attends back to in a sliding window; `None` attends the whole history.
     pub window: Option<usize>,
@@ -173,11 +173,11 @@ impl CacheSpec {
             }
             let semantics = (pool.block, group.kind, group.window);
             if logical_groups
-                .insert(group.vllm_group, semantics)
+                .insert(group.logical_group, semantics)
                 .is_some_and(|previous| previous != semantics)
             {
                 return Err(invalid(
-                    "engine groups of one vLLM group disagree on block size or attention kind",
+                    "logical cache groups disagree on block size, attention kind, or window",
                 ));
             }
         }
@@ -190,7 +190,7 @@ impl CacheSpec {
             .enumerate()
             .any(|(expected, actual)| expected != actual)
         {
-            return Err(invalid("vLLM cache group IDs are not contiguous"));
+            return Err(invalid("logical cache group IDs are not contiguous"));
         }
         Ok(())
     }
@@ -365,7 +365,7 @@ mod tests {
             groups: vec![Group {
                 pool: 0,
                 layers: layers.collect(),
-                vllm_group: 0,
+                logical_group: 0,
                 kind: Kind::Paged,
                 window: None,
             }],
@@ -395,7 +395,7 @@ mod tests {
         spec.groups.push(Group {
             pool: 1,
             layers: vec![2],
-            vllm_group: 1,
+            logical_group: 1,
             kind: Kind::State,
             window: None,
         });
@@ -434,8 +434,8 @@ mod tests {
         assert!(paged(64, 0..1).layer_sizes(1 << 25).is_ok());
     }
 
-    /// Descriptors cover every stable model layer once, and logical vLLM groups have one block
-    /// size and attention kind even when multiple engine groups use different page formats.
+    /// Descriptors cover every stable model layer once, and logical groups have one block size,
+    /// attention kind, and window even when engine groups use different page formats.
     #[test]
     fn validates_layer_and_logical_group_mapping() {
         let mut spec = CacheSpec {
@@ -445,14 +445,14 @@ mod tests {
                 Group {
                     pool: 0,
                     layers: vec![0, 2],
-                    vllm_group: 0,
+                    logical_group: 0,
                     kind: Kind::Paged,
                     window: None,
                 },
                 Group {
                     pool: 1,
                     layers: vec![1],
-                    vllm_group: 0,
+                    logical_group: 0,
                     kind: Kind::Paged,
                     window: None,
                 },
@@ -476,15 +476,15 @@ mod tests {
         spec.groups[1].window = Some(8);
         assert_eq!(
             spec.validate().unwrap_err().to_string(),
-            "engine groups of one vLLM group disagree on block size or attention kind"
+            "logical cache groups disagree on block size, attention kind, or window"
         );
         spec.groups[1].window = None;
-        spec.groups[1].vllm_group = 2;
+        spec.groups[1].logical_group = 2;
         assert_eq!(
             spec.validate().unwrap_err().to_string(),
-            "vLLM cache group IDs are not contiguous"
+            "logical cache group IDs are not contiguous"
         );
-        spec.groups[1].vllm_group = 0;
+        spec.groups[1].logical_group = 0;
         spec.groups[1].layers.clear();
         assert_eq!(
             spec.validate().unwrap_err().to_string(),
@@ -554,7 +554,7 @@ mod tests {
                 groups: vec![Group {
                     pool: 0,
                     layers: vec![0],
-                    vllm_group: 0,
+                    logical_group: 0,
                     kind: Kind::Paged,
                     window: None,
                 }],

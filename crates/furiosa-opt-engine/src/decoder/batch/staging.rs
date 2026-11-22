@@ -263,7 +263,7 @@ mod tests {
                     groups: vec![Group {
                         pool: 0,
                         layers: vec![0],
-                        vllm_group: 0,
+                        logical_group: 0,
                         kind: Kind::Paged,
                         window: None,
                     }],

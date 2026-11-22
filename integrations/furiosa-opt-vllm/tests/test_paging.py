@@ -31,8 +31,8 @@ def test_rejects_an_engine_group_without_a_vllm_group() -> None:
 def test_matches_logical_group_ids_to_vllm_group_order_by_layer_set() -> None:
     cache = SimpleNamespace(
         groups=[
-            SimpleNamespace(vllm_group=0, layers=[4, 0]),
-            SimpleNamespace(vllm_group=1, layers=[3]),
+            SimpleNamespace(logical_group=0, layers=[4, 0]),
+            SimpleNamespace(logical_group=1, layers=[3]),
         ]
     )
     first, second = object(), object()
@@ -49,7 +49,7 @@ def test_matches_logical_group_ids_to_vllm_group_order_by_layer_set() -> None:
 
 
 def test_rejects_a_vllm_cache_group_placed_in_host_memory() -> None:
-    cache = SimpleNamespace(groups=[SimpleNamespace(vllm_group=0, layers=[0])])
+    cache = SimpleNamespace(groups=[SimpleNamespace(logical_group=0, layers=[0])])
     config = SimpleNamespace(
         kv_cache_groups=[
             SimpleNamespace(layer_names=["layers.0"], kv_cache_spec=object(), host_resident=True)

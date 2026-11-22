@@ -109,7 +109,7 @@ class CacheSpec:
     @property
     def groups(self) -> builtins.list[Group]:
         r"""
-        Engine storage groups. Groups with the same logical vLLM group share one block table.
+        Engine storage groups. Groups with the same logical cache group share one block table.
         """
 
 @typing.final
@@ -128,9 +128,9 @@ class Group:
         Stable model layer IDs the group caches; the list may be non-contiguous.
         """
     @property
-    def vllm_group(self) -> builtins.int:
+    def logical_group(self) -> builtins.int:
         r"""
-        Logical vLLM block-table group shared by this engine storage group.
+        Logical cache group shared by this engine storage group.
         """
     @property
     def kind(self) -> Kind:

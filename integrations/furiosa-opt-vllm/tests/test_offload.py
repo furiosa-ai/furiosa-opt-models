@@ -181,15 +181,17 @@ def test_failed_submission_waits_for_submitted_copies() -> None:
 
 
 def test_shared_core_submission_drains_copies_on_failure() -> None:
-    first = Copies()
+    first = Copies(RuntimeError("copy failed"))
 
     def submitted() -> Iterator[Copies]:
         yield first
         raise RuntimeError("submission failed")
 
-    with pytest.raises(RuntimeError, match="submission failed"):
+    with pytest.raises(RuntimeError, match="submission failed") as error:
         _ = submit_transfers(submitted())
     assert first.waited
+    assert isinstance(error.value.__cause__, RuntimeError)
+    assert str(error.value.__cause__) == "copy failed"
 
 
 def test_shared_core_routes_pages_in_both_directions() -> None:
@@ -319,7 +321,7 @@ def test_staged_transfer_does_not_commit_failed_dma() -> None:
 
     with pytest.raises(RuntimeError, match="DMA failed"):
         staged.wait()
-    assert released == []
+    assert released == ["staging"]
 
 
 class _ImmediateCopy:
@@ -391,9 +393,9 @@ def test_routes_multigroup_ranges_to_heterogeneous_engine_subgroups(
             SimpleNamespace(bytes=other),
         ],
         groups=[
-            SimpleNamespace(pool=0, layers=[0], vllm_group=1),
-            SimpleNamespace(pool=1, layers=[1], vllm_group=1),
-            SimpleNamespace(pool=2, layers=[2], vllm_group=0),
+            SimpleNamespace(pool=0, layers=[0], logical_group=1),
+            SimpleNamespace(pool=1, layers=[1], logical_group=1),
+            SimpleNamespace(pool=2, layers=[2], logical_group=0),
         ],
     )
     cache_instance = SimpleNamespace(spec=cache_spec, layers=layers, blocks=8)
@@ -506,7 +508,7 @@ def test_canonical_mapping_uses_metadata_views_and_fails_closed(
         shape=[2, 2, 1, 2],
         strides=list(strides),
     )
-    engine_group = SimpleNamespace(pool=0, layers=[0], vllm_group=0)
+    engine_group = SimpleNamespace(pool=0, layers=[0], logical_group=0)
     cache_instance = SimpleNamespace(spec=SimpleNamespace(pools=[pool], groups=[engine_group]))
     layer_spec = FullAttentionSpec(block_size=2, num_kv_heads=1, head_size=2, dtype=torch.uint8)
     cache_config = KVCacheConfig(

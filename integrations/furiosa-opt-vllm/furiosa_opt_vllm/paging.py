@@ -82,7 +82,7 @@ def describe(runner: Runner) -> dict[str, KVCacheSpec]:
             case engine.decoder.Kind.Cross():
                 raise NotImplementedError("the plugin does not serve encoder Cross cache groups")
             case _:
-                raise ValueError(f"engine group {group.vllm_group} has an invalid cache window")
+                raise ValueError(f"engine group {group.logical_group} has an invalid cache window")
         if spec.page_size_bytes != pool.bytes:
             raise ValueError(
                 f"the engine pages {pool.bytes} bytes a block, vLLM {spec.page_size_bytes}"
@@ -254,7 +254,7 @@ def initialize(runner: Runner, config: KVCacheConfig) -> None:
             _validate_kv_cache_tensors(config, layout, expected)
             runner.cache = engine.decoder.Cache(loaded.cache, config.num_blocks)
             runner.engine_group_block_table_indices = tuple(
-                vllm_group_indices[group.vllm_group] for group in loaded.cache.groups
+                vllm_group_indices[group.logical_group] for group in loaded.cache.groups
             )
         case _:
             assert_never(model)

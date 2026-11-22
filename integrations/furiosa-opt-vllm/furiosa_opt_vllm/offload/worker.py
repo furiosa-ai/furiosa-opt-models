@@ -236,7 +236,7 @@ class Host(OffloadingWorker):
             for layer_id in group.layers:
                 if not 0 <= layer_id < len(cache.layers):
                     raise ValueError(f"engine cache group names unknown layer {layer_id}")
-                layer_owner[layer_id] = (engine_group_indices[group.vllm_group], group.pool)
+                layer_owner[layer_id] = (engine_group_indices[group.logical_group], group.pool)
 
         mappings: dict[str, CanonicalPageMapping] = {}
         if self.canonical_layout:
@@ -392,7 +392,10 @@ class Host(OffloadingWorker):
         """Copy selected logical groups to/from their engine subgroups and host chunk regions."""
         for work in groups:
             group_id = work.group_id
-            for chunk_id, device_blocks, host_slots in work.chunks:
+            for chunk in work.chunks:
+                chunk_id = chunk.chunk_id
+                device_blocks = chunk.device_blocks
+                host_slots = chunk.host_slots
                 for route in self.routes[group_id]:
                     layer = self.layers[route.layer_id]
                     if route.mapping is None and self.region is None:
@@ -553,16 +556,16 @@ class Host(OffloadingWorker):
             chunks_needed = (first_slot + count + self.blocks - 1) // self.blocks
             if chunk_offset + chunks_needed > len(chunk_ids):
                 raise ValueError("vLLM host chunks do not cover the requested block range")
-            chunks: list[tuple[int, tuple[int, ...], tuple[int, ...]]] = []
+            chunks: list[ChunkWork] = []
             group_cursor = 0
             for chunk_position in range(chunks_needed):
                 slot_start = first_slot if chunk_position == 0 else 0
                 length = min(count - group_cursor, self.blocks - slot_start)
                 chunks.append(
-                    (
-                        chunk_ids[chunk_offset + chunk_position],
-                        group_blocks[group_cursor : group_cursor + length],
-                        tuple(range(slot_start, slot_start + length)),
+                    ChunkWork(
+                        chunk_id=chunk_ids[chunk_offset + chunk_position],
+                        device_blocks=group_blocks[group_cursor : group_cursor + length],
+                        host_slots=tuple(range(slot_start, slot_start + length)),
                     )
                 )
                 group_cursor += length
@@ -576,9 +579,10 @@ class Host(OffloadingWorker):
 
     def _size(self, groups: list[GroupWork]) -> int:
         return sum(
-            len(device_blocks) * sum(route.host_page_bytes for route in self.routes[group.group_id])
+            len(chunk.device_blocks)
+            * sum(route.host_page_bytes for route in self.routes[group.group_id])
             for group in groups
-            for _, device_blocks, _ in group.chunks
+            for chunk in group.chunks
         )
 
     def _shared_slice(self, offset: int, size: int) -> memoryview:
@@ -607,9 +611,16 @@ class Host(OffloadingWorker):
 
 
 @dataclass(frozen=True, slots=True)
+class ChunkWork:
+    chunk_id: int
+    device_blocks: tuple[int, ...]
+    host_slots: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class GroupWork:
     group_id: int
-    chunks: tuple[tuple[int, tuple[int, ...], tuple[int, ...]], ...]
+    chunks: tuple[ChunkWork, ...]
 
 
 @final
@@ -627,6 +638,7 @@ class _StagedTransfer:
         self.staging = staging
         self.commit = commit
         self.release = release
+        self._released = False
         self.settled = False
         self.failure: Exception | None = None
 
@@ -636,13 +648,23 @@ class _StagedTransfer:
         if self.failure is not None:
             raise self.failure
         try:
-            if not self.transfer.done():
-                return False
+            ready = self.transfer.done()
+        except Exception as error:
+            try:
+                self.transfer.wait()
+            except Exception as wait_error:
+                self._fail(wait_error)
+                raise wait_error from error
+            self._fail(error)
+            raise
+        if not ready:
+            return False
+        try:
             self.transfer.wait()
             self._finish()
             return True
         except Exception as error:
-            self.failure = error
+            self._fail(error)
             raise
 
     def wait(self) -> None:
@@ -654,15 +676,29 @@ class _StagedTransfer:
             self.transfer.wait()
             self._finish()
         except Exception as error:
-            self.failure = error
+            self._fail(error)
             raise
 
     def _finish(self) -> None:
-        if self.commit is not None:
-            self.commit()
-        if self.release is not None:
-            self.release()
+        try:
+            if self.commit is not None:
+                self.commit()
+        finally:
+            self._release()
         self.settled = True
+
+    def _fail(self, error: Exception) -> None:
+        self.failure = error
+        try:
+            self._release()
+        except Exception as release_error:
+            raise error from release_error
+
+    def _release(self) -> None:
+        if self.release is None or self._released:
+            return
+        self._released = True
+        self.release()
 
 
 def _copy_mapping(

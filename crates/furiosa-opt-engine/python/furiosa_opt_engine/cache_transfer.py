@@ -161,13 +161,15 @@ def copy_cache_pages(
 
 
 def submit(transfers: Iterable[TransferT]) -> tuple[TransferT, ...]:
-    """Submit copies, draining submitted work if a later copy cannot be submitted."""
+    """Submit copies and drain earlier work if a later copy cannot be submitted."""
     submitted: list[TransferT] = []
     try:
         for transfer in transfers:
             submitted.append(transfer)
-    except Exception:
-        _ = settle(submitted)
+    except Exception as submit_error:
+        drain_error = settle(submitted)
+        if drain_error is not None and drain_error is not submit_error:
+            raise submit_error from drain_error
         raise
     return tuple(submitted)
 

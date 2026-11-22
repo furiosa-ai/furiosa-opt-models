@@ -69,7 +69,7 @@ fn cache_spec<S: Geometry>() -> CacheSpec {
         groups: vec![Group {
             pool: 0,
             layers: (0..S::LAYERS).collect(),
-            vllm_group: 0,
+            logical_group: 0,
             kind: Kind::Paged,
             window: None,
         }],

@@ -26,6 +26,14 @@ import torch
 from typing_extensions import override
 from vllm import envs
 
+from furiosa_opt_vllm.contracts import Contract
+from furiosa_opt_vllm.offloading import (
+    direct_connector_contracts,
+    direct_offloadings,
+    offload,
+    offloading_contracts,
+)
+
 if TYPE_CHECKING:
     from vllm.config import (
         LoadConfig,
@@ -54,11 +62,6 @@ CACHE_DTYPES: Final[Mapping[str, str | None]] = MappingProxyType(
 )
 
 
-# The KV connector `--kv-offloading-size` selects, by the class and module vLLM's factory loads.
-CONNECTOR: Final = "RNGDOffloadingConnector"
-CONNECTOR_MODULE: Final = "furiosa_opt_vllm.offload"
-
-
 @final
 class Refused(ValueError):
     """A server option the plugin cannot honor, and the requirement it violates."""
@@ -72,84 +75,6 @@ class Refused(ValueError):
     @override
     def __str__(self) -> str:
         return f"furiosa-opt-vllm {self.requirement}"
-
-
-@dataclass(frozen=True, slots=True)
-class Contract:
-    option: str
-    accepts: Callable[[VllmConfig], bool]
-    requirement: str
-
-
-def offload(config: VllmConfig) -> None:
-    """Turn `--kv-offloading-size` into the transfer config vLLM derives from it for its own
-    connector, naming `CONNECTOR` instead, and take the size: vLLM derives its config after the
-    platform's check, from a size it still sees."""
-    from vllm.config import KVTransferConfig
-
-    cache = config.cache_config
-    if (
-        cache.kv_offloading_size is None
-        or cache.kv_offloading_backend != "native"
-        or envs.VLLM_USE_SIMPLE_KV_OFFLOAD
-    ):
-        return
-    transfer = config.kv_transfer_config or KVTransferConfig()
-    transfer.kv_connector = CONNECTOR
-    transfer.kv_connector_module_path = CONNECTOR_MODULE
-    transfer.kv_role = "kv_both"
-    extra = transfer.kv_connector_extra_config
-    extra["cpu_bytes_to_use"] = cache.kv_offloading_size * (1 << 30)
-    if extra.get("spec_name") is None:
-        if extra.get("secondary_tiers"):
-            extra["spec_name"] = "TieringOffloadingSpec"
-        else:
-            extra.pop("spec_name", None)
-    config.kv_transfer_config = transfer
-    cache.kv_offloading_size = None
-
-
-@dataclass(frozen=True, slots=True)
-class Offloading:
-    """What the contracts check of an offloading transfer config through `CONNECTOR`, with its
-    `kv_connector_extra_config` keys read as vLLM's offloading reads them."""
-
-    # vLLM's stock CPU spec, or its stock tiering spec when a secondary tier is configured.
-    supported_spec: bool
-    tiering_spec: bool
-    canonical_layout: bool
-    load_failure_policy: Literal["recompute", "fail"]
-
-
-def offloading(config: VllmConfig) -> Offloading | None:
-    """The offloading settings of `config` when it runs through `CONNECTOR`, or none without it."""
-    transfer = config.kv_transfer_config
-    if transfer is None or transfer.kv_connector != CONNECTOR:
-        return None
-    extra: Mapping[str, object] = transfer.kv_connector_extra_config
-    spec_name = extra.get("spec_name")
-    if spec_name is None and extra.get("secondary_tiers"):
-        spec_name = "TieringOffloadingSpec"
-    elif spec_name is None:
-        spec_name = "CPUOffloadingSpec"
-    spec_module = extra.get("spec_module_path")
-    cpu_spec = spec_name == "CPUOffloadingSpec" and spec_module is None
-    tiering_spec = spec_name == "TieringOffloadingSpec" and spec_module is None
-    has_secondary_tiers = bool(extra.get("secondary_tiers"))
-    return Offloading(
-        (cpu_spec and not has_secondary_tiers) or tiering_spec,
-        tiering_spec,
-        bool(extra.get("canonical_layout")),
-        transfer.kv_load_failure_policy,
-    )
-
-
-def engine_cache(model: ModelConfig | None) -> bool:
-    """Whether the engine holds `model`'s cache: the paged attention cache of a generating decoder
-    with no recurrent state or encoder memory."""
-    return model is None or (
-        model.runner_type == "generate" and not (model.has_inner_state or model.is_encoder_decoder)
-    )
 
 
 # The projections the engine adds an adapter's updates to, in BF16, and the packed projections
@@ -255,88 +180,8 @@ CONTRACTS: Final = (
         lambda c: not c.aux_output_config.enable_return_routed_experts,
         "returns no routed experts",
     ),
-    Contract(
-        "kv_offloading_backend",
-        lambda c: (
-            c.cache_config.kv_offloading_size is None
-            or c.cache_config.kv_offloading_backend == "native"
-        ),
-        "offloads the KV cache with kv_offloading_backend=native",
-    ),
-    Contract(
-        "VLLM_USE_SIMPLE_KV_OFFLOAD",
-        lambda c: c.cache_config.kv_offloading_size is None or not envs.VLLM_USE_SIMPLE_KV_OFFLOAD,
-        f"offloads through {CONNECTOR}, so it serves no VLLM_USE_SIMPLE_KV_OFFLOAD=1",
-    ),
-    Contract(
-        "kv_transfer_config",
-        lambda c: (
-            c.kv_transfer_config is None
-            or c.kv_transfer_config.kv_connector != "OffloadingConnector"
-        ),
-        f"offloads through {CONNECTOR}, which --kv-offloading-size selects: vLLM's "
-        + "OffloadingConnector copies through CUDA streams",
-    ),
-    Contract(
-        "kv_transfer_config",
-        lambda c: (
-            c.kv_transfer_config is None
-            or (
-                c.kv_transfer_config.kv_connector == CONNECTOR
-                and c.kv_transfer_config.kv_connector_module_path == CONNECTOR_MODULE
-            )
-        ),
-        f"serves no KV connector but {CONNECTOR}, which --kv-offloading-size selects",
-    ),
-    Contract(
-        "kv_connector_extra_config",
-        lambda c: (settings := offloading(c)) is None or settings.supported_spec,
-        "uses vLLM's CPUOffloadingSpec for host offload or TieringOffloadingSpec when "
-        + "secondary_tiers are configured",
-    ),
-    # A failed copy poisons the blocks and host rows it touched, so no request reruns on them.
-    Contract(
-        "kv_load_failure_policy",
-        lambda c: (settings := offloading(c)) is None or settings.load_failure_policy == "fail",
-        "stops the engine when an offloaded block fails to copy: kv_load_failure_policy=fail",
-    ),
-    # vLLM's offloading scheduler ends a job once each of its ranks' workers reports it, and one
-    # worker drives every chip of the replica.
-    Contract(
-        "tensor_parallel_size",
-        lambda c: offloading(c) is None or c.parallel_config.tensor_parallel_size == 1,
-        "offloads at tensor_parallel_size=1: vLLM awaits each rank; one worker drives all chips",
-    ),
-    Contract(
-        "pipeline_parallel_size",
-        lambda c: offloading(c) is None or c.parallel_config.pipeline_parallel_size == 1,
-        "offloads at pipeline_parallel_size=1: vLLM awaits each rank; one worker drives all chips",
-    ),
-    # The worker joins vLLM's process groups as rank 0 of 1, which data parallelism renumbers.
-    Contract(
-        "data_parallel_size",
-        lambda c: offloading(c) is None or c.parallel_config.data_parallel_size == 1,
-        "offloads at data_parallel_size=1: vLLM ranks each replica's worker among all replicas",
-    ),
-    Contract(
-        "kv_offloading_size",
-        lambda c: offloading(c) is None or engine_cache(c.model_config),
-        "offloads the attention cache of a decoder, not recurrent state or encoder memory",
-    ),
-    Contract(
-        "kv_offloading_size",
-        lambda c: offloading(c) is None or not c.is_mm_encoder_only,
-        "offloads the attention cache of a decoder, which an encoder-only instance does not run",
-    ),
-    # Sleep mode frees the cache storage and allocates new storage on waking, while the host tier
-    # keeps copying the storage it was built over.
-    Contract(
-        "enable_sleep_mode",
-        lambda c: (
-            offloading(c) is None or not (c.model_config and c.model_config.enable_sleep_mode)
-        ),
-        "offloads the KV cache without sleep mode, which frees the cache its host tier copies",
-    ),
+    *offloading_contracts(direct_offloadings),
+    *direct_connector_contracts(),
     # A consumer needs the checkpoint's language model, which the engine does not serve; of vLLM's
     # connectors, the example one saves a producer's host rows as they are.
     Contract(

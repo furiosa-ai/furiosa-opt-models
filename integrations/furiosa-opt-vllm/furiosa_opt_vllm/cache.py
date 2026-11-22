@@ -29,8 +29,8 @@ def group_indices(
         for layer_id in group.layers:
             if layer_id in layer_owner:
                 raise ValueError(f"engine cache layer {layer_id} belongs to multiple groups")
-            layer_owner[layer_id] = group.vllm_group
-            engine_groups[group.vllm_group].add(f"layers.{layer_id}")
+            layer_owner[layer_id] = group.logical_group
+            engine_groups[group.logical_group].add(f"layers.{layer_id}")
 
     vllm_groups: dict[frozenset[str], int] = {}
     for index, group in enumerate(groups):
