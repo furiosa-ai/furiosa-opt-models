@@ -241,8 +241,9 @@ class Host(HostKVCache):
             ]
             copy = self.copier.copy_in(transfers, self.host_cache)
             copy.submitted()
-            # SGLang records each layer-ready event as soon as this callback returns. The engine
-            # batches every layer into one DMA call, so wait for that call before signaling layer 0.
+            # SGLang records layer-ready and allocator-finish events as soon as this callback
+            # returns; neither event is ordered with the engine's PDMA queue. The engine batches
+            # every layer into one DMA call, so wait for it before SGLang may consume or reuse pages.
             copy.wait()
             seen = set()
             self._pending_loads[key] = seen

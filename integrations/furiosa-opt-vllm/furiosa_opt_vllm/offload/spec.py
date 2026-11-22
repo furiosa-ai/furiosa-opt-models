@@ -52,7 +52,7 @@ class _PinnedPrimaryTier(CPUPrimaryTierOffloadingManager):
 
 
 class FuriosaOffloadingSpec(CPUOffloadingSpec):
-    """Keep vLLM's scheduler policy while the worker uses Furiosa's transfer queue."""
+    """Keep vLLM's aggregate sizing and scheduler policy; engine slots hold all TP shards."""
 
     @property
     def coalescing(self) -> bool:

@@ -151,16 +151,6 @@ def offloading_contracts(
             "stops the engine when an offloaded block fails to copy: kv_load_failure_policy=fail",
         ),
         Contract(
-            "tensor_parallel_size",
-            lambda config: (
-                not settings_for(config) or config.parallel_config.tensor_parallel_size == 1
-            ),
-            (
-                "offloads at tensor_parallel_size=1: vLLM awaits each rank; "
-                "one worker drives all chips"
-            ),
-        ),
-        Contract(
             "pipeline_parallel_size",
             lambda config: (
                 not settings_for(config) or config.parallel_config.pipeline_parallel_size == 1

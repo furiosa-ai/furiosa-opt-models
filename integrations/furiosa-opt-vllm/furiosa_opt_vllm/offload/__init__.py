@@ -95,6 +95,10 @@ class RNGDOffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             if role == KVConnectorRole.SCHEDULER
             else None
         )
+        if self._scheduler is not None:
+            # This process's Furiosa worker owns every tensor-parallel chip, so vLLM receives
+            # one transfer completion for each job rather than one from every TP rank.
+            self._scheduler.config = self._scheduler.config._replace(num_workers=1)
         self._worker: Worker | None = None
 
     def register(self, cache: engine.decoder.Cache, chips: int) -> None:
@@ -106,8 +110,13 @@ class RNGDOffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         if self._worker is not None:
             raise RuntimeError("the cache transfer worker is already registered")
         parallel = self._spec.config.parallel
-        if parallel.world_size != 1 or parallel.rank != 0:
-            raise ValueError("the pinned host cache requires one vLLM worker rank")
+        if parallel.rank != 0 or parallel.world_size != parallel.tp_size:
+            raise ValueError("one Furiosa worker must own every rank of a single TP replica")
+        if chips != parallel.tp_size:
+            raise ValueError(
+                f"the engine cache spans {chips} chips, but vLLM configured TP size "
+                f"{parallel.tp_size}"
+            )
         self._worker = Worker(
             Host(
                 cache,
@@ -197,7 +206,7 @@ class RNGDOffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:
-        # The engine cache is one group, so no other group bounds what a load may reach.
+        # vLLM's scheduler applies the matched-token bound across every selected cache group.
         return self.scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
 
     @override

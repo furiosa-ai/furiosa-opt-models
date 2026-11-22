@@ -435,10 +435,6 @@ def test_offloads_through_the_rngd_connector(
     assert transfer.kv_connector_extra_config == {"cpu_bytes_to_use": 1 << 30, **options}
 
 
-# The refusals that name a single worker's ranks.
-RANKS = "{}: vLLM awaits each rank; one worker drives all chips"
-
-
 @pytest.mark.usefixtures("platform_env")
 @pytest.mark.parametrize(
     ("ignored", "option", "requirement"),
@@ -474,15 +470,11 @@ RANKS = "{}: vLLM awaits each rank; one worker drives all chips"
             "kv_load_failure_policy",
             "stops the engine when an offloaded block fails to copy: kv_load_failure_policy=fail",
         ),
-        (
-            Ignored(kv_offloading_size=1, tensor_parallel_size=2),
-            "tensor_parallel_size",
-            RANKS.format("offloads at tensor_parallel_size=1"),
-        ),
         pytest.param(
             Ignored(kv_offloading_size=1, pipeline_parallel_size=2),
             "pipeline_parallel_size",
-            RANKS.format("offloads at pipeline_parallel_size=1"),
+            "offloads at pipeline_parallel_size=1: vLLM awaits each rank; "
+            "one worker drives all chips",
             marks=pytest.mark.skip(reason="pending: pipeline parallelism, refused for every model"),
         ),
         (
@@ -502,7 +494,6 @@ RANKS = "{}: vLLM awaits each rank; one worker drives all chips"
         "module",
         "unsupported-spec",
         "recompute",
-        "tp",
         "pp",
         "dp",
         "sleep",

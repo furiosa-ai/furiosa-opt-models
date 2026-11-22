@@ -166,12 +166,12 @@ Both servers copy the cache blocks of computed prompts to a tier of host memory,
     it uses the worker's local page layout.
     A block key names cached token content, while its page bytes encode the worker's tensor-parallel
     shards. Direct restore is correct only when the reader maps that key to the same canonical byte
-    sequence; otherwise heads land in the wrong shards. Each engine page is one chip's shard, so a
-    worker spanning chips would need those shards gathered into the canonical page. Translating
-    layouts also requires scattering or reshaping page fragments. This adapter keeps direct DMA, so
-    it accepts only identity mappings and one engine chip per worker.
-    vLLM completes a transfer once the worker of each rank reports it, and one worker drives every chip, so offloading serves one chip a replica.
-    It also serves one replica: with data parallelism vLLM ranks each replica's worker among all of them.
+    sequence; otherwise heads land in the wrong shards. `canonical_layout` therefore remains
+    limited to one engine chip and byte-identical mappings. With it disabled, the L3 offloader
+    accepts compiled TP chip counts: one worker moves each chip's page in rank order and reports
+    one completion for the full transfer. Offloading remains single-replica because vLLM ranks each
+    replica's worker among all data-parallel workers; replicas can still serve independently without
+    offloading.
     Sleep mode frees the cache storage the host tier copies, so startup refuses `--enable-sleep-mode` beside offloading.
     The `vllm:kv_offload_store_bytes` and `vllm:kv_offload_load_bytes` metrics count the bytes moved each way.
 
