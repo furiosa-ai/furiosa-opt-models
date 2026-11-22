@@ -238,6 +238,8 @@ Each framework's online FP8 method quantizes a Qwen3-0.6B, Qwen3-1.7B or Qwen3-4
     If a checkpoint declares its own quantization, `fp8` adds no conversion; the engine reads the stored form or refuses it if unsupported.
     Waking from [sleep](#put-the-server-to-sleep) quantizes the BF16 weights again, so a woken server answers as before.
 
+These are our best compatible mappings for Furiosa's BF16-activation load path: each preserves the weight-scale layout of that framework's online FP8 method. This compatibility choice does not claim either granularity is universally faster or more accurate.
+
 The load stores each decoder projection's weight as E4M3 codes with FP32 scales, as the framework's method computes them, each scale the largest magnitude it covers over 448.
 Each projection restores the codes to BF16 before its product, so the activations stay in BF16, as each framework computes its method without an FP8 matrix unit; the embedding and the vocabulary head stay in BF16.
 Where SGLang has FP8 matrix units, its `fp8` also quantizes the activations of each token, so its answers there may differ slightly from these.
