@@ -15,12 +15,16 @@ from . import decoder, llama, mistral, qwen3, vision_language
 
 __all__ = [
     "Checkpoint",
+    "Copier",
+    "Copy",
     "Decoder",
     "Device",
     "Encoder",
     "HbmBuffer",
     "HbmTensor",
     "HostBuffer",
+    "HostCache",
+    "HostSlot",
     "HostTensor",
     "LoadOptions",
     "Placement",
@@ -334,6 +338,49 @@ class HostBuffer:
             RuntimeError: The transfer failed before this returns; the `Transfer` raises a later
                 failure.
         """
+
+@typing.final
+class Copier:
+    r"""Six-worker queue for batched page copies between HBM layers and pinned host slots."""
+    def __new__(
+        cls,
+        layers: collections.abc.Sequence[HbmBuffer],
+        page_bytes: collections.abc.Sequence[builtins.int],
+        host_offsets: collections.abc.Sequence[builtins.int],
+        groups: collections.abc.Sequence[builtins.int],
+        host_block_bytes: builtins.int,
+    ) -> Copier: ...
+    def copy_in(
+        self,
+        pairs: collections.abc.Sequence[tuple[builtins.int, builtins.int]],
+        host: HostCache,
+        group: builtins.int,
+    ) -> Copy: ...
+    def copy_out(
+        self,
+        pairs: collections.abc.Sequence[tuple[builtins.int, builtins.int]],
+        host: HostCache,
+        group: builtins.int,
+    ) -> Copy: ...
+    def shutdown(self) -> None: ...
+
+@typing.final
+class HostCache:
+    r"""Persistent pool of page-locked host slots used by the copier and storage adapters."""
+    def __new__(cls, copier: Copier, slots: builtins.int) -> HostCache: ...
+    def slot(self, index: builtins.int) -> HostSlot: ...
+
+@typing.final
+class HostSlot:
+    r"""Writable buffer view of one pinned host slot, with no intermediate copy."""
+    def __len__(self) -> builtins.int: ...
+
+@typing.final
+class Copy:
+    r"""Completion handle for an asynchronous batched page copy."""
+    def done(self, timeout: builtins.float | None = 0.0) -> builtins.bool: ...
+    def submitted(self) -> None: ...
+    def wait(self) -> None: ...
 
 @typing.final
 class HostTensor:

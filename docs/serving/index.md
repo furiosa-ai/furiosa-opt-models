@@ -143,15 +143,15 @@ Both servers copy the cache blocks of computed prompts to a tier of host memory,
     `--kv-offloading-size` sets the host tier in GiB, as on a GPU.
     The platform serves it through the plugin's `RNGDOffloadingConnector` instead of vLLM's `OffloadingConnector`, which copies with CUDA streams; vLLM's scheduler still decides what to store, load and evict.
     Options of vLLM's CPU offloading, such as `blocks_per_chunk` and `eviction_policy`, go in `--kv-transfer-config '{"kv_connector_extra_config": {...}}'` beside the size.
-    To persist evicted chunks in vLLM's filesystem tier, add `secondary_tiers`; this selects vLLM's stock `TieringOffloadingSpec` and `FileSystemTierManager`:
+    To persist evicted chunks in vLLM's filesystem tier, add `secondary_tiers`:
 
     ```bash
     vllm serve Qwen/Qwen3-0.6B --kv-offloading-size 16 \
       --kv-transfer-config '{"kv_connector_extra_config":{"secondary_tiers":[{"type":"fs","root_dir":"/mnt/kv-cache"}]}}'
     ```
 
-    The filesystem tier uses vLLM's model/config namespace and token hashes. It has no size cap or automatic stale-directory cleanup; operators remove old directories. `canonical_layout` in `kv_connector_extra_config` requests vLLM's exact canonical mapping check; pages without a certified mapping stay opaque and rank/topology-specific.
-    vLLM uses `O_DIRECT` when the configured filesystem supports it, and falls back to buffered I/O otherwise.
+    vLLM keeps its scheduler, LRU policy, file naming and lookup; the plugin stores pages in the engine's pinned host slots and uses aligned `O_DIRECT` I/O when the filesystem supports it, with buffered fallback otherwise. The filesystem tier has no size cap or automatic stale-directory cleanup; operators remove old directories.
+    vLLM's `canonical_layout` gives KV pages a topology-independent format so different TP/CP configurations can reuse files. Furiosa accepts it only when vLLM certifies an identity mapping; validation runs at startup, and transfers still use direct #322 page DMA. Non-identity scatter/gather needs fragment transfers and more descriptors, so this adapter rejects it to preserve direct page DMA. Cross-topology reuse requires another reader to use the same canonical format and block keys.
     vLLM completes a transfer once the worker of each rank reports it, and one worker drives every chip, so offloading serves one chip a replica.
     It also serves one replica: with data parallelism vLLM ranks each replica's worker among all of them.
     Sleep mode frees the cache storage the host tier copies, so startup refuses `--enable-sleep-mode` beside offloading.
@@ -167,6 +167,8 @@ Both servers copy the cache blocks of computed prompts to a tier of host memory,
     `--hicache-storage-backend file` persists host pages through SGLang's `HiCacheFile`; pass `--hicache-storage-backend-extra-config` to set its `file_storage_path`.
     The memory saver frees the cache storage the host tier copies, so startup refuses `--enable-memory-saver` beside the hierarchical cache.
     A `/generate` response reports reused tokens by tier in `meta_info.cached_tokens_details`.
+
+Both adapters keep the framework's scheduling, keys, and tier lifecycle. Their host transfers share the engine's six-worker queue: each batch moves up to two pinned host slots, with all layer pages in one runtime DMA batch. Filesystem I/O uses one page-aligned, per-thread bounce buffer and one aligned syscall per cache page, matching #322; `O_DIRECT` is used when supported, with buffered fallback otherwise. vLLM keeps its chunk files and writes each page at its own aligned offset.
 
 Only the attention cache moves, so both servers refuse offloading at startup for a model with recurrent state, and vLLM also for one with encoder memory; the [vLLM](vllm.md#options) and [SGLang](sglang.md#options) option pages name the other refused settings.
 A failed copy poisons the memory it touched, and neither server recovers once it observes the failure, so vLLM's `kv_load_failure_policy` takes only `fail`.

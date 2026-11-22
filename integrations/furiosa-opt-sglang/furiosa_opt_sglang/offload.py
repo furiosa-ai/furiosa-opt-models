@@ -1,19 +1,13 @@
-"""SGLang's hierarchical cache over the engine cache: a host-pool stack SGLang assembles for the
-engine's token pool, whose pages move to and from the engine cache's layers.
+"""SGLang's host-pool adapter over the engine cache.
 
-- Each layer's host pages lie in one host buffer, page after page; a host page holds the layer's
-  cache page as the device holds it, every chip's part chip after chip.
-- SGLang moves whole pages: `pages` reads its tensor of token slots as pages of `page_size`
-  consecutive slots from a multiple of `page_size`, on the device as on the host. Pages that follow
-  each other on both move in one copy.
-- A backup or load returns once submitted. The device orders each copy after the calls and copies
-  that wrote its bytes and before the ones that read or overwrite them, which is all SGLang's
-  completion events stand for here.
+Each pinned slot holds one whole page across all layers. Six native workers batch up to two slots,
+with every layer copy in one runtime DMA batch. SGLang keeps page selection and lifecycle; the
+adapter submits work asynchronously and reads storage through the same pinned slots.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Final, cast, final
+from typing import TYPE_CHECKING, Final, final
 
 import torch
 from pydantic import ConfigDict, TypeAdapter
@@ -30,7 +24,6 @@ from sglang.srt.runtime_context import get_memory
 from typing_extensions import override
 
 import furiosa_opt_engine as engine
-from furiosa_opt_engine.cache_transfer import copy_bytes, submit, transfer_cache_pages
 from furiosa_opt_sglang.cache import Cache
 from furiosa_opt_sglang.platform import Hierarchical
 
@@ -75,6 +68,14 @@ class Strategy(StackStrategy):
         assert params.tp_cache_group is not None
         options = Hierarchical.parse(get_memory())
         host = Host(kvcache, options.hicache_ratio, options.hicache_size, params.page_size)
+        if storage_backend == "file":
+            storage_backend = "dynamic"
+            storage_backend_extra_config = {
+                **(storage_backend_extra_config or {}),
+                "backend_name": "furiosa_file",
+                "module_path": "furiosa_opt_sglang.storage",
+                "class_name": "FuriosaHiCacheFile",
+            }
         layers = kvcache.layer_num
         group = HostPoolGroup(
             [
@@ -152,8 +153,37 @@ class Host(HostKVCache):
         return self.size_per_token
 
     @override
-    def init_kv_buffer(self) -> list[engine.HostBuffer]:
-        return [engine.HostBuffer(self.page_num * size * self.chips) for size in self.sizes]
+    def init_kv_buffer(self) -> list[engine.HostCache]:
+        offsets: list[int] = []
+        offset = 0
+        for size in self.sizes:
+            offsets.append(offset)
+            offset += size * self.chips
+        self.copier = engine.Copier(
+            self.layers,
+            self.sizes,
+            offsets,
+            [0] * len(self.layers),
+            offset,
+        )
+        self.host_cache = engine.HostCache(self.copier, self.page_num)
+        self._pending_loads: dict[
+            tuple[tuple[int, ...], tuple[int, ...]], tuple[set[int], engine.Copy]
+        ] = {}
+        return [self.host_cache]
+
+    @override
+    def get_hybrid_pool_buffer(self) -> list[engine.HostCache]:
+        return [self.host_cache]
+
+    @override
+    def destroy(self) -> None:
+        copier = getattr(self, "copier", None)
+        if copier is not None:
+            copier.shutdown()
+        self.host_cache = None
+        self.copier = None
+        super().destroy()
 
     @override
     def backup_from_device_all_layer(
@@ -165,14 +195,11 @@ class Host(HostKVCache):
     ) -> None:
         device = pages(device_indices, self.page_size)
         host = pages(host_indices, self.page_size)
-        transfers = (
-            transfer
-            for layer, size, buffer in zip(self.layers, self.sizes, self.buffers, strict=True)
-            for transfer in transfer_cache_pages(
-                layer, buffer, device, host, size, self.chips, to_host=True
-            )
-        )
-        _ = submit(transfers)
+        if len(device) != len(host):
+            raise ValueError("hierarchical cache backup source and destination pages differ")
+        pairs = [(source, target) for source, target in zip(device, host, strict=True)]
+        copy = self.copier.copy_out(pairs, self.host_cache, 0)
+        copy.submitted()
 
     @override
     def load_to_device_per_layer(
@@ -185,23 +212,36 @@ class Host(HostKVCache):
         *,
         is_draft: bool = False,
     ) -> None:
-        layer, size, buffer = self.layers[layer_id], self.sizes[layer_id], self.buffers[layer_id]
-        device, host = pages(device_indices, self.page_size), pages(host_indices, self.page_size)
-        _ = transfer_cache_pages(layer, buffer, device, host, size, self.chips, to_host=False)
+        if not 0 <= layer_id < self.layer_num:
+            raise ValueError("hierarchical cache load names an unknown layer")
+        device = tuple(pages(device_indices, self.page_size))
+        host = tuple(pages(host_indices, self.page_size))
+        if len(device) != len(host):
+            raise ValueError("hierarchical cache load source and destination pages differ")
+        if not device:
+            return
+
+        key = (tuple(device), tuple(host))
+        pending = self._pending_loads.get(key)
+        if pending is None:
+            pairs = [(source, target) for source, target in zip(device, host, strict=True)]
+            copy = self.copier.copy_in(pairs, self.host_cache, 0)
+            copy.submitted()
+            seen: set[int] = set()
+            self._pending_loads[key] = (seen, copy)
+        else:
+            seen, copy = pending
+            copy.done()
+        seen.add(layer_id)
+        if len(seen) == self.layer_num:
+            del self._pending_loads[key]
 
     @override
     def get_data_page(self, index: int, flat: bool = True) -> torch.Tensor:
         if not flat:
             raise ValueError("the engine cache exposes opaque flat pages to storage")
         page = self._page_index(index)
-        layers = [
-            torch.frombuffer(
-                memoryview(buffer.slice(page * size * self.chips, size * self.chips)),
-                dtype=torch.uint8,
-            )
-            for size, buffer in zip(self.sizes, self.buffers, strict=True)
-        ]
-        return torch.cat(layers).view(self.dtype)
+        return torch.frombuffer(self.host_cache.slot(page), dtype=torch.uint8).view(self.dtype)
 
     @override
     def get_dummy_flat_data_page(self) -> torch.Tensor:
@@ -216,12 +256,7 @@ class Host(HostKVCache):
         source = memoryview(data_page.contiguous().view(torch.uint8).reshape(-1).numpy()).cast("B")
         if len(source) != self._page_bytes:
             raise ValueError("stored page size differs from the engine cache page")
-        offset = 0
-        for size, buffer in zip(self.sizes, self.buffers, strict=True):
-            layer_bytes = size * self.chips
-            destination = buffer.slice(page * layer_bytes, layer_bytes)
-            copy_bytes(destination, source[offset : offset + layer_bytes])
-            offset += layer_bytes
+        memoryview(self.host_cache.slot(page)).cast("B")[:] = source
 
     @property
     def _page_bytes(self) -> int:
@@ -234,11 +269,6 @@ class Host(HostKVCache):
         if page >= self.page_num:
             raise ValueError("storage page is outside the engine host pool")
         return page
-
-    @property
-    def buffers(self) -> list[engine.HostBuffer]:
-        """Each layer's pages, as `init_kv_buffer` allocated them."""
-        return cast("list[engine.HostBuffer]", self.kv_buffer)
 
 
 # The dtypes in which SGLang's pools name token slots.

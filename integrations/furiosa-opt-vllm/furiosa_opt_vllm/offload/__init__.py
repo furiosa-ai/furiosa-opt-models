@@ -1,10 +1,8 @@
 """vLLM's KV cache offloading to host memory on RNGD: `RNGDOffloadingConnector`, the connector the
 platform makes `--kv-offloading-size` select.
 
-- Its scheduler side is vLLM's offloading scheduler over vLLM's CPU offloading spec: which blocks to
-  store and load, their eviction, and the host tier's size.
-- Its worker side, `worker.Worker`, follows vLLM's offloading worker on the engine cache that
-  `register` gives it.
+- Its scheduler side keeps vLLM's offloading and tiering policies.
+- Its worker side moves pages through the engine's pinned HostCache and DMA queue.
 """
 
 from __future__ import annotations
@@ -32,10 +30,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
 )
-from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
-from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
 
 from furiosa_opt_vllm.offload.worker import Host, Worker
 
@@ -75,11 +71,18 @@ class RNGDOffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         transfer = vllm_config.kv_transfer_config
         if transfer is not None:
             extra = transfer.kv_connector_extra_config
+            requested_spec = extra.get("spec_name")
+            if requested_spec not in (None, "CPUOffloadingSpec", "TieringOffloadingSpec"):
+                raise ValueError(f"unsupported vLLM offloading spec: {requested_spec}")
+            if extra.get("spec_module_path") is not None:
+                raise ValueError("out-of-tree vLLM offloading specs are not supported")
             if extra.get("spec_name") is None:
                 if extra.get("secondary_tiers"):
                     extra["spec_name"] = "TieringOffloadingSpec"
                 else:
                     extra.pop("spec_name", None)
+            extra["spec_name"] = "FuriosaOffloadingSpec"
+            extra["spec_module_path"] = "furiosa_opt_vllm.offload.spec"
         offloading_config = build_offloading_config(vllm_config, kv_cache_config)
         spec = OffloadingSpecFactory.create_spec(offloading_config)
         if not isinstance(spec, CPUOffloadingSpec):
@@ -100,34 +103,19 @@ class RNGDOffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             raise ValueError("kv_offloading_size must hold at least one chunk of cache blocks")
         if self._worker is not None:
             raise RuntimeError("the cache transfer worker is already registered")
-        region = None
-        if isinstance(self._spec, TieringOffloadingSpec):
-            parallel = self._spec.config.parallel
-            if parallel.world_size != 1 or parallel.rank != 0:
-                raise ValueError("the shared host tier requires one vLLM worker rank")
-            region = SharedOffloadRegion(
-                engine_id=self._spec.config.engine_id,
-                num_chunks=chunks,
-                rank=parallel.rank,
-                kv_bytes_per_chunk=self._spec.kv_bytes_per_chunk,
-                cpu_page_size=self._spec.cpu_page_size_per_worker,
+        parallel = self._spec.config.parallel
+        if parallel.world_size != 1 or parallel.rank != 0:
+            raise ValueError("the pinned host cache requires one vLLM worker rank")
+        self._worker = Worker(
+            Host(
+                cache,
+                chips,
+                self._spec,
+                self._vllm_config,
+                self._kv_cache_config,
+                get_offloading_group_ids(self._kv_cache_config),
             )
-        try:
-            self._worker = Worker(
-                Host(
-                    cache,
-                    chips,
-                    self._spec,
-                    self._vllm_config,
-                    self._kv_cache_config,
-                    get_offloading_group_ids(self._kv_cache_config),
-                    mmap_region=region,
-                )
-            )
-        except Exception:
-            if region is not None:
-                region.cleanup()
-            raise
+        )
 
     @property
     def scheduler(self) -> OffloadingConnectorScheduler:

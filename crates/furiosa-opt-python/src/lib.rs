@@ -29,6 +29,7 @@ use std::io::{self, ErrorKind};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use tokio::runtime::Runtime;
 
+mod cache;
 mod decoder;
 mod model;
 mod stub;
@@ -51,6 +52,10 @@ fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<tensor::Device>()?;
     module.add_class::<tensor::HbmBuffer>()?;
     module.add_class::<tensor::HostBuffer>()?;
+    module.add_class::<cache::PyCopier>()?;
+    module.add_class::<cache::PyHostCache>()?;
+    module.add_class::<cache::PyHostSlot>()?;
+    module.add_class::<cache::PyCopy>()?;
     module.add_class::<tensor::Transfer>()?;
     module.add_class::<tensor::HostTensor>()?;
     module.add_class::<tensor::HbmTensor>()?;

@@ -1,30 +1,23 @@
-"""Page routing and host copies shared by serving-framework adapters."""
+"""DMA completion and aligned file I/O shared by serving-framework adapters."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
-from itertools import pairwise
+import contextlib
+import ctypes
+import mmap
+import os
+import threading
+import uuid
+from collections.abc import Iterable
 from typing import Protocol, TypeAlias, TypeVar, cast
 
 from typing_extensions import Buffer
 
 import furiosa_opt_engine as engine
 
-ByteBuffer: TypeAlias = memoryview | engine.HostBuffer
-
-
-@dataclass(frozen=True, slots=True)
-class CachePageRoute:
-    """A repeated byte fragment from one cache page to its host representation."""
-
-    # Offsets and strides are page-relative bytes; `fragments` copies each repeated fragment.
-    cache_offset: int
-    host_offset: int
-    fragment_bytes: int
-    fragments: int = 1
-    cache_stride: int = 0
-    host_stride: int = 0
+ByteBuffer: TypeAlias = memoryview | engine.HostBuffer | engine.HostSlot
+DEFAULT_READ_THREADS = 8
+DEFAULT_WRITE_THREADS = 4
 
 
 class PendingTransfer(Protocol):
@@ -38,126 +31,146 @@ class PendingTransfer(Protocol):
 TransferT = TypeVar("TransferT", bound=PendingTransfer)
 
 
-def page_runs(
-    device: Sequence[int], host: Sequence[int], chips: int
-) -> tuple[tuple[int, int, int], ...]:
-    """Return contiguous `(device_page, host_page, count)` runs safe for one DMA copy each."""
-    if chips <= 0:
-        raise ValueError("cache transfers require at least one chip")
-    if len(device) != len(host):
-        raise ValueError("device and host page lists must have the same length")
-    starts: list[int] = []
-    for index, (device_page, host_page) in enumerate(zip(device, host, strict=True)):
-        if device_page < 0 or host_page < 0:
-            raise ValueError("cache page indices cannot be negative")
-        if (
-            index == 0
-            or chips > 1
-            or (device_page - device[index - 1], host_page - host[index - 1]) != (1, 1)
-        ):
-            starts.append(index)
-    return tuple(
-        (device[start], host[start], end - start) for start, end in pairwise((*starts, len(device)))
-    )
+class AlignedFileIO:
+    """Use a page-aligned per-thread bounce buffer; O_DIRECT cannot use dma-buf slots directly."""
+
+    def __init__(self, directory: str, *, use_direct: bool | None = None) -> None:
+        self.alignment = mmap.PAGESIZE
+        self.use_direct = _probe_o_direct(directory) if use_direct is None else use_direct
+        self.local = threading.local()
+
+    def write(self, path: str, source: ByteBuffer) -> None:
+        source_view = _byte_view(source)
+        try:
+            self.prepare(path, len(source_view), 1)
+            self._write_page(path, 0, source_view)
+        finally:
+            source_view.release()
+
+    def read(self, path: str, destination: ByteBuffer) -> None:
+        destination_view = _byte_view(destination)
+        try:
+            self._read_page(path, 0, destination_view)
+        finally:
+            destination_view.release()
+
+    def prepare(self, path: str, page_bytes: int, pages: int) -> None:
+        """Create a file with one page-aligned extent per cache page."""
+        if pages <= 0:
+            raise ValueError("file transfers must contain pages")
+        size = self.aligned_size(page_bytes) * pages
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.ftruncate(descriptor, size)
+        except Exception:
+            os.close(descriptor)
+            with contextlib.suppress(OSError):
+                os.remove(path)
+            raise
+        os.close(descriptor)
+
+    def write_page(self, path: str, index: int, source: ByteBuffer) -> None:
+        """Write one page at its aligned file offset through the thread-local bounce buffer."""
+        source_view = _byte_view(source)
+        try:
+            self._write_page(path, index, source_view)
+        finally:
+            source_view.release()
+
+    def read_page(self, path: str, index: int, destination: ByteBuffer) -> None:
+        """Read one page from its aligned file offset through the thread-local bounce buffer."""
+        destination_view = _byte_view(destination)
+        try:
+            self._read_page(path, index, destination_view)
+        finally:
+            destination_view.release()
+
+    def _write_page(self, path: str, index: int, source: memoryview) -> None:
+        page_bytes = len(source)
+        stride = self.aligned_size(page_bytes)
+        target = self._buffer(stride)
+        try:
+            source_address = ctypes.addressof(ctypes.c_ubyte.from_buffer(source))
+            ctypes.memmove(self.local.address, source_address, page_bytes)
+            target[page_bytes:] = bytes(stride - page_bytes)
+            descriptor = os.open(path, os.O_WRONLY | self._direct_flag())
+            try:
+                written = os.pwrite(descriptor, target, index * stride)
+                if written != stride:
+                    raise OSError(f"short write of {path}: {written} of {stride} bytes")
+            finally:
+                os.close(descriptor)
+        finally:
+            target.release()
+
+    def _read_page(self, path: str, index: int, destination: memoryview) -> None:
+        page_bytes = len(destination)
+        stride = self.aligned_size(page_bytes)
+        source = self._buffer(stride)
+        try:
+            descriptor = os.open(path, os.O_RDONLY | self._direct_flag())
+            try:
+                read = os.preadv(descriptor, [source], index * stride)
+                if read != stride:
+                    raise OSError(f"short read of {path}: {read} of {stride} bytes")
+            finally:
+                os.close(descriptor)
+            destination_address = ctypes.addressof(ctypes.c_ubyte.from_buffer(destination))
+            ctypes.memmove(destination_address, self.local.address, page_bytes)
+        finally:
+            source.release()
+
+    def _direct_flag(self) -> int:
+        return getattr(os, "O_DIRECT", 0) if self.use_direct else 0
+
+    def aligned_size(self, size: int) -> int:
+        if size <= 0:
+            raise ValueError("file transfers must contain bytes")
+        return ((size + self.alignment - 1) // self.alignment) * self.alignment
+
+    def _buffer(self, size: int) -> memoryview:
+        if size <= 0:
+            raise ValueError("file transfers must contain bytes")
+        capacity = getattr(self.local, "capacity", 0)
+        if capacity < size:
+            aligned = ((size + self.alignment - 1) // self.alignment) * self.alignment
+            previous = getattr(self.local, "buffer", None)
+            if previous is not None:
+                previous.close()
+            self.local.buffer = None
+            self.local.capacity = 0
+            buffer = mmap.mmap(-1, aligned)
+            address = ctypes.addressof(ctypes.c_ubyte.from_buffer(buffer))
+            self.local.buffer = buffer
+            self.local.address = address
+            self.local.capacity = aligned
+        return memoryview(self.local.buffer)[:size]
 
 
-def transfer_cache_pages(
-    layer: engine.HbmBuffer,
-    host: engine.HostBuffer,
-    device_pages: Sequence[int],
-    host_pages: Sequence[int],
-    page_bytes: int,
-    chips: int,
-    *,
-    to_host: bool,
-) -> tuple[engine.Transfer, ...]:
-    """Submit model-layout pages between one engine layer and chip-interleaved host rows."""
-    if page_bytes <= 0:
-        raise ValueError("cache pages must contain bytes")
-    transfers: list[engine.Transfer] = []
-    host_page_bytes = page_bytes * chips
-    for device_page, host_page, count in page_runs(device_pages, host_pages, chips):
-        device_range = layer.slice(device_page * page_bytes, count * page_bytes)
-        host_range = host.slice(host_page * host_page_bytes, count * host_page_bytes)
-        transfers.append(
-            device_range.to_host(host_range) if to_host else host_range.to_hbm(device_range)
-        )
-    return submit(transfers)
+def _probe_o_direct(directory: str) -> bool:
+    """Check direct I/O once; callers use buffered I/O when the filesystem rejects it."""
+    direct = getattr(os, "O_DIRECT", 0)
+    if not direct:
+        return False
+    path = os.path.join(directory, f".furiosa-o-direct-{uuid.uuid4().hex}")
+    buffer = mmap.mmap(-1, mmap.PAGESIZE)
+    try:
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | direct, 0o600)
+        try:
+            return os.write(descriptor, buffer) == mmap.PAGESIZE
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return False
+    finally:
+        buffer.close()
+        with contextlib.suppress(OSError):
+            os.remove(path)
 
 
 def _byte_view(buffer: ByteBuffer) -> memoryview:
     """Export the engine buffer protocol, which Python 3.11 cannot express in a type stub."""
     return memoryview(cast(Buffer, buffer)).cast("B")
-
-
-def copy_bytes(destination: ByteBuffer, source: ByteBuffer) -> None:
-    """Copy equal-sized host byte ranges without changing their layout."""
-    target = _byte_view(destination)
-    value = _byte_view(source)
-    if len(target) != len(value):
-        raise ValueError("source and destination host ranges differ in size")
-    target[:] = value
-
-
-def copy_cache_pages(
-    cache: ByteBuffer,
-    host: ByteBuffer,
-    routes: Sequence[CachePageRoute],
-    *,
-    page_count: int,
-    cache_page_bytes: int,
-    cache_page_stride: int,
-    host_page_bytes: int,
-    host_page_stride: int,
-    to_host: bool,
-) -> None:
-    """Gather or scatter cache pages between engine and host layouts using certified byte routes."""
-    if page_count <= 0:
-        raise ValueError("cache page copies require at least one page")
-    if not 0 < cache_page_bytes <= cache_page_stride:
-        raise ValueError("cache page size must fit its stride")
-    if not 0 < host_page_bytes <= host_page_stride:
-        raise ValueError("host page size must fit its stride")
-
-    cache_view = _byte_view(cache)
-    host_view = _byte_view(host)
-    if len(cache_view) < page_count * cache_page_stride:
-        raise ValueError("cache buffer is smaller than its page range")
-    if len(host_view) < page_count * host_page_stride:
-        raise ValueError("host buffer is smaller than its page range")
-    for route in routes:
-        if route.cache_offset < 0 or route.host_offset < 0 or route.fragment_bytes <= 0:
-            raise ValueError("cache page route has an invalid offset or fragment size")
-        if route.fragments <= 0:
-            raise ValueError("cache page route must contain at least one fragment")
-        if route.cache_stride < 0 or route.host_stride < 0:
-            raise ValueError("cache page route strides cannot be negative")
-        cache_end = route.cache_offset + (route.fragments - 1) * route.cache_stride
-        host_end = route.host_offset + (route.fragments - 1) * route.host_stride
-        if cache_end + route.fragment_bytes > cache_page_bytes:
-            raise ValueError("cache page route exceeds its engine page")
-        if host_end + route.fragment_bytes > host_page_bytes:
-            raise ValueError("cache page route exceeds its host page")
-
-    if not to_host:
-        empty = bytes(cache_page_stride)
-        for page in range(page_count):
-            start = page * cache_page_stride
-            cache_view[start : start + cache_page_stride] = empty
-
-    for route in routes:
-        for page in range(page_count):
-            cache_base = page * cache_page_stride
-            host_base = page * host_page_stride
-            for fragment in range(route.fragments):
-                cache_start = cache_base + route.cache_offset + fragment * route.cache_stride
-                host_start = host_base + route.host_offset + fragment * route.host_stride
-                cache_range = slice(cache_start, cache_start + route.fragment_bytes)
-                host_range = slice(host_start, host_start + route.fragment_bytes)
-                if to_host:
-                    host_view[host_range] = cache_view[cache_range]
-                else:
-                    cache_view[cache_range] = host_view[host_range]
 
 
 def submit(transfers: Iterable[TransferT]) -> tuple[TransferT, ...]:

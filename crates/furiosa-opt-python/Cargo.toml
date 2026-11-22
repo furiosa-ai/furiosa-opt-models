@@ -10,6 +10,8 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
+libc = "0.2"
+memmap2 = "0.9"
 furiosa-opt-engine = { path = "../furiosa-opt-engine" }
 furiosa-opt-models = { path = "../furiosa-opt-models" }
 furiosa-opt-std = { workspace = true }

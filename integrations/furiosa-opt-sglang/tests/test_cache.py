@@ -113,27 +113,6 @@ def test_file_storage_round_trips_engine_host_buffers() -> None:
         assert host.get_data_page(4).tolist() == page.tolist()
 
 
-@pytest.mark.parametrize(
-    ("device", "host", "chips", "moved"),
-    [
-        ([4, 5, 6], [10, 11, 12], 1, [(4, 10, 3)]),
-        ([4, 5, 7, 8], [0, 1, 2, 3], 1, [(4, 0, 2), (7, 2, 2)]),
-        ([4, 5, 6], [0, 1, 3], 1, [(4, 0, 2), (6, 3, 1)]),
-        ([6, 5, 4], [0, 1, 2], 1, [(6, 0, 1), (5, 1, 1), (4, 2, 1)]),
-        ([4, 5], [0, 1], 2, [(4, 0, 1), (5, 1, 1)]),
-    ],
-    ids=["adjacent", "device-gap", "host-gap", "descending", "two-chips"],
-)
-def test_hierarchical_cache_moves_adjacent_pages_in_one_copy(
-    device: list[int], host: list[int], chips: int, moved: list[tuple[int, int, int]]
-) -> None:
-    """Pages that follow each other on the device and on the host move in one copy on a cache of
-    one chip, and one page a copy on more chips, whose copy writes chip after chip."""
-    from furiosa_opt_engine.cache_transfer import page_runs
-
-    assert page_runs(device, host, chips) == tuple(moved)
-
-
 def test_mamba_pool_copies_and_restores_slots() -> None:
     from array import array
     from collections.abc import Callable

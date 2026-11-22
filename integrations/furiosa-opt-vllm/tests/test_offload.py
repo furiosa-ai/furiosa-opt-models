@@ -1,9 +1,8 @@
 """vLLM's KV cache offloading keeps evicted prompt blocks in host memory, and a prompt answers with
 them as with its blocks in the device cache.
 
-- The jobs that copy blocks report each ended job once and raise a failed copy once every copy
-  submitted before it ended, here over stand-in transfers; blocks whose host rows follow each other
-  share one copy.
+- The transfer tracker reports each ended job once and drains submitted copies after a submission
+  failure, here over stand-in completions.
 - On RNGD, `vllm serve --kv-offloading-size` answers an evicted prompt as a server without
   offloading answers it from its device cache. Under batch invariance a prompt reloaded from
   chunks, or resumed after preemption, answers as it does with no block cached.
@@ -26,16 +25,8 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
-    UniformTypeKVCacheSpecs,
 )
-from vllm.v1.kv_offload.base import CopyRun, GPULoadStoreSpec
-from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 
-from furiosa_opt_engine.cache_transfer import (
-    CachePageRoute,
-    copy_cache_pages,
-    page_runs,
-)
 from furiosa_opt_engine.cache_transfer import (
     submit as submit_transfers,
 )
@@ -194,46 +185,6 @@ def test_shared_core_submission_drains_copies_on_failure() -> None:
     assert str(error.value.__cause__) == "copy failed"
 
 
-def test_shared_core_routes_pages_in_both_directions() -> None:
-    route = CachePageRoute(
-        cache_offset=0,
-        host_offset=1,
-        fragment_bytes=1,
-        fragments=2,
-        cache_stride=2,
-        host_stride=3,
-    )
-    routes = (route,)
-    cache = bytearray([10, 11, 12, 99, 20, 21, 22, 99])
-    host = bytearray(10)
-    copy_cache_pages(
-        cache,
-        host,
-        routes,
-        page_count=2,
-        cache_page_bytes=3,
-        cache_page_stride=4,
-        host_page_bytes=5,
-        host_page_stride=5,
-        to_host=True,
-    )
-    assert host == bytearray([0, 10, 0, 0, 12, 0, 20, 0, 0, 22])
-
-    cache[:] = bytes([255]) * len(cache)
-    copy_cache_pages(
-        cache,
-        host,
-        routes,
-        page_count=2,
-        cache_page_bytes=3,
-        cache_page_stride=4,
-        host_page_bytes=5,
-        host_page_stride=5,
-        to_host=False,
-    )
-    assert cache == bytearray([10, 0, 12, 0, 20, 0, 22, 0])
-
-
 def test_raises_failed_copy() -> None:
     """A poll that finds a failed copy raises its error instead of reporting the job."""
     failure = RuntimeError("copy failed")
@@ -263,233 +214,6 @@ def test_shutdown_ends_every_job_then_raises() -> None:
         running.shutdown()
     assert all(transfer.waited for transfer in copies)
     assert running.finished() == []
-
-
-@pytest.mark.parametrize(
-    ("blocks", "rows", "chips", "moved"),
-    [
-        ([4, 5, 6], [10, 11, 12], 1, [(4, 10, 3)]),
-        ([4, 5, 7, 8], [0, 1, 2, 3], 1, [(4, 0, 2), (7, 2, 2)]),
-        ([4, 5, 6], [0, 1, 3], 1, [(4, 0, 2), (6, 3, 1)]),
-        ([6, 5, 4], [0, 1, 2], 1, [(6, 0, 1), (5, 1, 1), (4, 2, 1)]),
-        ([4, 5], [0, 1], 2, [(4, 0, 1), (5, 1, 1)]),
-    ],
-    ids=["adjacent", "block-gap", "row-gap", "descending", "two-chips"],
-)
-def test_moves_adjacent_blocks_in_one_copy(
-    blocks: list[int], rows: list[int], chips: int, moved: list[tuple[int, int, int]]
-) -> None:
-    """Blocks whose host rows follow theirs move in one copy on a cache of one chip, and one block
-    a copy on more chips, whose copy writes chip after chip."""
-    assert page_runs(blocks, rows, chips) == tuple(moved)
-
-
-def test_staged_transfer_commits_shared_bytes_after_dma_completion() -> None:
-    """The shared primary row is committed only after its DMA staging copy finishes."""
-    copy = Copies()
-    committed: list[str] = []
-    released: list[str] = []
-    staged = worker._StagedTransfer(
-        copy,
-        object(),
-        lambda: committed.append("stored"),
-        lambda: released.append("staging"),
-    )
-
-    assert not staged.done()
-    assert committed == released == []
-    copy.ended = True
-    assert staged.done()
-    assert copy.waited
-    assert committed == ["stored"]
-    assert released == ["staging"]
-    assert staged.done()
-    assert committed == ["stored"]
-    assert released == ["staging"]
-
-
-def test_staged_transfer_does_not_commit_failed_dma() -> None:
-    """A failed engine copy never publishes unverified staging bytes into the shared region."""
-    failure = RuntimeError("DMA failed")
-    released: list[str] = []
-    staged = worker._StagedTransfer(
-        Copies(failure),
-        object(),
-        lambda: pytest.fail("committed"),
-        lambda: released.append("staging"),
-    )
-
-    with pytest.raises(RuntimeError, match="DMA failed"):
-        staged.wait()
-    assert released == ["staging"]
-
-
-class _ImmediateCopy:
-    def done(self) -> bool:
-        return True
-
-    def wait(self) -> None:
-        return
-
-
-class _Buffer:
-    def __init__(self, source: int | bytearray, start: int = 0, size: int | None = None) -> None:
-        self.data = source if isinstance(source, bytearray) else bytearray(source)
-        self.start = start
-        self.size = len(self.data) - start if size is None else size
-
-    def __len__(self) -> int:
-        return self.size
-
-    def slice(self, offset: int, size: int) -> _Buffer:
-        if offset < 0 or size <= 0 or offset + size > self.size:
-            raise ValueError("invalid test buffer range")
-        return type(self)(self.data, self.start + offset, size)
-
-    @property
-    def view(self) -> memoryview:
-        return memoryview(self.data)[self.start : self.start + self.size]
-
-    def to_hbm(self, device: _FakeHbmBuffer) -> _ImmediateCopy:
-        device.view[:] = self.view
-        return _ImmediateCopy()
-
-
-class _FakeHostBuffer(_Buffer):
-    pass
-
-
-class _FakeHbmBuffer(_Buffer):
-    def to_host(self, host: _FakeHostBuffer) -> _ImmediateCopy:
-        host.view[:] = self.view
-        return _ImmediateCopy()
-
-
-def _attention_page(page_bytes: int) -> FullAttentionSpec:
-    head_size = page_bytes // 4
-    return FullAttentionSpec(
-        block_size=2,
-        num_kv_heads=1,
-        head_size=head_size,
-        dtype=torch.uint8,
-    )
-
-
-def test_routes_multigroup_ranges_to_heterogeneous_engine_subgroups(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """One logical group fans out by layer page size; group offsets keep independent block IDs."""
-    monkeypatch.setattr(worker.engine, "HostBuffer", _FakeHostBuffer)
-    (small, large, other) = (8, 16, 8)
-    layers = [_FakeHbmBuffer(8 * size) for size in (small, large, other)]
-    for block in range(8):
-        for layer, size, value in zip(layers, (small, large, other), (10, 30, 50), strict=True):
-            layer.view[block * size : (block + 1) * size] = bytes([value + block]) * size
-
-    cache_spec = SimpleNamespace(
-        pools=[
-            SimpleNamespace(bytes=small),
-            SimpleNamespace(bytes=large),
-            SimpleNamespace(bytes=other),
-        ],
-        groups=[
-            SimpleNamespace(pool=0, layers=[0], logical_group=1),
-            SimpleNamespace(pool=1, layers=[1], logical_group=1),
-            SimpleNamespace(pool=2, layers=[2], logical_group=0),
-        ],
-    )
-    cache_instance = SimpleNamespace(spec=cache_spec, layers=layers, blocks=8)
-    cache_config = KVCacheConfig(
-        num_blocks=8,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(layer_names=["layers.2"], kv_cache_spec=_attention_page(other)),
-            KVCacheGroupSpec(
-                layer_names=["layers.0", "layers.1"],
-                kv_cache_spec=UniformTypeKVCacheSpecs(
-                    block_size=2,
-                    kv_cache_specs={
-                        "layers.0": _attention_page(small),
-                        "layers.1": _attention_page(large),
-                    },
-                ),
-            ),
-        ],
-    )
-    spec = SimpleNamespace(
-        blocks_per_chunk=2,
-        num_chunks=4,
-        kv_bytes_per_chunk=64,
-        cpu_page_size_per_worker=64,
-        config=SimpleNamespace(canonical_layout=False),
-    )
-    host = worker.Host(cache_instance, 1, spec, None, cache_config, (0, 1))  # type: ignore[arg-type]
-    gpu = GPULoadStoreSpec([2, 3, 4], group_sizes=[1, 2], block_indices=[0, 1])
-    cpu = CPULoadStoreSpec([2, 3, 1])
-
-    assert host.submit_store(0, gpu, cpu)
-    (stored,) = host.get_finished()
-    assert stored.transfer_size == 56
-    assert bytes(host.rows[0].slice(7 * small, small).view) == bytes([13]) * small
-    assert bytes(host.rows[0].slice(2 * small, small).view) == bytes([14]) * small
-    assert bytes(host.rows[1].slice(7 * large, large).view) == bytes([33]) * large
-    assert bytes(host.rows[1].slice(2 * large, large).view) == bytes([34]) * large
-    assert bytes(host.rows[2].slice(2 * other, other).view) == bytes([52]) * other
-
-    for layer in layers:
-        layer.view[:] = bytes(len(layer))
-    assert host.submit_load(1, cpu, gpu)
-    (loaded,) = host.get_finished()
-    assert loaded.transfer_size == stored.transfer_size
-    assert bytes(layers[0].slice(3 * small, small).view) == bytes([13]) * small
-    assert bytes(layers[0].slice(4 * small, small).view) == bytes([14]) * small
-    assert bytes(layers[1].slice(3 * large, large).view) == bytes([33]) * large
-    assert bytes(layers[2].slice(2 * other, other).view) == bytes([52]) * other
-    host.shutdown()
-
-    shared = bytearray(4 * 64)
-    region = SimpleNamespace(
-        rank=0,
-        create_kv_memoryview=lambda: memoryview(shared),
-        cleanup=lambda: None,
-    )
-    tiered = worker.Host(
-        cache_instance,
-        1,
-        spec,
-        None,
-        cache_config,
-        (0, 1),
-        mmap_region=region,  # type: ignore[arg-type]
-    )
-    assert tiered._staging_pool_bytes == 0
-    assert tiered.submit_store(2, gpu, cpu)
-    assert not any(shared)
-    (tiered_store,) = tiered.get_finished()
-    assert tiered_store.transfer_size == stored.transfer_size
-    staged_ids = {id(stage) for buffers in tiered._staging_pool.values() for stage in buffers}
-    assert tiered._staging_pool_bytes == 32
-    assert shared[128:136] == bytes([52]) * other
-    assert shared[216:224] == bytes([13]) * small
-    assert shared[240:256] == bytes([33]) * large
-    assert shared[96:112] == bytes([34]) * large
-
-    for layer in layers:
-        layer.view[:] = bytes(len(layer))
-    assert tiered.submit_load(3, cpu, gpu)
-    assert tiered._staging_pool_bytes == 0
-    (tiered_load,) = tiered.get_finished()
-    assert tiered_load.transfer_size == stored.transfer_size
-    assert {
-        id(stage) for buffers in tiered._staging_pool.values() for stage in buffers
-    } == staged_ids
-    assert bytes(layers[0].slice(3 * small, small).view) == bytes([13]) * small
-    assert bytes(layers[0].slice(4 * small, small).view) == bytes([14]) * small
-    assert bytes(layers[1].slice(3 * large, large).view) == bytes([33]) * large
-    assert bytes(layers[1].slice(4 * large, large).view) == bytes([34]) * large
-    assert bytes(layers[2].slice(2 * other, other).view) == bytes([52]) * other
-    tiered.shutdown()
-    assert tiered._staging_pool_bytes == 0
 
 
 @pytest.mark.parametrize(
@@ -537,27 +261,6 @@ def test_canonical_mapping_uses_metadata_views_and_fails_closed(
     mapping = mappings["layers.0"]
     assert (mapping.local_page_size_bytes, mapping.canonical_page_size_bytes) == (8, 8)
     assert mapping.parallelism_agnostic is portable
-
-
-def test_canonical_copy_reorders_fragments_and_zeros_padding() -> None:
-    """Only upstream-certified page bytes persist, and loading restores local offsets."""
-    mapping = SimpleNamespace(
-        local_page_size_bytes=3,
-        canonical_page_size_bytes=3,
-        runs=(
-            CopyRun(0, 2, 1, 1, 1, 1),
-            CopyRun(1, 0, 1, 1, 1, 1),
-            CopyRun(2, 1, 1, 1, 1, 1),
-        ),
-    )
-    local = bytearray([10, 20, 30, 99, 40, 50, 60, 99])
-    canonical = bytearray(6)
-    worker._copy_mapping(canonical, local, mapping, 2, local_page_stride=4, store=True)
-    assert canonical == bytes([20, 30, 10, 50, 60, 40])
-
-    restored = bytearray(8)
-    worker._copy_mapping(restored, canonical, mapping, 2, local_page_stride=4, store=False)
-    assert restored == bytes([10, 20, 30, 0, 40, 50, 60, 0])
 
 
 def ask(tokenizer: PreTrainedTokenizerBase, people: tuple[tuple[str, str, str], ...]) -> list[int]:
