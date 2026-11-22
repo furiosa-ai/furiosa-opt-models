@@ -13,7 +13,7 @@ import furiosa_opt_engine as engine
 from furiosa_opt_sglang.batch import operand
 from furiosa_opt_sglang.checkpoint import checkout
 from furiosa_opt_sglang.decoder import RELEASED, Decoder, Location
-from furiosa_opt_sglang.load import quantization
+from furiosa_opt_sglang.load import quantized_options
 from furiosa_opt_sglang.platform import Refused
 
 if TYPE_CHECKING:
@@ -65,16 +65,15 @@ class Draft:
             raise RuntimeError(RELEASED)
         try:
             loads = engine.LoadOptions().chips(target.model.parallel)
-            if (
-                name := quantization(options.speculative_draft_model_quantization, stored)
-            ) is not None:
-                loads = loads.quantization(name)
+            loads = quantized_options(
+                loads, options.speculative_draft_model_quantization, stored
+            )
             mapped = checkpoint.mapped()
-            loads.parse(mapped)
+            loads.parse(mapped.source)
         except (NotImplementedError, ValueError) as error:
             raise Refused("speculative_draft_model_path", str(error)) from None
         # The draft shares the target's chips, whose memory the target's token pool then sizes.
-        draft = Decoder.load(checkpoint, loads, target.device, config.vocab_size, mapped=mapped)
+        draft = Decoder.load(mapped, loads, target.device, config.vocab_size)
         if not (
             draft.model is not None
             and draft.model.output == engine.decoder.Output.TOKENS

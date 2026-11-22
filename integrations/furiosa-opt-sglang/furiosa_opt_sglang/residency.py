@@ -77,7 +77,7 @@ def resume(module: Module, tags: Collection[str] | None) -> None:
         released = module.asleep.get(tag)
         match released:
             case Weights(copy):
-                source = decoder.checkpoint.mapped() if copy is None else copy
+                source = decoder.checkpoint.mapped().source if copy is None else copy
                 module.loaded = replace(model, core=replace(decoder, copy=copy).loaded(source))
             case Storage(spec, blocks):
                 cache.storage = engine.decoder.Cache(spec, blocks)

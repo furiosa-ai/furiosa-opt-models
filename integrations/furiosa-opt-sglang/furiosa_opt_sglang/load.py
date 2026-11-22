@@ -5,6 +5,7 @@
   quantizations and models load.
 - `quantization` is the engine's quantization of a load SGLang quantizes, of the served checkpoint
   and of a draft model alike.
+- `quantized_options` applies that quantization to engine load options.
 - `bind` loads the checkpoint onto a scheduler's chips.
 """
 
@@ -47,8 +48,7 @@ def options(
     # SGLang's model config leaves the type of the method it resolves partly unknown: the operator's
     # `--quantization`, or the checkpoint's own when it declares one.
     method = cast("str | None", model_config.quantization)
-    if (name := quantization(method, hf_config)) is not None:
-        loads = loads.quantization(name)
+    loads = quantized_options(loads, method, hf_config)
     if not model_config.is_generation and is_generation_model(hf_config.architectures or []):
         # SGLang pools the hidden rows of a causal checkpoint's base model.
         base = MODEL_MAPPING_NAMES.get(hf_config.model_type)
@@ -79,6 +79,17 @@ def quantization(
     _validate_quantization_metadata(config_mapping)
     declared = resolve_checkpoint_quant_spec(config)
     return "fp8_per_channel" if declared is None else None
+
+
+def quantized_options(
+    loads: engine.LoadOptions,
+    method: str | None,
+    config: Mapping[str, JsonValue] | PretrainedConfig,
+) -> engine.LoadOptions:
+    """`loads` with the online quantization SGLang applies to `config` under `method`, if any."""
+    if (name := quantization(method, config)) is not None:
+        return loads.quantization(name)
+    return loads
 
 
 def bind(model_config: ModelConfig, first: int) -> Model:
@@ -114,7 +125,7 @@ def bind(model_config: ModelConfig, first: int) -> Model:
     try:
         loads = options(model_config, tensor, dtype, deterministic=deterministic)
         mapped = checkpoint.mapped()
-        loads.parse(mapped)
+        loads.parse(mapped.source)
     except (NotImplementedError, ValueError) as error:
         raise Refused("model_path", str(error)) from None
     device = engine.Device(engine.Placement(chips(first, tensor), PES))
@@ -122,7 +133,7 @@ def bind(model_config: ModelConfig, first: int) -> Model:
     backup = cast("bool", features.enable_memory_saver and features.enable_weights_cpu_backup)
     try:
         decoder = Decoder.load(
-            checkpoint, loads, device, model_config.vocab_size, backup=backup, mapped=mapped
+            mapped, loads, device, model_config.vocab_size, backup=backup
         )
     except NotImplementedError as error:
         raise Refused("model_path", str(error)) from None

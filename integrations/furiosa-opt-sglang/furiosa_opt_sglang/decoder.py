@@ -50,9 +50,17 @@ class Location:
     directory: str
     config: dict[str, JsonValue] | None
 
-    def mapped(self) -> engine.Checkpoint:
-        """The checkpoint's tensors, mapped from its files as they are now."""
-        return engine.Checkpoint(self.directory, config=self.config)
+    def mapped(self) -> MappedCheckpoint:
+        """The checkpoint's tensors, mapped from its files as they are now, with their location."""
+        return MappedCheckpoint(self, engine.Checkpoint(self.directory, config=self.config))
+
+
+@dataclass(frozen=True, slots=True)
+class MappedCheckpoint:
+    """A mapped checkpoint and its location, which maps the same source again after release."""
+
+    location: Location
+    source: engine.Checkpoint
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,19 +84,18 @@ class Decoder:
     @classmethod
     def load(
         cls,
-        checkpoint: Location,
+        checkpoint: MappedCheckpoint,
         options: engine.LoadOptions,
         device: engine.Device,
         vocabulary: int,
         *,
         backup: bool = False,
-        mapped: engine.Checkpoint | None = None,
     ) -> Decoder:
         """`checkpoint` loaded with `options` onto `device`, whose token IDs lie below `vocabulary`;
-        `mapped` reuses a preflight file mapping. `backup` keeps a host copy of the tensors.
+        `backup` keeps a host copy of the tensors.
         Refuses a decoder whose calls return scores or whose cache is not one paged full-history
         group."""
-        source = checkpoint.mapped() if mapped is None else mapped
+        source = checkpoint.source
         copy = source.read() if backup else None
         loaded = options.load(source if copy is None else copy, device)
         match loaded:
@@ -100,7 +107,14 @@ class Decoder:
             case [engine.decoder.Group(kind=engine.decoder.Kind.Paged(), window=None) as group]:
                 pool = loaded.cache.pools[group.pool]
                 return cls(
-                    loaded, copy, checkpoint, options, device, vocabulary, pool, group.layers
+                    loaded,
+                    copy,
+                    checkpoint.location,
+                    options,
+                    device,
+                    vocabulary,
+                    pool,
+                    group.layers,
                 )
             case _:
                 raise NotImplementedError("the plugin pages only one full-history attention group")

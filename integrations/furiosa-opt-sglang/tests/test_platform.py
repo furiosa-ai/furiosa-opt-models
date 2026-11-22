@@ -199,6 +199,37 @@ def test_quantizes_each_output_channel() -> None:
 
 @pytest.mark.feature("Online quantization")
 @pytest.mark.parametrize(
+    ("draft_method", "expected"),
+    [
+        pytest.param("fp8", "fp8_per_channel", id="draft-owned-fp8"),
+        pytest.param("unquant", None, id="unquant"),
+    ],
+)
+def test_applies_draft_quantization_to_load_options(
+    draft_method: str, expected: str | None
+) -> None:
+    """A BF16 target leaves its weights as stored; the draft's own method sets its load options."""
+    from furiosa_opt_sglang.load import quantized_options
+
+    class LoadOptions:
+        def __init__(self) -> None:
+            self.quantizations: list[str] = []
+
+        def quantization(self, name: str) -> "LoadOptions":
+            self.quantizations.append(name)
+            return self
+
+    target = LoadOptions()
+    draft = LoadOptions()
+    _ = quantized_options(target, None, {})
+    _ = quantized_options(draft, draft_method, {})
+
+    assert target.quantizations == []
+    assert draft.quantizations == ([] if expected is None else [expected])
+
+
+@pytest.mark.feature("Online quantization")
+@pytest.mark.parametrize(
     "config",
     [
         pytest.param(
