@@ -253,9 +253,9 @@ VLLM_NIXL_SIDE_CHANNEL_PORT=5601 vllm serve Qwen/Qwen3-0.6B --port 8200 --kv-tra
      "kv_role": "kv_both", "kv_connector_extra_config": {"cpu_bytes_to_use": 17179869184}}]}}'
 ```
 
-vLLM looks up a request's blocks in connector order and uses the first connector with a hit. It sends store hooks to each connector, which applies its own scheduling and eviction policy. Keep NIXL first for remote-first lookup, or put offloading first for local-first lookup.
+vLLM asks connectors in order and uses the first one reporting matched tokens; it does not merge hit lengths. It sends store hooks to each connector, which applies its own scheduling and eviction policy. Keep NIXL first for remote-first lookup, or put offloading first for local-first lookup.
 The NIXL entry may be `NixlPushConnector`.
-NIXL's registered CPU buffer and vLLM's offloading host region or filesystem tier have separate ownership and lifetimes. A request stored by both paths can therefore copy the same KV blocks twice, using extra host bandwidth and capacity; a hit in one tier does not reuse the other's copy.
+The NIXL adapter stages engine pages before copying them into NIXL's CPU buffer. vLLM's offloading host region and optional filesystem tier have separate ownership and lifetimes. A request stored by both paths can therefore copy the same KV blocks twice, using extra host bandwidth and capacity; a hit in one path does not reuse the other's copy.
 NIXL alone supports data-parallel replicas and sleep mode. When offloading is combined with NIXL, offloading still requires data-parallel degree 1 and does not support sleep mode.
 With NIXL data-parallel replicas, route a request's reloads to the replica that decoded it (`X-data-parallel-rank`).
 
