@@ -7,10 +7,11 @@ hide: [toc]
 MiniMax H3 generates video with stereo audio from text on four RNGD chips.
 This setup and integration guide covers a manually validated profile with private
 reference data.
-The profile below has passed local native, vLLM-Omni and HTTP lifecycle checks,
-including TeaCache. The original 77-token workload passes component, raw-output
-and served-output GPU reference checks. H3 has no CI coverage and is not in the
-published CI benchmark inventory.
+The profile below has passed local native, vLLM-Omni and HTTP checks, including
+TeaCache callback and error recovery. The original 77-token workload passes
+component, raw-output and served-output GPU reference checks. H3 device and
+reference tests are currently opt-in and are not executed by CI; H3 is not in
+the published CI benchmark inventory.
 
 ## MiniMaxAI/MiniMax-H3
 
@@ -71,39 +72,54 @@ To enable the H3 TeaCache policy, append these flags to the serving command:
 
 TeaCache reuses transformer residuals on selected denoising steps. The engine
 retains the probe and residual rows, while Omni applies the scalar policy.
-Each new generation resets the retained rows. Normal-threshold HTTP generation,
-repeated decoded outputs and cancellation/recovery have passed local checks;
-the recorded cached request passes the original served-output GPU bounds. These
-checks do not establish quality across other prompts or cache thresholds.
+Each new generation resets the retained rows. The device tests cover callback
+failures and cache recovery. Broader generation quality at normal TeaCache
+thresholds and across prompts requires separate validation.
 
 ### Validation status
 
-Local checks cover four-chip component coexistence, text encoding through 2048
-tokens, and short/2048-token framework calls. Forced-compute cache calls match
-uncached output bits. Callback failures and cancellation restore storage and
-allow the next call to succeed.
-
-Both uncached and normal-threshold cached HTTP checks cover a complete 50-step
-request, repeated decoded values, cancellation of an in-progress request with
-successful recovery, and normal shutdown with worker release.
+The implementation at [3dccd57](https://github.com/furiosa-ai/furiosa-opt-models/commit/3dccd579106532f81af89b4605dc5491b948228d)
+passed the five opt-in H3 device cases: a complete raw 50-step video/audio
+request, callback reentry refusal, cache invalidation and recovery after both
+Python and reentry failures, and a queued reset from another thread. The original
+77-token text encoder comparison and served HTTP/media checks also pass.
 
 The recorded raw-output request uses saved GPU text conditioning and checks five
 sampled frames and the full stereo waveform before media encoding. Served-output
 checks also cover the plain-text path. Both use the original numerical bounds.
-Component comparisons cover the text encoder, condition projection, refiner,
-first joint block and heads at the original sampled steps. Numerical acceptance
-uses the original 77-token workload and tolerances. Runtime-length checks through
-2048 tokens are separate from GPU numerical comparisons; broader prompt and cache
-quality coverage is not established by this workload.
+Numerical acceptance uses the original 77-token workload and tolerances.
+Runtime-length checks through 2048 tokens are separate from GPU numerical
+comparisons; broader prompt and TeaCache generation quality are not established
+by this workload.
 
-Two corrected uncached HTTP requests took 255.41 and 256.44 seconds, averaging
-255.92 seconds. The earlier ten-request Furiosa reference baseline averaged
-255.40 seconds on the same host and four chips at 300 W. Both use the original
-50-step workload with TeaCache disabled and time the complete HTTP response.
-The measurements use each implementation's pinned SDK/compiler, and the two new
-requests were not interleaved with the earlier baseline. The observed average
-offset is 0.52 seconds; this comparison does not establish exact performance
-parity or a statistically significant difference.
+One uncached HTTP request on this implementation took **255.51 seconds**, using
+the profile above and 50 denoising steps with TeaCache disabled. Timing runs from
+client submission through receipt of the complete HTTP response; server startup
+and model loading are excluded.
+
+### Rust kernel tests and CI coverage
+
+Thirty H3-related device cases in the models crate are marked `#[ignore]`,
+including 22 that require four explicitly selected RNGD chips. These include
+data-free packing, gather, attention, exchange, projection and synthetic component tests; they do not all
+require private weights or captures.
+
+The current CI test job runs its binaries without `--include-ignored`, so these
+cases compile but do not execute, even on the four-chip runner. Enabling the
+data-free cases in CI remains open. To run an exchange case locally, select four
+free chips and use:
+
+```bash
+FURIOSA_VISIBLE_CHIPS=4,5,6,7 \
+cargo furiosa-opt test -p furiosa-opt-models --release --lib \
+  ops::collective::prefix::tests::device_prefix_exchange_preserves_rows_and_capacity_tail \
+  -- --include-ignored --test-threads 1
+```
+
+H3 is included in every native engine/plugin build. CI's `--no-run` build also
+compiles the ignored test entries. The added cost in CI's 90-minute build job has
+not been measured; a local single-job full wheel build took 57.5 minutes, which
+does not isolate H3's incremental cost or predict CI's parallel build time.
 
 ### Private reference tests
 
