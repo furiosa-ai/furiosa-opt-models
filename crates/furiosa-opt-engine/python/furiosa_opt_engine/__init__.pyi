@@ -61,6 +61,62 @@ class Checkpoint:
         eviction nor a later change to its files reaches them.
         """
 
+@typing.final
+class Copier:
+    r"""
+    Python handle for the device cache's copy queue.
+    """
+    def __new__(
+        cls,
+        layers: typing.Sequence[HbmBuffer],
+        page_bytes: typing.Sequence[builtins.int],
+        host_offsets: typing.Sequence[builtins.int],
+        groups: typing.Sequence[builtins.int],
+        host_block_bytes: builtins.int,
+    ) -> Copier:
+        r"""
+        Build one transfer queue over the layer buffers.
+
+        `page_bytes`, `host_offsets`, and `groups` have one entry per layer. Page sizes are bytes
+        per chip; offsets address the concatenated bytes in each host slot.
+        """
+    def copy_out(
+        self,
+        pages: typing.Sequence[
+            tuple[builtins.int, typing.Sequence[tuple[builtins.int, builtins.int]]]
+        ],
+        host: HostCache,
+    ) -> Copy:
+        r"""
+        Submit device-to-host copies for host slots and their `(group, device_block)` routes.
+        """
+    def copy_in(
+        self,
+        pages: typing.Sequence[
+            tuple[builtins.int, typing.Sequence[tuple[builtins.int, builtins.int]]]
+        ],
+        host: HostCache,
+    ) -> Copy:
+        r"""
+        Submit host-to-device copies for host slots and their `(group, device_block)` routes.
+        """
+    def shutdown(self) -> None:
+        r"""
+        Wait for every submitted copy and stop the workers.
+        """
+
+@typing.final
+class Copy:
+    r"""
+    Completion of a queued cache copy.
+    """
+    def done(self, timeout: builtins.float | None = 0.0) -> builtins.bool: ...
+    def wait(self) -> None: ...
+    def submitted(self) -> None:
+        r"""
+        Wait until every runtime batch was submitted, without waiting for DMA completion.
+        """
+
 @typing_extensions.disjoint_base
 class Decoder:
     r"""
@@ -340,49 +396,22 @@ class HostBuffer:
         """
 
 @typing.final
-class Copier:
-    r"""Six-worker queue for batched page copies between HBM layers and pinned host slots."""
-    def __new__(
-        cls,
-        layers: collections.abc.Sequence[HbmBuffer],
-        page_bytes: collections.abc.Sequence[builtins.int],
-        host_offsets: collections.abc.Sequence[builtins.int],
-        groups: collections.abc.Sequence[builtins.int],
-        host_block_bytes: builtins.int,
-    ) -> Copier: ...
-    def copy_in(
-        self,
-        pages: collections.abc.Sequence[
-            tuple[builtins.int, collections.abc.Sequence[tuple[builtins.int, builtins.int]]]
-        ],
-        host: HostCache,
-    ) -> Copy: ...
-    def copy_out(
-        self,
-        pages: collections.abc.Sequence[
-            tuple[builtins.int, collections.abc.Sequence[tuple[builtins.int, builtins.int]]]
-        ],
-        host: HostCache,
-    ) -> Copy: ...
-    def shutdown(self) -> None: ...
-
-@typing.final
 class HostCache:
-    r"""Persistent pool of page-locked host slots used by the copier and storage adapters."""
+    r"""
+    A persistent pool of page-locked host blocks, one slot per offloaded cache block.
+    """
     def __new__(cls, copier: Copier, slots: builtins.int) -> HostCache: ...
-    def slot(self, index: builtins.int) -> HostSlot: ...
+    def slot(self, index: builtins.int) -> HostSlot:
+        r"""
+        A writable, zero-copy view of one slot, for the filesystem and tensor adapters.
+        """
 
 @typing.final
 class HostSlot:
-    r"""Writable buffer view of one pinned host slot, with no intermediate copy."""
+    r"""
+    A zero-copy view of one pinned host slot.
+    """
     def __len__(self) -> builtins.int: ...
-
-@typing.final
-class Copy:
-    r"""Completion handle for an asynchronous batched page copy."""
-    def done(self, timeout: builtins.float | None = 0.0) -> builtins.bool: ...
-    def submitted(self) -> None: ...
-    def wait(self) -> None: ...
 
 @typing.final
 class HostTensor:

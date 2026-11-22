@@ -52,7 +52,7 @@ class _PinnedPrimaryTier(CPUPrimaryTierOffloadingManager):
 
 
 class FuriosaOffloadingSpec(CPUOffloadingSpec):
-    """Keep vLLM's scheduler policy while the worker uses #322's transfer plane."""
+    """Keep vLLM's scheduler policy while the worker uses Furiosa's transfer queue."""
 
     @classmethod
     @override

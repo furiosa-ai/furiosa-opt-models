@@ -143,7 +143,9 @@ Both servers copy the cache blocks of computed prompts to a tier of host memory,
     `--kv-offloading-size` sets the host tier in GiB, as on a GPU.
     The platform serves it through the plugin's `RNGDOffloadingConnector` instead of vLLM's `OffloadingConnector`, which copies with CUDA streams; vLLM's scheduler still decides what to store, load and evict.
     Options of vLLM's CPU offloading, such as `blocks_per_chunk` and `eviction_policy`, go in `--kv-transfer-config '{"kv_connector_extra_config": {...}}'` beside the size.
-    To persist evicted chunks in vLLM's filesystem tier, add `secondary_tiers`:
+    This uses vLLM's native `TieringOffloadingSpec`: `secondary_tiers` is its documented
+    `kv_connector_extra_config` field, and vLLM owns tier lookup and lifecycle. Furiosa supplies
+    the filesystem-tier manager so file I/O uses engine-pinned slots:
 
     ```bash
     vllm serve Qwen/Qwen3-0.6B --kv-offloading-size 16 \
@@ -151,7 +153,12 @@ Both servers copy the cache blocks of computed prompts to a tier of host memory,
     ```
 
     vLLM keeps its scheduler, LRU policy, file naming and lookup; the plugin stores pages in the engine's pinned host slots and uses aligned `O_DIRECT` I/O when the filesystem supports it, with buffered fallback otherwise. The filesystem tier has no size cap or automatic stale-directory cleanup; operators remove old directories.
-    vLLM's `canonical_layout` gives KV pages a topology-independent format so different TP/CP configurations can reuse files. Furiosa accepts it only when vLLM certifies an identity mapping; validation runs at startup, and transfers still use direct #322 page DMA. Non-identity scatter/gather needs fragment transfers and more descriptors, so this adapter rejects it to preserve direct page DMA. Cross-topology reuse requires another reader to use the same canonical format and block keys.
+    If `canonical_layout` is enabled, startup succeeds only when vLLM's canonical mapping is
+    byte-for-byte identical to the engine's page layout and each vLLM worker drives one engine
+    chip. The adapter raises an error for non-identity mappings instead of converting page
+    fragments. With `canonical_layout` disabled, it uses the worker's local page layout.
+    Cross-topology reuse still requires another reader to understand the same canonical layout
+    and block keys.
     vLLM completes a transfer once the worker of each rank reports it, and one worker drives every chip, so offloading serves one chip a replica.
     It also serves one replica: with data parallelism vLLM ranks each replica's worker among all of them.
     Sleep mode frees the cache storage the host tier copies, so startup refuses `--enable-sleep-mode` beside offloading.
@@ -168,7 +175,11 @@ Both servers copy the cache blocks of computed prompts to a tier of host memory,
     The memory saver frees the cache storage the host tier copies, so startup refuses `--enable-memory-saver` beside the hierarchical cache.
     A `/generate` response reports reused tokens by tier in `meta_info.cached_tokens_details`.
 
-Both adapters keep the framework's scheduling, keys, and tier lifecycle. Their host transfers share the engine's six-worker queue: each batch moves up to two pinned host slots, with all layer pages in one runtime DMA batch. Filesystem I/O uses one page-aligned, per-thread bounce buffer and one aligned syscall per cache page, matching #322; `O_DIRECT` is used when supported, with buffered fallback otherwise. vLLM keeps its chunk files and writes each page at its own aligned offset.
+Both adapters keep the framework's scheduling, keys, and tier lifecycle. Their host transfers
+share the engine's six-worker queue: each batch moves up to two pinned host slots, with all layer
+pages in one runtime DMA batch. Filesystem I/O uses one page-aligned, per-thread bounce buffer
+and one aligned syscall per cache page; `O_DIRECT` is used when supported, with buffered fallback
+otherwise. vLLM keeps its chunk files and writes each page at its own aligned offset.
 
 Only the attention cache moves, so both servers refuse offloading at startup for a model with recurrent state, and vLLM also for one with encoder memory; the [vLLM](vllm.md#options) and [SGLang](sglang.md#options) option pages name the other refused settings.
 A failed copy poisons the memory it touched, and neither server recovers once it observes the failure, so vLLM's `kv_load_failure_policy` takes only `fail`.

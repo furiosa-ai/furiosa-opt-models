@@ -21,7 +21,7 @@ The platform accepts these values:
 | `--logits-processors` | Processors of vLLM's V1 interface, under `VLLM_USE_V2_MODEL_RUNNER=0` |
 | `VLLM_BATCH_INVARIANT` | `0`, or `1` to load the model [batch invariant](index.md#keep-outputs-independent-of-the-batch) |
 | `--ec-transfer-config` | An encoder-only instance (`ec_role` `ec_producer`) through `ECExampleConnector`, for a checkpoint whose media encoder the engine loads alone |
-| `--kv-offloading-size` | Native offloading through `RNGDOffloadingConnector` ([Offload the KV cache to host memory](index.md#offload-the-kv-cache-to-host-memory)), for causal full-attention and sliding-window `Paged` cache groups, with vLLM's legal KV layouts; rejects recurrent `State` and encoder `Cross` groups, requires tensor, pipeline and data parallel degrees 1, and does not support sleep mode; `--kv-transfer-config` beside it accepts vLLM CPU offloading options and stock filesystem secondary tiers |
+| `--kv-offloading-size` | Native offloading through `RNGDOffloadingConnector` ([Offload the KV cache to host memory](index.md#offload-the-kv-cache-to-host-memory)), for causal full-attention and sliding-window `Paged` cache groups, with vLLM's legal KV layouts; rejects recurrent `State` and encoder `Cross` groups, requires tensor, pipeline and data parallel degrees 1, and does not support sleep mode; `--kv-transfer-config` accepts vLLM's `CPUOffloadingSpec` and `TieringOffloadingSpec` settings, including its `secondary_tiers` option; Furiosa supplies the filesystem-tier implementation |
 
 These features are not supported yet, and the plugin refuses them at startup rather than ignore them:
 
