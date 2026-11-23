@@ -4,7 +4,7 @@ use crate::Op;
 use crate::load::Load;
 use crate::ops::index::table::{self, Access, Offsets};
 use crate::tensor::cache::Blocks;
-use crate::tensor::cache::{Block, KeyValue};
+use crate::tensor::cache::{Block, KeyValue, Layer};
 use crate::tensor::{
     axis::Tile, live::Live, mapping::Rows as Layout, parallel::Chip, scalar::Value,
 };
@@ -334,7 +334,7 @@ pub(crate) struct Read<
     I: M,
     Chips: M + 'static = Chip,
 > {
-    pub pool: &'a Blocks<Heads, Head, bf16, Chips>,
+    pub pool: Layer<&'a Blocks<Heads, Head, bf16, Chips>>,
     pub indices: &'a HbmTensor<i32, Chips, I>,
     pub output: PhantomData<(C, S, E)>,
 }
@@ -360,9 +360,11 @@ impl<Heads: AxisName, Head: AxisName, C: M, S: M, E: M, I: M, Chips: M + 'static
     ) -> Self::Output {
         // SAFETY: the caller supplies offsets in range of this layer's blocks.
         unsafe {
-            pool.tokens
+            pool.blocks
+                .tokens
                 .gather::<m![1], m![Block, KeyValue, Heads, Head]>()
                 .by_byte_offsets(indices)
+                .entry(pool.entry)
                 .unchecked()
                 .to_dm(&mut context.tdma)
         }
@@ -391,11 +393,13 @@ impl<Heads: AxisName, Head: AxisName, C: M, S: M, E: M, I: M, Sparse: M, L: M, C
     ) -> Self::Output {
         // SAFETY: the caller bounds every index up to the longest prefix by this layer's blocks.
         unsafe {
-            pool.tokens
+            pool.blocks
+                .tokens
                 .gather::<m![1], m![Block, KeyValue, Heads, Head]>()
                 .by_byte_offsets(indices)
                 .prefix::<Sparse, _>(lengths, offset)
                 .overfetch()
+                .entry(pool.entry)
                 .unchecked()
                 .to_dm(&mut context.tdma)
         }
