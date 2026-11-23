@@ -8,9 +8,9 @@ use furiosa_opt_models::modules::parallel::Gathered;
 use furiosa_opt_models::ops::attention::full::{Joined, Joint, Projection};
 use furiosa_opt_models::ops::attention::geometry::{Hidden, ProjectionWidth};
 use furiosa_opt_models::ops::collective::{AllGather, GatherTile, InTiles, Pieces, Tiled};
-use furiosa_opt_models::ops::linear::grouped::Layout;
-use furiosa_opt_models::ops::linear::{Grouped, Linear};
+use furiosa_opt_models::ops::linear::Linear;
 use furiosa_opt_models::tensor::axis::Rows;
+use furiosa_opt_models::tensor::form::grouped::{Grouped, Layout};
 use furiosa_opt_models::tensor::live::{BlockPrefix, Live, Partitioned};
 use furiosa_opt_models::tensor::parallel::{Parallel, Shard};
 use furiosa_opt_models::tensor::scalar::Value;
@@ -26,9 +26,16 @@ type Output<W, S> = HbmTensor<bf16, Chips, m![{ Symbol<Pieces<S, 4>> }, W]>;
 type Qkv<W, S> = (Output<W, S>, Output<W, S>, Output<W, S>);
 type GatheredRows<I, S, const T: usize, const K: usize, const H: usize> =
     Tiled<GatherTile<bf16, 4, I, T>, Pieces<S, 4>, 4, T, K, H>;
-type Owned<I, W> = Projection<Grouped<I, Joint<W>, Chips>, Head>;
-type Borrowed<'a, I, W> =
-    Projection<Grouped<I, Joint<W>, Chips, &'a HbmTensor<bf16, Chips, Layout<I, Joint<W>>>>, Head>;
+type Owned<I, W> = Projection<Linear<I, Joint<W>, Chips, Grouped<I, Joint<W>, Chips>>, Head>;
+type Borrowed<'a, I, W> = Projection<
+    Linear<
+        I,
+        Joint<W>,
+        Chips,
+        Grouped<I, Joint<W>, Chips, &'a HbmTensor<bf16, Chips, Layout<I, Joint<W>>>>,
+    >,
+    Head,
+>;
 type Plain<I, W> = Projection<Linear<I, Joint<W>, Chips>, Head>;
 
 #[device(chip = 4)]

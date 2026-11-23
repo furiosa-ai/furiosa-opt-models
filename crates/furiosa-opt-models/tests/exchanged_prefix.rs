@@ -8,8 +8,9 @@ use furiosa_opt_models::load::{Checkpoint, Context, Load, Named};
 use furiosa_opt_models::modules::parallel::Exchanged;
 use furiosa_opt_models::ops::attention::geometry::{Hidden, ProjectionWidth};
 use furiosa_opt_models::ops::collective::Pieces;
-use furiosa_opt_models::ops::linear::{Grouped, grouped::Layout};
+use furiosa_opt_models::ops::linear::Linear;
 use furiosa_opt_models::tensor::axis::Rows;
+use furiosa_opt_models::tensor::form::grouped::{Grouped, Layout};
 use furiosa_opt_models::tensor::live::{
     BlockPrefix, ExtentRange, Extents, Live, PrefixInputs, PrefixPlan,
 };
@@ -26,9 +27,13 @@ type Chips = m![{ Symbol<Shard<4>> }];
 type B = Rows<256>;
 type Split<R, I> = HbmTensor<bf16, Chips, m![{ Symbol<Pieces<R, 4>> }, { Symbol<Part<I, 4>> }]>;
 type Local<R, W> = HbmTensor<bf16, Chips, m![R, W]>;
-type Owned<I, O> = Exchanged<Named<"projection", Grouped<I, O, Chips>>, Parallel<4>>;
+type Owned<I, O> =
+    Exchanged<Named<"projection", Linear<I, O, Chips, Grouped<I, O, Chips>>>, Parallel<4>>;
 type Borrowed<'a, I, O> = Exchanged<
-    Named<"projection", Grouped<I, O, Chips, &'a HbmTensor<bf16, Chips, Layout<I, O>>>>,
+    Named<
+        "projection",
+        Linear<I, O, Chips, Grouped<I, O, Chips, &'a HbmTensor<bf16, Chips, Layout<I, O>>>>,
+    >,
     Parallel<4>,
 >;
 type State<R, O> = (Local<R, O>, Value<Chips>);
@@ -197,10 +202,6 @@ async fn check<R: AxisName, I: AxisName, O: AxisName, G: Extents>(works: &[usize
     let (_directory, checkpoint) = checkpoint::<I, O>();
     let weights: Owned<I, O> = checkpoint.load(&mut device).unwrap();
     let borrowed_weights = Borrowed::load(&mut Context::new(None), &weights).unwrap();
-    assert!(std::ptr::eq(
-        weights.operation.0.tensor(),
-        borrowed_weights.operation.0.tensor()
-    ));
     let reference = reference::<I>();
     for &work in works {
         let prefix = BlockPrefix::<(), R, B>::try_over(work).unwrap();

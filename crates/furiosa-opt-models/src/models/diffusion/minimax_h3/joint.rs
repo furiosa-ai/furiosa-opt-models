@@ -13,10 +13,11 @@ use crate::modules::attention::Full;
 use crate::modules::parallel::Exchanged;
 use crate::ops::attention::{Attention, flash, full::PackKeys};
 use crate::ops::collective::Pieces;
-use crate::ops::linear::{Grouped, grouped::Layout};
+use crate::ops::linear::Linear;
 use crate::ops::rotary::{Rotary, Rotation};
 use crate::specialize::attention::{Flash, Strategy};
 use crate::tensor::axis::Rows;
+use crate::tensor::form::grouped::{Grouped, Layout};
 use crate::tensor::live::{BlockPrefix, Live};
 use crate::tensor::parallel::{Parallel, Part};
 use crate::tensor::scalar::F32;
@@ -38,7 +39,10 @@ impl<'i, 'p, 'e, 'c, 'a, 's, R, K, W, A, Qkv, QkvState, Storage>
             { Strategy::Items },
             { Flash::SinglePass },
         >,
-        Named<"out_proj", Exchanged<Grouped<A, W, Chips, Storage>, Parallel<PARTS>>>,
+        Named<
+            "out_proj",
+            Exchanged<Linear<A, W, Chips, Grouped<A, W, Chips, Storage>>, Parallel<PARTS>>,
+        >,
     >
 where
     R: AxisName,

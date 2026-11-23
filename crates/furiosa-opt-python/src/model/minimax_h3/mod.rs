@@ -32,7 +32,21 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-pub(super) fn object(
+/// Prepare checked host weights, then place on the original context outside its device lock.
+pub(super) fn load(
+    py: Python<'_>,
+    options: &furiosa_opt_engine::LoadOptions,
+    checkpoint: &furiosa_opt_engine::Checkpoint,
+    device: &Device,
+) -> Result<Py<PyAny>, Error> {
+    let shared = py.detach(|| furiosa_opt_engine::residency::SharedDevice::bind(device.0.clone()));
+    let prepared =
+        py.detach(|| options.prepare_pipeline::<engine::Pipeline>(checkpoint, shared.placement()))?;
+    let pipeline = py.detach(|| block_on(prepared.place(shared)))?;
+    Ok(object(py, pipeline, device.0.clone())?.into_any())
+}
+
+fn object(
     py: Python<'_>,
     pipeline: Arc<engine::Pipeline>,
     context: Shared,

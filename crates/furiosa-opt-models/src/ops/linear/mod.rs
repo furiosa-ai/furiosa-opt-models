@@ -4,7 +4,6 @@ pub use affine::{Affine, Bias, output, query};
 pub(crate) use affine::{Coefficients, Inputs, Outputs};
 pub(crate) use decode::Matrix;
 pub use experts::Experts;
-pub use grouped::Grouped;
 pub(crate) use rows::Projection;
 
 use core::borrow::Borrow;
@@ -25,7 +24,7 @@ pub mod affine;
 mod decode;
 pub(crate) mod experts;
 pub(crate) mod fp8;
-pub mod grouped;
+mod grouped;
 pub(crate) mod kernel;
 pub mod modulation;
 pub mod nvfp4;
@@ -35,8 +34,8 @@ pub(crate) mod rows;
 pub(crate) mod split;
 pub(crate) mod stream;
 
-/// Multiply BF16 input rows by a retained [Out, In] weight matrix transposed: its checkpoint's
-/// `weight`, held as `T`, the HBM tensor or a borrow of it in a borrowed tree.
+/// Multiply BF16 input rows by retained [Out, In] coefficients transposed: its checkpoint's
+/// `weight`, held as `T`, a weight form or the ordinary HBM tensor, owned or borrowed.
 #[derive(DeviceSend, Load, Residency)]
 #[residency(children(T))]
 pub struct Linear<
@@ -51,7 +50,7 @@ pub struct Linear<
 }
 
 impl<In: AxisName, Out: AxisName, Chips: M, T> Linear<In, Out, Chips, T> {
-    /// Retain the BF16 [Out, In] matrix, owned or borrowed, without copying it.
+    /// Retain the BF16 [Out, In] coefficients in their storage form without copying them.
     pub fn new(weight: Weight<m![Out, In], Chips, T>) -> Self {
         Self {
             affine: Affine::new(weight.into_tensor(), ()),

@@ -16,6 +16,7 @@ use super::Matrix;
 use super::kernel::{Contraction, Rounded, Tiling, Unrounded};
 use crate::Op;
 use crate::specialize::contraction;
+use crate::specialize::contraction::RowConfig as Config;
 use furiosa_opt_std::prelude::*;
 
 pub(crate) mod grouped;
@@ -63,44 +64,6 @@ impl<I: AxisName, O: AxisName, R: AxisName, Chips: M> Slab<I, O, R, Chips>
 {
     fn slab(&self, device: &mut Device, pass: usize) -> Weight<I, O, R, Chips> {
         self.tile::<Chunked<I, O, R>>(device, pass)
-    }
-}
-
-/// BF16 elements one register fill holds a slice: one bank, so the next fill takes the other.
-const REGISTER: usize = 16_384;
-
-#[derive(Clone, Copy)]
-struct Config {
-    /// K groups: the slices whose partials one inter-slice reduction sums.
-    parts: usize,
-    /// Outputs one slice holds after the reduction, for each of its rows.
-    kept: usize,
-    passes: usize,
-}
-
-/// The row tile of `(input, output)` at a cluster's rows of `rows`, checked against the register,
-/// slab and slice geometry so a tile that cannot hold fails to compile.
-impl Config {
-    const fn new(input: usize, output: usize, rows: usize) -> Self {
-        let (parts, kept, passes) = contraction::row_tile(input, output, contraction::half(rows));
-        let tiling = Config {
-            parts,
-            kept,
-            passes,
-        };
-        let chunk = input / parts;
-        let outputs = tiling.outputs(rows);
-        assert!(input.is_multiple_of(parts) && chunk.is_multiple_of(4));
-        assert!(contraction::half(rows) * chunk <= REGISTER);
-        assert!(kept.is_multiple_of(8) && outputs * chunk * 2 <= contraction::SLAB);
-        assert!(256 / parts * outputs * passes == output);
-        tiling
-    }
-
-    /// Outputs a slice computes in a pass: the reduction spreads them over its K groups, kept a
-    /// slice.
-    const fn outputs(self, rows: usize) -> usize {
-        self.parts / (contraction::half(rows) / 8) * self.kept
     }
 }
 

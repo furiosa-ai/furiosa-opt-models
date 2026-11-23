@@ -16,12 +16,12 @@ use crate::modules::{attention, diffusion, feedforward};
 use crate::ops::attention::flash;
 use crate::ops::attention::{Attention, full, geometry};
 use crate::ops::collective::InTiles;
-use crate::ops::linear::{self, Linear, modulation};
+use crate::ops::linear::{Linear, modulation};
 use crate::ops::normalization::{AdaptiveRms, RmsNorm};
 use crate::ops::pointwise::{SwiGlu, add::Add, gated};
 use crate::ops::swiglu::GateUp;
 use crate::specialize::attention::{Flash, Strategy};
-use crate::tensor::form::Weight;
+use crate::tensor::form::{Weight, grouped};
 use crate::tensor::memory::residency::Residency;
 use crate::tensor::memory::{Hbm, Memory};
 use crate::tensor::parallel::{Parallel, Part};
@@ -59,7 +59,7 @@ pub type BlockAttention<W = Width, A = Attended, X = Hbm, Tiles = GatherTiles> =
                     Gathered<
                         full::Joined<
                             full::Projection<
-                                Grouped<W, full::Joint<Part<A, 4>>, X>,
+                                Packed<W, full::Joint<Part<A, 4>>, X>,
                                 flash::Head,
                                 Rotated,
                             >,
@@ -79,16 +79,16 @@ pub type BlockAttention<W = Width, A = Attended, X = Hbm, Tiles = GatherTiles> =
         { Strategy::Items },
         { Flash::SinglePass },
     >,
-    Named<"out_proj", Exchanged<Grouped<A, W, X>, Parallel<4>>>,
+    Named<"out_proj", Exchanged<Packed<A, W, X>, Parallel<4>>>,
 >;
 
 /// Replicated K-grouped gate/up and down matrices, with `bf16(bf16(silu(gate)) * up)` products.
 ///
 /// Source: https://github.com/vllm-project/vllm-omni/blob/6daf5b30f07cc0b3db87766d22fdf433f8a1a7c9/vllm_omni/diffusion/models/minimax_h3/minimax_h3_transformer.py
 pub type BlockFeedForward<W = Width, F = Expanded, X = Hbm> = feedforward::Mlp<
-    Prefix<Named<"fc1", Grouped<W, GateUp<F>, X>>>,
+    Prefix<Named<"fc1", Packed<W, GateUp<F>, X>>>,
     Prefix<SwiGlu>,
-    Prefix<Named<"fc2", Grouped<F, W, X>>>,
+    Prefix<Named<"fc2", Packed<F, W, X>>>,
 >;
 
 /// A quarter of every one of the eighteen modulation chunks on each chip.
@@ -214,8 +214,12 @@ impl<'a, In: AxisName, Attended: AxisName, P: Load<&'a Checkpoint>> Load<&'a Che
 pub type Norm<W = Width, X = Hbm> =
     RmsNorm<W, EPSILON, Chips, Weight<m![W], Chips, <X as Memory>::Tensor<bf16, Chips, m![W]>>>;
 
-pub type Grouped<I, O, X = Hbm> =
-    linear::Grouped<I, O, Chips, <X as Memory>::Tensor<bf16, Chips, linear::grouped::Layout<I, O>>>;
+pub type Packed<I, O, X = Hbm> = Linear<
+    I,
+    O,
+    Chips,
+    grouped::Grouped<I, O, Chips, <X as Memory>::Tensor<bf16, Chips, grouped::Layout<I, O>>>,
+>;
 
 pub type Dense<I, O, X = Hbm> = Linear<I, O, Chips, <X as Memory>::Tensor<bf16, Chips, m![O, I]>>;
 
@@ -400,7 +404,7 @@ mod tests {
         let cp = checkpoint(true);
         let _tree = Joint::<Host>::load(&mut Context::new(None), &cp).unwrap();
         let qkv = image("qkv_proj");
-        let k = linear::grouped::Chunk::<W, full::Joint<Part<A, 4>>>::SIZE;
+        let k = grouped::Chunk::<W, full::Joint<Part<A, 4>>>::SIZE;
         for chip in 0..4 {
             for term in 0..3 {
                 for d in 0..128 {

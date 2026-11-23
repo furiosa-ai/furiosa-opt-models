@@ -114,7 +114,8 @@ impl<D, C, S> Load<&Cell<D, C, S>> for Cell<D, C, S> {
 mod tests {
     use super::{Cell, Cells};
     use furiosa_opt_models::load::{Checkpoint, Context, Load, LoadError};
-    use furiosa_opt_models::ops::linear::grouped::{Grouped, Layout};
+    use furiosa_opt_models::ops::linear::Linear;
+    use furiosa_opt_models::tensor::form::grouped::{Grouped, Layout};
     use furiosa_opt_models::tensor::memory::Memory;
     use furiosa_opt_models::tensor::parallel::Shard;
     use furiosa_opt_std::prelude::*;
@@ -123,8 +124,12 @@ mod tests {
 
     axes![Width = 128, Out = 512, Rows = 4, Columns = 4];
     type Chips = m![{ Symbol<Shard<4>> }];
-    type Projection<X> =
-        Grouped<Width, Out, Chips, <X as Memory>::Tensor<bf16, Chips, Layout<Width, Out>>>;
+    type Projection<X> = Linear<
+        Width,
+        Out,
+        Chips,
+        Grouped<Width, Out, Chips, <X as Memory>::Tensor<bf16, Chips, Layout<Width, Out>>>,
+    >;
 
     #[derive(Load)]
     struct Norm<X: Memory> {

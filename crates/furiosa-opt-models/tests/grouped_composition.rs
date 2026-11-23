@@ -7,10 +7,11 @@ use furiosa_opt_models::load::{Checkpoint, Load};
 use furiosa_opt_models::modules::parallel::Exchanged;
 use furiosa_opt_models::ops::attention::geometry::{Hidden, ProjectionWidth};
 use furiosa_opt_models::ops::collective::Pieces;
-use furiosa_opt_models::ops::linear::{Grouped, Linear};
+use furiosa_opt_models::ops::linear::Linear;
 use furiosa_opt_models::ops::pointwise::SwiGlu;
 use furiosa_opt_models::ops::swiglu::{GateUp, Intermediate};
 use furiosa_opt_models::tensor::axis::Rows;
+use furiosa_opt_models::tensor::form::grouped::Grouped;
 use furiosa_opt_models::tensor::parallel::{Parallel, Part, Shard};
 use furiosa_opt_models::{Module, Then};
 use furiosa_opt_std::prelude::*;
@@ -30,7 +31,7 @@ struct ExchangeWeights<P> {
     output: Exchanged<P, Parallel<4>>,
 }
 
-type PackedExchange = ExchangeWeights<Grouped<H, O, Chips>>;
+type PackedExchange = ExchangeWeights<Linear<H, O, Chips, Grouped<H, O, Chips>>>;
 type OrdinaryExchange = ExchangeWeights<Linear<H, O, Chips>>;
 
 #[derive(DeviceSend, Load)]
@@ -39,7 +40,10 @@ struct Mlp<U, D> {
     fc2: D,
 }
 
-type PackedMlp = Mlp<Grouped<H, GateUp<I>, Chips>, Grouped<I, H, Chips>>;
+type PackedMlp = Mlp<
+    Linear<H, GateUp<I>, Chips, Grouped<H, GateUp<I>, Chips>>,
+    Linear<I, H, Chips, Grouped<I, H, Chips>>,
+>;
 type OrdinaryMlp = Mlp<Linear<H, GateUp<I>, Chips>, Linear<I, H, Chips>>;
 
 #[device(chip = 4)]

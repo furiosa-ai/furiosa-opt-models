@@ -13,8 +13,7 @@
 
 use crate::decoder::{Decoder, Instance, Served};
 use crate::diffusion::minimax_h3;
-use crate::load::{Quantization, io_error};
-use crate::residency::SharedDevice;
+use crate::load::Quantization;
 use crate::vision_language::Encoder;
 use furiosa_opt_models::load::{Checkpoint, Context, Load, LoadError, Part};
 use furiosa_opt_models::models::decoder::attention::{llama, qwen3};
@@ -27,11 +26,7 @@ use furiosa_opt_models::tensor::memory::Hbm;
 use furiosa_opt_models::tensor::parallel::Parallel;
 use furiosa_opt_std::prelude::Placement;
 use safetensors::Dtype;
-use std::any::Any;
-use std::future::Future;
-use std::io;
-use std::pin::Pin;
-use std::sync::Arc;
+use std::any::TypeId;
 
 /// Every upstream architecture name, by family level, with the decoders that implement it; a
 /// refused name has none.
@@ -920,15 +915,12 @@ enum Loader {
         chips: usize,
         check: fn(&Checkpoint) -> Result<(), LoadError>,
         options: PipelineOptions,
-        load: fn(&Checkpoint, SharedDevice) -> Result<Loading, LoadError>,
+        type_id: fn() -> TypeId,
     },
 }
 
 type PipelineOptions =
     fn(Option<usize>, Option<Dtype>, Option<Quantization>, Tiling) -> Result<(), LoadError>;
-
-// Placement is polled by the caller outside the context lock, on that caller's executor.
-pub(crate) type Loading = Pin<Box<dyn Future<Output = io::Result<Model>>>>;
 
 /// A model a load returns, as a framework serves it.
 pub enum Model {
@@ -936,8 +928,6 @@ pub enum Model {
     Decoder(Box<dyn Served>),
     /// A media encoder of images, video frames and audio.
     Encoder(Box<dyn Encoder>),
-    /// A pipeline retaining its concrete family capability and original shared device.
-    Pipeline(Arc<dyn Any + Send + Sync>),
 }
 
 impl Model {
@@ -945,7 +935,7 @@ impl Model {
     pub fn decoder(self) -> Option<Box<dyn Served>> {
         match self {
             Self::Decoder(decoder) => Some(decoder),
-            Self::Encoder(_) | Self::Pipeline(_) => None,
+            Self::Encoder(_) => None,
         }
     }
 }
@@ -964,15 +954,15 @@ pub trait Listed: Implements + for<'a> Load<&'a Checkpoint> + Sized + 'static {
 
 /// A registered pipeline with checked component documents and a separately placed host tree.
 /// Its family keeps the concrete prepared type and places it on the caller's retained device.
-pub trait Pipeline: Implements + Any + Send + Sync {
+pub trait Pipeline: Implements + 'static {
     /// The chip count required by this implementation.
     const CHIPS: usize;
 
     /// Checked component documents, read before any weight is loaded.
     type Inputs;
 
-    /// Owned, strictly loaded host weights, ready for asynchronous placement.
-    type Prepared: Send + 'static;
+    /// Strictly loaded host weights, ready for placement by the family binding.
+    type Prepared;
 
     /// Refuse a checkpoint part this pipeline does not read.
     fn reads(part: Part) -> Result<(), LoadError>;
@@ -993,20 +983,6 @@ pub trait Pipeline: Implements + Any + Send + Sync {
 
     /// Refuse a device placement before preparing any host weight or device allocation.
     fn check_placement(placement: &Placement) -> Result<(), LoadError>;
-
-    /// Place owned host weights while retaining the caller's original shared device.
-    fn place(
-        prepared: Self::Prepared,
-        device: SharedDevice,
-    ) -> impl Future<Output = io::Result<Arc<Self>>>;
-
-    /// Preserve the concrete family owner for the binding to recover after common loading.
-    fn served(self: Arc<Self>) -> Model
-    where
-        Self: Sized,
-    {
-        Model::Pipeline(self)
-    }
 }
 
 /// A decoder reads a whole model and serves requests as an instance of the load's tiling.
@@ -1059,13 +1035,7 @@ impl Implementation {
                 chips: P::CHIPS,
                 check: |source| P::inputs(source).map(|_| ()),
                 options: P::options,
-                load: |source, device| {
-                    P::check_placement(device.placement())?;
-                    let prepared = P::prepare(source, P::inputs(source)?)?;
-                    Ok(Box::pin(async move {
-                        P::place(prepared, device).await.map(P::served)
-                    }))
-                },
+                type_id: TypeId::of::<P>,
             },
         }
     }
@@ -1080,6 +1050,13 @@ impl Implementation {
 
     pub(crate) fn is_pipeline(&self) -> bool {
         matches!(self.load, Loader::Pipeline { .. })
+    }
+
+    pub(crate) fn is_pipeline_type<P: Pipeline>(&self) -> bool {
+        match self.load {
+            Loader::Pipeline { type_id, .. } => type_id() == TypeId::of::<P>(),
+            Loader::Model(_) => false,
+        }
     }
 
     /// Validate a pipeline's component documents before any weight is read.
@@ -1174,27 +1151,8 @@ impl Implementation {
             Loader::Model(load) => context.field("", scope, |cx| load(cx, source, tiling)),
             Loader::Pipeline { .. } => Err(LoadError::Unsupported {
                 name: "device".into(),
-                reason: "pipeline placement requires a retained SharedDevice; use LoadOptions::load_shared".into(),
+                reason: "pipeline placement requires a retained SharedDevice; use LoadOptions::prepare_pipeline and the family's placement method".into(),
             }),
-        }
-    }
-
-    /// Load on the original shared context, returning owned placement work that holds no lock.
-    pub(crate) fn load_shared(
-        &self,
-        device: &SharedDevice,
-        source: &Checkpoint,
-        tiling: Tiling,
-    ) -> Result<Loading, LoadError> {
-        match self.load {
-            Loader::Model(_) => {
-                let loaded = device.with_device(|device| {
-                    self.load(&mut Context::new(device), source, tiling)
-                        .map_err(io_error)
-                });
-                Ok(Box::pin(std::future::ready(loaded)))
-            }
-            Loader::Pipeline { load, .. } => load(source, device.clone()),
         }
     }
 

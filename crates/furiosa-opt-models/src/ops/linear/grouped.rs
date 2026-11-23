@@ -1,165 +1,18 @@
-//! BF16 projections with K-grouped weights for the register-resident row tile.
+//! BF16 row projections whose Linear retains K-grouped coefficients.
 
 use core::borrow::Borrow;
-use core::marker::PhantomData;
 
+use super::Linear;
 use crate::Op;
-use crate::load::{Checkpoint, Context, Load, LoadError};
-use crate::tensor::form::Weight;
+use crate::tensor::form::grouped::{Grouped, Layout};
 use crate::tensor::live::{BlockPrefix, Live};
-use crate::tensor::memory::residency::Residency;
 use furiosa_opt_std::prelude::*;
-
-/// Coefficients grouped as 32 outputs by one K group of the 256-row tile.
-pub type Layout<In, Out> = m![
-    Out / 32,
-    In / ({ Symbol<Chunk<In, Out>> }),
-    Out % 32,
-    In % ({ Symbol<Chunk<In, Out>> })
-];
-
-/// Features of one K group in the packed 256-row projection's weight.
-#[derive(Clone, Debug)]
-pub struct Chunk<In, Out>(PhantomData<(In, Out)>);
-
-impl<In: AxisName, Out: AxisName> AxisName for Chunk<In, Out> {
-    const NAME: Ident = Ident::new("RowChunk");
-    const SIZE: usize =
-        <super::rows::Chunked<In, Out, crate::tensor::axis::Rows<256>> as AxisName>::SIZE;
-}
-
-/// Multiply BF16 HBM rows by K-grouped coefficients, rounding each output once.
-/// Owned and borrowed trees hold the same weight layout and run the same kernel.
-#[derive(DeviceSend, Load, Residency)]
-#[load(tree)]
-#[residency(children(T))]
-pub struct Grouped<
-    In: AxisName,
-    Out: AxisName,
-    Chips: M = m![1],
-    T = HbmTensor<bf16, Chips, Layout<In, Out>>,
-> {
-    weight: T,
-    shape: PhantomData<fn() -> (In, Out, Chips)>,
-}
-
-impl<In: AxisName, Out: AxisName, Chips: M, T> Grouped<In, Out, Chips, T> {
-    /// Retain an already packed matrix without copying it.
-    pub fn new(weight: Weight<Layout<In, Out>, Chips, T>) -> Self {
-        Self {
-            weight: weight.into_tensor(),
-            shape: PhantomData,
-        }
-    }
-}
-
-impl<In: AxisName, Out: AxisName, Chips: M, T> Grouped<In, Out, Chips, T>
-where
-    T: Borrow<HbmTensor<bf16, Chips, Layout<In, Out>>>,
-{
-    /// The packed coefficients of this projection.
-    pub fn tensor(&self) -> &HbmTensor<bf16, Chips, Layout<In, Out>> {
-        self.weight.borrow()
-    }
-}
-
-/// Strictly read an ordinary checkpoint matrix and pack it before upload.
-impl<'a, In: AxisName, Out: AxisName, Chips: M + 'static, T> Load<&'a Checkpoint>
-    for Grouped<In, Out, Chips, T>
-where
-    T: Load<HostTensor<bf16, m![{ Chips }, { Layout<In, Out> }]>>,
-{
-    fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
-        context.checkpoint(from, |cx| {
-            cx.field("weight", "weight", |cx| {
-                cx.compare(from)?;
-                let host = from.host::<bf16, m![Out, In], m![{ Chips }, { m![Out, In] }]>(cx)?;
-                T::load(cx, pack::<In, Out, Chips>(host))
-            })
-            .map(|weight| Self {
-                weight,
-                shape: PhantomData,
-            })
-        })
-    }
-}
-
-impl<In: AxisName, Out: AxisName, Chips: M + 'static, T>
-    Load<HostTensor<bf16, m![{ Chips }, { m![Out, In] }]>> for Grouped<In, Out, Chips, T>
-where
-    T: Load<HostTensor<bf16, m![{ Chips }, { Layout<In, Out> }]>>,
-{
-    fn load(
-        context: &mut Context<'_>,
-        host: HostTensor<bf16, m![{ Chips }, { m![Out, In] }]>,
-    ) -> Result<Self, LoadError> {
-        T::load(context, pack::<In, Out, Chips>(host)).map(|weight| Self {
-            weight,
-            shape: PhantomData,
-        })
-    }
-}
-
-/// Pack a converted matrix and write the held tensor's existing storage.
-impl<'t, In: AxisName, Out: AxisName, Chips: M + 'static, T>
-    Load<(
-        &'t mut Grouped<In, Out, Chips, T>,
-        HostTensor<bf16, m![{ Chips }, { m![Out, In] }]>,
-    )> for &'t mut Grouped<In, Out, Chips, T>
-where
-    for<'u> &'u mut T: Load<(
-        &'u mut T,
-        HostTensor<bf16, m![{ Chips }, { Layout<In, Out> }]>,
-    )>,
-{
-    fn load(
-        context: &mut Context<'_>,
-        (into, host): (
-            &'t mut Grouped<In, Out, Chips, T>,
-            HostTensor<bf16, m![{ Chips }, { m![Out, In] }]>,
-        ),
-    ) -> Result<Self, LoadError> {
-        <&mut T as Load<_>>::load(context, (&mut into.weight, pack::<In, Out, Chips>(host)))?;
-        Ok(into)
-    }
-}
-
-/// Pack a checkpoint update and write the existing allocation, preserving ties.
-impl<'t, 's, In: AxisName, Out: AxisName, Chips: M + 'static, T>
-    Load<(&'t mut Grouped<In, Out, Chips, T>, &'s Checkpoint)>
-    for &'t mut Grouped<In, Out, Chips, T>
-where
-    for<'u> &'u mut T: Load<(
-        &'u mut T,
-        HostTensor<bf16, m![{ Chips }, { Layout<In, Out> }]>,
-    )>,
-{
-    fn load(
-        context: &mut Context<'_>,
-        (into, from): (&'t mut Grouped<In, Out, Chips, T>, &'s Checkpoint),
-    ) -> Result<Self, LoadError> {
-        context.checkpoint(from, |cx| {
-            cx.field("weight", "weight", |cx| {
-                cx.rule(
-                    |cx| {
-                        cx.compare(from)?;
-                        let host =
-                            from.host::<bf16, m![Out, In], m![{ Chips }, { m![Out, In] }]>(cx)?;
-                        Ok(pack::<In, Out, Chips>(host))
-                    },
-                    |cx, host| <&mut T as Load<_>>::load(cx, (&mut into.weight, host)).map(drop),
-                )
-            })
-        })?;
-        Ok(into)
-    }
-}
 
 impl<'x, 'o, In: AxisName, Out: AxisName, R: AxisName, Chips: M, T>
     Op<(
         &'x HbmTensor<bf16, Chips, m![R, In]>,
         &'o mut HbmTensor<bf16, Chips, m![R, Out]>,
-    )> for Grouped<In, Out, Chips, T>
+    )> for Linear<In, Out, Chips, Grouped<In, Out, Chips, T>>
 where
     T: Borrow<HbmTensor<bf16, Chips, Layout<In, Out>>>,
 {
@@ -173,14 +26,14 @@ where
             &'o mut HbmTensor<bf16, Chips, m![R, Out]>,
         ),
     ) {
-        let weight = super::rows::grouped::Packed(self.tensor());
+        let weight = super::rows::grouped::Packed(self.affine.weight.tensor());
         super::rows::Projection::<In, Out, R, Chips, (), bf16, _>::new(&weight, &())
             .forward(device, (input, &mut super::rows::grouped::Output(output)));
     }
 }
 
 impl<'x, In: AxisName, Out: AxisName, R: AxisName, Chips: M, T>
-    Op<&'x HbmTensor<bf16, Chips, m![R, In]>> for Grouped<In, Out, Chips, T>
+    Op<&'x HbmTensor<bf16, Chips, m![R, In]>> for Linear<In, Out, Chips, Grouped<In, Out, Chips, T>>
 where
     T: Borrow<HbmTensor<bf16, Chips, Layout<In, Out>>>,
 {
@@ -190,7 +43,7 @@ where
         &self,
         device: &mut Device,
         input: &'x HbmTensor<bf16, Chips, m![R, In]>,
-    ) -> Self::Output {
+    ) -> HbmTensor<bf16, Chips, m![R, Out]> {
         let mut output = HbmTensor::new();
         self.forward(device, (input, &mut output));
         output
@@ -204,7 +57,7 @@ impl<'x, 'r, 'o, In: AxisName, Out: AxisName, R: AxisName, B: AxisName, Chips: M
     Op<(
         &'r BlockPrefix<&'x HbmTensor<bf16, Chips, m![R, In]>, R, B>,
         &'o mut HbmTensor<bf16, Chips, m![R, Out]>,
-    )> for Grouped<In, Out, Chips, T>
+    )> for Linear<In, Out, Chips, Grouped<In, Out, Chips, T>>
 where
     T: Borrow<HbmTensor<bf16, Chips, Layout<In, Out>>>,
 {
@@ -217,12 +70,12 @@ where
             &'r BlockPrefix<&'x HbmTensor<bf16, Chips, m![R, In]>, R, B>,
             &'o mut HbmTensor<bf16, Chips, m![R, Out]>,
         ),
-    ) -> Self::Output {
+    ) -> Live<(), R> {
         const {
             assert!(B::SIZE == 256, "grouped prefixes use 256-row blocks");
             assert!(R::SIZE.is_multiple_of(256));
         }
-        let weight = super::rows::grouped::Packed(self.tensor());
+        let weight = super::rows::grouped::Packed(self.affine.weight.tensor());
         super::rows::Projection::<In, Out, R, Chips, (), bf16, _>::new(&weight, &())
             .prefix::<bf16, _, _, _, _, B>(
                 device,
@@ -237,7 +90,8 @@ where
 /// Allocate the usual row envelope and initialize only its checked work prefix. The owned result
 /// carries that interval; allocation rows outside it are not initialized or exposed as work.
 impl<'x, 'r, In: AxisName, Out: AxisName, R: AxisName, B: AxisName, Chips: M, T>
-    Op<&'r BlockPrefix<&'x HbmTensor<bf16, Chips, m![R, In]>, R, B>> for Grouped<In, Out, Chips, T>
+    Op<&'r BlockPrefix<&'x HbmTensor<bf16, Chips, m![R, In]>, R, B>>
+    for Linear<In, Out, Chips, Grouped<In, Out, Chips, T>>
 where
     T: Borrow<HbmTensor<bf16, Chips, Layout<In, Out>>>,
 {
@@ -247,19 +101,10 @@ where
         &self,
         device: &mut Device,
         input: &'r BlockPrefix<&'x HbmTensor<bf16, Chips, m![R, In]>, R, B>,
-    ) -> Self::Output {
+    ) -> Live<HbmTensor<bf16, Chips, m![R, Out]>, R> {
         let mut output = HbmTensor::new();
         self.forward(device, (input, &mut output)).with(output)
     }
-}
-
-/// Only the storage layout changes: all BF16 bit patterns survive the transpose.
-fn pack<In: AxisName, Out: AxisName, Chips: M>(
-    host: HostTensor<bf16, m![{ Chips }, { m![Out, In] }]>,
-) -> HostTensor<bf16, m![{ Chips }, { Layout<In, Out> }]> {
-    let matrix = Tensor::<bf16, m![{ Chips }, { m![Out, In] }]>::from_vec(host.into_vec());
-    let packed = matrix.transpose::<m![{ Chips }, { Layout<In, Out> }]>(false);
-    HostTensor::from_vec(packed.into_vec())
 }
 
 #[cfg(test)]
@@ -267,37 +112,17 @@ mod tests {
     use super::*;
     use crate::ops::attention::geometry::{Hidden, ProjectionWidth};
     use crate::tensor::axis::Rows;
+    use crate::tensor::form::Weight;
+    use crate::tensor::form::grouped::pack;
 
     type In = Hidden<128>;
     type Out = ProjectionWidth<2048>;
     type R = Rows<768>;
 
-    #[test]
-    fn packing_preserves_coefficients_on_each_chip() {
-        type In = Hidden<128>;
-        type Out = ProjectionWidth<2048>;
-        type Chips = m![2];
-        let original: Vec<bf16> = (0..2 * In::SIZE * Out::SIZE)
-            .map(|i| bf16::from_bits(i.wrapping_mul(40503) as u16))
-            .collect();
-        let packed = pack::<In, Out, Chips>(HostTensor::from_vec(original.clone()));
-        let packed =
-            Tensor::<bf16, m![{ Chips }, { Layout<In, Out> }]>::from_vec(packed.into_vec());
-        let restored = packed
-            .transpose::<m![{ Chips }, { m![Out, In] }]>(false)
-            .into_vec();
-        assert!(
-            original
-                .iter()
-                .zip(restored)
-                .all(|(a, b)| a.to_bits() == b.to_bits())
-        );
-    }
-
     #[device(chip = 1)]
     fn project(
         device: &mut Device,
-        grouped: &Grouped<In, Out>,
+        grouped: &Linear<In, Out, m![1], Grouped<In, Out>>,
         input: &HbmTensor<bf16, m![1], m![R, In]>,
     ) -> HbmTensor<bf16, m![1], m![R, Out]> {
         grouped.forward(device, input)
@@ -320,12 +145,12 @@ mod tests {
             .map(|i| bf16::from_f32(((i * 23 % 61) as f32 - 30.0) / 32.0))
             .collect();
         let packed = pack::<In, Out, m![1]>(HostTensor::from_vec(weight.clone()));
-        let grouped = Grouped::new(Weight::new(
+        let grouped = Linear::new(Weight::new(Grouped::new(Weight::new(
             packed
                 .to_hbm::<m![1], Layout<In, Out>>(&mut device.pdma)
                 .await
                 .unwrap(),
-        ));
+        ))));
         let input = HostTensor::<bf16, m![R, In]>::from_vec(rows.clone())
             .to_hbm::<m![1], m![R, In]>(&mut device.pdma)
             .await
@@ -356,7 +181,7 @@ mod tests {
 
 #[cfg(test)]
 mod update_tests {
-    use super::{Grouped, Layout};
+    use super::{Grouped, Layout, Linear};
     use crate::load::{Checkpoint, Context, Failed, Load, LoadError, Update};
     use crate::tensor::memory::residency::{Path, Residency, Visit};
     use crate::tensor::memory::{Hbm, Memory};
@@ -407,8 +232,12 @@ mod update_tests {
         }
     }
 
-    type Projection<X> =
-        Grouped<In, Out, Chips, <X as Memory>::Tensor<bf16, Chips, Layout<In, Out>>>;
+    type Projection<X> = Linear<
+        In,
+        Out,
+        Chips,
+        Grouped<In, Out, Chips, <X as Memory>::Tensor<bf16, Chips, Layout<In, Out>>>,
+    >;
 
     #[derive(Load, Residency)]
     #[residency(memory(X))]
@@ -570,9 +399,10 @@ mod prefix_tests {
     use crate::Op;
     use crate::load::{Checkpoint, Context, Load};
     use crate::ops::attention::geometry::{Hidden, ProjectionWidth};
-    use crate::ops::linear::{Grouped, grouped::Layout};
+    use crate::ops::linear::Linear;
     use crate::tensor::axis::Rows;
     use crate::tensor::form::Weight;
+    use crate::tensor::form::grouped::{Grouped, Layout};
     use crate::tensor::live::{BlockPrefix, Live};
     use crate::tensor::scalar::Value;
     use furiosa_opt_std::prelude::*;
@@ -584,15 +414,20 @@ mod prefix_tests {
     type Out = ProjectionWidth<2048>;
     type Input = HbmTensor<bf16, m![1], m![R, In]>;
     type Output = HbmTensor<bf16, m![1], m![R, Out]>;
-    type Owned = Grouped<In, Out>;
-    type Borrowed<'a> = Grouped<In, Out, m![1], &'a HbmTensor<bf16, m![1], Layout<In, Out>>>;
+    type Owned = Linear<In, Out, m![1], Grouped<In, Out>>;
+    type Borrowed<'a> = Linear<
+        In,
+        Out,
+        m![1],
+        Grouped<In, Out, m![1], &'a HbmTensor<bf16, m![1], Layout<In, Out>>>,
+    >;
 
     type FullIn = Hidden<5376>;
     type FullOut = ProjectionWidth<28672>;
     type FullRows = Rows<10496>;
     type FullInput = HbmTensor<bf16, m![1], m![FullRows, FullIn]>;
     type FullOutput = HbmTensor<bf16, m![1], m![FullRows, FullOut]>;
-    type FullProjection = Grouped<FullIn, FullOut>;
+    type FullProjection = Linear<FullIn, FullOut, m![1], Grouped<FullIn, FullOut>>;
 
     const SENTINEL: f32 = 13.0;
     const POISON: u16 = 0x7fc1;
@@ -731,12 +566,13 @@ mod prefix_tests {
         let packed = canonical
             .transpose::<Layout<FullIn, FullOut>>(false)
             .into_vec();
-        let model = FullProjection::new(Weight::new(
+        let weight = Grouped::new(Weight::new(
             HostTensor::<bf16, Layout<FullIn, FullOut>>::from_vec(packed)
                 .to_hbm(&mut device.pdma)
                 .await
                 .unwrap(),
         ));
+        let model = FullProjection::new(Weight::new(weight));
         for rows in [0, 256, 512, 9472, 9728, 9984] {
             let source: FullInput = HostTensor::<bf16, m![FullRows, FullIn]>::from_vec(
                 (0..FullRows::SIZE * FullIn::SIZE).map(|at| {
@@ -798,8 +634,8 @@ mod prefix_tests {
 
     /// One compiled entry handles empty, single, paired, odd/even and full work. Source NaNs past
     /// each prefix expose padded computation, and reused destination sentinels detect stray stores.
-    /// The empty and short cases also exercise prefetch bounds. The borrowed
-    /// load shares the exact owned weight; both public output forms match independent FP64 dots.
+    /// The empty and short cases also exercise prefetch bounds. Owned and borrowed
+    /// projections, in both public output forms, match independent FP64 dots.
     #[tokio::test(flavor = "current_thread")]
     async fn loaded_grouped_prefixes_match_fp64_and_preserve_allocation_tails() {
         let _lease = crate::tests::DEVICE.lock().await;
@@ -807,7 +643,6 @@ mod prefix_tests {
         let (_directory, source) = checkpoint();
         let module: Owned = source.load(&mut device).unwrap();
         let borrowed = Borrowed::load(&mut Context::new(None), &module).unwrap();
-        assert!(std::ptr::eq(module.tensor(), borrowed.tensor()));
         let reference = reference();
         let sentinel = || {
             HostTensor::<bf16, m![R, Out]>::from_vec(std::iter::repeat_n(

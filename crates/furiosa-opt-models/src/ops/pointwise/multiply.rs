@@ -38,7 +38,7 @@ impl<D: Float, S: M + 'static, Chips: M> Op<(&HbmTensor<D, Chips, S>, &HbmTensor
         device: &mut Device,
         (left, right): (&HbmTensor<D, Chips, S>, &HbmTensor<D, Chips, S>),
     ) -> Self::Output {
-        Window::<S>::combine::<_, true, Chips>(device, left, right)
+        Window::<S>::combine::<D, Chips>(device, left, right, FpBinaryOp::MulF(FpMulAlu::Mul0))
     }
 }
 

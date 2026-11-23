@@ -13,9 +13,9 @@ use furiosa_opt_models::load::{Checkpoint, Context, Load};
 use furiosa_opt_models::modules::parallel::Gathered;
 use furiosa_opt_models::ops::attention::full::{Joined, Joint, Projection};
 use furiosa_opt_models::ops::collective::{InTiles, Pieces};
-use furiosa_opt_models::ops::linear::Grouped;
-use furiosa_opt_models::ops::linear::grouped::Layout;
+use furiosa_opt_models::ops::linear::Linear;
 use furiosa_opt_models::tensor::axis::Rows;
+use furiosa_opt_models::tensor::form::grouped::{Grouped, Layout};
 use furiosa_opt_models::tensor::live::BlockPrefix;
 use furiosa_opt_models::tensor::parallel::{Parallel, Shard};
 use furiosa_opt_models::tensor::scalar::Value;
@@ -32,13 +32,22 @@ type Input = HbmTensor<bf16, Chips, m![Capacity, InputWidth]>;
 type Output = HbmTensor<bf16, Chips, m![{ Symbol<Pieces<Capacity, 4>> }, Width]>;
 type Qkv = (Output, Output, Output);
 type Buffers = [HbmBuffer; 3];
-type Owned = Projection<Grouped<InputWidth, Joint<Width>, Chips>, Head, Rotated>;
+type Owned = Projection<
+    Linear<InputWidth, Joint<Width>, Chips, Grouped<InputWidth, Joint<Width>, Chips>>,
+    Head,
+    Rotated,
+>;
 type Borrowed<'a> = Projection<
-    Grouped<
+    Linear<
         InputWidth,
         Joint<Width>,
         Chips,
-        &'a HbmTensor<bf16, Chips, Layout<InputWidth, Joint<Width>>>,
+        Grouped<
+            InputWidth,
+            Joint<Width>,
+            Chips,
+            &'a HbmTensor<bf16, Chips, Layout<InputWidth, Joint<Width>>>,
+        >,
     >,
     Head,
     Rotated,

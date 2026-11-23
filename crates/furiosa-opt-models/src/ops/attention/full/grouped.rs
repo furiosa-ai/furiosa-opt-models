@@ -2,10 +2,10 @@
 
 use super::{Joint, Projection};
 use crate::Op;
-use crate::load::{self, Checkpoint, Load, LoadError};
+use crate::load::Load;
 use crate::ops::collective::{GatherTile as Tile, Pieces, Tiled};
-use crate::ops::linear::grouped::Layout;
-use crate::ops::linear::{self, Grouped};
+use crate::ops::linear::{self, Linear};
+use crate::tensor::form::grouped::{Grouped, Layout};
 use crate::tensor::live::{BlockPrefix, Live, Partitioned};
 use crate::tensor::memory::residency::Residency;
 use crate::tensor::parallel::Shard;
@@ -38,7 +38,18 @@ impl<
     const K: usize,
     const HEAD: usize,
 > Op<&'x BlockPrefix<Tiled<Tile<bf16, N, In, T>, Pieces<S, N>, N, T, K, HEAD>, S, U>>
-    for Joined<Projection<Grouped<In, Joint<W>, m![{ Symbol<Shard<N>> }], Storage>, Head, Rotated>>
+    for Joined<
+        Projection<
+            Linear<
+                In,
+                Joint<W>,
+                m![{ Symbol<Shard<N>> }],
+                Grouped<In, Joint<W>, m![{ Symbol<Shard<N>> }], Storage>,
+            >,
+            Head,
+            Rotated,
+        >,
+    >
 where
     Storage: Borrow<HbmTensor<bf16, m![{ Symbol<Shard<N>> }], Layout<In, Joint<W>>>>,
 {
@@ -58,7 +69,7 @@ where
     ) -> Self::Output {
         let (mut query, mut key, mut value) =
             (HbmTensor::new(), HbmTensor::new(), HbmTensor::new());
-        let weight = linear::rows::grouped::Packed(self.0.0.tensor());
+        let weight = linear::rows::grouped::Packed(self.0.0.affine.weight.tensor());
         linear::Projection::<In, Joint<W>, Pieces<S, N>, m![{ Symbol<Shard<N>> }], (), bf16, _>::new(
             &weight,
             &(),
@@ -72,24 +83,6 @@ where
         Live::<(), Pieces<S, N>>::all()
             .subrange(0, N * tiles.rows())
             .with((query, key, value))
-    }
-}
-
-/// The weight under `weight`, in the leaf's order.
-impl<'a, In: AxisName, W: AxisName, Chips, T, Head: AxisName, Rotated: AxisName>
-    Load<&'a Checkpoint> for Projection<Grouped<In, Joint<W>, Chips, T>, Head, Rotated>
-where
-    Chips: M + 'static,
-    Grouped<In, Joint<W>, Chips, T>:
-        Load<HostTensor<bf16, m![{ Chips }, { m![{ Symbol<Joint<W>> }, In] }]>>,
-{
-    fn load(context: &mut load::Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
-        context.checkpoint(from, |cx| {
-            cx.field("0", "weight", |cx| {
-                let joint = Self::joint::<In, W, Chips>(from, cx)?;
-                Ok(Self::new(Load::load(cx, joint)?))
-            })
-        })
     }
 }
 
@@ -108,7 +101,16 @@ impl<
     const K: usize,
     const HEAD: usize,
 > Op<&'x Partitioned<Tiled<Tile<bf16, N, In, T>, Pieces<S, N>, N, T, K, HEAD>, S, N>>
-    for Projection<Grouped<In, Joint<W>, m![{ Symbol<Shard<N>> }], Storage>, Head, Rotated>
+    for Projection<
+        Linear<
+            In,
+            Joint<W>,
+            m![{ Symbol<Shard<N>> }],
+            Grouped<In, Joint<W>, m![{ Symbol<Shard<N>> }], Storage>,
+        >,
+        Head,
+        Rotated,
+    >
 where
     Storage: Borrow<HbmTensor<bf16, m![{ Symbol<Shard<N>> }], Layout<In, Joint<W>>>>,
 {
@@ -129,7 +131,7 @@ where
     ) -> Self::Output {
         let (mut query, mut key, mut value) =
             (HbmTensor::new(), HbmTensor::new(), HbmTensor::new());
-        let weight = linear::rows::grouped::Packed(self.0.tensor());
+        let weight = linear::rows::grouped::Packed(self.0.affine.weight.tensor());
         linear::Projection::<In, Joint<W>, Pieces<S, N>, m![{ Symbol<Shard<N>> }], (), bf16, _>::new(
             &weight,
             &(),
@@ -144,52 +146,9 @@ where
     }
 }
 
-/// The weight written in place, one rule of an update.
-impl<'t, 's, In: AxisName, W: AxisName, Chips, T, Head: AxisName, Rotated: AxisName>
-    Load<(
-        &'t mut Projection<Grouped<In, Joint<W>, Chips, T>, Head, Rotated>,
-        &'s Checkpoint,
-    )> for &'t mut Projection<Grouped<In, Joint<W>, Chips, T>, Head, Rotated>
-where
-    Chips: M + 'static,
-    for<'u> &'u mut Grouped<In, Joint<W>, Chips, T>: Load<(
-        &'u mut Grouped<In, Joint<W>, Chips, T>,
-        HostTensor<bf16, m![{ Chips }, { m![{ Symbol<Joint<W>> }, In] }]>,
-    )>,
-{
-    fn load(
-        context: &mut load::Context<'_>,
-        (into, from): (
-            &'t mut Projection<Grouped<In, Joint<W>, Chips, T>, Head, Rotated>,
-            &'s Checkpoint,
-        ),
-    ) -> Result<Self, LoadError> {
-        context.checkpoint(from, |cx| {
-            cx.field("0", "weight", |cx| {
-                cx.rule(
-                    |cx| {
-                        Projection::<Grouped<In, Joint<W>, Chips, T>, Head, Rotated>::joint(
-                            from, cx,
-                        )
-                    },
-                    |cx, joint| {
-                        <&mut Grouped<In, Joint<W>, Chips, T> as Load<_>>::load(
-                            cx,
-                            (&mut into.0, joint),
-                        )
-                        .map(drop)
-                    },
-                )
-            })
-            .map(drop)
-        })?;
-        Ok(into)
-    }
-}
-
 impl<'x, In: AxisName, W: AxisName, R: AxisName, Chips: M, T, Head, Rotated>
     Op<&'x HbmTensor<bf16, Chips, m![R, In]>>
-    for Projection<Grouped<In, Joint<W>, Chips, T>, Head, Rotated>
+    for Projection<Linear<In, Joint<W>, Chips, Grouped<In, Joint<W>, Chips, T>>, Head, Rotated>
 where
     T: Borrow<HbmTensor<bf16, Chips, Layout<In, Joint<W>>>>,
 {
@@ -206,7 +165,7 @@ where
     ) -> Self::Output {
         let (mut query, mut key, mut value) =
             (HbmTensor::new(), HbmTensor::new(), HbmTensor::new());
-        let weight = linear::rows::grouped::Packed(self.0.tensor());
+        let weight = linear::rows::grouped::Packed(self.0.affine.weight.tensor());
         let projection =
             linear::Projection::<In, Joint<W>, R, Chips, (), bf16, _>::new(&weight, &());
         if const { <linear::rows::Passes<In, Joint<W>, R> as AxisName>::SIZE == 1 } {
@@ -231,7 +190,16 @@ impl<
     const K: usize,
     const HEAD: usize,
 > Op<&'x Tiled<Tile<bf16, N, In, T>, Pieces<S, N>, N, T, K, HEAD>>
-    for Projection<Grouped<In, Joint<W>, m![{ Symbol<Shard<N>> }], Storage>, Head, Rotated>
+    for Projection<
+        Linear<
+            In,
+            Joint<W>,
+            m![{ Symbol<Shard<N>> }],
+            Grouped<In, Joint<W>, m![{ Symbol<Shard<N>> }], Storage>,
+        >,
+        Head,
+        Rotated,
+    >
 where
     Storage: Borrow<HbmTensor<bf16, m![{ Symbol<Shard<N>> }], Layout<In, Joint<W>>>>,
 {
@@ -248,7 +216,7 @@ where
     ) -> Self::Output {
         let (mut query, mut key, mut value) =
             (HbmTensor::new(), HbmTensor::new(), HbmTensor::new());
-        let weight = linear::rows::grouped::Packed(self.0.tensor());
+        let weight = linear::rows::grouped::Packed(self.0.affine.weight.tensor());
         linear::Projection::<In, Joint<W>, Pieces<S, N>, m![{ Symbol<Shard<N>> }], (), bf16, _>::new(
             &weight, &(),
         ).tiled::<bf16, _, _, _, N, T, K, HEAD>(

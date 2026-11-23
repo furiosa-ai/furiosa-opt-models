@@ -1,12 +1,10 @@
 //! H3 execution on the pipeline's original four-chip device context.
 
-use crate::residency::SharedDevice;
 use furiosa_opt_models::load::{Checkpoint, LoadError, Part};
 use furiosa_opt_models::models::diffusion::minimax_h3::Inputs;
 use furiosa_opt_models::models::{Class, Implements};
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
 use safetensors::Dtype;
-use std::{io, sync::Arc};
 
 mod audio;
 mod cache;
@@ -105,9 +103,5 @@ impl crate::registry::Pipeline for Pipeline {
             });
         }
         Ok(())
-    }
-
-    async fn place(prepared: Prepared, device: SharedDevice) -> io::Result<Arc<Self>> {
-        prepared.place(device).await
     }
 }

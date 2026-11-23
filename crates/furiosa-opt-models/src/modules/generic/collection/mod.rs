@@ -628,10 +628,11 @@ mod residency_tests {
     use super::{Array, Collected};
     use crate::load::{Checkpoint, Context, Load, LoadError, Named};
     use crate::modules::residual::Residual;
-    use crate::ops::linear::grouped::{Grouped, Layout};
+    use crate::ops::linear::Linear;
     use crate::ops::normalization::{EPSILON, RmsNorm};
     use crate::ops::pointwise::add::Add;
     use crate::tensor::form::Weight;
+    use crate::tensor::form::grouped::{Grouped, Layout};
     use crate::tensor::memory::residency::{Leaves, Path, Residency, Visit};
     use crate::tensor::memory::{Hbm, Memory};
     use crate::tensor::parallel::Shard;
@@ -645,7 +646,7 @@ mod residency_tests {
     type Gain<X> = Weight<m![Width], Chips, <X as Memory>::Tensor<bf16, Chips, m![Width]>>;
     type Norm<X> = RmsNorm<Width, EPSILON, Chips, Gain<X>>;
     type Projection<I, O, X> =
-        Grouped<I, O, Chips, <X as Memory>::Tensor<bf16, Chips, Layout<I, O>>>;
+        Linear<I, O, Chips, Grouped<I, O, Chips, <X as Memory>::Tensor<bf16, Chips, Layout<I, O>>>>;
     type Up<X> = Projection<Width, Wide, X>;
     type Down<X> = Projection<Wide, Width, X>;
     type Block<X> =
@@ -853,12 +854,12 @@ mod residency_tests {
             [
                 "body.0.input.weight.tensor",
                 "body.1.layers.0.0.norm.weight.tensor",
-                "body.1.layers.0.1.0.up.weight",
-                "body.1.layers.0.1.1.down.weight",
+                "body.1.layers.0.1.0.up.affine.weight",
+                "body.1.layers.0.1.1.down.affine.weight",
                 "body.1.layers.1.0.norm.weight.tensor",
-                "body.1.layers.1.1.0.up.weight",
-                "body.1.layers.1.1.1.down.weight",
-                "tied.weight",
+                "body.1.layers.1.1.0.up.affine.weight",
+                "body.1.layers.1.1.1.down.affine.weight",
+                "tied.affine.weight",
             ]
         );
         assert!(Arc::ptr_eq(&before.0[2].bytes, &before.0[7].bytes));

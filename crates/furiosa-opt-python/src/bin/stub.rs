@@ -33,19 +33,26 @@ fn main() -> pyo3_stub_gen::Result<()> {
             .lines()
             .flat_map(|line| [line.trim_end(), "\n"])
             .collect();
+        // Native classes that permit subclasses are disjoint bases for type checkers.
+        for class in module.class.values().filter(|class| class.subclass) {
+            if !text.lines().any(|line| line == "import typing_extensions") {
+                text = patch(
+                    text,
+                    "\n__all__ = [",
+                    "\nimport typing_extensions\n\n__all__ = [",
+                );
+            }
+            let suffix = if class.bases.is_empty() { ":" } else { "(" };
+            let anchor = format!("\nclass {}{suffix}", class.name);
+            let replacement = format!("\n@typing_extensions.disjoint_base{anchor}");
+            text = patch(text, &anchor, &replacement);
+        }
         let file = match name.strip_prefix("engine.") {
             None => {
                 text = patch(
                     text,
                     "def __getitem__(self, rows: slice)",
                     "def __getitem__(self, rows: slice, /)",
-                );
-                // Each model's class derives from `Decoder`, so type checkers learn it is a
-                // disjoint base.
-                text = patch(
-                    text,
-                    "\nclass Decoder:",
-                    "\n@typing_extensions.disjoint_base\nclass Decoder:",
                 );
                 "__init__.pyi".to_string()
             }
@@ -65,17 +72,6 @@ fn main() -> pyo3_stub_gen::Result<()> {
                 text,
                 "\n@typing.final\nclass Request:",
                 &format!("{enums}\n@typing.final\nclass Request:"),
-            );
-            // Each kind's class derives from `Kind`, so type checkers learn it is a disjoint base.
-            text = patch(
-                text,
-                "import typing\n",
-                "import typing\nimport typing_extensions\n",
-            );
-            text = patch(
-                text,
-                "\nclass Kind:",
-                "\n@typing_extensions.disjoint_base\nclass Kind:",
             );
         }
         let path = directory.join(file);

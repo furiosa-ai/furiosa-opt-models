@@ -7,6 +7,7 @@ import typing
 
 import numpy
 import numpy.typing
+import typing_extensions
 
 import furiosa_opt_engine as engine
 
@@ -42,6 +43,7 @@ class AudioOutput:
     def wait(self) -> None: ...
     def to_host(self) -> numpy.typing.NDArray[numpy.float32]: ...
 
+@typing_extensions.disjoint_base
 class Component:
     r"""
     Shared ownership and placement of a pipeline or any of its component views.

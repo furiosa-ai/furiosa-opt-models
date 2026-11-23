@@ -959,6 +959,44 @@ pub(crate) const fn row_tile(input: usize, output: usize, half: usize) -> (usize
     derived(input, output, half)
 }
 
+/// BF16 elements one register fill holds a slice: one bank, so the next fill takes the other.
+const REGISTER: usize = 16_384;
+
+#[derive(Clone, Copy)]
+pub(crate) struct RowConfig {
+    /// K groups: the slices whose partials one inter-slice reduction sums.
+    pub(crate) parts: usize,
+    /// Outputs one slice holds after the reduction, for each of its rows.
+    pub(crate) kept: usize,
+    pub(crate) passes: usize,
+}
+
+/// The row tile of `(input, output)` at a cluster's rows of `rows`, checked against the register,
+/// slab and slice geometry so a tile that cannot hold fails to compile.
+impl RowConfig {
+    pub(crate) const fn new(input: usize, output: usize, rows: usize) -> Self {
+        let (parts, kept, passes) = row_tile(input, output, half(rows));
+        let tiling = RowConfig {
+            parts,
+            kept,
+            passes,
+        };
+        let chunk = input / parts;
+        let outputs = tiling.outputs(rows);
+        assert!(input.is_multiple_of(parts) && chunk.is_multiple_of(4));
+        assert!(half(rows) * chunk <= REGISTER);
+        assert!(kept.is_multiple_of(8) && outputs * chunk * 2 <= SLAB);
+        assert!(256 / parts * outputs * passes == output);
+        tiling
+    }
+
+    /// Outputs a slice computes in a pass: the reduction spreads them over its K groups, kept a
+    /// slice.
+    pub(crate) const fn outputs(self, rows: usize) -> usize {
+        self.parts / (half(rows) / 8) * self.kept
+    }
+}
+
 /// The row tile of the fewest weight passes, then the fewest K groups, whose slab fits
 /// [`DERIVED_SLAB`]: a K group's rows of a block fill one of the two TRF banks, and each slice's
 /// outputs are whole groups of eight kept outputs over the K groups the reduction spreads them on.

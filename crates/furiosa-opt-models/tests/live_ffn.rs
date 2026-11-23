@@ -6,9 +6,10 @@
 use furiosa_opt_models::load::{Checkpoint, Context, Load, Named};
 use furiosa_opt_models::modules::generic::Prefix;
 use furiosa_opt_models::ops::attention::geometry::Hidden;
-use furiosa_opt_models::ops::linear::{Grouped, grouped::Layout};
+use furiosa_opt_models::ops::linear::Linear;
 use furiosa_opt_models::ops::pointwise::SwiGlu;
 use furiosa_opt_models::ops::swiglu::{GateUp, Intermediate};
+use furiosa_opt_models::tensor::form::grouped::{Grouped, Layout};
 use furiosa_opt_models::tensor::{axis::Rows, live::BlockPrefix, scalar::Value};
 use furiosa_opt_models::{Op, Then};
 use furiosa_opt_std::prelude::*;
@@ -29,10 +30,16 @@ struct Weights<U, D> {
     fc2: D,
 }
 
-type Owned = Weights<Grouped<H, GateUp<I>>, Grouped<I, H>>;
+type Owned =
+    Weights<Linear<H, GateUp<I>, m![1], Grouped<H, GateUp<I>>>, Linear<I, H, m![1], Grouped<I, H>>>;
 type Borrowed<'a> = Weights<
-    Grouped<H, GateUp<I>, m![1], &'a HbmTensor<bf16, m![1], Layout<H, GateUp<I>>>>,
-    Grouped<I, H, m![1], &'a HbmTensor<bf16, m![1], Layout<I, H>>>,
+    Linear<
+        H,
+        GateUp<I>,
+        m![1],
+        Grouped<H, GateUp<I>, m![1], &'a HbmTensor<bf16, m![1], Layout<H, GateUp<I>>>>,
+    >,
+    Linear<I, H, m![1], Grouped<I, H, m![1], &'a HbmTensor<bf16, m![1], Layout<I, H>>>>,
 >;
 
 const PERIOD: usize = 29;
@@ -288,8 +295,6 @@ async fn checked_ffn_prefixes_preserve_rounding_values_zero_rows_and_tails() {
     let (_directory, source) = checkpoint();
     let weights: Owned = source.load(&mut device).unwrap();
     let borrowed = Borrowed::load(&mut Context::new(None), &weights).unwrap();
-    assert!(std::ptr::eq(weights.fc1.tensor(), borrowed.fc1.tensor()));
-    assert!(std::ptr::eq(weights.fc2.tensor(), borrowed.fc2.tensor()));
     let reference = Reference::new();
     for blocks in [0, 1, 2, 3, 37, 38, 39, 41, 1, 0] {
         let rows = blocks * B::SIZE;

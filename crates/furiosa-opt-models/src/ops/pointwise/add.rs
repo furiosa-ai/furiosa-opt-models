@@ -68,7 +68,7 @@ impl<D: Float, S: M + 'static, Chips: M> Op<&(Rows<D, S, Chips>, Rows<D, S, Chip
         device: &mut Device,
         (left, right): &(Rows<D, S, Chips>, Rows<D, S, Chips>),
     ) -> Self::Output {
-        Window::<S>::combine_tile::<D, false, Chips>(device, left, right)
+        Window::<S>::combine_tile::<D, Chips>(device, left, right, FpBinaryOp::AddF)
     }
 }
 
@@ -84,7 +84,7 @@ impl<D: Float, S: M + 'static, Chips: M> Op<(&HbmTensor<D, Chips, S>, &HbmTensor
         device: &mut Device,
         (left, right): (&HbmTensor<D, Chips, S>, &HbmTensor<D, Chips, S>),
     ) -> Self::Output {
-        Window::<S>::combine::<_, false, Chips>(device, left, right)
+        Window::<S>::combine::<D, Chips>(device, left, right, FpBinaryOp::AddF)
     }
 }
 

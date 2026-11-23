@@ -9,7 +9,7 @@ use super::{
     B, Blocked, Bs, Chunked, Cluster, Hr, KeptOutputs, Ks, Np, PassOutputs, Result, Rows, Sink,
     Slab, Weight,
 };
-use crate::ops::linear::grouped::Layout;
+use crate::tensor::form::grouped::Layout;
 use furiosa_opt_std::prelude::*;
 
 type Tile = crate::tensor::axis::Rows<256>;

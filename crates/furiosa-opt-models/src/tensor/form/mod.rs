@@ -13,6 +13,7 @@ use crate::tensor::memory::residency::Residency;
 use crate::tensor::parallel::Chip;
 
 pub mod fp8;
+pub mod grouped;
 pub mod nvfp4;
 pub mod split;
 
