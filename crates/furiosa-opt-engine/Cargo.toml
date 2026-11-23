@@ -11,18 +11,20 @@ readme = "README.md"
 [package.metadata.furiosa-opt]
 
 [dependencies]
+bytemuck = "1.25.2"
 futures-executor = "0.3"
 safetensors = "=0.4.5"
 furiosa-opt-models = { path = "../furiosa-opt-models", version = "0.1.0" }
 furiosa-opt-std = { workspace = true }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "sync"] }
 # Unused in code: the features the tests' tempfile and tracing enable, so the stub and the wheel
 # reuse the test build.
 rustix = "1"
 tracing-core = "0.1"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["sync"] }
 furiosa-opt-models = { path = "../furiosa-opt-models", features = ["test-support"] }
 tempfile = "3"
 tracing = "0.1"

@@ -7,6 +7,7 @@ use crate::ops::index::packed::Timestep;
 use crate::ops::normalization::{Chunk, Spread};
 use crate::ops::vector::Silu as _;
 use crate::tensor::live::Live;
+use crate::tensor::memory::residency::Residency;
 use furiosa_opt_std::prelude::*;
 
 /// Elementwise activation selected by a model's configuration.
@@ -198,7 +199,7 @@ impl<D: Float, S: M + 'static, Chips: M + 'static> Op<&HbmTensor<D, Chips, S>> f
 }
 
 /// x * sigmoid(x), preserving any input chip mapping.
-#[derive(Clone, Copy, Default, DeviceSend, Load)]
+#[derive(Clone, Copy, Default, DeviceSend, Load, Residency)]
 pub struct Silu;
 
 impl<D: Float, S: M + 'static, Chips: M> Op<&HbmTensor<D, Chips, S>> for Silu {

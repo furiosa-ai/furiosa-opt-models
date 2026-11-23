@@ -1,8 +1,8 @@
-//! The registry: every upstream architecture name once, by family level, with the decoders and
-//! media encoders that implement it, or none when the name is refused.
+//! The registry: every upstream architecture name once, by family level, with the decoders,
+//! media encoders and pipelines that implement it, or none when the name is refused.
 //!
 //! - `ARCHITECTURES` lists each name, and each alias as a name of its own, with its
-//!   implementations: a decoder or media encoder type at one size each.
+//!   implementations: a decoder, media encoder or pipeline type at one size each.
 //! - `Implementation::listed` finds the first of some architecture names that the list holds, with
 //!   its implementations, and `choose` picks the one whose scope serves a checkpoint, from its
 //!   config and names alone; its `load` then reads the checkpoint strictly at that scope into HBM,
@@ -12,6 +12,8 @@
 //! - A refused name is `Unsupported`, an unknown one `InvalidData`.
 
 use crate::decoder::{Decoder, Instance, Served};
+use crate::diffusion::minimax_h3;
+use crate::load::Quantization;
 use crate::vision_language::Encoder;
 use furiosa_opt_models::load::{Checkpoint, Context, Load, LoadError, Part};
 use furiosa_opt_models::models::decoder::attention::{llama, qwen3};
@@ -22,6 +24,9 @@ use furiosa_opt_models::ops::attention::full::paged::Tiling;
 use furiosa_opt_models::tensor::cache;
 use furiosa_opt_models::tensor::memory::Hbm;
 use furiosa_opt_models::tensor::parallel::Parallel;
+use furiosa_opt_std::prelude::Placement;
+use safetensors::Dtype;
+use std::any::TypeId;
 
 /// Every upstream architecture name, by family level, with the decoders that implement it; a
 /// refused name has none.
@@ -818,6 +823,10 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
     // Source: <https://github.com/vllm-project/vllm-omni/blob/6daf5b30f07cc0b3db87766d22fdf433f8a1a7c9/vllm_omni/model_executor/models/minicpmo_4_5/batched_token2wav.py>.
     ("MiniCPMO45Code2Wav", &[]),
     ("MiniCPMO45OmniForConditionalGeneration", &[]),
+    (
+        "MiniMaxH3Pipeline",
+        &[Implementation::pipeline::<minimax_h3::Pipeline>()],
+    ),
     ("MiniMaxMusic3AcousticForConditionalGeneration", &[]),
     ("MossTTSCodecDecoder", &[]),
     ("NemotronVoiceChatCode2Wav", &[]),
@@ -895,8 +904,23 @@ pub struct Implementation {
     class: Class,
     scope: fn(&Checkpoint) -> Result<&'static str, LoadError>,
     adapters: usize,
-    load: fn(&mut Context<'_>, &Checkpoint, Tiling) -> Result<Model, LoadError>,
+    load: Loader,
 }
+
+/// Placement through a borrowed device, or through the retained context a pipeline needs.
+#[derive(Debug)]
+enum Loader {
+    Model(fn(&mut Context<'_>, &Checkpoint, Tiling) -> Result<Model, LoadError>),
+    Pipeline {
+        chips: usize,
+        check: fn(&Checkpoint) -> Result<(), LoadError>,
+        options: PipelineOptions,
+        type_id: fn() -> TypeId,
+    },
+}
+
+type PipelineOptions =
+    fn(Option<usize>, Option<Dtype>, Option<Quantization>, Tiling) -> Result<(), LoadError>;
 
 /// A model a load returns, as a framework serves it.
 pub enum Model {
@@ -926,6 +950,39 @@ pub trait Listed: Implements + for<'a> Load<&'a Checkpoint> + Sized + 'static {
 
     /// The type as a framework serves it, its calls attending tiled as `tiling` says.
     fn served(self, tiling: Tiling) -> Model;
+}
+
+/// A registered pipeline with checked component documents and a separately placed host tree.
+/// Its family keeps the concrete prepared type and places it on the caller's retained device.
+pub trait Pipeline: Implements + 'static {
+    /// The chip count required by this implementation.
+    const CHIPS: usize;
+
+    /// Checked component documents, read before any weight is loaded.
+    type Inputs;
+
+    /// Strictly loaded host weights, ready for placement by the family binding.
+    type Prepared;
+
+    /// Refuse a checkpoint part this pipeline does not read.
+    fn reads(part: Part) -> Result<(), LoadError>;
+
+    /// Refuse load choices the pipeline cannot serve, before reading component documents.
+    fn options(
+        chips: Option<usize>,
+        kv_cache: Option<Dtype>,
+        quantization: Option<Quantization>,
+        tiling: Tiling,
+    ) -> Result<(), LoadError>;
+
+    /// Read and validate the component documents without reading a weight.
+    fn inputs(source: &Checkpoint) -> Result<Self::Inputs, LoadError>;
+
+    /// Load strictly using those already checked documents, without rereading them.
+    fn prepare(source: &Checkpoint, inputs: Self::Inputs) -> Result<Self::Prepared, LoadError>;
+
+    /// Refuse a device placement before preparing any host weight or device allocation.
+    fn check_placement(placement: &Placement) -> Result<(), LoadError>;
 }
 
 /// A decoder reads a whole model and serves requests as an instance of the load's tiling.
@@ -958,7 +1015,75 @@ impl Implementation {
                 T::scope(source)
             },
             adapters: T::ADAPTERS,
-            load: |context, source, tiling| Ok(T::load(context, source)?.served(tiling)),
+            load: Loader::Model(|context, source, tiling| {
+                Ok(T::load(context, source)?.served(tiling))
+            }),
+        }
+    }
+
+    /// A pipeline implementation whose family owns its prepared type and placement.
+    pub const fn pipeline<P: Pipeline>() -> Self {
+        Self {
+            size: P::SIZE,
+            class: P::CLASS,
+            scope: |source| {
+                P::reads(source.part())?;
+                P::scope(source)
+            },
+            adapters: 0,
+            load: Loader::Pipeline {
+                chips: P::CHIPS,
+                check: |source| P::inputs(source).map(|_| ()),
+                options: P::options,
+                type_id: TypeId::of::<P>,
+            },
+        }
+    }
+
+    /// The chip count of this implementation; it is not a global parallelism choice.
+    pub fn chips(&self) -> usize {
+        match self.load {
+            Loader::Model(_) => 1,
+            Loader::Pipeline { chips, .. } => chips,
+        }
+    }
+
+    pub(crate) fn is_pipeline(&self) -> bool {
+        matches!(self.load, Loader::Pipeline { .. })
+    }
+
+    pub(crate) fn is_pipeline_type<P: Pipeline>(&self) -> bool {
+        match self.load {
+            Loader::Pipeline { type_id, .. } => type_id() == TypeId::of::<P>(),
+            Loader::Model(_) => false,
+        }
+    }
+
+    /// Validate a pipeline's component documents before any weight is read.
+    pub(crate) fn check(&self, source: &Checkpoint) -> Result<(), LoadError> {
+        match self.load {
+            Loader::Model(_) => Ok(()),
+            Loader::Pipeline { check, .. } => check(source),
+        }
+    }
+
+    /// Check the implementation's load choices before any component document or weight read.
+    pub(crate) fn options(
+        &self,
+        chips: Option<usize>,
+        kv_cache: Option<Dtype>,
+        quantization: Option<Quantization>,
+        tiling: Tiling,
+    ) -> Result<(), LoadError> {
+        match self.load {
+            Loader::Pipeline { options, .. } => options(chips, kv_cache, quantization, tiling),
+            Loader::Model(_) if chips.is_some_and(|chosen| chosen != self.chips()) => {
+                Err(LoadError::Unsupported {
+                    name: "chips".into(),
+                    reason: "every implementation runs on one chip".into(),
+                })
+            }
+            Loader::Model(_) => Ok(()),
         }
     }
 
@@ -1022,7 +1147,13 @@ impl Implementation {
         tiling: Tiling,
     ) -> Result<Model, LoadError> {
         let scope = (self.scope)(source)?;
-        context.field("", scope, |cx| (self.load)(cx, source, tiling))
+        match self.load {
+            Loader::Model(load) => context.field("", scope, |cx| load(cx, source, tiling)),
+            Loader::Pipeline { .. } => Err(LoadError::Unsupported {
+                name: "device".into(),
+                reason: "pipeline placement requires a retained SharedDevice; use LoadOptions::prepare_pipeline and the family's placement method".into(),
+            }),
+        }
     }
 
     /// The size, as the hub spells it.
@@ -1119,7 +1250,7 @@ mod tests {
     #[test]
     fn lists_every_name_once_by_its_kind() {
         let names: HashSet<_> = ARCHITECTURES.iter().map(|(name, _)| name).collect();
-        assert_eq!((names.len(), ARCHITECTURES.len()), (670, 670));
+        assert_eq!((names.len(), ARCHITECTURES.len()), (671, 671));
         for &(name, implementations) in ARCHITECTURES {
             match (implementations, Implementation::listed(&[name])) {
                 ([], Err(refusal @ LoadError::Unsupported { .. })) => {

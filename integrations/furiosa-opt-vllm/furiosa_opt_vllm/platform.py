@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, final
 
+import psutil
 import torch
 from pydantic import ValidationError
 from typing_extensions import override
@@ -58,6 +59,13 @@ class FuriosaPlatform(Platform):
     @override
     def get_device_name(cls, device_id: int = 0) -> str:
         return "rngd"
+
+    @classmethod
+    @override
+    def get_current_memory_usage(cls, device: torch.device | str | int | None = None) -> int:
+        # Framework tensors and streamed host sources use process memory. The engine accounts
+        # for its NPU allocations separately, on the context owning those chips.
+        return psutil.Process().memory_info().rss
 
     @override
     def uses_host_device_handling(self) -> bool:

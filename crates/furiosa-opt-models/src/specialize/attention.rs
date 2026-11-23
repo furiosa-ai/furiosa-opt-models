@@ -36,6 +36,15 @@ pub trait Decode {
     type Positions: AxisName;
 }
 
+/// The bidirectional flash kernel's mass channels and running-maximum update.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ConstParamTy)]
+pub enum Flash {
+    /// Sixteen mass channels and staged running-maximum updates.
+    Standard,
+    /// Eight mass channels and a single-pass running-maximum update.
+    SinglePass,
+}
+
 /// How a decode attends each row's history in the pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ConstParamTy)]
 pub enum Strategy {

@@ -14,6 +14,7 @@ use crate::specialize::index::{
 };
 use crate::tensor::form::Weight;
 use crate::tensor::mapping::{self, Clusters, Packets, Rows as Layout};
+use crate::tensor::memory::residency::Residency;
 use crate::tensor::parallel::Chip;
 use crate::tensor::{
     axis::{self, Lanes},
@@ -31,8 +32,9 @@ use std::marker::PhantomData;
 pub type Ids<Rows, Chips = Chip> = HbmTensor<i32, Chips, Packets<Rows>>;
 
 /// Look up token features by a row byte offset or by token IDs.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
 #[load(tree)]
+#[residency(children(Parameter))]
 pub struct Embedding<
     Vocabulary: AxisName,
     Hidden: AxisName,

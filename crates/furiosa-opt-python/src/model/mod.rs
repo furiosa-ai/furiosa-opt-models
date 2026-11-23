@@ -26,6 +26,7 @@ use std::path::PathBuf;
 use std::sync::PoisonError;
 
 mod llama;
+pub(super) mod minimax_h3;
 mod mistral;
 mod qwen3;
 
@@ -45,6 +46,15 @@ type Family = (
 
 /// A decoder as an object of one class.
 type Constructor = fn(Decoder, Python<'_>) -> PyResult<Py<Decoder>>;
+
+/// A pipeline's class and its family's typed preparation and placement constructor.
+const PIPELINES: &[(Class, PipelineConstructor)] = &[(
+    engine::diffusion::minimax_h3::Pipeline::CLASS,
+    minimax_h3::load,
+)];
+
+type PipelineConstructor =
+    fn(Python<'_>, &engine::LoadOptions, &engine::Checkpoint, &Device) -> Result<Py<PyAny>, Error>;
 
 /// The tensors of a checkpoint directory, mapped or read into host memory, and the config of its
 /// model.
@@ -200,7 +210,7 @@ impl LoadOptions {
     ///     ValueError: As `parse` does, or a tensor is missing, unexpected or malformed.
     ///     NotImplementedError: As `parse` does, or no class holds the model yet.
     ///     RuntimeError: The device fails.
-    #[gen_stub(override_return_type(type_repr = "Decoder | Encoder"))]
+    #[gen_stub(override_return_type(type_repr = "Decoder | Encoder | minimax_h3.Pipeline"))]
     fn load(
         &self,
         py: Python<'_>,
@@ -208,6 +218,16 @@ impl LoadOptions {
         device: &Device,
     ) -> Result<Py<PyAny>, Error> {
         let config = self.0.parse(&checkpoint.0)?;
+        if config.is_pipeline() {
+            let (_, constructor) = PIPELINES
+                .iter()
+                .find(|(class, _)| *class == config.class())
+                .ok_or_else(|| LoadError::Unsupported {
+                    name: config.architecture().into(),
+                    reason: "no Python class holds the pipeline yet".into(),
+                })?;
+            return constructor(py, &self.0, &checkpoint.0, device);
+        }
         // A decoder's class is its model type's, found before a weight is read.
         let unbound = || LoadError::Unsupported {
             name: config.architecture().into(),
@@ -436,14 +456,17 @@ mod tests {
     use furiosa_opt_engine::registry::{ARCHITECTURES, Implementation};
     use pyo3::types::PyDict;
 
-    /// Every implementation the registry lists loads as a class: a decoder as the class its
-    /// family's submodule lists under its name, a media encoder as `Encoder`.
+    /// Every implementation loads as a class: its family's decoder or pipeline, or `Encoder`.
     #[test]
     fn binds_a_class_to_every_listed_implementation() {
         let unbound: Vec<_> = (ARCHITECTURES.iter())
             .flat_map(|&(_, implementations)| implementations)
             .map(Implementation::class)
-            .filter(|class| class.name != "Encoder" && Decoder::class(*class).is_none())
+            .filter(|class| {
+                class.name != "Encoder"
+                    && Decoder::class(*class).is_none()
+                    && !PIPELINES.iter().any(|(bound, _)| bound == class)
+            })
             .collect();
         assert!(unbound.is_empty(), "{unbound:?}");
     }

@@ -8,8 +8,9 @@
 //!   checkpoint.
 //! - A load reads the whole model, or its media encoder alone, which the registry lists as an
 //!   implementation of its own.
-//! - Every implementation runs on one chip, caches keys and values in BF16 and loads whole; any
-//!   other choice is unsupported until the registry holds an implementation that makes it.
+//! - The registry chooses the implementation's chip count. Decoders use BF16 KV caches;
+//!   pipelines prepare host weights before shared-device placement and have no KV cache. Both
+//!   load whole.
 //! - A batch-invariant load asks every implementation's calls to tile their attention fixed, which
 //!   they serve as an `Instance` of their decoder.
 //! - A quantization reads the checkpoint quantized, so an implementation whose projections a load
@@ -22,11 +23,11 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::str::FromStr;
 
-use crate::registry::{Implementation, Model};
+use crate::registry::{Implementation, Model, Pipeline};
 use furiosa_opt_models::load::{Checkpoint, Context, LoadError, Part};
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
 use furiosa_opt_models::tensor::form::fp8::Granularity;
-use furiosa_opt_std::prelude::Device;
+use furiosa_opt_std::prelude::{Device, Placement};
 use safetensors::Dtype;
 use serde_json::Value;
 
@@ -150,7 +151,11 @@ impl LoadOptions {
     /// The implementation `checkpoint` loads as with these choices, from its config and its names
     /// alone: no weight is read and no device is needed.
     pub fn parse(&self, checkpoint: &Checkpoint) -> Result<Config, LoadError> {
-        self.read(checkpoint, |checkpoint| self.select(checkpoint))
+        self.read(checkpoint, |checkpoint| {
+            let config = self.configure(checkpoint)?;
+            config.implementation.check(checkpoint)?;
+            Ok(config)
+        })
     }
 
     /// The implementation `checkpoint` loads as with these choices, loaded strictly into HBM of
@@ -164,8 +169,30 @@ impl LoadOptions {
                 implementation,
                 tiling,
                 ..
-            } = self.select(checkpoint)?;
+            } = self.configure(checkpoint)?;
+            implementation.check(checkpoint)?;
             implementation.load(&mut Context::new(device), checkpoint, tiling)
+        })
+    }
+
+    /// Prepare the selected pipeline's strict host weights after checking its exact registered
+    /// type and placement, before reading component documents or weights. Its family places the
+    /// concrete prepared tree on the caller's retained device outside its context lock.
+    pub fn prepare_pipeline<P: Pipeline>(
+        &self,
+        checkpoint: &Checkpoint,
+        placement: &Placement,
+    ) -> Result<P::Prepared, LoadError> {
+        self.read(checkpoint, |checkpoint| {
+            let config = self.configure(checkpoint)?;
+            if !config.implementation.is_pipeline_type::<P>() {
+                return Err(LoadError::Unsupported {
+                    name: "pipeline".into(),
+                    reason: "the selected implementation is not this pipeline type".into(),
+                });
+            }
+            P::check_placement(placement)?;
+            P::prepare(checkpoint, P::inputs(checkpoint)?)
         })
     }
 
@@ -187,7 +214,7 @@ impl LoadOptions {
     }
 
     /// The implementation the load of `checkpoint`, as it reads it, selects.
-    fn select(&self, checkpoint: &Checkpoint) -> Result<Config, LoadError> {
+    fn configure(&self, checkpoint: &Checkpoint) -> Result<Config, LoadError> {
         let config = checkpoint.config();
         let names: Vec<&str> = match self.architecture {
             Some(name) => vec![name],
@@ -208,12 +235,13 @@ impl LoadOptions {
             name: name.into(),
             reason: reason.into(),
         };
-        if self.chips.is_some_and(|chips| chips.get() != 1) {
-            return Err(unsupported(
-                "chips",
-                "every implementation runs on one chip",
-            ));
-        }
+        let chips = implementation.chips();
+        implementation.options(
+            self.chips.map(NonZeroUsize::get),
+            self.kv_cache,
+            self.quantization,
+            self.tiling,
+        )?;
         if self.kv_cache.is_some_and(|dtype| dtype != Dtype::BF16) {
             return Err(unsupported(
                 "kv_cache",
@@ -255,7 +283,7 @@ impl LoadOptions {
                 _ => Dtype::F8_E4M3,
             },
             kv_cache: Dtype::BF16,
-            chips: 1,
+            chips,
             tiling: self.tiling,
         })
     }
@@ -287,13 +315,18 @@ impl Config {
         self.precision
     }
 
-    /// The form its KV cache stores keys and values in.
+    /// The decoder's KV cache form. Pipelines (`is_pipeline()`) have no KV cache.
     pub fn kv_cache(&self) -> Dtype {
         self.kv_cache
     }
 
     pub fn chips(&self) -> usize {
         self.chips
+    }
+
+    /// Whether placement returns a pipeline retaining the original shared device context.
+    pub fn is_pipeline(&self) -> bool {
+        self.implementation.is_pipeline()
     }
 
     /// How the implementation's calls tile each row's attention.
@@ -366,5 +399,77 @@ mod tests {
         ] {
             assert_eq!(refusal(config), (kind, name.to_owned()));
         }
+    }
+
+    /// An unregistered type cannot prepare a selected pipeline by copying its class and size.
+    #[test]
+    fn refuses_a_different_pipeline_type_before_documents_and_weights() {
+        use crate::diffusion::minimax_h3;
+        use crate::registry::Pipeline;
+        use furiosa_opt_models::load::Part;
+        use furiosa_opt_models::models::{Class, Implements};
+        use furiosa_opt_models::ops::attention::full::paged::Tiling;
+        use furiosa_opt_std::prelude::Placement;
+        use safetensors::Dtype;
+
+        struct OtherPipeline;
+
+        impl Implements for OtherPipeline {
+            const SIZE: &'static str = <minimax_h3::Pipeline as Implements>::SIZE;
+            const CLASS: Class = minimax_h3::Pipeline::CLASS;
+
+            fn scope(_: &Checkpoint) -> Result<&'static str, LoadError> {
+                panic!("an unregistered pipeline must not be selected")
+            }
+        }
+
+        impl Pipeline for OtherPipeline {
+            const CHIPS: usize = minimax_h3::Pipeline::CHIPS;
+            type Inputs = ();
+            type Prepared = ();
+
+            fn reads(_: Part) -> Result<(), LoadError> {
+                panic!("an unregistered pipeline must not be selected")
+            }
+
+            fn options(
+                _: Option<usize>,
+                _: Option<Dtype>,
+                _: Option<crate::Quantization>,
+                _: Tiling,
+            ) -> Result<(), LoadError> {
+                panic!("an unregistered pipeline must not be selected")
+            }
+
+            fn inputs(_: &Checkpoint) -> Result<(), LoadError> {
+                panic!("type refusal must precede component documents")
+            }
+
+            fn prepare(_: &Checkpoint, _: ()) -> Result<(), LoadError> {
+                panic!("type refusal must precede weight preparation")
+            }
+
+            fn check_placement(_: &Placement) -> Result<(), LoadError> {
+                panic!("type refusal must precede placement checking")
+            }
+        }
+
+        let empty = tempfile::tempdir().unwrap();
+        let checkpoint = Checkpoint::new(
+            empty.path(),
+            Some(json!({"_class_name": "MiniMaxH3Pipeline"})),
+        )
+        .unwrap();
+        let placement = Placement {
+            chips: vec![4, 5, 6, 7],
+            pes: 0..8,
+        };
+        let refused = LoadOptions::new().prepare_pipeline::<OtherPipeline>(&checkpoint, &placement);
+        assert!(
+            matches!(&refused, Err(LoadError::Unsupported { name, reason })
+                if name == "pipeline"
+                    && reason == "the selected implementation is not this pipeline type"),
+            "{refused:?}"
+        );
     }
 }

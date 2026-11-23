@@ -28,6 +28,7 @@ use crate::Module;
 use crate::modules::generic::schedule::{Begin, IntoStream, Slot, Stream};
 
 use crate::tensor::live::Live;
+use crate::tensor::memory::residency::Residency;
 
 use core::task::Poll;
 
@@ -111,7 +112,8 @@ pub struct Context<Positions, Write, Read> {
 
 /// Projects the same input independently into query, key and value rows; each reads under the
 /// name its family gives it.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(Query, Key, Value))]
 pub struct Projection<Query, Key = Query, Value = Key> {
     #[load(rename = "")]
     pub query: Query,
@@ -146,7 +148,8 @@ where
 }
 
 /// Projects QKV, normalizes Q and K independently and leaves V unchanged.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(Projection, QueryNorm, KeyNorm))]
 pub struct NormalizedQkv<Projection, QueryNorm, KeyNorm> {
     #[load(rename = "")]
     pub projection: Projection,
@@ -196,6 +199,52 @@ where
             .forward(&mut *device, env, query_norm, &query);
         let key = self.key_norm.forward(device, env, key_norm, &key);
         (query, key, value)
+    }
+}
+
+/// Lift a [`NormalizedQkv`] composition over the shared live interval returned by its projection.
+/// The existing projection, gain loading, residency tree and three child state slots are reused.
+/// Both normalization children must preserve their input interval. Their tile-padding contracts
+/// still apply; this wrapper neither initializes nor exposes the allocation tail.
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(M))]
+pub struct LiveNormalizedQkv<M>(
+    #[load(rename = "")]
+    #[residency(transparent)]
+    pub M,
+);
+
+impl<'s, X, Q, K, V, NQ, NK, PS, QS, KS, P, QN, KN, Env: Copy, R: AxisName>
+    Module<&X, Env, &'s mut (PS, QS, KS)> for LiveNormalizedQkv<NormalizedQkv<P, QN, KN>>
+where
+    P: for<'x> Module<&'x X, Env, &'s mut PS, Output = Live<(Q, K, V), R>>,
+    QN: for<'x> Module<Live<&'x Q, R>, Env, &'s mut QS, Output = Live<NQ, R>>,
+    KN: for<'x> Module<Live<&'x K, R>, Env, &'s mut KS, Output = Live<NK, R>>,
+{
+    type Output = Live<(NQ, NK, V), R>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        env: Env,
+        (projection, query_norm, key_norm): &'s mut (PS, QS, KS),
+        input: &X,
+    ) -> Self::Output {
+        let projected = self
+            .0
+            .projection
+            .forward(&mut *device, env, projection, input);
+        let interval = projected.with(());
+        let (query, key, value) = projected.into_value();
+        let query = self
+            .0
+            .query_norm
+            .forward(&mut *device, env, query_norm, interval.with(&query));
+        let key = self
+            .0
+            .key_norm
+            .forward(device, env, key_norm, interval.with(&key));
+        interval.with((query.into_value(), key.into_value(), value))
     }
 }
 
@@ -493,7 +542,8 @@ where
 }
 
 /// Projects Q/K/V, stores them in the cache, attends over the history and projects the result.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(Qkv, Cache, Attend, Project))]
 pub struct Attention<Qkv, Cache, Attend, Project> {
     #[load(rename = "")]
     pub qkv: Qkv,

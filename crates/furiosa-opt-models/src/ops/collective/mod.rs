@@ -13,9 +13,10 @@ use crate::{
     },
 };
 use furiosa_opt_std::prelude::*;
-pub use gather::{AllGather, Pieces};
+pub use gather::{AllGather, InTiles, Pieces, Tile as GatherTile, TileRows, Tiled, Whole};
 
 mod gather;
+pub mod prefix;
 
 /// Sum chip-local vectors in a fixed pairwise f32 order and replicate the result on every chip.
 #[derive(DeviceSend)]
@@ -343,10 +344,31 @@ impl<'x, D: MaterializableScalar, S: AxisName, W: AxisName, const N: usize>
     }
 }
 
+impl<const N: usize> Exchange<Parallel<N>> {
+    /// Exchange one whole, statically described set of parts into caller-owned storage.
+    /// Views can name compact root windows inside larger allocations. Their row stride must
+    /// describe the actual parts; cropping a capacity-strided tensor does not compact its rows.
+    pub fn write<D: MaterializableScalar, S: AxisName, W: AxisName>(
+        &self,
+        device: &mut Device,
+        input: RowsView<'_, D, N, Pieces<S, N>, Part<W, N>>,
+        output: HbmTensorViewMut<'_, D, ChipMap<N>, m![S, W]>,
+    ) {
+        type L<W, const N: usize> = Symbol<Part<W, N>>;
+        // SAFETY: the rows are the parts in chip order, each its rows in order.
+        let rows = unsafe { input.reshape::<ChipMap<N>, m![{ O<N> }, S, { L<W, N> }]>() };
+        // SAFETY: chip `t` holds part `t` of the rows, its columns the parts in chip order.
+        let target =
+            unsafe { output.reshape::<m![{ O<N> }], m![S, { Symbol<Shard<N>> }, { L<W, N> }]>() };
+        rows.to_hbm_view(&mut device.tdma, target);
+    }
+}
+
 axes![Two = 2];
 
 type ChipMap<const N: usize> = m![{ Symbol<Shard<N>> }];
 type Rows<D, const N: usize, R, W> = HbmTensor<D, ChipMap<N>, m![R, W]>;
+type RowsView<'a, D, const N: usize, R, W> = HbmTensorView<'a, D, ChipMap<N>, m![R, W]>;
 type ReductionSlices<W> = m![W % 1024 / 128, W % 128 / 4];
 type Local<D, Chips, W> = DmTensor<D, Chips, m![1 # 2], ReductionSlices<W>, m![W / 1024, W % 4]>;
 /// A chip's rows in the sum's layout: each slice one part of every row.
@@ -442,11 +464,12 @@ impl OutputScalar for bf16 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::tensor::{axis, scalar::Value};
     use crate::tests::DEVICE;
-    use furiosa_opt_std::runtime::launch;
+    use furiosa_opt_std::runtime::{HbmBuffer, launch};
     use std::iter;
 
-    axes![Hidden = 5120, Attended = 7168];
+    axes![Hidden = 5120, Attended = 7168, Width = 7168, Narrow = 512];
 
     #[derive(Clone, Debug)]
     pub(crate) struct Part4<const ROWS: usize>;
@@ -459,6 +482,13 @@ pub(crate) mod tests {
     /// A chip's part of the rows.
     pub(crate) type Small = Part4<1024>;
     type Local = Part<Attended, 4>;
+
+    pub(super) type Chips = m![{ Symbol<Shard<4>> }];
+    pub(super) type Input<C, W> =
+        HbmTensor<bf16, Chips, m![{ Symbol<Pieces<C, 4>> }, { Symbol<Part<W, 4>> }]>;
+    pub(super) type Output<C, W> = HbmTensor<bf16, Chips, m![C, W]>;
+    type SourceRoots<A, B, E, W> = (Input<A, W>, Input<B, W>, Input<E, W>);
+    type DestinationRoots<A, B, E, W> = (Output<A, W>, Output<B, W>, Output<E, W>);
 
     /// Element `(row, column)` of the rows of every chip: a value each neighbor differs in.
     pub(crate) fn value(row: usize, column: usize) -> bf16 {
@@ -585,5 +615,187 @@ pub(crate) mod tests {
                 assert_eq!(*got, value(row, column), "chip {chip} element {at}");
             }
         }
+    }
+
+    #[device(chip = 4)]
+    fn root_windows<C: AxisName, W: AxisName, A: AxisName, B: AxisName, E: AxisName>(
+        device: &mut Device,
+        input: &SourceRoots<A, B, E, W>,
+        output: &mut DestinationRoots<A, B, E, W>,
+        rows: &Value<Chips>,
+        _capacity: &std::marker::PhantomData<C>,
+    ) {
+        let rows = rows.extent::<m![C]>();
+        let exchange = Exchange::<Parallel<4>>::default();
+        if rows == A::SIZE {
+            exchange.write(device, input.0.view(), output.0.view_mut());
+        } else if rows == B::SIZE {
+            exchange.write(device, input.1.view(), output.1.view_mut());
+        } else {
+            exchange.write(device, input.2.view(), output.2.view_mut());
+        }
+    }
+
+    fn coefficient(index: usize) -> bf16 {
+        bf16::from_bits(0x3f00 | ((index * 131 + index / 17) % 1024) as u16)
+    }
+
+    pub(super) async fn buffers<C: AxisName, W: AxisName>(
+        device: &mut Device,
+        work: usize,
+    ) -> (Input<C, W>, Output<C, W>) {
+        let local_width = W::SIZE / 4;
+        let input_per_chip = 4 * C::SIZE * local_width;
+        let output_per_chip = C::SIZE * W::SIZE;
+        let poison = bf16::from_bits(0x7fc1);
+        let input: Input<C, W> = HostTensor::<
+            bf16,
+            m![{ Chips }, { Symbol<Pieces<C, 4>> }, { Symbol<Part<W, 4>> }],
+        >::from_vec((0..4 * input_per_chip).map(|index| {
+            if index % input_per_chip < 4 * work * local_width {
+                coefficient(index)
+            } else {
+                poison
+            }
+        }))
+        .to_hbm::<Chips, m![{ Symbol<Pieces<C, 4>> }, { Symbol<Part<W, 4>> }]>(&mut device.pdma)
+        .await
+        .unwrap();
+        let mut output: Output<C, W> = HbmBuffer::alloc_shared(device, output_per_chip * 2)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        HostTensor::<bf16, m![{ Chips }, C, W]>::from_vec(std::iter::repeat_n(
+            poison,
+            4 * output_per_chip,
+        ))
+        .to_hbm(&mut device.pdma)
+        .output(&mut output)
+        .await
+        .unwrap();
+        (input, output)
+    }
+
+    pub(super) async fn assert_output<C: AxisName, W: AxisName>(
+        device: &mut Device,
+        output: &Output<C, W>,
+        work: usize,
+    ) {
+        let local_width = W::SIZE / 4;
+        let input_per_chip = 4 * C::SIZE * local_width;
+        let output_per_chip = C::SIZE * W::SIZE;
+        let poison = bf16::from_bits(0x7fc1);
+        let result = output
+            .to_host::<m![{ Chips }, C, W]>(&mut device.pdma)
+            .await
+            .unwrap()
+            .into_vec();
+        for (index, actual) in result.into_iter().enumerate() {
+            let chip = index / output_per_chip;
+            let row = index / W::SIZE % C::SIZE;
+            let column = index % W::SIZE;
+            let expected = if row < work {
+                let source_chip = column / local_width;
+                let source_row = chip * work + row;
+                coefficient(
+                    source_chip * input_per_chip + source_row * local_width + column % local_width,
+                )
+            } else {
+                poison
+            };
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "work {work}, chip {chip}, row {row}, column {column}"
+            );
+        }
+    }
+
+    async fn check_root_windows<C: AxisName, W: AxisName, A: AxisName, B: AxisName, E: AxisName>() {
+        let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
+        let geometry = std::marker::PhantomData::<C>;
+        let local_width = W::SIZE / 4;
+        for work in [A::SIZE, E::SIZE, B::SIZE, A::SIZE] {
+            let (input, output) = buffers::<C, W>(&mut device, work).await;
+            let rows: Value<Chips> = HostTensor::<i32, m![1]>::from_vec([work as i32])
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+            let input = input.into_buffer();
+            let output = output.into_buffer();
+            // SAFETY: root_windows reaches the destination through exactly one geometry in
+            // each launch. No full-capacity destination argument or concurrent writer is bound.
+            unsafe { output.partition() };
+            // Prepare alternative root windows on the host. Aliases share their backing allocation;
+            // only the selected geometry writes during a launch. Retain every owner through completion.
+            let inputs: SourceRoots<A, B, E, W> = (
+                input
+                    .alias(..4 * A::SIZE * local_width * 2)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                input
+                    .alias(..4 * B::SIZE * local_width * 2)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                input
+                    .alias(..4 * E::SIZE * local_width * 2)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            );
+            let mut outputs: DestinationRoots<A, B, E, W> = (
+                output
+                    .alias(..A::SIZE * W::SIZE * 2)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                output
+                    .alias(..B::SIZE * W::SIZE * 2)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                output
+                    .alias(..E::SIZE * W::SIZE * 2)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            );
+
+            // Reuse the same destination across completed writes, then check rows and tail.
+            for _ in 0..2 {
+                launch(
+                    root_windows,
+                    (&mut device, &inputs, &mut outputs, &rows, &geometry),
+                )
+                .await
+                .unwrap();
+            }
+            let output: Output<C, W> = output.try_into().unwrap();
+            assert_output(&mut device, &output, work).await;
+        }
+    }
+
+    /// Root windows must describe compact parts rather than retain capacity-strided coordinates.
+    #[tokio::test(flavor = "current_thread")]
+    async fn compact_whole_exchange_preserves_prefix_and_capacity_tail() {
+        let _lease = crate::tests::DEVICE.lock().await;
+        check_root_windows::<
+            axis::Rows<1280>,
+            Narrow,
+            axis::Rows<256>,
+            axis::Rows<768>,
+            axis::Rows<1280>,
+        >()
+        .await;
+        check_root_windows::<
+            axis::Rows<10496>,
+            Width,
+            axis::Rows<9472>,
+            axis::Rows<9728>,
+            axis::Rows<9984>,
+        >()
+        .await;
     }
 }

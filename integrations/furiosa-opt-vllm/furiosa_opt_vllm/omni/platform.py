@@ -1,4 +1,4 @@
-"""vLLM-Omni platform that hands diffusion pipelines to the engine, which refuses each one."""
+"""vLLM-Omni platform with host framework tensors and model calls through the engine."""
 
 from typing import final
 
@@ -7,6 +7,8 @@ import torch
 from typing_extensions import override
 from vllm.platforms.cpu import CpuPlatform
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
+
+from furiosa_opt_vllm.platform import FuriosaPlatform
 
 
 @final
@@ -36,7 +38,7 @@ class Platform(OmniPlatform, CpuPlatform):
     @classmethod
     @override
     def get_current_memory_usage(cls, device: torch.device | str | int | None = None) -> int:
-        return psutil.Process().memory_info().rss
+        return FuriosaPlatform.get_current_memory_usage(device)
 
     @classmethod
     @override

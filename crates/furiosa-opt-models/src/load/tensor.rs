@@ -51,9 +51,25 @@ impl Checkpoint {
         }
     }
 
-    /// The host value, laid out as `E`, of the leaf of element mapping `S` at the context's
-    /// position: the tensor at its name, or the value of its config key in every element.
-    pub(crate) fn host<D: MaterializableScalar, S: M, E: M>(
+    /// Prepare an owned host value for a storage backend, without accessing a device.
+    ///
+    /// Reads the tensor at `context`'s current checkpoint name, or its config value, checking
+    /// its shape against element mapping `S` and dtype against `D`. F32, BF16 and F16 convert
+    /// among one another; other dtypes must match exactly. The result follows host mapping `E`,
+    /// with zero-filled padding. `E` must cover every stored axis in full. Use `E = S` for one
+    /// replicated copy, or `E = m![{ C }, { S }]` for chip shares when [`Self::splits`] is true
+    /// for `C` and `S`.
+    ///
+    /// The read participates in `context`'s name accounting. The caller supplies the outer
+    /// [`Context::checkpoint`] traversal for strict unused-name checks and [`Context::leaf`]
+    /// for tied-leaf comparison and sharing; this method performs neither scope itself.
+    /// The returned bytes can be retained after the checkpoint is dropped. They are not
+    /// guaranteed to be page-locked.
+    ///
+    /// # Panics
+    ///
+    /// Panics when reading a tensor from a declared checkpoint that contains headers only.
+    pub fn host<D: MaterializableScalar, S: M, E: M>(
         &self,
         context: &mut Context<'_>,
     ) -> Result<HostTensor<D, E>, LoadError> {
@@ -216,9 +232,13 @@ impl Checkpoint {
         }
     }
 
-    /// Whether the chips of `C` split an axis a leaf of element mapping `S` stores, a share a chip;
-    /// chips naming none of its axes each hold every value.
-    pub(super) fn splits<C: M, S: M>() -> bool {
+    /// Whether chip mapping `C` names an axis stored by element mapping `S`.
+    ///
+    /// When true, prepare each chip's share with [`Self::host`] using host mapping
+    /// `m![{ C }, { S }]`. Otherwise prepare one replicated copy using `S`. This is a layout
+    /// classification, not validation: `host` checks that its host mapping covers every stored
+    /// axis in full. No device or checkpoint values are accessed here.
+    pub fn splits<C: M, S: M>() -> bool {
         let chips = C::to_value().idents();
         Self::stored(&S::to_value())
             .iter()
@@ -260,6 +280,71 @@ mod tests {
     use furiosa_opt_std::prelude::*;
 
     axes![O = 2, I = 4];
+
+    /// A backend can retain converted, padded chip images without a device or the checkpoint.
+    #[test]
+    fn host_preparation_retains_chip_layout_and_padding() {
+        use crate::tensor::parallel::Shard;
+
+        let values = [0.1_f32, -1.25, 2.5, 3.75, -4.125, 5.5, 6.25, -7.0];
+        let mut source = Checkpoint::default();
+        source
+            .insert(
+                "weight",
+                Dtype::F32,
+                &[2, 4],
+                values.into_iter().flat_map(f32::to_le_bytes).collect(),
+            )
+            .unwrap();
+        type Replicated = m![O, I, 1 # 2];
+        type Sharded = m![O, I % 2, 1 # 2];
+        assert!(!Checkpoint::splits::<m![{ Symbol<Shard<2>> }], Replicated>());
+        assert!(Checkpoint::splits::<m![I / 2], Sharded>());
+        let mut context = Context::new(None);
+        let (replicated, sharded) = context
+            .checkpoint(&source, |cx| {
+                cx.field("weight", "weight", |cx| {
+                    Ok((
+                        source.host::<bf16, Replicated, Replicated>(cx)?,
+                        source.host::<bf16, Sharded, m![I / 2, { Sharded }]>(cx)?,
+                    ))
+                })
+            })
+            .unwrap();
+        drop(source);
+        let padded = |order: &[usize]| {
+            order
+                .iter()
+                .flat_map(|&i| [bf16::from_f32(values[i]), bf16::from_f32(0.0)])
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(replicated.into_vec(), padded(&[0, 1, 2, 3, 4, 5, 6, 7]));
+        assert_eq!(sharded.into_vec(), padded(&[0, 1, 4, 5, 2, 3, 6, 7]));
+    }
+
+    /// Host preparation records scoped reads but leaves strict traversal to its caller.
+    #[test]
+    fn host_preparation_accounts_for_scoped_names() {
+        let mut source = Checkpoint::default();
+        for name in ["model.weight", "model.unused"] {
+            source
+                .insert(name, Dtype::F32, &[2, 4], vec![0; 32])
+                .unwrap();
+        }
+        let mut context = Context::new(None);
+        let result = context.checkpoint(&source, |cx| {
+            cx.field("model", "model", |cx| {
+                cx.field("weight", "weight", |cx| {
+                    source.host::<f32, m![O, I], m![O, I]>(cx)
+                })
+            })
+        });
+        assert!(matches!(result, Err(LoadError::Unexpected(names)) if names == ["model.unused"]));
+        let result = context.field("missing", "model.missing", |cx| {
+            source.host::<f32, m![O, I], m![O, I]>(cx)
+        });
+        assert!(matches!(result, Err(LoadError::Missing(names)) if names == ["model.missing"]));
+    }
 
     /// A chip mapping splitting an axis gives each chip its share of the whole stored tensor; a
     /// leaf holding part of an axis on every chip is refused.

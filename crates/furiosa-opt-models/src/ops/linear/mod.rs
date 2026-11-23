@@ -4,7 +4,7 @@ pub use affine::{Affine, Bias, output, query};
 pub(crate) use affine::{Coefficients, Inputs, Outputs};
 pub(crate) use decode::Matrix;
 pub use experts::Experts;
-pub(crate) use rows::Projection;
+pub(crate) use rows::{LiveProjection, Projection};
 
 use core::borrow::Borrow;
 use core::marker::PhantomData;
@@ -17,12 +17,14 @@ use crate::ops::normalization::Spread;
 use crate::tensor::form::Weight;
 use crate::tensor::form::{Part, Projections};
 use crate::tensor::mapping;
+use crate::tensor::memory::residency::Residency;
 use crate::tensor::{axis::Lanes, live::Live};
 
 pub mod affine;
 mod decode;
 pub(crate) mod experts;
 pub(crate) mod fp8;
+mod grouped;
 pub(crate) mod kernel;
 pub mod modulation;
 pub mod nvfp4;
@@ -32,9 +34,10 @@ pub(crate) mod rows;
 pub(crate) mod split;
 pub(crate) mod stream;
 
-/// Multiply BF16 input rows by a retained [Out, In] weight matrix transposed: its checkpoint's
-/// `weight`, held as `T`, the HBM tensor or a borrow of it in a borrowed tree.
-#[derive(DeviceSend, Load)]
+/// Multiply BF16 input rows by retained [Out, In] coefficients transposed: its checkpoint's
+/// `weight`, held as `T`, a weight form or the ordinary HBM tensor, owned or borrowed.
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(T))]
 pub struct Linear<
     In: AxisName,
     Out: AxisName,
@@ -47,7 +50,7 @@ pub struct Linear<
 }
 
 impl<In: AxisName, Out: AxisName, Chips: M, T> Linear<In, Out, Chips, T> {
-    /// Retain the BF16 [Out, In] matrix, owned or borrowed, without copying it.
+    /// Retain the BF16 [Out, In] coefficients in their storage form without copying them.
     pub fn new(weight: Weight<m![Out, In], Chips, T>) -> Self {
         Self {
             affine: Affine::new(weight.into_tensor(), ()),
@@ -294,7 +297,8 @@ where
 
 /// A biased projection whose output rows come out head-major, each head's `H` features in order,
 /// from its checkpoint's `weight` and `bias` held as `W` and `B`, owned or borrowed.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(W, B))]
 pub struct PerHead<
     In: AxisName,
     Out: AxisName,

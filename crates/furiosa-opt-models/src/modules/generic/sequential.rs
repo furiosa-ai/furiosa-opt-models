@@ -3,10 +3,12 @@
 use super::schedule::{IntoStream, Stream};
 use crate::Module;
 use crate::load::Load;
+use crate::tensor::memory::residency::Residency;
 use furiosa_opt_std::prelude::{Device, DeviceSend};
 
 /// Applies A, then passes its output by value to B.
-#[derive(Clone, Copy, DeviceSend, Load)]
+#[derive(Clone, Copy, DeviceSend, Load, Residency)]
+#[residency(children(A, B))]
 pub struct Sequential<A, B>(pub A, pub B);
 
 // --8<-- [start:sequential]
@@ -65,7 +67,8 @@ where
 }
 
 /// Applies A, then lends its output to B without transferring ownership.
-#[derive(Clone, DeviceSend, Load)]
+#[derive(Clone, DeviceSend, Load, Residency)]
+#[residency(children(A, B))]
 pub struct Then<A, B>(pub A, pub B);
 
 impl<A, B> Then<A, B> {

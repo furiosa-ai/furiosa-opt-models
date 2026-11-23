@@ -1,0 +1,341 @@
+//! Prepared host weights and their reusable, bounded page-locked transfer images.
+//!
+//! The loader has already converted values and laid them out for the target tensor. A source
+//! retains one replicated image or every chip's part in chip order; pinning changes neither.
+
+use furiosa_opt_models::load::LoadError;
+use furiosa_opt_std::prelude::*;
+use std::{io, ops::Range};
+
+/// Chip images are split into pieces of at most 1 GiB, retaining each piece's byte offset.
+/// A replicated image's pieces are reused on every destination chip.
+const PIECE: usize = 1 << 30;
+
+/// A prepared tensor's bytes, retained until a pinned image replaces them or the owner drops.
+/// Always owns the complete prepared payload; layout-only or empty placeholders are not sources.
+pub(super) struct Source {
+    bytes: HostBuffer,
+    len: usize,
+    shards: Option<usize>,
+}
+
+impl Source {
+    /// Retain a host result already laid out as one target chip's elements or all chips' parts.
+    /// Equal byte lengths alone do not establish compatible layouts.
+    pub(super) fn from_host<D: MaterializableScalar, C: M, S: M, E: M>(
+        host: HostTensor<D, E>,
+        name: &str,
+    ) -> Result<Self, LoadError> {
+        let unsupported = |reason: &str| LoadError::Unsupported {
+            name: name.into(),
+            reason: reason.into(),
+        };
+        if C::SIZE == 0 {
+            return Err(unsupported("a resident tensor requires at least one chip"));
+        }
+        let layout = E::to_value().normalize();
+        let shards = if layout == S::to_value().normalize() {
+            None
+        } else if layout == <m![{ C }, { S }]>::to_value().normalize() {
+            Some(C::SIZE)
+        } else {
+            return Err(unsupported(
+                "resident host weights must be prepared in element order or chip-major order",
+            ));
+        };
+        let total = HbmTensor::<D, C, S>::size();
+        let len = total / C::SIZE;
+        let mut bytes = host.into_buffer();
+        if len == 0 || !total.is_multiple_of(C::SIZE) || bytes.len() != len * shards.unwrap_or(1) {
+            return Err(unsupported(
+                "resident host weights must hold a nonempty whole byte image per chip",
+            ));
+        }
+        // Converted host trees may spell a replicated weight as identical chip-major images.
+        // Retaining all of those copies multiplies a large pipeline's host memory by its chip
+        // count. Compare actual bytes, so real tensor-parallel shards retain their own images.
+        // Keep explicitly pinned input storage as supplied, including its placement policy.
+        let shards = if shards.is_some_and(|count| count > 1)
+            && !bytes.is_pinned()
+            && bytes
+                .chunks_exact(len)
+                .skip(1)
+                .all(|part| part == &bytes[..len])
+        {
+            bytes = HostBuffer::from_vec(bytes[..len].to_vec());
+            None
+        } else {
+            shards
+        };
+        Ok(Self { bytes, len, shards })
+    }
+
+    /// Bytes of one chip's copy.
+    pub(super) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Page-lock every chip's prepared bytes once, using the calling thread's NUMA policy.
+    /// The caller replaces its source only after every piece has been prepared successfully.
+    pub(super) fn pin(&self) -> io::Result<Image> {
+        let mut pieces = Vec::new();
+        for shard in 0..self.shards.unwrap_or(1) {
+            for at in (0..self.len).step_by(PIECE) {
+                let len = PIECE.min(self.len - at);
+                let mut bytes = HostBuffer::zero(len);
+                if !bytes.is_pinned() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        format!("the system cannot page-lock another {len} bytes"),
+                    ));
+                }
+                let begin = shard * self.len + at;
+                bytes.copy_from_slice(&self.bytes[begin..begin + len]);
+                pieces.push(Pinned {
+                    bytes,
+                    chip: self.shards.map(|_| shard),
+                    at,
+                });
+            }
+        }
+        Ok(Image {
+            pieces,
+            len: self.len,
+            shards: self.shards,
+        })
+    }
+
+    /// The pageable source in each destination chip's byte order.
+    pub(super) fn pieces(&self, chips: usize) -> io::Result<Vec<Piece<'_>>> {
+        check_chips(self.shards, chips)?;
+        Ok(match self.shards {
+            Some(_) => vec![Piece {
+                host: HostBufferSlice::from(&self.bytes),
+                chips: 0..chips,
+                bytes: 0..self.len,
+            }],
+            None => (0..chips)
+                .map(|chip| Piece {
+                    host: HostBufferSlice::from(&self.bytes),
+                    chips: chip..chip + 1,
+                    bytes: 0..self.len,
+                })
+                .collect(),
+        })
+    }
+}
+
+/// Page-locked weight bytes and their layout, retained for streaming and reload across requests.
+pub(super) struct Image {
+    pieces: Vec<Pinned>,
+    len: usize,
+    shards: Option<usize>,
+}
+
+struct Pinned {
+    bytes: HostBuffer,
+    chip: Option<usize>,
+    at: usize,
+}
+
+/// Host bytes and the byte interval they fill on their destination chips.
+pub(super) struct Piece<'a> {
+    pub(super) host: HostBufferSlice<'a>,
+    pub(super) chips: Range<usize>,
+    pub(super) bytes: Range<usize>,
+}
+
+impl Image {
+    pub(super) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(super) fn pieces(&self, chips: usize) -> io::Result<Vec<Piece<'_>>> {
+        check_chips(self.shards, chips)?;
+        Ok(self
+            .pieces
+            .iter()
+            .flat_map(|piece| {
+                let ranks = piece.chip.map_or(0..chips, |chip| chip..chip + 1);
+                ranks.map(move |chip| Piece {
+                    host: HostBufferSlice::from(&piece.bytes),
+                    chips: chip..chip + 1,
+                    bytes: piece.at..piece.at + piece.bytes.len(),
+                })
+            })
+            .collect())
+    }
+}
+
+fn check_chips(shards: Option<usize>, chips: usize) -> io::Result<()> {
+    if chips == 0 || shards.is_some_and(|expected| expected != chips) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "prepared weight shards do not match the destination chip count",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+    use furiosa_opt_models::tensor::parallel::Shard;
+
+    axes![Out = 4, In = 4];
+    type Chips = m![Out / 2];
+    type Shape = m![Out % 2, In];
+
+    /// Reconstruct destination images from transfer descriptors, independent of piece splitting.
+    pub(in super::super) fn assert_prepared_bytes(
+        pieces: &[Piece<'_>],
+        chips: usize,
+        len: usize,
+        expected: &[u8],
+    ) {
+        let mut actual = vec![0; chips * len];
+        let mut written = vec![false; chips * len];
+        for piece in pieces {
+            let width = piece.bytes.len();
+            let host = piece.host.bytes().unwrap();
+            assert!(piece.chips.end <= chips && piece.bytes.end <= len);
+            assert_eq!(host.len(), width * piece.chips.len());
+            for (chip, bytes) in piece.chips.clone().zip(host.chunks_exact(width)) {
+                let range = chip * len + piece.bytes.start..chip * len + piece.bytes.end;
+                actual[range.clone()].copy_from_slice(bytes);
+                written[range].fill(true);
+            }
+        }
+        assert!(written.into_iter().all(|byte| byte));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn retains_prepared_parts_and_refuses_equal_sized_permutations() {
+        let values: Vec<f32> = (0..16).map(|at| at as f32).collect();
+        let source = Source::from_host::<f32, Chips, Shape, m![Out, In]>(
+            HostTensor::from_vec(values.clone()),
+            "weight",
+        )
+        .unwrap();
+        assert_eq!(source.len(), 8 * 4);
+        let expected: Vec<_> = values.iter().flat_map(|x| x.to_le_bytes()).collect();
+        assert!(source.pieces(1).is_err());
+        assert_prepared_bytes(&source.pieces(2).unwrap(), 2, source.len(), &expected);
+
+        let error = Source::from_host::<f32, Chips, Shape, m![In, Out]>(
+            HostTensor::from_vec(values),
+            "weight",
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(error, LoadError::Unsupported { name, .. } if name == "weight"));
+    }
+
+    #[test]
+    fn retains_one_source_for_replicated_weights() {
+        let single = Source::from_host::<f32, m![{ Symbol<Shard<4>> }], m![In], m![In]>(
+            HostTensor::from_vec([1., 2., 3., 4.]),
+            "norm",
+        )
+        .unwrap();
+        let expanded = Source::from_host::<
+            f32,
+            m![{ Symbol<Shard<4>> }],
+            m![In],
+            m![{ Symbol<Shard<4>> }, In],
+        >(
+            HostTensor::from_vec([1., 2., 3., 4.].repeat(4)),
+            "expanded_norm",
+        )
+        .unwrap();
+        for source in [single, expanded] {
+            assert_eq!(source.len(), 16);
+            assert_eq!(
+                source.bytes.len(),
+                16,
+                "identical chip images retain one host copy"
+            );
+            let expected: Vec<_> = [1f32, 2., 3., 4.]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect();
+            assert_prepared_bytes(
+                &source.pieces(4).unwrap(),
+                4,
+                source.len(),
+                &expected.repeat(4),
+            );
+            assert!(source.pieces(0).is_err());
+        }
+    }
+
+    /// The image owns pinned copies in chip order, independent of the pageable source.
+    #[test]
+    #[ignore = "requires page-locked host memory from /dev/dma_heap/system"]
+    fn pins_prepared_bytes_in_chip_order() {
+        let source = Source::from_host::<f32, Chips, Shape, m![Out, In]>(
+            HostTensor::from_vec((0..16).map(|at| at as f32)),
+            "weight",
+        )
+        .unwrap();
+        let image = source.pin().unwrap();
+        drop(source);
+        assert_eq!(image.len(), 32);
+        for piece in &image.pieces {
+            assert!(piece.bytes.is_pinned());
+            assert!(piece.bytes.len() <= PIECE);
+        }
+        let expected: Vec<_> = (0..16).flat_map(|at| (at as f32).to_le_bytes()).collect();
+        assert_prepared_bytes(&image.pieces(2).unwrap(), 2, image.len(), &expected);
+        assert!(image.pieces(4).is_err());
+    }
+
+    /// A submitted image may span several runtime queue slots. Dropping its caller-owned
+    /// pieces must not cancel the later slots or release their pinned memory prematurely.
+    #[test]
+    #[ignore = "requires four explicitly selected RNGD chips and page-locked host memory"]
+    fn uploads_every_piece_when_an_image_exceeds_one_runtime_slot() {
+        let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
+        let parts = 70;
+        let len = parts * 8;
+        let expected: Vec<u8> = (0..4 * parts * 2)
+            .flat_map(|at| ((at * 17 % 251) as u32).to_le_bytes())
+            .collect();
+        let mut pieces = Vec::new();
+        for chip in 0..4 {
+            for part in 0..parts {
+                let mut bytes = HostBuffer::zero(8);
+                assert!(bytes.is_pinned());
+                let begin = chip * len + part * 8;
+                bytes.copy_from_slice(&expected[begin..begin + 8]);
+                pieces.push(Pinned {
+                    bytes,
+                    chip: Some(chip),
+                    at: part * 8,
+                });
+            }
+        }
+        let image = Image {
+            pieces,
+            len,
+            shards: Some(4),
+        };
+        let (buffer, completion) = super::super::upload::issue(&mut device, &image).unwrap();
+        drop(image);
+        let pending = completion.is_some();
+        if let Some(completion) = completion {
+            completion.wait().unwrap();
+        }
+        let bytes = futures_executor::block_on(
+            buffer
+                .slice(.., ..)
+                .unwrap()
+                .to_host(&mut device.pdma)
+                .submit(),
+        )
+        .unwrap();
+        assert_eq!(&bytes[..], expected);
+        println!("280-piece pinned upload: async completion returned: {pending}");
+    }
+}

@@ -4,21 +4,27 @@
 use crate::load::Load;
 use crate::ops::normalization::Chunk;
 use crate::specialize::pointwise;
+use crate::tensor::memory::residency::Residency;
 use furiosa_opt_std::prelude::*;
 use std::marker::PhantomData;
 
+pub mod abs;
 pub mod activation;
 pub mod add;
+mod arithmetic;
 pub mod cast;
 pub mod clamp;
 pub mod gated;
 pub mod guidance;
 pub mod multiply;
+mod prefix;
 pub mod rescale;
 pub mod softplus;
+pub mod subtract;
+pub mod sum;
 
 /// `silu(gate) * up` of rows packed as their gate features followed by their up features.
-#[derive(Clone, Copy, Default, DeviceSend, Load)]
+#[derive(Clone, Copy, Default, DeviceSend, Load, Residency)]
 pub struct SwiGlu;
 
 /// Flattened logical element count, independent of the input's named axes.

@@ -3,8 +3,9 @@
 use crate::Op;
 use crate::load::Load;
 use crate::ops::linear;
-use crate::specialize::attention::Strategy;
+use crate::specialize::attention::{Flash, Strategy};
 use crate::tensor::cache::KeyValue;
+use crate::tensor::memory::residency::Residency;
 use crate::tensor::scalar::F32;
 use crate::tensor::{
     axis::{Single, Tile},
@@ -30,8 +31,15 @@ mod split;
 
 /// Scaled dot-product attention `softmax(scale * QK^T) V` over the keys each query sees, query
 /// heads grouped over key/value heads, a decode's history attended as `STRATEGY` says.
-#[derive(DeviceSend, Load)]
-pub struct Attention<Heads = usize, Scale = f64, const STRATEGY: Strategy = { Strategy::Items }> {
+/// Bidirectional flash calls select their mass channels and maximum update with `FLASH`.
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(Heads, Scale))]
+pub struct Attention<
+    Heads = usize,
+    Scale = f64,
+    const STRATEGY: Strategy = { Strategy::Items },
+    const FLASH: Flash = { Flash::Standard },
+> {
     /// Query-head geometry.
     pub heads: Heads,
     /// Multiplier applied to query/key scores before additive bias.
@@ -39,8 +47,8 @@ pub struct Attention<Heads = usize, Scale = f64, const STRATEGY: Strategy = { St
 }
 
 /// The attention a kernel compiles whole: its heads a type and its scale a compile-time FP32.
-impl<Heads, const BITS: usize, const STRATEGY: Strategy> Default
-    for Attention<PhantomData<Heads>, F32<BITS>, STRATEGY>
+impl<Heads, const BITS: usize, const STRATEGY: Strategy, const FLASH: Flash> Default
+    for Attention<PhantomData<Heads>, F32<BITS>, STRATEGY, FLASH>
 {
     fn default() -> Self {
         Self {

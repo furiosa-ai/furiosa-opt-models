@@ -40,6 +40,60 @@ impl<M, F> Function<M, F> {
     pub fn new(module: M, entry: F) -> Self {
         Self { module, entry }
     }
+
+    /// Submit a call and retain its completion for weight residency. Submission refusal returns
+    /// an error immediately; an accepted call returns its output and work without waiting.
+    /// The caller keeps every movable weight it reads until the completion ends.
+    /// Returned tensors may still be written. Before passing one to a dependent multi-chip
+    /// launch, wait for its `ready()` future outside the device lock; the runtime refuses
+    /// overlapping accesses to peer-shared return storage. Independent prefetch can run first.
+    pub fn forward_tracked<I, E, S, O>(
+        &self,
+        device: &mut Device,
+        env: E,
+        state: S,
+        input: I,
+    ) -> io::Result<(O, crate::residency::Completion)>
+    where
+        M: DeviceSend + Module<I, E, S, Output = O> + Sync,
+        I: DeviceSend + Send,
+        E: DeviceSend + Send,
+        S: DeviceSend + Send,
+        O: DeviceOutput,
+        F: Copy + Sync + for<'d, 'm> DeviceFn<(&'d mut Device, &'m M, E, S, I), Output = O>,
+    {
+        let mut output = O::alloc(device).map_err(io::Error::other)?;
+        let work = self.forward_into_tracked(device, env, state, input, &mut output)?;
+        Ok((output, work))
+    }
+
+    /// Submit into the caller's retained output, returning only its accepted-work completion.
+    /// The caller retains inputs and output until completion, including on failure/cancellation.
+    /// Explicit local allocations support ordered workspace/ring reuse for entries whose output
+    /// writes stay on each chip; the ordinary return path keeps its shared allocation policy.
+    pub fn forward_into_tracked<I, E, S, O>(
+        &self,
+        device: &mut Device,
+        env: E,
+        state: S,
+        input: I,
+        output: &mut O,
+    ) -> io::Result<crate::residency::Completion>
+    where
+        M: DeviceSend + Module<I, E, S, Output = O> + Sync,
+        I: DeviceSend + Send,
+        E: DeviceSend + Send,
+        S: DeviceSend + Send,
+        O: DeviceOutput,
+        F: Copy + Sync + for<'d, 'm> DeviceFn<(&'d mut Device, &'m M, E, S, I), Output = O>,
+    {
+        let accepted = launch(self.entry, (device, &self.module, env, state, input))
+            .output(output)
+            .submit()
+            .accepted()
+            .map_err(io::Error::other)?;
+        Ok(crate::residency::Completion::new(accepted))
+    }
 }
 
 impl<M, F, I, E, S, O> AsyncModule<I, E, S> for Function<M, F>
@@ -82,10 +136,23 @@ where
 }
 // --8<-- [end:entry]
 
+/// Runs a module on four chips, on the env, state and input its launch passes.
+#[device(chip = 4)]
+pub fn forward_four<M, I, E, S, O>(device: &mut Device, module: &M, env: E, state: S, input: I) -> O
+where
+    M: DeviceSend + Module<I, E, S, Output = O>,
+    I: DeviceSend,
+    E: DeviceSend,
+    S: DeviceSend,
+    O: DeviceOutput,
+{
+    module.forward(device, env, state, input)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use furiosa_opt_std::prelude::{Broadcast, HbmTensor, m};
+    use furiosa_opt_std::prelude::{Broadcast, HbmTensor, Topology, m};
 
     type Scalar = HbmTensor<f32, m![1], m![1]>;
 
@@ -107,8 +174,7 @@ mod tests {
         }
     }
 
-    // One entry per chip count, since `#[device]` takes a literal.
-    /// `forward` on two chips.
+    /// The same module contract on two chips.
     #[device(chip = 2)]
     fn two<M, I, E, S, O>(device: &mut Device, module: &M, env: E, state: S, input: I) -> O
     where
@@ -121,30 +187,36 @@ mod tests {
         module.forward(device, env, state, input)
     }
 
-    /// `forward` on four chips.
-    #[device(chip = 4)]
-    fn four<M, I, E, S, O>(device: &mut Device, module: &M, env: E, state: S, input: I) -> O
-    where
-        M: DeviceSend + Module<I, E, S, Output = O>,
-        I: DeviceSend,
-        E: DeviceSend,
-        S: DeviceSend,
-        O: DeviceOutput,
-    {
-        module.forward(device, env, state, input)
-    }
-
-    /// A function launches a module with its env and state through the entry of each chip count.
-    const _: () = {
-        fn launches<A>(_: A)
+    /// A function keeps the topology of the entry it launches.
+    #[test]
+    fn topology_follows_entry() {
+        fn topology<F>(_: Function<Echo, F>) -> Topology
         where
-            A: AsyncModule<&'static Scalar, &'static Scalar, &'static mut Scalar, Output = Scalar>,
+            F: DeviceFn<
+                    (
+                        &'static mut Device,
+                        &'static Echo,
+                        &'static Scalar,
+                        &'static mut Scalar,
+                        &'static Scalar,
+                    ),
+                    Output = Scalar,
+                >,
         {
+            F::TOPOLOGY
         }
-        let _ = || {
-            launches(Function::new(&Echo, forward));
-            launches(Function::new(&Echo, two));
-            launches(Function::new(&Echo, four));
-        };
-    };
+
+        assert_eq!(
+            topology(Function::new(Echo, forward)),
+            Topology { chips: 1, pes: 8 }
+        );
+        assert_eq!(
+            topology(Function::new(Echo, two)),
+            Topology { chips: 2, pes: 8 }
+        );
+        assert_eq!(
+            topology(Function::new(Echo, forward_four)),
+            Topology { chips: 4, pes: 8 }
+        );
+    }
 }

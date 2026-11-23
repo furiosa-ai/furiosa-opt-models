@@ -23,6 +23,8 @@ use crate::tensor::scalar;
 use crate::tensor::scalar::Value;
 use core::marker::PhantomData;
 
+mod single_pass;
+
 axes![
     Rows = 4096,
     TailRows = 1024,
@@ -2305,8 +2307,9 @@ mod tests {
     use super::{Duo, Head, Queries, Rows, Span, Tokens, Visible};
     use crate::ops::attention::Attention;
     use crate::ops::normalization::tests::random;
+    use crate::specialize::attention::{Flash, Strategy};
     use crate::tensor::axis::Single;
-    use crate::tensor::live::tests::count;
+    use crate::tensor::live::{Live, tests::count};
     use crate::tensor::scalar::F32;
     use crate::tensor::scalar::Value;
     use crate::tests::DEVICE;
@@ -2336,16 +2339,354 @@ mod tests {
         visible: &Visible<Spans>,
         keys: &Value,
         output: &mut Queries<Rows, Pairs>,
+        single_pass: &Value,
     ) {
         // Through the catalog leaf, as a model calls it.
-        let attention = Attention {
+        let attention = Attention::<_, _> {
             heads: PhantomData::<Heads<Pairs>>,
             scale: F32::<INVERSE_ROOT>,
         };
-        attention
-            .forward(&mut *device, (query, key, value, (visible, keys)))
+        let result = if single_pass.extent::<m![2]>() != 0 {
+            Attention::<
+                PhantomData<Heads<Pairs>>,
+                F32<INVERSE_ROOT>,
+                { Strategy::Items },
+                { Flash::SinglePass },
+            >::default()
+            .forward(device, (query, key, value, (visible, keys)))
+        } else {
+            attention.forward(device, (query, key, value, (visible, keys)))
+        };
+        result
             .view()
             .to_hbm_view(&mut device.tdma, output.view_mut());
+    }
+
+    #[device(chip = 1)]
+    fn attend_live_heads<R: AxisName>(
+        device: &mut Device,
+        query: &Queries<R, Seven>,
+        key: &Tokens<Three, Seven>,
+        value: &Tokens<Three, Seven>,
+        visible: &Visible<Three>,
+        keys: &Value,
+        queries: &Value,
+        start: &Value,
+        scattered: &Value,
+    ) -> Queries<R, Seven> {
+        let rows = Live::<(), R>::all()
+            .subrange(start.extent::<m![R]>(), Live::<(), R>::read(queries).rows());
+        let op = Attention::<
+            PhantomData<Heads<Seven>>,
+            F32<INVERSE_ROOT>,
+            { Strategy::Items },
+            { Flash::SinglePass },
+        >::default();
+        if scattered.extent::<m![2]>() != 0 {
+            op.forward(
+                device,
+                (
+                    rows.with(query),
+                    key,
+                    value,
+                    (&super::Scattered(visible), keys),
+                ),
+            )
+            .into_value()
+        } else {
+            op.forward(device, (rows.with(query), key, value, (visible, keys)))
+                .into_value()
+        }
+    }
+
+    /// Zero scores give a uniform softmax. Visible pairs' alternating +/-1/4 values cancel,
+    /// leaving an exact head/channel constant; masked values of 8 must contribute nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_queries_preserve_tail_and_visibility() {
+        use crate::tensor::axis;
+        type Capacity = axis::Rows<8192>;
+        let _lease = DEVICE.lock().await;
+        let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+        let query: Queries<Capacity, Seven> =
+            HostTensor::<bf16, m![Capacity, Seven, Duo, Head]>::zero()
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+        let key: Tokens<Three, Seven> =
+            HostTensor::<bf16, m![Seven, Duo, Three, Span, Head]>::zero()
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+        let base = |head: usize, channel: usize| (head * 8 + channel % 8) as f32 / 128.0;
+        for (live_keys, scattered) in [(4800, false), (5800, false), (6144, true)] {
+            let mode = count(usize::from(scattered))
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+            let seen = |key: usize| key < live_keys && (!scattered || key / 2 % 3 != 1);
+            let values = (0..14 * Three::SIZE * Span::SIZE * Head::SIZE).map(|at| {
+                let (head, key, channel) = (
+                    at / (Three::SIZE * Span::SIZE * Head::SIZE),
+                    at / Head::SIZE % (Three::SIZE * Span::SIZE),
+                    at % Head::SIZE,
+                );
+                bf16::from_f32(if seen(key) {
+                    base(head, channel) + if key % 2 == 0 { 0.25 } else { -0.25 }
+                } else {
+                    8.0
+                })
+            });
+            let value: Tokens<Three, Seven> =
+                HostTensor::<bf16, m![Seven, Duo, Three, Span, Head]>::from_vec(values)
+                    .to_hbm(&mut device.pdma)
+                    .await
+                    .unwrap();
+            let visible: Visible<Three> = HostTensor::<bf16, m![Three, Span]>::from_vec(
+                (0..Three::SIZE * Span::SIZE)
+                    .map(|at| bf16::from_f32(if seen(at) { 1.0 } else { 0.0 })),
+            )
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap();
+            for (start, rows) in [
+                (0, 128),
+                (0, 2048),
+                (0, 4096),
+                (0, 5120),
+                (0, 6144),
+                (0, 8192),
+                (512, 5120),
+                (8064, 128),
+                (0, 0),
+                (0, 128),
+            ] {
+                // Empty work must not inspect even a zero key count.
+                let keys = count(if rows == 0 { 0 } else { live_keys })
+                    .to_hbm(&mut device.pdma)
+                    .await
+                    .unwrap();
+                let queries = count(rows).to_hbm(&mut device.pdma).await.unwrap();
+                let origin = count(start).to_hbm(&mut device.pdma).await.unwrap();
+                let output = launch(
+                    attend_live_heads,
+                    (
+                        &mut device,
+                        &query,
+                        &key,
+                        &value,
+                        &visible,
+                        &keys,
+                        &queries,
+                        &origin,
+                        &mode,
+                    ),
+                )
+                .await
+                .unwrap();
+                if rows == 0 {
+                    continue;
+                }
+                let storage = output.into_buffer();
+                let row_bytes = 14 * Head::SIZE * 2;
+                let bytes = storage
+                    .slice(.., start * row_bytes..(start + rows) * row_bytes)
+                    .unwrap()
+                    .to_host(&mut device.pdma)
+                    .await
+                    .unwrap();
+                for (at, bytes) in bytes.chunks_exact(2).enumerate() {
+                    let actual = u16::from_le_bytes([bytes[0], bytes[1]]);
+                    let (head, channel) = (at / Head::SIZE % 14, at % Head::SIZE);
+                    assert_eq!(
+                        actual,
+                        bf16::from_f32(base(head, channel)).to_bits(),
+                        "scattered {scattered}, keys {live_keys}, row {}, head {head}, channel {channel}",
+                        start + at / (14 * Head::SIZE)
+                    );
+                }
+            }
+        }
+    }
+
+    #[device(chip = 1)]
+    fn attend_single_pass_long_prefix<R: AxisName>(
+        device: &mut Device,
+        query: &Queries<R, Seven>,
+        key: &Tokens<Twenty, Seven>,
+        value: &Tokens<Twenty, Seven>,
+        visible: &Visible<Twenty>,
+        keys: &Value,
+        queries: &Value,
+        start: &Value,
+    ) -> Queries<R, Seven> {
+        let rows = Live::<(), R>::all()
+            .subrange(start.extent::<m![R]>(), Live::<(), R>::read(queries).rows());
+        Attention::<
+            PhantomData<Heads<Seven>>,
+            F32<INVERSE_ROOT>,
+            { Strategy::Items },
+            { Flash::SinglePass },
+        >::default()
+        .forward(device, (rows.with(query), key, value, (visible, keys)))
+        .into_value()
+    }
+
+    /// Two key classes with uniform scores within each class have a closed-form softmax.
+    /// Nonzero, row-dependent queries expose misplaced output rows; odd key counts expose an
+    /// incorrect final-key mask.
+    /// NaN query padding may be computed by a surrounding tile but must not reach live rows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn single_pass_runtime_long_queries_preserve_rows_and_key_tails() {
+        use crate::tensor::axis;
+        type Capacity = axis::Rows<41984>;
+        const HEADS: usize = Seven::SIZE * Duo::SIZE;
+        let _lease = DEVICE.lock().await;
+        let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+        let amplitude = |row: usize, head: usize| ((row * 7 + head * 3) % 17) as f32 - 8.0;
+        let base = |head: usize, channel: usize| (head * 8 + channel % 8 + 1) as f64 / 128.0;
+        let scale = f64::from(f32::from_bits(INVERSE_ROOT as u32));
+        let cases: &[(usize, &[(usize, usize)])] = &[
+            (
+                37787,
+                &[
+                    (0, 37888),
+                    (0, 37887),
+                    (0, 37889),
+                    (512, 37888),
+                    (Capacity::SIZE - 128, 128),
+                    (0, 0),
+                    (0, 37888),
+                ],
+            ),
+            (37839, &[(0, 38912)]),
+            (39758, &[(0, 39936)]),
+        ];
+        for &(live_keys, intervals) in cases {
+            // All visible keys have only their first feature nonzero: +1 for the even
+            // class, -1 for the odd class. Dot products are therefore exact BF16 amplitudes.
+            // Masked keys/values are finite adversarial padding: the kernel clears V by
+            // multiplication, which deliberately does not promise to erase a NaN.
+            let key: Tokens<Twenty, Seven> =
+                HostTensor::<bf16, m![Seven, Duo, Twenty, Span, Head]>::from_vec(
+                    (0..HEADS * Twenty::SIZE * Span::SIZE * Head::SIZE).map(|at| {
+                        let key = at / Head::SIZE % (Twenty::SIZE * Span::SIZE);
+                        bf16::from_f32(if at % Head::SIZE != 0 {
+                            0.0
+                        } else if key >= live_keys {
+                            32.0
+                        } else if key % 2 == 0 {
+                            1.0
+                        } else {
+                            -1.0
+                        })
+                    }),
+                )
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+            let value: Tokens<Twenty, Seven> =
+                HostTensor::<bf16, m![Seven, Duo, Twenty, Span, Head]>::from_vec(
+                    (0..HEADS * Twenty::SIZE * Span::SIZE * Head::SIZE).map(|at| {
+                        let head = at / (Twenty::SIZE * Span::SIZE * Head::SIZE);
+                        let key = at / Head::SIZE % (Twenty::SIZE * Span::SIZE);
+                        bf16::from_f32(if key >= live_keys {
+                            8.0
+                        } else {
+                            (base(head, at % Head::SIZE) + if key % 2 == 0 { 0.25 } else { -0.25 })
+                                as f32
+                        })
+                    }),
+                )
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+            let visible: Visible<Twenty> = HostTensor::<bf16, m![Twenty, Span]>::from_vec(
+                (0..Twenty::SIZE * Span::SIZE)
+                    .map(|key| bf16::from_f32(if key < live_keys { 1.0 } else { 0.0 })),
+            )
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap();
+            for &(start, rows) in intervals {
+                let query: Queries<Capacity, Seven> =
+                    HostTensor::<bf16, m![Capacity, Seven, Duo, Head]>::from_vec(
+                        (0..Capacity::SIZE * HEADS * Head::SIZE).map(|at| {
+                            let row = at / (HEADS * Head::SIZE);
+                            if !(start..start + rows).contains(&row) {
+                                bf16::from_bits(0x7fc1)
+                            } else {
+                                bf16::from_f32(if at % Head::SIZE == 0 {
+                                    amplitude(row, at / Head::SIZE % HEADS)
+                                } else {
+                                    0.0
+                                })
+                            }
+                        }),
+                    )
+                    .to_hbm(&mut device.pdma)
+                    .await
+                    .unwrap();
+                let keys = count(if rows == 0 { 0 } else { live_keys })
+                    .to_hbm(&mut device.pdma)
+                    .await
+                    .unwrap();
+                let queries = count(rows).to_hbm(&mut device.pdma).await.unwrap();
+                let origin = count(start).to_hbm(&mut device.pdma).await.unwrap();
+                let output = launch(
+                    attend_single_pass_long_prefix,
+                    (
+                        &mut device,
+                        &query,
+                        &key,
+                        &value,
+                        &visible,
+                        &keys,
+                        &queries,
+                        &origin,
+                    ),
+                )
+                .await
+                .unwrap();
+                if rows == 0 {
+                    continue;
+                }
+                let row_bytes = HEADS * Head::SIZE * 2;
+                let bytes = output
+                    .into_buffer()
+                    .slice(.., start * row_bytes..(start + rows) * row_bytes)
+                    .unwrap()
+                    .to_host(&mut device.pdma)
+                    .await
+                    .unwrap();
+                assert_eq!(bytes.len(), rows * row_bytes);
+                let (mut error, mut norm, mut worst) = (0.0f64, 0.0f64, 0.0f64);
+                for (at, head_bytes) in bytes.chunks_exact(Head::SIZE * 2).enumerate() {
+                    let (row, head) = (start + at / HEADS, at % HEADS);
+                    let score = f64::from(amplitude(row, head)) * scale;
+                    let positive = live_keys.div_ceil(2) as f64 * score.exp();
+                    let negative = (live_keys / 2) as f64 * (-score).exp();
+                    let shift = 0.25 * (positive - negative) / (positive + negative);
+                    for (channel, bytes) in head_bytes.chunks_exact(2).enumerate() {
+                        let actual = f64::from(
+                            bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32(),
+                        );
+                        let expected = base(head, channel) + shift;
+                        assert!(
+                            actual.is_finite(),
+                            "single_pass keys {live_keys}, row {row}, head {head}, channel {channel}: {actual}"
+                        );
+                        error += (actual - expected).powi(2);
+                        norm += expected.powi(2);
+                        worst = worst.max((actual - expected).abs());
+                    }
+                }
+                let relative = (error / norm).sqrt();
+                eprintln!(
+                    "single_pass live long attention keys {live_keys}, start {start}, rows {rows}: relative L2 {relative:.3e}, worst {worst:.3e}"
+                );
+                assert!(relative < 1e-2, "relative L2 {relative}");
+            }
+        }
     }
 
     /// `tokens` in token-major order (`[key][head][channel]`) as the kernel takes them, head-major.
@@ -2365,6 +2706,7 @@ mod tests {
     async fn run<Spans: AxisName, Pairs: AxisName>(
         (q, k, v): (&[bf16], &[bf16], &[bf16]),
         live: usize,
+        single_pass: bool,
     ) -> Vec<bf16> {
         let heads = Pairs::SIZE * Duo::SIZE;
         let keys = Spans::SIZE * Span::SIZE;
@@ -2393,6 +2735,10 @@ mod tests {
         .to_hbm(&mut device.pdma)
         .await
         .unwrap();
+        let variant = count(usize::from(single_pass))
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap();
         let count = count(live).to_hbm(&mut device.pdma).await.unwrap();
         let mut output: Queries<Rows, Pairs> =
             HostTensor::<bf16, m![Rows, Pairs, Duo, Head]>::zero()
@@ -2409,6 +2755,7 @@ mod tests {
                 &visible,
                 &count,
                 &mut output,
+                &variant,
             ),
         )
         .await
@@ -2446,49 +2793,51 @@ mod tests {
                 bf16::from_f32(x.to_f32() * if absent { 4.0 } else { 1.0 })
             })
             .collect();
-        let got = run::<Spans, Pairs>((&q, &k, &v), live).await;
-        let scale = f32::from_bits(INVERSE_ROOT as u32) as f64;
-        let (mut error, mut norm, mut worst) = (0.0f64, 0.0f64, 0.0f64);
-        for row in (0..Rows::SIZE).step_by(stride) {
-            for head in 0..heads {
-                let at = |t: &[bf16], r: usize, d: usize| {
-                    t[(r * heads + head) * Head::SIZE + d].to_f32() as f64
-                };
-                // The kernel rounds each score to BF16 before scaling it.
-                let scores: Vec<f64> = (0..live)
-                    .map(|key| {
-                        let dot: f64 = (0..Head::SIZE)
-                            .map(|d| at(&q, row, d) * at(&k, key, d))
-                            .sum();
-                        scale * bf16::from_f32(dot as f32).to_f32() as f64
-                    })
-                    .collect();
-                let top = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-                let weights: Vec<f64> = scores.iter().map(|s| (s - top).exp()).collect();
-                let mass: f64 = weights.iter().sum();
-                for d in 0..Head::SIZE {
-                    let want = weights
-                        .iter()
-                        .enumerate()
-                        .map(|(key, w)| w * at(&v, key, d))
-                        .sum::<f64>()
-                        / mass;
-                    let found = at(&got, row, d);
-                    assert!(
-                        found.is_finite(),
-                        "row {row} head {head} channel {d}: {found}"
-                    );
-                    error += (found - want).powi(2);
-                    norm += want.powi(2);
-                    worst = worst.max((found - want).abs());
+        for single_pass in [false, true] {
+            let got = run::<Spans, Pairs>((&q, &k, &v), live, single_pass).await;
+            let scale = f32::from_bits(INVERSE_ROOT as u32) as f64;
+            let (mut error, mut norm, mut worst) = (0.0f64, 0.0f64, 0.0f64);
+            for row in (0..Rows::SIZE).step_by(stride) {
+                for head in 0..heads {
+                    let at = |t: &[bf16], r: usize, d: usize| {
+                        t[(r * heads + head) * Head::SIZE + d].to_f32() as f64
+                    };
+                    // The kernel rounds each score to BF16 before scaling it.
+                    let scores: Vec<f64> = (0..live)
+                        .map(|key| {
+                            let dot: f64 = (0..Head::SIZE)
+                                .map(|d| at(&q, row, d) * at(&k, key, d))
+                                .sum();
+                            scale * bf16::from_f32(dot as f32).to_f32() as f64
+                        })
+                        .collect();
+                    let top = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let weights: Vec<f64> = scores.iter().map(|s| (s - top).exp()).collect();
+                    let mass: f64 = weights.iter().sum();
+                    for d in 0..Head::SIZE {
+                        let want = weights
+                            .iter()
+                            .enumerate()
+                            .map(|(key, w)| w * at(&v, key, d))
+                            .sum::<f64>()
+                            / mass;
+                        let found = at(&got, row, d);
+                        assert!(
+                            found.is_finite(),
+                            "row {row} head {head} channel {d}: {found}"
+                        );
+                        error += (found - want).powi(2);
+                        norm += want.powi(2);
+                        worst = worst.max((found - want).abs());
+                    }
                 }
             }
+            let relative = (error / norm).sqrt();
+            eprintln!(
+                "flash attention {heads} heads x {live} keys: relative L2 {relative:.3e}, worst {worst:.3e}"
+            );
+            assert!(relative < 1e-2, "relative L2 {relative}");
         }
-        let relative = (error / norm).sqrt();
-        eprintln!(
-            "flash attention {heads} heads x {live} keys: relative L2 {relative:.3e}, worst {worst:.3e}"
-        );
-        assert!(relative < 1e-2, "relative L2 {relative}");
     }
 
     /// Two heads over three spans, the third's last 300 keys absent.

@@ -53,7 +53,7 @@ CARGO=cargo-furiosa-opt uv pip install --torch-backend cpu ./integrations/furios
 <!-- --8<-- [end:vllm] -->
 
 Installation registers the platform plugin with vLLM.
-The `omni` extra, `./integrations/furiosa-opt-vllm[omni]`, also installs vLLM-Omni, whose diffusion pipelines the plugin refuses at load: the engine loads none yet.
+The `omni` extra, `./integrations/furiosa-opt-vllm[omni]`, also installs vLLM-Omni for [MiniMax H3 video with stereo audio](../serving/minimax-h3.md), currently the plugin's only supported diffusion pipeline.
 The plugin uses [vLLM's CPU build](https://docs.vllm.ai/en/stable/getting_started/installation/cpu/), whose torch comes from PyTorch's CPU index.
 
 ### SGLang
@@ -82,7 +82,8 @@ python -c "import furiosa_opt_engine as engine; print(engine.LoadOptions())"
 ## Build time
 
 !!! note
-    The first build compiles every model function and takes several minutes.
+    The first build compiles every model function, including H3 even when you intend to serve another model.
+    Build time depends on the kernel cache and available parallelism; H3's share of build time has not been measured.
     Add `-v` to see its progress.
 
 uv builds each install in a fresh Python environment, so reinstalling recompiles pyo3 and the engine.

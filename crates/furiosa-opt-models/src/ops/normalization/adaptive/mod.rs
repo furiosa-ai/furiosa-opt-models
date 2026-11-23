@@ -9,11 +9,13 @@ use crate::load::Load;
 use crate::ops::index::packed::{Packed, Rows, Table};
 use crate::ops::normalization::{Lanes, Root, Scale, Squares};
 use crate::tensor::form::Weight;
+use crate::tensor::memory::residency::Residency;
 use furiosa_opt_std::prelude::*;
 use std::borrow::Borrow;
 use std::marker::PhantomData;
 
 pub(crate) mod blocks;
+pub(crate) mod live;
 pub(crate) mod rows;
 
 axes![Strip = 64];
@@ -93,7 +95,8 @@ impl<Width: AxisName, const EPSILON: usize, X: M, T> Op<&Feature<bf16, Width, X>
 
 /// `bf16(x * rsqrt(mean(x²) + eps) * (w * (1 + scale)) + shift)` with each span's table row, FP32
 /// inside, `EPSILON` epsilon's FP32 bits and the gain `w` the checkpoint's `weight`, held as `T`.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(T))]
 pub struct AdaptiveRms<
     Width: AxisName,
     const EPSILON: usize,
@@ -145,7 +148,8 @@ where
 
 /// One modality's final norm: RMS normalization rounded to BF16, then `bf16(n * (1 + scale) +
 /// shift)` of its timestep row, `EPSILON` epsilon's FP32 bits and the gain `weight` held as `T`.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(T))]
 pub struct FinalNorm<
     Width: AxisName,
     const EPSILON: usize,

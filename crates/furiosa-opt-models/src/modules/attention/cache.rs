@@ -8,6 +8,7 @@
 //!   these steps among its children.
 
 use super::{Attend, Attention, Context, History, Paged, Positioned};
+use crate::tensor::memory::residency::Residency;
 
 use crate::Module;
 use crate::load::Load;
@@ -23,7 +24,8 @@ use core::task::Poll;
 use furiosa_opt_std::prelude::*;
 
 /// Writes this call's keys and values to the cache and returns the history attention reads.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(Write, Read))]
 pub struct KeyValue<Write, Read> {
     #[load(rename = "")]
     pub write: Write,

@@ -14,6 +14,7 @@ use core::marker::PhantomData;
 
 use furiosa_opt_std::prelude::*;
 
+use crate::Op;
 use crate::ops::index::packed::{Group, Rows, Table};
 use crate::ops::normalization::{Lanes, Root, Squares};
 use crate::specialize::diffusion::{Run, Spread};
@@ -88,6 +89,27 @@ impl<E, const ROWS: usize, const SLICES: usize> Lines<E, ROWS, SLICES> {
                 .view()
                 .tile::<m![Group], 1, m![Group = 1 # Group, W]>(index)
                 .reshape::<X, m![W]>()
+        }
+    }
+}
+
+impl<E: AxisName, const ROWS: usize, const SLICES: usize> Lines<E, ROWS, SLICES> {
+    /// Overwrite whole strips without reading their previous contents. A whole DM fill followed
+    /// by the ordinary strip store avoids the SDK's unsupported ranged memset.
+    pub(crate) fn clear<R: AxisName, W: AxisName, X: M>(
+        &self,
+        device: &mut Device,
+        output: &mut Rows<R, W, X>,
+        first: usize,
+        count: usize,
+    ) {
+        if count > 0 {
+            let mut zero: Part<bf16, W, X, E, ROWS, SLICES> = DmTensor::new();
+            zero.view_mut()
+                .memset(const { bf16::from_f32(0.0) }, &mut device.sub);
+            for index in 0..count {
+                self.forward(device, (&zero, &mut *output, first + index));
+            }
         }
     }
 }

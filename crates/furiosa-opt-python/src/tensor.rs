@@ -554,7 +554,7 @@ impl HostTensor {
     /// Raises:
     ///     ValueError: The tensor is not on the host or its dtype is unsupported.
     #[staticmethod]
-    fn from_dlpack(
+    pub(crate) fn from_dlpack(
         #[gen_stub(override_type(type_repr = "object"))] value: &Bound<'_, PyAny>,
     ) -> PyResult<Self> {
         let py = value.py();

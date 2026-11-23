@@ -12,6 +12,7 @@ use super::collection::{Collected, Stack, Stacked, View};
 use super::schedule::{IntoStream, Slot, Stream};
 use crate::Module;
 use crate::load::Load;
+use crate::tensor::memory::residency::Residency;
 use core::iter::Zip;
 use core::slice;
 use core::task::Poll;
@@ -278,7 +279,8 @@ impl<T, U: Stream<Item = T>, R: Refill<T, Stream = C>, C: Stream<Item = T> + AsM
 
 /// The layers of a collection applied in order, each with its own state slot; the kind `K` rolls
 /// or unrolls the loop.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(C, K))]
 pub struct Layers<C, K = Rolled> {
     #[load(rename = "")]
     pub layers: C,
@@ -287,12 +289,16 @@ pub struct Layers<C, K = Rolled> {
 }
 
 /// A device loop over the layers: one copy of a layer's code runs every trip.
-#[derive(Clone, Copy, Default, DeviceSend, Load)]
+#[derive(Clone, Copy, Default, DeviceSend, Load, Residency)]
 pub struct Rolled;
 
 /// Every layer's code in place: the loop unrolls before scheduling.
-#[derive(Clone, Copy, Default, DeviceSend, Load)]
+#[derive(Clone, Copy, Default, DeviceSend, Load, Residency)]
 pub struct Unrolled;
+
+/// Unroll an explicit constant range when the device compiler cannot unroll enumeration.
+#[derive(Clone, Copy, Default, DeviceSend, Load, Residency)]
+pub struct UnrolledRange;
 
 impl<'s, X, LayerState, C, const N: usize, Env: Copy> Module<X, Env, &'s mut [LayerState; N]>
     for Layers<C, Rolled>
@@ -336,6 +342,35 @@ where
         if N > 0 {
             #[unroll]
             for (index, slot) in state.iter_mut().enumerate() {
+                hidden = self.layers.apply(&mut *device, env, slot, hidden, index);
+            }
+        }
+        hidden
+    }
+}
+
+impl<'s, X, LayerState, C, const N: usize, Env: Copy> Module<X, Env, &'s mut [LayerState; N]>
+    for Layers<C, UnrolledRange>
+where
+    C: Collection<X, Env, &'s mut LayerState, Output = X>,
+{
+    type Output = X;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        env: Env,
+        state: &'s mut [LayerState; N],
+        mut hidden: X,
+    ) -> X {
+        const { assert!(C::COUNT == N, "one state slot for each layer") };
+        if N > 0 {
+            let mut slots = state.iter_mut();
+            #[unroll]
+            for index in 0..N {
+                // The explicit constant range is the device compiler's unroll boundary. The
+                // iterator lends disjoint state slots for the full call lifetime.
+                let slot = slots.next().expect("one state slot for each layer");
                 hidden = self.layers.apply(&mut *device, env, slot, hidden, index);
             }
         }

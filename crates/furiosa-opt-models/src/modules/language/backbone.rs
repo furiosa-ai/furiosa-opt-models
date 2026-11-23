@@ -3,11 +3,13 @@
 use crate::Module;
 use crate::load::Load;
 use crate::modules::generic::schedule::{IntoStream, Stream};
+use crate::tensor::memory::residency::Residency;
 use furiosa_opt_std::prelude::*;
 
 /// Embeds the input, then passes the hidden values to the body; the body is its checkpoint's
 /// `layers`, and the embedding names itself.
-#[derive(Clone, DeviceSend, Load)]
+#[derive(Clone, DeviceSend, Load, Residency)]
+#[residency(children(Embedding, Body))]
 pub struct Backbone<Embedding, Body> {
     #[load(rename = "")]
     pub embedding: Embedding,

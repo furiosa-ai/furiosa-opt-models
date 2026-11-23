@@ -2,10 +2,12 @@
 
 use crate::Module;
 use crate::load::Load;
+use crate::tensor::memory::residency::Residency;
 use furiosa_opt_std::prelude::{Device, DeviceSend};
 
 /// Lends one borrowed input to each module of a pair or triple, returning their outputs in order.
-#[derive(Clone, DeviceSend, Load)]
+#[derive(Clone, DeviceSend, Load, Residency)]
+#[residency(children(T))]
 pub struct Fork<T>(pub T);
 
 /// A composition, not an op.

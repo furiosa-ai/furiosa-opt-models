@@ -56,7 +56,10 @@ docstring-code-format = true
 [tool.pytest.ini_options]
 addopts = ["-ra", "--strict-config", "--strict-markers"]
 testpaths = ["integrations"]
-markers = ["feature(name): covers the named row of the serving feature support table"]
+markers = [
+    "feature(name): covers the named row of the serving feature support table",
+    "h3: requires --h3, four selected chips, a local H3 checkpoint and private external references",
+]
 pythonpath = ["."]
 filterwarnings = [
     "error",

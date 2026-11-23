@@ -30,8 +30,8 @@ For a walkthrough, see [Using the engine](../engine/python.md).
 
 ## Loaded models
 
-A load returns a `Decoder`, which serves every model alike, as an object of its model type's class from the submodule of that model type.
-Every `forward` returns its device outputs once the device accepted the call; a copy of pinned `HostBuffer` memory may return before it ends, and only `Transfer.wait`, every other copy, `HbmTensor.wait` and `Device.synchronize` wait for the device ([asynchronous calls](../engine/python.md#run-calls-asynchronously)).
+A load of a text model returns an instance of its model class derived from `Decoder`.
+Each decoder's `forward` returns its device outputs once the device accepted the call; a copy of pinned `HostBuffer` memory may return before it ends, and only `Transfer.wait`, every other copy, `HbmTensor.wait` and `Device.synchronize` wait for the device ([asynchronous calls](../engine/python.md#run-calls-asynchronously)).
 
 ::: furiosa_opt_engine.Decoder
 
@@ -50,6 +50,44 @@ A load of a vision-language model's media encoder alone (`LoadOptions.encoder()`
 ::: furiosa_opt_engine.vision_language.Image
 
 ::: furiosa_opt_engine.vision_language.Audio
+
+## Diffusion pipelines
+
+A MiniMax H3 load returns one four-chip `Pipeline` whose component views retain the same pipeline and device.
+A component's `prepare` checks and uploads framework operands, and its prepared call's `forward` submits device work and returns an owned result.
+Use `wait` to wait without converting, or `to_host` to consume the result into NumPy arrays; the framework adapter converts those arrays into framework tensors.
+The video result is an ongoing two-buffer decode: `wait` waits for the current group, while `to_host` advances the remaining groups and performs the original ordered stitching.
+Consume or drop a prepared call and its result before preparing another call on the same pipeline.
+These calls do not use the decoder KV-cache API below.
+See the [H3 profile](../serving/minimax-h3.md) for supported inputs and serving.
+
+::: furiosa_opt_engine.minimax_h3.Component
+
+::: furiosa_opt_engine.minimax_h3.Pipeline
+
+::: furiosa_opt_engine.minimax_h3.Transformer
+
+::: furiosa_opt_engine.minimax_h3.TextEncoder
+
+::: furiosa_opt_engine.minimax_h3.VideoDecoder
+
+::: furiosa_opt_engine.minimax_h3.AudioDecoder
+
+::: furiosa_opt_engine.minimax_h3.PreparedStep
+
+::: furiosa_opt_engine.minimax_h3.Output
+
+::: furiosa_opt_engine.minimax_h3.PreparedText
+
+::: furiosa_opt_engine.minimax_h3.Encoded
+
+::: furiosa_opt_engine.minimax_h3.PreparedVideo
+
+::: furiosa_opt_engine.minimax_h3.VideoDecoding
+
+::: furiosa_opt_engine.minimax_h3.PreparedAudio
+
+::: furiosa_opt_engine.minimax_h3.AudioOutput
 
 ## Requests and cache
 

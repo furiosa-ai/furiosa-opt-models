@@ -30,12 +30,14 @@ use crate::ops::linear;
 use crate::specialize::convolution::{Group, Narrow, Outputs, Slabs, Strategy};
 use crate::tensor::form::Weight;
 use crate::tensor::image::{Grid, Image};
+use crate::tensor::memory::residency::Residency;
 use crate::tensor::{axis::Single, parallel::Chip};
 use frames::{Blocked, Doubled, FrameRows, Frames, Groups, LEAD, Pads, Stereo, Window};
 
 pub mod activation;
 pub mod frames;
 pub mod input;
+pub mod output;
 pub mod residual;
 pub mod transpose;
 
@@ -43,8 +45,9 @@ axes![Term = 2, Lag = 8, Lane = 8, Reach = 16, Split = 2];
 
 /// torch's convolution `y[o, t] = b[o] + sum_k sum_c w[o, c, k] x[c, STRIDE t + DILATION k - pad]`,
 /// `W` in its strategy's mapping; returned padding rows hold what `P` reads.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
 #[load(tree)]
+#[residency(children(W, B))]
 pub struct Convolution<W, B = (), const STRIDE: usize = 1, const DILATION: usize = 1, P = ()> {
     pub weight: W,
     pub bias: B,

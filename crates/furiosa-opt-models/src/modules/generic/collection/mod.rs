@@ -1,6 +1,8 @@
 use furiosa_opt_std::prelude::*;
 
 use crate::load::{Checkpoint, Context, Load, LoadError};
+use crate::tensor::memory::Memory;
+use crate::tensor::memory::residency::{Leaves, Path, Residency, Visit};
 
 /// A layer collection owning one backing per parameter kind.
 #[derive(DeviceSend)]
@@ -100,6 +102,28 @@ impl<L: View<N>, const N: usize> Kind<L, N> for Stack {
 /// itself, so a model alias generic over its layers' parts keeps the kind a parameter.
 #[derive(DeviceSend)]
 pub struct Collected<K: Kind<L, N>, L, const N: usize>(pub K::Of);
+
+/// Array collections retain independent layer owners in every memory backend. Stacked HBM
+/// backings have a different ownership contract and are not projected through this impl.
+impl<L: Residency, const N: usize> Residency for Collected<Array, L, N> {
+    type In<X: Memory> = Collected<Array, L::In<X>, N>;
+
+    fn map<'t, From: Memory, To: Memory, P: Leaves<'t, From, To>>(
+        tree: &'t Self::In<From>,
+        leaves: &mut P,
+        path: Path<'_>,
+    ) -> Result<Self::In<To>, P::Error> {
+        <[L; N] as Residency>::map(&tree.0, leaves, path).map(Collected::<Array, L::In<To>, N>)
+    }
+
+    fn visit<X: Memory, V: Visit<X>>(
+        tree: &Self::In<X>,
+        visitor: &mut V,
+        path: Path<'_>,
+    ) -> Result<(), V::Error> {
+        <[L; N] as Residency>::visit(&tree.0, visitor, path)
+    }
+}
 
 impl<K: Kind<L, N, Of: Clone>, L, const N: usize> Clone for Collected<K, L, N> {
     fn clone(&self) -> Self {
@@ -596,5 +620,317 @@ mod tests {
         assert_eq!(want, rows(collected, &mut device).await, "rolled stack");
 
         assert!(want.iter().any(|&bits| bits != 0));
+    }
+}
+
+#[cfg(test)]
+mod residency_tests {
+    use super::{Array, Collected};
+    use crate::load::{Checkpoint, Context, Load, LoadError, Named};
+    use crate::modules::residual::Residual;
+    use crate::ops::linear::Linear;
+    use crate::ops::normalization::{EPSILON, RmsNorm};
+    use crate::ops::pointwise::add::Add;
+    use crate::tensor::form::Weight;
+    use crate::tensor::form::grouped::{Grouped, Layout};
+    use crate::tensor::memory::residency::{Leaves, Path, Residency, Visit};
+    use crate::tensor::memory::{Hbm, Memory};
+    use crate::tensor::parallel::Shard;
+    use crate::{Layers, Sequential, Then};
+    use furiosa_opt_std::prelude::*;
+    use safetensors::Dtype;
+    use std::{convert::Infallible, marker::PhantomData, sync::Arc};
+
+    axes![Width = 128, Wide = 512];
+    type Chips = m![{ Symbol<Shard<4>> }];
+    type Gain<X> = Weight<m![Width], Chips, <X as Memory>::Tensor<bf16, Chips, m![Width]>>;
+    type Norm<X> = RmsNorm<Width, EPSILON, Chips, Gain<X>>;
+    type Projection<I, O, X> =
+        Linear<I, O, Chips, Grouped<I, O, Chips, <X as Memory>::Tensor<bf16, Chips, Layout<I, O>>>>;
+    type Up<X> = Projection<Width, Wide, X>;
+    type Down<X> = Projection<Wide, Width, X>;
+    type Block<X> =
+        Residual<Named<"norm", Norm<X>>, Then<Named<"up", Up<X>>, Named<"down", Down<X>>>, Add>;
+    type Network<X> = Sequential<Named<"input", Norm<X>>, Layers<Collected<Array, Block<X>, 2>>>;
+
+    #[derive(Load, Residency)]
+    #[residency(memory(X))]
+    struct Tree<X: Memory> {
+        body: Network<X>,
+        #[load(tied = "body.0.up")]
+        tied: Up<X>,
+    }
+
+    /// Test storage retains the public loader's host result; it performs no layout conversion.
+    struct Host;
+    struct Leaf<D, C, S> {
+        bytes: Arc<HostBuffer>,
+        form: PhantomData<(D, C, S)>,
+    }
+
+    impl Memory for Host {
+        type Tensor<D: MaterializableScalar, C: M + 'static, S: M + 'static> = Leaf<D, C, S>;
+    }
+
+    impl<D, C, S> Clone for Leaf<D, C, S> {
+        fn clone(&self) -> Self {
+            Self {
+                bytes: self.bytes.clone(),
+                form: PhantomData,
+            }
+        }
+    }
+
+    impl<D, C, S> Leaf<D, C, S> {
+        fn split(_: &Context<'_>, leaf: Self) -> Result<(Self, Self), LoadError> {
+            Ok((leaf.clone(), leaf))
+        }
+    }
+
+    impl<'a, D: MaterializableScalar, C: M + 'static, S: M + 'static> Load<&'a Checkpoint>
+        for Leaf<D, C, S>
+    {
+        fn load(cx: &mut Context<'_>, source: &'a Checkpoint) -> Result<Self, LoadError> {
+            cx.checkpoint(source, |cx| {
+                cx.leaf(
+                    source,
+                    |cx| {
+                        let host = source.host::<D, S, m![{ C }, { S }]>(cx)?;
+                        Ok(Self {
+                            bytes: Arc::new(host.into_buffer()),
+                            form: PhantomData,
+                        })
+                    },
+                    Self::split,
+                )
+            })
+        }
+    }
+
+    impl<D: MaterializableScalar, C: M + 'static, S: M + 'static, E: M> Load<HostTensor<D, E>>
+        for Leaf<D, C, S>
+    {
+        fn load(cx: &mut Context<'_>, host: HostTensor<D, E>) -> Result<Self, LoadError> {
+            cx.share(
+                |_| {
+                    Ok(Self {
+                        bytes: Arc::new(host.into_buffer()),
+                        form: PhantomData,
+                    })
+                },
+                Self::split,
+            )
+        }
+    }
+
+    struct Share;
+    impl<'t> Leaves<'t, Host, Host> for Share {
+        type Error = Infallible;
+
+        fn leaf<D: MaterializableScalar, C: M + 'static, S: M + 'static>(
+            &mut self,
+            leaf: &'t Leaf<D, C, S>,
+            _: Path<'_>,
+        ) -> Result<Leaf<D, C, S>, Infallible> {
+            Ok(leaf.clone())
+        }
+    }
+
+    struct Borrow;
+    impl<'t> Leaves<'t, Host, &'t Host> for Borrow {
+        type Error = Infallible;
+
+        fn leaf<D: MaterializableScalar, C: M + 'static, S: M + 'static>(
+            &mut self,
+            leaf: &'t Leaf<D, C, S>,
+            _: Path<'_>,
+        ) -> Result<&'t Leaf<D, C, S>, Infallible> {
+            Ok(leaf)
+        }
+    }
+
+    struct Seen {
+        path: String,
+        leaf: usize,
+        bytes: Arc<HostBuffer>,
+    }
+
+    #[derive(Default)]
+    struct Observe(Vec<Seen>);
+
+    impl Observe {
+        fn record<D, C, S>(&mut self, leaf: &Leaf<D, C, S>, path: Path<'_>) {
+            self.0.push(Seen {
+                path: path.to_string(),
+                leaf: std::ptr::from_ref(leaf).addr(),
+                bytes: leaf.bytes.clone(),
+            });
+        }
+    }
+
+    impl Visit<Host> for Observe {
+        type Error = Infallible;
+
+        fn leaf<D: MaterializableScalar, C: M + 'static, S: M + 'static>(
+            &mut self,
+            leaf: &Leaf<D, C, S>,
+            path: Path<'_>,
+        ) -> Result<(), Infallible> {
+            self.record(leaf, path);
+            Ok(())
+        }
+    }
+
+    impl<'a> Visit<&'a Host> for Observe {
+        type Error = Infallible;
+
+        fn leaf<D: MaterializableScalar, C: M + 'static, S: M + 'static>(
+            &mut self,
+            leaf: &&'a Leaf<D, C, S>,
+            path: Path<'_>,
+        ) -> Result<(), Infallible> {
+            self.record(*leaf, path);
+            Ok(())
+        }
+    }
+
+    /// Loads real numerical modules, traverses and shares their array-backed tree, and lends
+    /// that tree without an HBM allocation.
+    #[test]
+    fn actual_array_layers_load_map_and_borrow_with_strict_ties() {
+        let mut source = Checkpoint::default();
+        let norm = bf16::from_f32(1.25)
+            .to_bits()
+            .to_le_bytes()
+            .repeat(Width::SIZE);
+        source
+            .insert(
+                "body.input.weight",
+                Dtype::BF16,
+                &[Width::SIZE],
+                norm.clone(),
+            )
+            .unwrap();
+        for layer in 0..2 {
+            source
+                .insert(
+                    &format!("body.{layer}.norm.weight"),
+                    Dtype::BF16,
+                    &[Width::SIZE],
+                    norm.clone(),
+                )
+                .unwrap();
+            for (name, shape) in [
+                ("up", [Wide::SIZE, Width::SIZE]),
+                ("down", [Width::SIZE, Wide::SIZE]),
+            ] {
+                let bytes = (0..shape.iter().product())
+                    .flat_map(|i: usize| {
+                        bf16::from_f32((i % 47) as f32 / 32.0 - 0.5)
+                            .to_bits()
+                            .to_le_bytes()
+                    })
+                    .collect();
+                source
+                    .insert(
+                        &format!("body.{layer}.{name}.weight"),
+                        Dtype::BF16,
+                        &shape,
+                        bytes,
+                    )
+                    .unwrap();
+            }
+        }
+        let load = |source: &Checkpoint| Tree::<Host>::load(&mut Context::new(None), source);
+        let tree = load(&source).unwrap();
+        let mut before = Observe::default();
+        Tree::<Hbm>::visit(&tree, &mut before, Path::ROOT).unwrap();
+        assert_eq!(
+            before
+                .0
+                .iter()
+                .map(|seen| seen.path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "body.0.input.weight.tensor",
+                "body.1.layers.0.0.norm.weight.tensor",
+                "body.1.layers.0.1.0.up.affine.weight",
+                "body.1.layers.0.1.1.down.affine.weight",
+                "body.1.layers.1.0.norm.weight.tensor",
+                "body.1.layers.1.1.0.up.affine.weight",
+                "body.1.layers.1.1.1.down.affine.weight",
+                "tied.affine.weight",
+            ]
+        );
+        assert!(Arc::ptr_eq(&before.0[2].bytes, &before.0[7].bytes));
+        for (first, second) in before.0[1..4].iter().zip(&before.0[4..7]) {
+            assert!(
+                !Arc::ptr_eq(&first.bytes, &second.bytes),
+                "layers own independent copies"
+            );
+            assert_eq!(&**first.bytes, &**second.bytes);
+        }
+
+        let shared: Tree<Host> = Tree::<Hbm>::map(&tree, &mut Share, Path::ROOT).unwrap();
+        let mut owned = Observe::default();
+        Tree::<Hbm>::visit(&shared, &mut owned, Path::ROOT).unwrap();
+        for (first, second) in before.0.iter().zip(&owned.0) {
+            assert_eq!(first.path, second.path);
+            assert!(Arc::ptr_eq(&first.bytes, &second.bytes));
+        }
+        drop(tree);
+        let borrowed: Tree<&Host> = Tree::<Hbm>::map(&shared, &mut Borrow, Path::ROOT).unwrap();
+        let mut lent = Observe::default();
+        Tree::<Hbm>::visit(&borrowed, &mut lent, Path::ROOT).unwrap();
+        for (first, second) in owned.0.iter().zip(&lent.0) {
+            assert_eq!(first.path, second.path);
+            assert_eq!(
+                first.leaf, second.leaf,
+                "borrowed leaves point into the owning tree"
+            );
+            assert!(Arc::ptr_eq(&first.bytes, &second.bytes));
+        }
+
+        let mut invalid = source.read();
+        invalid.remove("body.1.down.weight");
+        assert!(
+            matches!(load(&invalid).err(), Some(LoadError::Missing(names)) if names == ["body.1.down.weight"])
+        );
+        let mut invalid = source.read();
+        invalid
+            .insert("extra", Dtype::BF16, &[1], vec![0; 2])
+            .unwrap();
+        assert!(
+            matches!(load(&invalid).err(), Some(LoadError::Unexpected(names)) if names == ["extra"])
+        );
+
+        let stored = source.get("body.0.up.weight").unwrap().data().to_vec();
+        source
+            .insert(
+                "tied.weight",
+                Dtype::BF16,
+                &[Wide::SIZE, Width::SIZE],
+                stored.clone(),
+            )
+            .unwrap();
+        let matching = load(&source).expect("a matching stored copy is a valid tie");
+        let mut seen = Observe::default();
+        Tree::<Hbm>::visit(&matching, &mut seen, Path::ROOT).unwrap();
+        assert!(Arc::ptr_eq(&seen.0[2].bytes, &seen.0[7].bytes));
+        source.remove("tied.weight");
+        let mut conflicting = stored;
+        conflicting[0] ^= 1;
+        source
+            .insert(
+                "tied.weight",
+                Dtype::BF16,
+                &[Wide::SIZE, Width::SIZE],
+                conflicting,
+            )
+            .unwrap();
+        assert!(
+            matches!(load(&source).err(), Some(LoadError::InvalidData { name, reason })
+            if name == "tied.weight" && reason == "tied copy differs from body.0.up.weight")
+        );
     }
 }

@@ -2,12 +2,14 @@
 
 use super::Modulated;
 use crate::load::Load;
+use crate::tensor::memory::residency::Residency;
 use crate::{Module, Then};
 use furiosa_opt_std::prelude::{Device, DeviceSend};
 
 /// Modulates pre-norm attention and feed-forward residuals from a shared condition; `norm` is the
 /// attention's, `feedforward_norm` the feed-forward's.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(Modulation, Attention, FeedForward, Norm, Gate, FeedForwardNorm))]
 pub struct Adaptive<Modulation, Attention, FeedForward, Norm, Gate, FeedForwardNorm = Norm> {
     #[load(rename = "")]
     pub modulation: Modulation,

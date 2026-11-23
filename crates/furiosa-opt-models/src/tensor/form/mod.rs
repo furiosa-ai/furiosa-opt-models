@@ -9,9 +9,11 @@ use furiosa_opt_std::prelude::*;
 use crate::load::quantization::fp8 as online;
 use crate::load::{Checkpoint, Children, Context, Load, LoadError};
 use crate::tensor::memory::Memory;
+use crate::tensor::memory::residency::Residency;
 use crate::tensor::parallel::Chip;
 
 pub mod fp8;
+pub mod grouped;
 pub mod nvfp4;
 pub mod split;
 
@@ -509,7 +511,8 @@ where
 
 /// Retained BF16 parameter of shape `S` on chips `Chips`, held as `T`: the HBM tensor, or a
 /// borrow of it in a borrowed tree.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(T))]
 pub struct Weight<S: M, Chips: M = m![1], T = HbmTensor<bf16, Chips, S>> {
     #[load(rename = "")]
     tensor: T,

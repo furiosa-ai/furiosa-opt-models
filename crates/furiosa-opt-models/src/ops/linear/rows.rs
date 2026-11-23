@@ -18,6 +18,12 @@ use crate::Op;
 use crate::specialize::contraction;
 use furiosa_opt_std::prelude::*;
 
+pub(crate) use live::Projection as LiveProjection;
+
+pub(crate) mod grouped;
+mod live;
+mod tiled;
+
 /// Rows projected by `weight` plus `bias`, block by block, into `Out` rows.
 pub(crate) struct Projection<'a, I: AxisName, O: AxisName, R: AxisName, Chips: M, Bias, Out = bf16>
 {

@@ -8,6 +8,7 @@ use crate::load::LoadError;
 use crate::modules::generic::collection::View;
 use crate::ops::pointwise::cast::Convert;
 use crate::tensor::mapping::Packet;
+use crate::tensor::memory::residency::Residency;
 use core::borrow::Borrow;
 use core::f32::consts::FRAC_PI_2;
 use core::f32::consts::TAU;
@@ -26,6 +27,8 @@ use crate::tensor::{live::Live, mapping::Rows as Layout};
 use crate::ops::pointwise::multiply::QueryScale;
 use crate::tensor::axis;
 use crate::tensor::mapping::BroadcastClusters as Cluster;
+
+mod ahead;
 
 // The rotation pairs each position with the one a half-head away: `Half` is the half a value is
 // read from, `OutputHalf` the half it is rotated into, `Row` its position within either.
@@ -330,7 +333,8 @@ type CoefficientSlices<Rows, Rotated, Chips = Chip> =
 
 /// Produce each row's rotation from the frequency of each rotated coordinate and the row's token
 /// position; each constant is held as `T`: the HBM tensor, or a borrow of it in a borrowed tree.
-#[derive(DeviceSend)]
+#[derive(DeviceSend, Residency)]
+#[residency(children(T))]
 pub struct Coefficients<Rotated: AxisName, Chips: M = Chip, T = Parameters<Rotated, Chips>> {
     /// The first input half's coefficients.
     low: Component<T>,
@@ -342,7 +346,8 @@ pub struct Coefficients<Rotated: AxisName, Chips: M = Chip, T = Parameters<Rotat
 }
 
 /// The constants of one half's coefficients: the sine of each angle times `sign` plus `phase`.
-#[derive(DeviceSend)]
+#[derive(DeviceSend, Residency)]
+#[residency(children(T))]
 pub struct Component<T> {
     /// Phase shifts in radians.
     phase: T,
@@ -974,7 +979,7 @@ type HeadTile<Heads, Head, D = bf16, Chips = Chip> =
 
 /// Rotate the first Rotated/2 pairs across the two Head/2 halves by each row's rotation; `D` is
 /// the element type of the rotated key output.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
 pub struct Rotary<Head: AxisName, Rotated: AxisName = Head, D: Scalar = bf16, Chips: M = Chip>(
     PhantomData<(Head, Rotated, D, Chips)>,
 );
@@ -1061,6 +1066,80 @@ impl<'q, 'k, Head: AxisName, Width: AxisName, R: AxisName, Chips: M>
             Heads::<Width, R, Head, Chips, _>(PhantomData).forward(&mut *device, (query, rotation)),
             Heads::<Width, R, Head, Chips, _>(PhantomData).forward(device, (key, rotation)),
         )
+    }
+}
+
+/// Rotate the HBM query/key tiles intersecting one shared live interval.
+///
+/// Partial edge tiles must also be initialized in both inputs. The row tile has
+/// `2 * (256 / next_power_of_two((Width / Head) / kept)) * depth` rows, where
+/// `kept = max(1, 256 / Head)` and `depth` is 8 for heads at most 64 wide, otherwise 4.
+/// The returned interval remains exactly the input interval; aligned intervals touch no
+/// surrounding rows. Empty work reads neither tensors nor coefficient tables.
+impl<Head: AxisName, Width: AxisName, R: AxisName, Chips: M>
+    crate::Op<(
+        Live<
+            (
+                &HbmTensor<bf16, Chips, m![R, Width]>,
+                &HbmTensor<bf16, Chips, m![R, Width]>,
+            ),
+            R,
+        >,
+        &Rotation<Head, Chips, R>,
+    )> for Rotary<Head, Head, bf16, Chips>
+{
+    type Output = Live<
+        (
+            HbmTensor<bf16, Chips, m![R, Width]>,
+            HbmTensor<bf16, Chips, m![R, Width]>,
+        ),
+        R,
+    >;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (input, rotation): (
+            Live<
+                (
+                    &HbmTensor<bf16, Chips, m![R, Width]>,
+                    &HbmTensor<bf16, Chips, m![R, Width]>,
+                ),
+                R,
+            >,
+            &Rotation<Head, Chips, R>,
+        ),
+    ) -> Self::Output {
+        let (mut query, mut key) = (HbmTensor::new(), HbmTensor::new());
+        self.write_live(device, (input, rotation), (&mut query, &mut key))
+            .with((query, key))
+    }
+}
+
+impl<Head: AxisName, Chips: M> Rotary<Head, Head, bf16, Chips> {
+    /// Write rotated Q/K into caller-owned HBM storage. Only tiles intersecting the live
+    /// interval are written; all other rows retain their bytes. The edge-padding contract
+    /// is the same as the HBM Live `Op` implementation. Input tiles and their coefficient
+    /// tables prefetch together.
+    pub fn write_live<Width: AxisName, R: AxisName>(
+        &self,
+        device: &mut Device,
+        (input, rotation): (
+            Live<
+                (
+                    &HbmTensor<bf16, Chips, m![R, Width]>,
+                    &HbmTensor<bf16, Chips, m![R, Width]>,
+                ),
+                R,
+            >,
+            &Rotation<Head, Chips, R>,
+        ),
+        output: (
+            &mut HbmTensor<bf16, Chips, m![R, Width]>,
+            &mut HbmTensor<bf16, Chips, m![R, Width]>,
+        ),
+    ) -> Live<(), R> {
+        ahead::write_live(device, (input, rotation), output)
     }
 }
 

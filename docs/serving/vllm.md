@@ -1,6 +1,7 @@
 # vLLM options
 
 This page lists the vLLM options the plugin overrides or checks; other options keep vLLM's behavior.
+For H3's `--omni`, eager-mode requirements and option refusals, see [MiniMax H3](minimax-h3.md).
 [Serving](index.md) shows each serving task, and [Integrating frameworks](../engine/frameworks.md#return-the-rows-the-framework-needs) explains which steps take their tokens from the device.
 
 ## Options

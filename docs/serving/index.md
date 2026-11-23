@@ -5,13 +5,17 @@
 The vLLM and SGLang plugins serve model functions through each framework's own Python and HTTP APIs, and the model computation runs on RNGD.
 This page shows each serving task for both frameworks; the tabs switch together.
 Install a plugin first ([Installation](../getting-started/installation.md)); [Quickstart](../getting-started/quickstart.md) shows text generation.
+For video with stereo audio through vLLM-Omni, see [MiniMax H3](minimax-h3.md).
 
 ## Feature support
+
+Unless H3 is named explicitly, this table describes decoder and pooling servers. H3 has its own [supported profile and restrictions](minimax-h3.md).
 
 | Feature | vLLM | SGLang | Details |
 | --- | --- | --- | --- |
 | Text generation | <span class="support support-yes">Supported</span> (greedy decoding) | <span class="support support-yes">Supported</span> (greedy decoding) | [Quickstart](../getting-started/quickstart.md#serve-over-http) |
 | Embeddings | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Serve embeddings](#serve-embeddings) |
+| Video with stereo audio from text | <span class="support support-yes">Supported</span> (vLLM-Omni, H3 only) | <span class="support support-no">Not yet</span> | [MiniMax H3](minimax-h3.md) |
 | Reranking | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Classification and rewards from a score head | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Multimodal inputs (images, video, audio) | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
@@ -30,7 +34,7 @@ Install a plugin first ([Installation](../getting-started/installation.md)); [Qu
 | Sleep mode | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> (without speculative decoding) | [Put the server to sleep](#put-the-server-to-sleep) |
 | Long contexts, up to the compiled window | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Serve long contexts](#serve-long-contexts) |
 | Context extension past the trained length | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Extend the context past the trained length](#extend-the-context-past-the-trained-length) |
-| Tensor parallelism over a compiled chip count | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
+| Tensor parallelism over a compiled chip count | <span class="support support-yes">H3 only</span> (four chips, one Omni worker) | <span class="support support-no">Not yet</span> | [H3 placement](minimax-h3.md#serving); decoder servers still use one chip |
 | Data parallelism | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Run data-parallel replicas](#run-data-parallel-replicas) |
 | Pipeline, expert and context parallelism | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | LoRA | <span class="support support-yes">Supported</span> | <span class="support support-no">Not yet</span> | [Serve LoRA adapters](#serve-lora-adapters) |
@@ -389,6 +393,6 @@ Why each feature is not served yet:
 - **Speculative methods other than ngram and suffix** (vLLM, which also has no draft model yet) or NGRAM and STANDALONE (SGLang).
 - **FP8 KV cache and quantized checkpoints**: the served checkpoints load BF16 weights and cache keys and values in BF16.
 - **Online quantization** with SGLang, and with vLLM any method but `fp8_per_tensor`: the other methods quantize the activations too or use other formats, and the SGLang plugin passes no quantization to the load.
-- **Tensor, pipeline, expert and context parallelism**, and serving across nodes: each served checkpoint runs on one chip.
+- **Tensor parallelism for decoder servers**, plus pipeline, expert and context parallelism and serving across nodes: decoder checkpoints run on one chip. [MiniMax H3](minimax-h3.md) uses four RNGD chips through one vLLM-Omni worker.
 - **LoRA with SGLang**: `--enable-lora` and `--lora-paths` are refused; the SGLang plugin runs no adapter yet.
 - **Disaggregated prefill, KV connectors and a disaggregated encoder**: no cache row moves to another instance, and of a disaggregated encoder only the [encoder-only instance](#embed-media-on-an-encoder-only-instance) runs.

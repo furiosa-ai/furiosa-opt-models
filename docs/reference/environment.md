@@ -23,3 +23,5 @@ Framework variables, such as vLLM's, keep their framework's meaning.
 | Variable | Effect |
 | --- | --- |
 | `FURIOSA_OPT_REFERENCES` | Directory of downloaded [reference outputs](../develop/testing.md#reference-outputs), each in `<directory>/<tag>`. The tests of an inventory row that names a reference read it there. |
+| `FURIOSA_H3_CHECKPOINT` | Local MiniMax H3 checkpoint root or `FL2VA` directory for the opt-in [H3 tests](../serving/minimax-h3.md#private-reference-tests). No weights are downloaded by these tests. |
+| `FURIOSA_H3_GOLDEN` | Private H3 reference directory containing `manifest.json`, `inputs.safetensors` and `outputs.safetensors` for the recorded request. The opt-in tests validate the checkpoint identity, workload, hashes and tensor contracts. There is no public reference-download fallback. |

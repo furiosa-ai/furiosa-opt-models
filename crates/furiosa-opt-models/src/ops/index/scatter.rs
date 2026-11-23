@@ -12,9 +12,10 @@ use crate::ops::reduction::Selected;
 use crate::specialize::index::store;
 use crate::tensor::cache::Blocks;
 use crate::tensor::cache::{Block, KeyValue};
+use crate::tensor::memory::residency::Residency;
 use crate::tensor::{
     axis::{self, Lanes, Single, Tile},
-    live::Live,
+    live::{BlockPrefix, Live},
     mapping::Rows as Layout,
     parallel::Chip,
 };
@@ -217,6 +218,38 @@ impl<D: MaterializableScalar, Chips: M, E: M>
     }
 }
 
+/// Copy a checked initialized prefix into equal-capacity storage, leaving its suffix untouched.
+impl<D: MaterializableScalar, R: AxisName, W: AxisName, C: M, B: AxisName>
+    Op<(
+        &BlockPrefix<&HbmTensor<D, C, m![R, W]>, R, B>,
+        &mut HbmTensor<D, C, m![R, W]>,
+    )> for Store
+{
+    type Output = ();
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (input, output): (
+            &BlockPrefix<&HbmTensor<D, C, m![R, W]>, R, B>,
+            &mut HbmTensor<D, C, m![R, W]>,
+        ),
+    ) {
+        for index in 0..input.blocks() {
+            input
+                .value()
+                .view()
+                .tile::<m![R / B], 1, m![R / B = 1 # (R / B), R % B, W]>(index)
+                .to_hbm_view(
+                    &mut device.tdma,
+                    output
+                        .view_mut()
+                        .tile::<m![R / B], 1, m![R / B = 1 #{!} (R / B), R % B, W]>(index),
+                );
+        }
+    }
+}
+
 /// Tile `at` of an envelope's rows, `N` rows a tile, into storage its caller owns.
 impl<D: MaterializableScalar, R: AxisName, S: AxisName, const N: usize, Chips: M + 'static>
     Op<(
@@ -314,7 +347,7 @@ where
 }
 
 /// Write key and value rows to distinct physical byte offsets, bounded by the supplied count.
-#[derive(Default, DeviceSend, Load)]
+#[derive(Default, DeviceSend, Load, Residency)]
 pub struct Scatter;
 
 /// The offsets and count are owned or borrowed, so a count every layer shares stays one operand.
@@ -874,8 +907,9 @@ impl<Reach: AxisName, Heads: AxisName, Head: AxisName, R: AxisName, Chips: M + '
 
 /// `N` learned rows written over rows `AT..AT + N` of a stream, after its `AT` tokens: the rows of
 /// its checkpoint tensor, then zero rows, held as `T`, the HBM tensor or a borrow of it.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
 #[load(tree)]
+#[residency(children(T))]
 pub struct Registers<
     W: AxisName,
     const AT: usize,

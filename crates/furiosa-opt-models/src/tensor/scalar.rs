@@ -2,6 +2,7 @@
 //! that compute on it.
 
 use crate::load::{Context, Load, LoadError};
+use crate::tensor::memory::residency::Residency;
 use crate::tensor::{
     mapping::{BroadcastClusters as Cluster, BroadcastSlices as Slices},
     parallel::Chip,
@@ -12,7 +13,7 @@ use furiosa_opt_std::prelude::*;
 pub type Value<Chips = Chip> = HbmTensor<i32, Chips, m![1]>;
 
 /// An FP32 fixed when the kernel compiles, as its bits: a score multiplier or a norm epsilon.
-#[derive(Clone, Copy, Debug, DeviceSend, Load)]
+#[derive(Clone, Copy, Debug, DeviceSend, Load, Residency)]
 pub struct F32<const BITS: usize>;
 
 impl<const BITS: usize> From<F32<BITS>> for f32 {

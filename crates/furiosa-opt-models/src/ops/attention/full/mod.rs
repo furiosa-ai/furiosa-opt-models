@@ -14,6 +14,8 @@ use crate::ops::linear::Linear;
 use crate::ops::normalization;
 use crate::ops::rotary;
 use crate::ops::rotary::Rotary;
+use crate::specialize::attention::{Flash, Strategy};
+use crate::tensor::memory::residency::Residency;
 use crate::tensor::parallel::Chip;
 use crate::tensor::scalar;
 use crate::tensor::scalar::F32;
@@ -24,9 +26,14 @@ use furiosa_opt_std::runtime::HostBuffer;
 
 /// The attention op, as the FP8 execution form's files implement it from here.
 pub(crate) use super::Attention;
+pub use grouped::Joined;
+pub use pack::{PackInputs, PackKeys, PackPlan};
 
+mod grouped;
 pub mod head;
+pub mod pack;
 pub mod paged;
+mod text;
 
 /// A row's query, key and value columns, `W` each, in that order.
 #[derive(Clone, Debug)]
@@ -39,7 +46,8 @@ impl<W: AxisName> AxisName for Joint<W> {
 
 /// Rows projected once into query, key and value columns, each returned as rows; a load orders the
 /// head-major `weight` by part, pairing query and key features by `Rotated`, each chip its heads.
-#[derive(DeviceSend)]
+#[derive(DeviceSend, Residency)]
+#[residency(children(L))]
 pub struct Projection<L, Head, Rotated = Head>(pub L, PhantomData<fn() -> (Head, Rotated)>);
 
 impl<L, Head, Rotated> Projection<L, Head, Rotated> {
@@ -766,6 +774,43 @@ impl<
     }
 }
 
+/// The same finite text-envelope preparation, with the single-pass flash strategy selected explicitly.
+impl<
+    const LIVE: usize,
+    const ROWS: usize,
+    W: AxisName,
+    Heads: AxisName,
+    K: AxisName,
+    Chips: M,
+    const BITS: usize,
+>
+    Op<(
+        &Rows<bf16, Text<LIVE, ROWS>, W, Chips>,
+        &Rows<bf16, Text<LIVE, ROWS>, W, Chips>,
+        &Rows<bf16, Text<LIVE, ROWS>, W, Chips>,
+        (&flash::Visible<K, Chips>, &scalar::Value<Chips>),
+    )> for Attention<PhantomData<Heads>, F32<BITS>, { Strategy::Items }, { Flash::SinglePass }>
+{
+    type Output = Rows<bf16, Text<LIVE, ROWS>, W, Chips>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (query, key, value, (visible, live)): (
+            &Rows<bf16, Text<LIVE, ROWS>, W, Chips>,
+            &Rows<bf16, Text<LIVE, ROWS>, W, Chips>,
+            &Rows<bf16, Text<LIVE, ROWS>, W, Chips>,
+            (&flash::Visible<K, Chips>, &scalar::Value<Chips>),
+        ),
+    ) -> Self::Output {
+        text::attend::<LIVE, ROWS, W, Heads, K, Chips, _>(
+            device,
+            self,
+            (query, key, value, (visible, live)),
+        )
+    }
+}
+
 /// The same attention with the context a layer of a collection lends it.
 impl<
     'c,
@@ -804,7 +849,8 @@ impl<
 
 /// Each head normalized alone over flattened feature columns, its `weight` gain in the order the
 /// `Rotated` rotation pairs the features; `EPSILON` holds epsilon's FP32 bits, which a load places.
-#[derive(DeviceSend)]
+#[derive(DeviceSend, Residency)]
+#[residency(children(Parameter, Epsilon))]
 pub struct HeadNorm<
     Head: AxisName,
     Chips: M = m![1],
@@ -817,6 +863,12 @@ pub struct HeadNorm<
     pub epsilon: Epsilon,
     pub head: PhantomData<(Head, Chips, Rotated)>,
 }
+
+/// Head-major BF16 rows scaled as `(x * gain) / sqrt(mean(x²) + epsilon)`.
+/// The wrapped head norm supplies its existing gain and epsilon; division stays in the final
+/// scaling pass, retaining that arithmetic's BF16 rounding rather than multiplying a reciprocal.
+#[derive(DeviceSend)]
+pub struct Division<Norm>(pub Norm);
 
 /// The rotation-ordered gain of a head norm, on every chip of `C`.
 type Gain<Head, C> = HostTensor<f32, m![{ C }, { m![Head] }]>;
@@ -982,6 +1034,7 @@ impl<D: Scalar, Head: AxisName, Width: AxisName, Count: AxisName> Op<&Rows<D, Co
 /// Head rows of a row sequence in HBM.
 pub(crate) mod heads {
     use crate::ops::normalization::{self, Root, Scale, Squares};
+    use crate::tensor::live::Live;
     use core::borrow::Borrow;
     use furiosa_opt_std::prelude::*;
     use std::marker::PhantomData;
@@ -1271,6 +1324,215 @@ pub(crate) mod heads {
         }
     }
 
+    impl<
+        Head: AxisName,
+        Width: AxisName,
+        Count: AxisName,
+        Chips: M,
+        Parameter,
+        Epsilon,
+        const EPSILON: usize,
+        Rotated,
+    > crate::Op<Live<&HbmTensor<bf16, Chips, m![Count, Width]>, Count>>
+        for super::HeadNorm<Head, Chips, Parameter, Epsilon, EPSILON, Rotated>
+    where
+        Parameter: Borrow<HbmTensor<f32, Chips, m![Head]>>,
+        Epsilon: Borrow<HbmTensor<f32, Chips, m![1]>>,
+    {
+        type Output = Live<HbmTensor<bf16, Chips, m![Count, Width]>, Count>;
+
+        fn forward(
+            &self,
+            device: &mut Device,
+            input: Live<&HbmTensor<bf16, Chips, m![Count, Width]>, Count>,
+        ) -> Self::Output {
+            let mut output = HbmTensor::new();
+            self.write_live(device, input.with(*input.value()), &mut output);
+            input.with(output)
+        }
+    }
+
+    impl<Head: AxisName, Chips: M, Parameter, Epsilon, const EPSILON: usize, Rotated>
+        super::HeadNorm<Head, Chips, Parameter, Epsilon, EPSILON, Rotated>
+    where
+        Parameter: Borrow<HbmTensor<f32, Chips, m![Head]>>,
+        Epsilon: Borrow<HbmTensor<f32, Chips, m![1]>>,
+    {
+        /// Normalize the whole norm tiles intersecting `input`, preserving all other output rows.
+        ///
+        /// Each tile contains `2 * (256 / padded_heads) * lanes` rows, where `padded_heads` is
+        /// the next power of two of `Width / Head`, and `lanes` starts at 32 and halves until
+        /// the capacity is divisible by the tile size. Partial edge tiles must be initialized
+        /// in the input too; the returned interval does not grant access to that padding.
+        /// Aligned intervals read and write exactly their rows. Gains and epsilon stage once even
+        /// for empty work, but empty work reads no input rows and writes no output rows.
+        /// Allocation capacity never becomes initialized work.
+        pub fn write_live<Count: AxisName, Width: AxisName>(
+            &self,
+            device: &mut Device,
+            input: Live<&HbmTensor<bf16, Chips, m![Count, Width]>, Count>,
+            output: &mut HbmTensor<bf16, Chips, m![Count, Width]>,
+        ) -> Live<(), Count> {
+            let (first_tile, tiles) = input.groups::<Block<Count, Width, Head>>();
+            let input = input.with(*input.value());
+            let fill = |device: &mut Device,
+                        rows: &HbmTensor<bf16, Chips, m![Count, Width]>,
+                        at: usize,
+                        part: &mut Part<Count, Width, Head, Chips>| {
+                // SAFETY: the tiles split the rows in order and a row is its heads in order.
+                unsafe { rows.view().reshape::<Chips, Blocked<Count, Width, Head>>() }
+                    .tile::<m![{ Bs<Count, Width, Head> }], 1, m![
+                        { Bs<Count, Width, Head> } = 1 # ({ Bs<Count, Width, Head> }),
+                        { B<Count, Width, Head> },
+                        { H<Width, Head> },
+                        Head
+                    ]>(at)
+                    .to_dm_view(&mut device.tdma, part.view_mut());
+            };
+
+            let drain = |device: &mut Device,
+                         part: &Part<Count, Width, Head, Chips>,
+                         rows: &mut HbmTensor<bf16, Chips, m![Count, Width]>,
+                         at: usize| {
+                part.view().to_hbm_view(
+                    &mut device.tdma,
+                    // SAFETY: the tiles split the rows in order and a row is its heads in order.
+                    unsafe {
+                        rows.view_mut()
+                            .reshape::<Chips, Blocked<Count, Width, Head>>()
+                    }
+                    .tile::<m![{ Bs<Count, Width, Head> }], 1, m![
+                        { Bs<Count, Width, Head> } = 1 #{!} ({ Bs<Count, Width, Head> }),
+                        { B<Count, Width, Head> },
+                        { H<Width, Head> },
+                        Head
+                    ]>(at),
+                );
+            };
+
+            let inverse = |device: &mut Device,
+                           part: &Part<Count, Width, Head, Chips>,
+                           epsilon: &Scalar<Count, Width, Head, Chips>|
+             -> RowOperand<Count, Width, Head, Chips> {
+                let mean: Statistic<Count, Width, Head, Chips> =
+                    Squares::<
+                        Norm<Rows<Count, Width, Head>, Head>,
+                        Head,
+                        Rows<Count, Width, Head>,
+                        m![1],
+                        0,
+                    >::of(&mut device.main, part.view())
+                    .vector_final()
+                    .commit_trim::<m![1 # 8]>()
+                    .commit();
+                Root::<Rows<Count, Width, Head>, m![1 # 8]>::of(
+                    &mut device.sub,
+                    mean.view(),
+                    |square| square.vector_fp_binary(FpBinaryOp::AddF, epsilon),
+                )
+                .to_vrf()
+            };
+
+            let scale = |device: &mut Device,
+                         part: &Part<Count, Width, Head, Chips>,
+                         (weight, inverse): (
+                &VrfTensor<
+                    f32,
+                    Chips,
+                    Cluster<Count, Width, Head>,
+                    Groups<Count, Width, Head>,
+                    m![Head],
+                >,
+                &RowOperand<Count, Width, Head, Chips>,
+            ),
+                         output: &mut Part<Count, Width, Head, Chips>| {
+                Scale::<Norm<Rows<Count, Width, Head>, Head>>::of(
+                    &mut device.main,
+                    part.view(),
+                    inverse,
+                    weight,
+                )
+                .commit_view(output.view_mut());
+            };
+            let (weight, epsilon): (
+                &HbmTensor<f32, Chips, m![Head]>,
+                &HbmTensor<f32, Chips, m![1]>,
+            ) = (self.weight.borrow(), self.epsilon.borrow());
+            let weight: DmTensor<
+                f32,
+                Chips,
+                Cluster<Count, Width, Head>,
+                Groups<Count, Width, Head>,
+                m![Head],
+            > = weight.to_dm(&mut device.tdma);
+            let weight: VrfTensor<
+                f32,
+                Chips,
+                Cluster<Count, Width, Head>,
+                Groups<Count, Width, Head>,
+                m![Head],
+            > = device
+                .sub
+                .begin(weight.view())
+                .fetch::<m![Head / 8], m![Head % 8]>()
+                .collect::<m![Head / 8], m![Head % 8]>()
+                .to_vrf();
+            // One copy a slice, shared by its rows: a copy a row is written as one slow 32-byte
+            // write each.
+            let epsilon: DmTensor<
+                f32,
+                Chips,
+                Cluster<Count, Width, Head>,
+                Groups<Count, Width, Head>,
+                m![1 # 8],
+            > = epsilon.view().pad::<m![1 # 8]>().to_dm(&mut device.tdma);
+            let epsilon: Scalar<Count, Width, Head, Chips> = device
+                .sub
+                .begin(epsilon.view())
+                .fetch::<m![1], m![1 # 8]>()
+                .collect::<m![1], m![1 # 8]>()
+                .to_vrf();
+            let last = tiles.max(1) - 1;
+            let (mut current, mut next): (
+                Part<Count, Width, Head, Chips>,
+                Part<Count, Width, Head, Chips>,
+            ) = (DmTensor::new(), DmTensor::new());
+            let (mut kept, mut held): (
+                Part<Count, Width, Head, Chips>,
+                Part<Count, Width, Head, Chips>,
+            ) = (DmTensor::new(), DmTensor::new());
+            // Keep only row DMA conditional: staged VRF parameters remain outside runtime
+            // control flow, including for empty work, as in the ordinary full-capacity path.
+            for _ in 0..tiles.min(1) {
+                fill(device, input.value(), first_tile, &mut current);
+                fill(device, input.value(), first_tile + 1.min(last), &mut next);
+            }
+            // An odd count's last pair normalizes the last tile twice.
+            for pair in 0..(tiles + 1) / 2 {
+                let at = 2 * pair;
+                let first = inverse(device, &current, &epsilon);
+                let second = inverse(device, &next, &epsilon);
+                scale(device, &current, (&weight, &first), &mut kept);
+                fill(
+                    device,
+                    input.value(),
+                    first_tile + (at + 2).min(last),
+                    &mut current,
+                );
+                drain(device, &kept, output, first_tile + at);
+                scale(device, &next, (&weight, &second), &mut held);
+                fill(
+                    device,
+                    input.value(),
+                    first_tile + (at + 3).min(last),
+                    &mut next,
+                );
+                drain(device, &held, output, first_tile + (at + 1).min(last));
+            }
+            input.with(())
+        }
+    }
+
     /// Head rows a tile at a time, row-major or head-major, each slice 512 bytes of a row; the
     /// next tile arrives, and the last one stores, while the current one computes.
     pub(crate) mod tiles {
@@ -1279,8 +1541,9 @@ pub(crate) mod heads {
         use furiosa_opt_std::prelude::*;
         use std::marker::PhantomData;
 
-        use super::super::HeadNorm;
+        use super::super::{Division, HeadNorm};
         use super::H;
+        use crate::tensor::live::Live;
 
         /// The heads a slice holds of a row.
         #[derive(Clone, Debug)]
@@ -1572,6 +1835,52 @@ pub(crate) mod heads {
             }
         }
 
+        impl<Count: AxisName, Width: AxisName, Head: AxisName, Chips: M, Q: M, L, P>
+            crate::Op<(Live<&L, Count>, &mut L)> for Strips<Count, Width, Head, P, Chips, Q>
+        where
+            L: Layout<Count, Width, Head, Chips, Order = Q>,
+            P: Pass<Width, Head, Chips, Q>,
+        {
+            type Output = ();
+
+            fn forward(&self, device: &mut Device, (input, output): (Live<&L, Count>, &mut L)) {
+                let pass = &self.1;
+                let (first_tile, tiles) = input.groups::<Strip<Width, Head>>();
+                if tiles == 0 {
+                    return;
+                }
+                let (mut first, mut second): (
+                    Tile<bf16, Width, Head, Chips, Q>,
+                    Tile<bf16, Width, Head, Chips, Q>,
+                ) = (DmTensor::new(), DmTensor::new());
+                let (mut kept, mut held): (
+                    Tile<bf16, Width, Head, Chips, Q>,
+                    Tile<bf16, Width, Head, Chips, Q>,
+                ) = (DmTensor::new(), DmTensor::new());
+                input.value().to_dm(device, first_tile, &mut first);
+                if tiles > 1 {
+                    input.value().to_dm(device, first_tile + 1, &mut second);
+                }
+                for pair in 0..tiles / 2 {
+                    let at = 2 * pair;
+                    pass.apply(device, &first, first_tile + at, &mut kept);
+                    input
+                        .value()
+                        .to_dm(device, first_tile + (at + 2).min(tiles - 1), &mut first);
+                    output.store(device, &kept, first_tile + at);
+                    pass.apply(device, &second, first_tile + at + 1, &mut held);
+                    input
+                        .value()
+                        .to_dm(device, first_tile + (at + 3).min(tiles - 1), &mut second);
+                    output.store(device, &held, first_tile + at + 1);
+                }
+                if tiles % 2 == 1 {
+                    pass.apply(device, &first, first_tile + tiles - 1, &mut kept);
+                    output.store(device, &kept, first_tile + tiles - 1);
+                }
+            }
+        }
+
         /// One pass over the same tile of two row sequences, so what the tile's rows share writes
         /// once for both.
         pub(crate) trait Both<Width: AxisName, Head: AxisName, Chips: M, Q: M> {
@@ -1648,6 +1957,79 @@ pub(crate) mod heads {
                         device,
                         (&first.0, &first.1),
                         tiles - 1,
+                        (&mut kept.0, &mut kept.1),
+                    );
+                    store_both(device, &kept, tiles - 1);
+                }
+            }
+        }
+
+        impl<Count: AxisName, Width: AxisName, Head: AxisName, Chips: M, Q: M, L, P>
+            crate::Op<(Live<(&L, &L), Count>, (&mut L, &mut L))>
+            for Strips<Count, Width, Head, P, Chips, Q>
+        where
+            L: Layout<Count, Width, Head, Chips, Order = Q>,
+            P: Both<Width, Head, Chips, Q>,
+        {
+            type Output = ();
+
+            fn forward(
+                &self,
+                device: &mut Device,
+                (inputs, outputs): (Live<(&L, &L), Count>, (&mut L, &mut L)),
+            ) {
+                let pass = &self.1;
+                type Two<Width, Head, Chips, Q> = (
+                    Tile<bf16, Width, Head, Chips, Q>,
+                    Tile<bf16, Width, Head, Chips, Q>,
+                );
+                let (first_tile, tiles) = inputs.groups::<Strip<Width, Head>>();
+                if tiles == 0 {
+                    return;
+                }
+                let both_to_dm =
+                    |device: &mut Device, at: usize, both: &mut Two<Width, Head, Chips, Q>| {
+                        inputs.value().0.to_dm(device, first_tile + at, &mut both.0);
+                        inputs.value().1.to_dm(device, first_tile + at, &mut both.1);
+                    };
+                let (first_out, second_out) = outputs;
+                let mut store_both =
+                    |device: &mut Device, both: &Two<Width, Head, Chips, Q>, at: usize| {
+                        first_out.store(device, &both.0, first_tile + at);
+                        second_out.store(device, &both.1, first_tile + at);
+                    };
+                let mut first: Two<Width, Head, Chips, Q> = (DmTensor::new(), DmTensor::new());
+                let mut second: Two<Width, Head, Chips, Q> = (DmTensor::new(), DmTensor::new());
+                let mut kept: Two<Width, Head, Chips, Q> = (DmTensor::new(), DmTensor::new());
+                let mut held: Two<Width, Head, Chips, Q> = (DmTensor::new(), DmTensor::new());
+                both_to_dm(device, 0, &mut first);
+                if tiles > 1 {
+                    both_to_dm(device, 1, &mut second);
+                }
+                for pair in 0..tiles / 2 {
+                    let at = 2 * pair;
+                    pass.apply(
+                        device,
+                        (&first.0, &first.1),
+                        first_tile + at,
+                        (&mut kept.0, &mut kept.1),
+                    );
+                    both_to_dm(device, (at + 2).min(tiles - 1), &mut first);
+                    store_both(device, &kept, at);
+                    pass.apply(
+                        device,
+                        (&second.0, &second.1),
+                        first_tile + at + 1,
+                        (&mut held.0, &mut held.1),
+                    );
+                    both_to_dm(device, (at + 3).min(tiles - 1), &mut second);
+                    store_both(device, &held, at + 1);
+                }
+                if tiles % 2 == 1 {
+                    pass.apply(
+                        device,
+                        (&first.0, &first.1),
+                        first_tile + tiles - 1,
                         (&mut kept.0, &mut kept.1),
                     );
                     store_both(device, &kept, tiles - 1);
@@ -1751,6 +2133,120 @@ pub(crate) mod heads {
                 output
             }
         }
+
+        /// Gain-then-divide normalization for head-major rows.
+        struct Divide<Width: AxisName, Head: AxisName, Chips: M> {
+            weight: VrfTensor<f32, Chips, Half<Width, Head>, Slices<Width, Head>, m![Head]>,
+            epsilon: VrfTensor<f32, Chips, Half<Width, Head>, Slices<Width, Head>, m![1 # 8]>,
+        }
+
+        impl<Width: AxisName, Head: AxisName, Chips: M, Q: M> Pass<Width, Head, Chips, Q>
+            for Divide<Width, Head, Chips>
+        {
+            fn apply(
+                &self,
+                device: &mut Device,
+                rows: &Tile<bf16, Width, Head, Chips, Q>,
+                _: usize,
+                normalized: &mut Tile<bf16, Width, Head, Chips, Q>,
+            ) {
+                let mean: Statistic<Width, Head, Chips, Q> =
+                    Squares::<super::Norm<Q, Head>, Head, m![{ Q }], m![1], 0>::of(
+                        &mut device.main,
+                        rows.view(),
+                    )
+                    .vector_final()
+                    .commit_trim::<m![1 # 8]>()
+                    .commit();
+                let rms: RowOperand<Width, Head, Chips, Q> = device
+                    .sub
+                    .begin(mean.view())
+                    .fetch::<m![{ Q }], m![1 # 8]>()
+                    .collect::<m![{ Q }], m![1 # 8]>()
+                    .vector_init()
+                    .vector_intra_slice_tag(TagMode::Zero)
+                    .vector_narrow_trim::<m![1 # 4]>()
+                    .vector_fp_binary(FpBinaryOp::AddF, &self.epsilon)
+                    .vector_fp_unary(FpUnaryOp::Sqrt)
+                    .vector_widen_pad::<m![1 # 8]>()
+                    .vector_final()
+                    .to_vrf();
+                device
+                    .main
+                    .begin(rows.view())
+                    .fetch::<m![{ Q }, Head / 8], m![Head % 8]>()
+                    .fetch_cast::<f32>()
+                    .collect::<m![{ Q }, Head / 8], m![Head % 8]>()
+                    .vector_init()
+                    .vector_intra_slice_tag(TagMode::Zero)
+                    .vector_narrow_split::<m![{ Q }, Head / 8, Head % 8 / 4 % 2], m![Head % 4]>()
+                    .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &self.weight)
+                    .vector_fp_div(&rms)
+                    .vector_widen_concat::<m![{ Q }, Head / 8], m![Head % 8]>()
+                    .vector_final()
+                    .cast::<bf16, m![Head % 8 # 16]>()
+                    .commit_trim::<m![Head % 8]>()
+                    .commit_view(normalized.view_mut());
+            }
+        }
+
+        /// Every head row of `input` normalized by its RMS and the shared head weight.
+        impl<
+            Head: AxisName,
+            Width: AxisName,
+            Count: AxisName,
+            Chips: M,
+            Parameter,
+            Epsilon,
+            const EPSILON: usize,
+            Rotated,
+        > crate::Op<&Major<Count, Width, Head, Chips>>
+            for Division<&HeadNorm<Head, Chips, Parameter, Epsilon, EPSILON, Rotated>>
+        where
+            Parameter: Borrow<HbmTensor<f32, Chips, m![Head]>>,
+            Epsilon: Borrow<HbmTensor<f32, Chips, m![1]>>,
+        {
+            type Output = Major<Count, Width, Head, Chips>;
+
+            fn forward(
+                &self,
+                device: &mut Device,
+                input: &Major<Count, Width, Head, Chips>,
+            ) -> Self::Output {
+                let (weight, epsilon): (
+                    &HbmTensor<f32, Chips, m![Head]>,
+                    &HbmTensor<f32, Chips, m![1]>,
+                ) = (self.0.weight.borrow(), self.0.epsilon.borrow());
+                let weight: DmTensor<f32, Chips, Half<Width, Head>, Slices<Width, Head>, m![Head]> =
+                    weight.to_dm(&mut device.tdma);
+                let weight = device
+                    .sub
+                    .begin(weight.view())
+                    .fetch::<m![Head / 8], m![Head % 8]>()
+                    .collect::<m![Head / 8], m![Head % 8]>()
+                    .to_vrf();
+                let epsilon: DmTensor<
+                    f32,
+                    Chips,
+                    Half<Width, Head>,
+                    Slices<Width, Head>,
+                    m![1 # 8],
+                > = epsilon.view().pad::<m![1 # 8]>().to_dm(&mut device.tdma);
+                let epsilon = device
+                    .sub
+                    .begin(epsilon.view())
+                    .fetch::<m![1], m![1 # 8]>()
+                    .collect::<m![1], m![1 # 8]>()
+                    .to_vrf();
+                let mut output = HbmTensor::new();
+                Strips::<Count, Width, Head, _, Chips, Columns<Width, Head>>(
+                    PhantomData,
+                    Divide::<Width, Head, Chips> { weight, epsilon },
+                )
+                .forward(device, (Live::<(), Count>::all().with(input), &mut output));
+                output
+            }
+        }
     }
 }
 
@@ -1840,7 +2336,9 @@ mod tests {
         Width = 7168,
         Count = 512,
         Shard = 1792,
-        Sharded = 2048
+        Sharded = 2048,
+        TileWidth = 2048,
+        ShortHead = 64
     ];
 
     axes![
@@ -1899,7 +2397,7 @@ mod tests {
     }
 
     impl Fixture {
-        async fn heads_normalize_alone<Width: AxisName, Count: AxisName>() {
+        async fn heads_normalize_alone<Width: AxisName, Count: AxisName, Head: AxisName>() {
             let _lease = DEVICE.lock().await;
             let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
             let inputs: Vec<bf16> = random(Count::SIZE * Width::SIZE, 0x2545_f491_4f6c_dd1d)
@@ -1928,29 +2426,53 @@ mod tests {
                 .to_hbm::<m![1], m![Count, Width]>(&mut device.pdma)
                 .await
                 .unwrap();
-            let output = launch(normalized, (&mut device, &norm, &input))
+            let row_major = launch(normalized, (&mut device, &norm, &input))
                 .await
                 .unwrap()
                 .to_host::<m![Count, Width]>(&mut device.pdma)
                 .await
                 .unwrap()
                 .into_vec();
-            for (head, values) in inputs.chunks_exact(Head::SIZE).enumerate() {
-                let mean = values
-                    .iter()
-                    .map(|v| f64::from(v.to_f32()).powi(2))
-                    .sum::<f64>()
-                    / Head::SIZE as f64;
-                let inverse = 1.0 / (mean + 1e-5).sqrt();
-                for (dim, value) in values.iter().enumerate() {
-                    let expected = f64::from(value.to_f32()) * inverse * f64::from(weight[dim]);
-                    let got = f64::from(output[head * Head::SIZE + dim].to_f32());
-                    assert!(
-                        (got - expected).abs() <= expected.abs() / 128.0 + 1e-3,
-                        "row {} head {} dim {dim}: {got} vs {expected}",
-                        head / (Width::SIZE / Head::SIZE),
-                        head % (Width::SIZE / Head::SIZE),
-                    );
+            let major = HostTensor::<bf16, m![Count, Width]>::from_vec(inputs.clone())
+                .to_hbm::<m![1], m![Width / ({ Symbol<Head> }), Count, Width % ({ Symbol<Head> })]>(
+                    &mut device.pdma,
+                )
+                .await
+                .unwrap();
+            let ordinary = launch(normalized_major, (&mut device, &norm, &major))
+                .await
+                .unwrap();
+            let divided = launch(normalized_division, (&mut device, &norm, &major))
+                .await
+                .unwrap();
+            let mut outputs = vec![row_major];
+            for output in [ordinary, divided] {
+                outputs.push(
+                    output
+                        .to_host::<m![Count, Width]>(&mut device.pdma)
+                        .await
+                        .unwrap()
+                        .into_vec(),
+                );
+            }
+            for (variant, output) in outputs.iter().enumerate() {
+                for (head, values) in inputs.chunks_exact(Head::SIZE).enumerate() {
+                    let mean = values
+                        .iter()
+                        .map(|v| f64::from(v.to_f32()).powi(2))
+                        .sum::<f64>()
+                        / Head::SIZE as f64;
+                    let inverse = 1.0 / (mean + 1e-5).sqrt();
+                    for (dim, value) in values.iter().enumerate() {
+                        let expected = f64::from(value.to_f32()) * inverse * f64::from(weight[dim]);
+                        let got = f64::from(output[head * Head::SIZE + dim].to_f32());
+                        assert!(
+                            (got - expected).abs() <= expected.abs() / 128.0 + 1e-3,
+                            "variant {variant} row {} head {} dim {dim}: {got} vs {expected}",
+                            head / (Width::SIZE / Head::SIZE),
+                            head % (Width::SIZE / Head::SIZE),
+                        );
+                    }
                 }
             }
         }
@@ -2178,20 +2700,39 @@ mod tests {
         Fixture::fused_parts::<Double, Local>().await;
     }
     #[device(chip = 1)]
-    fn normalized<W: AxisName, C: AxisName>(
+    fn normalized<W: AxisName, C: AxisName, H: AxisName>(
         device: &mut Device,
-        norm: &HeadNorm<Head>,
+        norm: &HeadNorm<H>,
         input: &Rows<bf16, C, W>,
     ) -> Rows<bf16, C, W> {
         Op::forward(norm, device, input)
+    }
+
+    #[device(chip = 1)]
+    fn normalized_major<W: AxisName, C: AxisName, H: AxisName>(
+        device: &mut Device,
+        norm: &HeadNorm<H>,
+        input: &heads::tiles::Major<C, W, H, m![1]>,
+    ) -> heads::tiles::Major<C, W, H, m![1]> {
+        Op::forward(norm, device, input)
+    }
+
+    #[device(chip = 1)]
+    fn normalized_division<W: AxisName, C: AxisName, H: AxisName>(
+        device: &mut Device,
+        norm: &HeadNorm<H>,
+        input: &heads::tiles::Major<C, W, H, m![1]>,
+    ) -> heads::tiles::Major<C, W, H, m![1]> {
+        Op::forward(&Division(norm), device, input)
     }
 
     /// Each head of each row is RMS-normalized alone, as the FP64 definition rounded once to BF16;
     /// a row's heads differ in magnitude by up to 2^9, so a statistic shared across heads fails.
     #[tokio::test(flavor = "current_thread")]
     async fn normalizes_each_head_alone() {
-        Fixture::heads_normalize_alone::<Width, Count>().await;
-        Fixture::heads_normalize_alone::<Shard, Sharded>().await;
+        Fixture::heads_normalize_alone::<Width, Count, Head>().await;
+        Fixture::heads_normalize_alone::<Shard, Sharded, Head>().await;
+        Fixture::heads_normalize_alone::<TileWidth, Sharded, ShortHead>().await;
     }
 
     #[device(chip = 1)]
@@ -2248,7 +2789,7 @@ mod tests {
         live: &Value,
     ) -> Rows<bf16, Envelope, PairWidth> {
         Op::forward(
-            &Attention {
+            &Attention::<_, _> {
                 heads: PhantomData::<Two>,
                 scale: F32::<INVERSE_ROOT>,
             },
@@ -2349,5 +2890,266 @@ mod tests {
         let relative = (error / norm).sqrt();
         eprintln!("text attention: relative L2 {relative:.3e}");
         assert!(relative < 1e-2, "relative L2 {relative}");
+    }
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    //! Replicated refiner attention with one 2048-row envelope and explicit scattered key visibility.
+    //!
+    //! Synthetic finite Q/K/V exercise all 56 heads on every chip. Both single-pass and ordinary
+    //! attention use the shared envelope preparation and are checked against independent FP64
+    //! softmax values. This is an attention boundary contract, not an owning-refiner execution test.
+
+    use crate::Op;
+    use crate::ops::attention::Attention;
+    use crate::ops::attention::flash::{Head, Span, Visible};
+    use crate::ops::index::packed;
+    use crate::specialize::attention::{Flash, Strategy};
+    use crate::tensor::parallel::Shard;
+    use crate::tensor::scalar::{F32, Value};
+    use furiosa_opt_std::prelude::*;
+    use furiosa_opt_std::runtime::launch;
+    use std::marker::PhantomData;
+
+    axes![Width = 7168, Heads = 56, Spans = 3];
+
+    type Envelope = packed::Span<2048, 2048>;
+    type Chips = m![{ Symbol<Shard<4>> }];
+    type Rows = packed::Rows<Envelope, Width, Chips>;
+    type Mask = Visible<Spans, Chips>;
+    type Operands<'a> = (&'a Rows, &'a Rows, &'a Rows, &'a Mask, &'a Value<Chips>);
+    type Ordinary = Attention<PhantomData<Heads>, F32<SCALE>>;
+
+    const SCALE: usize = (std::f32::consts::FRAC_1_SQRT_2 / 8.).to_bits() as usize;
+    const KEY_BOUND: usize = 6144;
+    const CLASSES: usize = 7;
+    // Existing permanent attention gates use a 1e-2 relative RMS bound.
+    const LIMIT: f64 = 1e-2;
+
+    #[derive(Clone, Copy, Debug)]
+    struct Case {
+        valid: usize,
+        scattered: bool,
+        uniform: bool,
+    }
+
+    #[device(chip = 4)]
+    fn attend<A>(device: &mut Device, attention: &A, (q, k, v, mask, bound): Operands<'_>) -> Rows
+    where
+        A: DeviceSend,
+        A: for<'a> Op<(&'a Rows, &'a Rows, &'a Rows, (&'a Mask, &'a Value<Chips>)), Output = Rows>,
+    {
+        attention.forward(device, (q, k, v, (mask, bound)))
+    }
+
+    fn amplitude(chip: usize, row: usize, head: usize, uniform: bool) -> bf16 {
+        let integer = (row % CLASSES) as i32 - 3 + (head % 3) as i32 - (chip % 2) as i32;
+        bf16::from_f32(if uniform { 0. } else { integer as f32 * 4. })
+    }
+
+    fn key(row: usize, valid: usize, channel: usize) -> bf16 {
+        let value = if channel != 0 {
+            0.
+        } else if row < valid {
+            [-1., -0.5, 0.5, 1.][row % 4]
+        } else {
+            // Distracting padding is finite, and would dominate an accidentally unmasked key.
+            6. + (row % 3) as f32
+        };
+        bf16::from_f32(value)
+    }
+
+    fn value(chip: usize, row: usize, head: usize, channel: usize, valid: usize) -> bf16 {
+        let base = (32 + (chip * 5 + head * 3 + channel * 7) % 29) as f32 / 64.;
+        let part = [-3., -1., 1., 3.][row % 4] / 16.;
+        bf16::from_f32(base + part + if row < valid { 0. } else { 16. })
+    }
+
+    fn visible(case: Case, position: usize) -> bool {
+        if case.scattered {
+            // First/last keys of all three spans. A token-count bound would miss later spans.
+            [0, 2047, 2048, 4095, 4096, 6143].contains(&position)
+        } else {
+            position < case.valid
+        }
+    }
+
+    async fn upload(device: &mut Device, target: &mut Rows, case: Case, term: usize) {
+        let values = (0..4).flat_map(|chip| {
+            (0..Envelope::SIZE).flat_map(move |row| {
+                (0..Width::SIZE).map(move |column| {
+                    let (head, channel) = (column / Head::SIZE, column % Head::SIZE);
+                    match term {
+                        0 if channel == 0 => amplitude(chip, row, head, case.uniform),
+                        0 => bf16::from_f32(0.),
+                        1 => key(row, case.valid, channel),
+                        _ => value(chip, row, head, channel, case.valid),
+                    }
+                })
+            })
+        });
+        HostTensor::<bf16, m![{ Chips }, Envelope, Width]>::from_vec(values)
+            .to_hbm(&mut device.pdma)
+            .output(target)
+            .await
+            .unwrap();
+    }
+
+    // The source formula has four key/value classes. Count actual visible key positions, including
+    // repeated source rows in later spans; no production packing or attention helper is used here.
+    fn oracle(case: Case) -> Vec<f64> {
+        let mut counts = [0usize; 4];
+        for position in 0..KEY_BOUND {
+            if visible(case, position) {
+                counts[position % Envelope::SIZE % 4] += 1;
+            }
+        }
+        assert!(counts.iter().sum::<usize>() > 0);
+        let mut result = Vec::with_capacity(4 * Heads::SIZE * CLASSES * Head::SIZE);
+        for chip in 0..4 {
+            for head in 0..Heads::SIZE {
+                for class in 0..CLASSES {
+                    let q = f64::from(amplitude(chip, class, head, case.uniform).to_f32());
+                    let masses: [f64; 4] = std::array::from_fn(|kind| {
+                        let k = f64::from(key(kind, 2048, 0).to_f32());
+                        counts[kind] as f64
+                            * (q * k * f64::from(f32::from_bits(SCALE as u32))).exp()
+                    });
+                    let denominator = masses.iter().sum::<f64>();
+                    for channel in 0..Head::SIZE {
+                        let numerator = (0..4)
+                            .map(|kind| {
+                                masses[kind]
+                                    * f64::from(value(chip, kind, head, channel, 2048).to_f32())
+                            })
+                            .sum::<f64>();
+                        result.push(numerator / denominator);
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn check(actual: &[bf16], expected: &[f64], case: Case, variant: &str) {
+        assert_eq!(actual.len(), 4 * Envelope::SIZE * Width::SIZE);
+        for chip in 0..4 {
+            for row in 0..Envelope::SIZE {
+                for head in 0..Heads::SIZE {
+                    let mut error = 0.;
+                    let mut square = 0.;
+                    for channel in 0..Head::SIZE {
+                        let at = ((chip * Heads::SIZE + head) * CLASSES + row % CLASSES)
+                            * Head::SIZE
+                            + channel;
+                        let want = expected[at];
+                        let column = head * Head::SIZE + channel;
+                        let got = f64::from(
+                            actual[(chip * Envelope::SIZE + row) * Width::SIZE + column].to_f32(),
+                        );
+                        assert!(
+                            got.is_finite(),
+                            "{variant} {case:?} chip={chip} row={row} head={head} channel={channel}"
+                        );
+                        error += (got - want).powi(2);
+                        square += want.powi(2);
+                    }
+                    let relative = (error / square).sqrt();
+                    assert!(
+                        relative <= LIMIT,
+                        "{variant} {case:?} chip={chip} row={row} head={head} relative_RMS={relative}, limit={LIMIT}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn compact_and_ordinary_refiner_envelopes_preserve_masks_and_values() {
+        let _lease = crate::tests::DEVICE.lock().await;
+        const {
+            assert!(
+                Heads::SIZE * Head::SIZE == Width::SIZE && Spans::SIZE * Span::SIZE == KEY_BOUND
+            )
+        };
+        let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
+        let mut q = Rows::alloc(&device).unwrap();
+        let mut k = Rows::alloc(&device).unwrap();
+        let mut v = Rows::alloc(&device).unwrap();
+        let mut mask = Mask::alloc(&device).unwrap();
+        let bound: Value<Chips> = HostTensor::<i32, m![1]>::from_vec([KEY_BOUND as i32])
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap();
+        let single_pass = Attention::<
+            PhantomData<Heads>,
+            F32<SCALE>,
+            { Strategy::Items },
+            { Flash::SinglePass },
+        >::default();
+        let ordinary = Ordinary::default();
+        let mut cases: Vec<_> = [128, 129, 511, 1025, 2047, 2048, 1, 128, 2048, 129, 128]
+            .into_iter()
+            .enumerate()
+            .map(|(index, valid)| Case {
+                valid,
+                scattered: false,
+                uniform: index == 0,
+            })
+            .collect();
+        cases.insert(
+            6,
+            Case {
+                valid: 2048,
+                scattered: true,
+                uniform: false,
+            },
+        );
+        for (index, case) in cases.into_iter().enumerate() {
+            // Reuse allocations and rewrite every cell: shrink after growth cannot retain old keys.
+            upload(&mut device, &mut q, case, 0).await;
+            upload(&mut device, &mut k, case, 1).await;
+            upload(&mut device, &mut v, case, 2).await;
+            HostTensor::<bf16, m![{ Chips }, Spans, Span]>::from_vec((0..4).flat_map(|_| {
+                (0..KEY_BOUND).map(|position| bf16::from_f32(f32::from(visible(case, position))))
+            }))
+            .to_hbm(&mut device.pdma)
+            .output(&mut mask)
+            .await
+            .unwrap();
+            let expected = oracle(case);
+            // Alternate variant order while reusing the rewritten operands and mask.
+            for use_single_pass in [index % 2 == 0, index % 2 != 0] {
+                let variant = if use_single_pass {
+                    "single-pass"
+                } else {
+                    "ordinary"
+                };
+                let output = if use_single_pass {
+                    launch(
+                        attend,
+                        (&mut device, &single_pass, (&q, &k, &v, &mask, &bound)),
+                    )
+                    .await
+                    .unwrap()
+                } else {
+                    launch(
+                        attend,
+                        (&mut device, &ordinary, (&q, &k, &v, &mask, &bound)),
+                    )
+                    .await
+                    .unwrap()
+                };
+                output.ready().await.unwrap();
+                let values = output
+                    .to_host::<m![{ Chips }, Envelope, Width]>(&mut device.pdma)
+                    .await
+                    .unwrap()
+                    .into_vec();
+                check(&values, &expected, case, variant);
+                drop(output);
+            }
+        }
     }
 }

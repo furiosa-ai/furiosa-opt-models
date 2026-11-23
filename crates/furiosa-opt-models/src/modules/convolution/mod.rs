@@ -7,6 +7,7 @@ use crate::ops::convolution::activation::Snake;
 use crate::ops::convolution::frames::{self, Blocked, Doubled, Frames, Phase, Window};
 use crate::ops::convolution::transpose::{ConvolutionTranspose, Half, Quad, UpBand};
 use crate::ops::convolution::{Convolution, DownBand, Lag, Lane, Reach, Split, Term};
+use crate::tensor::memory::residency::Residency;
 use crate::tensor::parallel::Chip;
 use crate::{Module, Sequential, Then};
 pub use attention::Projection;
@@ -139,8 +140,9 @@ pub type Stack<First, Layer, const REPEATS: usize> = Sequential<First, [Layer; R
 
 /// `down(snake(up(x)))` by two from checkpoint `upsample.filter`, `downsample.lowpass.filter` and
 /// `act`: `input` repeats its edge samples over its padding rows, the result's are zero.
-#[derive(DeviceSend, Load)]
+#[derive(DeviceSend, Load, Residency)]
 #[load(tree)]
+#[residency(children(U, D, I, F))]
 pub struct AntiAliased<
     C: AxisName,
     X: M = Chip,
@@ -340,8 +342,30 @@ where
     }
 }
 
+/// Residual branches receive a reference to their input, which may already borrow its frame.
+impl<'x, 'a, D: MaterializableScalar + FetchCast<bf16>, C: AxisName, S: Doubled, X: M, U, B, I, F>
+    Module<&'x &'a Frames<D, C, S, X>, (), &mut ()> for AntiAliased<C, X, U, B, I, F>
+where
+    U: Borrow<UpBand<X>>,
+    B: Borrow<DownBand<X>>,
+    I: Borrow<HbmTensor<i32, X, m![C]>>,
+    F: Borrow<HbmTensor<f32, X, m![C]>>,
+{
+    type Output = Frames<bf16, C, S, X>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        env: (),
+        state: &mut (),
+        input: &'x &'a Frames<D, C, S, X>,
+    ) -> Self::Output {
+        self.forward(device, env, state, *input)
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::Module;
     use crate::load::Checkpoint;
     use crate::tests::DEVICE;
@@ -359,12 +383,7 @@ mod tests {
     impl frames::Doubled for Rows {
         type Twice = Span<8000, 32, 7980>;
     }
-    type Wide = Span<1040, 8, 1035>;
-
-    impl frames::Doubled for Wide {
-        type Twice = Span<2080, 16, 2070>;
-    }
-    axes![C = 16, W = 512];
+    axes![C = 16];
 
     /// The anti-aliasing filter every activation of the checkpoint stores.
     pub(crate) const KAISER: [f32; 12] = [
@@ -401,7 +420,7 @@ mod tests {
 
     /// A stereo signal and the checkpoint of an activation: its up-sampling and low-pass filters,
     /// and SnakeBeta's log-scale `alpha` and `beta` of each channel.
-    struct Case {
+    pub(crate) struct Case {
         signal: Vec<f32>,
         filters: ([f32; 12], [f32; 12]),
         alpha: Vec<f32>,
@@ -409,7 +428,11 @@ mod tests {
     }
 
     impl Case {
-        fn new(samples: usize, channels: usize, filters: ([f32; 12], [f32; 12])) -> Self {
+        pub(crate) fn new(
+            samples: usize,
+            channels: usize,
+            filters: ([f32; 12], [f32; 12]),
+        ) -> Self {
             let random = convolution::tests::Case::random;
             Self {
                 signal: random(2 * samples * channels, 21)
@@ -424,7 +447,7 @@ mod tests {
 
         /// The activation's checkpoint as the audio decoder stores one: both filters `[1, 1, 12]`
         /// and SnakeBeta's parameters `[C]`, in F32.
-        fn checkpoint(&self) -> Checkpoint {
+        pub(crate) fn checkpoint(&self) -> Checkpoint {
             let (up, down) = &self.filters;
             let (filter, channel) = ([1, 1, 12], [self.alpha.len()]);
             let mut checkpoint = Checkpoint::default();
@@ -440,7 +463,7 @@ mod tests {
             checkpoint
         }
 
-        fn frame<S: Window>(&self, channels: usize) -> Vec<f32> {
+        pub(crate) fn frame<S: Window>(&self, channels: usize) -> Vec<f32> {
             let (rows, samples) = (LEAD + S::SIZE + LEAD, S::SAMPLES);
             let mut frame = vec![0.0f32; 2 * rows * channels];
             for b in 0..2 {
@@ -495,7 +518,7 @@ mod tests {
 
         /// The live samples of every `stride`-th channel against the reference, and the padding
         /// rows the next convolution reads, zero on every channel.
-        fn check<S: Window>(&self, actual: &[bf16], channels: usize, stride: usize) {
+        pub(crate) fn check<S: Window>(&self, actual: &[bf16], channels: usize, stride: usize) {
             let (rows, samples) = (LEAD + S::SIZE + LEAD, S::SAMPLES);
             let mut worst = 0.0f64;
             for b in 0..2 {
@@ -533,15 +556,6 @@ mod tests {
         module.forward(device, (), &mut (), input)
     }
 
-    #[device(chip = 1)]
-    fn wide(
-        device: &mut Device,
-        input: &Frames<f32, W, Wide>,
-        module: &AntiAliased<W>,
-    ) -> Frames<bf16, W, Wide> {
-        module.forward(device, (), &mut (), input)
-    }
-
     /// Up-sampling, SnakeBeta and low-pass of a 16-channel stereo signal whose length is not a
     /// whole block, loaded from a checkpoint whose two filters differ: the definition with edge
     /// replication on the live samples, zero on the padding rows the next convolution reads.
@@ -566,27 +580,5 @@ mod tests {
             .unwrap()
             .into_vec();
         case.check::<Rows>(&actual, C::SIZE, 1);
-    }
-
-    /// The same over 512 channels in 32 packets of sixteen, both filters the checkpoint's.
-    #[tokio::test(flavor = "current_thread")]
-    async fn wide_activation_matches_definition() {
-        let _lease = DEVICE.lock().await;
-        let mut device = Device::new(wide.topology()).unwrap();
-        let case = Case::new(Wide::SAMPLES, W::SIZE, (KAISER, KAISER));
-        let input = HostTensor::<f32, m![Stereo, { frames::FrameRows<Wide> }, W]>::from_vec(
-            case.frame::<Wide>(W::SIZE),
-        )
-        .to_hbm::<Chip, m![Stereo, { frames::FrameRows<Wide> }, W]>(&mut device.pdma)
-        .await
-        .unwrap();
-        let module: AntiAliased<W> = case.checkpoint().load(&mut device).unwrap();
-        let output = launch(wide, (&mut device, &input, &module)).await.unwrap();
-        let actual = output
-            .to_host::<m![Stereo, { frames::FrameRows<Wide> }, W]>(&mut device.pdma)
-            .await
-            .unwrap()
-            .into_vec();
-        case.check::<Wide>(&actual, W::SIZE, 37);
     }
 }
