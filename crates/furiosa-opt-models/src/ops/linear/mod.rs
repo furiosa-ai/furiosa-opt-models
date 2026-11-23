@@ -4,7 +4,7 @@ pub use affine::{Affine, Bias, output, query};
 pub(crate) use affine::{Coefficients, Inputs, Outputs};
 pub(crate) use decode::Matrix;
 pub use experts::Experts;
-pub(crate) use rows::Projection;
+pub(crate) use rows::{LiveProjection, Projection};
 
 use core::borrow::Borrow;
 use core::marker::PhantomData;

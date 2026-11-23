@@ -27,7 +27,7 @@ where
         ),
     ) {
         let weight = super::rows::grouped::Packed(self.affine.weight.tensor());
-        super::rows::Projection::<In, Out, R, Chips, (), bf16, _>::new(&weight, &())
+        super::rows::LiveProjection::<In, Out, R, Chips, (), bf16, _>::new(&weight, &())
             .forward(device, (input, &mut super::rows::grouped::Output(output)));
     }
 }
@@ -76,7 +76,7 @@ where
             assert!(R::SIZE.is_multiple_of(256));
         }
         let weight = super::rows::grouped::Packed(self.affine.weight.tensor());
-        super::rows::Projection::<In, Out, R, Chips, (), bf16, _>::new(&weight, &())
+        super::rows::LiveProjection::<In, Out, R, Chips, (), bf16, _>::new(&weight, &())
             .prefix::<bf16, _, _, _, _, B>(
                 device,
                 *input.value(),

@@ -70,7 +70,7 @@ where
         let (mut query, mut key, mut value) =
             (HbmTensor::new(), HbmTensor::new(), HbmTensor::new());
         let weight = linear::rows::grouped::Packed(self.0.0.affine.weight.tensor());
-        linear::Projection::<In, Joint<W>, Pieces<S, N>, m![{ Symbol<Shard<N>> }], (), bf16, _>::new(
+        linear::LiveProjection::<In, Joint<W>, Pieces<S, N>, m![{ Symbol<Shard<N>> }], (), bf16, _>::new(
             &weight,
             &(),
         )
@@ -132,7 +132,7 @@ where
         let (mut query, mut key, mut value) =
             (HbmTensor::new(), HbmTensor::new(), HbmTensor::new());
         let weight = linear::rows::grouped::Packed(self.0.affine.weight.tensor());
-        linear::Projection::<In, Joint<W>, Pieces<S, N>, m![{ Symbol<Shard<N>> }], (), bf16, _>::new(
+        linear::LiveProjection::<In, Joint<W>, Pieces<S, N>, m![{ Symbol<Shard<N>> }], (), bf16, _>::new(
             &weight,
             &(),
         )
@@ -167,7 +167,7 @@ where
             (HbmTensor::new(), HbmTensor::new(), HbmTensor::new());
         let weight = linear::rows::grouped::Packed(self.0.affine.weight.tensor());
         let projection =
-            linear::Projection::<In, Joint<W>, R, Chips, (), bf16, _>::new(&weight, &());
+            linear::LiveProjection::<In, Joint<W>, R, Chips, (), bf16, _>::new(&weight, &());
         if const { <linear::rows::Passes<In, Joint<W>, R> as AxisName>::SIZE == 1 } {
             projection.forward(device, (input, &mut (&mut query, &mut key, &mut value)));
         } else {
@@ -217,7 +217,7 @@ where
         let (mut query, mut key, mut value) =
             (HbmTensor::new(), HbmTensor::new(), HbmTensor::new());
         let weight = linear::rows::grouped::Packed(self.0.affine.weight.tensor());
-        linear::Projection::<In, Joint<W>, Pieces<S, N>, m![{ Symbol<Shard<N>> }], (), bf16, _>::new(
+        linear::LiveProjection::<In, Joint<W>, Pieces<S, N>, m![{ Symbol<Shard<N>> }], (), bf16, _>::new(
             &weight, &(),
         ).tiled::<bf16, _, _, _, N, T, K, HEAD>(
             device, (tiles, &mut (&mut query, &mut key, &mut value)),

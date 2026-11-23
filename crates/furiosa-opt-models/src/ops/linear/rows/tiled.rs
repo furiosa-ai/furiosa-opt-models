@@ -8,9 +8,10 @@
 
 use core::marker::PhantomData;
 
+use super::live::{Projection, Slab};
 use super::{
-    B, Blocked, Bs, Cluster, Hr, InDm, Ks, Lines, Np, Offset, Parts, Passes, Projection, Register,
-    Result, Rounding, RowBlock, Rows, Sink, Slab, Source,
+    B, Blocked, Bs, Cluster, Hr, InDm, Ks, Lines, Np, Offset, Parts, Passes, Register, Result,
+    Rounding, RowBlock, Rows, Sink, Source,
 };
 use crate::ops::collective::{Owners, Pieces, TileRows, Tiled};
 use furiosa_opt_std::prelude::*;

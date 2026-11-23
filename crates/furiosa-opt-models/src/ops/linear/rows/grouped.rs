@@ -5,11 +5,12 @@
 //! each pass lands its output-column slab in DM through TDMA. The contraction
 //! is shared with ordinary row projections.
 
+use super::live::{Projection, Slab};
 use super::{
     B, Blocked, Bs, Chunked, Cluster, Hr, KeptOutputs, Ks, Np, PassOutputs, Result, Rows, Sink,
-    Slab, Weight,
+    Weight,
 };
-use super::{InDm, Offset, Parts, Pass, Passes, Projection, Rounding, Source, tiled};
+use super::{InDm, Offset, Parts, Pass, Passes, Rounding, Source, tiled};
 use crate::Op;
 use crate::tensor::form::grouped::Layout;
 use core::marker::PhantomData;

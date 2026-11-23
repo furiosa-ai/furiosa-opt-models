@@ -2,13 +2,54 @@
 
 use super::tiled::{Pending, Strided};
 use super::{
-    B, Bs, Hr, InDm, Ks, Lines, Offset, Passes, Projection, Register, Result, Rounding, RowBlock,
-    Sink, Slab, Source,
+    B, Bs, Chunked, Hr, InDm, Ks, Lines, Matrix, Offset, Passes, Register, Result, Rounding,
+    RowBlock, Sink, Source, Weight,
 };
 use crate::ops::collective::{Owners, Pieces, TileRows, Tiled};
 use crate::tensor::live::{BlockPrefix, Live};
 use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
+
+/// Row-tile projection with layout-specific coefficient storage for Live and grouped paths.
+pub(crate) struct Projection<
+    'a,
+    I: AxisName,
+    O: AxisName,
+    R: AxisName,
+    Chips: M,
+    Bias,
+    Out = bf16,
+    W = HbmTensor<bf16, Chips, m![O, I]>,
+> {
+    pub(super) weight: &'a W,
+    pub(super) bias: &'a Bias,
+    rows: PhantomData<(I, O, R, Chips, Out)>,
+}
+
+impl<'a, I: AxisName, O: AxisName, R: AxisName, Chips: M, Bias, Out, W>
+    Projection<'a, I, O, R, Chips, Bias, Out, W>
+{
+    pub(crate) const fn new(weight: &'a W, bias: &'a Bias) -> Self {
+        Self {
+            weight,
+            bias,
+            rows: PhantomData,
+        }
+    }
+}
+
+/// The storage layout determines how a row projection lands one weight slab.
+pub(crate) trait Slab<I: AxisName, O: AxisName, R: AxisName, Chips: M> {
+    fn slab(&self, device: &mut Device, pass: usize) -> Weight<I, O, R, Chips>;
+}
+
+impl<I: AxisName, O: AxisName, R: AxisName, Chips: M> Slab<I, O, R, Chips>
+    for HbmTensor<bf16, Chips, m![O, I]>
+{
+    fn slab(&self, device: &mut Device, pass: usize) -> Weight<I, O, R, Chips> {
+        self.tile::<Chunked<I, O, R>>(device, pass)
+    }
+}
 
 impl<I: AxisName, O: AxisName, R: AxisName, Chips: M, Bias: Offset<I, O, R, Chips>, Out, W>
     Projection<'_, I, O, R, Chips, Bias, Out, W>

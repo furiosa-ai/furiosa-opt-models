@@ -18,30 +18,24 @@ use crate::Op;
 use crate::specialize::contraction;
 use furiosa_opt_std::prelude::*;
 
+pub(crate) use live::Projection as LiveProjection;
+
 pub(crate) mod grouped;
 mod live;
 mod tiled;
 
 /// Rows projected by `weight` plus `bias`, block by block, into `Out` rows.
-pub(crate) struct Projection<
-    'a,
-    I: AxisName,
-    O: AxisName,
-    R: AxisName,
-    Chips: M,
-    Bias,
-    Out = bf16,
-    W = HbmTensor<bf16, Chips, m![O, I]>,
-> {
-    weight: &'a W,
+pub(crate) struct Projection<'a, I: AxisName, O: AxisName, R: AxisName, Chips: M, Bias, Out = bf16>
+{
+    weight: &'a HbmTensor<bf16, Chips, m![O, I]>,
     bias: &'a Bias,
-    rows: PhantomData<(I, O, R, Chips, Out)>,
+    rows: PhantomData<(R, Out)>,
 }
 
-impl<'a, I: AxisName, O: AxisName, R: AxisName, Chips: M, Bias, Out, W>
-    Projection<'a, I, O, R, Chips, Bias, Out, W>
+impl<'a, I: AxisName, O: AxisName, R: AxisName, Chips: M, Bias, Out>
+    Projection<'a, I, O, R, Chips, Bias, Out>
 {
-    pub(crate) const fn new(weight: &'a W, bias: &'a Bias) -> Self {
+    pub(crate) const fn new(weight: &'a HbmTensor<bf16, Chips, m![O, I]>, bias: &'a Bias) -> Self {
         Self {
             weight,
             bias,
@@ -85,19 +79,6 @@ impl Config {
     /// slice.
     const fn outputs(self, rows: usize) -> usize {
         self.parts / (contraction::half(rows) / 8) * self.kept
-    }
-}
-
-/// The storage layout determines how a row projection lands one weight slab.
-pub(crate) trait Slab<I: AxisName, O: AxisName, R: AxisName, Chips: M> {
-    fn slab(&self, device: &mut Device, pass: usize) -> Weight<I, O, R, Chips>;
-}
-
-impl<I: AxisName, O: AxisName, R: AxisName, Chips: M> Slab<I, O, R, Chips>
-    for HbmTensor<bf16, Chips, m![O, I]>
-{
-    fn slab(&self, device: &mut Device, pass: usize) -> Weight<I, O, R, Chips> {
-        self.tile::<Chunked<I, O, R>>(device, pass)
     }
 }
 
