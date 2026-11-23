@@ -9,7 +9,7 @@ use crate::ops::linear::{Affine, Linear, Matrix};
 use crate::ops::normalization::span::Owned;
 use crate::ops::pointwise::SwiGlu;
 use crate::ops::swiglu::GateUp;
-use crate::tensor::live::Live;
+use crate::tensor::live::{Fill, Live};
 use crate::tensor::parallel::Chip;
 use furiosa_opt_std::prelude::*;
 
@@ -128,7 +128,8 @@ where
     }
 }
 
-/// `bf16(bf16(silu(gate)) * up)` of a span's gate/up rows in HBM.
+/// `bf16(bf16(silu(gate)) * up)` of a span's live gate/up rows in HBM, a tile of them at a time;
+/// the rows of the tiles past them are unspecified.
 impl<Intermediate: AxisName, Rows: AxisName, Capacity: AxisName, Env: Copy>
     Module<Live<Lines<Rows, GateUp<Intermediate>>, Capacity>, Env, &mut ()> for SwiGlu
 {
@@ -137,11 +138,14 @@ impl<Intermediate: AxisName, Rows: AxisName, Capacity: AxisName, Env: Copy>
     fn forward(
         &self,
         context: &mut Device,
-        env: Env,
+        _: Env,
         _: &mut (),
         projected: Live<Lines<Rows, GateUp<Intermediate>>, Capacity>,
     ) -> Self::Output {
-        self.forward(context, env, &mut (), projected.value())
+        let mut product = Lines::new();
+        let live = projected.with(());
+        crate::Op::forward(self, context, (projected.value(), &mut product, live));
+        product
     }
 }
 
@@ -298,6 +302,7 @@ where
     Rows: AxisName,
     Capacity: AxisName,
     T: Matrix<In = Intermediate, Out = Hidden>,
+    Lines<Rows, Hidden>: Fill<Device, Live<(), Rows>, Rows = Owned<Hidden, Rows>>,
 {
     type Output = Owned<Hidden, Rows>;
 
@@ -319,6 +324,6 @@ where
                 &mut projected,
             ),
         );
-        projected.to_dm(&mut context.tdma)
+        projected.fill(context, Live::all().subrange(0, product.rows()))
     }
 }

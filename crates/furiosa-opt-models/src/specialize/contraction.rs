@@ -860,13 +860,17 @@ pub(crate) const fn odd(value: usize) -> usize {
 }
 
 /// Rows of `rows`, each `inputs` BF16 inputs, one contraction pass carries: all while at most 32
-/// fit the tensor registers beside the weight, else one lane group of `lanes`.
+/// fit the tensor registers beside the weight, else the most whole lane groups of `lanes`, at most
+/// 32 rows, that divide them and fit, since each pass fetches the whole weight slab once.
 pub(crate) const fn batch(rows: usize, inputs: usize, lanes: usize) -> usize {
     if rows <= 32 && rows * inputs * 2 <= super::TRF {
-        rows
-    } else {
-        lanes
+        return rows;
     }
+    let mut batch = 32 / lanes * lanes;
+    while batch > lanes && !(rows.is_multiple_of(batch) && batch * inputs * 2 <= super::TRF) {
+        batch -= lanes;
+    }
+    batch
 }
 
 /// Output rows of a block of `block` rows one restoration scales: a power of two dividing the
