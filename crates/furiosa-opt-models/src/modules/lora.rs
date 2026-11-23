@@ -8,8 +8,9 @@
 //!   its selection of the call's rows, one on the rows that run with it and zero on every other. The
 //!   projection adds each adapter's update of the rows it selects to its own output; a call without
 //!   adapters keeps the state `()`.
-//! - [`Packed`] is the update of a projection that computes the query, key and value projections
-//!   at once, its rows ordered as the base checkpoint's packed weight orders them.
+//! - [`GateUp`] is the update of a feed-forward's packed gate and up projections.
+//! - A projection adds each adapter's update to the rows it writes in HBM ([`Adapters::add`]); a
+//!   layer's [`Layer`] holds each of its projections' adapters.
 //!
 //! Numerics: `lora_A x` rounds to BF16, the selection keeps or zeroes it exactly, `lora_B` of it
 //! rounds to BF16, and its sum with the projection's BF16 output rounds once.
@@ -21,19 +22,18 @@ use safetensors::Dtype;
 use safetensors::tensor::TensorView;
 use serde_json::Value;
 
-use crate::Module;
 use crate::load::{Checkpoint, Children, Context, Load, LoadError};
 use crate::ops::linear::Affine;
-use crate::ops::normalization::Spread;
 use crate::ops::pointwise::{add::Add, multiply::Multiply};
+use crate::tensor::parallel::Chip;
 use crate::tensor::{live::Live, memory::Memory};
 
 /// The rank a term holds for each module it adapts: an adapter of a lower rank is zero-padded, and
 /// a contraction part holds at least 32 inputs (`specialize::contraction`).
 pub const RANK: usize = 32;
 
-/// The rank columns of a term adapting `N` modules at once: one, or the query, key and value
-/// projections a packed projection computes.
+/// The rank columns of a term adapting `N` modules at once: one, or the gate and up projections a
+/// packed projection computes.
 #[derive(Clone, Debug)]
 pub struct Rank<const N: usize>;
 
@@ -58,66 +58,194 @@ pub struct Adapters<'a, T, S, const N: usize> {
     pub selections: &'a [S; N],
 }
 
-/// The projection's output plus each adapter's update of the rows it selects: the update's
-/// `lora_A` and `lora_B` run as the projection does, its selection is a product and its sum an
-/// addition.
-impl<'s, 'a, I, W, A, B, Out, K, R, Env, const N: usize>
-    Module<I, Env, &'s mut Adapters<'a, Term<A, B>, HbmTensor<bf16, m![1], m![R, K]>, N>>
-    for Affine<W, ()>
-where
-    I: Copy,
-    Out: AxisName,
-    K: AxisName,
-    R: AxisName,
-    Env: Copy,
-    Self: for<'u> Module<I, Env, &'u mut (), Output = Live<Spread<Out, R>, R>>,
-    Affine<A, ()>: for<'u> Module<I, Env, &'u mut (), Output = Live<Spread<K, R>, R>>,
-    Affine<B, ()>: for<'h, 'u> Module<
-            &'h Live<Spread<K, R>, R>,
-            Env,
-            &'u mut (),
-            Output = Live<Spread<Out, R>, R>,
-        >,
-{
-    type Output = Live<Spread<Out, R>, R>;
-
-    fn forward(
-        &self,
-        device: &mut Device,
-        env: Env,
-        adapters: &'s mut Adapters<'a, Term<A, B>, HbmTensor<bf16, m![1], m![R, K]>, N>,
-        input: I,
-    ) -> Self::Output {
-        let mut output = self.forward(&mut *device, env, &mut (), input);
-        #[unroll]
-        for slot in 0..N {
-            let term = adapters.terms[slot];
-            let shrunk = term.lora_a.forward(&mut *device, env, &mut (), input);
-            let selection: Spread<K, R> = adapters.selections[slot].to_dm(&mut device.tdma);
-            let selected = Multiply.forward(
-                &mut *device,
-                env,
-                &mut (),
-                (&shrunk, &shrunk.with(selection)),
-            );
-            let update = term.lora_b.forward(&mut *device, env, &mut (), &selected);
-            output = Add.forward(&mut *device, env, &mut (), (&output, &update));
-        }
-        output
+/// Written out, as a derive would ask the term and the selection to be `Copy` too.
+impl<T, S, const N: usize> Clone for Adapters<'_, T, S, N> {
+    fn clone(&self) -> Self {
+        *self
     }
 }
 
-/// The update of a projection computing `Queries` query rows and two equal parts of key and value
-/// rows at once: its rank holds the query's, the key's and the value's in turn, and each output
-/// row reads only its own part's, its outputs ordered as the base's packed weight: of each part's
-/// `KvHeads` equal row blocks, block `b` of every part in turn, before block `b + 1`.
-#[derive(DeviceSend)]
-pub struct Packed<KvHeads, Queries, T>(T, PhantomData<fn() -> (KvHeads, Queries)>);
+impl<T, S, const N: usize> Copy for Adapters<'_, T, S, N> {}
 
-impl<KvHeads, Queries, T> Packed<KvHeads, Queries, T> {
+/// The update of a feed-forward's projection computing its gate and up rows at once, packed as
+/// the gate's rows then the up's: its rank holds the gate's, then the up's, and each output row
+/// reads only its own part's.
+#[derive(DeviceSend)]
+pub struct GateUp<T>(T);
+
+impl<T> GateUp<T> {
     /// The term, in the packed projection's output order.
     pub fn term(&self) -> &T {
         &self.0
+    }
+}
+
+/// The adapters each of a layer's projections runs with in a call: its query, key, value and
+/// output projections' and its feed-forward's packed gate/up and down projections'.
+#[derive(Clone, Copy, DeviceSend)]
+pub struct Layer<Q, K, V, O, G, D> {
+    pub query: Q,
+    pub key: K,
+    pub value: V,
+    pub output: O,
+    pub gate_up: G,
+    pub down: D,
+}
+
+/// The states of a layer's projections in a call: `()` for every one when the call runs no
+/// adapter, else a [`Layer`] of their adapters.
+pub trait States: Copy {
+    type Query;
+    type Key;
+    type Value;
+    type Output;
+    type GateUp;
+    type Down;
+
+    fn query(&mut self) -> &mut Self::Query;
+    fn key(&mut self) -> &mut Self::Key;
+    fn value(&mut self) -> &mut Self::Value;
+    fn output(&mut self) -> &mut Self::Output;
+    fn gate_up(&mut self) -> &mut Self::GateUp;
+    fn down(&mut self) -> &mut Self::Down;
+}
+
+/// A call without adapters: every projection's state is `()`.
+impl States for () {
+    type Query = ();
+    type Key = ();
+    type Value = ();
+    type Output = ();
+    type GateUp = ();
+    type Down = ();
+
+    fn query(&mut self) -> &mut () {
+        self
+    }
+
+    fn key(&mut self) -> &mut () {
+        self
+    }
+
+    fn value(&mut self) -> &mut () {
+        self
+    }
+
+    fn output(&mut self) -> &mut () {
+        self
+    }
+
+    fn gate_up(&mut self) -> &mut () {
+        self
+    }
+
+    fn down(&mut self) -> &mut () {
+        self
+    }
+}
+
+impl<Q: Copy, K: Copy, V: Copy, O: Copy, G: Copy, D: Copy> States for Layer<Q, K, V, O, G, D> {
+    type Query = Q;
+    type Key = K;
+    type Value = V;
+    type Output = O;
+    type GateUp = G;
+    type Down = D;
+
+    fn query(&mut self) -> &mut Q {
+        &mut self.query
+    }
+
+    fn key(&mut self) -> &mut K {
+        &mut self.key
+    }
+
+    fn value(&mut self) -> &mut V {
+        &mut self.value
+    }
+
+    fn output(&mut self) -> &mut O {
+        &mut self.output
+    }
+
+    fn gate_up(&mut self) -> &mut G {
+        &mut self.gate_up
+    }
+
+    fn down(&mut self) -> &mut D {
+        &mut self.down
+    }
+}
+
+/// The windows of `Window` rows of `All` rows.
+#[derive(Clone, Debug)]
+struct Windows<All, Window>(PhantomData<(All, Window)>);
+
+impl<All: AxisName, Window: AxisName> AxisName for Windows<All, Window> {
+    const NAME: Ident = Ident::new("Windows");
+    const SIZE: usize = All::SIZE / Window::SIZE;
+}
+
+impl<'a, A, B, K: AxisName, All: AxisName, const N: usize>
+    Adapters<'a, Term<A, B>, HbmTensor<bf16, Chip, m![All, K]>, N>
+{
+    /// `lines`, a window of rows a projection wrote from launch row `start` on, the projection of
+    /// the live rows `live` of `input`, plus each adapter's update of those rows; `start` is a
+    /// multiple of the window's rows.
+    pub(crate) fn add<'i, Rows, Window, Out, I>(
+        &self,
+        device: &mut Device,
+        live: Live<(), Rows>,
+        input: &'i I,
+        start: usize,
+        mut lines: HbmTensor<bf16, Chip, m![Window, Out]>,
+    ) -> HbmTensor<bf16, Chip, m![Window, Out]>
+    where
+        Rows: AxisName,
+        Window: AxisName,
+        Out: AxisName,
+        Affine<A, ()>: for<'o> crate::Op<
+                (
+                    Live<(), Rows>,
+                    &'i I,
+                    &'o mut HbmTensor<bf16, Chip, m![Window, K]>,
+                ),
+                Output = (),
+            >,
+        Affine<B, ()>: for<'s, 'o> crate::Op<
+                (
+                    Live<(), Window>,
+                    &'s HbmTensor<bf16, Chip, m![Window, K]>,
+                    &'o mut HbmTensor<bf16, Chip, m![Window, Out]>,
+                ),
+                Output = (),
+            >,
+    {
+        type Spans<All, Window> = Symbol<Windows<All, Window>>;
+        let rows = Live::<(), Window>::all().subrange(0, live.rows());
+        #[unroll]
+        for slot in 0..N {
+            let term = self.terms[slot];
+            let mut shrunk = HbmTensor::new();
+            crate::Op::forward(&term.lora_a, &mut *device, (live, input, &mut shrunk));
+            // SAFETY: a window's rows of a selection are contiguous, and no launch writes one.
+            let selection: HbmTensor<bf16, Chip, m![Window, K]> = unsafe {
+                self.selections[slot]
+                    .view()
+                    .reshape::<Chip, m![{ Spans<All, Window> }, Window, K]>()
+                    .tile::<m![{ Spans<All, Window> }], 1, m![
+                        { Spans<All, Window> } = 1 # ({ Spans<All, Window> }),
+                        Window,
+                        K
+                    ]>(start / Window::SIZE)
+                    .alias()
+            };
+            let selected = crate::Op::forward(&Multiply, &mut *device, (&shrunk, &selection));
+            let mut update = HbmTensor::new();
+            crate::Op::forward(&term.lora_b, &mut *device, (rows, &selected, &mut update));
+            lines = crate::Op::forward(&Add, &mut *device, (&lines, &update));
+        }
+        lines
     }
 }
 
@@ -346,29 +474,21 @@ impl<'c, In: AxisName, Out: AxisName, K: AxisName> Load<&'c Checkpoint>
     }
 }
 
-/// The query, key and value modules below the context's name, `q_proj`, `k_proj` and `v_proj`,
-/// joined: each part's `lora_A` rows in turn, each padded to [`RANK`], and each output row its
-/// part's `lora_B` row in the part's rank columns, zero in the others.
-impl<'c, In, Out, K, KvHeads, Queries> Load<&'c Checkpoint>
-    for Packed<KvHeads, Queries, Term<Host<m![K, In]>, Host<m![Out, K]>>>
+/// The `gate_proj` and `up_proj` modules below the context's name, joined: the gate's `lora_A`
+/// rows then the up's, each padded to [`RANK`], and each output row its part's `lora_B` row in the
+/// part's rank columns, zero in the other's.
+impl<'c, In, Out, K> Load<&'c Checkpoint> for GateUp<Term<Host<m![K, In]>, Host<m![Out, K]>>>
 where
     In: AxisName,
     Out: AxisName,
     K: AxisName,
-    KvHeads: AxisName,
-    Queries: AxisName,
 {
     fn load(context: &mut Context<'_>, from: &'c Checkpoint) -> Result<Self, LoadError> {
-        const { assert!(K::SIZE == 3 * RANK && Out::SIZE > Queries::SIZE) };
-        let keys = (Out::SIZE - Queries::SIZE) / 2;
-        let parts = [
-            ("q_proj", Queries::SIZE),
-            ("k_proj", keys),
-            ("v_proj", keys),
-        ];
+        const { assert!(K::SIZE == 2 * RANK && Out::SIZE.is_multiple_of(2)) };
+        let rows = Out::SIZE / 2;
         context.checkpoint(from, |cx| {
-            let mut stored = Vec::with_capacity(parts.len());
-            for (part, rows) in parts {
+            let mut stored = Vec::with_capacity(2);
+            for part in ["gate_proj", "up_proj"] {
                 stored.push(cx.field(part, part, |cx| {
                     Stored::read(from, cx, (In::SIZE, rows), RANK)
                 })?);
@@ -378,33 +498,33 @@ where
                 vec![zero; K::SIZE * In::SIZE],
                 vec![zero; Out::SIZE * K::SIZE],
             );
-            let mut packed = 0;
-            for block in 0..KvHeads::SIZE {
-                for (part, ((_, rows), stored)) in parts.iter().zip(&stored).enumerate() {
-                    let block_rows = rows / KvHeads::SIZE;
-                    for row in block * block_rows..(block + 1) * block_rows {
-                        if let Some(Stored {
-                            rank, b: values, ..
-                        }) = stored
-                        {
-                            let into = &mut b[packed * K::SIZE + part * RANK..][..*rank];
-                            for (into, value) in into.iter_mut().zip(&values[row * rank..]) {
-                                *into = bf16::from_f32(*value);
-                            }
-                        }
-                        packed += 1;
+            for (part, stored) in stored.iter().enumerate() {
+                let Some(Stored {
+                    rank,
+                    a: shrink,
+                    b: expand,
+                }) = stored
+                else {
+                    continue;
+                };
+                (a[part * RANK * In::SIZE..].iter_mut().zip(shrink))
+                    .for_each(|(into, value)| *into = bf16::from_f32(*value));
+                for row in 0..rows {
+                    let into = &mut b[(part * rows + row) * K::SIZE + part * RANK..][..*rank];
+                    for (into, value) in into.iter_mut().zip(&expand[row * rank..]) {
+                        *into = bf16::from_f32(*value);
                     }
                 }
             }
-            assert_eq!(packed, Out::SIZE, "the parts' rows fill the packed outputs");
-            for (part, stored) in stored.iter().enumerate() {
-                if let Some(Stored { a: values, .. }) = stored {
-                    (a[part * RANK * In::SIZE..].iter_mut().zip(values))
-                        .for_each(|(into, value)| *into = bf16::from_f32(*value));
-                }
-            }
-            Ok(Packed(Term::host(a, b), PhantomData))
+            Ok(GateUp(Term::host(a, b)))
         })
+    }
+}
+
+/// A packed gate/up term built on host, in HBM of the context's device.
+impl<'h, T: Load<&'h U>, U> Load<&'h GateUp<U>> for GateUp<T> {
+    fn load(context: &mut Context<'_>, host: &'h GateUp<U>) -> Result<Self, LoadError> {
+        Ok(GateUp(T::load(context, &host.0)?))
     }
 }
 
@@ -417,18 +537,6 @@ impl<'h, A: Load<HA>, B: Load<HB>, HA: Clone, HB: Clone> Load<&'h Term<HA, HB>> 
             lora_a: Affine::new(a, ()),
             lora_b: Affine::new(b, ()),
         })
-    }
-}
-
-/// A packed term built on host, in HBM of the context's device.
-impl<'h, KvHeads, Queries, T: Load<&'h U>, U> Load<&'h Packed<KvHeads, Queries, U>>
-    for Packed<KvHeads, Queries, T>
-{
-    fn load(
-        context: &mut Context<'_>,
-        host: &'h Packed<KvHeads, Queries, U>,
-    ) -> Result<Self, LoadError> {
-        Ok(Packed(T::load(context, &host.0)?, PhantomData))
     }
 }
 
@@ -516,28 +624,6 @@ fn scaled(checkpoint: &Checkpoint) -> Result<Checkpoint, LoadError> {
 mod tests {
     use super::*;
     use crate::load::Named;
-    use crate::ops::normalization::RowMajor;
-    use crate::ops::normalization::tests::random;
-    use crate::tensor::axis::Sixteen;
-    use crate::tensor::live::tests::count;
-    use crate::tensor::scalar::Value as Count;
-    use crate::tests::DEVICE;
-    use furiosa_opt_std::runtime::launch;
-
-    axes![Hidden = 1024, Qkv = 4096, Queries = 2048];
-
-    /// Each row's adapter: the first, none or the second.
-    const ADAPTERS: [Option<usize>; 3] = [Some(0), None, Some(1)];
-
-    /// Live rows of the sixteen: past the rows of one lane group.
-    const LIVE: usize = 13;
-
-    type Rows<W> = HbmTensor<bf16, m![1], RowMajor<W, Sixteen>>;
-    type Projection<In, Out> = Affine<HbmTensor<bf16, m![1], m![Out, In]>, ()>;
-    type Factors<In, Out, K> =
-        Term<HbmTensor<bf16, m![1], m![K, In]>, HbmTensor<bf16, m![1], m![Out, K]>>;
-    type Selection<K> = HbmTensor<bf16, m![1], m![Sixteen, K]>;
-    type Normalized<W> = Live<DmTensor<bf16, m![1], m![2], m![1 # 256], m![Sixteen, W]>, Sixteen>;
 
     axes![Inputs = 64, Outputs = 48];
 
@@ -549,173 +635,6 @@ mod tests {
         "base_model",
         Named<"layer", Named<"proj", Term<Host<m![One, Inputs]>, Host<m![Outputs, One]>>>>,
     >;
-
-    /// The rows of `input`, all features a slice, as a projection reads normalized rows.
-    fn rows<W: AxisName>(device: &mut Device, live: &Count, input: &Rows<W>) -> Normalized<W> {
-        Live::<(), Sixteen>::read(live).with(input.to_dm(&mut device.tdma))
-    }
-
-    #[device(chip = 1)]
-    fn plain<In: AxisName, Out: AxisName>(
-        device: &mut Device,
-        live: &Count,
-        projection: &Projection<In, Out>,
-        input: &Rows<In>,
-    ) -> Rows<Out> {
-        let rows = rows(device, live, input);
-        let output = projection.forward(&mut *device, (), &mut (), &rows);
-        output.value().to_hbm(&mut device.tdma)
-    }
-
-    #[device(chip = 1)]
-    fn adapted<In: AxisName, Out: AxisName, K: AxisName>(
-        device: &mut Device,
-        live: &Count,
-        projection: &Projection<In, Out>,
-        terms: [&Factors<In, Out, K>; 2],
-        selections: &[Selection<K>; 2],
-        input: &Rows<In>,
-    ) -> Rows<Out> {
-        let rows = rows(device, live, input);
-        let mut adapters = Adapters { terms, selections };
-        let output = projection.forward(&mut *device, (), &mut adapters, &rows);
-        output.value().to_hbm(&mut device.tdma)
-    }
-
-    /// `values` in HBM, laid out as `S`.
-    async fn upload<S: M + 'static>(
-        device: &mut Device,
-        values: Vec<bf16>,
-    ) -> HbmTensor<bf16, m![1], S> {
-        HostTensor::<bf16, S>::from_vec(values)
-            .to_hbm(&mut device.pdma)
-            .await
-            .unwrap()
-    }
-
-    /// `rows x [outputs, inputs]` transposed in FP32.
-    fn product(rows: &[f32], weight: &[f32], inputs: usize) -> Vec<f32> {
-        rows.chunks_exact(inputs)
-            .flat_map(|row| {
-                weight
-                    .chunks_exact(inputs)
-                    .map(move |weight| row.iter().zip(weight).map(|(x, w)| x * w).sum())
-            })
-            .collect()
-    }
-
-    fn widened(values: &[bf16]) -> Vec<f32> {
-        values.iter().map(|value| value.to_f32()).collect()
-    }
-
-    fn rounded(values: Vec<f32>) -> Vec<f32> {
-        values
-            .into_iter()
-            .map(|value| bf16::from_f32(value).to_f32())
-            .collect()
-    }
-
-    /// An adapter's factors of a projection: an eighth of pseudo-random values, the rank columns
-    /// of `lora_B` past `rank` zero.
-    fn factors(seed: u64, inputs: usize, outputs: usize, rank: usize) -> [Vec<bf16>; 2] {
-        let columns = outputs * rank;
-        let b = (random(columns, seed + 1).into_iter().enumerate()).map(|(at, value)| {
-            bf16::from_f32(f32::from(u8::from(at % rank < rank / 2 + 1)) * value.to_f32() / 8.0)
-        });
-        let a = random(rank * inputs, seed)
-            .into_iter()
-            .map(|value| bf16::from_f32(value.to_f32() / 8.0));
-        [a.collect(), b.collect()]
-    }
-
-    /// Mixed rows of no adapter and of each of two adapters through an adapted projection: every
-    /// live row is the host's product plus its adapter's update, with BF16 roundings of `lora_A x`,
-    /// of the update and of the sum; a row without an adapter is the plain projection's, bit for
-    /// bit.
-    async fn adds_each_rows_update<In: AxisName, Out: AxisName, K: AxisName>() {
-        let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
-        // Weights of the factors' scale, so an update outweighs the tolerance of their sum.
-        let weight: Vec<bf16> = (random(Out::SIZE * In::SIZE, 0x9e37).into_iter())
-            .map(|value| bf16::from_f32(value.to_f32() / 8.0))
-            .collect();
-        let input = random(Sixteen::SIZE * In::SIZE, 0x2545);
-        let projection: Projection<In, Out> =
-            Affine::new(upload(&mut device, weight.clone()).await, ());
-        let rows: Rows<In> = upload(&mut device, input.clone()).await;
-        let live = count(LIVE).to_hbm(&mut device.pdma).await.unwrap();
-        let (mut terms, mut host) = (Vec::new(), Vec::new());
-        for seed in [11, 12] {
-            let [a, b] = factors(seed, In::SIZE, Out::SIZE, K::SIZE);
-            let term: Factors<In, Out, K> = Term {
-                lora_a: Affine::new(upload(&mut device, a.clone()).await, ()),
-                lora_b: Affine::new(upload(&mut device, b.clone()).await, ()),
-            };
-            terms.push(term);
-            host.push((widened(&a), widened(&b)));
-        }
-        let adapter = |row: usize| ADAPTERS[row % ADAPTERS.len()].filter(|_| row < LIVE);
-        let mut selections = Vec::new();
-        for slot in 0..2 {
-            let ones = (0..Sixteen::SIZE).flat_map(|row| {
-                let one = bf16::from_f32(f32::from(u8::from(adapter(row) == Some(slot))));
-                std::iter::repeat_n(one, K::SIZE)
-            });
-            let selection: Selection<K> = upload(&mut device, ones.collect()).await;
-            selections.push(selection);
-        }
-        let selections: [Selection<K>; 2] = selections.try_into().ok().unwrap();
-        let base = launch(plain, (&mut device, &live, &projection, &rows))
-            .await
-            .unwrap();
-        let base = base
-            .to_host::<RowMajor<Out, Sixteen>>(&mut device.pdma)
-            .await
-            .unwrap()
-            .into_vec();
-        let terms = [&terms[0], &terms[1]];
-        let got = launch(
-            adapted,
-            (&mut device, &live, &projection, terms, &selections, &rows),
-        )
-        .await
-        .unwrap();
-        let got = got
-            .to_host::<RowMajor<Out, Sixteen>>(&mut device.pdma)
-            .await
-            .unwrap()
-            .into_vec();
-        let x = widened(&input);
-        let projected = rounded(product(&x, &widened(&weight), In::SIZE));
-        let updates: Vec<Vec<f32>> = host
-            .iter()
-            .map(|(a, b)| rounded(product(&rounded(product(&x, a, In::SIZE)), b, K::SIZE)))
-            .collect();
-        for row in 0..LIVE {
-            let Some(slot) = adapter(row) else {
-                let range = row * Out::SIZE..(row + 1) * Out::SIZE;
-                assert_eq!(got[range.clone()], base[range], "row {row} has no adapter");
-                continue;
-            };
-            for column in 0..Out::SIZE {
-                let at = row * Out::SIZE + column;
-                let expected = projected[at] + updates[slot][at];
-                let actual = got[at].to_f32();
-                assert!(
-                    (actual - expected).abs() <= 0.02 * expected.abs().max(1.0),
-                    "row {row} column {column}: {actual}, expected {expected}"
-                );
-            }
-        }
-    }
-
-    /// A packed query, key and value projection and an output projection, each updated by two
-    /// adapters over rows of neither, one and the other.
-    #[tokio::test(flavor = "current_thread")]
-    async fn adds_each_adapters_update() {
-        let _lease = DEVICE.lock().await;
-        adds_each_rows_update::<Hidden, Qkv, Rank<3>>().await;
-        adds_each_rows_update::<Queries, Hidden, Rank<1>>().await;
-    }
 
     /// A configuration as PEFT writes it reads as its rank and its scale under each rule; each
     /// field that changes the update, a rank past the terms', a scale past FP32 and a malformed

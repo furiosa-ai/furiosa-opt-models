@@ -4,11 +4,8 @@
 use crate::load::{Checkpoint, Context, Load, LoadError, Named};
 use crate::models::config::{Exclusion, Exclusions, Scheme, compiled, decoder, scaling::Spectrum};
 use crate::models::decoder::{
-    attention::{
-        self, Geometry, Head, KvHeads,
-        qwen3::{self, launch},
-    },
-    form,
+    attention::{self, Geometry, Head, KvHeads, qwen3},
+    form, launch,
 };
 use crate::models::{Class, Family, Implements};
 use crate::modules::attention::Projection;
@@ -20,7 +17,6 @@ use crate::ops::rotary::Rotary;
 use crate::ops::{embedding::Embedding, normalization::RmsNorm, pointwise::add::Add};
 use crate::specialize::attention::Decode;
 use crate::tensor::{
-    axis,
     form::{Weight, nvfp4::W4A16},
     memory::{Hbm, Memory},
     parallel::Chip,
@@ -33,7 +29,12 @@ use std::{io, marker::PhantomData};
 #[derive(DeviceSend, Load)]
 pub struct ForCausalLM {
     #[load(rename = "")]
-    pub model: launch::Over<Size, Body, form::Nvfp4BlockScaled<W4A16>>,
+    pub model: attention::ForCausalLM<
+        Size,
+        launch::Over<Size, Body, form::Nvfp4BlockScaled<W4A16>>,
+        qwen3::LmHead<Size, Hbm>,
+        form::Nvfp4BlockScaled<W4A16>,
+    >,
     #[load(rename = "", with = calibration)]
     pub calibration: Calibration,
 }
@@ -97,14 +98,10 @@ impl Geometry for Size {
 impl Decode for Size {
     type Rows = <Original as Decode>::Rows;
     type Windows = <Original as Decode>::Windows;
-    type Width = <Original as Decode>::Width;
-    type Packed = <Original as Decode>::Packed;
-    type Work = <Original as Decode>::Work;
     type Capacity = <Original as Decode>::Capacity;
     type Reach = <Original as Decode>::Reach;
     type Sequences = <Original as Decode>::Sequences;
     type Slots = <Original as Decode>::Slots;
-    type Positions = axis::Rows<131072>;
 }
 impl Family for Size {
     type Hf = decoder::Config<Spectrum>;

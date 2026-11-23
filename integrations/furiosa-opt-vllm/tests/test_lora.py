@@ -246,10 +246,10 @@ NO_ADAPTER: Final = "adapters: unsupported, the Qwen3ForCausalLM {} implementati
 @pytest.mark.parametrize(
     ("model", "quantization", "reason"),
     [
-        ("Qwen/Qwen3-8B", None, NO_ADAPTER.format("8B")),
+        ("furiosa-ai/Qwen3-8B-FP8", None, NO_ADAPTER.format("8B")),
         (MODEL, "fp8_per_tensor", NO_ADAPTER.format("0.6B")),
     ],
-    ids=["8B", "quantized"],
+    ids=["block-scaled", "quantized"],
 )
 def test_refuses_lora_on_loads_without_adapters(
     tmp_path: Path, model: str, quantization: str | None, reason: str
