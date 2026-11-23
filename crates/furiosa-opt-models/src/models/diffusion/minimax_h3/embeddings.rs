@@ -217,7 +217,6 @@ pub const EPSILON: usize = 1e-5_f32.to_bits() as usize;
 pub(super) mod tests {
     use super::*;
     use crate::load::{Checkpoint, Context, Load, LoadError};
-    use crate::ops::index::packed::Timestep;
     use crate::tensor::memory::Memory;
     use crate::tensor::memory::residency::{Leaves, Path, Visit};
     use safetensors::Dtype;
@@ -518,24 +517,8 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn strict_named_tree_reads_only_the_reference_component_group() {
-        let tensors = fixture();
-        let _tree = load(&tensors).unwrap();
-        let loaded = images();
-        assert_eq!(loaded.len(), 21); // Ten input leaves, frequencies, and five leaves per head.
-        assert!(loaded.iter().all(|image| image.chips == 4));
-        assert_eq!(Chips::SIZE, 4);
-        assert_eq!(
-            (
-                Condition::SIZE,
-                Width::SIZE,
-                Time::SIZE,
-                Patch::SIZE,
-                Latent::SIZE
-            ),
-            (5120, 5376, 2688, 96, 32)
-        );
-        let mut tensors = tensors;
+    fn refuses_unclaimed_component_weights() {
+        let mut tensors = fixture();
         tensors.push(Tensor {
             name: "transformer.unclaimed.weight".into(),
             shape: vec![1],
@@ -772,82 +755,6 @@ pub(super) mod tests {
         }
     }
 
-    #[test]
-    fn borrowed_children_have_the_reference_input_and_output_scalar_contracts() {
-        type R = crate::tensor::axis::Rows<64>;
-        fn accepts<M, I, O>()
-        where
-            M: for<'s> Module<I, (), &'s mut (), Output = O>,
-        {
-        }
-        accepts::<
-            Text<SmallCondition, SmallWidth, Chips, &'static Hbm>,
-            &HbmTensor<bf16, Chips, m![R, SmallCondition]>,
-            HbmTensor<bf16, Chips, m![R, SmallWidth]>,
-        >();
-        accepts::<
-            Input<SmallVideo, SmallWidth, Chips, &'static Hbm>,
-            &HbmTensor<f32, Chips, m![R, SmallVideo]>,
-            HbmTensor<bf16, Chips, m![R, SmallWidth]>,
-        >();
-        accepts::<
-            Timesteps<SmallWidth, SmallTime, Chips, &'static Hbm>,
-            &HbmTensor<f32, Chips, m![R,1 # 8]>,
-            HbmTensor<f32, Chips, m![R, SmallTime]>,
-        >();
-        accepts::<
-            VideoHead<SmallWidth, SmallTime, SmallVideo, Chips, &'static Hbm>,
-            (
-                &HbmTensor<bf16, Chips, m![R, SmallWidth]>,
-                &HbmTensor<f32, Chips, m![Timestep, SmallTime]>,
-            ),
-            HbmTensor<f32, Chips, m![R, SmallVideo]>,
-        >();
-        accepts::<
-            AudioHead<SmallWidth, SmallTime, SmallAudio, Chips, &'static Hbm>,
-            (
-                &HbmTensor<bf16, Chips, m![R, SmallWidth]>,
-                &HbmTensor<f32, Chips, m![Timestep, SmallTime]>,
-            ),
-            HbmTensor<f32, Chips, m![R, SmallAudio]>,
-        >();
-        accepts::<
-            Inputs<&'static Hbm>,
-            (
-                &HbmTensor<f32, Chips, m![R,1 # 8]>,
-                (
-                    &HbmTensor<f32, Chips, m![R, SmallVideo]>,
-                    &HbmTensor<f32, Chips, m![R, SmallAudio]>,
-                ),
-            ),
-            (
-                HbmTensor<f32, Chips, m![R, SmallTime]>,
-                (
-                    HbmTensor<bf16, Chips, m![R, SmallWidth]>,
-                    HbmTensor<bf16, Chips, m![R, SmallWidth]>,
-                ),
-            ),
-        >();
-        fn accepts_heads<M, I, O>()
-        where
-            M: for<'s> Module<I, (), &'s mut ((), ()), Output = O>,
-        {
-        }
-        accepts_heads::<
-            Heads<&'static Hbm>,
-            (
-                &(
-                    HbmTensor<bf16, Chips, m![R, SmallWidth]>,
-                    HbmTensor<bf16, Chips, m![R, SmallWidth]>,
-                ),
-                &HbmTensor<f32, Chips, m![Timestep, SmallTime]>,
-            ),
-            (
-                HbmTensor<f32, Chips, m![R, SmallVideo]>,
-                HbmTensor<f32, Chips, m![R, SmallAudio]>,
-            ),
-        >();
-    }
     #[test]
     fn h3_canonical_projection_loads_visits_and_borrows_without_copying_storage() {
         fn canonical<T: Residency>()

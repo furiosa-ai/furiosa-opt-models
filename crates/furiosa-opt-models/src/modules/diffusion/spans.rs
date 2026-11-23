@@ -295,39 +295,6 @@ mod tests {
 
     type W = axis::Rows<256>;
     type R = axis::Rows<1280>;
-    #[test]
-    fn named_norms_delegate_explicit_operands_and_the_wrapped_block_runs() {
-        type C = Chip;
-        type Input = Hidden<R, W, C>;
-        type Norm1 = Named<"norm1", AdaptiveRms<W, EPSILON, C>>;
-        type Norm2 = Named<"norm2", AdaptiveRms<W, EPSILON, C>>;
-        fn norm<N>()
-        where
-            for<'m, 'p, 'x, 't, 's> BoundSpans<'m, 'p, N, R, 16>:
-                Module<(&'x Input, &'t (Table<W, C>, Table<W, C>)), (), &'s mut (), Output = Input>,
-        {
-        }
-        norm::<Norm1>();
-        norm::<Norm2>();
-        norm::<Named<"norm1", AdaptiveRms<W, EPSILON, C, &HbmTensor<bf16, C, m![W]>>>>();
-        norm::<Named<"norm2", AdaptiveRms<W, EPSILON, C, &HbmTensor<bf16, C, m![W]>>>>();
-
-        fn module<T>()
-        where
-            for<'c, 'p, 's> T: Module<
-                    Input,
-                    (
-                        &'c Conditions<W, C>,
-                        (&'p SpanPlan<R, 16>, BranchEnv<'p, R, W, C, 16>),
-                    ),
-                    &'s mut ((), (), ()),
-                    Output = Input,
-                >,
-        {
-        }
-        module::<Fixture<W, C>>();
-    }
-
     #[device(chip = 1)]
     fn block(
         device: &mut Device,

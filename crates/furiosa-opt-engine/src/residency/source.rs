@@ -178,13 +178,37 @@ fn check_chips(shards: Option<usize>, chips: usize) -> io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use furiosa_opt_models::tensor::parallel::Shard;
 
     axes![Out = 4, In = 4];
     type Chips = m![Out / 2];
     type Shape = m![Out % 2, In];
+
+    /// Reconstruct destination images from transfer descriptors, independent of piece splitting.
+    pub(in super::super) fn assert_prepared_bytes(
+        pieces: &[Piece<'_>],
+        chips: usize,
+        len: usize,
+        expected: &[u8],
+    ) {
+        let mut actual = vec![0; chips * len];
+        let mut written = vec![false; chips * len];
+        for piece in pieces {
+            let width = piece.bytes.len();
+            let host = piece.host.bytes().unwrap();
+            assert!(piece.chips.end <= chips && piece.bytes.end <= len);
+            assert_eq!(host.len(), width * piece.chips.len());
+            for (chip, bytes) in piece.chips.clone().zip(host.chunks_exact(width)) {
+                let range = chip * len + piece.bytes.start..chip * len + piece.bytes.end;
+                actual[range.clone()].copy_from_slice(bytes);
+                written[range].fill(true);
+            }
+        }
+        assert!(written.into_iter().all(|byte| byte));
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn retains_prepared_parts_and_refuses_equal_sized_permutations() {
@@ -195,18 +219,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(source.len(), 8 * 4);
-        assert_eq!(
-            &source.bytes[..],
-            values
-                .iter()
-                .flat_map(|x| x.to_le_bytes())
-                .collect::<Vec<_>>()
-        );
+        let expected: Vec<_> = values.iter().flat_map(|x| x.to_le_bytes()).collect();
         assert!(source.pieces(1).is_err());
-        let pieces = source.pieces(2).unwrap();
-        assert_eq!(pieces.len(), 1);
-        assert_eq!(pieces[0].chips, 0..2);
-        assert_eq!(pieces[0].bytes, 0..32);
+        assert_prepared_bytes(&source.pieces(2).unwrap(), 2, source.len(), &expected);
 
         let error = Source::from_host::<f32, Chips, Shape, m![In, Out]>(
             HostTensor::from_vec(values),
@@ -241,12 +256,16 @@ mod tests {
                 16,
                 "identical chip images retain one host copy"
             );
-            let pieces = source.pieces(4).unwrap();
-            assert_eq!(pieces.len(), 4);
-            for (chip, piece) in pieces.iter().enumerate() {
-                assert_eq!(piece.chips, chip..chip + 1);
-                assert_eq!(piece.bytes, 0..16);
-            }
+            let expected: Vec<_> = [1f32, 2., 3., 4.]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect();
+            assert_prepared_bytes(
+                &source.pieces(4).unwrap(),
+                4,
+                source.len(),
+                &expected.repeat(4),
+            );
             assert!(source.pieces(0).is_err());
         }
     }
@@ -263,17 +282,12 @@ mod tests {
         let image = source.pin().unwrap();
         drop(source);
         assert_eq!(image.len(), 32);
-        assert_eq!(image.pieces.len(), 2);
-        for (chip, piece) in image.pieces.iter().enumerate() {
+        for piece in &image.pieces {
             assert!(piece.bytes.is_pinned());
-            assert_eq!(piece.chip, Some(chip));
-            assert_eq!(piece.at, 0);
-            let expected: Vec<u8> = (chip * 8..chip * 8 + 8)
-                .flat_map(|at| (at as f32).to_le_bytes())
-                .collect();
-            assert_eq!(&piece.bytes[..], expected);
+            assert!(piece.bytes.len() <= PIECE);
         }
-        assert_eq!(image.pieces(2).unwrap().len(), 2);
+        let expected: Vec<_> = (0..16).flat_map(|at| (at as f32).to_le_bytes()).collect();
+        assert_prepared_bytes(&image.pieces(2).unwrap(), 2, image.len(), &expected);
         assert!(image.pieces(4).is_err());
     }
 

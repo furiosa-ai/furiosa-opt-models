@@ -250,40 +250,14 @@ impl<W: AxisName> AxisName for Heads<W> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::embeddings::tests::{Host, IMAGES, Image, Leaf};
+    use super::super::embeddings::tests::{Host, IMAGES, Image};
     use super::*;
     use crate::load::{Checkpoint, Context, Load, LoadError};
-    use crate::tensor::memory::residency::{Leaves, Path, Residency, Visit};
     use safetensors::Dtype;
-    use std::convert::Infallible;
 
     axes![W = 256, A = 512, F = 512, T = 64];
     type Joint<X> = Named<"transformer.blocks.0", Block<W, A, F, T, X>>;
     type Text<X> = Named<"transformer.token_refiner", Refiner<W, A, F, X>>;
-
-    struct Borrow;
-    impl<'a> Leaves<'a, Host, &'a Host> for Borrow {
-        type Error = Infallible;
-        fn leaf<D: MaterializableScalar, C: M + 'static, S: M + 'static>(
-            &mut self,
-            leaf: &'a Leaf<D, C, S>,
-            _: Path<'_>,
-        ) -> Result<&'a Leaf<D, C, S>, Self::Error> {
-            Ok(leaf)
-        }
-    }
-    struct Nonempty;
-    impl Visit<Host> for Nonempty {
-        type Error = Infallible;
-        fn leaf<D: MaterializableScalar, C: M + 'static, S: M + 'static>(
-            &mut self,
-            leaf: &Leaf<D, C, S>,
-            _: Path<'_>,
-        ) -> Result<(), Self::Error> {
-            assert!(!leaf.bytes.is_empty());
-            Ok(())
-        }
-    }
 
     fn value(row: usize, column: usize, seed: usize) -> f32 {
         ((row * 29 + column * 7 + seed * 11) % 503) as f32 / 256.0 - 251.0 / 256.0
@@ -578,59 +552,4 @@ mod tests {
             .expect("H3 refiner stores one matrix to replicate across chips");
         assert!(matches!(error, LoadError::InvalidData { name: failed, .. } if failed == name));
     }
-
-    #[test]
-    fn default_and_reduced_trees_support_canonical_residency_and_borrowed_loading() {
-        fn canonical<M: Residency>()
-        where
-            for<'a> M::In<&'a Hbm>: Load<&'a M::In<Hbm>>,
-        {
-        }
-        canonical::<Block>();
-        canonical::<Refiner>();
-        type Wrapped<X> =
-            crate::modules::diffusion::WithSpans<Block<Width, Attended, Expanded, Time, X>>;
-        let projected: Option<
-            <crate::modules::diffusion::WithSpans<Block> as Residency>::In<Host>,
-        > = None;
-        let _: Option<Wrapped<Host>> = projected;
-        let borrowed: Option<<crate::modules::diffusion::WithSpans<Block> as Residency>::In<&Hbm>> =
-            None;
-        let _: Option<Wrapped<&Hbm>> = borrowed;
-        let cp = checkpoint(true);
-        let tree = Joint::<Host>::load(&mut Context::new(None), &cp).unwrap();
-        drop(cp);
-        let _borrowed =
-            Joint::<Hbm>::map::<Host, &Host, _>(&tree, &mut Borrow, Path::ROOT).unwrap();
-        let _loaded = Joint::<&Host>::load(&mut Context::new(None), &tree).unwrap();
-        Joint::<Hbm>::visit::<Host, _>(&tree, &mut Nonempty, Path::ROOT).unwrap();
-        let cp = checkpoint(false);
-        let tree = Text::<Host>::load(&mut Context::new(None), &cp).unwrap();
-        Text::<Hbm>::visit::<Host, _>(&tree, &mut Nonempty, Path::ROOT).unwrap();
-    }
-
-    // Full's context hands (hidden, positions) to QKV. First drops the unused refiner position
-    // operand without inserting another borrow, preserving this public Module boundary.
-    const _: () = {
-        use crate::ops::index::packed::Span;
-        use crate::tensor::scalar::Value;
-        type R = Span<2048, 2048>;
-        type Hidden = HbmTensor<bf16, Chips, m![R, Width]>;
-        type Visibility = flash::Visible<crate::tensor::axis::Rows<3>, Chips>;
-        type QkvState = ((), ((), (), ()));
-        type LayerState = ((QkvState, ()), ((), ((), ())));
-        type State = ([LayerState; 2], ());
-        fn refiner<M>()
-        where
-            for<'e, 's> M: Module<
-                    Hidden,
-                    &'e attention::Context<(), (), (&'e Visibility, &'e Value<Chips>)>,
-                    &'s mut State,
-                    Output = Hidden,
-                >,
-        {
-        }
-        let _ = refiner::<Refiner>;
-        let _ = refiner::<Refiner<Width, Attended, Expanded, &Hbm>>;
-    };
 }

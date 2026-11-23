@@ -275,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_sharded_leaves_retain_one_image_per_chip() {
+    fn ordinary_sharded_leaves_preserve_each_chips_bytes() {
         type Shape = m![Rows, Columns % 2];
         type Leaf = Cell<f32, m![Columns / 2], Shape>;
         let mut source = Checkpoint::default();
@@ -292,10 +292,21 @@ mod tests {
             .unwrap();
         let source = cell.parameter().source();
         assert_eq!(source.len(), 8 * size_of::<f32>());
-        let pieces = source.pieces(2).unwrap();
-        assert_eq!(pieces.len(), 1, "one chip-major image contains both shares");
-        assert_eq!(pieces[0].chips, 0..2);
-        assert_eq!(pieces[0].bytes, 0..32);
+        let expected: Vec<_> = (0..2)
+            .flat_map(|chip| {
+                (0..Rows::SIZE).flat_map(move |row| {
+                    (0..Columns::SIZE / 2)
+                        .map(move |column| (row * Columns::SIZE + chip * 2 + column) as f32)
+                })
+            })
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        super::super::source::tests::assert_prepared_bytes(
+            &source.pieces(2).unwrap(),
+            2,
+            source.len(),
+            &expected,
+        );
         assert!(source.pieces(4).is_err());
     }
 
