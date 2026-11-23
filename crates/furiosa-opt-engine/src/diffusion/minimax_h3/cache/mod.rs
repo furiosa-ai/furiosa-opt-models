@@ -97,7 +97,7 @@ pub(super) fn prime<
         &request::Inputs<R, K, T, A, V>,
         &mut (),
         (&Hidden<R>, &Hidden<R>),
-    )>::load(rows::add, device)
+    )>::load(crate::forward_four, device)
     .map_err(io::Error::other)?;
     Loadable::<(
         &mut Device,
@@ -105,7 +105,7 @@ pub(super) fn prime<
         &request::Inputs<R, K, T, A, V>,
         &mut (),
         (&Hidden<R>, &Hidden<R>),
-    )>::load(rows::subtract, device)
+    )>::load(crate::forward_four, device)
     .map_err(io::Error::other)?;
     Loadable::<(
         &mut Device,
@@ -113,7 +113,7 @@ pub(super) fn prime<
         &request::Inputs<R, K, T, A, V>,
         &mut Hidden<R>,
         &Hidden<R>,
-    )>::load(rows::copy, device)
+    )>::load(crate::forward_four, device)
     .map_err(io::Error::other)?;
     Ok(())
 }

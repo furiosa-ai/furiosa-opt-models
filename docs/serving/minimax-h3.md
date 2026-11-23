@@ -118,6 +118,8 @@ Keep reference files and test logs in private storage when running this command 
 
 TeaCache's synchronous decision callback cannot call a component of its own pipeline on that thread; such calls raise `RuntimeError`.
 Calls from other threads remain serialized through the same pipeline owner.
+The callback must not wait for another thread's call to the same pipeline to finish.
+That call waits for the callback's active call to release the pipeline, so waiting would deadlock.
 
 ### Unsupported scope
 

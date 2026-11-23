@@ -59,7 +59,7 @@ pub type BlockAttention<W = Width, A = Attended, X = Hbm, Tiles = GatherTiles> =
                     Gathered<
                         full::Joined<
                             full::Projection<
-                                Packed<W, full::Joint<Part<A, 4>>, X>,
+                                GroupedLinear<W, full::Joint<Part<A, 4>>, X>,
                                 flash::Head,
                                 Rotated,
                             >,
@@ -79,16 +79,16 @@ pub type BlockAttention<W = Width, A = Attended, X = Hbm, Tiles = GatherTiles> =
         { Strategy::Items },
         { Flash::SinglePass },
     >,
-    Named<"out_proj", Exchanged<Packed<A, W, X>, Parallel<4>>>,
+    Named<"out_proj", Exchanged<GroupedLinear<A, W, X>, Parallel<4>>>,
 >;
 
 /// Replicated K-grouped gate/up and down matrices, with `bf16(bf16(silu(gate)) * up)` products.
 ///
 /// Source: https://github.com/vllm-project/vllm-omni/blob/6daf5b30f07cc0b3db87766d22fdf433f8a1a7c9/vllm_omni/diffusion/models/minimax_h3/minimax_h3_transformer.py
 pub type BlockFeedForward<W = Width, F = Expanded, X = Hbm> = feedforward::Mlp<
-    Prefix<Named<"fc1", Packed<W, GateUp<F>, X>>>,
+    Prefix<Named<"fc1", GroupedLinear<W, GateUp<F>, X>>>,
     Prefix<SwiGlu>,
-    Prefix<Named<"fc2", Packed<F, W, X>>>,
+    Prefix<Named<"fc2", GroupedLinear<F, W, X>>>,
 >;
 
 /// A quarter of every one of the eighteen modulation chunks on each chip.
@@ -214,7 +214,8 @@ impl<'a, In: AxisName, Attended: AxisName, P: Load<&'a Checkpoint>> Load<&'a Che
 pub type Norm<W = Width, X = Hbm> =
     RmsNorm<W, EPSILON, Chips, Weight<m![W], Chips, <X as Memory>::Tensor<bf16, Chips, m![W]>>>;
 
-pub type Packed<I, O, X = Hbm> = Linear<
+/// Linear projection with K-grouped weights.
+pub type GroupedLinear<I, O, X = Hbm> = Linear<
     I,
     O,
     Chips,

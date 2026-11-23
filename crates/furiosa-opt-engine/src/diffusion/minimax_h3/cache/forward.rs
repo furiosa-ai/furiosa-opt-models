@@ -171,7 +171,7 @@ impl<
                 let embedded: Hidden<R> = alias(&work.embedded, ..)?;
                 let mut residual: Hidden<R> = alias(&work.cache.residual, ..)?;
                 let accepted = Arc::new(
-                    Function::new(rows::Subtract, rows::subtract).forward_into_tracked(
+                    Function::new(rows::Subtract, crate::forward_four).forward_into_tracked(
                         device,
                         &work.state.request.inputs,
                         &mut (),
@@ -190,13 +190,15 @@ impl<
                 let embedded: Hidden<R> = alias(&work.embedded, ..)?;
                 let residual: Hidden<R> = alias(&work.cache.residual, ..)?;
                 let mut output: Hidden<R> = alias(&work.hidden[0], ..)?;
-                let accepted = Arc::new(Function::new(rows::Add, rows::add).forward_into_tracked(
-                    device,
-                    &work.state.request.inputs,
-                    &mut (),
-                    (&embedded, &residual),
-                    &mut output,
-                )?);
+                let accepted = Arc::new(
+                    Function::new(rows::Add, crate::forward_four).forward_into_tracked(
+                        device,
+                        &work.state.request.inputs,
+                        &mut (),
+                        (&embedded, &residual),
+                        &mut output,
+                    )?,
+                );
                 flight.submitted(accepted);
                 Ok(())
             })?;
@@ -207,13 +209,15 @@ impl<
             let work = flight.held_mut();
             let probe: Hidden<R> = alias(&work.probe, ..)?;
             let mut retained: Hidden<R> = alias(&work.cache.probe, ..)?;
-            let accepted = Arc::new(Function::new(rows::Copy, rows::copy).forward_into_tracked(
-                device,
-                &work.state.request.inputs,
-                &mut retained,
-                &probe,
-                &mut (),
-            )?);
+            let accepted = Arc::new(
+                Function::new(rows::Copy, crate::forward_four).forward_into_tracked(
+                    device,
+                    &work.state.request.inputs,
+                    &mut retained,
+                    &probe,
+                    &mut (),
+                )?,
+            );
             flight.submitted(accepted);
             Ok(())
         })?;

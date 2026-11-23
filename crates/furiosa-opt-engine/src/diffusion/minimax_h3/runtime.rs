@@ -68,8 +68,7 @@ impl Prepared {
 /// Serialized framework component facade retaining the complete four-chip core.
 pub struct Pipeline {
     core: Arc<Core>,
-    // Serialize every component while allowing concurrent async callers to wait without
-    // blocking the executor. The DeviceContext lock is never held across core await points.
+    // Serialize component calls. The DeviceContext lock is never held across core await points.
     state: Arc<Mutex<State>>,
     decision: Decision,
 }
