@@ -209,6 +209,42 @@ def settle(transfers: Iterable[PendingTransfer]) -> BaseException | None:
     return failure
 
 
+class TransferBatch:
+    """Track completion and failure for a set of submitted asynchronous copies."""
+
+    def __init__(self, transfers: Iterable[PendingTransfer]) -> None:
+        self.transfers = tuple(transfers)
+        self._lock = threading.Lock()
+        self._finished = False
+        self._failure: BaseException | None = None
+
+    def done(self) -> bool:
+        """Return whether every copy has settled, draining the batch if a query fails."""
+        with self._lock:
+            if self._finished:
+                return True
+        try:
+            if not all(transfer.done() for transfer in self.transfers):
+                return False
+        except Exception as error:
+            self.synchronize(error)
+            return True
+        self.synchronize()
+        return True
+
+    def synchronize(self, observed_error: BaseException | None = None) -> BaseException | None:
+        """Wait for every copy and return the first failure after draining the rest."""
+        with self._lock:
+            if self._finished:
+                return self._failure
+            failure = settle(self.transfers)
+            if failure is None:
+                failure = observed_error
+            self._failure = failure
+            self._finished = True
+            return failure
+
+
 def page_runs(
     device_pages: Sequence[int], host_pages: Sequence[int], chips: int
 ) -> tuple[tuple[int, int, int], ...]:
