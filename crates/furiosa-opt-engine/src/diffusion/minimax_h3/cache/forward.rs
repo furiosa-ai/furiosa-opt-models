@@ -65,7 +65,7 @@ impl<
             .with_first_block(|launches, first| {
                 let work = flight.held_mut();
                 let time: stage::EmbeddedTime = alias(work.time.buffer(), ..)?;
-                let accepted = launches.on::<4>().forward_into_tracked(
+                let accepted = launches.forward_into_tracked(
                     kernel::Modulation {
                         model: &first.0.modulation.0,
                     },
@@ -80,7 +80,7 @@ impl<
                 let work = flight.held_mut();
                 let embedded: Hidden<R> = alias(&work.embedded, ..)?;
                 let mut probe: Hidden<R> = alias(&work.probe, ..)?;
-                let accepted = launches.on::<4>().forward_into_tracked(
+                let accepted = launches.forward_into_tracked(
                     kernel::Norm {
                         model: &first.0.norm.0,
                     },
@@ -102,17 +102,14 @@ impl<
                 let work = flight.held_mut();
                 let probe: Hidden<R> = alias(&work.probe, ..)?;
                 let previous: Hidden<R> = alias(&work.cache.probe, ..)?;
-                let accepted = Arc::new(
-                    Function::new(kernel::L1, kernel::l1)
-                        .on::<4>()
-                        .forward_into_tracked(
-                            device,
-                            &work.state.request.inputs,
-                            &mut (),
-                            (&probe, &previous),
-                            &mut work.totals,
-                        )?,
-                );
+                let accepted =
+                    Arc::new(Function::new(kernel::L1, kernel::l1).forward_into_tracked(
+                        device,
+                        &work.state.request.inputs,
+                        &mut (),
+                        (&probe, &previous),
+                        &mut work.totals,
+                    )?);
                 flight.submitted(Arc::clone(&accepted));
                 Ok(accepted)
             })?;
@@ -174,15 +171,13 @@ impl<
                 let embedded: Hidden<R> = alias(&work.embedded, ..)?;
                 let mut residual: Hidden<R> = alias(&work.cache.residual, ..)?;
                 let accepted = Arc::new(
-                    Function::new(rows::Subtract, rows::subtract)
-                        .on::<4>()
-                        .forward_into_tracked(
-                            device,
-                            &work.state.request.inputs,
-                            &mut (),
-                            (&result, &embedded),
-                            &mut residual,
-                        )?,
+                    Function::new(rows::Subtract, rows::subtract).forward_into_tracked(
+                        device,
+                        &work.state.request.inputs,
+                        &mut (),
+                        (&result, &embedded),
+                        &mut residual,
+                    )?,
                 );
                 flight.submitted(accepted);
                 Ok(())
@@ -195,17 +190,13 @@ impl<
                 let embedded: Hidden<R> = alias(&work.embedded, ..)?;
                 let residual: Hidden<R> = alias(&work.cache.residual, ..)?;
                 let mut output: Hidden<R> = alias(&work.hidden[0], ..)?;
-                let accepted = Arc::new(
-                    Function::new(rows::Add, rows::add)
-                        .on::<4>()
-                        .forward_into_tracked(
-                            device,
-                            &work.state.request.inputs,
-                            &mut (),
-                            (&embedded, &residual),
-                            &mut output,
-                        )?,
-                );
+                let accepted = Arc::new(Function::new(rows::Add, rows::add).forward_into_tracked(
+                    device,
+                    &work.state.request.inputs,
+                    &mut (),
+                    (&embedded, &residual),
+                    &mut output,
+                )?);
                 flight.submitted(accepted);
                 Ok(())
             })?;
@@ -216,17 +207,13 @@ impl<
             let work = flight.held_mut();
             let probe: Hidden<R> = alias(&work.probe, ..)?;
             let mut retained: Hidden<R> = alias(&work.cache.probe, ..)?;
-            let accepted = Arc::new(
-                Function::new(rows::Copy, rows::copy)
-                    .on::<4>()
-                    .forward_into_tracked(
-                        device,
-                        &work.state.request.inputs,
-                        &mut retained,
-                        &probe,
-                        &mut (),
-                    )?,
-            );
+            let accepted = Arc::new(Function::new(rows::Copy, rows::copy).forward_into_tracked(
+                device,
+                &work.state.request.inputs,
+                &mut retained,
+                &probe,
+                &mut (),
+            )?);
             flight.submitted(accepted);
             Ok(())
         })?;

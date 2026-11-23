@@ -39,10 +39,7 @@ impl Decoder {
         device.with_device(|device| {
             Loadable::<(
                 &mut Device,
-                (
-                    &&audio::Decoder<Chips, &Hbm>,
-                    std::marker::PhantomData<[(); 4]>,
-                ),
+                &&audio::Decoder<Chips, &Hbm>,
                 (),
                 &mut kernel::State,
                 &audio::Input,
@@ -81,7 +78,7 @@ impl Decoder {
             let work = flight.held_mut();
             let mut waveform: audio::Output = alias(&work.waveform, ..)?;
             let mut state: kernel::State = Default::default();
-            let accepted = launches.on::<4>().forward_into_tracked(
+            let accepted = launches.forward_into_tracked(
                 model,
                 kernel::decode,
                 (),
@@ -233,7 +230,7 @@ mod tests {
 
 /// Four-chip launch binding and nested decoder state.
 mod kernel {
-    pub(super) use crate::forward as decode;
+    pub(super) use crate::forward_four as decode;
 
     type UnitState = ((), ((), ()));
     type BlockState = (UnitState, (UnitState, UnitState));

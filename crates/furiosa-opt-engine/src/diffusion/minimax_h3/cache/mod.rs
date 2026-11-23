@@ -69,10 +69,7 @@ pub(super) fn prime<
 ) -> io::Result<()> {
     Loadable::<(
         &mut Device,
-        (
-            &kernel::Modulation<'_, '_>,
-            std::marker::PhantomData<[(); 4]>,
-        ),
+        &kernel::Modulation<'_, '_>,
         (),
         &mut kernel::Modulations,
         &stage::EmbeddedTime,
@@ -80,7 +77,7 @@ pub(super) fn prime<
     .map_err(io::Error::other)?;
     Loadable::<(
         &mut Device,
-        (&kernel::Norm<'_, '_>, std::marker::PhantomData<[(); 4]>),
+        &kernel::Norm<'_, '_>,
         &request::Inputs<R, K, T, A, V>,
         &mut Hidden<R>,
         (&Hidden<R>, &kernel::NormTables),
@@ -88,7 +85,7 @@ pub(super) fn prime<
     .map_err(io::Error::other)?;
     Loadable::<(
         &mut Device,
-        (&kernel::L1, std::marker::PhantomData<[(); 4]>),
+        &kernel::L1,
         &request::Inputs<R, K, T, A, V>,
         &mut (),
         (&Hidden<R>, &Hidden<R>),
@@ -96,7 +93,7 @@ pub(super) fn prime<
     .map_err(io::Error::other)?;
     Loadable::<(
         &mut Device,
-        (&rows::Add, std::marker::PhantomData<[(); 4]>),
+        &rows::Add,
         &request::Inputs<R, K, T, A, V>,
         &mut (),
         (&Hidden<R>, &Hidden<R>),
@@ -104,7 +101,7 @@ pub(super) fn prime<
     .map_err(io::Error::other)?;
     Loadable::<(
         &mut Device,
-        (&rows::Subtract, std::marker::PhantomData<[(); 4]>),
+        &rows::Subtract,
         &request::Inputs<R, K, T, A, V>,
         &mut (),
         (&Hidden<R>, &Hidden<R>),
@@ -112,7 +109,7 @@ pub(super) fn prime<
     .map_err(io::Error::other)?;
     Loadable::<(
         &mut Device,
-        (&rows::Copy, std::marker::PhantomData<[(); 4]>),
+        &rows::Copy,
         &request::Inputs<R, K, T, A, V>,
         &mut Hidden<R>,
         &Hidden<R>,

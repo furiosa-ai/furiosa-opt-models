@@ -57,10 +57,7 @@ impl Encoder {
         device.with_device(|device| {
             Loadable::<(
                 &mut Device,
-                (
-                    &&text::Embedding<P, &Hbm>,
-                    std::marker::PhantomData<[(); 4]>,
-                ),
+                &&text::Embedding<P, &Hbm>,
                 (),
                 &mut (),
                 &HbmTensor<i32, Chips, m![1]>,
@@ -68,7 +65,7 @@ impl Encoder {
             .map_err(io::Error::other)?;
             Loadable::<(
                 &mut Device,
-                (&kernel::Layer<'_, '_>, std::marker::PhantomData<[(); 4]>),
+                &kernel::Layer<'_, '_>,
                 &request::Row,
                 &mut Cache,
                 Hidden,
@@ -139,7 +136,7 @@ impl Encoder {
         let mut flight = Flight::new(Arc::clone(&request), request.rows().len());
         self.device.launch(ready, |launches, embedding| {
             for row in request.rows() {
-                let (output, work) = launches.on::<4>().forward_tracked(
+                let (output, work) = launches.forward_tracked(
                     embedding,
                     kernel::embedding,
                     (),
@@ -171,7 +168,7 @@ impl Encoder {
                 for (at, row) in request.rows().iter().enumerate() {
                     let (rows, _, cache) = flight.held_mut();
                     let input: Hidden = alias(&rows[at], ..)?;
-                    let (output, work) = launches.on::<4>().forward_tracked(
+                    let (output, work) = launches.forward_tracked(
                         kernel::Layer { layer, positions },
                         kernel::layer,
                         row,

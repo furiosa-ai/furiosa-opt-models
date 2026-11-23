@@ -81,10 +81,7 @@ impl Decoder {
         let context = device.with_device(|device| {
             Loadable::<(
                 &mut Device,
-                (
-                    &&video::Embedding<Chips, &Hbm>,
-                    std::marker::PhantomData<[(); 4]>,
-                ),
+                &&video::Embedding<Chips, &Hbm>,
                 &video::Context,
                 &mut ((), ()),
                 &video::Latent,
@@ -92,10 +89,7 @@ impl Decoder {
             .map_err(io::Error::other)?;
             Loadable::<(
                 &mut Device,
-                (
-                    &&video::Layer<Chips, &Hbm>,
-                    std::marker::PhantomData<[(); 4]>,
-                ),
+                &&video::Layer<Chips, &Hbm>,
                 &video::Context,
                 &mut (),
                 video::Residual,
@@ -103,10 +97,7 @@ impl Decoder {
             .map_err(io::Error::other)?;
             Loadable::<(
                 &mut Device,
-                (
-                    &&video::FinalNorm<Chips, &Hbm>,
-                    std::marker::PhantomData<[(); 4]>,
-                ),
+                &&video::FinalNorm<Chips, &Hbm>,
                 &video::Context,
                 &mut (),
                 &video::Residual,
@@ -114,10 +105,7 @@ impl Decoder {
             .map_err(io::Error::other)?;
             Loadable::<(
                 &mut Device,
-                (
-                    &&video::Head<Chips, &Hbm>,
-                    std::marker::PhantomData<[(); 4]>,
-                ),
+                &&video::Head<Chips, &Hbm>,
                 &video::Context,
                 &mut (),
                 &video::Normalized,
@@ -266,7 +254,7 @@ impl Decoder {
             let work = flight.held_mut();
             let input: video::Latent = alias(&work.inputs[slot], ..)?;
             let mut output: video::Residual = alias(&work.rows[0], ..)?;
-            let accepted = launches.on::<4>().forward_into_tracked(
+            let accepted = launches.forward_into_tracked(
                 model,
                 kernel::embedding,
                 work.context.as_ref(),
@@ -283,7 +271,7 @@ impl Decoder {
                 let work = flight.held_mut();
                 let input: video::Residual = alias(&work.rows[at % 2], ..)?;
                 let mut output: video::Residual = alias(&work.rows[(at + 1) % 2], ..)?;
-                let accepted = launches.on::<4>().forward_into_tracked(
+                let accepted = launches.forward_into_tracked(
                     model,
                     kernel::layer,
                     work.context.as_ref(),
@@ -300,7 +288,7 @@ impl Decoder {
             let work = flight.held_mut();
             let input: video::Residual = alias(&work.rows[video::DEPTH % 2], ..)?;
             let mut output: video::Normalized = alias(&work.normalized, ..)?;
-            let accepted = launches.on::<4>().forward_into_tracked(
+            let accepted = launches.forward_into_tracked(
                 model,
                 kernel::norm,
                 work.context.as_ref(),
@@ -316,7 +304,7 @@ impl Decoder {
             let work = flight.held_mut();
             let input: video::Normalized = alias(&work.normalized, ..)?;
             let mut output: video::Pixels = alias(&work.pixels[slot], ..)?;
-            let accepted = launches.on::<4>().forward_into_tracked(
+            let accepted = launches.forward_into_tracked(
                 model,
                 kernel::head,
                 work.context.as_ref(),
@@ -424,10 +412,10 @@ impl Workspace {
 
 /// Four-chip stage bindings for the shared Module entry.
 mod kernel {
-    pub(super) use crate::forward as embedding;
-    pub(super) use crate::forward as head;
-    pub(super) use crate::forward as layer;
-    pub(super) use crate::forward as norm;
+    pub(super) use crate::forward_four as embedding;
+    pub(super) use crate::forward_four as head;
+    pub(super) use crate::forward_four as layer;
+    pub(super) use crate::forward_four as norm;
 }
 
 #[cfg(test)]

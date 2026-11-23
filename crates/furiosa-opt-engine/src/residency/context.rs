@@ -170,9 +170,9 @@ mod tests {
                     if caller_output {
                         let mut output =
                             Values::alloc(launches.device()).map_err(io::Error::other)?;
-                        launches.on::<4>().forward_into_tracked(
+                        launches.forward_into_tracked(
                             Copy,
-                            crate::forward,
+                            crate::forward_four,
                             (),
                             &mut (),
                             *input,
@@ -180,9 +180,7 @@ mod tests {
                         )?;
                         Ok(output)
                     } else {
-                        launches
-                            .on::<4>()
-                            .forward(Copy, crate::forward, (), &mut (), *input)
+                        launches.forward(Copy, crate::forward_four, (), &mut (), *input)
                     }
                 })
                 .unwrap();

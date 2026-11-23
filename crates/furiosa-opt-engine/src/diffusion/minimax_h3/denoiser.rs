@@ -126,7 +126,7 @@ impl<
         device.with_device(|device| {
             Loadable::<(
                 &mut Device,
-                (&kernel::Embed<'_, '_>, std::marker::PhantomData<[(); 4]>),
+                &kernel::Embed<'_, '_>,
                 &request::Inputs<R, K, T, A, V>,
                 &mut (),
                 (&Times, (&Video<V>, &Audio<A>), &Hidden<T>),
@@ -134,7 +134,7 @@ impl<
             .map_err(io::Error::other)?;
             Loadable::<(
                 &mut Device,
-                (&kernel::Block<'_, '_>, std::marker::PhantomData<[(); 4]>),
+                &kernel::Block<'_, '_>,
                 &request::Inputs<R, K, T, A, V>,
                 &mut (),
                 (Hidden<R>, &kernel::EmbeddedTime),
@@ -142,7 +142,7 @@ impl<
             .map_err(io::Error::other)?;
             Loadable::<(
                 &mut Device,
-                (&kernel::Heads<'_, '_>, std::marker::PhantomData<[(); 4]>),
+                &kernel::Heads<'_, '_>,
                 &request::Inputs<R, K, T, A, V>,
                 &mut (),
                 (&Hidden<R>, &kernel::EmbeddedTime),
@@ -246,7 +246,7 @@ impl<
             } = slots(flight.held_mut());
             let mut output: (Hidden<R>, kernel::EmbeddedTime) =
                 (alias(hidden, ..)?, alias(time.buffer(), ..)?);
-            let accepted = launches.on::<4>().forward_into_tracked(
+            let accepted = launches.forward_into_tracked(
                 kernel::Embed { model },
                 kernel::embed,
                 &state.request.inputs,
@@ -277,7 +277,7 @@ impl<
                 let input: Hidden<R> = alias(input, ..)?;
                 let time: kernel::EmbeddedTime = alias(time.buffer(), ..)?;
                 let mut output: Hidden<R> = alias(output, ..)?;
-                let accepted = launches.on::<4>().forward_into_tracked(
+                let accepted = launches.forward_into_tracked(
                     kernel::Block { model },
                     kernel::block,
                     &state.request.inputs,
@@ -310,7 +310,7 @@ impl<
             let input: Hidden<R> = alias(input, ..)?;
             let time: kernel::EmbeddedTime = alias(time.buffer(), ..)?;
             let mut output: (Video<V>, Audio<A>) = (alias(video, ..)?, alias(audio, ..)?);
-            let accepted = launches.on::<4>().forward_into_tracked(
+            let accepted = launches.forward_into_tracked(
                 kernel::Heads { model },
                 kernel::heads,
                 &state.request.inputs,
