@@ -9,7 +9,10 @@ use super::{
     B, Blocked, Bs, Chunked, Cluster, Hr, KeptOutputs, Ks, Np, PassOutputs, Result, Rows, Sink,
     Slab, Weight,
 };
+use super::{InDm, Offset, Parts, Pass, Passes, Projection, Rounding, Source, tiled};
+use crate::Op;
 use crate::tensor::form::grouped::Layout;
+use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
 
 type Tile = crate::tensor::axis::Rows<256>;
@@ -22,8 +25,6 @@ pub(crate) struct Packed<'a, I: AxisName, O: AxisName, Chips: M>(
 impl<I: AxisName, O: AxisName, R: AxisName, Chips: M> Slab<I, O, R, Chips>
     for Packed<'_, I, O, Chips>
 {
-    const PIPELINED: bool = true;
-
     fn slab(&self, device: &mut Device, pass: usize) -> Weight<I, O, R, Chips> {
         const {
             assert!(
@@ -91,5 +92,182 @@ impl<D: MaterializableScalar, I: AxisName, O: AxisName, R: AxisName, Chips: M>
             kept.view().to_dm_view(&mut device.tdma, rows.view_mut());
             rows.view().to_hbm_view(&mut device.tdma, tile);
         }
+    }
+}
+
+impl<'s, 't, 'w, I, O, R, Chips, Bias, Out, SourceOrder, SinkOrder, S, T> Op<(&'s S, &'t mut T)>
+    for Projection<'_, I, O, R, Chips, Bias, Out, Packed<'w, I, O, Chips>>
+where
+    I: AxisName,
+    O: AxisName,
+    R: AxisName,
+    Chips: M,
+    Bias: Offset<I, O, R, Chips>,
+    Out: Rounding,
+    SourceOrder: M,
+    SinkOrder: M,
+    S: Source<I, O, R, Chips, Order = SourceOrder>,
+    T: Sink<Out, I, O, R, Chips, Order = SinkOrder>,
+{
+    type Output = ();
+
+    fn forward(&self, device: &mut Device, (rows, output): (&'s S, &'t mut T)) {
+        for pass in 0..<Passes<I, O, R> as AxisName>::SIZE {
+            Pass::<_, Out, SinkOrder>(self, PhantomData).forward(
+                device,
+                (
+                    pass,
+                    rows,
+                    |device: &mut Device, kept: &Result<Out, I, O, R, Chips, SinkOrder>, block| {
+                        output.store(device, kept, (block, pass))
+                    },
+                ),
+            );
+        }
+    }
+}
+
+impl<'i, 'o, 'w, I: AxisName, O: AxisName, R: AxisName, Chips: M, W: AxisName>
+    Op<(
+        &'i HbmTensor<bf16, Chips, m![R, I]>,
+        (
+            &'o mut HbmTensor<bf16, Chips, m![R, W]>,
+            &'o mut HbmTensor<bf16, Chips, m![R, W]>,
+            &'o mut HbmTensor<bf16, Chips, m![R, W]>,
+        ),
+    )> for Projection<'_, I, O, R, Chips, (), bf16, Packed<'w, I, O, Chips>>
+{
+    type Output = ();
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (input, (first, second, third)): (
+            &'i HbmTensor<bf16, Chips, m![R, I]>,
+            (
+                &'o mut HbmTensor<bf16, Chips, m![R, W]>,
+                &'o mut HbmTensor<bf16, Chips, m![R, W]>,
+                &'o mut HbmTensor<bf16, Chips, m![R, W]>,
+            ),
+        ),
+    ) {
+        const { assert!(O::SIZE == 3 * W::SIZE) };
+        if const {
+            <Passes<I, O, R> as AxisName>::SIZE == 3
+                && <PassOutputs<I, O, R> as AxisName>::SIZE == W::SIZE
+        } {
+            let store_part = |device: &mut Device,
+                              kept: &Result<bf16, I, O, R, Chips, Rows<I, O, R>>,
+                              output: &mut HbmTensor<bf16, Chips, m![R, W]>,
+                              block: usize| {
+                // SAFETY: the blocks split the rows in order, and a part's columns are its pass's
+                // outputs.
+                let blocked = unsafe {
+                    output
+                        .view_mut()
+                        .reshape::<Chips, m![{ Bs<R> }, { B<R> }, O % ({ Np<I, O, R> })]>()
+                };
+                let tile = blocked.tile::<m![{ Bs<R> }], 1, m![
+                    { Bs<R> } = 1 #{!} ({ Bs<R> }), { B<R> }, O % ({ Np<I, O, R> })
+                ]>(block);
+                kept.view().to_hbm_view(&mut device.tdma, tile);
+            };
+            Pass::<_, bf16, Rows<I, O, R>>(self, PhantomData).forward(
+                device,
+                (
+                    0,
+                    input,
+                    |device: &mut Device,
+                     kept: &Result<bf16, I, O, R, Chips, Rows<I, O, R>>,
+                     block| store_part(device, kept, first, block),
+                ),
+            );
+            Pass::<_, bf16, Rows<I, O, R>>(self, PhantomData).forward(
+                device,
+                (
+                    1,
+                    input,
+                    |device: &mut Device,
+                     kept: &Result<bf16, I, O, R, Chips, Rows<I, O, R>>,
+                     block| store_part(device, kept, second, block),
+                ),
+            );
+            Pass::<_, bf16, Rows<I, O, R>>(self, PhantomData).forward(
+                device,
+                (
+                    2,
+                    input,
+                    |device: &mut Device,
+                     kept: &Result<bf16, I, O, R, Chips, Rows<I, O, R>>,
+                     block| store_part(device, kept, third, block),
+                ),
+            );
+        } else {
+            let mut joint: HbmTensor<bf16, Chips, m![R, O]> = HbmTensor::new();
+            self.forward(&mut *device, (input, &mut joint));
+            // SAFETY: a row's outputs are its three parts in order.
+            let parts = unsafe { joint.view().reshape::<Chips, m![R, Parts, W]>() };
+            parts
+                .tile::<m![Parts], 1, m![R, Parts = 1 # 3, W]>(0)
+                .to_hbm_view(&mut device.tdma, first.view_mut());
+            parts
+                .tile::<m![Parts], 1, m![R, Parts = 1 # 3, W]>(1)
+                .to_hbm_view(&mut device.tdma, second.view_mut());
+            parts
+                .tile::<m![Parts], 1, m![R, Parts = 1 # 3, W]>(2)
+                .to_hbm_view(&mut device.tdma, third.view_mut());
+        }
+    }
+}
+
+impl<
+    's,
+    'w,
+    I: AxisName,
+    O: AxisName,
+    R: AxisName,
+    Chips: M,
+    Bias: Offset<I, O, R, Chips>,
+    Scalar,
+    D,
+    SourceOrder,
+    SinkOrder,
+    S,
+    Store,
+> Op<(usize, &'s S, Store)>
+    for Pass<
+        '_,
+        Projection<'_, I, O, R, Chips, Bias, Scalar, Packed<'w, I, O, Chips>>,
+        D,
+        SinkOrder,
+    >
+where
+    D: Rounding,
+    SourceOrder: M,
+    SinkOrder: M,
+    S: Source<I, O, R, Chips, Order = SourceOrder>,
+    Store: FnMut(&mut Device, &Result<D, I, O, R, Chips, SinkOrder>, usize),
+{
+    type Output = ();
+
+    fn forward(&self, device: &mut Device, (pass, rows, mut store): (usize, &'s S, Store)) {
+        let mut first: InDm<I, O, R, Chips, SourceOrder> = DmTensor::new();
+        let mut second: InDm<I, O, R, Chips, SourceOrder> = DmTensor::new();
+        rows.to_dm(device, 0, &mut first);
+        let slab = self.0.weight.slab(device, pass);
+        if const { <Bs<R> as M>::SIZE > 1 } {
+            rows.to_dm(device, 1, &mut second);
+        }
+        let offsets = self.0.bias.pass(device, pass);
+        let (_, (last, block)) = tiled::trips(
+            device,
+            (rows, |block| block, PhantomData::<Bs<R>>),
+            (first, second),
+            (),
+            |_: &mut Device, _, _: &mut InDm<I, O, R, Chips, SourceOrder>| {},
+            |device, register, kept| Bias::contract(device, (&slab, &offsets), register, kept),
+            &mut store,
+        );
+        store(device, &last, block);
     }
 }

@@ -296,6 +296,10 @@ pub struct Rolled;
 #[derive(Clone, Copy, Default, DeviceSend, Load, Residency)]
 pub struct Unrolled;
 
+/// Unroll an explicit constant range when the device compiler cannot unroll enumeration.
+#[derive(Clone, Copy, Default, DeviceSend, Load, Residency)]
+pub struct UnrolledRange;
+
 impl<'s, X, LayerState, C, const N: usize, Env: Copy> Module<X, Env, &'s mut [LayerState; N]>
     for Layers<C, Rolled>
 where
@@ -322,6 +326,31 @@ where
 
 impl<'s, X, LayerState, C, const N: usize, Env: Copy> Module<X, Env, &'s mut [LayerState; N]>
     for Layers<C, Unrolled>
+where
+    C: Collection<X, Env, &'s mut LayerState, Output = X>,
+{
+    type Output = X;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        env: Env,
+        state: &'s mut [LayerState; N],
+        mut hidden: X,
+    ) -> X {
+        const { assert!(C::COUNT == N, "one state slot for each layer") };
+        if N > 0 {
+            #[unroll]
+            for (index, slot) in state.iter_mut().enumerate() {
+                hidden = self.layers.apply(&mut *device, env, slot, hidden, index);
+            }
+        }
+        hidden
+    }
+}
+
+impl<'s, X, LayerState, C, const N: usize, Env: Copy> Module<X, Env, &'s mut [LayerState; N]>
+    for Layers<C, UnrolledRange>
 where
     C: Collection<X, Env, &'s mut LayerState, Output = X>,
 {

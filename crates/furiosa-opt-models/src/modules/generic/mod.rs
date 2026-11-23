@@ -11,7 +11,7 @@ pub use fork::Fork;
 use furiosa_opt_std::prelude::{Device, DeviceSend};
 pub use interleave::{Branch, Interleave};
 pub(crate) use layers::Collection;
-pub use layers::{Layers, Repeat, Rolled, Unrolled};
+pub use layers::{Layers, Repeat, Rolled, Unrolled, UnrolledRange};
 pub(crate) use order::Order;
 pub use prefix::Prefix;
 pub use schedule::Scheduled;

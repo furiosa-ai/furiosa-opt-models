@@ -1,6 +1,6 @@
 //! Elementwise sums, in FP32 and rounded once.
 
-use super::{Flat, Float, Rows, Window};
+use super::{Flat, Float, Registers, Rows, Segment, Width, Window};
 use crate::Op;
 use crate::load::Load;
 use crate::modules::generic::schedule::{Fill, IntoStream, Slot, Spill, Stream};
@@ -68,7 +68,28 @@ impl<D: Float, S: M + 'static, Chips: M> Op<&(Rows<D, S, Chips>, Rows<D, S, Chip
         device: &mut Device,
         (left, right): &(Rows<D, S, Chips>, Rows<D, S, Chips>),
     ) -> Self::Output {
-        Window::<S>::combine_tile::<D, Chips>(device, left, right, FpBinaryOp::AddF)
+        let right: Registers<S, Chips> = device
+            .sub
+            .begin(right.view())
+            .fetch::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
+            .fetch_cast::<f32>()
+            .collect::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
+            .to_vrf();
+        let sum: Rows<f32, S, Chips> = device
+            .main
+            .begin(left.view())
+            .fetch::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
+            .fetch_cast::<f32>()
+            .collect::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_split::<m![{ Width<S> } % ({ Segment<S> }) / 4], m![{ Width<S> } % 4]>()
+            .vector_fp_binary(FpBinaryOp::AddF, &right)
+            .vector_widen_concat::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
+            .vector_final()
+            .commit_trim::<m![{ Width<S> } % 8]>()
+            .commit();
+        D::narrow(device, sum)
     }
 }
 
@@ -84,7 +105,7 @@ impl<D: Float, S: M + 'static, Chips: M> Op<(&HbmTensor<D, Chips, S>, &HbmTensor
         device: &mut Device,
         (left, right): (&HbmTensor<D, Chips, S>, &HbmTensor<D, Chips, S>),
     ) -> Self::Output {
-        Window::<S>::combine::<D, Chips>(device, left, right, FpBinaryOp::AddF)
+        Window::<S>::combine::<_, false, Chips>(device, left, right)
     }
 }
 

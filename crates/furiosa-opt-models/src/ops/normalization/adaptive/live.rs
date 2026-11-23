@@ -37,7 +37,7 @@ where
             input,
             output,
             modulation,
-            Block::<R>::plan(plan.spans(), EDGE),
+            Block::<R>::plan_live(plan.spans(), EDGE),
         );
         clear_guards(device, output, plan);
     }
@@ -100,7 +100,7 @@ impl<R: AxisName, W: AxisName, C: M, const EDGE: usize>
             branch,
             output,
             gate,
-            Block::<R>::plan(plan.spans(), EDGE),
+            Block::<R>::plan_live(plan.spans(), EDGE),
         );
         clear_guards(device, output, plan);
     }

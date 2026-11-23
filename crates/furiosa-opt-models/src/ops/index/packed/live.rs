@@ -203,7 +203,7 @@ mod tests {
 
     fn coverage<R: AxisName, const EDGE: usize>(plan: SpanPlan<R, EDGE>) {
         let mut actual = vec![None; R::SIZE];
-        for regions in Block::<R>::plan(plan.spans(), EDGE) {
+        for regions in Block::<R>::plan_live(plan.spans(), EDGE) {
             for (region, (first, count, table)) in regions.into_iter().enumerate() {
                 let rows = if region == 1 { Block::<R>::SIZE } else { EDGE };
                 for (offset, slot) in actual[first * rows..(first + count) * rows]

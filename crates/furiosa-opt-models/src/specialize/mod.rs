@@ -6,6 +6,7 @@ pub(crate) mod contraction;
 pub(crate) mod convolution;
 pub(crate) mod diffusion;
 pub(crate) mod index;
+pub mod linear;
 pub(crate) mod normalization;
 pub(crate) mod pointwise;
 pub(crate) mod vocabulary;

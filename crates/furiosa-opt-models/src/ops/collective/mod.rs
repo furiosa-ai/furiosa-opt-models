@@ -329,9 +329,18 @@ impl<'x, D: MaterializableScalar, S: AxisName, W: AxisName, const N: usize>
         device: &mut Device,
         input: &'x Rows<D, N, Pieces<S, N>, Part<W, N>>,
     ) -> Self::Output {
-        let mut output = HbmTensor::new();
-        self.write(device, input.view(), output.view_mut());
-        output
+        type L<W, const N: usize> = Symbol<Part<W, N>>;
+        // SAFETY: the rows are the parts in chip order, each its rows in order.
+        let rows = unsafe {
+            input
+                .view()
+                .reshape::<ChipMap<N>, m![{ O<N> }, S, { L<W, N> }]>()
+        };
+        let mut output: HbmTensor<D, m![{ O<N> }], m![S, { Symbol<Shard<N>> }, { L<W, N> }]> =
+            HbmTensor::new();
+        rows.to_hbm_view(&mut device.tdma, output.view_mut());
+        // SAFETY: chip `t` holds part `t` of the rows, its columns the parts in chip order.
+        unsafe { output.reshape() }
     }
 }
 

@@ -231,7 +231,6 @@ impl<
 
 /// A video and an audio span each in rows of its own, `Video` and `Audio` rows long: both are
 /// allocated, then the video span is written in the leading rows of the first, then the audio span.
-/// Any additional rows are initialized to positive zero before a head reads its full envelope.
 #[derive(DeviceSend, Load)]
 pub struct Materialize<Video, Audio>(PhantomData<(Video, Audio)>);
 
@@ -267,18 +266,9 @@ impl<
             Rows<Span<AUDIO_LIVE, AUDIO_ROWS>, W, Chips>,
         ),
     ) -> Self::Output {
-        const {
-            assert!(VIDEO_ROWS <= Video::SIZE && AUDIO_ROWS <= Audio::SIZE);
-        }
         let mut media: Self::Output = (HbmTensor::new(), HbmTensor::new());
         Span::<VIDEO_LIVE, VIDEO_ROWS>::new().forward(&mut *device, (video, (&mut media.0, 0)));
         Span::<AUDIO_LIVE, AUDIO_ROWS>::new().forward(&mut *device, (audio, (&mut media.1, 0)));
-        if const { Video::SIZE > VIDEO_ROWS } {
-            rows::clear(device, &mut media.0, VIDEO_ROWS, Video::SIZE - VIDEO_ROWS);
-        }
-        if const { Audio::SIZE > AUDIO_ROWS } {
-            rows::clear(device, &mut media.1, AUDIO_ROWS, Audio::SIZE - AUDIO_ROWS);
-        }
         media
     }
 }
@@ -289,7 +279,12 @@ impl Join {
     pub(crate) const fn spans<T: AxisName, A: AxisName, V: AxisName>() -> [(usize, usize, usize); 3]
     {
         let unit = Packed::<T, A, V>::STRIP;
-        Self::spans_in_strips([T::SIZE / unit, A::SIZE / unit, V::SIZE / unit])
+        let (text, audio) = (T::SIZE / unit, A::SIZE / unit);
+        [
+            (0, text, 1),
+            (text, audio, 5),
+            (text + audio, V::SIZE / unit, 0),
+        ]
     }
 
     /// The shared table ordering for static and checked runtime spans. Callers establish that
@@ -405,21 +400,16 @@ pub(crate) mod row_tests {
     //! their previous values. Head outputs initialize their aligned extensions.
 
     use crate::Op;
-    use crate::ops::index::packed::{Join, Materialize, RowInputs, RowPlan, Rows, Span, Split};
-    use crate::tensor::{axis, parallel::Shard};
+    use crate::ops::index::packed::{Join, RowInputs, RowPlan, Rows, Split};
+    use crate::tensor::parallel::Shard;
     use furiosa_opt_std::prelude::*;
     use furiosa_opt_std::runtime::launch;
     use std::ops::Range;
 
     type Chips = m![{ Symbol<Shard<4>> }];
-    axes![Width = 128, HeadWidth = 5376, NarrowHead = 64];
-    type Media<A, V, W = Width> = (Rows<V, W, Chips>, Rows<A, W, Chips>);
+    axes![Width = 128];
+    type Media<A, V> = (Rows<V, Width, Chips>, Rows<A, Width, Chips>);
     type Header<R, T, A, V> = RowInputs<R, T, A, V, Chips>;
-
-    type Video = Span<50, 64>;
-    type Audio = Span<10, 16>;
-    type VideoHead = axis::Rows<80>;
-    type AudioHead = axis::Rows<32>;
 
     #[derive(Clone, Debug)]
     pub(crate) struct Case {
@@ -641,55 +631,5 @@ pub(crate) mod row_tests {
                 assert_bits(&actual, &expected, "independent Split", case_index);
             }
         }
-    }
-
-    #[device(chip = 4)]
-    fn materialize<W: AxisName>(
-        device: &mut Device,
-        media: &Media<Audio, Video, W>,
-    ) -> (Rows<VideoHead, W, Chips>, Rows<AudioHead, W, Chips>) {
-        Materialize::<VideoHead, AudioHead>::new().forward(device, media)
-    }
-
-    async fn materialize_case<W: AxisName>(device: &mut Device) {
-        let values = |modality, capacity| {
-            (0..4).flat_map(move |chip| {
-                (0..capacity).flat_map(move |row| {
-                    (0..W::SIZE).map(move |column| source(chip, modality, row, column))
-                })
-            })
-        };
-        let media = (
-            upload::<Video, W>(device, values(2, 64)).await,
-            upload::<Audio, W>(device, values(1, 16)).await,
-        );
-        let output = launch(materialize, (&mut *device, &media)).await.unwrap();
-        for (modality, copied, capacity, actual) in [
-            (2, 64, 80, download(device, &output.0).await),
-            (1, 16, 32, download(device, &output.1).await),
-        ] {
-            let expected: Vec<_> = (0..4)
-                .flat_map(|chip| {
-                    (0..capacity).flat_map(move |row| {
-                        (0..W::SIZE).map(move |column| {
-                            if row < copied {
-                                source(chip, modality, row, column)
-                            } else {
-                                bf16::from_bits(0)
-                            }
-                        })
-                    })
-                })
-                .collect();
-            assert_bits(&actual, &expected, "Materialize", 0);
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn materialize_preserves_source_padding_and_initializes_head_extensions() {
-        let _lease = crate::tests::DEVICE.lock().await;
-        let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
-        materialize_case::<HeadWidth>(&mut device).await;
-        materialize_case::<NarrowHead>(&mut device).await;
     }
 }

@@ -191,11 +191,10 @@ impl<S: M + 'static> Window<S> {
 }
 
 impl<S: M + 'static> Window<S> {
-    pub(in crate::ops) fn combine<D: Float, Chips: M>(
+    pub(in crate::ops) fn combine<D: Float, const MULTIPLY: bool, Chips: M>(
         device: &mut Device,
         lhs: &HbmTensor<D, Chips, S>,
         rhs: &HbmTensor<D, Chips, S>,
-        op: FpBinaryOp,
     ) -> HbmTensor<D, Chips, S> {
         let mut result = HbmTensor::<D, Chips, m![{ Width<S> }]>::new();
         for index in 0..S::SIZE / Window::<S>::SIZE {
@@ -205,33 +204,14 @@ impl<S: M + 'static> Window<S> {
             let rhs: Rows<D, S, Chips> = unsafe { rhs.view().reshape::<Chips, m![{ Width<S> }]>() }
                 .tile::<m![{ Width<S> } / ({ Extent<S> })], 1, Batch<S>>(index)
                 .to_dm(&mut device.tdma);
-            let output = Self::combine_tile::<D, Chips>(device, &lhs, &rhs, op);
-            output.view().to_hbm_view(
-                &mut device.tdma,
-                result
-                    .view_mut()
-                    .tile::<m![{ Width<S> } / ({ Extent<S> })], 1, BatchMut<S>>(index),
-            );
-        }
-        // SAFETY: flattening preserves the contiguous element order.
-        unsafe { result.reshape() }
-    }
-
-    /// Combine DM tiles in FP32, then narrow once to the source scalar type.
-    fn combine_tile<D: Float, Chips: M>(
-        device: &mut Device,
-        lhs: &Rows<D, S, Chips>,
-        rhs: &Rows<D, S, Chips>,
-        op: FpBinaryOp,
-    ) -> Rows<D, S, Chips> {
-        let rhs: Registers<S, Chips> = device
-            .sub
-            .begin(rhs.view())
-            .fetch::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
-            .fetch_cast::<f32>()
-            .collect::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
-            .to_vrf();
-        let output: Rows<f32, S, Chips> = device
+            let rhs: Registers<S, Chips> = device
+                .sub
+                .begin(rhs.view())
+                .fetch::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
+                .fetch_cast::<f32>()
+                .collect::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
+                .to_vrf();
+            let output: Rows<f32, S, Chips> = device
             .main
             .begin(lhs.view())
             .fetch::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
@@ -240,12 +220,27 @@ impl<S: M + 'static> Window<S> {
             .vector_init()
             .vector_intra_slice_tag(TagMode::Zero)
             .vector_narrow_split::<m![{ Width<S> } % ({ Segment<S> }) / 4], m![{ Width<S> } % 4]>()
-            .vector_fp_binary(op, &rhs)
+            .vector_fp_binary(
+                if MULTIPLY {
+                    FpBinaryOp::MulF(FpMulAlu::Mul0)
+                } else {
+                    FpBinaryOp::AddF
+                },
+                &rhs,
+            )
             .vector_widen_concat::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
             .vector_final()
             .commit_trim::<m![{ Width<S> } % 8]>()
             .commit();
-        D::narrow(device, output)
+            D::narrow(device, output).view().to_hbm_view(
+                &mut device.tdma,
+                result
+                    .view_mut()
+                    .tile::<m![{ Width<S> } / ({ Extent<S> })], 1, BatchMut<S>>(index),
+            );
+        }
+        // SAFETY: flattening preserves the contiguous element order.
+        unsafe { result.reshape() }
     }
 }
 

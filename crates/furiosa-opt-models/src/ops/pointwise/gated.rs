@@ -90,17 +90,72 @@ impl<T: AxisName, A: AxisName, V: AxisName, W: AxisName, X: M>
             &Table<W, X>,
         ),
     ) {
+        // Each span's strips before its first whole block, its whole blocks, then its strips after;
+        // strips are 64 rows when every span comes in them, else 16.
         let plan = const {
             Block::<Packed<T, A, V>>::plan(Join::spans::<T, A, V>(), Packed::<T, A, V>::STRIP)
         };
-        if const { Packed::<T, A, V>::STRIP == 64 } {
-            self.apply_spans::<Packed<T, A, V>, W, X, 64>(
-                device, input, branch, output, gate, plan,
-            );
-        } else {
-            self.apply_spans::<Packed<T, A, V>, W, X, 16>(
-                device, input, branch, output, gate, plan,
-            );
+        #[unroll]
+        for span in 0..3 {
+            #[unroll]
+            for region in 0..3 {
+                let (first, count, index) = plan[span][region];
+                if count > 0 {
+                    if region == 1 {
+                        type R<T, A, V> = Packed<T, A, V>;
+                        type B<T, A, V> = Block<R<T, A, V>>;
+                        let gate = B::<T, A, V>::new()
+                            .forward(&mut *device, B::<T, A, V>::row(gate, index));
+                        let last = first + count - 1;
+                        let mut current: (
+                            Part<bf16, R<T, A, V>, W, X>,
+                            Part<bf16, R<T, A, V>, W, X>,
+                        ) = (DmTensor::new(), DmTensor::new());
+                        let mut next: (Part<bf16, R<T, A, V>, W, X>, Part<bf16, R<T, A, V>, W, X>) =
+                            (DmTensor::new(), DmTensor::new());
+                        let (mut kept, mut held): (
+                            Part<bf16, R<T, A, V>, W, X>,
+                            Part<bf16, R<T, A, V>, W, X>,
+                        ) = (DmTensor::new(), DmTensor::new());
+                        B::<T, A, V>::new()
+                            .forward(&mut *device, ((input, branch), first, &mut current));
+                        B::<T, A, V>::new().forward(
+                            &mut *device,
+                            ((input, branch), (first + 1).min(last), &mut next),
+                        );
+                        for pair in 0..(count + 1) / 2 {
+                            let at = first + 2 * pair;
+                            B::<T, A, V>::new().forward(
+                                &mut *device,
+                                ((&current.0, &current.1), &gate, &mut kept),
+                            );
+                            B::<T, A, V>::new().forward(
+                                &mut *device,
+                                ((input, branch), (at + 2).min(last), &mut current),
+                            );
+                            B::<T, A, V>::new().forward(&mut *device, (&kept, &mut *output, at));
+                            B::<T, A, V>::new()
+                                .forward(&mut *device, ((&next.0, &next.1), &gate, &mut held));
+                            B::<T, A, V>::new().forward(
+                                &mut *device,
+                                ((input, branch), (at + 3).min(last), &mut next),
+                            );
+                            B::<T, A, V>::new()
+                                .forward(&mut *device, (&held, &mut *output, (at + 1).min(last)));
+                        }
+                    } else if const { Packed::<T, A, V>::STRIP == 64 } {
+                        rows::Wide::<W>::new().forward(
+                            &mut *device,
+                            (input, branch, &mut *output, gate, (first, count, index)),
+                        );
+                    } else {
+                        rows::Narrow::<W>::new().forward(
+                            &mut *device,
+                            (input, branch, &mut *output, gate, (first, count, index)),
+                        );
+                    }
+                }
+            }
         }
     }
 }

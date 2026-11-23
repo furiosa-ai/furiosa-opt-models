@@ -4,7 +4,7 @@
 
 use crate::Module;
 use crate::load::Load;
-use crate::ops::collective::{AllGather, AllReduce, Exchange, Pieces, Whole};
+use crate::ops::collective::{AllGather, AllReduce, Exchange, InTiles, Pieces, Whole};
 use crate::tensor::axis::Rows;
 use crate::tensor::live::{BlockPrefix, Extents, Live, PrefixPlan};
 use crate::tensor::memory::residency::Residency;
@@ -86,17 +86,34 @@ where
     }
 }
 
-impl<'x, X, Y, O, L, const N: usize, Env: Copy, Strategy> Module<&'x X, Env, &mut ()>
-    for Gathered<L, Parallel<N>, Strategy>
+impl<'x, X, Y, O, L, const N: usize, Env: Copy> Module<&'x X, Env, &mut ()>
+    for Gathered<L, Parallel<N>>
 where
     Parallel<N>: Placement,
-    AllGather<Parallel<N>, Strategy>: for<'a, 's> Module<&'a X, Env, &'s mut (), Output = Y>,
+    AllGather<Parallel<N>>: for<'a, 's> Module<&'a X, Env, &'s mut (), Output = Y>,
     L: for<'a, 's> Module<&'a Y, Env, &'s mut (), Output = O>,
 {
     type Output = O;
 
     fn forward(&self, device: &mut Device, env: Env, _: &mut (), input: &'x X) -> Self::Output {
-        let gathered = AllGather::<Parallel<N>, Strategy>::default().forward(
+        let gathered =
+            AllGather::<Parallel<N>>::default().forward(&mut *device, env, &mut (), input);
+        self.operation.forward(device, env, &mut (), &gathered)
+    }
+}
+
+impl<'x, X, Y, O, L, const N: usize, Env: Copy, const T: usize, const K: usize, const HEAD: usize>
+    Module<&'x X, Env, &mut ()> for Gathered<L, Parallel<N>, InTiles<T, K, HEAD>>
+where
+    Parallel<N>: Placement,
+    AllGather<Parallel<N>, InTiles<T, K, HEAD>>:
+        for<'a, 's> Module<&'a X, Env, &'s mut (), Output = Y>,
+    L: for<'a, 's> Module<&'a Y, Env, &'s mut (), Output = O>,
+{
+    type Output = O;
+
+    fn forward(&self, device: &mut Device, env: Env, _: &mut (), input: &'x X) -> Self::Output {
+        let gathered = AllGather::<Parallel<N>, InTiles<T, K, HEAD>>::default().forward(
             &mut *device,
             env,
             &mut (),

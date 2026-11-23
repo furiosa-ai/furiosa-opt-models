@@ -16,7 +16,6 @@ use super::Matrix;
 use super::kernel::{Contraction, Rounded, Tiling, Unrounded};
 use crate::Op;
 use crate::specialize::contraction;
-use crate::specialize::contraction::RowConfig as Config;
 use furiosa_opt_std::prelude::*;
 
 pub(crate) mod grouped;
@@ -51,11 +50,46 @@ impl<'a, I: AxisName, O: AxisName, R: AxisName, Chips: M, Bias, Out, W>
     }
 }
 
+/// BF16 elements one register fill holds a slice: one bank, so the next fill takes the other.
+const REGISTER: usize = 16_384;
+
+#[derive(Clone, Copy)]
+struct Config {
+    /// K groups: the slices whose partials one inter-slice reduction sums.
+    parts: usize,
+    /// Outputs one slice holds after the reduction, for each of its rows.
+    kept: usize,
+    passes: usize,
+}
+
+/// The row tile of `(input, output)` at a cluster's rows of `rows`, checked against the register,
+/// slab and slice geometry so a tile that cannot hold fails to compile.
+impl Config {
+    const fn new(input: usize, output: usize, rows: usize) -> Self {
+        let (parts, kept, passes) = contraction::row_tile(input, output, contraction::half(rows));
+        let tiling = Config {
+            parts,
+            kept,
+            passes,
+        };
+        let chunk = input / parts;
+        let outputs = tiling.outputs(rows);
+        assert!(input.is_multiple_of(parts) && chunk.is_multiple_of(4));
+        assert!(contraction::half(rows) * chunk <= REGISTER);
+        assert!(kept.is_multiple_of(8) && outputs * chunk * 2 <= contraction::SLAB);
+        assert!(256 / parts * outputs * passes == output);
+        tiling
+    }
+
+    /// Outputs a slice computes in a pass: the reduction spreads them over its K groups, kept a
+    /// slice.
+    const fn outputs(self, rows: usize) -> usize {
+        self.parts / (contraction::half(rows) / 8) * self.kept
+    }
+}
+
 /// The storage layout determines how a row projection lands one weight slab.
 pub(crate) trait Slab<I: AxisName, O: AxisName, R: AxisName, Chips: M> {
-    /// Use the grouped projection's weight-upload order and delayed result stores.
-    const PIPELINED: bool = false;
-
     fn slab(&self, device: &mut Device, pass: usize) -> Weight<I, O, R, Chips>;
 }
 
@@ -221,8 +255,8 @@ type Heads<I, O, R, H> = m![
     O % ({ Symbol<H> })
 ];
 
-impl<'s, 't, I, O, R, Chips, Bias, Out, W, SourceOrder, SinkOrder, S, T> Op<(&'s S, &'t mut T)>
-    for Projection<'_, I, O, R, Chips, Bias, Out, W>
+impl<'s, 't, I, O, R, Chips, Bias, Out, SourceOrder, SinkOrder, S, T> Op<(&'s S, &'t mut T)>
+    for Projection<'_, I, O, R, Chips, Bias, Out>
 where
     I: AxisName,
     O: AxisName,
@@ -230,7 +264,6 @@ where
     Chips: M,
     Bias: Offset<I, O, R, Chips>,
     Out: Rounding,
-    W: Slab<I, O, R, Chips>,
     SourceOrder: M,
     SinkOrder: M,
     S: Source<I, O, R, Chips, Order = SourceOrder>,
@@ -256,7 +289,7 @@ where
 
 axes![Parts = 3];
 
-impl<'i, 'o, I: AxisName, O: AxisName, R: AxisName, Chips: M, W: AxisName, Matrix>
+impl<'i, 'o, I: AxisName, O: AxisName, R: AxisName, Chips: M, W: AxisName>
     Op<(
         &'i HbmTensor<bf16, Chips, m![R, I]>,
         (
@@ -264,9 +297,7 @@ impl<'i, 'o, I: AxisName, O: AxisName, R: AxisName, Chips: M, W: AxisName, Matri
             &'o mut HbmTensor<bf16, Chips, m![R, W]>,
             &'o mut HbmTensor<bf16, Chips, m![R, W]>,
         ),
-    )> for Projection<'_, I, O, R, Chips, (), bf16, Matrix>
-where
-    Matrix: Slab<I, O, R, Chips>,
+    )> for Projection<'_, I, O, R, Chips, ()>
 {
     type Output = ();
 
@@ -362,17 +393,14 @@ impl<
     Chips: M,
     Bias: Offset<I, O, R, Chips>,
     Scalar,
-    W,
     D,
     SourceOrder,
     SinkOrder,
     S,
     Store,
-> Op<(usize, &'s S, Store)>
-    for Pass<'_, Projection<'_, I, O, R, Chips, Bias, Scalar, W>, D, SinkOrder>
+> Op<(usize, &'s S, Store)> for Pass<'_, Projection<'_, I, O, R, Chips, Bias, Scalar>, D, SinkOrder>
 where
     D: Rounding,
-    W: Slab<I, O, R, Chips>,
     SourceOrder: M,
     SinkOrder: M,
     S: Source<I, O, R, Chips, Order = SourceOrder>,
@@ -381,27 +409,6 @@ where
     type Output = ();
 
     fn forward(&self, device: &mut Device, (pass, rows, mut store): (usize, &'s S, Store)) {
-        if const { W::PIPELINED } {
-            let mut first: InDm<I, O, R, Chips, SourceOrder> = DmTensor::new();
-            let mut second: InDm<I, O, R, Chips, SourceOrder> = DmTensor::new();
-            rows.to_dm(device, 0, &mut first);
-            let slab = self.0.weight.slab(device, pass);
-            if const { <Bs<R> as M>::SIZE > 1 } {
-                rows.to_dm(device, 1, &mut second);
-            }
-            let offsets = self.0.bias.pass(device, pass);
-            let (_, (last, block)) = tiled::trips(
-                device,
-                (rows, |block| block, PhantomData::<Bs<R>>),
-                (first, second),
-                (),
-                |_: &mut Device, _, _: &mut InDm<I, O, R, Chips, SourceOrder>| {},
-                |device, register, kept| Bias::contract(device, (&slab, &offsets), register, kept),
-                &mut store,
-            );
-            store(device, &last, block);
-            return;
-        }
         let fill = |device: &mut Device, in_dm: &InDm<I, O, R, Chips, SourceOrder>| {
             device.sub.begin(in_dm.view())
                 .fetch::<
@@ -426,7 +433,7 @@ where
         if const { <Bs<R> as M>::SIZE > 1 } {
             rows.to_dm(device, 1, &mut second);
         }
-        let slab = self.0.weight.slab(device, pass);
+        let slab: Weight<I, O, R, Chips> = self.0.weight.tile::<Chunked<I, O, R>>(device, pass);
         let offsets = self.0.bias.pass(device, pass);
         // Block b contracts while block b + 1 fills and block b + 2 arrives.
         for pair in 0..blocks / 2 {

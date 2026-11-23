@@ -125,6 +125,7 @@ pub type Input<In, Out = Width, C = Chips, X = Hbm> = split::Embedding<
         <X as Memory>::Tensor<bf16, C, m![{ Symbol<Stacked<Out>> }, { Symbol<Sides<In>> }]>,
     >,
     <X as Memory>::Tensor<f32, C, m![Out]>,
+    { crate::specialize::linear::Split::Resident },
 >;
 
 /// Cosines then sines, an FP32 projection, FP32 SiLU, and an FP32 projection. The two projections

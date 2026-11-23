@@ -9,7 +9,7 @@ use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
 
 use super::Convolution;
-use super::frames::{Frames, Stereo, Window};
+use super::frames::{self, Blocks, Frames, Groups, LEAD, Row, Stereo, Window};
 use crate::Op;
 use crate::load::{Checkpoint, Context, Load, LoadError};
 use crate::tensor::memory::residency::Residency;
@@ -96,7 +96,51 @@ where
 
     fn forward(&self, device: &mut Device, input: &'x Frames<bf16, C, S, X>) -> Self::Output {
         const { assert!(C::SIZE > 0 && C::SIZE <= 16) };
-        super::banded::<C, S, X, true>(device, self.band.borrow(), input)
+        type Rows<C, S, X> =
+            DmTensor<bf16, X, m![Stereo], Blocks<S>, m![{ Symbol<Groups<S>> }, Lag, C]>;
+        // SAFETY: each window's rows are eight-row groups and their offsets within the group.
+        let near: Rows<C, S, X> = unsafe {
+            frames::FrameAxis::<S>::new()
+                .forward(&mut *device, (input, LEAD - 3))
+                .reshape()
+        };
+        let far: Rows<C, S, X> = unsafe {
+            frames::FrameAxis::<S>::new()
+                .forward(&mut *device, (input, LEAD - 3 + 8))
+                .reshape()
+        };
+        let band: DmTensor<bf16, X, m![Stereo], Blocks<S>, m![Lane, Term, Lag, C]> =
+            self.band.borrow().to_dm(&mut device.tdma);
+        let register: TrfTensor<bf16, X, m![Stereo], Blocks<S>, m![Lane], m![Term, Lag, C # 16]> =
+            device
+                .sub
+                .begin(band.view())
+                .fetch::<m![Lane, Term, Lag], m![C]>()
+                .collect::<m![Lane, Term, Lag], m![C # 16]>()
+                .to_trf();
+        let samples: DmTensor<f32, X, m![Stereo], Blocks<S>, m![{ Symbol<Groups<S>> }, Lane]> =
+            device
+                .main
+                .begin_interleaved::<Term, _, _, _, _, _>(near.view(), far.view())
+                .fetch::<m![{ Symbol<Groups<S>> }, Term, Lag], m![C]>()
+                .collect::<m![{ Symbol<Groups<S>> }, Term, Lag], m![C # 16]>()
+                .contract_outer::<m![{ Symbol<Groups<S>> }, Term, Lag], m![C # 16], _, _, _>(
+                    &register,
+                )
+                .contract_packet::<m![1]>()
+                .contract_time::<m![{ Symbol<Groups<S>> }]>()
+                .contract_lane::<m![{ Symbol<Groups<S>> }], m![Lane]>(LaneMode::Interleaved)
+                .vector_init()
+                .vector_intra_slice_tag(TagMode::Zero)
+                .vector_clip(ClipBinaryOpF32::Max, -1.0f32)
+                .vector_clip(ClipBinaryOpF32::Min, 1.0f32)
+                .vector_final()
+                .commit_trim::<m![Lane]>()
+                .commit();
+        // SAFETY: each group's eight lanes are its block's rows in order.
+        let samples: DmTensor<f32, X, m![Stereo], Blocks<S>, m![{ Row<S> }]> =
+            unsafe { samples.reshape() };
+        samples.to_hbm(&mut device.tdma)
     }
 }
 
@@ -104,8 +148,8 @@ where
 mod tests {
     use super::*;
     use crate::load::Named;
-    use crate::ops::convolution::frames::{self, FrameRows, LEAD, Span};
     use crate::tensor::memory::Dtype;
+    use frames::{FrameRows, Span};
     use furiosa_opt_std::runtime::launch;
 
     axes![Channels = 8];

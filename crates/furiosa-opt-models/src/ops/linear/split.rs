@@ -9,6 +9,7 @@ use crate::ops::normalization::adaptive::{
     Banded, Feature, Half, Operand, Slices, Strip, Strips, Tile,
 };
 use crate::ops::normalization::{Chunk, FeatureSlices};
+use crate::specialize::linear::Split;
 use crate::tensor::form::Weight;
 use crate::tensor::form::split::{Sides, Stacked};
 use crate::tensor::memory::residency::Residency;
@@ -301,6 +302,7 @@ pub struct Embedding<
     X: M = m![1],
     Matrix = Linear<Sides<In>, Stacked<Out>, X>,
     Offset = HbmTensor<f32, X, m![Out]>,
+    const STRATEGY: Split = { Split::Staged },
 > {
     weight: Matrix,
     bias: Offset,
@@ -366,8 +368,8 @@ impl<In: AxisName, Out: AxisName, X: M> Embedding<In, Out, X> {
 
 /// The coefficients of `weight`: each output's high parts twice, then each output's low parts and
 /// zeros.
-impl<In: AxisName, Out: AxisName, X: M + 'static, Matrix, Offset> Load<Stored<Out, In>>
-    for Embedding<In, Out, X, Matrix, Offset>
+impl<In: AxisName, Out: AxisName, X: M + 'static, Matrix, Offset, const STRATEGY: Split>
+    Load<Stored<Out, In>> for Embedding<In, Out, X, Matrix, Offset, STRATEGY>
 where
     Matrix: Load<
         HostTensor<
@@ -402,11 +404,11 @@ where
 }
 
 /// Rows' high and low parts, side by side, project into the stacked sums.
-impl<'x, 'o, In: AxisName, Out: AxisName, R: AxisName, X: M, Matrix, Offset>
+impl<'x, 'o, In: AxisName, Out: AxisName, R: AxisName, X: M, Matrix, Offset, const STRATEGY: Split>
     Op<(
         &'x Rows<R, Sides<In>, X>,
         &'o mut HbmTensor<f32, X, m![R, { Symbol<Stacked<Out>> }]>,
-    )> for Embedding<In, Out, X, Matrix, Offset>
+    )> for Embedding<In, Out, X, Matrix, Offset, STRATEGY>
 where
     Matrix: Op<
             (
@@ -430,9 +432,142 @@ where
     }
 }
 
+impl<'x, In: AxisName, Out: AxisName, R: AxisName, X: M, Matrix, Offset>
+    Op<&'x HbmTensor<f32, X, m![R, In]>> for Embedding<In, Out, X, Matrix, Offset>
+where
+    Matrix: for<'p, 'o> Op<
+            (
+                &'p Rows<R, Sides<In>, X>,
+                &'o mut HbmTensor<f32, X, m![R, { Symbol<Stacked<Out>> }]>,
+            ),
+            Output = (),
+        >,
+    Offset: Borrow<HbmTensor<f32, X, m![Out]>>,
+{
+    type Output = Rows<R, Out, X>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        input: &'x HbmTensor<f32, X, m![R, In]>,
+    ) -> Self::Output {
+        type Each = m![Strip % 32 # 256];
+        type Wide<Matrix, X> = DmTensor<f32, X, Half, Slices<Matrix>, m![Strip % 8, Matrix % 128]>;
+        // Each row's high and low parts, side by side.
+        let mut parts: Rows<R, Sides<In>, X> = HbmTensor::new();
+        for tile in 0..Strips::<R>::SIZE {
+            let rows: DmTensor<f32, X, Half, Each, m![In]> =
+                // SAFETY: the tiles split the rows in order.
+                unsafe { input.view().reshape::<X, Banded<R, In>>() }
+                    .tile::<m![{ Symbol<Strips<R>> }], 1, m![
+                        { Symbol<Strips<R>> } = 1 # ({ Symbol<Strips<R>> }),
+                        Strip,
+                        In
+                    ]>(tile)
+                    .to_dm(&mut device.tdma);
+            let high: DmTensor<bf16, X, Half, Each, m![In]> = device
+                .main
+                .begin(rows.view())
+                .fetch::<m![In / 8], m![In % 8]>()
+                .collect::<m![In / 8], m![In % 8]>()
+                .cast::<bf16, m![In % 8 # 16]>()
+                .commit_trim::<m![In % 8]>()
+                .commit();
+            let widened: VrfTensor<f32, X, Half, Each, m![In]> = device
+                .sub
+                .begin(high.view())
+                .fetch::<m![In / 8], m![In % 8]>()
+                .fetch_cast::<f32>()
+                .collect::<m![In / 8], m![In % 8]>()
+                .to_vrf();
+            let low: DmTensor<bf16, X, Half, Each, m![In]> = device
+                .main
+                .begin(rows.view())
+                .fetch::<m![In / 8], m![In % 8]>()
+                .collect::<m![In / 8], m![In % 8]>()
+                .vector_init()
+                .vector_intra_slice_tag(TagMode::Zero)
+                .vector_narrow_split::<m![In / 8, In % 8 / 4 % 2], m![In % 4]>()
+                .vector_fp_binary(FpBinaryOp::SubF, &widened)
+                .vector_widen_concat::<m![In / 8], m![In % 8]>()
+                .vector_final()
+                .cast::<bf16, m![In % 8 # 16]>()
+                .commit_trim::<m![In % 8]>()
+                .commit();
+            Sides::<In>::new().forward(&mut *device, (&high, &mut parts, (tile, 0)));
+            Sides::<In>::new().forward(&mut *device, (&low, &mut parts, (tile, 1)));
+        }
+        let mut sums: HbmTensor<f32, X, m![R, { Symbol<Stacked<Out>> }]> = HbmTensor::new();
+        self.weight.forward(&mut *device, (&parts, &mut sums));
+        let bias: &HbmTensor<f32, X, m![Out]> = self.bias.borrow();
+        let bias: Feature<f32, Out, X> = bias.view().to_dm(&mut device.tdma);
+        let bias: Operand<Out, X> = device
+            .sub
+            .begin(bias.view())
+            .fetch::<m![Out % 128 / 8], m![Out % 8]>()
+            .collect::<m![Out % 128 / 8], m![Out % 8]>()
+            .to_vrf();
+        // SAFETY: a row's stacked sums are its first sums, then its second, and the tiles split the
+        // rows in order.
+        let sums = unsafe {
+            sums.view()
+                .reshape::<X, m![{ Symbol<Strips<R>> }, Strip, Part, Out]>()
+        };
+        let mut output = HbmTensor::new();
+        for tile in 0..Strips::<R>::SIZE {
+            let part = |device: &mut Device, part: usize| -> Wide<Out, X> {
+                sums.tile::<m![{ Symbol<Strips<R>> }], 1, m![
+                    { Symbol<Strips<R>> } = 1 # ({ Symbol<Strips<R>> }),
+                    Strip,
+                    Part,
+                    Out
+                ]>(tile)
+                    .tile::<m![Part], 1, m![
+                        { Symbol<Strips<R>> } = 1 # ({ Symbol<Strips<R>> }),
+                        Strip,
+                        Part = 1 # 2,
+                        Out
+                    ]>(part)
+                    .to_dm(&mut device.tdma)
+            };
+            let (first, second) = (part(device, 0), part(device, 1));
+            let second: VrfTensor<f32, X, Half, Slices<Out>, m![Strip % 8, Out % 128]> = device
+                .sub
+                .begin(second.view())
+                .fetch::<m![Strip % 8, Out % 128 / 8], m![Out % 8]>()
+                .collect::<m![Strip % 8, Out % 128 / 8], m![Out % 8]>()
+                .to_vrf();
+            let sum: Tile<bf16, Out, X> = device
+                .main
+                .begin(first.view())
+                .fetch::<m![Strip % 8, Out % 128 / 8], m![Out % 8]>()
+                .collect::<m![Strip % 8, Out % 128 / 8], m![Out % 8]>()
+                .vector_init()
+                .vector_intra_slice_tag(TagMode::Zero)
+                .vector_narrow_split::<m![Strip % 8, Out % 128 / 8, Out % 8 / 4 % 2], m![Out % 4]>()
+                .vector_fp_binary(FpBinaryOp::AddF, &second)
+                .vector_widen_concat::<m![Strip % 8, Out % 128 / 8], m![Out % 8]>()
+                .vector_clip(ClipBinaryOpF32::Add, &bias)
+                .vector_final()
+                .cast::<bf16, m![Out % 8 # 16]>()
+                .commit_trim::<m![Out % 8]>()
+                .commit();
+            Strips::<R>::new().forward(&mut *device, (&sum, &mut output, tile));
+        }
+        output
+    }
+}
+
 impl<'x, In: AxisName, Out: AxisName, R: AxisName, X: M, Coefficients, Offset>
     Op<&'x HbmTensor<f32, X, m![R, In]>>
-    for Embedding<In, Out, X, Linear<Sides<In>, Stacked<Out>, X, Coefficients>, Offset>
+    for Embedding<
+        In,
+        Out,
+        X,
+        Linear<Sides<In>, Stacked<Out>, X, Coefficients>,
+        Offset,
+        { Split::Resident },
+    >
 where
     Coefficients: Borrow<HbmTensor<bf16, X, m![{ Symbol<Stacked<Out>> }, { Symbol<Sides<In>> }]>>,
     Offset: Borrow<HbmTensor<f32, X, m![Out]>>,
@@ -595,9 +730,9 @@ impl AxisName for Sinusoid {
 }
 
 /// FP32 sums of a stacked projection, their two halves added with the FP32 offset.
-impl<In: AxisName, Out: AxisName, X: M, R: AxisName, Matrix, Offset>
+impl<In: AxisName, Out: AxisName, X: M, R: AxisName, Matrix, Offset, const STRATEGY: Split>
     Op<(&HbmTensor<f32, X, m![R, { Symbol<Stacked<Out>> }]>,)>
-    for Embedding<In, Out, X, Matrix, Offset>
+    for Embedding<In, Out, X, Matrix, Offset, STRATEGY>
 where
     Offset: Borrow<HbmTensor<f32, X, m![Out]>>,
 {

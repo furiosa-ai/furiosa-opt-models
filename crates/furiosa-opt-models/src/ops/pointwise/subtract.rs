@@ -1,6 +1,7 @@
 //! Elementwise differences, computed in FP32 and rounded once to the source element type.
 
-use super::{Float, Rows, Window};
+use super::sum::Windowed;
+use super::{Float, Registers, Rows, Segment, Width};
 use crate::Op;
 use crate::load::Load;
 use crate::tensor::memory::residency::Residency;
@@ -19,9 +20,9 @@ impl<D: Float, S: M + 'static, Chips: M> Op<(&HbmTensor<D, Chips, S>, &HbmTensor
     fn forward(
         &self,
         device: &mut Device,
-        (left, right): (&HbmTensor<D, Chips, S>, &HbmTensor<D, Chips, S>),
+        operands: (&HbmTensor<D, Chips, S>, &HbmTensor<D, Chips, S>),
     ) -> Self::Output {
-        Window::<S>::combine::<D, Chips>(device, left, right, FpBinaryOp::SubF)
+        Windowed::<S>::map(operands, device, self)
     }
 }
 
@@ -35,7 +36,28 @@ impl<D: Float, S: M + 'static, Chips: M> Op<&(Rows<D, S, Chips>, Rows<D, S, Chip
         device: &mut Device,
         (left, right): &(Rows<D, S, Chips>, Rows<D, S, Chips>),
     ) -> Self::Output {
-        Window::<S>::combine_tile::<D, Chips>(device, left, right, FpBinaryOp::SubF)
+        let right: Registers<S, Chips> = device
+            .sub
+            .begin(right.view())
+            .fetch::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
+            .fetch_cast::<f32>()
+            .collect::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
+            .to_vrf();
+        let difference: Rows<f32, S, Chips> = device
+            .main
+            .begin(left.view())
+            .fetch::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
+            .fetch_cast::<f32>()
+            .collect::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_split::<m![{ Width<S> } % ({ Segment<S> }) / 4], m![{ Width<S> } % 4]>()
+            .vector_fp_binary(FpBinaryOp::SubF, &right)
+            .vector_widen_concat::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
+            .vector_final()
+            .commit_trim::<m![{ Width<S> } % 8]>()
+            .commit();
+        D::narrow(device, difference)
     }
 }
 

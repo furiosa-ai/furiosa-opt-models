@@ -26,7 +26,7 @@ use crate::tensor::memory::residency::Residency;
 use crate::tensor::memory::{Hbm, Memory};
 use crate::tensor::parallel::{Parallel, Part};
 use crate::tensor::scalar::F32;
-use crate::{First, Layers, Module, Sequential, Then, Unrolled};
+use crate::{First, Layers, Module, Sequential, Then, UnrolledRange};
 use furiosa_opt_std::prelude::*;
 use std::marker::PhantomData;
 
@@ -111,7 +111,7 @@ pub type AdaptiveNorm<W = Width, X = Hbm> =
 ///
 /// Source: https://github.com/vllm-project/vllm-omni/blob/6daf5b30f07cc0b3db87766d22fdf433f8a1a7c9/vllm_omni/diffusion/models/minimax_h3/minimax_h3_transformer.py
 pub type Refiner<W = Width, A = Attended, F = Expanded, X = Hbm> = Then<
-    Named<"blocks", Layers<[RefinerLayer<W, A, F, X>; 2], Unrolled>>,
+    Named<"blocks", Layers<[RefinerLayer<W, A, F, X>; 2], UnrolledRange>>,
     Named<"final_norm", Norm<W, X>>,
 >;
 

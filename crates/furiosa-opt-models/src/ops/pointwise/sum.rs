@@ -84,11 +84,20 @@ type LocalTotal<Chips> = DmTensor<f32, Chips, m![1 # 2], m![1 # 256], m![1 # 8]>
 /// A tensor or a tuple of tensors whose corresponding windows land in DM together.
 /// `S` is the allocation shape; `G` determines numerical window geometry and defaults to `S`.
 /// Checked prefixes use their whole-block geometry so capacity cannot change their tiling.
-/// Kept private to pointwise operations; ordinary HBM mapping uses `Window`.
+/// Kept private to pointwise operations; unary HBM mapping already uses `Window::map`.
 pub(super) trait Windowed<S: M + 'static, G: M + 'static = S>: Sized {
     type Tile;
 
     fn land(&self, device: &mut Device, index: usize) -> Self::Tile;
+
+    fn map<D, Chips, F>(self, device: &mut Device, op: &F) -> HbmTensor<D, Chips, S>
+    where
+        D: MaterializableScalar,
+        Chips: M,
+        F: for<'t> Op<&'t Self::Tile, Output = Rows<D, G, Chips>>,
+    {
+        self.map_windows(device, S::SIZE / Window::<G>::SIZE, op)
+    }
 
     /// Map initialized whole windows without reading or filling source allocation tails.
     fn map_windows<D, Chips, F>(
