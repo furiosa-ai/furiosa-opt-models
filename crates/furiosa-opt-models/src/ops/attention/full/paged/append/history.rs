@@ -245,8 +245,7 @@ impl<P: Panel> AxisName for ScoreWindows<P> {
     const NAME: Ident = match Self::SIZE {
         1 => Ident::new("ScoreWindow"),
         2 => Ident::new("ScoreWindows2"),
-        4 => Ident::new("ScoreWindows4"),
-        _ => panic!("score window count must be 1, 2, or 4"),
+        _ => Ident::new("ScoreWindows4"),
     };
     const SIZE: usize = {
         let keys = <P::Keys as AxisName>::SIZE;
@@ -305,7 +304,8 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, P: Panel, T: AxisName>
             )
         };
         let mut probabilities = Keyed::<KvHeads, Groups, P, T>::new();
-        // Keep one fill closure outside the unrolled window loop for lowering.
+        // One fill closure serves every window: a closure made inside an unrolled loop does not
+        // lower.
         #[unroll]
         for w in 0..ScoreWindows::<P>::SIZE {
             let first = w * <P::Window as Panel>::Span::SIZE;
