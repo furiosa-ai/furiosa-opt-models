@@ -148,7 +148,7 @@ impl<'a, H: AxisName, I: AxisName, R: AxisName, C: AxisName>
         device: &mut Device,
         (first, normalized): (GateUp<H, I>, Live<&'a Owned<H, R>, C>),
     ) -> Self::Output {
-        gate_up(device, self, first, normalized, false, |_| ()).0
+        gate_up(device, self, first, normalized, |_| ()).0
     }
 }
 
@@ -159,17 +159,18 @@ pub(crate) fn gate_up<H: AxisName, I: AxisName, R: AxisName, C: AxisName, P>(
     weights: &GateUpWeights<H, I>,
     first: GateUp<H, I>,
     normalized: Live<&Owned<H, R>, C>,
-    early_gate: bool,
     before_final_slab: impl FnOnce(&mut Device) -> P,
 ) -> ((Projection<I, R>, Projection<I, R>), P) {
+    let gate = compute::channel_scales(device, &weights.1, 0);
+    let up = compute::channel_scales(device, &weights.1, 1);
     let scales = input_scales(device, normalized.value(), normalized.rows());
     compute::forward(
         device,
-        (&weights.0, &weights.1),
+        &weights.0,
         first,
         normalized,
         true,
-        (|_, _, _| scales, early_gate, before_final_slab),
+        (|_, _, _| scales, |_| gate, |_| up, before_final_slab),
     )
 }
 
@@ -199,6 +200,7 @@ pub struct Staging<I: AxisName, R: AxisName> {
     scales: TokenScales<I, R>,
     stored_scales: StoredTokens<I, R>,
     resident_scales: bool,
+    decode: bool,
 }
 
 impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName>
@@ -238,12 +240,15 @@ impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName>
             scales.to_hbm_view(&mut device.tdma, stored_scales.view_mut());
         }
         let scales = product_scale_operand(device, &factors);
-        let panels = (
-            quantize_panel(device, &product, &scales, 0, rows),
-            quantize_panel(device, &product, &scales, 1, rows),
-            quantize_panel(device, &product, &scales, 2, rows),
-            quantize_panel(device, &product, &scales, 3, rows),
-        );
+        let panels = match rows {
+            0..=8 => stage_panels::<I, R, 8, 1, 1>(device, &product, &scales, rows),
+            9..=16 => stage_panels::<I, R, 16, 2, 1>(device, &product, &scales, rows),
+            17..=32 => stage_panels::<I, R, 32, 4, 1>(device, &product, &scales, rows),
+            33..=64 => stage_panels::<I, R, 64, 8, 1>(device, &product, &scales, rows),
+            65..=128 => stage_panels::<I, R, 128, 8, 2>(device, &product, &scales, rows),
+            129..=256 => stage_panels::<I, R, 256, 8, 4>(device, &product, &scales, rows),
+            _ => stage_panels::<I, R, 512, 8, 8>(device, &product, &scales, rows),
+        };
         Staging {
             panels,
             scales: if resident_scales {
@@ -253,6 +258,7 @@ impl<H: AxisName, I: AxisName, R: AxisName, C: AxisName>
             },
             stored_scales,
             resident_scales,
+            decode,
         }
     }
 }
@@ -287,6 +293,7 @@ pub(crate) fn project_down<H: AxisName, I: AxisName, R: AxisName, C: AxisName, F
         scales,
         stored_scales,
         resident_scales,
+        decode,
     } = staging.into_value();
     let row = if resident_scales {
         down_scale_rows::<H, I, R>(device, &scales, rows)
@@ -306,6 +313,7 @@ pub(crate) fn project_down<H: AxisName, I: AxisName, R: AxisName, C: AxisName, F
         device,
         first,
         rows,
+        decode,
         (
             |device, panel| load_product(device, [&p0, &p1, &p2][panel], rows),
             (|_| second, |device| down::<H, I, 64>(device, weights, 2)),
@@ -445,15 +453,60 @@ fn load_down<H: AxisName, I: AxisName, const B: usize>(
             .to_dm_view(&mut device.tdma, output.view_mut());
     }
 }
-/// Quantize directly into consecutive B-feature rows, ready for the panel's HBM store.
-/// All panels reuse the full-token FP32 scale; selecting a band does not recompute its maximum.
-fn quantize_panel<I: AxisName, R: AxisName, const B: usize>(
+axes![ScratchQuarter = 4];
+type Scratch<I, R> = DmTensor<
+    f8e4m3,
+    Chip,
+    Cluster<I>,
+    Slice<I, R>,
+    m![ScratchQuarter, R % (R / 8), {Symbol<Inputs<32>>} % 32],
+>;
+type Region<R, const Q: usize> =
+    m![ScratchQuarter = {Q} #{!} 4, R % (R / 8), {Symbol<Inputs<32>>} % 32];
+type Codes<R, const B: usize> = m![1 #{!} (128 / {B}), R % (R / 8), {Symbol<Inputs<B>>} % {B}];
+
+/// Two 64-feature SRAM regions alternate between the quantizer and TDMA.
+/// Select the live DMA width once for the entire producer/consumer pipeline.
+fn stage_panels<I: AxisName, R: AxisName, const N: usize, const G: usize, const W: usize>(
+    device: &mut Device,
+    product: &Projection<I, R>,
+    scales: &ProductScales<I, R>,
+    rows: usize,
+) -> (
+    PackedPanel<R, 64>,
+    PackedPanel<R, 64>,
+    PackedPanel<R, 64>,
+    PackedPanel<R, 32>,
+) {
+    let mut scratch = Scratch::<I, R>::new();
+    (
+        stage_panel::<I, R, 64, 2, 0, N, G, W>(device, product, scales, 0, rows, &mut scratch),
+        stage_panel::<I, R, 64, 2, 2, N, G, W>(device, product, scales, 1, rows, &mut scratch),
+        stage_panel::<I, R, 64, 2, 0, N, G, W>(device, product, scales, 2, rows, &mut scratch),
+        stage_panel::<I, R, 32, 1, 2, N, G, W>(device, product, scales, 3, rows, &mut scratch),
+    )
+}
+
+fn stage_panel<
+    I: AxisName,
+    R: AxisName,
+    const B: usize,
+    const Q: usize,
+    const AT: usize,
+    const N: usize,
+    const G: usize,
+    const W: usize,
+>(
     device: &mut Device,
     product: &Projection<I, R>,
     scales: &ProductScales<I, R>,
     panel: usize,
     rows: usize,
+    scratch: &mut Scratch<I, R>,
 ) -> PackedPanel<R, B> {
+    const {
+        assert!(Q * 32 == B && AT + Q <= 4);
+    }
     let band = product
         .view()
         .tile::<Out<I>, B, m![R % (R / 8), {Out<I>} = {B} # (I / 64)]>(64 * panel);
@@ -472,20 +525,20 @@ fn quantize_panel<I: AxisName, R: AxisName, const B: usize>(
         m![R % (R / 8) / 4],
         m![R % 4],
     >;
-    let mut packed: DmTensor<
-        f8e4m3,
-        Chip,
-        Cluster<I>,
-        Slice<I, R>,
-        m![R % (R / 8), {Symbol<Inputs<B>>} % {B}],
-    > = DmTensor::new();
+    // SAFETY: the selected consecutive quarters have exactly B bytes per local row.
+    // Both views retain the original cluster and slice ownership.
+    let dest = unsafe {
+        scratch
+            .view_mut()
+            .tile::<m![ScratchQuarter], Q, Region<R, Q>>(AT)
+            .reshape::<Chip, Cluster<I>, Slice<I, R>, Codes<R, B>>()
+    };
     Quantizer::<I, R, B>::rows(&mut device.main, band, scales)
-        .commit_prefix::<m![R % (R / 8)], _, _>(packed.view_mut(), rows.div_ceil(64) * 8);
-    // SAFETY: the same eight-row owner permutation, with compact B-feature rows.
+        .commit_prefix::<m![R % (R / 8)], _, _>(dest, rows.div_ceil(64) * 8);
     let band = unsafe {
-        packed.view().reshape::<Chip, Cluster<Inputs<B>>,
-            m![{Blocks<Inputs<B>>}, R % 64 / 8],
-            m![R / 64, R % 8, {Symbol<Inputs<B>>} % {B}]>()
+        scratch.view().tile::<m![ScratchQuarter], Q, m![ScratchQuarter = {Q} # 4, R % (R / 8), {Symbol<Inputs<32>>} % 32]>(AT)
+        .reshape::<Chip, Cluster<Inputs<B>>, m![{Blocks<Inputs<B>>}, R % 64 / 8],
+            m![1 # (128 / {B}), R / 64, R % 8, {Symbol<Inputs<B>>} % {B}]>()
     };
     fn store<R: AxisName, const B: usize, const N: usize, const G: usize, const W: usize>(
         device: &mut Device,
@@ -495,7 +548,7 @@ fn quantize_panel<I: AxisName, R: AxisName, const B: usize>(
             Chip,
             Cluster<Inputs<B>>,
             m![{Blocks<Inputs<B>>}, R % 64 / 8],
-            m![R / 64, R % 8, {Symbol<Inputs<B>>} % {B}],
+            m![1 # (128 / {B}), R / 64, R % 8, {Symbol<Inputs<B>>} % {B}],
         >,
         output: &mut PackedPanel<R, B>,
     ) {
@@ -505,20 +558,12 @@ fn quantize_panel<I: AxisName, R: AxisName, const B: usize>(
         band.slice_tile::<m![R % 64 / 8], G,
                 m![{Blocks<Inputs<B>>}, R % 64 / 8 = {G} # 8]>(0)
             .tile::<m![R / 64], W,
-                m![R / 64 = {W} # (R / 64), R % 8, {Symbol<Inputs<B>>} % {B}]>(0)
+                m![1 # (128 / {B}), R / 64 = {W} # (R / 64), R % 8, {Symbol<Inputs<B>>} % {B}]>(0)
             .to_hbm_view(&mut device.tdma, output.view_mut().tile::<m![R], N,
                 m![{Cluster<Inputs<B>>}, {Blocks<Inputs<B>>}, R = {N} #{!} R, {Symbol<Inputs<B>>} % {B}]>(0));
     }
     let mut stored = PackedPanel::new();
-    match rows {
-        0..=8 => store::<R, B, 8, 1, 1>(device, band, &mut stored),
-        9..=16 => store::<R, B, 16, 2, 1>(device, band, &mut stored),
-        17..=32 => store::<R, B, 32, 4, 1>(device, band, &mut stored),
-        33..=64 => store::<R, B, 64, 8, 1>(device, band, &mut stored),
-        65..=128 => store::<R, B, 128, 8, 2>(device, band, &mut stored),
-        129..=256 => store::<R, B, 256, 8, 4>(device, band, &mut stored),
-        _ => store::<R, B, 512, 8, 8>(device, band, &mut stored),
-    }
+    store::<R, B, N, G, W>(device, band, &mut stored);
     stored
 }
 /// Reorder the gate/up row digits once and broadcast the unchanged FP32 token scales to

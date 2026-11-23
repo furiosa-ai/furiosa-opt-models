@@ -266,10 +266,9 @@ fn end(
     let attended = sum.forward(&mut *device, (), &mut (), (&input, &projected));
     let normalized = gain.normalize_span(device, &attended, short_decode(call));
     let rows = tile.with(normalized.value());
-    let (projected, second) =
-        mlp::gate_up(device, gate_up, ahead, rows, short_decode(call), |device| {
-            mlp::down::<_, _, 64>(device, down, 1)
-        });
+    let (projected, second) = mlp::gate_up(device, gate_up, ahead, rows, |device| {
+        mlp::down::<_, _, 64>(device, down, 1)
+    });
     // Pure item launches retain product scales in DM at any span size. The MLP also
     // retains them for spans of at most 256 rows, including prompt and mixed launches.
     let staged = down.forward(

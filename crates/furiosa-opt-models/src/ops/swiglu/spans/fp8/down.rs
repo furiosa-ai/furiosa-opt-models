@@ -252,6 +252,7 @@ impl<Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: AxisNam
             context,
             &first,
             rows,
+            true,
             (
                 |context, panel| landed(context, (panel, [&h0, &h1, &h2][panel])),
                 (
@@ -558,12 +559,13 @@ fn project<
     }
     output
 }
-/// Three full input panels in Qwen's load/compute order, followed by an optional native tail.
-/// Tail preparation overlaps the third full contraction. Every addition rounds to BF16 in DM.
+/// Land the down operands and queue the next front before contracting the panels in order.
+/// Every panel addition rounds to BF16 in DM.
 pub(super) fn panels<H: AxisName, I: AxisName, R: AxisName, W, Input, Tail, Output>(
     device: &mut Device,
     first: &W,
     rows: usize,
+    prefetch_before_first: bool,
     (mut load, (second, third), mut project): (
         impl FnMut(&mut Device, usize) -> Input,
         (impl FnOnce(&mut Device) -> W, impl FnOnce(&mut Device) -> W),
@@ -574,14 +576,29 @@ pub(super) fn panels<H: AxisName, I: AxisName, R: AxisName, W, Input, Tail, Outp
         impl FnOnce(&mut Device, Tail, Partial<H, I, R>) -> Output,
     ),
 ) -> Output {
-    let (input0, input1) = (load(device, 0), load(device, 1));
-    let second = second(device);
-    let input2 = load(device, 2);
-    let a = project(device, first, input0);
-    let third = third(device);
-    let b = project(device, &second, input1);
+    let input0 = load(device, 0);
+    let (a, b, third, input2, tail) = if prefetch_before_first {
+        let input1 = load(device, 1);
+        let second = second(device);
+        let input2 = load(device, 2);
+        let third = third(device);
+        let tail = prepare_tail(device);
+        let a = project(device, first, input0);
+        let b = project(device, &second, input1);
+        (a, b, third, input2, tail)
+    } else {
+        // Queue the product lookahead before the runtime wave loop. Transfers behind
+        // this loop can otherwise wait for both panel-0 waves to finish.
+        let input1 = load(device, 1);
+        let second = second(device);
+        let input2 = load(device, 2);
+        let a = project(device, first, input0);
+        let third = third(device);
+        let tail = prepare_tail(device);
+        let b = project(device, &second, input1);
+        (a, b, third, input2, tail)
+    };
     let sum = add(device, &a, &b, rows);
-    let tail = prepare_tail(device);
     let c = project(device, &third, input2);
     let sum = add(device, &sum, &c, rows);
     finish_tail(device, tail, sum)
