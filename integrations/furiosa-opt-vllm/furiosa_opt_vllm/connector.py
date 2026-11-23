@@ -24,13 +24,8 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 import furiosa_opt_engine as engine
-from furiosa_opt_engine.cache_transfer import (
-    settle as settle_transfers,
-)
+from furiosa_opt_engine.cache_transfer import TransferBatch, transfer_cache_pages
 from furiosa_opt_engine.cache_transfer import submit as submit_transfers
-from furiosa_opt_engine.cache_transfer import (
-    transfer_cache_pages,
-)
 from furiosa_opt_vllm import residency
 from furiosa_opt_vllm.cache import assigned
 
@@ -162,7 +157,7 @@ class Layers:
         match direction:
             case "d2h":
                 copies = submit_transfers(transfers(to_host=True))
-                if (failure := settle_transfers(copies)) is not None:
+                if (failure := TransferBatch(copies).synchronize()) is not None:
                     raise failure
                 for name, layer in layers.items():
                     dst[name][target] = nixl_order(layer.staged(len(blocks)))
@@ -182,7 +177,8 @@ class Layers:
                             to_host=False,
                         )
 
-                if (failure := settle_transfers(submit_transfers(uploads()))) is not None:
+                copies = submit_transfers(uploads())
+                if (failure := TransferBatch(copies).synchronize()) is not None:
                     raise failure
             case _:
                 assert_never(direction)

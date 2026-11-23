@@ -17,6 +17,7 @@ from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_schedule
 
 import furiosa_opt_engine as engine
+from furiosa_opt_engine.cache_transfer import TransferBatch as EngineTransferBatch
 from furiosa_opt_engine.cache_transfer import settle as settle_transfers
 from furiosa_opt_engine.cache_transfer import transfer_cache_pages
 from furiosa_opt_sglang.cache import Cache
@@ -83,17 +84,13 @@ class _TransferBatch:
     ) -> None:
         self.handler = handler
         self.decode_req = decode_req
-        self.transfers = tuple(transfers)
+        self._engine_batch = EngineTransferBatch(transfers)
         self._lock = threading.Lock()
         self._finished = False
 
     def query(self) -> bool:
-        try:
-            if not all(transfer.done() for transfer in self.transfers):
-                return False
-        except Exception as error:
-            self.synchronize(error)
-            return True
+        if not self._engine_batch.done():
+            return False
         self.synchronize()
         return True
 
@@ -101,9 +98,7 @@ class _TransferBatch:
         with self._lock:
             if self._finished:
                 return
-            failure = settle_transfers(self.transfers)
-            if failure is None:
-                failure = observed_error
+            failure = self._engine_batch.synchronize(observed_error)
             self._finished = True
         with self.handler._transfer_lock:
             self.handler._transfer_batches.discard(self)
@@ -195,14 +190,14 @@ class EngineDecodeStagingHandler(DecodeStagingHandler):
         first_host_page = staging_offset // host_page_bytes
         transfers: list[Transfer] = []
         try:
-            for layer_id, layer in enumerate(cache.storage.layers):
-                start = first_host_page + layer_id * num_pages
+            for layer_index, layer in enumerate(cache.storage.layers):
+                host_start = first_host_page + layer_index * num_pages
                 transfers.extend(
                     transfer_cache_pages(
                         layer,
                         self.staging_allocator.buffer.buffer,
                         page_ids,
-                        range(start, start + num_pages),
+                        range(host_start, host_start + num_pages),
                         page_bytes,
                         cache.pages.chips,
                         to_host=False,
