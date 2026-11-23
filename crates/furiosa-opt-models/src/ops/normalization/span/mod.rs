@@ -24,6 +24,9 @@ pub(crate) type Owned<Width, All, Chips = Chip> = DmTensor<
 
 /// A span's rows in one cluster's half.
 type Half = m![Span % (Span / 2)];
+/// The rows of a half a launch of at most `FEW` rows fills: a decode's, normalized alone.
+const FEW: usize = 8;
+type Few = m![{ Half } = { FEW }];
 
 /// A width whose norm runs a cluster's half of a span in tiles of `Capacity` rows, then a last one
 /// of `Last` rows: the rows its vector registers hold, which the norm checks.
@@ -61,7 +64,8 @@ where
     }
 }
 
-/// The live rows of each cluster's half of a span, capped at the half; the norm keeps them.
+/// The live rows of each cluster's half of a span, capped at the half; the norm keeps them, and
+/// reads only the first [`FEW`] rows of a half that holds no more.
 impl<Width, R: AxisName, const EPSILON: usize, const CAPACITY: usize, const LAST: usize>
     Op<&Live<Owned<Width, Span>, R>> for super::RmsNorm<Width, EPSILON, Chip, Scale<Width, Span>>
 where
@@ -82,14 +86,35 @@ where
         // The variances of the rows each slice holds, reduced over the slices of their features.
         let mut variance: DmTensor<f32, Chip, m![Span / (Span / 2)], m![256], m![{ Half }, 1 # 8]> =
             DmTensor::new();
-        Squares::<kernel::Rows<Half, Offset<Width>>, Width, Half, Part<Width>, EPSILON>::of(
-            &mut context.main,
-            rows.value().view(),
-        )
-        .vector_inter_slice_reduce::<m![256], Half>(InterSliceReduceOpF32::Add)
-        .vector_final()
-        .commit_trim::<m![1 # 2]>()
-        .commit_prefix::<Half, _, _>(variance.view_mut(), reach);
+        if reach <= FEW {
+            Squares::<kernel::Rows<Few, Offset<Width>>, Width, Few, Part<Width>, EPSILON>::of(
+                &mut context.main,
+                rows.value()
+                    .view()
+                    .tile::<Half, FEW, m![{ Half } = { FEW } # ({ Half } / 1), { Offset<Width> }]>(
+                        0,
+                    )
+                    .unpad::<m![{ Few }, { Offset<Width> }]>(),
+            )
+            .vector_inter_slice_reduce::<m![256], Few>(InterSliceReduceOpF32::Add)
+            .vector_final()
+            .commit_trim::<m![1 # 2]>()
+            .commit_prefix::<Few, _, _>(
+                variance.view_mut().tile::<Half, FEW, m![
+                    { Half } = { FEW } #{!} ({ Half } / 1), 1 # 8
+                ]>(0),
+                reach,
+            );
+        } else {
+            Squares::<kernel::Rows<Half, Offset<Width>>, Width, Half, Part<Width>, EPSILON>::of(
+                &mut context.main,
+                rows.value().view(),
+            )
+            .vector_inter_slice_reduce::<m![256], Half>(InterSliceReduceOpF32::Add)
+            .vector_final()
+            .commit_trim::<m![1 # 2]>()
+            .commit_prefix::<Half, _, _>(variance.view_mut(), reach);
+        }
         // SAFETY: the reduction broadcasts each scalar to the original feature partitions.
         let variance: DmTensor<
             f32,
@@ -100,7 +125,17 @@ where
         > = unsafe { variance.reshape() };
         let input = (rows.value(), &variance, &gain);
         let mut output = Owned::<Width, Span>::new();
-        tiles::<Width, CAPACITY, LAST>(context, input, &mut output, reach);
+        if reach <= FEW {
+            kernel::normalized::<FEW, _, _, _, _>(context, input, 0)
+                .commit_prefix::<m![{ Half } = { FEW }], _, _>(
+                    output.view_mut().tile::<Half, FEW, m![
+                        { Half } = { FEW } #{!} ({ Half } / 1), { Offset<Width> }
+                    ]>(0),
+                    reach,
+                );
+        } else {
+            tiles::<Width, CAPACITY, LAST>(context, input, &mut output, reach);
+        }
         rows.with(output)
     }
 }

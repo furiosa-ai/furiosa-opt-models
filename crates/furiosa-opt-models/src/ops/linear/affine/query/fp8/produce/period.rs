@@ -35,7 +35,11 @@ impl<Hidden: AxisName, G: Group, KvHeads: AxisName> Period<Hidden, G, KvHeads> {
 
 /// A period's queries, their heads spread over the slices, with their heads' squared scales.
 impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, G: Group, KvHeads: AxisName>
-    Op<&Period<Hidden, G, KvHeads>> for Affine<(Weight<Hidden, Heads, Head>, Squared<Heads>), ()>
+    Op<&Period<Hidden, G, KvHeads>>
+    for Affine<(Weight<Hidden, Heads, Head>, QuerySquares<Heads>), ()>
+where
+    QuerySquares<Heads>:
+        Of<G, Squares = Written<G, Heads, QuerySpread<G, Heads>, QueryLocal<G, Heads>>>,
 {
     type Output = Scaled<
         Queries<G, Heads, Head>,
@@ -43,7 +47,6 @@ impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, G: Group, KvHeads: AxisN
     >;
 
     fn forward(&self, context: &mut Device, rows: &Period<Hidden, G, KvHeads>) -> Self::Output {
-        let squares = squares(&mut *context, &self.weight.1);
         let lanes = Fill(PhantomData).forward(&mut *context, (&rows.own, rows.groups));
         Affine::new(&self.weight.0, ()).forward(
             context,
@@ -54,7 +57,7 @@ impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, G: Group, KvHeads: AxisN
                     groups: rows.groups,
                     output: PhantomData,
                 },
-                &squares,
+                Of::<G>::of(&self.weight.1),
             ),
         )
     }
@@ -64,12 +67,13 @@ impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, G: Group, KvHeads: AxisN
 /// squared scales.
 impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, G: Group, KvHeads: AxisName>
     Op<&Period<Hidden, G, KvHeads>>
-    for Affine<((Weight<Hidden, Heads, Head>, Squared<Heads>), ()), ()>
+    for Affine<((Weight<Hidden, Heads, Head>, KeySquares<Heads>), ()), ()>
+where
+    KeySquares<Heads>: Of<G, Squares = Written<G, Heads, G::Copies, PairLocal<Heads>>>,
 {
     type Output = Scaled<Pairs<G, Heads, Head>, Inverse<G, Heads, G::Copies, PairLocal<Heads>>>;
 
     fn forward(&self, context: &mut Device, rows: &Period<Hidden, G, KvHeads>) -> Self::Output {
-        let squares = squares(&mut *context, &self.weight.0.1);
         let lanes = Fill(PhantomData).forward(&mut *context, (&rows.own, rows.groups));
         Affine::new(&self.weight.0.0, ()).forward(
             context,
@@ -80,7 +84,7 @@ impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, G: Group, KvHeads: AxisN
                     groups: rows.groups,
                     output: PhantomData,
                 },
-                &squares,
+                Of::<G>::of(&self.weight.0.1),
             ),
         )
     }

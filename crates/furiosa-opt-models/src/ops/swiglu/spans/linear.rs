@@ -30,6 +30,29 @@ where
     fn forward(&self, _: &mut Device, _: Env, _: &mut (), _: Begin<()>) {}
 }
 
+/// Nor anything before the projection's last step, which projects the rows alone.
+impl<'t, Hidden, Intermediate, Rows, Capacity, T, Env>
+    Module<Begin<((), Live<&'t Owned<Hidden, Rows>, Capacity>)>, Env, &mut ()>
+    for Linear<Hidden, GateUp<Intermediate>, Chip, T>
+where
+    Hidden: AxisName,
+    Intermediate: AxisName,
+    Rows: AxisName,
+    Capacity: AxisName,
+    T: Matrix<In = Hidden, Out = GateUp<Intermediate>>,
+{
+    type Output = ();
+
+    fn forward(
+        &self,
+        _: &mut Device,
+        _: Env,
+        _: &mut (),
+        _: Begin<((), Live<&'t Owned<Hidden, Rows>, Capacity>)>,
+    ) {
+    }
+}
+
 /// The packed gate/up projection of a span's live rows, which move to HBM for it.
 impl<'t, Hidden, Intermediate, Rows, Capacity, T, Env: Copy>
     Module<((), Live<&'t Owned<Hidden, Rows>, Capacity>), Env, &mut ()>
@@ -211,7 +234,7 @@ where
 
 /// Nor does any of its input land before it projects: the product is the down projection's input.
 impl<Hidden, Intermediate, Rows, Capacity, T, Env>
-    Module<Live<(Lines<Rows, Intermediate>, ((), ())), Capacity>, Env, &mut ()>
+    Module<Live<(Lines<Rows, Intermediate>, ()), Capacity>, Env, &mut ()>
     for Linear<Intermediate, Hidden, Chip, T>
 where
     Hidden: AxisName,
@@ -227,9 +250,31 @@ where
         _: &mut Device,
         _: Env,
         _: &mut (),
-        staged: Live<(Lines<Rows, Intermediate>, ((), ())), Capacity>,
+        staged: Live<(Lines<Rows, Intermediate>, ()), Capacity>,
     ) -> Lines<Rows, Intermediate> {
         staged.into_value().0
+    }
+}
+
+/// Nor a weight panel after it.
+impl<Hidden, Intermediate, Rows, T, Env> Module<(Lines<Rows, Intermediate>, ()), Env, &mut ()>
+    for Linear<Intermediate, Hidden, Chip, T>
+where
+    Hidden: AxisName,
+    Intermediate: AxisName,
+    Rows: AxisName,
+    T: Matrix<In = Intermediate, Out = Hidden>,
+{
+    type Output = Lines<Rows, Intermediate>;
+
+    fn forward(
+        &self,
+        _: &mut Device,
+        _: Env,
+        _: &mut (),
+        (product, ()): (Lines<Rows, Intermediate>, ()),
+    ) -> Lines<Rows, Intermediate> {
+        product
     }
 }
 

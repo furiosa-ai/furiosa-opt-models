@@ -3,7 +3,7 @@ use super::{Cluster, Output, Rows, Tile};
 pub(crate) use super::{
     PairLocal, PairSlices, Pairs, Queries, QueryLocal, QuerySlices, QuerySpread, Reduced,
 };
-use crate::ops::linear::query::group::Group;
+use crate::ops::linear::query::group::{Group, TilePair, Tiles};
 use crate::ops::normalization::Scaled;
 use crate::tensor::parallel::Chip;
 use crate::{Op, ops::linear::Affine};
@@ -99,6 +99,44 @@ pub(crate) type Squares<G, Heads, Spread, Local> =
 /// [`Squares`] written in data memory, before the register file reads them.
 pub(crate) type Written<G, Heads, Spread, Local> =
     DmTensor<f32, Chip, Cluster<Heads>, Rows<G, Heads, Spread>, m![{ Local }, Tile % 8]>;
+
+/// A projection's [`Written`] squares for each group a launch's periods take: a pair's, then a
+/// single tile's.
+pub struct Grouped<P, S> {
+    pair: P,
+    single: S,
+}
+
+/// [`Grouped`] squares of a query projection's heads.
+pub type QuerySquares<Heads> =
+    Grouped<QueryWritten<TilePair, Heads>, QueryWritten<Tiles<1>, Heads>>;
+type QueryWritten<G, Heads> = Written<G, Heads, QuerySpread<G, Heads>, QueryLocal<G, Heads>>;
+/// [`Grouped`] squares of a key projection's heads.
+pub type KeySquares<Heads> = Grouped<KeyWritten<TilePair, Heads>, KeyWritten<Tiles<1>, Heads>>;
+type KeyWritten<G, Heads> = Written<G, Heads, <G as Group>::Copies, PairLocal<Heads>>;
+
+/// The squares that the periods of group `G` read.
+pub trait Of<G> {
+    type Squares;
+
+    fn of(&self) -> &Self::Squares;
+}
+
+impl<P, S> Of<TilePair> for Grouped<P, S> {
+    type Squares = P;
+
+    fn of(&self) -> &P {
+        &self.pair
+    }
+}
+
+impl<P, S> Of<Tiles<1>> for Grouped<P, S> {
+    type Squares = S;
+
+    fn of(&self) -> &S {
+        &self.single
+    }
+}
 
 /// The projection of a period's rows; its heads' squares, written beforehand, are fetched once the
 /// contraction is issued, so the contraction does not wait for them.
