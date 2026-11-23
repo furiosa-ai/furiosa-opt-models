@@ -9,7 +9,6 @@ use crate::ops::normalization::adaptive::{
     Banded, Feature, Half, Operand, Slices, Strip, Strips, Tile,
 };
 use crate::ops::normalization::{Chunk, FeatureSlices};
-use crate::specialize::linear::Split;
 use crate::tensor::form::Weight;
 use crate::tensor::form::split::{Sides, Stacked};
 use crate::tensor::memory::residency::Residency;
@@ -302,7 +301,6 @@ pub struct Embedding<
     X: M = m![1],
     Matrix = Linear<Sides<In>, Stacked<Out>, X>,
     Offset = HbmTensor<f32, X, m![Out]>,
-    const STRATEGY: Split = { Split::Staged },
 > {
     weight: Matrix,
     bias: Offset,
@@ -368,8 +366,8 @@ impl<In: AxisName, Out: AxisName, X: M> Embedding<In, Out, X> {
 
 /// The coefficients of `weight`: each output's high parts twice, then each output's low parts and
 /// zeros.
-impl<In: AxisName, Out: AxisName, X: M + 'static, Matrix, Offset, const STRATEGY: Split>
-    Load<Stored<Out, In>> for Embedding<In, Out, X, Matrix, Offset, STRATEGY>
+impl<In: AxisName, Out: AxisName, X: M + 'static, Matrix, Offset> Load<Stored<Out, In>>
+    for Embedding<In, Out, X, Matrix, Offset>
 where
     Matrix: Load<
         HostTensor<
@@ -404,11 +402,11 @@ where
 }
 
 /// Rows' high and low parts, side by side, project into the stacked sums.
-impl<'x, 'o, In: AxisName, Out: AxisName, R: AxisName, X: M, Matrix, Offset, const STRATEGY: Split>
+impl<'x, 'o, In: AxisName, Out: AxisName, R: AxisName, X: M, Matrix, Offset>
     Op<(
         &'x Rows<R, Sides<In>, X>,
         &'o mut HbmTensor<f32, X, m![R, { Symbol<Stacked<Out>> }]>,
-    )> for Embedding<In, Out, X, Matrix, Offset, STRATEGY>
+    )> for Embedding<In, Out, X, Matrix, Offset>
 where
     Matrix: Op<
             (
@@ -558,16 +556,55 @@ where
     }
 }
 
+/// FP32 rows projected with coefficient chunks retained in DM for the whole launch.
+/// Input and coefficient values split into BF16 high/low parts; the offset is added before
+/// the result rounds once to BF16, within 2^-17 of each term.
+#[derive(DeviceSend, Load, Residency)]
+#[residency(children(Matrix, Offset))]
+#[load(from = Stored<Out, In>)]
+pub struct ResidentEmbedding<
+    In: AxisName,
+    Out: AxisName,
+    X: M = m![1],
+    Matrix = Linear<Sides<In>, Stacked<Out>, X>,
+    Offset = HbmTensor<f32, X, m![Out]>,
+> {
+    weight: Matrix,
+    bias: Offset,
+    shape: PhantomData<fn() -> (In, Out, X)>,
+}
+
+/// Load the same stacked coefficient image and FP32 bias as the staged embedding.
+impl<In: AxisName, Out: AxisName, X: M + 'static, Matrix, Offset> Load<Stored<Out, In>>
+    for ResidentEmbedding<In, Out, X, Matrix, Offset>
+where
+    Matrix: Load<
+        HostTensor<
+            bf16,
+            m![{ X }, {
+                m![{ Symbol<Stacked<Out>> }, { Symbol<Sides<In>> }]
+            }],
+        >,
+    >,
+    Offset: Load<HostTensor<f32, m![{ X }, { m![Out] }]>>,
+{
+    fn load(context: &mut Context<'_>, stored: Stored<Out, In>) -> Result<Self, LoadError> {
+        let Embedding {
+            weight,
+            bias,
+            shape,
+        } = Embedding::load(context, stored)?;
+        Ok(Self {
+            weight,
+            bias,
+            shape,
+        })
+    }
+}
+
 impl<'x, In: AxisName, Out: AxisName, R: AxisName, X: M, Coefficients, Offset>
     Op<&'x HbmTensor<f32, X, m![R, In]>>
-    for Embedding<
-        In,
-        Out,
-        X,
-        Linear<Sides<In>, Stacked<Out>, X, Coefficients>,
-        Offset,
-        { Split::Resident },
-    >
+    for ResidentEmbedding<In, Out, X, Linear<Sides<In>, Stacked<Out>, X, Coefficients>, Offset>
 where
     Coefficients: Borrow<HbmTensor<bf16, X, m![{ Symbol<Stacked<Out>> }, { Symbol<Sides<In>> }]>>,
     Offset: Borrow<HbmTensor<f32, X, m![Out]>>,
@@ -730,9 +767,9 @@ impl AxisName for Sinusoid {
 }
 
 /// FP32 sums of a stacked projection, their two halves added with the FP32 offset.
-impl<In: AxisName, Out: AxisName, X: M, R: AxisName, Matrix, Offset, const STRATEGY: Split>
+impl<In: AxisName, Out: AxisName, X: M, R: AxisName, Matrix, Offset>
     Op<(&HbmTensor<f32, X, m![R, { Symbol<Stacked<Out>> }]>,)>
-    for Embedding<In, Out, X, Matrix, Offset, STRATEGY>
+    for Embedding<In, Out, X, Matrix, Offset>
 where
     Offset: Borrow<HbmTensor<f32, X, m![Out]>>,
 {

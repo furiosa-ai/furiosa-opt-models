@@ -114,7 +114,7 @@ pub type Text<In = Condition, Out = Width, C = Chips, X = Hbm> = split::Biased<
 
 /// FP32 input and coefficient values split into BF16 parts; the result rounds once to BF16.
 /// Its stored matrix is `[Out, In]`; its prepared image is `[2*Out, 2*In]`.
-pub type Input<In, Out = Width, C = Chips, X = Hbm> = split::Embedding<
+pub type Input<In, Out = Width, C = Chips, X = Hbm> = split::ResidentEmbedding<
     In,
     Out,
     C,
@@ -125,7 +125,6 @@ pub type Input<In, Out = Width, C = Chips, X = Hbm> = split::Embedding<
         <X as Memory>::Tensor<bf16, C, m![{ Symbol<Stacked<Out>> }, { Symbol<Sides<In>> }]>,
     >,
     <X as Memory>::Tensor<f32, C, m![Out]>,
-    { crate::specialize::linear::Split::Resident },
 >;
 
 /// Cosines then sines, an FP32 projection, FP32 SiLU, and an FP32 projection. The two projections
@@ -136,9 +135,23 @@ pub type Timesteps<Hidden = Width, Out = Time, C = Chips, X = Hbm> = split::Time
     Hidden,
     Out,
     C,
-    Named<"proj_in", Input<split::Sinusoid, Hidden, C, X>>,
-    Named<"proj_out", Input<Hidden, Out, C, X>>,
+    Named<"proj_in", TimestepProjection<split::Sinusoid, Hidden, C, X>>,
+    Named<"proj_out", TimestepProjection<Hidden, Out, C, X>>,
     <X as Memory>::Tensor<f32, C, m![{ Symbol<split::Frequency> }]>,
+>;
+
+/// Timestep projections write and combine stacked FP32 sums before the next activation.
+type TimestepProjection<In, Out, C, X> = split::Embedding<
+    In,
+    Out,
+    C,
+    Linear<
+        Sides<In>,
+        Stacked<Out>,
+        C,
+        <X as Memory>::Tensor<bf16, C, m![{ Symbol<Stacked<Out>> }, { Symbol<Sides<In>> }]>,
+    >,
+    <X as Memory>::Tensor<f32, C, m![Out]>,
 >;
 
 /// Video uses timestep 0 and projects to a 2×2 patch of the 24-channel latent.
