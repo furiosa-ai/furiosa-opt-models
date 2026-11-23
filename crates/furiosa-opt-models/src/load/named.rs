@@ -2,10 +2,9 @@
 
 use super::{Checkpoint, Context, Footprint, Load, LoadError};
 use crate::Module;
-use crate::modules::generic::schedule::{IntoStream, Stream};
 use furiosa_opt_std::prelude::{Device, DeviceSend};
 
-/// `M` under the checkpoint and tree segment `NAME`; it computes, launches and streams as `M`.
+/// `M` under the checkpoint and tree segment `NAME`; it computes and launches as `M`.
 #[derive(Clone, DeviceSend)]
 pub struct Named<const NAME: &'static str, M>(pub M);
 
@@ -17,27 +16,6 @@ impl<I, E, S, const NAME: &'static str, M: Module<I, E, S>> Module<I, E, S> for 
 
     fn forward(&self, device: &mut Device, env: E, state: S, input: I) -> M::Output {
         self.0.forward(device, env, state, input)
-    }
-}
-
-impl<U: Stream, E, S, const NAME: &'static str, M: IntoStream<U, E, S>> IntoStream<U, E, S>
-    for Named<NAME, M>
-{
-    type Stream = M::Stream;
-
-    fn into_stream(self, env: E, state: S, upstream: U) -> Self::Stream {
-        self.0.into_stream(env, state, upstream)
-    }
-}
-
-impl<'m, U: Stream, E, S, const NAME: &'static str, M> IntoStream<U, E, S> for &'m Named<NAME, M>
-where
-    &'m M: IntoStream<U, E, S>,
-{
-    type Stream = <&'m M as IntoStream<U, E, S>>::Stream;
-
-    fn into_stream(self, env: E, state: S, upstream: U) -> Self::Stream {
-        (&self.0).into_stream(env, state, upstream)
     }
 }
 

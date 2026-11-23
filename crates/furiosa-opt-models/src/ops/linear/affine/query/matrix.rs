@@ -6,8 +6,8 @@
 use super::group::{Group, TilePair};
 use super::launch::{Launch, Next, Normalized};
 use super::{Cluster, Output, PairLocal, Pairs, Queries, QueryLocal, QuerySpread, Reduced, Tile};
+use crate::Begin;
 use crate::Module;
-use crate::modules::generic::schedule::Begin;
 use crate::modules::lora::{self, Term};
 use crate::ops::linear::{Affine, Matrix, fp8};
 use crate::tensor::form::Weight;
@@ -152,7 +152,7 @@ impl<Hidden: AxisName, Heads: AxisName, Head: AxisName, Env> Module<Begin<()>, E
     type Output = Affine<Flat<Hidden, Heads, Head>, ()>;
 
     fn forward(&self, _: &mut Device, _: Env, _: &mut (), _: Begin<()>) -> Self::Output {
-        // SAFETY: the node that holds the alias keeps the weight it reads, heads in HBM order.
+        // SAFETY: the landed form that holds the alias keeps the weight it reads, heads in HBM order.
         Affine::new(unsafe { self.weight.view().alias() }, ())
     }
 }

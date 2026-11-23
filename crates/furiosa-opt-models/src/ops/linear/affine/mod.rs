@@ -2,7 +2,6 @@
 
 use crate::Op;
 use crate::load::Load;
-use crate::modules::generic::schedule::{IntoStream, RowWise, Stream};
 use crate::ops::index::gather;
 use crate::ops::normalization;
 use crate::ops::normalization::{Cluster, FeatureSlices};
@@ -255,19 +254,6 @@ impl<D: Scalar, W: Scalar, In: AxisName, Out: AxisName, Rows: AxisName, const BI
         input: HbmTensor<D, m![1], m![Rows, In]>,
     ) -> Self::Output {
         self.forward(device, &input)
-    }
-}
-
-/// A projection of a borrowed tree's matrix streams one `forward` a tile.
-impl<'m, 's, 'w, U: Stream, E, S, D: Scalar, C: M, F: M, B> IntoStream<U, E, &'s mut S>
-    for &'m Affine<&'w HbmTensor<D, C, F>, B>
-where
-    RowWise<'s, &'m Affine<&'w HbmTensor<D, C, F>, B>, E, S, U>: Stream,
-{
-    type Stream = RowWise<'s, &'m Affine<&'w HbmTensor<D, C, F>, B>, E, S, U>;
-
-    fn into_stream(self, env: E, state: &'s mut S, upstream: U) -> Self::Stream {
-        RowWise::new(self, env, state, upstream)
     }
 }
 
