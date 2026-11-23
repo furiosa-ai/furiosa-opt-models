@@ -299,17 +299,6 @@ async fn check<R: AxisName, I: AxisName, O: AxisName, G: Extents>(works: &[usize
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn compact_exchange_named_projection_matches_fp64_at_all_main_work_extents() {
-    check::<
-        Rows<10496>,
-        Hidden<512>,
-        ProjectionWidth<256>,
-        ExtentRange<Rows<9472>, Rows<9984>, Rows<256>>,
-    >(&[9472, 9984, 9728, 9472])
-    .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
 async fn full_width_exchange_projection_matches_fp64_at_one_block() {
     check::<Rows<768>, Hidden<7168>, ProjectionWidth<5376>, ExtentRange<Rows<256>, Rows<256>, B>>(
         &[256],

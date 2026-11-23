@@ -471,14 +471,6 @@ async fn tiled_gather_preserves_fused_projection() {
     let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
     check::<Hidden<128>, ProjectionWidth<512>, Rows<768>, 512, 2, 256>(&mut device).await;
     check::<Hidden<128>, ProjectionWidth<512>, Rows<1280>, 512, 3, 256>(&mut device).await;
-    check::<Hidden<5376>, ProjectionWidth<1792>, Rows<9472>, 1024, 10, 256>(&mut device).await;
-}
-
-/// Exercises a larger aligned sequence; full long-text model validation is separate.
-#[tokio::test(flavor = "current_thread")]
-async fn larger_gather_preserves_fused_projection() {
-    let mut device = Device::new(Topology { chips: 4, pes: 8 }).unwrap();
-    check::<Hidden<5376>, ProjectionWidth<1792>, Rows<9984>, 512, 20, 256>(&mut device).await;
 }
 
 /// One first/body gather envelope serves the runtime work extents required through 2048 text

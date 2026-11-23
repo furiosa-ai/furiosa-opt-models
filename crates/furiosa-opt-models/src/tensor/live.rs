@@ -33,20 +33,6 @@ pub struct BlockPrefix<X, R, B> {
 }
 
 impl<R: AxisName, B: AxisName> BlockPrefix<(), R, B> {
-    /// A statically known work extent inside the same allocation envelope. Invalid bounds or
-    /// alignment fail at compilation; runtime requests use the checked host count or HBM reader.
-    pub const fn fixed<Count: AxisName>() -> Self {
-        const {
-            assert!(B::SIZE > 0 && R::SIZE.is_multiple_of(B::SIZE));
-            assert!(Count::SIZE <= R::SIZE && Count::SIZE.is_multiple_of(B::SIZE));
-        }
-        Self {
-            value: (),
-            blocks: Count::SIZE / B::SIZE,
-            shape: PhantomData,
-        }
-    }
-
     /// Check a host row count without rounding it or discarding an invalid suffix.
     pub fn try_over(rows: usize) -> Option<Self> {
         const {

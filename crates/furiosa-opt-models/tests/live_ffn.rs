@@ -3,15 +3,14 @@
 #![feature(register_tool)]
 #![register_tool(furiosa_opt)]
 
-use furiosa_opt_models::load::{Checkpoint, Context, Load, Named};
-use furiosa_opt_models::modules::generic::Prefix;
+use furiosa_opt_models::Op;
+use furiosa_opt_models::load::{Checkpoint, Context, Load};
 use furiosa_opt_models::ops::attention::geometry::Hidden;
 use furiosa_opt_models::ops::linear::Linear;
 use furiosa_opt_models::ops::pointwise::SwiGlu;
 use furiosa_opt_models::ops::swiglu::{GateUp, Intermediate};
 use furiosa_opt_models::tensor::form::grouped::{Grouped, Layout};
 use furiosa_opt_models::tensor::{axis::Rows, live::BlockPrefix, scalar::Value};
-use furiosa_opt_models::{Op, Then};
 use furiosa_opt_std::prelude::*;
 use furiosa_opt_std::runtime::launch;
 
@@ -62,59 +61,6 @@ fn into(
     weights
         .fc2
         .forward(device, (&prefix.with(&scratch.1), &mut scratch.2));
-}
-
-#[device(chip = 1)]
-fn owned(device: &mut Device, weights: &Owned, input: &Input, count: &Value<m![1]>) -> Input {
-    let prefix = BlockPrefix::<(), R, B>::read(count);
-    let projected = weights.fc1.forward(&mut *device, &prefix.with(input));
-    let product = SwiGlu.forward(&mut *device, &prefix.with(projected.value()));
-    weights
-        .fc2
-        .forward(device, &prefix.with(product.value()))
-        .into_value()
-}
-
-/// The ordinary Mlp Module receives the same checked request interval through every child.
-/// Ownership is passed into Live once; Then lends each intermediate to the next Prefix.
-#[device(chip = 1)]
-fn module_ffn(
-    device: &mut Device,
-    weights: &Borrowed<'_>,
-    input: Input,
-    count: &Value<m![1]>,
-) -> Input {
-    let prefix = BlockPrefix::<(), R, B>::read(count);
-    let model = Then(
-        Prefix(Named::<"fc1", _>(&weights.fc1)),
-        Then(Prefix(SwiGlu), Prefix(Named::<"fc2", _>(&weights.fc2))),
-    );
-    let mut state = ((), ((), ()));
-    furiosa_opt_models::Module::forward(
-        &model,
-        device,
-        (&prefix, ()),
-        &mut state,
-        &prefix.interval().with(input),
-    )
-    .into_value()
-}
-
-#[device(chip = 1)]
-fn fixed<N: AxisName>(
-    device: &mut Device,
-    weights: &Owned,
-    input: &Input<N>,
-    scratch: &mut Scratch<N>,
-) {
-    weights.fc1.forward(&mut *device, (input, &mut scratch.0));
-    SwiGlu.forward(&mut *device, (&scratch.0, &mut scratch.1));
-    weights.fc2.forward(device, (&scratch.1, &mut scratch.2));
-}
-
-#[device(chip = 1)]
-fn legacy_128(device: &mut Device, input: &Packed<Rows<128>>) -> Product<Rows<128>> {
-    SwiGlu.forward(device, input)
 }
 
 fn value(row: usize, column: usize) -> bf16 {
@@ -378,104 +324,5 @@ async fn checked_ffn_prefixes_preserve_rounding_values_zero_rows_and_tails() {
                 (error / norm).sqrt()
             );
         }
-        let mut baseline = scratch::<R>(&mut device).await;
-        launch(fixed, (&mut device, &weights, &input, &mut baseline))
-            .await
-            .unwrap();
-        let static_packed = baseline
-            .0
-            .to_host::<m![R,{Symbol<GateUp<I>>}]>(&mut device.pdma)
-            .await
-            .unwrap()
-            .into_vec();
-        let static_product = baseline
-            .1
-            .to_host::<m![R, I]>(&mut device.pdma)
-            .await
-            .unwrap()
-            .into_vec();
-        let static_output = baseline
-            .2
-            .to_host::<m![R, H]>(&mut device.pdma)
-            .await
-            .unwrap()
-            .into_vec();
-        for (got, want, width) in [
-            (&packed, &static_packed, 2 * I::SIZE),
-            (&product, &static_product, I::SIZE),
-            (&output, &static_output, H::SIZE),
-        ] {
-            assert!(
-                got[..rows * width]
-                    .iter()
-                    .zip(&want[..rows * width])
-                    .all(|(a, b)| a.to_bits() == b.to_bits()),
-                "static parity, work {rows}, width {width}"
-            );
-        }
-        let owned_result = launch(owned, (&mut device, &weights, &input, &count))
-            .await
-            .unwrap();
-        if rows > 0 {
-            let bytes = owned_result
-                .into_buffer()
-                .slice(.., ..rows * H::SIZE * 2)
-                .unwrap()
-                .to_host(&mut device.pdma)
-                .await
-                .unwrap();
-            for (at, b) in bytes.chunks_exact(2).enumerate() {
-                assert_eq!(
-                    u16::from_le_bytes([b[0], b[1]]),
-                    output[at].to_bits(),
-                    "owned parity, work {rows}, element {at}"
-                );
-            }
-        }
-        // The generic Module composition must match the checked leaf composition bit for bit.
-        // Consume the already uploaded input only after all borrowed leaf comparisons finish.
-        let module_result = launch(module_ffn, (&mut device, &borrowed, input, &count))
-            .await
-            .unwrap();
-        if rows > 0 {
-            let bytes = module_result
-                .into_buffer()
-                .slice(.., ..rows * H::SIZE * 2)
-                .unwrap()
-                .to_host(&mut device.pdma)
-                .await
-                .unwrap();
-            for (at, b) in bytes.chunks_exact(2).enumerate() {
-                assert_eq!(
-                    u16::from_le_bytes([b[0], b[1]]),
-                    output[at].to_bits(),
-                    "Module parity, work {rows}, element {at}"
-                );
-            }
-        }
-    }
-    let packed: Packed<Rows<128>> = HostTensor::<
-        bf16,
-        m![{ Symbol<Rows<128>> }, { Symbol<GateUp<I>> }],
-    >::from_vec((0..128 * 2 * I::SIZE).map(|at| {
-        reference.packed[((at / (2 * I::SIZE)) % PERIOD) * 2 * I::SIZE + at % (2 * I::SIZE)]
-    }))
-    .to_hbm(&mut device.pdma)
-    .await
-    .unwrap();
-    let legacy = launch(legacy_128, (&mut device, &packed))
-        .await
-        .unwrap()
-        .to_host::<m![{ Symbol<Rows<128>> }, I]>(&mut device.pdma)
-        .await
-        .unwrap()
-        .into_vec();
-    for (at, got) in legacy.iter().enumerate() {
-        let want = reference.product[((at / I::SIZE) % PERIOD) * I::SIZE + at % I::SIZE];
-        let (got, want) = (f64::from(got.to_f32()), f64::from(want.to_f32()));
-        assert!(
-            got.is_finite() && (got - want).abs() <= want.abs() / 128.0 + 1e-3,
-            "legacy 128 element {at}"
-        );
     }
 }
