@@ -140,6 +140,7 @@ class Worker:
 @dataclass(frozen=True, slots=True)
 class LayerRoute:
     layer_id: int
+    group_index: int
     device_page_bytes: int
     host_page_bytes: int
     host_offset: int
@@ -261,7 +262,6 @@ class Host(OffloadingWorker):
 
         self.routes: dict[int, tuple[LayerRoute, ...]] = {}
         self.group_indices: dict[int, int] = {}
-        layer_order: list[tuple[int, int, int, int]] = []
         group_offset = 0
         for group_index, group_id in enumerate(selected_group_ids):
             if not 0 <= group_id < len(kv_cache_config.kv_cache_groups):
@@ -309,9 +309,14 @@ class Host(OffloadingWorker):
                 if spec.config.canonical_layout:
                     _require_identity_mapping(mappings.get(name), name, page_bytes)
                 layer_routes.append(
-                    LayerRoute(layer_id, page_bytes, host_page_bytes, group_offset + layer_offset)
+                    LayerRoute(
+                        layer_id,
+                        group_index,
+                        page_bytes,
+                        host_page_bytes,
+                        group_offset + layer_offset,
+                    )
                 )
-                layer_order.append((layer_id, page_bytes, group_index, group_offset + layer_offset))
                 layer_offset += host_page_bytes
             self.routes[group_id] = tuple(layer_routes)
             group_offset += layer_offset
@@ -327,12 +332,13 @@ class Host(OffloadingWorker):
             )
         copy_layers = [
             engine.CopierLayer(
-                buffer=cache.layers[layer_id],
-                page_bytes=page_bytes,
-                host_offset=offset,
-                group=group,
+                buffer=cache.layers[route.layer_id],
+                page_bytes=route.device_page_bytes,
+                host_offset=route.host_offset,
+                group=route.group_index,
             )
-            for layer_id, page_bytes, group, offset in layer_order
+            for routes in self.routes.values()
+            for route in routes
         ]
         self.copier = engine.Copier(copy_layers, group_offset)
         self.host_cache = engine.HostCache(self.copier, self.chunks * self.blocks)
