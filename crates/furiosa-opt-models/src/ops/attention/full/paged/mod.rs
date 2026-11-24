@@ -143,6 +143,50 @@ pub struct Retained<'a, Reach: AxisName, Heads: AxisName, Head: AxisName> {
 /// A launch's query rows of each (KV head, group) and the rows attention returns.
 type Rows<Reach, Heads, Groups, Head> = HbmTensor<bf16, Chip, m![Reach, Heads, Groups, Head]>;
 
+axes![Physical = 256, Slot = 2];
+pub(crate) use {Physical as OPhysical, Slot as OSlot};
+pub(crate) type SingleRow<Q> = DmTensor<bf16, Chip, m![Q / 2048], m![Physical], m![Slot, Q % 2048]>;
+impl<
+    Sequences: AxisName,
+    Heads: AxisName,
+    G: AxisName,
+    Head: AxisName,
+    const WAVES: usize,
+    L: AxisName,
+> Context<'_, Sequences, Heads, G, Head, WAVES, L>
+{
+    pub(crate) fn single_wide(&self) -> bool {
+        self.items.rows() == 1 && self.shape.single_wide() && self.chunks == 0
+    }
+    pub(crate) fn capture<Q: AxisName, Reach: AxisName, Scale: Copy + Into<f32>, H, S, Env: Copy>(
+        &self,
+        dev: &mut Device,
+        env: Env,
+        att: &attention::Attention<PhantomData<(Heads, G, Head)>, Scale>,
+        query: &Rows<Reach, Heads, G, Head>,
+        history: &Retained<'_, Reach, Heads, Head>,
+        boundary: (&H, &mut S),
+        attended: &mut Rows<Reach, Heads, G, Head>,
+    ) -> SingleRow<Q>
+    where
+        H: for<'d, 's> Module<&'s mut S, Env, &'d mut (), Output = ()>,
+    {
+        let att = attention::Attention {
+            heads: att.heads,
+            scale: att.scale.into(),
+        };
+        self.work.items.capture(
+            dev,
+            env,
+            &att,
+            query,
+            attended,
+            self.shape,
+            (history.read, history.pool),
+            boundary,
+        )
+    }
+}
 /// Every live row attends its visible keys into `attended`, items over the pool, chunks also over
 /// their retained keys and values; `boundary` runs once the last history is in flight.
 impl<

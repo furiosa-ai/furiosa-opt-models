@@ -400,10 +400,28 @@ impl<H: AxisName, Q: AxisName> channel::Stored<H, Q> {
         landed: &Landed<H, Q, Span, f32, bf16>,
         attended: &Attended<Reach, KvHeads, Groups, Head>,
         tile: Live<(), Capacity>,
+        resident: &crate::ops::attention::full::paged::SingleRow<Q>,
+        use_resident: bool,
         after_rows: impl FnOnce(&mut Device) -> T,
         after_first: impl FnOnce(&mut Device) -> A,
     ) -> (T, A, Owned<H, Span>) {
-        let input = input_rows::<H, Q, _, _, _, _, _>(device, attended, tile);
+        use crate::ops::attention::full::paged::{OPhysical, OSlot};
+        let input = if use_resident {
+            let source = resident
+                .view()
+                .slice_tile::<m![OPhysical], 1, m![OPhysical=1 # 256]>(0)
+                .tile::<m![OSlot], 1, m![OSlot=1 # 2,Q % 2048]>(0);
+            // Only wave zero, column zero and the first token slice contain this row.
+            let source =
+                unsafe { source.reshape::<Chip, m![Q / 2048], m![1 # 256], m![1 # 2,Q % 2048]>() };
+            let mut input = InDm::<H, Q, Span>::new();
+            source.to_dm_view(&mut device.tdma,input.view_mut()
+               .slice_tile::<m![Span / (Span / 4)],1,m![H / 1024,Span / (Span / 4)=1 #{!} 4,Q % 2048 / 128]>(0)
+               .tile::<m![Span % (Span / 4)],1,m![Span % (Span / 4)=1 #{!} 128,Q % 128]>(0));
+            input
+        } else {
+            input_rows::<H, Q, _, _, _, _, _>(device, attended, tile)
+        };
         let residual = after_rows(device);
         let rows = tile.rows();
         let waves = (rows + 31) / 32;
