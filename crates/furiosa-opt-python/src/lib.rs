@@ -52,6 +52,7 @@ fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<tensor::Device>()?;
     module.add_class::<tensor::HbmBuffer>()?;
     module.add_class::<tensor::HostBuffer>()?;
+    module.add_class::<cache::PyCopierLayer>()?;
     module.add_class::<cache::PyCopier>()?;
     module.add_class::<cache::PyHostCache>()?;
     module.add_class::<cache::PyHostSlot>()?;

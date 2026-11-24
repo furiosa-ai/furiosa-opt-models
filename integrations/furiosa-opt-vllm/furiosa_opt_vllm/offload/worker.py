@@ -325,13 +325,16 @@ class Host(OffloadingWorker):
                 "engine cache pages exceed vLLM's host chunk layout "
                 f"({group_offset * self.blocks} > {self.row_stride} bytes)"
             )
-        self.copier = engine.Copier(
-            [cache.layers[layer_id] for layer_id, _, _, _ in layer_order],
-            [page_bytes for _, page_bytes, _, _ in layer_order],
-            [offset for _, _, _, offset in layer_order],
-            [group for _, _, group, _ in layer_order],
-            group_offset,
-        )
+        copy_layers = [
+            engine.CopierLayer(
+                buffer=cache.layers[layer_id],
+                page_bytes=page_bytes,
+                host_offset=offset,
+                group=group,
+            )
+            for layer_id, page_bytes, group, offset in layer_order
+        ]
+        self.copier = engine.Copier(copy_layers, group_offset)
         self.host_cache = engine.HostCache(self.copier, self.chunks * self.blocks)
         self.engine_id = spec.config.engine_id
         self.jobs = Jobs()

@@ -16,6 +16,7 @@ from . import decoder, llama, mistral, qwen3, vision_language
 __all__ = [
     "Checkpoint",
     "Copier",
+    "CopierLayer",
     "Copy",
     "Decoder",
     "Device",
@@ -72,18 +73,13 @@ class Copier:
     under the GIL; completions can move to framework worker threads.
     """
     def __new__(
-        cls,
-        layers: typing.Sequence[HbmBuffer],
-        page_bytes: typing.Sequence[builtins.int],
-        host_offsets: typing.Sequence[builtins.int],
-        groups: typing.Sequence[builtins.int],
-        host_block_bytes: builtins.int,
+        cls, layers: typing.Sequence[CopierLayer], host_block_bytes: builtins.int
     ) -> Copier:
         r"""
         Build one transfer queue over the layer buffers.
 
-        `page_bytes`, `host_offsets`, and `groups` have one entry per layer. Page sizes are bytes
-        per chip; offsets address the concatenated bytes in each host slot.
+        Each layer names its own page size (bytes per chip), byte offset in a host slot, and cache
+        group, so one layer's metadata cannot accidentally drift from another's buffer.
         """
     def copy_out(
         self,
@@ -122,6 +118,25 @@ class Copier:
     def shutdown(self) -> None:
         r"""
         Wait for every submitted copy and stop the workers.
+        """
+
+@typing.final
+class CopierLayer:
+    r"""
+    One layer's byte layout in the device cache and each pinned host-cache block.
+    """
+    def __new__(
+        cls,
+        buffer: HbmBuffer,
+        page_bytes: builtins.int,
+        host_offset: builtins.int,
+        group: builtins.int,
+    ) -> CopierLayer:
+        r"""
+        Describe one cache layer's device page and its location in each host block.
+
+        `page_bytes` is per chip; `host_offset` is a byte offset; `group` names the layer's cache
+        group.
         """
 
 @typing.final

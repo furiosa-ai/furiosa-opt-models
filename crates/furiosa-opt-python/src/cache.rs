@@ -41,6 +41,16 @@ pub(crate) struct PyCopier {
     pending: Transfers,
 }
 
+/// One layer's byte layout in the device cache and each pinned host-cache block.
+#[gen_stub_pyclass]
+#[pyclass(name = "CopierLayer", module = "engine", frozen)]
+pub(crate) struct PyCopierLayer {
+    buffer: Py<PyHbmBuffer>,
+    page_bytes: usize,
+    host_offset: usize,
+    group: usize,
+}
+
 /// A persistent pool of page-locked host blocks, one slot per offloaded cache block.
 #[gen_stub_pyclass]
 #[pyclass(name = "HostCache", module = "engine", frozen)]
@@ -82,45 +92,32 @@ impl Drop for PyHostSlotAccess {
 impl PyCopier {
     /// Build one transfer queue over the layer buffers.
     ///
-    /// `page_bytes`, `host_offsets`, and `groups` have one entry per layer. Page sizes are bytes
-    /// per chip; offsets address the concatenated bytes in each host slot.
+    /// Each layer names its own page size (bytes per chip), byte offset in a host slot, and cache
+    /// group, so one layer's metadata cannot accidentally drift from another's buffer.
     #[new]
     fn new(
         py: Python<'_>,
-        layers: Vec<PyRef<'_, PyHbmBuffer>>,
-        page_bytes: Vec<usize>,
-        host_offsets: Vec<usize>,
-        groups: Vec<usize>,
+        layers: Vec<PyRef<'_, PyCopierLayer>>,
         host_block_bytes: usize,
     ) -> PyResult<Self> {
         let first = layers
             .first()
             .ok_or_else(|| PyValueError::new_err("cache copies require nonempty layer buffers"))?;
-        if page_bytes.len() != layers.len()
-            || host_offsets.len() != layers.len()
-            || groups.len() != layers.len()
-        {
-            return Err(PyValueError::new_err(
-                "each cache layer needs a page size, host offset, and group",
-            ));
-        }
         if host_block_bytes == 0 {
             return Err(PyValueError::new_err(
                 "host cache blocks must contain bytes",
             ));
         }
-        let context = first.context.clone();
+        let context = first.buffer.bind(py).borrow().context.clone();
         let chips = usize::from(Context::lock(&context, py).device.topology().chips);
         let mut core_layers = Vec::with_capacity(layers.len());
         let mut core_groups = BTreeMap::<usize, Vec<usize>>::new();
         let mut ranges = Vec::with_capacity(layers.len());
-        for (index, (((layer, &page), &offset), &group)) in layers
-            .iter()
-            .zip(&page_bytes)
-            .zip(&host_offsets)
-            .zip(&groups)
-            .enumerate()
-        {
+        for (index, description) in layers.iter().enumerate() {
+            let layer = description.buffer.bind(py).borrow();
+            let page = description.page_bytes;
+            let offset = description.host_offset;
+            let group = description.group;
             if !Arc::ptr_eq(&context, &layer.context) {
                 return Err(PyValueError::new_err("cache layers must share a device"));
             }
@@ -346,6 +343,25 @@ impl PyCopier {
             self.pending.insert(key, completion);
         }
         Ok(PyCopy(completion))
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyCopierLayer {
+    /// Describe one cache layer's device page and its location in each host block.
+    ///
+    /// `page_bytes` is per chip; `host_offset` is a byte offset; `group` names the layer's cache
+    /// group.
+    #[pyo3(signature = (buffer, page_bytes, host_offset, group))]
+    #[new]
+    fn new(buffer: Py<PyHbmBuffer>, page_bytes: usize, host_offset: usize, group: usize) -> Self {
+        Self {
+            buffer,
+            page_bytes,
+            host_offset,
+            group,
+        }
     }
 }
 

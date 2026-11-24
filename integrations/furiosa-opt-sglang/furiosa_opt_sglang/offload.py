@@ -181,18 +181,20 @@ class Host(HostKVCache):
 
     @override
     def init_kv_buffer(self) -> list[engine.HostCache]:
-        offsets: list[int] = []
+        copy_layers: list[engine.CopierLayer] = []
         offset = 0
-        for size in self.sizes:
-            offsets.append(offset)
-            offset += size * self.chips
-        self.copier = engine.Copier(
-            self.layers,
-            self.sizes,
-            offsets,
-            [0] * len(self.layers),
-            offset,
-        )
+        for layer, page_bytes in zip(self.layers, self.sizes, strict=True):
+            copy_layers.append(
+                engine.CopierLayer(
+                    buffer=layer,
+                    page_bytes=page_bytes,
+                    host_offset=offset,
+                    group=0,
+                )
+            )
+
+            offset += page_bytes * self.chips
+        self.copier = engine.Copier(copy_layers, offset)
         self.host_cache = engine.HostCache(self.copier, self.page_num)
         self._pending_loads: dict[tuple[tuple[int, ...], tuple[int, ...]], set[int]] = {}
         self._pending_loads_lock = Lock()
