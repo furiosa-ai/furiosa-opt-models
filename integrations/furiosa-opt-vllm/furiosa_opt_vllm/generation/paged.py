@@ -11,12 +11,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeAlias
 
 import furiosa_opt_engine as engine
-from furiosa_opt_vllm.batch import operand
+from furiosa_opt_engine.batch import operand
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
-    from furiosa_opt_vllm.batch import Call
+    from furiosa_opt_engine.batch import Call
     from furiosa_opt_vllm.decoder import Decoder
     from furiosa_opt_vllm.runner import Runner
 

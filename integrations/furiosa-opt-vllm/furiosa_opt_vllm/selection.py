@@ -25,23 +25,24 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
     from vllm.config import VllmConfig
-    from vllm.config.model import LogprobsMode
+    from vllm.config.model import LogprobsMode, ModelConfig
     from vllm.v1.outputs import LogprobsLists, SamplingMaskLists
     from vllm.v1.sample.metadata import SamplingMetadata
     from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
     import furiosa_opt_engine as engine
     from furiosa_opt_vllm.admission import Speculative
+    from furiosa_opt_vllm.decoder import Decoder
     from furiosa_opt_vllm.replay import Replay
 
 
 def choose(
     config: VllmConfig,
     speculative: Speculative | None,
-    target: engine.decoder.CacheSpec | None,
+    target: Decoder | None,
     requests: Mapping[str, CachedRequestState],
 ) -> Sampling | Speculation:
-    """Choose sampling or rejection; a draft model loads beside the target cache."""
+    """Choose sampling or rejection; a draft model loads beside the `target` decoder."""
     model = config.model_config
 
     def sampler() -> Sampler:
@@ -58,7 +59,7 @@ def choose(
         case Method.SUFFIX:
             proposer = SuffixDecodingProposer(config)
         case Draft():
-            proposer = Drafter.load(speculative, target)
+            proposer = Drafter.load(speculative, target, config.model_config)
         case _:
             assert_never(speculative)
     return Speculation(RejectionSampler(sampler()), proposer)
@@ -133,12 +134,27 @@ class Sampling:
             masks,
         )
 
-    def capacity(self, blocks: int) -> int:
+    def capacity(self, blocks: int, _target_bytes_per_block: int) -> int:
         """`blocks`, since sampling holds no cache."""
         return blocks
 
     def allocate(self, _blocks: int, _requests: Mapping[str, CachedRequestState]) -> None:
         """Nothing, since sampling holds no cache."""
+
+    def release_weights(self, *, preserve_copy: bool) -> None:
+        """Nothing, since sampling holds no engine model."""
+
+    def synchronize(self) -> None:
+        """Nothing, since sampling holds no engine device."""
+
+    def restore_weights(self, _target: Decoder, _target_config: ModelConfig) -> None:
+        """Nothing, since sampling holds no engine model."""
+
+    def release_cache(self) -> None:
+        """Nothing, since sampling holds no engine cache."""
+
+    def restore_cache(self) -> None:
+        """Nothing, since sampling holds no engine cache."""
 
     def retire(self, _req_id: str) -> None:
         """Nothing, since sampling holds no request's state."""
@@ -156,6 +172,62 @@ class Speculation:
     proposer: NgramProposer | SuffixDecodingProposer | Drafter | Drafting
     # The drafts proposed after the last sampled step, until vLLM takes them.
     drafts: DraftTokenIds | None = None
+
+    def release_weights(self, *, preserve_copy: bool) -> None:
+        """Release a draft model with the same host-copy policy as the target weights."""
+        match self.proposer:
+            case Drafter() as drafter:
+                self.proposer = drafter.release_weights(preserve_copy=preserve_copy)
+            case Drafting() as drafting:
+                drafting.release_weights(preserve_copy=preserve_copy)
+            case NgramProposer() | SuffixDecodingProposer():
+                pass
+            case _:
+                assert_never(self.proposer)
+
+    def synchronize(self) -> None:
+        """Wait for a draft device as well as the target before a memory lifecycle change."""
+        match self.proposer:
+            case Drafter() as drafter:
+                drafter.synchronize()
+            case Drafting() as drafting:
+                drafting.synchronize()
+            case NgramProposer() | SuffixDecodingProposer():
+                pass
+            case _:
+                assert_never(self.proposer)
+
+    def restore_weights(self, target: Decoder, target_config: ModelConfig) -> None:
+        """Restore a draft model after the target weights are awake."""
+        match self.proposer:
+            case Drafter() as drafter:
+                self.proposer = drafter.restore_weights(target, target_config)
+            case Drafting() as drafting:
+                drafting.restore_weights(target, target_config)
+            case NgramProposer() | SuffixDecodingProposer():
+                pass
+            case _:
+                assert_never(self.proposer)
+
+    def release_cache(self) -> None:
+        """Release a draft cache alongside the target KV cache."""
+        match self.proposer:
+            case Drafting() as drafting:
+                drafting.release_cache()
+            case NgramProposer() | SuffixDecodingProposer() | Drafter():
+                pass
+            case _:
+                assert_never(self.proposer)
+
+    def restore_cache(self) -> None:
+        """Restore empty draft cache storage after the target KV cache is awake."""
+        match self.proposer:
+            case Drafting() as drafting:
+                drafting.restore_cache()
+            case NgramProposer() | SuffixDecodingProposer() | Drafter():
+                pass
+            case _:
+                assert_never(self.proposer)
 
     def accept(
         self, tokens: Mapping[str, Sequence[tuple[engine.HbmTensor, int]]], batch: InputBatch
@@ -205,13 +277,16 @@ class Speculation:
             result.sampled_token_ids, batch.vocab_size, logprobs_tensors=result.logprobs_tensors
         )
 
-    def capacity(self, blocks: int) -> int:
-        """The target's cache `blocks`, or fewer when a draft model's cache must hold as many."""
+    def capacity(self, blocks: int, target_bytes_per_block: int) -> int:
+        """The target's `blocks` at `target_bytes_per_block`, or fewer when its draft cache must
+        hold as many blocks."""
         match self.proposer:
             case NgramProposer() | SuffixDecodingProposer():
                 return blocks
-            case (Drafter() as drafter) | Drafting(drafter=drafter):
-                return min(blocks, drafter.capacity())
+            case Drafter() as drafter:
+                return drafter.capacity(blocks, target_bytes_per_block)
+            case Drafting() as drafting:
+                return drafting.capacity(blocks, target_bytes_per_block)
             case _:
                 assert_never(self.proposer)
 
@@ -220,8 +295,10 @@ class Speculation:
         match self.proposer:
             case NgramProposer() | SuffixDecodingProposer():
                 pass
-            case (Drafter() as drafter) | Drafting(drafter=drafter):
+            case Drafter() as drafter:
                 self.proposer = Drafting(drafter, blocks, requests)
+            case Drafting() as drafting:
+                self.proposer = drafting.with_cache(blocks, requests)
             case _:
                 assert_never(self.proposer)
 

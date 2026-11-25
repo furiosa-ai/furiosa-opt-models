@@ -9,8 +9,8 @@ import numpy as np
 import torch
 
 import furiosa_opt_engine as engine
+from furiosa_opt_engine.batch import Call, Row
 from furiosa_opt_vllm import embedding, generation
-from furiosa_opt_vllm.batch import Call, Row
 from furiosa_opt_vllm.decoder import RELEASED, Decoder
 from furiosa_opt_vllm.generation import Sampled, Scored, paged
 from furiosa_opt_vllm.runner import Argmax, Logits, Runner

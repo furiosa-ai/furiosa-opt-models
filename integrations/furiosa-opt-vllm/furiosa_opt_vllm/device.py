@@ -4,12 +4,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from furiosa_opt_vllm.batch import Identity
-
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
     import furiosa_opt_engine as engine
+    from furiosa_opt_engine.batch import Identity
 
 
 def read(

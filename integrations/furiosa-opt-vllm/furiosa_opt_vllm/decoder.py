@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, ClassVar, Final
 from vllm.platforms import current_platform
 
 import furiosa_opt_engine as engine
+from furiosa_opt_engine.placement import PE_COUNT, PlacedDevice, open_placed_device
 from furiosa_opt_vllm import checkpoint
 from furiosa_opt_vllm.admission import Refused, options
 
@@ -28,7 +29,7 @@ if TYPE_CHECKING:
     from furiosa_opt_vllm.checkpoint import Location
 
 # Every PE of an RNGD chip.
-PES: Final = range(8)
+PES: Final = range(PE_COUNT)
 
 RELEASED: Final = "no weights are on the device: wake them up, or reload them after a failed reload"
 
@@ -45,7 +46,7 @@ class Decoder:
     copy: engine.Checkpoint | None
     checkpoint: Location
     options: engine.LoadOptions
-    device: engine.Device
+    selected: PlacedDevice
     vocabulary: int
     # A call allocates its buffers as it runs, from the memory the cache leaves free.
     workspace: ClassVar[int] = 0
@@ -58,11 +59,19 @@ class Decoder:
         model = config.model_config
         tensor = config.parallel_config.tensor_parallel_size
         chips = [current_platform.device_id_to_physical_device_id(rank) for rank in range(tensor)]
-        device = engine.Device(engine.Placement(chips, PES))
+        placement = engine.Placement(chips, PES)
+        selected = open_placed_device(placement)
         located = checkpoint.located(model, config.load_config.download_dir)
         mapped = located.mapped()
         copy = mapped.read() if model.enable_sleep_mode else None
-        decoder = cls(None, copy, located, options(config), device, model.get_vocab_size())
+        decoder = cls(
+            None,
+            copy,
+            located,
+            options(config),
+            selected,
+            model.get_vocab_size(),
+        )
         loaded = decoder.loaded(mapped if copy is None else copy)
         match loaded.model:
             case engine.Decoder(window=window) if model.max_model_len > window:
@@ -78,6 +87,16 @@ class Decoder:
                 return replace(self, model=model)
             case _:
                 raise NotImplementedError(f"{type(model).__name__} is no served decoder")
+
+    @property
+    def device(self) -> engine.Device:
+        """The opened target device paired with its physical placement."""
+        return self.selected.device
+
+    @property
+    def placement(self) -> engine.Placement:
+        """The target placement used to open its device."""
+        return self.selected.placement
 
     @property
     def rows(self) -> int:

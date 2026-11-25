@@ -51,6 +51,9 @@ UPSTREAM: Final = frozenset(map(str, get_args(SpeculativeMethod)))
         {"chips": [1, 1], "pes": [0, 8]},
         {"chips": [True], "pes": [0, 8]},
         {"chips": [1], "pes": [4, 2]},
+        {"chips": [256], "pes": [0, 8]},
+        {"chips": [1], "pes": [0, 256]},
+        {"chips": [1], "pes": [0, 9]},
     ],
 )
 def test_refuses_bad_placement(placement: dict[str, list[int]]) -> None:
@@ -95,7 +98,7 @@ def test_refuses_unserved_requests(
 
 
 @pytest.mark.parametrize("name", sorted(UPSTREAM - set(Method)))
-@pytest.mark.feature("Speculative decoding (EAGLE, MTP, Medusa, MLP, parallel draft models)")
+@pytest.mark.feature("Speculative decoding (EAGLE, MTP, Medusa, MLP, parallel drafting)")
 def test_refuses_unbuilt_methods(name: str) -> None:
     """Admission refuses every speculative method vLLM names but ngram, suffix and a draft model."""
     with pytest.raises(Refused) as error:
@@ -291,7 +294,7 @@ def test_refuses_hits(hybrid: Path) -> None:
 
 
 def test_refuses_recurrent_models(hybrid: Path) -> None:
-    """Draft rejection cannot undo a recurrent state's updates."""
+    """The speculative path has no rollback path for recurrent-state updates."""
     arguments = EngineArgs(
         model=str(hybrid),
         dtype="bfloat16",

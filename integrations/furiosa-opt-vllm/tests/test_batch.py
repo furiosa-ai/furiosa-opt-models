@@ -6,7 +6,7 @@ from typing import cast
 
 import pytest
 
-from furiosa_opt_vllm import batch
+import furiosa_opt_engine.batch as batch
 
 
 def test_call_preserves_chunks_and_kept_order() -> None:

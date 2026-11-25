@@ -7,11 +7,20 @@ from typing import TYPE_CHECKING, Annotated, ClassVar
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_core import PydanticCustomError
 
+from furiosa_opt_engine.placement import (
+    MAX_CHIP_ID,
+    PE_COUNT,
+    has_distinct_chips,
+    is_nonempty_pe_range,
+)
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-# A chip or PE index, which no bool or float stands for.
-Index = Annotated[int, Field(strict=True, ge=0)]
+# A physical chip ID in the engine's `u8` range.
+Chip = Annotated[int, Field(strict=True, ge=0, le=MAX_CHIP_ID)]
+# A half-open PE range endpoint; a chip has PEs 0 through 7.
+PE = Annotated[int, Field(strict=True, ge=0, le=PE_COUNT)]
 
 
 class Placement(BaseModel):
@@ -19,20 +28,20 @@ class Placement(BaseModel):
 
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
 
-    chips: tuple[Index, ...]
-    pes: tuple[Index, Index]
+    chips: tuple[Chip, ...]
+    pes: tuple[PE, PE]
 
     @field_validator("chips")
     @classmethod
     def distinct(cls, chips: tuple[int, ...]) -> tuple[int, ...]:
-        if not chips or len(set(chips)) < len(chips):
+        if not has_distinct_chips(chips):
             raise PydanticCustomError("distinct", "Input should be one or more distinct chips")
         return chips
 
     @field_validator("pes")
     @classmethod
     def ascending(cls, pes: tuple[int, int]) -> tuple[int, int]:
-        if pes[0] >= pes[1]:
+        if not is_nonempty_pe_range(pes):
             raise PydanticCustomError("ascending", "Input should be a nonempty half-open range")
         return pes
 
@@ -42,7 +51,7 @@ class Section(BaseModel):
 
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
 
-    # Where the draft model loads; by default on the chips the target leaves free.
+    # Where the draft model loads; by default on the target's chips.
     draft_placement: Placement | None = None
 
     @classmethod

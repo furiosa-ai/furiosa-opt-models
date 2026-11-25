@@ -449,6 +449,17 @@ def quantization(config: ModelConfig, scope: str = "") -> Quantization | None:
     return "fp8_per_tensor"
 
 
+ROLLBACK: Final = (
+    "speculative decoding requires an attention-cache rollback path; recurrent-state rollback "
+    "is unsupported"
+)
+
+
+def recurrent(model: ModelConfig) -> bool:
+    """Whether `model` keeps recurrent state the speculative path cannot restore."""
+    return model.is_hybrid or model.hf_text_config.model_type in ("mamba", "mamba2", "bamba")
+
+
 class Method(StrEnum):
     """A speculative method the plugin serves, under its vLLM name."""
 
@@ -470,24 +481,32 @@ class Method(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class Draft:
-    """A draft model to load beside the target: its checkpoint, parallelism and cache dtype, where
-    it loads, and the context its cache must hold."""
+    """A draft model beside its target: checkpoint, placement, cache budget and context."""
 
     model: ModelConfig
     parallel: ParallelConfig
-    # By default the draft model loads on the chips the target leaves free.
+    # By default the draft model loads on the target's chips.
     placement: Placement | None
     download_dir: str | None
     # The engine's dtype name; `None` keeps the engine's.
     cache_dtype: str | None
     # The target's context length, to which drafting extends a request.
     max_model_len: int
+    # Disjoint draft cache fraction; a colocated draft uses the target's resolved block budget.
+    memory_utilization: float
+    # Under parallel drafting, the token the draft model reads at each draft position after the
+    # first; `None` drafts each position from the draft before it.
+    mask: int | None
 
     @classmethod
     def parse(cls, config: VllmConfig, settings: SpeculativeConfig, section: Section) -> Draft:
         """The draft model of `config`'s speculative `settings`, whose load config and cache dtype
         default to the target's; refuses a setting the drafter would not honor, naming its
         option."""
+        # This proposer rewrites attention blocks after rejection; it does not manage recurrent
+        # state snapshots. Refuse before the engine reads the draft checkpoint.
+        if recurrent(settings.draft_model_config):
+            raise Refused("speculative_config.model", ROLLBACK)
         if settings.draft_sample_method != "greedy":
             raise Refused(
                 "speculative_config.draft_sample_method",
@@ -515,6 +534,38 @@ class Draft:
             )
         if quantization(settings.draft_model_config, "speculative_config.") is not None:
             raise Refused("speculative_config.quantization", "quantizes no draft model at load")
+        mask = None
+        if settings.parallel_drafting:
+            # The first token of these the draft config names, as vLLM's proposer reads it.
+            draft = settings.draft_model_config.hf_config
+            dflash = getattr(draft, "dflash_config", None)
+            if dflash is not None and "mask_token_id" in dflash:
+                mask = dflash["mask_token_id"]
+            else:
+                mask = getattr(draft, "mask_token_id", None)
+                if mask is None:
+                    for name in ("dspark_noise_token_id", "pard_token", "ptd_token_id"):
+                        if hasattr(draft, name):
+                            mask = getattr(draft, name)
+                            break
+            vocabulary = settings.draft_model_config.get_vocab_size()
+            # The engine reads no token ID, so one past the vocabulary would read other memory.
+            from furiosa_opt_engine.speculative import validate_mask_token
+
+            candidate: object = mask
+            try:
+                mask = validate_mask_token(candidate, vocabulary)
+            except ValueError:
+                mask = None
+            if mask is None:
+                raise Refused(
+                    "speculative_config.parallel_drafting",
+                    (
+                        "requires a draft config whose mask token (dflash_config.mask_token_id, "
+                        "mask_token_id, dspark_noise_token_id, pard_token or ptd_token_id) lies "
+                        f"in the draft vocabulary of {vocabulary} tokens, not {candidate!r}"
+                    ),
+                )
         # The engine loads once vLLM checks a configuration, not when vLLM imports the platform.
         import furiosa_opt_engine as engine
 
@@ -533,6 +584,8 @@ class Draft:
             load.download_dir,
             cache_dtype,
             config.model_config.max_model_len,
+            config.cache_config.gpu_memory_utilization,
+            mask,
         )
 
 
@@ -619,20 +672,25 @@ def speculative(config: VllmConfig, section: Section) -> Speculative | None:
     without speculation; refuses a setting the plugin would not honor, naming its option."""
     settings = config.speculative_config
     if settings is None:
+        if section.draft_placement is not None:
+            raise Refused(
+                "additional_config.furiosa.draft_placement",
+                "requires speculative_config.method=draft_model",
+            )
         return None
     method = Method.parse(settings.method)
+    if section.draft_placement is not None and method != Method.MODEL:
+        raise Refused(
+            "additional_config.furiosa.draft_placement",
+            "requires speculative_config.method=draft_model",
+        )
     if settings.rejection_sample_method != "standard":
         raise Refused(
             "speculative_config.rejection_sample_method",
             "requires speculative_config.rejection_sample_method=standard",
         )
-    model = config.model_config
-    if model and (
-        model.is_hybrid or model.hf_text_config.model_type in ("mamba", "mamba2", "bamba")
-    ):
-        raise Refused(
-            "speculative_config", "cannot roll back recurrent state for speculative decoding"
-        )
+    if config.model_config and recurrent(config.model_config):
+        raise Refused("speculative_config", ROLLBACK)
     match method:
         case Method.NGRAM:
             return method
