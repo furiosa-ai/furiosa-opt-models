@@ -44,6 +44,9 @@ class PositionedMediaAdapter:
         """Adapt position-based processor output to SGLang's grid-based EPD API."""
         from sglang.srt.managers.schedule_batch import Modality as SGLangModality
 
+        # SGLang's generic process_mm_items requires conventional grids and derives token counts
+        # from generic model formulas. This processor needs per-item positions and counts of valid
+        # engine rows; EPD still validates item/grid cardinality and final output row counts.
         match modality:
             case SGLangModality.IMAGE:
                 inputs = await preprocessor._process_image_items(items, None)
