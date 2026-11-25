@@ -276,21 +276,25 @@ def test_session_suspends_weights_and_cache_independently(model: Model) -> None:
         8,
         4,
     )
-    cache = session._cache
-    session._held["sequence"] = 2
+    first = DraftRequest("sequence", (1, 2, 3), 0, ((3, 4),), 1)
+    _ = session.propose((first,))
+    model.calls.clear()
+    next_step = DraftRequest("sequence", (1, 2, 3, 0), 3, ((3, 4),), 1)
 
     session.release_weights()
-    assert session._model is None
-    assert session._held == {"sequence": 2}
+    with pytest.raises(RuntimeError, match="must be awake"):
+        _ = session.propose((next_step,))
     session.restore_weights(cast(engine.Decoder, cast(object, model)))
-    assert session._model is model
-    assert session._cache is cache
+    _ = session.propose((next_step,))
+    assert model.calls[0][0].cached == 3
 
     session.release_cache()
-    assert session._cache is None
-    assert session._held == {}
+    with pytest.raises(RuntimeError, match="must be awake"):
+        _ = session.propose((next_step,))
     session.restore_cache()
-    assert session._cache is not None and session._cache.blocks == 8
+    model.calls.clear()
+    _ = session.propose((next_step,))
+    assert model.calls[0][0].cached == 0
 
 
 def test_zero_drafts_skip_the_decoder(model: Model) -> None:

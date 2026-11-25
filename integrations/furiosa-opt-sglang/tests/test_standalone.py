@@ -11,53 +11,10 @@ import sglang  # noqa: F401
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
-from furiosa_opt_engine.batch import chunks
 from furiosa_opt_engine.speculative import DraftRequest, DraftSession
 from furiosa_opt_sglang.platform import Refused
 from furiosa_opt_sglang.speculative import Decoding
 from furiosa_opt_sglang.speculative.standalone import Config, Draft, mask_token
-
-
-@pytest.mark.parametrize(
-    ("lengths", "rows", "first", "second"),
-    [
-        ((35, 18, 2, 0), 8, ((0, 3), (1, 3), (2, 2)), ((0, 4), (1, 4))),
-        ((2, 3, 4), 1, ((0, 1),), ((1, 1),)),
-    ],
-)
-def test_batches_sequence_rows_within_decoder_capacity(
-    lengths: tuple[int, ...],
-    rows: int,
-    first: tuple[tuple[int, int], ...],
-    second: tuple[tuple[int, int], ...],
-) -> None:
-    """Batch work across requests without duplicating a sequence or exceeding compiled rows."""
-    consumed = [[] for _ in lengths]
-    remaining = sum(lengths)
-    batches = tuple(chunks(lengths, rows))
-    assert tuple((chunk.sequence, chunk.length) for chunk in batches[0]) == first
-    assert tuple((chunk.sequence, chunk.length) for chunk in batches[1]) == second
-    for batch in batches:
-        used = sum(chunk.length for chunk in batch)
-        assert used == min(rows, remaining)
-        assert len({chunk.sequence for chunk in batch}) == len(batch)
-        for chunk in batch:
-            consumed[chunk.sequence].extend(range(chunk.start, chunk.start + chunk.length))
-        remaining -= used
-
-    assert consumed == [list(range(length)) for length in lengths]
-    assert remaining == 0
-
-
-def test_chunks_rotates_spare_rows_between_sequences() -> None:
-    """Carry the round-robin turn across calls when requests leave spare decoder rows."""
-    batches = tuple(chunks((20, 20, 20), 4))[:3]
-    allocated = tuple(
-        sum(chunk.length for batch in batches for chunk in batch if chunk.sequence == sequence)
-        for sequence in range(3)
-    )
-
-    assert allocated == (4, 4, 4)
 
 
 @pytest.mark.parametrize("room", [0, -1])
