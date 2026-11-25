@@ -73,6 +73,18 @@ jobs:
           python-version: '3.11'
           activate-environment: true
           enable-cache: false
+      # The driver lowers each test binary's changed kernels with as many workers as the runner has
+      # CPUs, and cargo links many binaries at once, so a change to most kernels starves the runner
+      # of memory and the runner goes offline. Each binary takes its share of the runner's memory
+      # instead: 3 GiB a worker, for up to 20 binaries linking at once.
+      - name: Bound the kernel workers by the runner's memory
+        run: |
+          limit=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)
+          if [ "$limit" = max ]; then limit=$(awk '/^MemTotal/ { print $2 * 1024 }' /proc/meminfo); fi
+          gib=$(( limit >> 30 ))
+          workers=$(( gib / 60 > 1 ? gib / 60 : 1 ))
+          echo "$(nproc) CPUs, $gib GiB: $workers kernel workers a test binary"
+          echo "RAYON_NUM_THREADS=$workers" >> "$GITHUB_ENV"
       - run: |
           mkdir -p products/tests
           cargo furiosa-opt test $PACKAGES --release --no-run --message-format=json-render-diagnostics > tests.jsonl
