@@ -70,3 +70,67 @@ A call takes one `Request` per sequence and the `Cache` they append to; `Cache(s
 ::: furiosa_opt_engine.decoder.Group
 
 ::: furiosa_opt_engine.decoder.Kind
+
+## Batch planning
+
+Framework adapters use these shared helpers to map scheduled rows to decoder calls.
+`Identity` carries each framework's request identifier through `Row`, `Request` and `Call` typing.
+
+::: furiosa_opt_engine.batch.Batch
+
+::: furiosa_opt_engine.batch.Framing
+
+::: furiosa_opt_engine.batch.Call
+
+::: furiosa_opt_engine.batch.Row
+
+::: furiosa_opt_engine.batch.Request
+
+::: furiosa_opt_engine.batch.Chunk
+
+::: furiosa_opt_engine.batch.chunks
+
+::: furiosa_opt_engine.batch.admit
+
+::: furiosa_opt_engine.batch.operand
+
+## Speculative drafting
+
+`SequenceId` carries a hashable framework request ID through `DraftRequest` and `DraftSession`.
+Use `draft_device` to choose a target or disjoint physical placement; it returns the matching
+`PlacedDevice` pair. `open_placed_device` opens a target placement and keeps the device paired with
+the placement used to open it.
+
+::: furiosa_opt_engine.speculative.TokenSource
+
+::: furiosa_opt_engine.placement.PlacedDevice
+
+::: furiosa_opt_engine.placement.open_placed_device
+
+::: furiosa_opt_engine.placement.draft_device
+
+::: furiosa_opt_engine.placement.has_distinct_chips
+
+::: furiosa_opt_engine.placement.is_nonempty_pe_range
+
+::: furiosa_opt_engine.placement.MAX_CHIP_ID
+
+::: furiosa_opt_engine.placement.PE_COUNT
+
+::: furiosa_opt_engine.speculative.same_tokenizer_vocabulary
+
+::: furiosa_opt_engine.speculative.validate_draft_vocabulary
+
+::: furiosa_opt_engine.speculative.validate_draft_decoder
+
+::: furiosa_opt_engine.speculative.validate_mask_token
+
+::: furiosa_opt_engine.speculative.cache_memory_budget
+
+::: furiosa_opt_engine.speculative.cache_blocks_for_memory
+
+::: furiosa_opt_engine.speculative.draft_blocks_for_shared_budget
+
+::: furiosa_opt_engine.speculative.DraftRequest
+
+::: furiosa_opt_engine.speculative.DraftSession
