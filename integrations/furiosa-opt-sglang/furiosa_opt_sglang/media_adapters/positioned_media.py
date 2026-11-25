@@ -119,6 +119,7 @@ def _visual_result(
 
     features = _processor_tensor(inputs, feature_key)
     positions = _processor_tensor(inputs, position_key)
+    # EPD checks grid/token counts, but cannot verify processor rows align with position IDs.
     if (
         features.ndim != 3
         or positions.ndim != 3
@@ -159,6 +160,7 @@ def _video_result(inputs: Mapping[str, object], modality: Modality) -> EncoderRe
 
     features = _processor_tensor(inputs, "pixel_values_videos")
     positions = _processor_tensor(inputs, "video_position_ids")
+    # EPD checks grid/token counts, but cannot verify processor frames align with position IDs.
     if (
         features.ndim != 4
         or positions.ndim != 4
@@ -208,6 +210,7 @@ def _audio_result(inputs: Mapping[str, object], modality: Modality) -> EncoderRe
     lengths = _integer_counts(
         _processor_tensor(inputs, "audio_feature_lens_raw"), "audio_feature_lens_raw"
     )
+    # EPD checks row/token counts, but cannot compare raw lengths with processor frame masks.
     if features.ndim != 3 or masks.ndim != 2 or features.shape[:2] != masks.shape:
         raise ValueError(
             "audio processor must return matching [clips, frames, width] "
@@ -223,6 +226,7 @@ def _audio_result(inputs: Mapping[str, object], modality: Modality) -> EncoderRe
     for rows, mask, length in zip(features, masks, lengths):  # noqa: B905
         valid = mask.to(torch.bool)
         count = int(valid.sum())
+        # Keep model-reported raw lengths authoritative; SGLang does not check them against masks.
         if count != int(length):
             raise ValueError(f"audio mask has {count} valid frames, but metadata reports {length}")
         grid = torch.tensor([count], dtype=torch.long)

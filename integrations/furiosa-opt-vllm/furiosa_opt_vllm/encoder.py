@@ -1,4 +1,4 @@
-"""A vision-language model's media encoder alone, as vLLM's encoder-only instance runs it: each step
+"""A model's media encoder alone, as vLLM's encoder-only instance runs it: each step
 embeds its requests' scheduled images, videos and audio on the device and hands the rows to the
 encoder cache connector, which another instance's language model reads.
 
@@ -55,13 +55,13 @@ def step(
     ):
         vision_features: list[MultiModalFeatureSpec] = []
         audio_features: list[MultiModalFeatureSpec] = []
-        seen: set[str] = set()
         for req_id, indices in scheduler.scheduled_encoder_inputs.items():
             for index in indices:
                 feature = requests[req_id].mm_features[index]
-                if feature.identifier in model.transfers or feature.identifier in seen:
+                # vLLM 0.31's _try_schedule_encoder_inputs omits cached and duplicate hashes;
+                # _batch_mm_inputs_from_scheduler skips data-less specs, which this path mirrors.
+                if feature.data is None:
                     continue
-                seen.add(feature.identifier)
                 match feature.modality:
                     case "image" | "video":
                         vision_features.append(feature)
@@ -88,18 +88,16 @@ def _embed(model: Encoder, features: Sequence[MultiModalFeatureSpec]) -> list[en
     modality = features[0].modality
     match modality:
         case "image" | "video":
-            if model.encoder.vision_input_width is None:
-                raise NotImplementedError("the loaded encoder has no vision capability")
             if not isinstance(model.adapter, VisionAdapter):
                 raise NotImplementedError("the vLLM adapter cannot prepare vision inputs")
+            # The engine call reports if this loaded model has no vision capability.
             # vLLM passes sampled video frames here; soundtrack has its own audio feature.
             items = [model.adapter.prepare_vision(feature, model.device) for feature in features]
             rows = model.encoder.vision(items)
         case "audio":
-            if model.encoder.audio_input_width is None:
-                raise NotImplementedError("the loaded encoder has no audio capability")
             if not isinstance(model.adapter, AudioAdapter):
                 raise NotImplementedError("the vLLM adapter cannot prepare audio inputs")
+            # The engine call reports if this loaded model has no audio capability.
             items = [model.adapter.prepare_audio(feature, model.device) for feature in features]
             rows = model.encoder.audio(items)
         case modality:

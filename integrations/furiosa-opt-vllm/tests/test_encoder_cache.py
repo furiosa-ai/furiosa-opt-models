@@ -76,10 +76,13 @@ def test_step_reuses_and_evicts_encoder_cache(monkeypatch: pytest.MonkeyPatch) -
             self.prepared.append(identifier)
             return identifier
 
-    def feature(identifier: str, modality: str = "image") -> SimpleNamespace:
+    def feature(
+        identifier: str, modality: str = "image", *, has_data: bool = True
+    ) -> SimpleNamespace:
         return SimpleNamespace(
             identifier=identifier,
             modality=modality,
+            data=object() if has_data else None,
             mm_position=SimpleNamespace(get_num_embeds=lambda: 1),
         )
 
@@ -93,7 +96,7 @@ def test_step_reuses_and_evicts_encoder_cache(monkeypatch: pytest.MonkeyPatch) -
     )
     scheduler = SimpleNamespace(
         free_encoder_mm_hashes=["evicted"],
-        scheduled_encoder_inputs={"request": [0, 1, 2, 3, 4, 5, 6]},
+        scheduled_encoder_inputs={"request": [2, 4, 5, 6, 7]},
     )
     requests = {
         "request": SimpleNamespace(
@@ -105,6 +108,7 @@ def test_step_reuses_and_evicts_encoder_cache(monkeypatch: pytest.MonkeyPatch) -
                 feature("other"),
                 feature("audio-one", "audio"),
                 feature("audio-two", "audio"),
+                feature("data-less", has_data=False),
             ]
         )
     }
@@ -136,13 +140,12 @@ def test_step_reuses_and_evicts_encoder_cache(monkeypatch: pytest.MonkeyPatch) -
 
     assert output == "empty"
     assert "evicted" not in connector_caches[0]
-    assert adapter.prepared == ["evicted", "fresh", "other", "audio-one", "audio-two"]
-    assert encoder.vision_inputs == [["evicted", "fresh", "other"]]
+    assert adapter.prepared == ["fresh", "other", "audio-one", "audio-two"]
+    assert encoder.vision_inputs == [["fresh", "other"]]
     assert encoder.audio_inputs == [["audio-one", "audio-two"]]
-    assert saved == ["evicted", "fresh", "other", "audio-one", "audio-two"]
+    assert saved == ["fresh", "other", "audio-one", "audio-two"]
     assert set(model.transfers) == {
         "kept",
-        "evicted",
         "fresh",
         "other",
         "audio-one",
@@ -216,6 +219,7 @@ def test_step_does_not_cache_rows_until_host_transfer_succeeds(
                 SimpleNamespace(
                     identifier="fresh",
                     modality="image",
+                    data=object(),
                     mm_position=SimpleNamespace(get_num_embeds=lambda: 1),
                 )
             ]

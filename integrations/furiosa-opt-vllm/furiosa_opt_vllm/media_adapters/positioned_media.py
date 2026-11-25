@@ -10,7 +10,7 @@ import torch
 import furiosa_opt_engine as engine
 
 if TYPE_CHECKING:
-    from vllm.multimodal.inputs import MultiModalFeatureSpec
+    from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItem
 
 
 class PositionedMediaAdapter:
@@ -64,6 +64,4 @@ def _image(
 
 
 def _data(feature: MultiModalFeatureSpec) -> Mapping[str, object]:
-    if feature.data is None:
-        raise ValueError(f"item {feature.identifier} has no inputs to embed")
-    return feature.data.get_data()
+    return cast("MultiModalKwargsItem", feature.data).get_data()

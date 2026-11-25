@@ -79,6 +79,15 @@ fn main() -> pyo3_stub_gen::Result<()> {
             );
         }
         if name == "engine.encoder" {
+            // These DLPack helpers are appended below, so their annotation imports may not be
+            // present in the generated module's inferred imports.
+            if !text.lines().any(|line| line == "import builtins") {
+                text = patch(
+                    text,
+                    "import collections.abc\n",
+                    "import builtins\nimport collections.abc\n",
+                );
+            }
             text = patch(
                 text,
                 "__all__ = [\n    \"Audio\",\n    \"Image\",\n]",

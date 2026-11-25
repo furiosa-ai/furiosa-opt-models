@@ -97,6 +97,16 @@ def test_refuses_encoder_only_for_models_without_a_registered_adapter() -> None:
     assert error.value.option == "model_path"
 
 
+def test_refuses_tensor_parallel_encoder_only() -> None:
+    """The encoder-only adapter loads one chip and refuses a requested multi-chip TP layout."""
+    arguments = prepare_server_args(
+        ["--model-path", "Qwen/Qwen3-1.7B", "--encoder-only", "--tp-size", "2"]
+    )
+    with pytest.raises(Refused) as error:
+        arguments.resolve_once()
+    assert error.value.option == "tp_size"
+
+
 def test_reads_only_options_sglang_declares() -> None:
     """Every option the platform reads is an SGLang server option, so none reads as missing."""
     declared = set(ServerArgs.__annotations__)

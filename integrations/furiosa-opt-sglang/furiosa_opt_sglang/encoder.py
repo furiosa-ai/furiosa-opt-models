@@ -56,6 +56,7 @@ class EncoderModel:
         items: list[MultimodalDataItem],
         modality: Literal["image", "video"],
     ) -> torch.Tensor:
+        # The adapter needs input width to normalize rows before constructing typed engine inputs.
         input_width = self.encoder.vision_input_width
         if input_width is None:
             raise NotImplementedError("the loaded encoder has no vision capability")
@@ -70,6 +71,7 @@ class EncoderModel:
         return _host_rows(rows, self.encoder.output_width)
 
     def _audio_feature(self, items: list[MultimodalDataItem]) -> torch.Tensor:
+        # The adapter needs input width to normalize rows before constructing typed engine inputs.
         input_width = self.encoder.audio_input_width
         if input_width is None:
             raise NotImplementedError("the loaded encoder has no audio capability")

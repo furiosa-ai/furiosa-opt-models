@@ -170,12 +170,12 @@ class Encoder:
     @property
     def vision_input_width(self) -> builtins.int | None:
         r"""
-        The number of BF16 values in each image or video patch row, or `None` if unsupported.
+        The number of BF16 values in each image or video patch row, if this model embeds vision.
         """
     @property
     def audio_input_width(self) -> builtins.int | None:
         r"""
-        The number of BF16 values in each audio frame, or `None` if unsupported.
+        The number of BF16 values in each audio frame, if this model embeds audio.
         """
     @property
     def output_width(self) -> builtins.int:
@@ -202,6 +202,52 @@ class Encoder:
             ValueError: A frame is not of the model's samples, or a tensor lies on another device.
             NotImplementedError: This model does not embed audio.
             RuntimeError: The device refuses the call.
+        """
+
+@typing.final
+class EncoderLoadOptions:
+    r"""
+    Options to load a model's media encoder alone.
+    """
+    def chips(self, chips: builtins.int) -> EncoderLoadOptions:
+        r"""
+        Load onto `chips` chips instead of the one count the model allows.
+
+        Raises:
+            ValueError: `chips` is zero.
+        """
+    def architecture(self, name: builtins.str) -> EncoderLoadOptions:
+        r"""
+        Select the architecture `name` instead of the one the checkpoint's config names.
+
+        Raises:
+            ValueError: The model list holds no architecture `name`.
+            NotImplementedError: The list refuses `name`.
+        """
+    def quantization(self, name: builtins.str) -> EncoderLoadOptions:
+        r"""
+        Quantize a BF16 checkpoint's projections at load as `name` says.
+
+        Raises:
+            ValueError: `name` names no quantization.
+        """
+    def parse(self, checkpoint: Checkpoint) -> None:
+        r"""
+        Check the choices against `checkpoint`'s config and names, reading no weight and opening no
+        device.
+
+        Raises:
+            ValueError: The config names no listed architecture or no listed encoder serves it.
+            NotImplementedError: The list refuses the architecture or a choice.
+        """
+    def load(self, checkpoint: Checkpoint, device: Device) -> Encoder:
+        r"""
+        Load the media encoder `checkpoint` selects strictly into HBM of `device`.
+
+        Raises:
+            ValueError: As `parse` does, or a tensor is missing, unexpected or malformed.
+            NotImplementedError: As `parse` does.
+            RuntimeError: The device fails.
         """
 
 @typing.final
@@ -493,52 +539,6 @@ class LoadOptions:
         Raises:
             ValueError: As `parse` does, or a tensor is missing, unexpected or malformed.
             NotImplementedError: As `parse` does, or no class holds the model yet.
-            RuntimeError: The device fails.
-        """
-
-@typing.final
-class EncoderLoadOptions:
-    r"""
-    Options to load a model's media encoder alone.
-    """
-    def chips(self, chips: builtins.int) -> EncoderLoadOptions:
-        r"""
-        Load onto `chips` chips instead of the one count the model allows.
-
-        Raises:
-            ValueError: `chips` is zero.
-        """
-    def architecture(self, name: builtins.str) -> EncoderLoadOptions:
-        r"""
-        Select the architecture `name` instead of the one the checkpoint's config names.
-
-        Raises:
-            ValueError: The model list holds no architecture `name`.
-            NotImplementedError: The list refuses `name`.
-        """
-    def quantization(self, name: builtins.str) -> EncoderLoadOptions:
-        r"""
-        Quantize a BF16 checkpoint's projections at load as `name` says.
-
-        Raises:
-            ValueError: `name` names no quantization.
-        """
-    def parse(self, checkpoint: Checkpoint) -> None:
-        r"""
-        Check the choices against `checkpoint`'s config and names, reading no weight and opening no
-        device.
-
-        Raises:
-            ValueError: The config names no listed architecture or no listed encoder serves it.
-            NotImplementedError: The list refuses the architecture or a choice.
-        """
-    def load(self, checkpoint: Checkpoint, device: Device) -> Encoder:
-        r"""
-        Load the media encoder `checkpoint` selects strictly into HBM of `device`.
-
-        Raises:
-            ValueError: As `parse` does, or a tensor is missing, unexpected or malformed.
-            NotImplementedError: As `parse` does.
             RuntimeError: The device fails.
         """
 

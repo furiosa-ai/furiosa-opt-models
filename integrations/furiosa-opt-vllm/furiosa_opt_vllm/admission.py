@@ -577,6 +577,11 @@ def encoder_options(config: VllmConfig) -> engine.EncoderLoadOptions:
     """The engine's media-encoder options for vLLM's encoder-only cache producer."""
     import furiosa_opt_engine as engine
 
+    if config.parallel_config.tensor_parallel_size != 1:
+        raise Refused(
+            "tensor_parallel_size",
+            "loads the encoder-only model on one chip, which requires tensor_parallel_size=1",
+        )
     loads = engine.LoadOptions().encoder()
     quantized = quantization(config.model_config)
     return loads if quantized is None else loads.quantization(quantized)

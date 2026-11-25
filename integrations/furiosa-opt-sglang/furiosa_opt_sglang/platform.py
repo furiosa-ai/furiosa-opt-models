@@ -319,6 +319,10 @@ class Platform(SRTPlatform):
         # the engine reads the operator's degree, which SGLang's ranks would each load whole.
         # Each data-parallel replica's first chip then lies that many chips past the last one's.
         tensor = cast("int", raw.get("tp_size") or 1)
+        if resolved.encoder_only and tensor != 1:
+            raise Refused(
+                "tp_size", "loads the encoder-only model on one chip, which requires tp_size=1"
+            )
         server_args.gpu_id_step = tensor
         server_args.tp_size = 1
         # The engine allocates each chip's cache whole, so a model split over chips needs the
@@ -343,8 +347,6 @@ class Platform(SRTPlatform):
 
                 architectures = getattr(hf_config, "architectures", ()) or ()
                 _ = require_adapter(architectures)
-                if tensor != 1:
-                    raise ValueError("media encoder producers require --tp-size 1")
                 engine.LoadOptions().encoder().parse(checkpoint)
             else:
                 options(
