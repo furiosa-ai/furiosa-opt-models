@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, ClassVar
 import torch
 from vllm.v1.outputs import make_empty_encoder_model_runner_output
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
+from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
 import furiosa_opt_engine as engine
 from furiosa_opt_vllm.media_adapter import Adapter, AudioAdapter, VisionAdapter
@@ -73,10 +74,12 @@ def step(
         for features in (vision_features, audio_features):
             if not features:
                 continue
-            # Encoder returns one output per input item; see engine.encoder.Encoder.
-            for feature, rows in zip(features, _embed(model, features)):  # noqa: B905
-                host_rows = _host_rows(rows)
-                model.transfers[feature.identifier] = host_rows
+            host_rows = [_host_rows(rows) for rows in _embed(model, features)]
+            # vLLM's helper requires torch tensors, so run it after the required host transfer.
+            sanity_check_mm_encoder_outputs(host_rows, expected_num_items=len(features))
+            # The upstream check above establishes one 2D output per feature.
+            for feature, rows in zip(features, host_rows):  # noqa: B905
+                model.transfers[feature.identifier] = rows
                 ECConnectorModelRunnerMixin.maybe_save_ec_to_connector(
                     model.transfers, feature.identifier
                 )
@@ -102,8 +105,7 @@ def _embed(model: Encoder, features: Sequence[MultiModalFeatureSpec]) -> list[en
             rows = model.encoder.audio(items)
         case modality:
             raise NotImplementedError(f"the media encoder embeds no {modality}")
-    # This direct path bypasses vLLM's sanity_check_mm_encoder_outputs. The engine guarantees one
-    # tensor per item; check vLLM's PlaceholderRange row count here.
+    # vLLM's helper checks item count and rank; it does not compare rows with each PlaceholderRange.
     for feature, item_rows in zip(features, rows):  # noqa: B905
         if (count := item_rows.shape[0]) != (positions := feature.mm_position.get_num_embeds()):
             raise ValueError(f"{feature.modality} has {count} rows for {positions} placeholders")

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import operator
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, cast
@@ -210,28 +209,20 @@ def _audio_result(inputs: Mapping[str, object], modality: Modality) -> EncoderRe
 
     features = _processor_tensor(inputs, "input_features")
     masks = _processor_tensor(inputs, "feature_attention_mask")
-    lengths = _integer_counts(
-        _processor_tensor(inputs, "audio_feature_lens_raw"), "audio_feature_lens_raw"
-    )
-    # EPD checks row/token counts, but cannot compare raw lengths with processor frame masks.
+    # SGLang 0.5.22 derives audio_feature_lens_raw from feature_attention_mask.sum(-1); use that
+    # same mask as the row-count source instead of rechecking the copied length metadata.
     if features.ndim != 3 or masks.ndim != 2 or features.shape[:2] != masks.shape:
         raise ValueError(
             "audio processor must return matching [clips, frames, width] "
             f"and [clips, frames] tensors; got {tuple(features.shape)} and {tuple(masks.shape)}"
         )
-    if len(lengths) != len(features):
-        raise ValueError(f"audio has {len(features)} clips and {len(lengths)} frame lengths")
 
     items = []
     grids = []
     token_counts = []
-    # Shape and length checks above establish equal counts for all three arrays.
-    for rows, mask, length in zip(features, masks, lengths):  # noqa: B905
+    for rows, mask in zip(features, masks):  # noqa: B905
         valid = mask.to(torch.bool)
         count = int(valid.sum())
-        # Keep model-reported raw lengths authoritative; SGLang does not check them against masks.
-        if count != int(length):
-            raise ValueError(f"audio mask has {count} valid frames, but metadata reports {length}")
         grid = torch.tensor([count], dtype=torch.long)
         grids.append(grid)
         items.append(
@@ -275,16 +266,6 @@ def _preprocess_result(
 
 def _processor_tensor(inputs: Mapping[str, object], key: str) -> torch.Tensor:
     return torch.as_tensor(cast(torch.Tensor, inputs[key])).detach().cpu()
-
-
-def _integer_counts(values: torch.Tensor, field: str) -> list[int]:
-    values = values.reshape(-1).tolist()
-    if any(isinstance(value, bool) for value in values):
-        raise ValueError(f"{field} must contain integer counts")
-    try:
-        return [operator.index(value) for value in values]
-    except TypeError as error:
-        raise ValueError(f"{field} must contain integer counts") from error
 
 
 async def _process_video_items(
