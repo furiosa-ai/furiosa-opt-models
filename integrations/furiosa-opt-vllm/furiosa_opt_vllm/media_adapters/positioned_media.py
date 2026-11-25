@@ -23,6 +23,9 @@ class PositionedMediaAdapter:
         feature: MultiModalFeatureSpec,
         device: engine.Device,
     ) -> engine.encoder.Image:
+        # vLLM passes the selected processor's tensors through in MultiModalFeatureSpec. Its
+        # contract aligns patch rows with position rows, including video frame axes, so this
+        # adapter relies on that contract instead of repeating shape checks.
         data = _data(feature)
         match feature.modality:
             case "image":
@@ -45,6 +48,8 @@ class PositionedMediaAdapter:
         feature: MultiModalFeatureSpec,
         device: engine.Device,
     ) -> engine.encoder.Audio:
+        # The processor pairs padded audio frames with their mask; vLLM preserves both fields, so
+        # this adapter relies on that contract instead of repeating shape checks.
         data = _data(feature)
         frames = cast(torch.Tensor, data["input_features_padded"])
         mask = cast(torch.Tensor, data["input_features_mask"])

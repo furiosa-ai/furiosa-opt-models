@@ -102,8 +102,8 @@ def _embed(model: Encoder, features: Sequence[MultiModalFeatureSpec]) -> list[en
             rows = model.encoder.audio(items)
         case modality:
             raise NotImplementedError(f"the media encoder embeds no {modality}")
-    # The engine guarantees one output tensor per item. vLLM's PlaceholderRange row count remains
-    # framework-specific and is not implied by that engine contract.
+    # This direct path bypasses vLLM's sanity_check_mm_encoder_outputs. The engine guarantees one
+    # tensor per item; check vLLM's PlaceholderRange row count here.
     for feature, item_rows in zip(features, rows):  # noqa: B905
         if (count := item_rows.shape[0]) != (positions := feature.mm_position.get_num_embeds()):
             raise ValueError(f"{feature.modality} has {count} rows for {positions} placeholders")
