@@ -11,13 +11,14 @@ import numpy
 import numpy.typing
 import typing_extensions
 
-from . import decoder, llama, mistral, qwen3, vision_language
+from . import decoder, encoder, llama, mistral, qwen3
 
 __all__ = [
     "Checkpoint",
     "Decoder",
     "Device",
     "Encoder",
+    "EncoderLoadOptions",
     "HbmBuffer",
     "HbmTensor",
     "HostBuffer",
@@ -26,10 +27,10 @@ __all__ = [
     "Placement",
     "Transfer",
     "decoder",
+    "encoder",
     "llama",
     "mistral",
     "qwen3",
-    "vision_language",
 ]
 
 @typing.final
@@ -163,12 +164,25 @@ class Device:
 @typing.final
 class Encoder:
     r"""
-    A media encoder loaded on a device, whatever its model: its calls turn images, video frames and
-    audio into rows of its language model's width.
+    An encoder loaded on a device, whatever its model: each supported modality maps to rows of the
+    model's output width.
     """
-    def vision(
-        self, images: collections.abc.Sequence[vision_language.Image]
-    ) -> builtins.list[HbmTensor]:
+    @property
+    def vision_input_width(self) -> builtins.int | None:
+        r"""
+        The number of BF16 values in each image or video patch row, or `None` if unsupported.
+        """
+    @property
+    def audio_input_width(self) -> builtins.int | None:
+        r"""
+        The number of BF16 values in each audio frame, or `None` if unsupported.
+        """
+    @property
+    def output_width(self) -> builtins.int:
+        r"""
+        The number of BF16 values in each output row.
+        """
+    def vision(self, images: collections.abc.Sequence[encoder.Image]) -> builtins.list[HbmTensor]:
         r"""
         The rows of each of `images`, `[patches, width]` BF16 in order, returned once the device
         accepted the call; reading them waits for it.
@@ -176,19 +190,17 @@ class Encoder:
         Raises:
             ValueError: A patch is not of the model's features, a position is outside those the
                 model places, or a tensor lies on another device.
-            NotImplementedError: An image holds more patches than a call takes.
+            NotImplementedError: This model does not embed vision.
             RuntimeError: The device refuses the call.
         """
-    def audio(
-        self, clips: collections.abc.Sequence[vision_language.Audio]
-    ) -> builtins.list[HbmTensor]:
+    def audio(self, clips: collections.abc.Sequence[encoder.Audio]) -> builtins.list[HbmTensor]:
         r"""
         The rows of each of `clips`, `[frames, width]` BF16 in order, returned once the device
         accepted the call; reading them waits for it.
 
         Raises:
             ValueError: A frame is not of the model's samples, or a tensor lies on another device.
-            NotImplementedError: A clip holds more frames than a call takes.
+            NotImplementedError: This model does not embed audio.
             RuntimeError: The device refuses the call.
         """
 
@@ -452,7 +464,7 @@ class LoadOptions:
         Raises:
             ValueError: `name` names no quantization.
         """
-    def encoder(self) -> LoadOptions:
+    def encoder(self) -> EncoderLoadOptions:
         r"""
         Load the model's media encoder alone, whose rows its language model reads: the producer
         of an encoder cache, for one.
@@ -472,16 +484,61 @@ class LoadOptions:
                 checkpoint, or a quantized checkpoint is given a quantization.
             NotImplementedError: The list refuses the architecture, or a choice.
         """
-    def load(self, checkpoint: Checkpoint, device: Device) -> Decoder | Encoder:
+    def load(self, checkpoint: Checkpoint, device: Device) -> Decoder:
         r"""
-        Load the model `checkpoint` selects strictly into HBM of `device`: a decoder, as an object of
-        its model type's class such as `qwen3.ForCausalLM`, or an `Encoder` for a load of the media
-        encoder alone. Dropping the object frees its device memory, and a new load of the same
-        model serves the caches the dropped one did.
+        Load the decoder `checkpoint` selects strictly into HBM of `device`, as an object of its
+        model type's class such as `qwen3.ForCausalLM`. Dropping the object frees its device memory,
+        and a new load of the same model serves the caches the dropped one did.
 
         Raises:
             ValueError: As `parse` does, or a tensor is missing, unexpected or malformed.
             NotImplementedError: As `parse` does, or no class holds the model yet.
+            RuntimeError: The device fails.
+        """
+
+@typing.final
+class EncoderLoadOptions:
+    r"""
+    Options to load a model's media encoder alone.
+    """
+    def chips(self, chips: builtins.int) -> EncoderLoadOptions:
+        r"""
+        Load onto `chips` chips instead of the one count the model allows.
+
+        Raises:
+            ValueError: `chips` is zero.
+        """
+    def architecture(self, name: builtins.str) -> EncoderLoadOptions:
+        r"""
+        Select the architecture `name` instead of the one the checkpoint's config names.
+
+        Raises:
+            ValueError: The model list holds no architecture `name`.
+            NotImplementedError: The list refuses `name`.
+        """
+    def quantization(self, name: builtins.str) -> EncoderLoadOptions:
+        r"""
+        Quantize a BF16 checkpoint's projections at load as `name` says.
+
+        Raises:
+            ValueError: `name` names no quantization.
+        """
+    def parse(self, checkpoint: Checkpoint) -> None:
+        r"""
+        Check the choices against `checkpoint`'s config and names, reading no weight and opening no
+        device.
+
+        Raises:
+            ValueError: The config names no listed architecture or no listed encoder serves it.
+            NotImplementedError: The list refuses the architecture or a choice.
+        """
+    def load(self, checkpoint: Checkpoint, device: Device) -> Encoder:
+        r"""
+        Load the media encoder `checkpoint` selects strictly into HBM of `device`.
+
+        Raises:
+            ValueError: As `parse` does, or a tensor is missing, unexpected or malformed.
+            NotImplementedError: As `parse` does.
             RuntimeError: The device fails.
         """
 

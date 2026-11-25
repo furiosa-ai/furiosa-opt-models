@@ -1,21 +1,22 @@
-//! Checkpoints, the options that load a registry model from one onto a device, and the decoder or
-//! media encoder a load returns.
+//! Checkpoints, typed options that load a registry decoder or media encoder onto a device, and the
+//! loaded object.
 //!
-//! A framework opens a `Checkpoint`, states its choices in `LoadOptions` and loads once; a refused
-//! choice raises before any weight is read. A load returns a `Decoder`, which serves every model
-//! alike, as an object of its model type's class in a submodule of its own, such as
-//! `qwen3.ForCausalLM`; a load of the media encoder alone returns an `Encoder`, whatever its model.
-//! A decoder whose projections take LoRA adapters loads them from PEFT checkpoints too.
+//! A framework opens a `Checkpoint`, states decoder choices in `LoadOptions` or encoder choices in
+//! `EncoderLoadOptions`, then loads once; a refused choice raises before any weight is read. A
+//! decoder load returns a `Decoder`, which serves every model alike, as an object of its model
+//! type's class in a submodule of its own, such as `qwen3.ForCausalLM`; an encoder load returns an
+//! `Encoder`, whatever its model. A decoder whose projections take LoRA adapters loads them from
+//! PEFT checkpoints too.
 
 use super::decoder::{self, Adapter, AdapterSpec, Cache, CacheSpec, Output, Request};
+use super::encoder::{Audio, Image};
 use super::tensor::{Device, Element, HbmTensor};
-use super::vision_language::{Audio, Image};
 use super::{Context, Error, Shared};
 use furiosa_opt_engine as engine;
 use furiosa_opt_engine::decoder::Served;
+use furiosa_opt_engine::encoder;
 use furiosa_opt_engine::registry::Model;
-use furiosa_opt_engine::vision_language;
-use furiosa_opt_models::load::{LoadError, Part};
+use furiosa_opt_models::load::LoadError;
 use furiosa_opt_models::models::Class;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -169,8 +170,8 @@ impl LoadOptions {
 
     /// Load the model's media encoder alone, whose rows its language model reads: the producer
     /// of an encoder cache, for one.
-    fn encoder(&self) -> Self {
-        Self(self.0.clone().encoder())
+    fn encoder(&self) -> EncoderLoadOptions {
+        EncoderLoadOptions(self.0.clone().encoder())
     }
 
     /// Load for calls that run LoRA adapters: `parse` and `load` refuse a model whose projections
@@ -191,16 +192,15 @@ impl LoadOptions {
         Ok(())
     }
 
-    /// Load the model `checkpoint` selects strictly into HBM of `device`: a decoder, as an object of
-    /// its model type's class such as `qwen3.ForCausalLM`, or an `Encoder` for a load of the media
-    /// encoder alone. Dropping the object frees its device memory, and a new load of the same
-    /// model serves the caches the dropped one did.
+    /// Load the decoder `checkpoint` selects strictly into HBM of `device`, as an object of its
+    /// model type's class such as `qwen3.ForCausalLM`. Dropping the object frees its device memory,
+    /// and a new load of the same model serves the caches the dropped one did.
     ///
     /// Raises:
     ///     ValueError: As `parse` does, or a tensor is missing, unexpected or malformed.
     ///     NotImplementedError: As `parse` does, or no class holds the model yet.
     ///     RuntimeError: The device fails.
-    #[gen_stub(override_return_type(type_repr = "Decoder | Encoder"))]
+    #[gen_stub(override_return_type(type_repr = "Decoder"))]
     fn load(
         &self,
         py: Python<'_>,
@@ -213,17 +213,14 @@ impl LoadOptions {
             name: config.architecture().into(),
             reason: "no Python class holds the model yet".into(),
         };
-        let class = match config.part() {
-            Part::Encoder => None,
-            Part::Whole => Some(Decoder::class(config.class()).ok_or_else(unbound)?),
-        };
+        let class = Decoder::class(config.class()).ok_or_else(unbound)?;
         let model = py.detach(|| {
             let mut context = device.0.lock().unwrap_or_else(PoisonError::into_inner);
             self.0.load(&mut context.device, &checkpoint.0)
         })?;
         let context = device.0.clone();
-        Ok(match (model, class) {
-            (Model::Decoder(served), Some(class)) => {
+        Ok(match model {
+            Model::Decoder(served) => {
                 let decoder = Decoder {
                     served,
                     config,
@@ -231,13 +228,75 @@ impl LoadOptions {
                 };
                 class(decoder, py)?.into_any()
             }
-            (Model::Encoder(encoder), None) => {
-                Py::new(py, Encoder { encoder, context })?.into_any()
-            }
-            _ => {
-                unreachable!("a load of the encoder alone serves a media encoder, others a decoder")
+            Model::Encoder(_) => {
+                unreachable!("decoder load options select a whole-model decoder")
             }
         })
+    }
+}
+
+/// Options to load a model's media encoder alone.
+#[gen_stub_pyclass]
+#[pyclass(frozen, module = "engine")]
+pub(super) struct EncoderLoadOptions(engine::EncoderLoadOptions);
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl EncoderLoadOptions {
+    /// Load onto `chips` chips instead of the one count the model allows.
+    ///
+    /// Raises:
+    ///     ValueError: `chips` is zero.
+    fn chips(&self, chips: usize) -> Result<Self, Error> {
+        Ok(Self(self.0.clone().chips(chips)?))
+    }
+
+    /// Select the architecture `name` instead of the one the checkpoint's config names.
+    ///
+    /// Raises:
+    ///     ValueError: The model list holds no architecture `name`.
+    ///     NotImplementedError: The list refuses `name`.
+    fn architecture(&self, name: &str) -> Result<Self, Error> {
+        Ok(Self(self.0.clone().architecture(name)?))
+    }
+
+    /// Quantize a BF16 checkpoint's projections at load as `name` says.
+    ///
+    /// Raises:
+    ///     ValueError: `name` names no quantization.
+    fn quantization(&self, name: &str) -> Result<Self, Error> {
+        Ok(Self(self.0.clone().quantization(name.parse()?)))
+    }
+
+    /// Check the choices against `checkpoint`'s config and names, reading no weight and opening no
+    /// device.
+    ///
+    /// Raises:
+    ///     ValueError: The config names no listed architecture or no listed encoder serves it.
+    ///     NotImplementedError: The list refuses the architecture or a choice.
+    fn parse(&self, checkpoint: &Checkpoint) -> Result<(), Error> {
+        self.0.parse(&checkpoint.0)?;
+        Ok(())
+    }
+
+    /// Load the media encoder `checkpoint` selects strictly into HBM of `device`.
+    ///
+    /// Raises:
+    ///     ValueError: As `parse` does, or a tensor is missing, unexpected or malformed.
+    ///     NotImplementedError: As `parse` does.
+    ///     RuntimeError: The device fails.
+    fn load(
+        &self,
+        py: Python<'_>,
+        checkpoint: &Checkpoint,
+        device: &Device,
+    ) -> Result<Py<Encoder>, Error> {
+        let encoder = py.detach(|| {
+            let mut context = device.0.lock().unwrap_or_else(PoisonError::into_inner);
+            self.0.load(&mut context.device, &checkpoint.0)
+        })?;
+        let context = device.0.clone();
+        Ok(Py::new(py, Encoder { encoder, context })?)
     }
 }
 
@@ -354,30 +413,48 @@ impl Decoder {
     }
 }
 
-/// A media encoder loaded on a device, whatever its model: its calls turn images, video frames and
-/// audio into rows of its language model's width.
+/// An encoder loaded on a device, whatever its model: each supported modality maps to rows of the
+/// model's output width.
 #[gen_stub_pyclass]
 #[pyclass(frozen, module = "engine")]
 pub(super) struct Encoder {
-    encoder: Box<dyn vision_language::Encoder>,
+    encoder: Box<dyn encoder::Encoder>,
     context: Shared,
 }
 
 #[gen_stub_pymethods]
 #[pymethods]
 impl Encoder {
+    /// The number of BF16 values in each image or video patch row, if this model embeds vision.
+    #[getter]
+    fn vision_input_width(&self) -> Option<usize> {
+        self.encoder.vision_input_width()
+    }
+
+    /// The number of BF16 values in each audio frame, if this model embeds audio.
+    #[getter]
+    fn audio_input_width(&self) -> Option<usize> {
+        self.encoder.audio_input_width()
+    }
+
+    /// The number of BF16 values in each output row.
+    #[getter]
+    fn output_width(&self) -> usize {
+        self.encoder.output_width()
+    }
+
     /// The rows of each of `images`, `[patches, width]` BF16 in order, returned once the device
     /// accepted the call; reading them waits for it.
     ///
     /// Raises:
     ///     ValueError: A patch is not of the model's features, a position is outside those the
     ///         model places, or a tensor lies on another device.
-    ///     NotImplementedError: An image holds more patches than a call takes.
+    ///     NotImplementedError: This model does not embed vision.
     ///     RuntimeError: The device refuses the call.
     fn vision(
         &self,
         py: Python<'_>,
-        #[gen_stub(override_type(type_repr = "collections.abc.Sequence[vision_language.Image]", imports = ("collections.abc",)))]
+        #[gen_stub(override_type(type_repr = "collections.abc.Sequence[encoder.Image]", imports = ("collections.abc",)))]
         images: Vec<PyRef<'_, Image>>,
     ) -> Result<Vec<HbmTensor>, Error> {
         let images = (images.iter())
@@ -396,12 +473,12 @@ impl Encoder {
     ///
     /// Raises:
     ///     ValueError: A frame is not of the model's samples, or a tensor lies on another device.
-    ///     NotImplementedError: A clip holds more frames than a call takes.
+    ///     NotImplementedError: This model does not embed audio.
     ///     RuntimeError: The device refuses the call.
     fn audio(
         &self,
         py: Python<'_>,
-        #[gen_stub(override_type(type_repr = "collections.abc.Sequence[vision_language.Audio]", imports = ("collections.abc",)))]
+        #[gen_stub(override_type(type_repr = "collections.abc.Sequence[encoder.Audio]", imports = ("collections.abc",)))]
         clips: Vec<PyRef<'_, Audio>>,
     ) -> Result<Vec<HbmTensor>, Error> {
         let clips = (clips.iter())

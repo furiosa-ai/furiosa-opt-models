@@ -30,7 +30,8 @@ use furiosa_opt_std::prelude::Device;
 use safetensors::Dtype;
 use serde_json::Value;
 
-/// The choices of one load; a choice the registry refuses is reported before any weight is read.
+/// The choices of one decoder load; a choice the registry refuses is reported before any weight
+/// is read.
 #[derive(Clone, Debug, Default)]
 pub struct LoadOptions {
     chips: Option<NonZeroUsize>,
@@ -42,6 +43,11 @@ pub struct LoadOptions {
     part: Part,
     adapters: bool,
 }
+
+/// Choices for loading a media encoder alone. Its type makes the loaded part explicit and keeps
+/// decoder-only choices out of the encoder load API.
+#[derive(Clone, Debug)]
+pub struct EncoderLoadOptions(LoadOptions);
 
 /// The quantization a load gives the projections of a checkpoint that stores them in BF16: E4M3
 /// codes, restored to BF16 before each contraction, under FP32 scales of the largest magnitude
@@ -130,12 +136,12 @@ impl LoadOptions {
         }
     }
 
-    /// Load the model's media encoder alone, whose rows its language model reads.
-    pub fn encoder(self) -> Self {
-        Self {
+    /// Select the model's media encoder alone, whose rows its language model reads.
+    pub fn encoder(self) -> EncoderLoadOptions {
+        EncoderLoadOptions(Self {
             part: Part::Encoder,
             ..self
-        }
+        })
     }
 
     /// Load for calls that run LoRA adapters: an implementation whose projections take none is
@@ -154,10 +160,9 @@ impl LoadOptions {
     }
 
     /// The implementation `checkpoint` loads as with these choices, loaded strictly into HBM of
-    /// `device` as the model a framework serves: a decoder, or the media encoder of a load of the
-    /// encoder alone; a refused choice is reported before any weight is read. A decoder serves its
-    /// calls with the config's tiling. Dropping the model frees its device memory, and a new load
-    /// of the same implementation serves the caches the dropped one did.
+    /// `device` as the decoder a framework serves; a refused choice is reported before any weight
+    /// is read. Dropping the model frees its device memory, and a new load of the same
+    /// implementation serves the caches the dropped one did.
     pub fn load(&self, device: &mut Device, checkpoint: &Checkpoint) -> Result<Model, LoadError> {
         self.read(checkpoint, |checkpoint| {
             let Config {
@@ -258,6 +263,43 @@ impl LoadOptions {
             chips: 1,
             tiling: self.tiling,
         })
+    }
+}
+
+impl EncoderLoadOptions {
+    /// Load onto `chips` chips instead of the one count the selected encoder allows; refuses zero.
+    pub fn chips(self, chips: usize) -> Result<Self, LoadError> {
+        Ok(Self(self.0.chips(chips)?))
+    }
+
+    /// Load the architecture `name` instead of the one the checkpoint's config names.
+    pub fn architecture(self, name: &str) -> Result<Self, LoadError> {
+        Ok(Self(self.0.architecture(name)?))
+    }
+
+    /// Quantize a BF16 checkpoint's projections at load as `quantization` says.
+    pub fn quantization(self, quantization: Quantization) -> Self {
+        Self(self.0.quantization(quantization))
+    }
+
+    /// The encoder implementation `checkpoint` loads as with these choices, from config and names
+    /// alone: no weight is read and no device is needed.
+    pub fn parse(&self, checkpoint: &Checkpoint) -> Result<Config, LoadError> {
+        self.0.parse(checkpoint)
+    }
+
+    /// Load the media encoder `checkpoint` selects strictly into HBM of `device`.
+    pub fn load(
+        &self,
+        device: &mut Device,
+        checkpoint: &Checkpoint,
+    ) -> Result<Box<dyn crate::encoder::Encoder>, LoadError> {
+        match self.0.load(device, checkpoint)? {
+            Model::Encoder(encoder) => Ok(encoder),
+            Model::Decoder(_) => {
+                unreachable!("encoder load options select a media encoder implementation")
+            }
+        }
     }
 }
 

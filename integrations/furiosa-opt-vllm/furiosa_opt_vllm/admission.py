@@ -537,8 +537,8 @@ class Draft:
 
 
 def options(config: VllmConfig) -> engine.LoadOptions:
-    """The engine's options of the load of `config`'s checkpoint: its media encoder alone on an
-    encoder-only instance, else the model on vLLM's tensor degree of chips with vLLM's cache dtype
+    """The engine's options of the decoder load of `config`'s checkpoint: the model on vLLM's
+    tensor degree of chips with vLLM's cache dtype
     and batch invariance, as its base model when vLLM pools the hidden rows of a causal model, and
     for calls that run LoRA adapters when vLLM enables LoRA; under the quantization vLLM asks of a
     BF16 checkpoint. Refuses a base model the engine lacks."""
@@ -550,36 +550,43 @@ def options(config: VllmConfig) -> engine.LoadOptions:
     import furiosa_opt_engine as engine
 
     model = config.model_config
-    loads = engine.LoadOptions()
-    if config.is_mm_encoder_only:
-        # An encoder cache producer runs no language model, so no cache, chip split or tiling.
-        loads = loads.encoder()
-    else:
-        loads = loads.chips(config.parallel_config.tensor_parallel_size)
-        if (dtype := CACHE_DTYPES[config.cache_config.cache_dtype]) is not None:
-            loads = loads.kv_cache(dtype)
-        if envs.VLLM_BATCH_INVARIANT:
-            loads = loads.batch_invariant()
-        if model.convert_type == "embed" and not ModelRegistry.is_pooling_model(
-            model.architectures, model
-        ):
-            base = MODEL_MAPPING_NAMES.get(model.hf_text_config.model_type)
-            if base is None:
-                raise Refused(
-                    "convert", f"finds no base model of {model.hf_text_config.model_type} to embed"
-                )
-            try:
-                loads = loads.architecture(base)
-            except (NotImplementedError, ValueError) as error:
-                raise Refused("convert", str(error)) from None
-        if config.lora_config is not None:
-            loads = loads.adapters()
+    loads = engine.LoadOptions().chips(config.parallel_config.tensor_parallel_size)
+    if (dtype := CACHE_DTYPES[config.cache_config.cache_dtype]) is not None:
+        loads = loads.kv_cache(dtype)
+    if envs.VLLM_BATCH_INVARIANT:
+        loads = loads.batch_invariant()
+    if model.convert_type == "embed" and not ModelRegistry.is_pooling_model(
+        model.architectures, model
+    ):
+        base = MODEL_MAPPING_NAMES.get(model.hf_text_config.model_type)
+        if base is None:
+            raise Refused(
+                "convert", f"finds no base model of {model.hf_text_config.model_type} to embed"
+            )
+        try:
+            loads = loads.architecture(base)
+        except (NotImplementedError, ValueError) as error:
+            raise Refused("convert", str(error)) from None
+    if config.lora_config is not None:
+        loads = loads.adapters()
     quantized = quantization(model)
     return loads if quantized is None else loads.quantization(quantized)
 
 
+def encoder_options(config: VllmConfig) -> engine.EncoderLoadOptions:
+    """The engine's media-encoder options for vLLM's encoder-only cache producer."""
+    import furiosa_opt_engine as engine
+
+    loads = engine.LoadOptions().encoder()
+    quantized = quantization(config.model_config)
+    return loads if quantized is None else loads.quantization(quantized)
+
+
 def verify_checkpoint(
-    model: ModelConfig, load: LoadConfig, option: str, options: engine.LoadOptions
+    model: ModelConfig,
+    load: LoadConfig,
+    option: str,
+    options: engine.LoadOptions | engine.EncoderLoadOptions,
 ) -> None:
     """Refuse under `option` the checkpoint of `model`, where `load` finds it, if the engine cannot
     load it with `options`: an architecture the engine does not serve, a configuration that no

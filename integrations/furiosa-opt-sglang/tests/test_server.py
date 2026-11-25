@@ -1,7 +1,6 @@
-"""SGLang's HTTP server returns the checkpoint's answer with its scheduling and caching intact.
+"""SGLang's servers run its Gemma 4 media producer and return decoder answers with caching intact.
 
-Tests run on the checkpoints of `.github/benchmarks.json`, so a new row is tested without editing
-a test.
+Decoder tests run on `.github/benchmarks.json` checkpoints, so a new decoder row needs no test edit.
 """
 
 import json
@@ -35,6 +34,20 @@ EMBEDDING = [row for row in INVENTORY["models"] if row["task"] == "embedding"]
 RERANKING = [row for row in INVENTORY["models"] if row["task"] == "reranking"]
 CLASSIFICATION = [row for row in INVENTORY["models"] if row["task"] == "classification"]
 DEFAULT = next(row for row in TEXT if row["id"] == "Qwen/Qwen3-1.7B")
+SERVER_START_TIMEOUT_SECONDS = 180
+# Encoder-only startup also loads its media checkpoint, so allow a longer warm start.
+ENCODER_START_TIMEOUT_SECONDS = 600
+ENCODERS = [
+    pytest.param(
+        {
+            "id": "unsloth/gemma-4-12b-it-NVFP4",
+            "revision": "b1f649734b34aa5575b03d186abd1b9be3d0d5c4",
+            "task": "encoder",
+            "flags": ["--encoder-only"],
+        },
+        id="gemma4",
+    )
+]
 WATERMARK_KEY = "0x5eed"
 WATERMARKED = DEFAULT | {
     "flags": [
@@ -163,7 +176,12 @@ class Chips:
 
         self._live = Live(process, send)
         try:
-            deadline = time.monotonic() + 180
+            timeout = (
+                ENCODER_START_TIMEOUT_SECONDS
+                if row.get("task") == "encoder"
+                else SERVER_START_TIMEOUT_SECONDS
+            )
+            deadline = time.monotonic() + timeout
             while True:
                 if process.poll() is not None or time.monotonic() >= deadline:
                     pytest.fail(f"SGLang did not start; see {log}")
@@ -199,6 +217,7 @@ class Chips:
         self.stop()
         embedding = row["task"] == "embedding"
         pooling = embedding or row["task"] == "classification"
+        encoder = row["task"] == "encoder"
         port = get_free_port()
         with log.open("w") as output:
             process = subprocess.Popen(
@@ -208,13 +227,18 @@ class Chips:
                     "sglang.launch_server",
                     "--model-path",
                     row["id"],
+                    *(["--revision", row["revision"]] if row.get("revision") else []),
                     *(["--is-embedding"] if pooling else []),
                     # SGLang serves `dimensions` only for Matryoshka embeddings, and its
                     # `--language-model-only` refuses most multimodal architectures, so a checkpoint
                     # serves its text model through the config, as language_model_only=True does.
                     "--json-model-override-args",
                     json.dumps(
-                        {"is_matryoshka": True} if embedding else {"language_model_only": True}
+                        {}
+                        if encoder
+                        else {"is_matryoshka": True}
+                        if embedding
+                        else {"language_model_only": True}
                     ),
                     *shared(row.get("serve", [])),
                     *(["--disable-radix-cache"] if row.get("disable_radix_cache") else []),
@@ -261,6 +285,16 @@ def chips() -> Generator[Chips, None, None]:
     held = Chips()
     yield held
     held.stop()
+
+
+@pytest.mark.feature("Disaggregated encoder and encoder caches")
+@pytest.mark.parametrize("row", ENCODERS)
+def test_encoder_only_server_passes_media_health_check(
+    tmp_path_factory: pytest.TempPathFactory, chips: Chips, row: dict[str, object]
+) -> None:
+    """SGLang loads each registered engine media producer through its encoder-only service."""
+    with chips.serve(tmp_path_factory, row):
+        pass
 
 
 @pytest.fixture(scope="module")

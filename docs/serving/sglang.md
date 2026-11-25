@@ -25,6 +25,7 @@ The platform accepts these values:
 | `--mem-fraction-static` | Unset defaults to 0.9, leaving the headroom a model split over chips needs |
 | `--enable-deterministic-inference` | Off, or on to load the model [batch invariant](index.md#keep-outputs-independent-of-the-batch) with the radix cache on |
 | `--enable-hierarchical-cache` | A model without recurrent state, with the host tier sized by `--hicache-ratio` or `--hicache-size` and kept in memory: `--hicache-host-memory-mode cache`, `--hicache-io-backend kernel`, `--hicache-mem-layout page_first`, no `--hicache-storage-backend` and no memory saver |
+| `--encoder-only` | Gemma 4 unified only; serves the media producer for SGLang encoder disaggregation and requires `--tp-size 1` |
 
 These features are not supported yet, and the plugin refuses them at startup rather than ignore them:
 
@@ -37,7 +38,7 @@ These features are not supported yet, and the plugin refuses them at startup rat
 - Per-layer embedding offload (`ple_offload_embedding`).
 - Returning hidden states, routed experts or indexer top-k.
 - Diffusion LM algorithms (`dllm_algorithm`) and `prefill_only_disable_kv_cache`.
-- Encoder disaggregation (`--encoder-only`, `--language-only`).
+- The language-only receiver (`--language-only`); this plugin serves the encoder producer only.
 
 The platform disables CUDA graphs and piecewise CUDA graphs, and sets the scheduling options by model kind:
 
@@ -50,6 +51,16 @@ The platform disables CUDA graphs and piecewise CUDA graphs, and sets the schedu
 
 A model that keeps recurrent state also requires `mamba_ssm_dtype` unset or `float32` and `mamba_radix_cache_strategy` `auto` or `no_buffer`, and does not support `enable_int8_mamba_checkpoint`, `enable_linear_replayssm` or `enable_linear_replayssm_spec` yet.
 [Integrating frameworks](../engine/frameworks.md#sglang-specifics) explains the overlap schedule and mixed chunks.
+
+## Gemma 4 encoder-only server
+
+Run SGLang's EPD encoder server with the plugin:
+
+```bash
+python -m sglang.launch_server --model-path unsloth/gemma-4-12b-it-NVFP4 --encoder-only
+```
+
+The plugin runs Gemma 4 unified's image, video and audio encoder on the NPU. SGLang keeps media preprocessing, request batching, caching and transfer. Pair this producer with a compatible language-only SGLang instance; the plugin itself refuses `--language-only` because it does not serve that consumer.
 
 ## Speculative decoding
 

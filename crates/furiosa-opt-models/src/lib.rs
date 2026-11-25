@@ -16,6 +16,7 @@
 
 extern crate self as furiosa_opt_models;
 
+pub mod encoder;
 pub mod load;
 mod module;
 pub use module::{Module, Op};

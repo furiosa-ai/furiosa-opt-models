@@ -9,7 +9,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 from furiosa_opt_vllm import generation
 from furiosa_opt_vllm.decoder import Decoder
-from furiosa_opt_vllm.multimodal import Media
+from furiosa_opt_vllm.encoder import Encoder
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -46,17 +46,17 @@ def update(runner: Runner, scheduler: SchedulerOutput) -> None:
         if req_id not in scheduled or req_id in resent:
             _ = runner.input_batch.remove_request(req_id)
     match model:
-        case Media():
-            media = True
+        case Encoder():
+            has_encoder = True
         case None | Decoder():
-            media = False
+            has_encoder = False
         case _:
             assert_never(model)
     for new in scheduler.scheduled_new_reqs:
         if (earlier := runner.requests.get(new.req_id)) is not None:
             runner.acknowledge(earlier, len((new.prefill_token_ids or [])[new.prompt_len :]))
         retire(runner, new.req_id)
-        if new.mm_features and not media:
+        if new.mm_features and not has_encoder:
             raise ValueError("media features require a multimodal model")
         request = runner.requests[new.req_id] = admit(
             new,

@@ -43,13 +43,19 @@ Every `forward` returns its device outputs once the device accepted the call; a 
 
 ::: furiosa_opt_engine.llama.ForCausalLM
 
-A load of a vision-language model's media encoder alone (`LoadOptions.encoder()`) returns an `Encoder`, whatever its model, whose calls turn the media below into rows of the language model's width.
+Calling `LoadOptions.encoder()` selects a model's media encoder and returns typed `EncoderLoadOptions`. Its `load()` returns an `Encoder`, whatever the model, whose calls turn media below into rows of the language model's width.
+
+::: furiosa_opt_engine.EncoderLoadOptions
 
 ::: furiosa_opt_engine.Encoder
 
-::: furiosa_opt_engine.vision_language.Image
+::: furiosa_opt_engine.encoder.Image
 
-::: furiosa_opt_engine.vision_language.Audio
+::: furiosa_opt_engine.encoder.Audio
+
+::: furiosa_opt_engine.encoder.image_from_dlpack
+
+::: furiosa_opt_engine.encoder.audio_from_dlpack
 
 ## Requests and cache
 

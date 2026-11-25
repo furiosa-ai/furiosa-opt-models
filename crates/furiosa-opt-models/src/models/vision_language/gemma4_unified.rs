@@ -15,6 +15,7 @@
 use furiosa_opt_std::prelude::*;
 use serde::Deserialize;
 
+use crate::encoder::{Audio as AudioCapability, Encoder as MediaEncoder, PositionAxis, Vision};
 use crate::load::{Checkpoint, Load, LoadError, Named};
 use crate::models::config::{self, Constant, Literal};
 use crate::models::{Class, Implements};
@@ -48,7 +49,7 @@ pub type Frames<R> = HbmTensor<bf16, Chip, m![R, Samples]>;
 pub type Rows<R> = HbmTensor<bf16, Chip, m![R, Text]>;
 
 /// The byte offset of each patch's row in the factorized position table for one coordinate:
-/// [`offset`](super::Encoder::offset) of its x, or of its y.
+/// [`offset`](Vision::offset) of its x, or of its y.
 pub type Offsets<R> = HbmTensor<i32, Chip, m![R]>;
 
 /// The factorized position table as stored, `[positions, coordinates, features]`: a table of rows
@@ -267,20 +268,29 @@ where
 
 /// Launches of 512 or 2304 rows; a patch's operand is the byte offset of the [`Table`] row its
 /// coordinate reads.
-impl super::Encoder for Encoder<Hbm> {
+impl MediaEncoder for Encoder<Hbm> {
+    type Text = Text;
+    type View<'a> = Encoder<&'a Hbm>;
+}
+
+impl Vision for Encoder<Hbm> {
     type Short = Short;
     type Long = Long;
     type Patch = Patch;
     type Positions = Positions;
-    type Samples = Samples;
-    type Text = Text;
-    type Vision = (VisionState, ProjectionState);
-    type Audio = ProjectionState;
-    type View<'a> = Encoder<&'a Hbm>;
+    type VisionState = (VisionState, ProjectionState);
 
-    fn offset(position: usize, coordinate: usize) -> i32 {
-        ((Coordinates::SIZE * position + coordinate) * Embed::SIZE * size_of::<bf16>()) as i32
+    fn offset(position: usize, coordinate: PositionAxis) -> i32 {
+        ((Coordinates::SIZE * position + coordinate.index()) * Embed::SIZE * size_of::<bf16>())
+            as i32
     }
+}
+
+impl AudioCapability for Encoder<Hbm> {
+    type Short = Short;
+    type Long = Long;
+    type Samples = Samples;
+    type AudioState = ProjectionState;
 }
 
 /// A [`VisionEmbedder`]'s state: its patch path's and its position table's, then its last norm's.

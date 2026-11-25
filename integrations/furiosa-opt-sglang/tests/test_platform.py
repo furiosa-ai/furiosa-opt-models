@@ -54,11 +54,6 @@ from furiosa_opt_sglang.platform import (
         (["--enable-unified-cache-external-linker"], "enable_unified_cache_external_linker"),
         (["--ple-offload-embedding"], "ple_offload_embedding"),
         (["--return-hidden-states-mode", "last"], "enable_return_hidden_states"),
-        pytest.param(
-            ["--encoder-only"],
-            "encoder_only",
-            marks=pytest.mark.feature("Disaggregated encoder and encoder caches"),
-        ),
         (["--language-only"], "language_only"),
         pytest.param(
             ["--enable-watermark"],
@@ -88,6 +83,15 @@ def test_refuses_unserved_cache(dtype: str) -> None:
     """Startup refuses a cache dtype the engine does not cache the model in, with the engine's
     reason, before a scheduler starts."""
     arguments = prepare_server_args(["--model-path", "Qwen/Qwen3-1.7B", "--kv-cache-dtype", dtype])
+    with pytest.raises(Refused) as error:
+        arguments.resolve_once()
+    assert error.value.option == "model_path"
+
+
+@pytest.mark.feature("Disaggregated encoder and encoder caches")
+def test_refuses_encoder_only_for_models_without_a_registered_adapter() -> None:
+    """The producer accepts models with both an engine encoder and processor adapter."""
+    arguments = prepare_server_args(["--model-path", "Qwen/Qwen3-1.7B", "--encoder-only"])
     with pytest.raises(Refused) as error:
         arguments.resolve_once()
     assert error.value.option == "model_path"

@@ -43,7 +43,7 @@ class Medium(NamedTuple):
 
 @pytest.fixture(scope="module")
 def media() -> dict[str, Medium]:
-    """vLLM's test assets by name: two images, a video of 32 frames and a clip of audio."""
+    """vLLM's test assets by name: two images, a video of 32 frames and two audio clips."""
     from vllm.assets.audio import AudioAsset
     from vllm.assets.image import ImageAsset, ImageAssetName
     from vllm.assets.video import VideoAsset
@@ -62,6 +62,7 @@ def media() -> dict[str, Medium]:
         "do_sample_frames": metadata["do_sample_frames"],
     }
     samples, rate = AudioAsset("mary_had_lamb").audio_and_sample_rate
+    shorter_samples = samples[: max(1, len(samples) // 2)]
     return {
         "stop_sign": image("stop_sign"),
         "cherry_blossom": image("cherry_blossom"),
@@ -69,6 +70,12 @@ def media() -> dict[str, Medium]:
             "video", (frames, metadata), {"type": "video", "video": frames}, options
         ),
         "mary_had_lamb": Medium("audio", (samples, rate), {"type": "audio", "audio": samples}, {}),
+        "mary_had_lamb_short": Medium(
+            "audio",
+            (shorter_samples, rate),
+            {"type": "audio", "audio": shorter_samples},
+            {},
+        ),
     }
 
 
@@ -85,7 +92,7 @@ def test_encoder_embeds_each_item_as_transformers_does(
 ) -> None:
     """The media encoder, loaded alone, returns for each item of a call the rows Transformers'
     embedders give it: in one call two images, which share a launch, and a video's frames, which
-    take another; then a clip of audio."""
+    take another; then two clips of audio in one call."""
     import torch
     from huggingface_hub import snapshot_download
     from transformers import AutoProcessor
@@ -106,17 +113,21 @@ def test_encoder_embeds_each_item_as_transformers_does(
         encoder = engine.LoadOptions().encoder().load(engine.Checkpoint(directory), device)
         assert isinstance(encoder, engine.Encoder)
 
-        def upload(rows: torch.Tensor) -> engine.HbmTensor:
-            rows = rows.to(torch.bfloat16).contiguous()
-            return engine.HostTensor.from_dlpack(rows).to_hbm(device)
-
         def host(call: list[engine.HbmTensor]) -> list[torch.Tensor]:
             return [torch.from_numpy(rows.to_host().numpy()) for rows in call]
 
         vision = encoder.vision(
-            [engine.vision_language.Image(upload(p), xy.tolist()) for p, xy in images]
+            [
+                engine.encoder.image_from_dlpack(p.to(torch.bfloat16), xy.tolist(), device)
+                for p, xy in images
+            ]
         )
-        audio = encoder.audio([engine.vision_language.Audio(upload(frames)) for frames in clips])
+        audio = encoder.audio(
+            [
+                engine.encoder.audio_from_dlpack(frames.to(torch.bfloat16), device)
+                for frames in clips
+            ]
+        )
         return host(vision), host(audio)
 
     def patches(pixels: torch.Tensor, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -144,13 +155,15 @@ def test_encoder_embeds_each_item_as_transformers_does(
         patches(cherry_blossom["pixel_values"][0], cherry_blossom["image_position_ids"][0]),
         patches(video["pixel_values_videos"][0], video["video_position_ids"][0]),
     ]
-    audio = inputs["mary_had_lamb"]
-    clips = [audio["input_features"][0][audio["input_features_mask"][0]]]
+    clip_names = ["mary_had_lamb", "mary_had_lamb_short"]
+    clip_inputs = [inputs[name] for name in clip_names]
+    clips = [audio["input_features"][0][audio["input_features_mask"][0]] for audio in clip_inputs]
     image_rows, clip_rows = embedded(images, clips)
     assert (len(image_rows), len(clip_rows)) == (len(images), len(clips))
     for name, rows in zip(names, image_rows, strict=True):
         check(rows, model, revision, inputs[name], media[name].modality)
-    check(clip_rows[0], model, revision, audio, "audio")
+    for rows, audio in zip(clip_rows, clip_inputs, strict=True):
+        check(rows, model, revision, audio, "audio")
 
 
 @pytest.mark.feature("Disaggregated encoder and encoder caches")

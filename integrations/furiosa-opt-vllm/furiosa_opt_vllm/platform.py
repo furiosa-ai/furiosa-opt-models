@@ -16,11 +16,13 @@ from furiosa_opt_vllm.admission import (
     CONTRACTS,
     Refused,
     adapters,
+    encoder_options,
     offload,
     options,
     speculative,
     verify_checkpoint,
 )
+from furiosa_opt_vllm.media_adapter import adapter_for
 
 if TYPE_CHECKING:
     from vllm.config import CacheConfig, ModelConfig, VllmConfig
@@ -96,7 +98,15 @@ class FuriosaPlatform(Platform):
         os.environ.setdefault("NUMBA_NUM_THREADS", str(torch.get_num_threads()))
         if model_config:
             recurrent_state(model_config, vllm_config.cache_config)
-            verify_checkpoint(model_config, vllm_config.load_config, "model", options(vllm_config))
+            if vllm_config.is_mm_encoder_only:
+                # Fail before checkpoint verification may access or download weights.
+                adapter_for(model_config.architectures)
+            loads = (
+                encoder_options(vllm_config)
+                if vllm_config.is_mm_encoder_only
+                else options(vllm_config)
+            )
+            verify_checkpoint(model_config, vllm_config.load_config, "model", loads)
             adapters(vllm_config)
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "furiosa_opt_vllm.worker.FuriosaWorker"

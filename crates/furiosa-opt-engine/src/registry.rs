@@ -12,7 +12,7 @@
 //! - A refused name is `Unsupported`, an unknown one `InvalidData`.
 
 use crate::decoder::{Decoder, Instance, Served};
-use crate::vision_language::Encoder;
+use crate::encoder::{Builder, Encoder};
 use furiosa_opt_models::load::{Checkpoint, Context, Load, LoadError, Part};
 use furiosa_opt_models::models::decoder::attention::{llama, qwen3};
 use furiosa_opt_models::models::decoder::form;
@@ -924,7 +924,7 @@ pub trait Listed: Implements + for<'a> Load<&'a Checkpoint> + Sized + 'static {
     /// Refuses a load of `part`, which the type does not read.
     fn reads(part: Part) -> Result<(), LoadError>;
 
-    /// The type as a framework serves it, its calls attending tiled as `tiling` says.
+    /// The type as a framework serves it. Decoder instances apply `tiling` to attention.
     fn served(self, tiling: Tiling) -> Model;
 }
 
@@ -962,7 +962,7 @@ impl Listed for gemma4_unified::Encoder<Hbm> {
     }
 
     fn served(self, _: Tiling) -> Model {
-        Model::Encoder(Box::new(self))
+        Model::Encoder(Builder::new(self).vision().audio().build())
     }
 }
 

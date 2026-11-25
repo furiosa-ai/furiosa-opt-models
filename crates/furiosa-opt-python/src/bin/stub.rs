@@ -78,6 +78,16 @@ fn main() -> pyo3_stub_gen::Result<()> {
                 "\n@typing_extensions.disjoint_base\nclass Kind:",
             );
         }
+        if name == "engine.encoder" {
+            text = patch(
+                text,
+                "__all__ = [\n    \"Audio\",\n    \"Image\",\n]",
+                "__all__ = [\n    \"Audio\",\n    \"Image\",\n    \"audio_from_dlpack\",\n    \"image_from_dlpack\",\n]",
+            );
+            text.push_str(
+                "\n\ndef image_from_dlpack(\n    patches: builtins.object,\n    positions: collections.abc.Sequence[collections.abc.Sequence[builtins.int]],\n    device: engine.Device,\n) -> Image: ...\n\ndef audio_from_dlpack(\n    frames: builtins.object, device: engine.Device\n) -> Audio: ...\n",
+            );
+        }
         let path = directory.join(file);
         fs::write(&path, text)?;
         paths.push(path);
