@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, pool_hidden_states
 
-from furiosa_opt_sglang.batch import Batch
+from furiosa_opt_engine.batch import Batch
 from furiosa_opt_sglang.generation import integers, sequence
 
 if TYPE_CHECKING:

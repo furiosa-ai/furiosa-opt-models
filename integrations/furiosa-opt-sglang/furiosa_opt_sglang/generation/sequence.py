@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING, cast
 import torch
 
 import furiosa_opt_engine as engine
-from furiosa_opt_sglang.batch import Batch, Call, Row, operand
-from furiosa_opt_sglang.decoder import RELEASED, Decoder
+from furiosa_opt_engine.batch import Batch, Call, Row, operand
+from furiosa_opt_sglang.decoder import RELEASED
 from furiosa_opt_sglang.generation.model import Model
 
 if TYPE_CHECKING:
@@ -40,12 +40,11 @@ def forward(
     pool = runner.req_to_token_pool
     if pool is None:
         raise RuntimeError("cache initialization must precede scheduled generation")
-    yield from paged(model, model.core, pool, batch, snapshot, every=every, feed=feed)
+    yield from paged(model, pool, batch, snapshot, every=every, feed=feed)
 
 
 def paged(
     model: Model,
-    decoder: Decoder,
     pool: ReqToTokenPool,
     batch: ScheduleBatch,
     snapshot: Batch,
@@ -59,6 +58,7 @@ def paged(
     lengths = [len(tokens) for tokens in inputs]
     if model.cache is None:
         raise RuntimeError("cache initialization must precede paged generation")
+    decoder = model.core
     storage, loaded = model.cache.storage, decoder.model
     if storage is None or loaded is None:
         raise RuntimeError(RELEASED)

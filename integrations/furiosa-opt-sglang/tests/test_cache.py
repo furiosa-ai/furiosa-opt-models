@@ -177,6 +177,7 @@ def copy_blocks() -> None:
     from transformers import AutoConfig
 
     import furiosa_opt_engine as engine
+    from furiosa_opt_engine.placement import open_placed_device
     from furiosa_opt_sglang.cache import Cache, Pages
     from furiosa_opt_sglang.decoder import PES, Decoder, Location, chips
 
@@ -184,9 +185,13 @@ def copy_blocks() -> None:
     download = cast("Callable[[str], str]", huggingface_hub.snapshot_download)
     directory = download("Qwen/Qwen3-1.7B")
     config = AutoConfig.from_pretrained(directory)
-    device = engine.Device(engine.Placement(chips(0, 1), PES))
+    placement = engine.Placement(chips(0, 1), PES)
+    selected = open_placed_device(placement)
     decoder = Decoder.load(
-        Location(directory, None), engine.LoadOptions(), device, config.vocab_size
+        Location(directory, None),
+        engine.LoadOptions(),
+        selected,
+        config.vocab_size,
     )
     assert decoder.model is not None
     heads, head = config.num_key_value_heads, config.head_dim
@@ -216,6 +221,7 @@ def follow_layout() -> None:
     from transformers import AutoConfig, AutoTokenizer
 
     import furiosa_opt_engine as engine
+    from furiosa_opt_engine.placement import open_placed_device
     from furiosa_opt_sglang.cache import Cache, Pages
     from furiosa_opt_sglang.decoder import PES, Decoder, Location, chips
 
@@ -224,10 +230,12 @@ def follow_layout() -> None:
     directory = download("Qwen/Qwen3-0.6B")
     config = AutoConfig.from_pretrained(directory)
     tokenizer = AutoTokenizer.from_pretrained(directory)
-    device = engine.Device(engine.Placement(chips(0, 1), PES))
+    placement = engine.Placement(chips(0, 1), PES)
+    selected = open_placed_device(placement)
+    device = selected.device
     # The base model's hidden rows tell apart attention over any other cache rows.
     options = engine.LoadOptions().architecture("Qwen3Model")
-    decoder = Decoder.load(Location(directory, None), options, device, config.vocab_size)
+    decoder = Decoder.load(Location(directory, None), options, selected, config.vocab_size)
     block, model = decoder.pool.block, decoder.model
     assert model is not None
     pages = Pages.parse(decoder, config.num_key_value_heads, config.head_dim)

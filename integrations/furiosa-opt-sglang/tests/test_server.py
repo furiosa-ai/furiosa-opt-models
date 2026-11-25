@@ -378,12 +378,17 @@ def test_replicas_answer_alike(server: Callable[..., HTTPResponse]) -> None:
 
 NGRAM = ("--speculative-algorithm", "NGRAM", "--speculative-ngram-max-bfs-breadth", "1")
 STANDALONE = ("--speculative-algorithm", "STANDALONE", "--speculative-draft-model-path")
+PARALLEL = (*STANDALONE, "amd/PARD-Qwen3-0.6B")
 
 
 @pytest.mark.parametrize(
     "flags",
-    [(*NGRAM, "--speculative-num-draft-tokens", "4"), (*STANDALONE, "Qwen/Qwen3-0.6B")],
-    ids=["ngram", "standalone"],
+    [
+        (*NGRAM, "--speculative-num-draft-tokens", "4"),
+        (*STANDALONE, "Qwen/Qwen3-0.6B"),
+        PARALLEL,
+    ],
+    ids=["ngram", "standalone", "parallel-mask"],
 )
 @pytest.mark.feature("Speculative decoding (ngram, suffix, draft model)")
 def test_speculative_parity(

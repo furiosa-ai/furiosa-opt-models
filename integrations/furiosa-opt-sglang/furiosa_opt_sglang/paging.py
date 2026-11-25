@@ -12,6 +12,7 @@ from sglang.srt.runtime_context import get_memory, get_schedule
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from typing_extensions import override
 
+from furiosa_opt_engine.speculative import cache_memory_budget
 from furiosa_opt_sglang.cache import Allocator, Cache, Pages
 from furiosa_opt_sglang.decoder import RELEASED, Decoder
 from furiosa_opt_sglang.generation.model import Model
@@ -45,13 +46,13 @@ def tokens(runner: Runner, limits: Limits, decoder: Decoder, pages: Pages) -> Ca
         "fp8_e4m3" if runner.kv_cache_dtype == torch.float8_e4m3fn else "auto"
     )
     device = decoder.device
-    free = device.available - int(device.capacity * (1 - runner.mem_fraction_static))
+    free = cache_memory_budget(device.available, device.capacity, runner.mem_fraction_static)
     match runner.speculative:
         case Speculative(proposer=Draft() as draft):
             pass
         case _:
             draft = None
-    count = decoder.blocks(free, *([draft.decoder] if draft is not None else []))
+    count = cache_blocks(decoder, free, runner.mem_fraction_static, draft)
     # The token pool keeps one dummy block.
     block = decoder.pool.block
     capacity = max(0, count - 1) * block
@@ -66,6 +67,13 @@ def tokens(runner: Runner, limits: Limits, decoder: Decoder, pages: Pages) -> Ca
         draft.allocate(cache.storage.blocks)
     runner.token_to_kv_pool = cache
     return cache
+
+
+def cache_blocks(decoder: Decoder, free: int, fraction: float, draft: Draft | None) -> int:
+    """Bound target and draft caches by both devices' memory when placement is disjoint."""
+    if draft is None:
+        return decoder.blocks(free)
+    return draft.capacity(decoder, free, fraction)
 
 
 @final

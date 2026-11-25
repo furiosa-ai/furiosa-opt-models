@@ -19,7 +19,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.utils import GenerationBatchResult
 
 import furiosa_opt_engine as engine
-from furiosa_opt_sglang.batch import Batch
+from furiosa_opt_engine.batch import Batch
 from furiosa_opt_sglang.decoder import RELEASED, Decoder
 from furiosa_opt_sglang.generation import sequence
 from furiosa_opt_sglang.generation.model import Model
@@ -115,7 +115,7 @@ class Sampled(GenerationBatchResult):
         ids = torch.zeros(self.size, dtype=torch.int64)
         for kept, tokens in self.calls:
             rows = torch.tensor([i for i, _ in kept])
-            ids[rows] = torch.tensor(tokens.to_host().numpy()[: len(kept)], dtype=torch.int64)
+            ids[rows] = torch.as_tensor(tokens.to_host().numpy()[: len(kept)])
         self.next_token_ids = ids
         self.calls = ()
 
