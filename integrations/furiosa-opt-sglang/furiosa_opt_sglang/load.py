@@ -57,7 +57,6 @@ def bind(model_config: ModelConfig, first: int) -> Model:
     from sglang.srt.runtime_context import get_exec, get_model, get_server_args
 
     import furiosa_opt_engine as engine
-    from furiosa_opt_engine.placement import open_placed_device
     from furiosa_opt_sglang.checkpoint import checkout, text
     from furiosa_opt_sglang.decoder import PES, Decoder, Location, chips
 
@@ -86,14 +85,14 @@ def bind(model_config: ModelConfig, first: int) -> Model:
     except (NotImplementedError, ValueError) as error:
         raise Refused("model_path", str(error)) from None
     placement = engine.Placement(chips(first, tensor), PES)
-    selected = open_placed_device(placement)
+    device = engine.Device(placement)
     # Only the memory saver releases the weights, so only it keeps the backup they resume from.
     backup = cast("bool", features.enable_memory_saver and features.enable_weights_cpu_backup)
     try:
         decoder = Decoder.load(
             checkpoint,
             loads,
-            selected,
+            device,
             model_config.vocab_size,
             backup=backup,
         )

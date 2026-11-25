@@ -9,7 +9,6 @@ import pytest
 from vllm import tokenizers
 
 import furiosa_opt_engine as engine
-from furiosa_opt_engine.placement import PlacedDevice
 from furiosa_opt_vllm import checkpoint
 from furiosa_opt_vllm.admission import Draft, Refused
 from furiosa_opt_vllm.decoder import Decoder
@@ -49,12 +48,8 @@ def test_refuses_different_token_to_id_mappings_before_opening_device(
     monkeypatch.setattr(engine, "Device", fail_if_loaded)
     monkeypatch.setattr(engine, "LoadOptions", fail_if_loaded)
     monkeypatch.setattr(checkpoint, "located", fail_if_loaded)
-    device = object()
     placement = engine.Placement([0], range(8))
-    selected = cast(
-        PlacedDevice,
-        cast(object, SimpleNamespace(device=device, placement=placement)),
-    )
+    device = SimpleNamespace(placement=placement)
     target = cast(
         Decoder,
         cast(
@@ -63,8 +58,6 @@ def test_refuses_different_token_to_id_mappings_before_opening_device(
                 model=object(),
                 vocabulary=2,
                 device=device,
-                placement=placement,
-                selected=selected,
             ),
         ),
     )

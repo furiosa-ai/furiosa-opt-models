@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Protocol, cast, final
 import numpy as np
 
 import furiosa_opt_engine as engine
-from furiosa_opt_engine.placement import PlacedDevice, draft_device
+from furiosa_opt_engine.placement import draft_device
 from furiosa_opt_engine.speculative import (
     DraftRequest,
     DraftSession,
@@ -69,7 +69,7 @@ def _same_tokenizer_vocabulary(target: ModelConfig, draft: ModelConfig) -> bool:
     return same_tokenizer_vocabulary(_tokenizer_vocabulary(target), _tokenizer_vocabulary(draft))
 
 
-def _select_device(draft: Draft, target: Decoder) -> PlacedDevice:
+def _select_device(draft: Draft, target: Decoder) -> engine.Device:
     """Select the target device or an explicitly disjoint draft device and placement."""
     placement = (
         None
@@ -78,7 +78,7 @@ def _select_device(draft: Draft, target: Decoder) -> PlacedDevice:
     )
     try:
         return draft_device(
-            target.selected,
+            target.device,
             placement,
             draft.parallel.tensor_parallel_size,
         )
@@ -94,17 +94,12 @@ class Drafter:
     """A draft model and the checkpoint state needed to release and restore its weights."""
 
     model: engine.Decoder | None
-    selected: PlacedDevice
-    target_placement: engine.Placement
+    device: engine.Device
+    target_device: engine.Device
     draft: Draft
     location: Location
     options: engine.LoadOptions
     copy: engine.Checkpoint | None = None
-
-    @property
-    def device(self) -> engine.Device:
-        """The device paired with this draft's selected placement."""
-        return self.selected.device
 
     @classmethod
     def load(
@@ -132,14 +127,14 @@ class Drafter:
                 "speculative_config.model",
                 "speculative_config.model requires matching target and draft token-to-ID mappings",
             )
-        selected = _select_device(draft, target)
+        device = _select_device(draft, target)
         options = engine.LoadOptions().chips(draft.parallel.tensor_parallel_size)
         if draft.cache_dtype is not None:
             options = options.kv_cache(draft.cache_dtype)
         location = checkpoint.located(draft.model, draft.download_dir)
         mapped = location.mapped()
         copy = mapped.read() if target_config.enable_sleep_mode else None
-        loaded = options.load(mapped if copy is None else copy, selected.device)
+        loaded = options.load(mapped if copy is None else copy, device)
         match loaded:
             case engine.Decoder():
                 model = loaded
@@ -152,7 +147,7 @@ class Drafter:
             validate_draft_decoder(target.model, model, draft.max_model_len)
         except ValueError as error:
             raise Refused("speculative_config.model", str(error)) from None
-        return cls(model, selected, target.selected.placement, draft, location, options, copy)
+        return cls(model, device, target.device, draft, location, options, copy)
 
     def release_weights(self, *, preserve_copy: bool) -> Drafter:
         """Drop loaded draft weights, keeping their host copy only for level-1 sleep."""
@@ -201,7 +196,7 @@ class Drafter:
         if model is None:
             raise RuntimeError("draft weights must be awake before cache sizing")
         cache = model.cache
-        if self.selected.placement == self.target_placement:
+        if self.device.placement == self.target_device.placement:
             return draft_blocks_for_shared_budget(blocks, target_bytes_per_block, cache)
         available = cache_memory_budget(
             self.device.available,

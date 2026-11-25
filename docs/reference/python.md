@@ -18,6 +18,8 @@ For a walkthrough, see [Using the engine](../engine/python.md).
 
 ::: furiosa_opt_engine.Device
 
+`Device.placement` is the immutable physical placement used to open that device.
+
 ::: furiosa_opt_engine.HbmBuffer
 
 ::: furiosa_opt_engine.HostBuffer
@@ -96,16 +98,11 @@ Framework adapters use these shared helpers to map scheduled rows to decoder cal
 
 ## Speculative drafting
 
+`draft_device` reuses the target device for a default or exact match, and opens a device for an
+explicit disjoint placement.
 `SequenceId` carries a hashable framework request ID through `DraftRequest` and `DraftSession`.
-Use `draft_device` to choose a target or disjoint physical placement; it returns the matching
-`PlacedDevice` pair. `open_placed_device` opens a target placement and keeps the device paired with
-the placement used to open it.
 
 ::: furiosa_opt_engine.speculative.TokenSource
-
-::: furiosa_opt_engine.placement.PlacedDevice
-
-::: furiosa_opt_engine.placement.open_placed_device
 
 ::: furiosa_opt_engine.placement.draft_device
 

@@ -43,7 +43,6 @@ def exercise_cache_transition(*, disjoint: bool = False) -> None:
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     import furiosa_opt_engine as engine
-    from furiosa_opt_engine.placement import open_placed_device
     from furiosa_opt_sglang.checkpoint import checkout
     from furiosa_opt_sglang.decoder import PES, Decoder, Location, chips
     from furiosa_opt_sglang.platform import DraftPlacement
@@ -54,11 +53,11 @@ def exercise_cache_transition(*, disjoint: bool = False) -> None:
     target_config = AutoConfig.from_pretrained(target_directory)
     target_tokenizer = AutoTokenizer.from_pretrained(target_directory)
     placement = engine.Placement(chips(0, 1), PES)
-    selected = open_placed_device(placement)
+    device = engine.Device(placement)
     target = Decoder.load(
         Location(target_directory, None),
         engine.LoadOptions(),
-        selected,
+        device,
         target_config.vocab_size,
     )
     assert target.model is not None

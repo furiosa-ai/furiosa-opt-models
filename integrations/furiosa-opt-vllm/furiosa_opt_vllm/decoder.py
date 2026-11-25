@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, ClassVar, Final
 from vllm.platforms import current_platform
 
 import furiosa_opt_engine as engine
-from furiosa_opt_engine.placement import PE_COUNT, PlacedDevice, open_placed_device
+from furiosa_opt_engine.placement import PE_COUNT
 from furiosa_opt_vllm import checkpoint
 from furiosa_opt_vllm.admission import Refused, options
 
@@ -46,7 +46,7 @@ class Decoder:
     copy: engine.Checkpoint | None
     checkpoint: Location
     options: engine.LoadOptions
-    selected: PlacedDevice
+    device: engine.Device
     vocabulary: int
     # A call allocates its buffers as it runs, from the memory the cache leaves free.
     workspace: ClassVar[int] = 0
@@ -60,7 +60,7 @@ class Decoder:
         tensor = config.parallel_config.tensor_parallel_size
         chips = [current_platform.device_id_to_physical_device_id(rank) for rank in range(tensor)]
         placement = engine.Placement(chips, PES)
-        selected = open_placed_device(placement)
+        device = engine.Device(placement)
         located = checkpoint.located(model, config.load_config.download_dir)
         mapped = located.mapped()
         copy = mapped.read() if model.enable_sleep_mode else None
@@ -69,7 +69,7 @@ class Decoder:
             copy,
             located,
             options(config),
-            selected,
+            device,
             model.get_vocab_size(),
         )
         loaded = decoder.loaded(mapped if copy is None else copy)
@@ -87,16 +87,6 @@ class Decoder:
                 return replace(self, model=model)
             case _:
                 raise NotImplementedError(f"{type(model).__name__} is no served decoder")
-
-    @property
-    def device(self) -> engine.Device:
-        """The opened target device paired with its physical placement."""
-        return self.selected.device
-
-    @property
-    def placement(self) -> engine.Placement:
-        """The target placement used to open its device."""
-        return self.selected.placement
 
     @property
     def rows(self) -> int:

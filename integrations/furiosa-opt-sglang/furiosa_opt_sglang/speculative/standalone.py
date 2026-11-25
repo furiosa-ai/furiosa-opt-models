@@ -122,8 +122,8 @@ class Draft:
             else engine.Placement(list(requested.chips), range(*requested.pes))
         )
         try:
-            selected = draft_device(
-                target.selected,
+            device = draft_device(
+                target.device,
                 placement,
                 target.model.parallel,
             )
@@ -151,7 +151,7 @@ class Draft:
             draft = Decoder.load(
                 checkpoint,
                 loads,
-                selected,
+                device,
                 config.vocab_size,
             )
         except NotImplementedError as error:
@@ -174,7 +174,7 @@ class Draft:
     def capacity(self, target: Decoder, target_memory: int, utilization: float) -> int:
         """Target blocks that fit this draft cache under colocated or disjoint placement."""
         draft = self._decoder
-        if draft.placement == target.placement:
+        if draft.device.placement == target.device.placement:
             return target.blocks(target_memory, draft)
         device = draft.device
         draft_memory = cache_memory_budget(device.available, device.capacity, utilization)

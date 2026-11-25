@@ -9,7 +9,6 @@ from typing import cast
 import pytest
 
 import furiosa_opt_engine as engine
-from furiosa_opt_engine.placement import PlacedDevice
 from furiosa_opt_sglang.decoder import Decoder, Location
 from furiosa_opt_sglang.paging import cache_blocks
 from furiosa_opt_sglang.platform import DRAFT_PLACEMENT_ENV, DraftPlacement, Refused, Standalone
@@ -21,7 +20,6 @@ def decoder(
     device: object,
     blocks: int,
     calls: list[tuple[int, tuple[Decoder, ...]]],
-    placement: engine.Placement,
 ) -> Decoder:
     """A decoder budget with a recorded block-count request."""
 
@@ -31,7 +29,7 @@ def decoder(
 
     return cast(
         Decoder,
-        cast(object, SimpleNamespace(device=device, placement=placement, blocks=count)),
+        cast(object, SimpleNamespace(device=device, blocks=count)),
     )
 
 
@@ -59,11 +57,11 @@ def causal_model() -> SimpleNamespace:
 
 def test_sizes_shared_draft_against_target_device() -> None:
     """A colocated draft retains the existing combined target-and-draft budget."""
-    device = object()
     placement = engine.Placement([0], range(8))
+    device = SimpleNamespace(placement=placement)
     calls: list[tuple[int, tuple[Decoder, ...]]] = []
-    target = decoder(device, 7, calls, placement)
-    draft_decoder = decoder(device, 5, [], placement)
+    target = decoder(device, 7, calls)
+    draft_decoder = decoder(device, 5, [])
     draft = draft_for(draft_decoder)
 
     count = cache_blocks(target, 600, 0.8, draft)
@@ -78,10 +76,16 @@ def test_sizes_shared_draft_against_target_device() -> None:
 def test_caps_disjoint_draft_by_each_device(target_blocks: int, expected: int) -> None:
     """A disjoint draft uses its own reserved-memory budget, then the tighter device limit."""
     calls: list[tuple[int, tuple[Decoder, ...]]] = []
-    target = decoder(object(), target_blocks, calls, engine.Placement([0], range(8)))
-    draft_device = SimpleNamespace(capacity=1000, available=900)
+    target = decoder(
+        SimpleNamespace(placement=engine.Placement([0], range(8))), target_blocks, calls
+    )
+    draft_device = SimpleNamespace(
+        capacity=1000,
+        available=900,
+        placement=engine.Placement([1], range(8)),
+    )
     draft_calls: list[tuple[int, tuple[Decoder, ...]]] = []
-    draft_decoder = decoder(draft_device, 7, draft_calls, engine.Placement([1], range(8)))
+    draft_decoder = decoder(draft_device, 7, draft_calls)
     draft = draft_for(draft_decoder)
 
     count = cache_blocks(target, 800, 0.8, draft)
@@ -132,12 +136,8 @@ def test_validates_tokenizer_and_selected_placement_before_draft_load(
     draft_vocabulary: int,
 ) -> None:
     """Reject incompatible tokenizer or vocabulary before opening/loading the draft."""
-    target_device = object()
     target_placement = engine.Placement([0, 1], range(8))
-    target_selected = cast(
-        PlacedDevice,
-        cast(object, SimpleNamespace(device=target_device, placement=target_placement)),
-    )
+    target_device = SimpleNamespace(placement=target_placement)
     target = cast(
         Decoder,
         cast(
@@ -145,8 +145,6 @@ def test_validates_tokenizer_and_selected_placement_before_draft_load(
             SimpleNamespace(
                 model=causal_model(),
                 device=target_device,
-                placement=target_placement,
-                selected=target_selected,
                 vocabulary=3,
                 pool=SimpleNamespace(block=16),
             ),
@@ -200,12 +198,14 @@ def test_validates_tokenizer_and_selected_placement_before_draft_load(
             pass
 
     monkeypatch.setattr(engine, "LoadOptions", LoadOptions)
-    selected_device = object()
+    opened_devices: list[engine.Device] = []
     opened_placements: list[engine.Placement] = []
 
-    def open_device(placement: engine.Placement) -> object:
+    def open_device(placement: engine.Placement) -> engine.Device:
         opened_placements.append(placement)
-        return selected_device
+        device = cast(engine.Device, cast(object, SimpleNamespace(placement=placement)))
+        opened_devices.append(device)
+        return device
 
     monkeypatch.setattr(engine, "Device", open_device)
     requested_placement = engine.Placement(list(chips), range(8))
@@ -245,16 +245,16 @@ def test_validates_tokenizer_and_selected_placement_before_draft_load(
             ),
         ),
     )
-    loads: list[PlacedDevice] = []
+    loads: list[engine.Device] = []
 
     def load(
         _cls: type[Decoder],
         _checkpoint: object,
         _options: object,
-        selected: PlacedDevice,
+        device: engine.Device,
         _vocabulary: int,
     ) -> Decoder:
-        loads.append(selected)
+        loads.append(device)
         return loaded
 
     monkeypatch.setattr(Decoder, "load", classmethod(load))
@@ -272,8 +272,8 @@ def test_validates_tokenizer_and_selected_placement_before_draft_load(
     assert len(loads) == 1
     assert loads[0].placement == requested_placement
     if opened:
-        assert loads[0].device is selected_device
+        assert loads[0] is opened_devices[0]
         assert opened_placements == [requested_placement]
     else:
-        assert loads[0].device is target_device
+        assert loads[0] is target_device
         assert not opened_placements

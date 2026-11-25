@@ -20,7 +20,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Final
 
 import furiosa_opt_engine as engine
-from furiosa_opt_engine.placement import PE_COUNT, PlacedDevice
+from furiosa_opt_engine.placement import PE_COUNT
 from furiosa_opt_engine.speculative import cache_blocks_for_memory
 
 if TYPE_CHECKING:
@@ -71,7 +71,7 @@ class Decoder:
     copy: engine.Checkpoint | None
     checkpoint: Location
     options: engine.LoadOptions
-    selected: PlacedDevice
+    device: engine.Device
     vocabulary: int
     cache_spec: engine.decoder.CacheSpec
     pool: engine.decoder.Pool
@@ -82,18 +82,18 @@ class Decoder:
         cls,
         checkpoint: Location,
         options: engine.LoadOptions,
-        selected: PlacedDevice,
+        device: engine.Device,
         vocabulary: int,
         *,
         backup: bool = False,
     ) -> Decoder:
-        """`checkpoint` loaded with `options` onto `selected`; token IDs lie below `vocabulary`;
+        """`checkpoint` loaded with `options` onto `device`; token IDs lie below `vocabulary`;
         with `backup`, loaded from a copy of its tensors in host memory, which the decoder keeps.
         Refuses a decoder whose calls return scores or whose cache is not one paged full-history
         group."""
         mapped = checkpoint.mapped()
         copy = mapped.read() if backup else None
-        loaded = options.load(mapped if copy is None else copy, selected.device)
+        loaded = options.load(mapped if copy is None else copy, device)
         match loaded:
             case engine.Decoder(output=engine.decoder.Output.TOKENS | engine.decoder.Output.HIDDEN):
                 pass
@@ -108,7 +108,7 @@ class Decoder:
                     copy,
                     checkpoint,
                     options,
-                    selected,
+                    device,
                     vocabulary,
                     cache_spec,
                     pool,
@@ -121,16 +121,6 @@ class Decoder:
         """This decoder with the weights of `checkpoint` loaded onto its device by its options: the
         line of its first load, whose cache format it keeps."""
         return replace(self, model=self.options.load(checkpoint, self.device))
-
-    @property
-    def device(self) -> engine.Device:
-        """The device that holds this decoder."""
-        return self.selected.device
-
-    @property
-    def placement(self) -> engine.Placement:
-        """The physical placement that holds this decoder."""
-        return self.selected.placement
 
     @property
     def rows(self) -> int:

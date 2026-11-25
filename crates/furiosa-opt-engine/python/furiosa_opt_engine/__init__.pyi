@@ -136,6 +136,11 @@ class Device:
     bytes per chip.
     """
     @property
+    def placement(self) -> Placement:
+        r"""
+        The placement used to open this device.
+        """
+    @property
     def capacity(self) -> builtins.int:
         r"""
         Total device memory in bytes per chip.

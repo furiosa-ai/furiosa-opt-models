@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, NoReturn, cast
 import pytest
 
 import furiosa_opt_engine as engine
-from furiosa_opt_engine.placement import PlacedDevice
 from furiosa_opt_vllm import checkpoint
 from furiosa_opt_vllm.additional import Placement, Section
 from furiosa_opt_vllm.admission import Draft, Refused, speculative
@@ -21,21 +20,13 @@ if TYPE_CHECKING:
 
 def target(chips: list[int]) -> Decoder:
     """A target placement and device identity for placement decisions."""
-    device = object()
     placement = engine.Placement(chips, range(8))
-    selected = cast(
-        PlacedDevice,
-        cast(object, SimpleNamespace(device=device, placement=placement)),
-    )
+    device = SimpleNamespace(placement=placement)
     return cast(
         Decoder,
         cast(
             object,
-            SimpleNamespace(
-                selected=selected,
-                device=device,
-                placement=placement,
-            ),
+            SimpleNamespace(device=device),
         ),
     )
 
@@ -67,12 +58,12 @@ def test_reuses_target_device_for_the_same_placement() -> None:
     """An explicit match reuses the target's open device and shares its HBM budget."""
     loaded_target = target([1, 2])
 
-    selected = _select_device(
+    device = _select_device(
         draft(Placement(chips=(1, 2), pes=(0, 8)), parallelism=2), loaded_target
     )
 
-    assert selected.device is loaded_target.device
-    assert selected.placement == loaded_target.placement
+    assert device is loaded_target.device
+    assert device.placement == loaded_target.device.placement
 
 
 @pytest.mark.parametrize(
@@ -90,7 +81,7 @@ def test_refuses_partial_chip_overlap(placement: Placement) -> None:
         _ = _select_device(draft(placement, parallelism=2), loaded_target)
 
     assert error.value.option == "additional_config.furiosa.draft_placement"
-    assert repr(loaded_target.placement) in error.value.requirement
+    assert repr(loaded_target.device.placement) in error.value.requirement
     assert (
         repr(engine.Placement(list(placement.chips), range(*placement.pes)))
         in error.value.requirement
@@ -99,22 +90,22 @@ def test_refuses_partial_chip_overlap(placement: Placement) -> None:
 
 def test_opens_a_device_for_disjoint_chips(monkeypatch: pytest.MonkeyPatch) -> None:
     """A disjoint placement opens its own device rather than reusing the target's."""
-    opened = object()
+    opened: list[engine.Device] = []
     placements: list[engine.Placement] = []
 
-    def open_device(placement: engine.Placement) -> object:
+    def open_device(placement: engine.Placement) -> engine.Device:
         placements.append(placement)
-        return opened
+        device = cast(engine.Device, cast(object, SimpleNamespace(placement=placement)))
+        opened.append(device)
+        return device
 
     monkeypatch.setattr(engine, "Device", open_device)
     loaded_target = target([1, 2])
 
-    selected = _select_device(
-        draft(Placement(chips=(3,), pes=(0, 8)), parallelism=1), loaded_target
-    )
+    device = _select_device(draft(Placement(chips=(3,), pes=(0, 8)), parallelism=1), loaded_target)
 
-    assert selected.device is opened
-    assert selected.placement.chips == [3]
+    assert device is opened[0]
+    assert device.placement.chips == [3]
     assert placements[0].chips == [3]
 
 
@@ -141,20 +132,20 @@ def drafter(
 ) -> Drafter:
     """A drafter with two cache groups whose total per-block size is 32 bytes."""
     cache = cache_spec()
-    target_device = SimpleNamespace(available=available, capacity=capacity)
-    device = (
-        target_device if shared_device else SimpleNamespace(available=available, capacity=capacity)
-    )
     target_placement = engine.Placement([0], range(8))
+    target_device = SimpleNamespace(
+        available=available, capacity=capacity, placement=target_placement
+    )
     placement = target_placement if shared_device else engine.Placement([1], range(8))
-    selected = cast(
-        PlacedDevice,
-        cast(object, SimpleNamespace(device=device, placement=placement)),
+    device = (
+        target_device
+        if shared_device
+        else SimpleNamespace(available=available, capacity=capacity, placement=placement)
     )
     return Drafter(
         cast(engine.Decoder, cast(object, SimpleNamespace(cache=cache))),
-        selected,
-        target_placement,
+        cast(engine.Device, cast(object, device)),
+        cast(engine.Device, cast(object, target_device)),
         cast(Draft, cast(object, SimpleNamespace(memory_utilization=utilization))),
         checkpoint.Location("", {}),
         engine.LoadOptions(),

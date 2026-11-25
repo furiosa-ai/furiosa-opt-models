@@ -31,7 +31,6 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 import furiosa_opt_engine as engine
 import furiosa_opt_engine.speculative as engine_speculative
-from furiosa_opt_engine.placement import PlacedDevice
 from furiosa_opt_vllm import admission, checkpoint, drafting
 from furiosa_opt_vllm.additional import Section
 from furiosa_opt_vllm.admission import Draft, Refused, speculative
@@ -217,16 +216,12 @@ def session(monkeypatch: pytest.MonkeyPatch) -> Callable[[VllmConfig], Session]:
             _ = runner.input_batch.add_request(runner.requests[req_id])
         # The engine in memory stands in for the engine's decoder, device and cache.
         decoder = cast("engine.Decoder", cast("object", model))
-        device = cast("engine.Device", cast("object", None))
         placement = engine.Placement([0], range(8))
-        selected = cast(
-            PlacedDevice,
-            cast("object", SimpleNamespace(device=device, placement=placement)),
-        )
+        device = cast("engine.Device", cast("object", SimpleNamespace(placement=placement)))
         drafter = Drafter(
             decoder,
-            selected,
-            placement,
+            device,
+            device,
             draft,
             checkpoint.Location("", {}),
             engine.LoadOptions(),
@@ -297,8 +292,8 @@ def test_uses_each_cache_group_and_tightest_capacity(
     prior = run.drafting._drafter
     drafter = Drafter(
         cast("engine.Decoder", cast("object", run.model)),
-        prior.selected,
-        prior.target_placement,
+        prior.device,
+        prior.target_device,
         prior.draft,
         prior.location,
         prior.options,
