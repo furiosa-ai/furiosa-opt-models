@@ -54,6 +54,9 @@ jobs:
     runs-on: furiosa-opt-models-runner
     # A new compiler revision compiles every kernel once; later runs compile only changed kernels.
     timeout-minutes: 90
+    env:
+      # Engine test builds need a lower parallelism ceiling than the runner's CPU-count default.
+      CARGO_BUILD_JOBS: ${{ matrix.package == 'engine' && '2' || '8' }}
     steps:
       - uses: actions/checkout@v4
         with:
