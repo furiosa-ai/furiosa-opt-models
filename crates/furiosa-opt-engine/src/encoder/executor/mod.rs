@@ -37,7 +37,7 @@ type Frames<'x, E, R> = (
 );
 
 /// A loaded encoder tree that embeds vision launches of `R` rows.
-trait EmbedsVision<E, R>:
+pub(crate) trait EmbedsVision<E, R>:
     DeviceSend
     + Send
     + Sync
@@ -71,7 +71,7 @@ where
 }
 
 /// A loaded encoder tree that embeds audio launches of `R` rows.
-trait EmbedsAudio<E, R>:
+pub(crate) trait EmbedsAudio<E, R>:
     DeviceSend
     + Send
     + Sync
