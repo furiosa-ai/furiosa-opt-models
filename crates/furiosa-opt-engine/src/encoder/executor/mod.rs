@@ -13,7 +13,7 @@ mod execution;
 mod planner;
 
 use self::execution::{embed_frames, embed_patches, keep_rows, output_buffers, output_tensors};
-use self::planner::{fits_short, launches, validate_positions};
+use self::planner::{fits_small, launches, validate_positions};
 
 /// `R` rows of `W` BF16 features on one chip: a launch's input or its output.
 type Tensor<R, W> = furiosa_opt_std::prelude::HbmTensor<bf16, Chip, m![R, W]>;
@@ -128,8 +128,8 @@ struct AudioExecutor<E>(Arc<E>);
 impl<E> VisionPath for VisionExecutor<E>
 where
     E: encoder_model::Encoder + encoder_model::Vision + Send + Sync + 'static,
-    for<'a> E::View<'a>: EmbedsVision<E, <E as encoder_model::Vision>::Short>
-        + EmbedsVision<E, <E as encoder_model::Vision>::Long>,
+    for<'a> E::View<'a>: EmbedsVision<E, <E as encoder_model::Vision>::SmallRows>
+        + EmbedsVision<E, <E as encoder_model::Vision>::LargeRows>,
 {
     fn input_width(&self) -> usize {
         <E as encoder_model::Vision>::Patch::SIZE
@@ -147,8 +147,8 @@ where
 impl<E> AudioPath for AudioExecutor<E>
 where
     E: encoder_model::Encoder + encoder_model::Audio + Send + Sync + 'static,
-    for<'a> E::View<'a>: EmbedsAudio<E, <E as encoder_model::Audio>::Short>
-        + EmbedsAudio<E, <E as encoder_model::Audio>::Long>,
+    for<'a> E::View<'a>: EmbedsAudio<E, <E as encoder_model::Audio>::SmallRows>
+        + EmbedsAudio<E, <E as encoder_model::Audio>::LargeRows>,
 {
     fn input_width(&self) -> usize {
         <E as encoder_model::Audio>::Samples::SIZE
@@ -185,13 +185,13 @@ where
     pub(crate) fn vision(mut self) -> Self
     where
         E: encoder_model::Vision,
-        for<'a> E::View<'a>: EmbedsVision<E, <E as encoder_model::Vision>::Short>
-            + EmbedsVision<E, <E as encoder_model::Vision>::Long>,
+        for<'a> E::View<'a>: EmbedsVision<E, <E as encoder_model::Vision>::SmallRows>
+            + EmbedsVision<E, <E as encoder_model::Vision>::LargeRows>,
     {
         assert_launch_rows(
             "vision",
-            <E as encoder_model::Vision>::Short::SIZE,
-            <E as encoder_model::Vision>::Long::SIZE,
+            <E as encoder_model::Vision>::SmallRows::SIZE,
+            <E as encoder_model::Vision>::LargeRows::SIZE,
         );
         self.vision = Some(Box::new(VisionExecutor(Arc::clone(&self.model))));
         self
@@ -200,13 +200,13 @@ where
     pub(crate) fn audio(mut self) -> Self
     where
         E: encoder_model::Audio,
-        for<'a> E::View<'a>: EmbedsAudio<E, <E as encoder_model::Audio>::Short>
-            + EmbedsAudio<E, <E as encoder_model::Audio>::Long>,
+        for<'a> E::View<'a>: EmbedsAudio<E, <E as encoder_model::Audio>::SmallRows>
+            + EmbedsAudio<E, <E as encoder_model::Audio>::LargeRows>,
     {
         assert_launch_rows(
             "audio",
-            <E as encoder_model::Audio>::Short::SIZE,
-            <E as encoder_model::Audio>::Long::SIZE,
+            <E as encoder_model::Audio>::SmallRows::SIZE,
+            <E as encoder_model::Audio>::LargeRows::SIZE,
         );
         self.audio = Some(Box::new(AudioExecutor(Arc::clone(&self.model))));
         self
@@ -226,14 +226,14 @@ where
 }
 
 /// Assert a valid compiled launch shape while registering the model path.
-fn assert_launch_rows(modality: &str, short: usize, long: usize) {
+fn assert_launch_rows(modality: &str, small_rows: usize, large_rows: usize) {
     assert!(
-        short > 0,
-        "{modality} short launch row count must be positive"
+        small_rows > 0,
+        "{modality} small launch row count must be positive"
     );
     assert!(
-        short <= long,
-        "{modality} short launch row count must not exceed long launch row count"
+        small_rows <= large_rows,
+        "{modality} small launch row count must not exceed large launch row count"
     );
 }
 
@@ -300,8 +300,8 @@ async fn embed_vision<E>(
 ) -> io::Result<Vec<HbmTensor>>
 where
     E: encoder_model::Encoder + encoder_model::Vision + Sync,
-    for<'a> E::View<'a>: EmbedsVision<E, <E as encoder_model::Vision>::Short>
-        + EmbedsVision<E, <E as encoder_model::Vision>::Long>,
+    for<'a> E::View<'a>: EmbedsVision<E, <E as encoder_model::Vision>::SmallRows>
+        + EmbedsVision<E, <E as encoder_model::Vision>::LargeRows>,
 {
     validate_positions(
         images.iter().flat_map(|image| image.positions.iter()),
@@ -311,9 +311,9 @@ where
         .map(Image::patches::<Symbol<<E as encoder_model::Vision>::Patch>>)
         .collect::<io::Result<Vec<_>>>()?;
     let counts: Vec<_> = patches.iter().map(Rows::len).collect();
-    let short = <E as encoder_model::Vision>::Short::SIZE;
-    let long = <E as encoder_model::Vision>::Long::SIZE;
-    let launches = launches(counts.iter().copied(), long);
+    let small_rows = <E as encoder_model::Vision>::SmallRows::SIZE;
+    let large_rows = <E as encoder_model::Vision>::LargeRows::SIZE;
+    let launches = launches(counts.iter().copied(), large_rows);
     let mut output =
         output_buffers::<Symbol<<E as encoder_model::Encoder>::Text>>(device, &counts, &launches)?;
     for launch in &launches {
@@ -333,13 +333,13 @@ where
             .zip(&chunks)
             .map(|(item, patches)| (patches, &images[item.item].positions[item.rows.clone()]))
             .collect();
-        let rows = match fits_short(launch.rows, short) {
+        let rows = match fits_small(launch.rows, small_rows) {
             true => {
-                embed_patches::<E, <E as encoder_model::Vision>::Short>(encoder, device, &items)
+                embed_patches::<E, <E as encoder_model::Vision>::SmallRows>(encoder, device, &items)
                     .await?
             }
             false => {
-                embed_patches::<E, <E as encoder_model::Vision>::Long>(encoder, device, &items)
+                embed_patches::<E, <E as encoder_model::Vision>::LargeRows>(encoder, device, &items)
                     .await?
             }
         };
@@ -356,16 +356,16 @@ async fn embed_audio<E>(
 ) -> io::Result<Vec<HbmTensor>>
 where
     E: encoder_model::Encoder + encoder_model::Audio + Sync,
-    for<'a> E::View<'a>: EmbedsAudio<E, <E as encoder_model::Audio>::Short>
-        + EmbedsAudio<E, <E as encoder_model::Audio>::Long>,
+    for<'a> E::View<'a>: EmbedsAudio<E, <E as encoder_model::Audio>::SmallRows>
+        + EmbedsAudio<E, <E as encoder_model::Audio>::LargeRows>,
 {
     let frames = (clips.iter())
         .map(Audio::frames::<Symbol<<E as encoder_model::Audio>::Samples>>)
         .collect::<io::Result<Vec<_>>>()?;
     let counts: Vec<_> = frames.iter().map(Rows::len).collect();
-    let short = <E as encoder_model::Audio>::Short::SIZE;
-    let long = <E as encoder_model::Audio>::Long::SIZE;
-    let launches = launches(counts.iter().copied(), long);
+    let small_rows = <E as encoder_model::Audio>::SmallRows::SIZE;
+    let large_rows = <E as encoder_model::Audio>::LargeRows::SIZE;
+    let launches = launches(counts.iter().copied(), large_rows);
     let mut output =
         output_buffers::<Symbol<<E as encoder_model::Encoder>::Text>>(device, &counts, &launches)?;
     for launch in &launches {
@@ -380,13 +380,13 @@ where
             })
             .collect::<io::Result<_>>()?;
         let items: Vec<_> = chunks.iter().collect();
-        let rows = match fits_short(launch.rows, short) {
+        let rows = match fits_small(launch.rows, small_rows) {
             true => {
-                embed_frames::<E, <E as encoder_model::Audio>::Short>(encoder, device, &items)
+                embed_frames::<E, <E as encoder_model::Audio>::SmallRows>(encoder, device, &items)
                     .await?
             }
             false => {
-                embed_frames::<E, <E as encoder_model::Audio>::Long>(encoder, device, &items)
+                embed_frames::<E, <E as encoder_model::Audio>::LargeRows>(encoder, device, &items)
                     .await?
             }
         };

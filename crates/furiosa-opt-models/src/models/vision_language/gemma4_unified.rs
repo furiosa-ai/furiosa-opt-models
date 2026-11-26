@@ -15,7 +15,7 @@
 use furiosa_opt_std::prelude::*;
 use serde::Deserialize;
 
-use crate::encoder::{Audio as AudioCapability, Encoder as MediaEncoder, PositionAxis, Vision};
+use crate::encoder::{self, Coordinate};
 use crate::load::{Checkpoint, Load, LoadError, Named};
 use crate::models::config::{self, Constant, Literal};
 use crate::models::{Class, Implements};
@@ -35,8 +35,8 @@ axes![
     Samples = 640,
     Positions = 1120,
     Coordinates = 2,
-    Short = 512,
-    Long = 2304
+    SmallRows = 512,
+    LargeRows = 2304
 ];
 
 /// A merged patch's features: 48 x 48 pixels of three channels.
@@ -49,7 +49,7 @@ pub type Frames<R> = HbmTensor<bf16, Chip, m![R, Samples]>;
 pub type Rows<R> = HbmTensor<bf16, Chip, m![R, Text]>;
 
 /// The byte offset of each patch's row in the factorized position table for one coordinate:
-/// [`offset`](Vision::offset) of its x, or of its y.
+/// [`offset`](encoder::Vision::offset) of its x, or of its y.
 pub type Offsets<R> = HbmTensor<i32, Chip, m![R]>;
 
 /// The factorized position table as stored, `[positions, coordinates, features]`: a table of rows
@@ -268,27 +268,27 @@ where
 
 /// Launches of 512 or 2304 rows; a patch's operand is the byte offset of the [`Table`] row its
 /// coordinate reads.
-impl MediaEncoder for Encoder<Hbm> {
+impl encoder::Encoder for Encoder<Hbm> {
     type Text = Text;
     type View<'a> = Encoder<&'a Hbm>;
 }
 
-impl Vision for Encoder<Hbm> {
-    type Short = Short;
-    type Long = Long;
+impl encoder::Vision for Encoder<Hbm> {
+    type SmallRows = SmallRows;
+    type LargeRows = LargeRows;
     type Patch = Patch;
     type Positions = Positions;
     type VisionState = (VisionState, ProjectionState);
 
-    fn offset(position: usize, coordinate: PositionAxis) -> i32 {
+    fn offset(position: usize, coordinate: Coordinate) -> i32 {
         ((Coordinates::SIZE * position + coordinate.index()) * Embed::SIZE * size_of::<bf16>())
             as i32
     }
 }
 
-impl AudioCapability for Encoder<Hbm> {
-    type Short = Short;
-    type Long = Long;
+impl encoder::Audio for Encoder<Hbm> {
+    type SmallRows = SmallRows;
+    type LargeRows = LargeRows;
     type Samples = Samples;
     type AudioState = ProjectionState;
 }

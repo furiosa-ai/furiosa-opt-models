@@ -7,16 +7,16 @@
 use crate::load::Load;
 use furiosa_opt_std::prelude::{AxisName, DeviceSend};
 
-/// One coordinate of a positioned vision patch.
+/// One x/y coordinate of a positioned vision patch.
 #[derive(Clone, Copy)]
-pub enum PositionAxis {
+pub enum Coordinate {
     /// Horizontal position.
     X,
     /// Vertical position.
     Y,
 }
 
-impl PositionAxis {
+impl Coordinate {
     /// The coordinate's index in an `(x, y)` position.
     pub const fn index(self) -> usize {
         match self {
@@ -42,10 +42,10 @@ pub trait Encoder {
 
 /// A model capability that maps positioned image patches to output rows.
 pub trait Vision: Encoder {
-    /// A positive row count of a launch whose items fit in the short kernel, no greater than `Long`.
-    type Short: AxisName + Send + Sync;
-    /// A positive row count of the long kernel, the most one launch holds.
-    type Long: AxisName + Send + Sync;
+    /// The positive row count of the small vision launch variant.
+    type SmallRows: AxisName + Send + Sync;
+    /// The maximum row count of one large vision launch; no smaller than `SmallRows`.
+    type LargeRows: AxisName + Send + Sync;
     /// A patch's feature width.
     type Patch: AxisName + Send + Sync;
     /// The extent of each coordinate in the model's position table.
@@ -54,15 +54,15 @@ pub trait Vision: Encoder {
     type VisionState: Default + DeviceSend + Send;
 
     /// The byte offset for one coordinate of a patch position.
-    fn offset(position: usize, coordinate: PositionAxis) -> i32;
+    fn offset(position: usize, coordinate: Coordinate) -> i32;
 }
 
 /// A model capability that maps audio-frame samples to output rows.
 pub trait Audio: Encoder {
-    /// A positive row count of a launch whose items fit in the short kernel, no greater than `Long`.
-    type Short: AxisName + Send + Sync;
-    /// A positive row count of the long kernel, the most one launch holds.
-    type Long: AxisName + Send + Sync;
+    /// The positive row count of the small audio launch variant.
+    type SmallRows: AxisName + Send + Sync;
+    /// The maximum row count of one large audio launch; no smaller than `SmallRows`.
+    type LargeRows: AxisName + Send + Sync;
     /// A frame's sample width.
     type Samples: AxisName + Send + Sync;
     /// State kept while one audio launch runs.

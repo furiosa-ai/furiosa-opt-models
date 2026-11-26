@@ -165,7 +165,7 @@ where
     R: AxisName + Send + Sync,
     for<'a> E::View<'a>: EmbedsVision<E, R>,
 {
-    let offsets = |coordinate: encoder_model::PositionAxis| {
+    let offsets = |coordinate: encoder_model::Coordinate| {
         let positions = items.iter().flat_map(|(_, positions)| positions.iter());
         let mut offsets: Vec<i32> = positions
             .map(|xy| {
@@ -177,8 +177,8 @@ where
         HostTensor::<i32, m![R]>::from_vec(offsets)
     };
     let (x, y) = (
-        offsets(encoder_model::PositionAxis::X),
-        offsets(encoder_model::PositionAxis::Y),
+        offsets(encoder_model::Coordinate::X),
+        offsets(encoder_model::Coordinate::Y),
     );
     let inputs: Vec<_> = items.iter().map(|(patches, _)| *patches).collect();
     let launch = Launch::new::<R, _>(device, &inputs)?;

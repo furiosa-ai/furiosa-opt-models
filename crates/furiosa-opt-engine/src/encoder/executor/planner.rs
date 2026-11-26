@@ -33,8 +33,11 @@ pub(super) fn validate_positions<'a>(
 }
 
 /// The launches of a call of items of `rows` rows each, in order: consecutive rows packed into
-/// launches of at most `long`, keeping items that fit and splitting oversized items.
-pub(super) fn launches(rows: impl IntoIterator<Item = usize>, long: usize) -> Vec<PackedLaunch> {
+/// launches of at most `large_rows`, keeping items that fit and splitting oversized items.
+pub(super) fn launches(
+    rows: impl IntoIterator<Item = usize>,
+    large_rows: usize,
+) -> Vec<PackedLaunch> {
     // Builder validates these compile-time row counts once when registering the modality.
     let mut launches = Vec::<PackedLaunch>::new();
     for (item, count) in rows.into_iter().enumerate() {
@@ -49,10 +52,10 @@ pub(super) fn launches(rows: impl IntoIterator<Item = usize>, long: usize) -> Ve
             continue;
         }
 
-        if count <= long
+        if count <= large_rows
             && launches
                 .last()
-                .is_some_and(|launch| count > long - launch.rows)
+                .is_some_and(|launch| count > large_rows - launch.rows)
         {
             launches.push(PackedLaunch {
                 items: Vec::new(),
@@ -62,14 +65,17 @@ pub(super) fn launches(rows: impl IntoIterator<Item = usize>, long: usize) -> Ve
 
         let mut start = 0;
         while start < count {
-            if launches.last().map_or(true, |launch| launch.rows == long) {
+            if launches
+                .last()
+                .map_or(true, |launch| launch.rows == large_rows)
+            {
                 launches.push(PackedLaunch {
                     items: Vec::new(),
                     rows: 0,
                 });
             }
             let launch = launches.last_mut().expect("a launch was just added");
-            let rows = (count - start).min(long - launch.rows);
+            let rows = (count - start).min(large_rows - launch.rows);
             let end = start + rows;
             launch.items.push(ItemRows {
                 item,
@@ -82,19 +88,19 @@ pub(super) fn launches(rows: impl IntoIterator<Item = usize>, long: usize) -> Ve
     launches
 }
 
-/// Whether a packed launch fits the encoder's short row count.
-pub(super) fn fits_short(rows: usize, short: usize) -> bool {
-    rows <= short
+/// Whether a packed launch fits the encoder's small row count.
+pub(super) fn fits_small(rows: usize, small_rows: usize) -> bool {
+    rows <= small_rows
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ItemRows, PackedLaunch, fits_short, launches, validate_positions};
+    use super::{ItemRows, PackedLaunch, fits_small, launches, validate_positions};
     use std::io;
 
     #[test]
-    fn packs_ordered_items_at_short_and_long_boundaries() {
-        // Two images fit one short launch; next image (video frames) needs long launch.
+    fn packs_ordered_items_at_small_and_large_boundaries() {
+        // Two images fit one small launch; next image (video frames) needs a large launch.
         let packed = launches([256, 256, 2304], 2304);
 
         assert_eq!(
@@ -122,8 +128,8 @@ mod tests {
                 }
             ]
         );
-        assert!(fits_short(packed[0].rows, 512));
-        assert!(!fits_short(packed[1].rows, 512));
+        assert!(fits_small(packed[0].rows, 512));
+        assert!(!fits_small(packed[1].rows, 512));
     }
 
     #[test]
@@ -155,8 +161,8 @@ mod tests {
                 }
             ]
         );
-        assert!(!fits_short(packed[0].rows, 512));
-        assert!(fits_short(packed[1].rows, 512));
+        assert!(!fits_small(packed[0].rows, 512));
+        assert!(fits_small(packed[1].rows, 512));
     }
 
     #[test]
