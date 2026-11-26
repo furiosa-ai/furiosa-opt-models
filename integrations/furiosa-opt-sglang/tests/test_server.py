@@ -58,6 +58,7 @@ PARSING = DEFAULT | {
     ]
 }
 PROMPTS = ["The capital of France is Paris. " * 5, "What is a compiler?"]
+NO_PREFIX_CACHE = "--no-enable-prefix-caching"
 CACHE_DTYPE = "--kv-cache-dtype"
 """The one row flag SGLang reads as vLLM does; the others select vLLM's own loading."""
 TOP = 5
@@ -217,7 +218,11 @@ class Chips:
                         {"is_matryoshka": True} if embedding else {"language_model_only": True}
                     ),
                     *shared(row.get("serve", [])),
-                    *(["--disable-radix-cache"] if row.get("disable_radix_cache") else []),
+                    *(
+                        ["--disable-radix-cache"]
+                        if row.get("disable_radix_cache") or NO_PREFIX_CACHE in row.get("serve", [])
+                        else []
+                    ),
                     # Small budgets prefill every prompt in several chunks and batch two requests.
                     "--context-length",
                     "128",
@@ -542,7 +547,7 @@ def test_bounds_context_by_the_window(
 @pytest.mark.parametrize(
     "server",
     [
-        *served(TEXT),
+        *served([row for row in TEXT if NO_PREFIX_CACHE not in row.get("serve", [])]),
         # Deterministic inference keeps the radix cache, whose prefixes a batch-invariant load reads
         # as it wrote them.
         pytest.param(

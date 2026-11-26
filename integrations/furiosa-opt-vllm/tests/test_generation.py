@@ -51,7 +51,7 @@ def llm(options: dict[str, Any], window: int) -> Generator["LLM"]:
             "max_num_seqs": 2,
             "max_num_batched_tokens": BUDGET,
             "enable_chunked_prefill": True,
-            "enable_prefix_caching": True,
+            "enable_prefix_caching": options.get("enable_prefix_caching", True),
             "enable_prompt_embeds": True,
             "max_logprobs": -1,
         }
@@ -163,9 +163,13 @@ def test_long_context_matches_transformers(
 
 
 @pytest.mark.feature("Automatic prefix caching")
-def test_prefix_cache(llm: "LLM", tokenizer: "PreTrainedTokenizerBase", window: int) -> None:
+def test_prefix_cache(
+    llm: "LLM", options: dict[str, Any], tokenizer: "PreTrainedTokenizerBase", window: int
+) -> None:
     from vllm import SamplingParams
 
+    if options.get("enable_prefix_caching") is False:
+        pytest.skip("this checkpoint disables cross-request prefix caching")
     prompt = long_prompt(tokenizer, window)
     greedy = SamplingParams(temperature=0, max_tokens=4)
     # Earlier tests may have cached this prompt; the first request below must miss.

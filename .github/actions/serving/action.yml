@@ -14,9 +14,31 @@ runs:
         # The engine core runs inside the server process, sparing a second import at startup.
         VLLM_ENABLE_V1_MULTIPROCESSING: '0'
       run: |
+        set -o pipefail
         inventory=.github/benchmarks.json
+        log="$RUNNER_TEMP/serving-sweep.log"
         while read -r checkpoint; do
           [ -n "$checkpoint" ] || continue
+          # These nightly checkpoints stay in the inventory and run until serving works.
+          # Match the reported refusal so device, download, and other failures stay red.
+          expected=""
+          if [[ "$TIER" == nightly ]]; then
+            case "$checkpoint" in
+              # Decoder support is in PR #46.
+              RedHatAI/Mistral-Nemo-Instruct-2407-FP8)
+                expected="hidden_size: 5120, the size Mistral-7B holds 4096" ;;
+              # Text serving is in PR #29.
+              unsloth/gemma-4-12b-it-NVFP4)
+                expected="encoder: unsupported, a media encoder loads alone, so choose the encoder" ;;
+              mistralai/Mistral-7B-v0.1)
+                expected="unsupported, sliding_window: the size attends the whole history" ;;
+              Qwen/Qwen3-Reranker-0.6B|Qwen/Qwen3-Reranker-4B|Qwen/Qwen3-Reranker-8B)
+                expected="classifier_from_token reads vocabulary scores, which the engine does not return" ;;
+              tomaarsen/Qwen3-Reranker-0.6B-seq-cls)
+                expected="['Qwen3ForSequenceClassification'] has no score head to classify with" ;;
+            esac
+          fi
+          measured=false
           task="$(jq -er --arg id "$checkpoint" '.models[] | select(.id == $id) | .task' "$inventory")"
           # The task's workloads of the tier; a task the tier does not serve sweeps nothing.
           workloads="$(jq -c --arg t "$TIER" --arg task "$task" '.tasks[$task].serving[$t] // [] | .[]' "$inventory")"
@@ -51,9 +73,20 @@ runs:
               | @sh' "$inventory")"
             # `sweep/<org>--<checkpoint>/<lengths>/` names what the metrics action tags.
             directory="sweep/$(tr '[:upper:]' '[:lower:]' <<< "${checkpoint/\//--}")"
-            python3 -m vllm.benchmarks.sweep.serve --output-dir "$directory" --experiment-name "$lengths" --num-runs 1 \
+            if python3 -m vllm.benchmarks.sweep.serve --output-dir "$directory" --experiment-name "$lengths" --num-runs 1 \
               --bench-params widths.json \
               --serve-cmd "vllm serve $checkpoint $serve" \
-              --bench-cmd "vllm bench serve --model $checkpoint $bench"
+              --bench-cmd "vllm bench serve --model $checkpoint $bench" 2>&1 | tee "$log"; then
+              measured=true
+            elif [[ -n "$expected" ]] && grep -Fq -- "$expected" "$log"; then
+              echo "::notice::XFAIL $checkpoint: $expected"
+              continue 2
+            else
+              exit 1
+            fi
           done <<< "$workloads"
+          if [[ -n "$expected" && "$measured" == true ]]; then
+            echo "::error::XPASS $checkpoint: remove its nightly expected failure"
+            exit 1
+          fi
         done <<< "$CHECKPOINTS"
