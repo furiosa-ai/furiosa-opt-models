@@ -1,19 +1,19 @@
 # Mooncake compatibility and upgrades
 
-Use this page to review adapter contracts after changing SGLang, vLLM, or Mooncake dependencies.
-Serving pages own supported behavior and Store configuration; the [installation guide](../getting-started/installation.md)
-owns package and system dependencies. Exact version ranges live in plugin manifests, which the
-Mooncake contract workflow reads.
+Use this page to review Mooncake storage adapter contracts after changing SGLang, vLLM, or Mooncake
+dependencies. It covers storage only; the [serving guide](../serving/index.md) owns the separate
+KV-transfer support status. Serving pages own Store configuration, and the
+[installation guide](../getting-started/installation.md) owns package and system dependencies.
+Exact version ranges live in plugin manifests, which the Mooncake contract workflow reads.
 
 ## Adapter paths
 
-KV storage and disaggregated KV transfer use different framework lifecycles, buffers, and completion
-contracts. Do not infer that one path works because the other does.
+The two storage adapters preserve their frameworks' native prefix-cache lifecycles.
 
-| Framework | KV storage | Disaggregated KV transfer | Same-server support |
-| --- | --- | --- | --- |
-| vLLM | `FuriosaMooncakeStoreConnector` reuses upstream Store scheduling and keys; its worker stages engine pages. | `MooncakeConnector` transfers request KV through staging buffers. | One direct KV connector per worker: Store, P2P transfer and `--kv-offloading-size` offload cannot be composed. |
-| SGLang | HiCache uses `MooncakeStore` for pages. | `MooncakeKVManager` and `MooncakeKVReceiver` follow the disaggregation lifecycle. | Decode-side HiCache is excluded during prefill/decode disaggregation; prefill-side storage has not been established. |
+| Framework | Storage integration | Upstream boundary |
+| --- | --- | --- |
+| vLLM | `FuriosaMooncakeStoreConnector` stages engine pages through its worker. | Reuses upstream Store scheduling and prefix-cache keys. |
+| SGLang | HiCache uses `MooncakeStore` for engine pages. | Reuses upstream HiCache lookup and storage lifecycle. |
 
 ## Dependency declarations
 
@@ -28,8 +28,8 @@ values.
 
 ## Framework upgrade contracts
 
-Review the adapter-specific framework APIs whenever a framework dependency changes. Storage and
-transfer adapters have separate upgrade surfaces and require separate regression coverage.
+Review the storage adapter's framework APIs whenever a framework dependency changes. This page does
+not establish compatibility for disaggregated KV transfer.
 
 ### SGLang
 
@@ -49,16 +49,6 @@ For storage, review `FuriosaHiCacheMooncake` in
 - Check that `offload.py` still selects the backend through SGLang's dynamic storage configuration
   and that `platform.py` still accepts `mooncake`.
 
-SGLang transfer depends on separate disaggregation hooks. If that adapter is in the release, review
-`FuriosaMooncakeKVManager` and `FuriosaMooncakeKVReceiver` in the transfer implementation:
-
-- Check the manager's staging registration, buffer initialization, peer registration, cache
-  attachment, and staged-transfer methods against SGLang's current lifecycle.
-- Revalidate `_staging_ctx`, `kv_args`, peer-registration metadata, `engine.batch_register`, and
-  `_transfer_data` contracts.
-- Check manager selection in `hooks.py` and rerun transfer scheduling, registration, page-layout,
-  and completion tests.
-
 ### vLLM
 
 vLLM storage depends on upstream's native Store scheduler and key contract. Review
@@ -76,16 +66,6 @@ vLLM storage depends on upstream's native Store scheduler and key contract. Revi
 - Keep Paged full/sliding support explicit; the adapter rejects `State` and `Cross` cache groups.
 - The adapter replaces upstream's receiver, so retain upstream's Mooncake disk GET budget,
   usable-ratio, batch-splitting and oversized-key failure behavior.
-
-The direct vLLM P2P transfer connector is a separate upgrade surface. If it is in the release,
-review `FuriosaMooncakeConnector` in `integrations/furiosa-opt-vllm/furiosa_opt_vllm/mooncake.py`:
-
-- Check its `MooncakeConnector` base-class hooks, registration methods, load submission, transfer
-  results, and shutdown behavior.
-- Revalidate connector metadata (`reqs_to_send`, `reqs_to_recv`) and worker fields
-  (`block_len_per_layer`, `kv_block_len_per_layer`).
-- Keep P2P transfer tests separate from Store tests, even when both are in
-  `tests/test_mooncake.py`.
 
 ## Shared storage safety contracts
 
@@ -110,7 +90,7 @@ described in the [vLLM](../serving/vllm.md#shared-mooncake-store-prefix-cache) a
 `MooncakeIOGuard` retains page leases and Store state when I/O completion is uncertain. The accepted
 GET/PUT outcomes are defined by the shared classifier in `_mooncake.py`; do not widen it unless the
 new Mooncake contract proves pointer access has stopped, and update its failure tests with any
-change. `TransferBatch` tracks engine DMA completion and does not replace this Store-I/O guard.
+change.
 
 ## Mooncake package upgrades
 
@@ -134,16 +114,10 @@ Review the package-level Store contract used by both storage adapters:
 
 The current contract tests prove Mooncake storage over TCP only; they do not establish RDMA support.
 
-The direct transfer adapters force TCP: vLLM sets `mooncake_protocol=tcp`, while SGLang requires
-`MC_FORCE_TCP=1`. This setting addresses RDMA registration failures for engine-pinned DMA-heap
-staging memory. Storage uses a different registration path: it passes engine host-page addresses to
-`MooncakeDistributedStore.register_buffer`, which Mooncake documents for zero-copy RDMA. Therefore,
-the transfer adapters' TCP restriction does not establish the storage backend's supported transport.
-
-Before documenting another storage transport, run an RNGD check for registration, PUT, GET,
-unregistration, and shutdown with a real engine host slot under that transport. Host fakes cannot
-validate DMA-heap registration. The existing contract job starts an ephemeral local Mooncake master
-over TCP and checks multi-page vLLM and multi-key SGLang I/O; it does not benchmark performance.
+The contract tests connect the Mooncake Store over TCP and cover registration, PUT, GET,
+unregistration, and shutdown with real engine host memory on RNGD. They do not establish RDMA
+support or measure performance. Before documenting another storage transport, repeat those checks
+on RNGD with that transport; host fakes cannot validate DMA-heap registration.
 
 ## Version-change verification
 
@@ -151,11 +125,10 @@ The required Mooncake contract workflow in `.github/workflows/test.yml` builds w
 minimum declared Mooncake version plus the newest stable allowed 0.3.x release on RNGD. It derives
 the minimum from both plugin manifests and runs one matrix entry if minimum and latest match.
 
-| Framework | Contract workflow | Additional adapter regression tests |
-| --- | --- | --- |
-| vLLM | `integrations/furiosa-opt-vllm/tests/test_mooncake.py`; `integrations/mooncake-contract-tests/test_vllm.py` | `integrations/furiosa-opt-vllm/tests/test_offload.py`; `integrations/furiosa-opt-vllm/tests/test_vllm_platform.py` |
-| SGLang | `integrations/furiosa-opt-sglang/tests/test_cache_transfer.py`; `integrations/furiosa-opt-sglang/tests/test_mooncake.py`; `integrations/mooncake-contract-tests/test_sglang.py` | `integrations/furiosa-opt-sglang/tests/test_platform.py` |
+| Framework | Minimum/latest and RNGD contract tests |
+| --- | --- |
+| vLLM | `integrations/furiosa-opt-vllm/tests/test_mooncake.py`; `integrations/mooncake-contract-tests/test_vllm.py` |
+| SGLang | `integrations/furiosa-opt-sglang/tests/test_cache_transfer.py`; `integrations/furiosa-opt-sglang/tests/test_mooncake.py`; `integrations/mooncake-contract-tests/test_sglang.py` |
 
-Run the additional regression tests when changing their framework integration; the contract workflow
-does not invoke those files. Keep mocked adapter checks separate from RNGD registration and pointer
-I/O checks. Never simulate RNGD kernels on CPU.
+Keep mocked adapter checks separate from RNGD registration and pointer-I/O checks. Never simulate
+RNGD kernels on CPU.
