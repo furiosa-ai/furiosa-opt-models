@@ -5,7 +5,9 @@ use crate::tensor::live::Live;
 use core::marker::PhantomData;
 
 /// A panel's contraction over the live waves, each wave's TRF fill one wave ahead.
-pub(super) struct Sweep;
+pub(super) struct Sweep {
+    compact: bool,
+}
 
 impl<'a, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>
     Op<(
@@ -29,12 +31,16 @@ impl<'a, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>
             (usize, usize),
         ),
     ) -> Self::Output {
+        if self.compact && rows <= 16 {
+            short_single(context, weight, input, panel, output, term, rows);
+            return first;
+        }
         let mut current = first;
         for wave in 0..live {
             let next = (wave + 5 - live) / 4;
             let filled = Fill.forward(&mut *context, (input, (panel, wave + 1 - next * live)));
             Contract.forward(
-                &mut *context,
+                context,
                 ((weight, &current), (&mut *output, term, wave), rows),
             );
             current = filled;
@@ -65,6 +71,10 @@ impl<'a, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>
             (usize, usize),
         ),
     ) -> Self::Output {
+        if self.compact && rows <= 16 {
+            short_pair(context, weight, input, panel, output, rows);
+            return first;
+        }
         let mut current = first;
         for wave in 0..live {
             let next = (wave + 5 - live) / 4;
@@ -72,10 +82,7 @@ impl<'a, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>
                 &mut *context,
                 (input, (panel + next, wave + 1 - next * live)),
             );
-            Contract.forward(
-                &mut *context,
-                ((weight, &current), (&mut *output, wave), rows),
-            );
+            Contract.forward(context, ((weight, &current), (&mut *output, wave), rows));
             current = filled;
         }
         current
@@ -105,42 +112,102 @@ impl<'t, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: Axi
             Live<&'t Owned<Hidden, Rows>, Capacity>,
         ),
     ) -> Self::Output {
-        const { assert!(Hidden::SIZE / 1024 == 4, "written for four passes") };
-        let waves = (normalized.count::<axis::Rows<128>>(), normalized.rows());
-        let (live, rows) = waves;
-        let normalized = *normalized.value();
-        let packed =
-            gate::Pack::<Rows, Hidden, _, _>(PhantomData).forward(&mut *context, normalized.view());
-        let stored = gate::Store.forward(&mut *context, (&packed, (live, rows)));
-        let scales = InputScales.forward(&mut *context, normalized);
-        let scales: DmTensor<
-            bf16,
-            Chip,
-            Cluster<Intermediate>,
-            Slice<Intermediate, Rows>,
-            m![Rows % (Rows / 8)],
-        > = scales.to_dm(&mut context.tdma);
-        let input =
-            Tiles::<Intermediate>(PhantomData).forward(&mut *context, (&stored, (live, rows)));
-        let pair = |context: &mut Device, panel: usize| -> GateUp<Hidden, Intermediate> {
-            self.forward(context, Begin(panel))
-        };
-        let second = pair(context, 1);
-        let scale = FetchRows.forward(&mut *context, scales.view());
-        // SAFETY: both partitions copy rows over the outer digit and keep rows in the inner digit.
-        let scales = unsafe {
-            scales.reshape::<Chip, Cluster<Intermediate>,
+        forward(
+            context,
+            &self.0,
+            first,
+            normalized,
+            false,
+            (
+                |context, normalized, _| InputScales.forward(context, normalized),
+                |device| channel_scales(device, &self.1, 0),
+                |device| channel_scales(device, &self.1, 1),
+                |_| (),
+            ),
+        )
+        .0
+    }
+}
+
+pub(super) fn channel_scales<I: AxisName, R: AxisName, S: MaterializableScalar>(
+    device: &mut Device,
+    weights: &HbmTensor<S, Chip, m![Term, I]>,
+    term: usize,
+) -> Channels<I, R, S> {
+    weights
+        .view()
+        .tile::<m![Term], 1, m![Term = 1 # 2, I]>(term)
+        .to_dm(&mut device.tdma)
+}
+
+/// The shared slab schedule, with an optional compact contraction for token-scaled inputs.
+pub(super) fn forward<
+    Hidden: AxisName,
+    Intermediate: AxisName,
+    Rows: AxisName,
+    Capacity: AxisName,
+    D: MaterializableScalar + FetchCast<f32>,
+    S: MaterializableScalar + FetchCast<f32>,
+    P,
+>(
+    context: &mut Device,
+    weights: &HbmTensor<f8e4m3, Chip, Blocked<Hidden, Intermediate>>,
+    first: GateUp<Hidden, Intermediate>,
+    normalized: Live<&Owned<Hidden, Rows>, Capacity>,
+    compact: bool,
+    (scales, gate_channels, up_channels, before_final_slab): (
+        impl FnOnce(&mut Device, &Owned<Hidden, Rows>, usize) -> HbmTensor<D, Chip, m![Rows]>,
+        impl FnOnce(&mut Device) -> Channels<Intermediate, Rows, S>,
+        impl FnOnce(&mut Device) -> Channels<Intermediate, Rows, S>,
+        impl FnOnce(&mut Device) -> P,
+    ),
+) -> (
+    (
+        Projection<Intermediate, Rows>,
+        Projection<Intermediate, Rows>,
+    ),
+    P,
+) {
+    const { assert!(Hidden::SIZE / 1024 == 4, "written for four passes") };
+    let sweep = Sweep { compact };
+    let waves = (normalized.count::<axis::Rows<128>>(), normalized.rows());
+    let (live, rows) = waves;
+    let normalized = *normalized.value();
+    let packed =
+        gate::Pack::<Rows, Hidden, _, _>(PhantomData).forward(&mut *context, normalized.view());
+    let stored = gate::Store.forward(&mut *context, (&packed, (live, rows)));
+    let scales = scales(&mut *context, normalized, rows);
+    let scales: DmTensor<
+        D,
+        Chip,
+        Cluster<Intermediate>,
+        Slice<Intermediate, Rows>,
+        m![Rows % (Rows / 8)],
+    > = scales.to_dm(&mut context.tdma);
+    let input = Tiles::<Intermediate>(PhantomData).forward(&mut *context, (&stored, (live, rows)));
+    let pair = |context: &mut Device, panel: usize| -> GateUp<Hidden, Intermediate> {
+        stage_gate_up(context, weights, panel)
+    };
+    let second = pair(context, 1);
+    let scale = FetchRows.forward(&mut *context, scales.view());
+    // SAFETY: both partitions copy rows over the outer digit and keep rows in the inner digit.
+    let scales = unsafe {
+        scales.reshape::<Chip, Cluster<Intermediate>,
                 m![Hidden % 1024 / 32, Rows / (Rows / 8)], m![Rows % (Rows / 8)]>()
-        };
-        let tiles = [
-            FetchTile.forward(&mut *context, (&scales, 0)),
-            FetchTile.forward(&mut *context, (&scales, 1)),
-            FetchTile.forward(&mut *context, (&scales, 2)),
-            FetchTile.forward(&mut *context, (&scales, 3)),
-        ];
-        let mut first_tile = Input::<Hidden, Intermediate, Rows>::new();
-        Quantize.forward(&mut *context, (&input[0], (&tiles[0], 0), &mut first_tile));
-        let l = Fill.forward(&mut *context, (&first_tile, (0, 0)));
+    };
+    let tiles = [
+        FetchTile.forward(&mut *context, (&scales, 0)),
+        FetchTile.forward(&mut *context, (&scales, 1)),
+        FetchTile.forward(&mut *context, (&scales, 2)),
+        FetchTile.forward(&mut *context, (&scales, 3)),
+    ];
+    let mut first_tile = Input::<Hidden, Intermediate, Rows>::new();
+    Quantize.forward(&mut *context, (&input[0], (&tiles[0], 0), &mut first_tile));
+    let l = Fill.forward(&mut *context, (&first_tile, (0, 0)));
+    // Short launches use only the already-quantized first wave, for all four input slabs.
+    let quantized = if compact && rows <= 16 {
+        first_tile
+    } else {
         let mut quantized = Input::<Hidden, Intermediate, Rows>::new();
         #[unroll]
         for wave in 0..4 {
@@ -149,67 +216,70 @@ impl<'t, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, Capacity: Axi
                 (&input[wave], (&tiles[wave], wave), &mut quantized),
             );
         }
-        let channels = |context: &mut Device, term: usize| -> ChannelScale<Intermediate, Rows> {
-            let channels: Channels<Intermediate, Rows> = self
-                .1
-                .view()
-                .tile::<m![Term], 1, m![Term = 1 # 2, Intermediate]>(term)
-                .to_dm(&mut context.tdma);
-            FetchChannels.forward(&mut *context, &channels)
-        };
-        let panel = |context: &mut Device, term: usize| -> Panel<Hidden, Intermediate> {
-            self.0
-                .view()
-                .tile::<m![Term], 1, m![Term = 1 # 2, Hidden / 1024,
+        quantized
+    };
+    let panel = |context: &mut Device, term: usize| -> Panel<Hidden, Intermediate> {
+        weights
+            .view()
+            .tile::<m![Term], 1, m![Term = 1 # 2, Hidden / 1024,
                     Intermediate / (Intermediate / 64), Hidden % 1024 / 128,
                     { Out<Intermediate> }, Hidden % 128]>(term)
-                .tile::<m![Hidden / 1024], 1, m![Term = 1 # 2,
+            .tile::<m![Hidden / 1024], 1, m![Term = 1 # 2,
                     Hidden / 1024 = 1 # (Hidden / 1024), Intermediate / (Intermediate / 64),
                     Hidden % 1024 / 128, { Out<Intermediate> }, Hidden % 128]>(
-                    const { Hidden::SIZE / 1024 - 1 },
-                )
-                .to_dm(&mut context.tdma)
-        };
-        let add = |context: &mut Device,
-                   (left, right): (&Both<Intermediate, Rows>, &Both<Intermediate, Rows>)|
-         -> Both<Intermediate, Rows> {
-            let mut sums: Both<Intermediate, Rows> = DmTensor::new();
-            Add::of::<
-                m![Rows % (Rows / 8), Term],
-                m![{ Out<Intermediate> } / 8],
-                m![{ Out<Intermediate> } % 8],
-                Side,
-                _,
-                _,
-                _,
-                _,
-            >(&mut *context, (left, right))
-            .commit_view(sums.view_mut());
-            sums
-        };
-        let mut b0: Both<Intermediate, Rows> = DmTensor::new();
-        let l = Sweep.forward(&mut *context, (&quantized, &first, &mut b0, (0, l), waves));
-        let third = pair(context, 2);
-        let mut b1: Both<Intermediate, Rows> = DmTensor::new();
-        let l = Sweep.forward(&mut *context, (&quantized, &second, &mut b1, (1, l), waves));
-        let sums = add(context, (&b0, &b1));
-        let (g3, u3) = (panel(context, 0), panel(context, 1));
-        let mut b2: Both<Intermediate, Rows> = DmTensor::new();
-        let l = Sweep.forward(&mut *context, (&quantized, &third, &mut b2, (2, l), waves));
-        let sums = add(context, (&sums, &b2));
-        let mut b3: Both<Intermediate, Rows> = DmTensor::new();
-        let l = Sweep.forward(
-            &mut *context,
-            (&quantized, &g3, (&mut b3, 0), (3, l), waves),
-        );
-        let channel = channels(context, 0);
-        let gate = Combine.forward(&mut *context, ((&sums, &b3, 0), (&scale, &channel), rows));
-        Sweep.forward(
-            &mut *context,
-            (&quantized, &u3, (&mut b3, 1), (3, l), waves),
-        );
-        let channel = channels(context, 1);
-        let up = Combine.forward(&mut *context, ((&sums, &b3, 1), (&scale, &channel), rows));
-        (gate, up)
-    }
+                const { Hidden::SIZE / 1024 - 1 },
+            )
+            .to_dm(&mut context.tdma)
+    };
+    let add = |context: &mut Device,
+               (left, right): (&Both<Intermediate, Rows>, &Both<Intermediate, Rows>)|
+     -> Both<Intermediate, Rows> {
+        let mut sums: Both<Intermediate, Rows> = DmTensor::new();
+        let addition = Add::of::<
+            m![Rows % (Rows / 8), Term],
+            m![{ Out<Intermediate> } / 8],
+            m![{ Out<Intermediate> } % 8],
+            Side,
+            _,
+            _,
+            _,
+            _,
+        >(&mut *context, (left, right));
+        addition.commit_view(sums.view_mut());
+        sums
+    };
+    let mut b0: Both<Intermediate, Rows> = DmTensor::new();
+    let l = sweep.forward(&mut *context, (&quantized, &first, &mut b0, (0, l), waves));
+    let third = pair(context, 2);
+    let mut b1: Both<Intermediate, Rows> = DmTensor::new();
+    let l = sweep.forward(&mut *context, (&quantized, &second, &mut b1, (1, l), waves));
+    let (sums, (g3, u3)) = if compact {
+        let last = (panel(context, 0), panel(context, 1));
+        (add(context, (&b0, &b1)), last)
+    } else {
+        (
+            add(context, (&b0, &b1)),
+            (panel(context, 0), panel(context, 1)),
+        )
+    };
+    let mut b2: Both<Intermediate, Rows> = DmTensor::new();
+    let l = sweep.forward(&mut *context, (&quantized, &third, &mut b2, (2, l), waves));
+    let sums = add(context, (&sums, &b2));
+    let prefetched = before_final_slab(context);
+    let mut b3: Both<Intermediate, Rows> = DmTensor::new();
+    let l = sweep.forward(
+        &mut *context,
+        (&quantized, &g3, (&mut b3, 0), (3, l), waves),
+    );
+    let gate_channels = gate_channels(context);
+    let channel = FetchChannels.forward(&mut *context, &gate_channels);
+    let gate = Combine.forward(&mut *context, ((&sums, &b3, 0), (&scale, &channel), rows));
+    sweep.forward(
+        &mut *context,
+        (&quantized, &u3, (&mut b3, 1), (3, l), waves),
+    );
+    let up_channels = up_channels(context);
+    let channel = FetchChannels.forward(&mut *context, &up_channels);
+    let up = Combine.forward(&mut *context, ((&sums, &b3, 1), (&scale, &channel), rows));
+    ((gate, up), prefetched)
 }

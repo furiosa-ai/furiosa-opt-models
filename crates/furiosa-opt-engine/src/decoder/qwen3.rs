@@ -391,7 +391,7 @@ macro_rules! launches {
         {
             const OUTPUT: Output = Output::Tokens;
             type Output = Rows<i32, m![1]>;
-            type Layers = <$size as Geometry>::Layers<Blocks<KvHeads, Head>>;
+            type Layers = Blocks<KvHeads, Head>;
             type Adapter = Infallible;
 
             /// The rows of a launch, a request reaching the positions its rotary table covers at
@@ -417,7 +417,12 @@ macro_rules! launches {
             }
 
             fn layers(storage: &[HbmBuffer]) -> io::Result<Self::Layers> {
-                views(storage)
+                if storage.len() != <$size as Geometry>::LAYERS {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "unexpected cache layer count"));
+                }
+                let layers = storage.iter().map(|layer| layer.alias(..).map_err(io::Error::other))
+                    .collect::<io::Result<Vec<_>>>()?;
+                Blocks::from_buffers(layers)
             }
 
             // The model is captured and launched in place, never held across an await: that `Send`
@@ -478,13 +483,10 @@ macro_rules! launches {
                     let tokens: launch::Ids<$size> = alias(&staged.tokens, ..)?;
                     let mut input: launch::Input<'_, $size> =
                         Input::new(tokens, staged.count, &operands);
-                    let slots = layers
-                        .each_mut()
-                        .map(|blocks| ((Default::default(), blocks, ()), ()));
                     let hidden = DeviceOutput::alloc(device).map_err(io::Error::other)?;
                     let tokens: launch::Tokens<$size> =
                         DeviceOutput::alloc(device).map_err(io::Error::other)?;
-                    let mut places = (((hidden, slots), ()), tokens);
+                    let mut places = (((hidden, layers), ()), tokens);
                     let state: launch::State<'_, '_, $size> = &mut places;
                     launch(forward, (&mut *device, model, (), state, &mut input))
                         .output(&mut ())
@@ -507,6 +509,7 @@ launches!(
     [B] launch::Over<qwen3::Size<"8B">, B>, qwen3::Size<"8B">;
     [] fp8::ForCausalLM, qwen3::Size<"8B">;
     [] llama::nvfp4::ForCausalLM, llama::nvfp4::Size;
+    [] llama::fp8::ForCausalLM, llama::fp8::Size;
 );
 
 #[cfg(test)]

@@ -19,10 +19,10 @@ type Wave<Hidden> = DmTensor<
 
 /// A group's normalized rows from `starts.0`, its second wave `starts.1` rows on, written where the
 /// quantization reads them; a one-wave group writes its first `groups` row groups alone.
-pub(crate) struct ToDm<G>(pub(crate) PhantomData<G>);
+pub(crate) struct ToDm<G, const HALF_WAVE: bool = false>(pub(crate) PhantomData<G>);
 
-impl<'a, Hidden: AxisName, G: Group, All: AxisName>
-    Op<(&'a Normalized<Hidden, All>, (usize, usize), usize)> for ToDm<G>
+impl<'a, Hidden: AxisName, G: Group, All: AxisName, const HALF_WAVE: bool>
+    Op<(&'a Normalized<Hidden, All>, (usize, usize), usize)> for ToDm<G, HALF_WAVE>
 {
     type Output = InDm<Hidden, G>;
 
@@ -73,6 +73,25 @@ impl<'a, Hidden: AxisName, G: Group, All: AxisName>
                         Hidden % 64 / 16, Tile % 8, Hidden % 16]>(0)
                         .tile::<m![Tile / 32], 1, m![Tile % 32 / 8 = 1 #{!} 4, Tile / 32 = 1 #{!} 4,
                         Hidden % 64 / 16, Tile % 8, Hidden % 16]>(0),
+                );
+            } else if HALF_WAVE && groups <= 8 {
+                let rows = normalized
+                    .view()
+                    .tile::<m![All / 8], 8, m![All / 8 = 8 # (All / 8), Hidden / 16, All % 8,
+                        Hidden % 16]>(start / 8);
+                // SAFETY: the window's row groups are the wave's first half, in order.
+                let rows = unsafe {
+                    rows.reshape::<
+                        Chip,
+                        m![Tile / 8 = 8 # (All / 8), Hidden / 16, Tile % 8, Hidden % 16],
+                    >()
+                };
+                rows.to_dm_view(
+                    &mut context.tdma,
+                    in_dm.view_mut().tile::<m![Tile / 32], 2, m![Tile % 32 / 8,
+                        Tile / 32 = 2 #{!} 4, Hidden % 64 / 16, Tile % 8, Hidden % 16]>(
+                        0
+                    ),
                 );
             } else {
                 let rows = normalized

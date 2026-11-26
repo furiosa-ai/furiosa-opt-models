@@ -162,7 +162,7 @@ impl<
             (
                 &Items<KvHeads, Groups, Head, WAVES>,
                 Shape,
-                (&Gather, &Blocks<KvHeads, Head>),
+                (&Gather, Layer<&Blocks<KvHeads, Head>>),
             ),
             &mut HeadRows<Rows, KvHeads, Q, Head>,
             (&H, &mut S),
@@ -185,7 +185,7 @@ where
             (
                 &Items<KvHeads, Groups, Head, WAVES>,
                 Shape,
-                (&Gather, &Blocks<KvHeads, Head>),
+                (&Gather, Layer<&Blocks<KvHeads, Head>>),
             ),
             &mut HeadRows<Rows, KvHeads, Q, Head>,
             (&H, &mut S),
@@ -300,7 +300,11 @@ pub(crate) mod tests {
         };
         let shape = items.shape();
         for _ in 0..layers.extent::<m![Layers]>() {
-            let input = (items, shape, (&Gather, &*pool));
+            let layer = Layer {
+                blocks: &*pool,
+                entry: 0,
+            };
+            let input = (items, shape, (&Gather, layer));
             Module::forward(
                 &attention,
                 &mut *device,
@@ -735,5 +739,42 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+}
+
+impl Shape {
+    pub(crate) fn single_wide(&self) -> bool {
+        self.packed.waves == 0 && self.wide.waves == 1 && self.wide.merges == 0
+    }
+}
+impl<KvHeads: AxisName, G: AxisName, Head: AxisName, const WAVES: usize>
+    Items<KvHeads, G, Head, WAVES>
+{
+    pub(crate) fn capture<Q: AxisName, Rows: AxisName, H, S, Env: Copy>(
+        &self,
+        dev: &mut Device,
+        env: Env,
+        attention: &Attention<KvHeads, G, Head>,
+        query: &HeadRows<Rows, KvHeads, G, Head>,
+        attended: &mut HeadRows<Rows, KvHeads, G, Head>,
+        plan: Shape,
+        pool: (&Gather, Layer<&Blocks<KvHeads, Head>>),
+        boundary: (&H, &mut S),
+    ) -> super::super::SingleRow<Q>
+    where
+        H: for<'d, 's> Module<&'s mut S, Env, &'d mut (), Output = ()>,
+    {
+        const {
+            assert!(G::SIZE == 4 && KvHeads::SIZE == 8 && Head::SIZE == 128 && Q::SIZE == 4096);
+        }
+        let rounded = attention.run_wide::<Waves<WAVES>, Rows, H, S, Env, true>(
+            dev,
+            env,
+            (query, attended),
+            (&self.wide, plan.wide, pool),
+            (boundary.0, boundary.1, 1),
+        );
+        // All physical slices keep their own column; row zero lives on physical slice zero.
+        unsafe { rounded.reshape() }
     }
 }

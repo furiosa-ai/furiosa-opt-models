@@ -12,7 +12,7 @@ use crate::{Module, Op};
 use super::chunks::Query;
 use std::marker::PhantomData;
 
-use crate::tensor::cache::Blocks;
+use crate::tensor::cache::{Blocks, Layer};
 use causal::CausalBlock;
 
 mod causal;
@@ -742,7 +742,7 @@ impl<
     Module<
         (
             (Input<'_, KvHeads, Groups, Head, All>, &Epoch<'_, Sequences>),
-            (&Gather, &Blocks<KvHeads, Head>),
+            (&Gather, Layer<&Blocks<KvHeads, Head>>),
             &mut Output<KvHeads, Groups, Head, All>,
             ((&H, &mut S), usize),
         ),
@@ -761,7 +761,7 @@ where
         _: &mut (),
         ((input, epoch), pool, output, ((boundary, state), keeps)): (
             (Input<'_, KvHeads, Groups, Head, All>, &Epoch<'_, Sequences>),
-            (&Gather, &Blocks<KvHeads, Head>),
+            (&Gather, Layer<&Blocks<KvHeads, Head>>),
             &mut Output<KvHeads, Groups, Head, All>,
             ((&H, &mut S), usize),
         ),
@@ -877,7 +877,7 @@ impl<
         (
             &Input<'_, KvHeads, Groups, Head, All>,
             (
-                (&Gather, &Blocks<KvHeads, Head>),
+                (&Gather, Layer<&Blocks<KvHeads, Head>>),
                 &mut Output<KvHeads, Groups, Head, All>,
             ),
             Committed<'_, KvHeads, Head>,
@@ -904,7 +904,7 @@ where
         (input, (pool, output), (runs, last), record, boundary, (own, previous)): (
             &Input<'_, KvHeads, Groups, Head, All>,
             (
-                (&Gather, &Blocks<KvHeads, Head>),
+                (&Gather, Layer<&Blocks<KvHeads, Head>>),
                 &mut Output<KvHeads, Groups, Head, All>,
             ),
             Committed<'_, KvHeads, Head>,
@@ -1046,7 +1046,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, All: AxisName, H, S, E
         (
             &Input<'_, KvHeads, Groups, Head, All>,
             (
-                (&Gather, &Blocks<KvHeads, Head>),
+                (&Gather, Layer<&Blocks<KvHeads, Head>>),
                 &mut Output<KvHeads, Groups, Head, All>,
             ),
             (Committed<'_, KvHeads, Head>, Record),
@@ -1068,7 +1068,7 @@ where
         (input, (pool, output), ((runs, last), record), (boundary, keeps)): (
             &Input<'_, KvHeads, Groups, Head, All>,
             (
-                (&Gather, &Blocks<KvHeads, Head>),
+                (&Gather, Layer<&Blocks<KvHeads, Head>>),
                 &mut Output<KvHeads, Groups, Head, All>,
             ),
             (Committed<'_, KvHeads, Head>, Record),
@@ -1397,7 +1397,7 @@ struct Fold;
 impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, T: AxisName, All: AxisName>
     Op<(
         &Input<'_, KvHeads, Groups, Head, All>,
-        (&Gather, &Blocks<KvHeads, Head>),
+        (&Gather, Layer<&Blocks<KvHeads, Head>>),
         (Run, Committed<'_, KvHeads, Head>),
         (
             &history::Group<KvHeads, Groups, Head, T>,
@@ -1413,7 +1413,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, T: AxisName, All: Axis
         context: &mut Device,
         (input, pool, (wide, (runs, last)), (queries, carry, running)): (
             &Input<'_, KvHeads, Groups, Head, All>,
-            (&Gather, &Blocks<KvHeads, Head>),
+            (&Gather, Layer<&Blocks<KvHeads, Head>>),
             (Run, Committed<'_, KvHeads, Head>),
             (
                 &history::Group<KvHeads, Groups, Head, T>,
@@ -1840,7 +1840,7 @@ mod tests {
     use super::super::chunks::{self, Words};
     use super::*;
     use crate::tensor::axis::Rows;
-    use crate::tensor::cache::Blocks;
+    use crate::tensor::cache::{Blocks, Layer};
     use crate::tensor::live::tests::count;
     use crate::tests::DEVICE;
     use furiosa_opt_std::runtime::launch;
@@ -1904,7 +1904,13 @@ mod tests {
                     },
                     &Epoch::new(&chunk.work, 0),
                 ),
-                (&Gather, &*blocks),
+                (
+                    &Gather,
+                    Layer {
+                        blocks: &*blocks,
+                        entry: 0,
+                    },
+                ),
                 output,
                 ((&(), &mut ()), 0),
             ),

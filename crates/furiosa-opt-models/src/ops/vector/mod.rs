@@ -153,6 +153,46 @@ pub(crate) struct Quantization<Time, Narrow, Reduce, Rows, Slices, Outer, Inner,
 impl<Time: M, Narrow: M, Reduce: AxisName, Rows: M, Slices: M, Outer: M, Inner: M, Fetched: M>
     Quantization<Time, Narrow, Reduce, Rows, Slices, Outer, Inner, Fetched>
 {
+    /// The token-dynamic FP8 scale, retained in FP32 through quantization and contraction.
+    /// Source: <https://github.com/vllm-project/vllm/blob/dc1b4a6f1300003ae27f033afbdff5e2683721ce/csrc/quantization/fp8/common.cuh>.
+    pub(crate) fn scales_f32<
+        'l,
+        D: MaterializableScalar + FetchCast<f32>,
+        X: M,
+        C: M,
+        S: M,
+        E: M,
+    >(
+        main: &'l mut TuContext<{ Tu::Main }>,
+        input: DmTensorView<'l, D, X, C, S, E>,
+    ) -> CommitTrimTensor<
+        'l,
+        { Tu::Main },
+        f32,
+        X,
+        C,
+        Slices,
+        m![{ Outer }, { Inner } / 2],
+        m![{ Inner } % 2],
+    > {
+        main.begin(input)
+            .fetch::<Fetched, m![Reduce % 8]>()
+            .fetch_cast::<f32>()
+            .collect::<Fetched, m![Reduce % 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_logic(LogicBinaryOpF32::BitAnd, f32::from_bits(0x7fff_ffff))
+            .vector_narrow_split::<Narrow, m![Reduce % 4]>()
+            .vector_intra_slice_reduce::<Reduce, Rows, m![1 # 4]>(IntraSliceReduceOpF32::Max)
+            .vector_fp_div(448.0_f32)
+            .vector_widen_pad::<m![1 # 8]>()
+            .vector_clip(ClipBinaryOpF32::Max, 1.0_f32 / (448.0 * 512.0))
+            .vector_inter_slice_reduce::<Slices, Rows>(InterSliceReduceOpF32::Max)
+            .vector_final()
+            .transpose::<m![{ Outer }, { Inner } / 2], m![{Inner} % 2 # 8]>()
+            .commit_trim::<m![{ Inner } % 2]>()
+    }
+
     /// Each row's scale of `input`, as the stream a caller commits.
     pub(crate) fn scales<'l, D: MaterializableScalar + FetchCast<f32>, X: M, C: M, S: M, E: M>(
         main: &'l mut TuContext<{ Tu::Main }>,
@@ -292,5 +332,150 @@ impl<'l, const T: Tu, Chip: M, Cluster: M, Slice: M, Narrow: M, Half: M>
             .vector_final()
             .cast::<bf16, m![{ Packet } # 16]>()
             .commit_trim::<Packet>()
+    }
+}
+
+/// Agree token scales when the two clusters own disjoint input features of the same rows.
+/// The input already contains a maximum over each cluster's complete input half. Only scale
+/// metadata crosses clusters; activations retain their contraction ownership.
+pub(crate) fn cluster_max<X: M, C: M, S: M, R: M>(
+    device: &mut Device,
+    local: &DmTensor<f32, X, C, S, R>,
+    rows: usize,
+) -> DmTensor<f32, X, C, S, R> {
+    const {
+        assert!(C::SIZE == 2 && R::SIZE.is_multiple_of(8));
+    }
+    let remote: DmTensor<f32, X, C, S, R> = local.view().cluster_swap().to_dm(&mut device.tdma);
+    let other: VrfTensor<f32, X, C, S, R> = device
+        .sub
+        .begin(remote.view())
+        .fetch::<m![{ R } / 8], m![{ R } % 8]>()
+        .collect::<m![{ R } / 8], m![{ R } % 8]>()
+        .to_vrf();
+    let mut output = DmTensor::new();
+    device
+        .main
+        .begin(local.view())
+        .fetch::<m![{ R } / 8], m![{ R } % 8]>()
+        .collect::<m![{ R } / 8], m![{ R } % 8]>()
+        .vector_init()
+        .vector_intra_slice_tag(TagMode::Zero)
+        .vector_clip(ClipBinaryOpF32::Max, &other)
+        .vector_final()
+        .commit_trim::<m![{ R } % 8]>()
+        .commit_prefix::<m![{ R } / 8], _, _>(output.view_mut(), rows.div_ceil(8));
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::DEVICE;
+    use furiosa_opt_std::runtime::launch;
+
+    axes![Rows = 8, Hidden = 4096];
+    type Q = Quantization<
+        m![Rows, Hidden % 64 / 8],
+        m![Rows, Hidden % 64 / 4],
+        Hidden,
+        m![Rows],
+        m![4, 1 # 64],
+        m![Rows / 8],
+        m![Rows % 8],
+    >;
+
+    #[device(chip = 1)]
+    fn token_quantized(
+        device: &mut Device,
+        input: &HbmTensor<bf16, m![1], m![Rows, Hidden]>,
+    ) -> (
+        HbmTensor<f8e4m3, m![1], m![Rows, Hidden]>,
+        HbmTensor<f32, m![1], m![Hidden / 64, Rows]>,
+    ) {
+        let input: DmTensor<bf16, m![1], m![2], m![4, Hidden / 64], m![Rows, Hidden % 64]> =
+            input.to_dm(&mut device.tdma);
+        let mut scales: DmTensor<f32, m![1], m![2], m![4, 1 # 64], m![Rows]> = DmTensor::new();
+        Q::scales_f32(&mut device.main, input.view()).commit_view(scales.view_mut());
+        // SAFETY: the maximum reduction broadcasts each row's scale to all 64 feature slices.
+        let copies = unsafe {
+            scales
+                .view()
+                .reshape::<m![1], m![2], m![4, Hidden / 64], m![Rows]>()
+        };
+        let factors: VrfTensor<f32, m![1], m![2], m![4, Hidden / 64], m![Rows]> = device
+            .sub
+            .begin(copies.clone())
+            .fetch::<m![Rows / 8], m![Rows % 8]>()
+            .collect::<m![Rows / 8], m![Rows % 8]>()
+            .to_vrf();
+        let mut codes: DmTensor<f8e4m3, m![1], m![2], m![4, Hidden / 64], m![Rows, Hidden % 64]> =
+            DmTensor::new();
+        Q::rows(&mut device.main, input.view(), &factors).commit_view(codes.view_mut());
+        let mut stored = HbmTensor::new();
+        copies.to_hbm_view(&mut device.tdma, stored.view_mut());
+        (codes.to_hbm(&mut device.tdma), stored)
+    }
+
+    /// Each token uses its complete input's FP32 scale, including zero/tiny rows and a largest
+    /// magnitude in the final feature slice; FP8 codes follow true division at that scale.
+    #[tokio::test(flavor = "current_thread")]
+    async fn token_scales_preserve_fp32_and_the_floor() {
+        let _lease = DEVICE.lock().await;
+        let mut device = Device::new(token_quantized.topology()).unwrap();
+        let magnitudes = [0.0, 1e-8, 0.001, 1.25, 7.5, 33.0, 448.0, 1e30];
+        let input: Vec<_> = (0..Rows::SIZE * Hidden::SIZE)
+            .map(|at| {
+                let (row, feature) = (at / Hidden::SIZE, at % Hidden::SIZE);
+                bf16::from_f32(
+                    magnitudes[row]
+                        * if feature == Hidden::SIZE - 1 {
+                            -1.0
+                        } else {
+                            ((feature % 97) as f32 - 48.0) / 64.0
+                        },
+                )
+            })
+            .collect();
+        let source = HostTensor::<bf16, m![Rows, Hidden]>::from_vec(input.clone())
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap();
+        let (codes, scales) = launch(token_quantized, (&mut device, &source))
+            .await
+            .unwrap();
+        let codes = codes
+            .to_host::<m![Rows, Hidden]>(&mut device.pdma)
+            .await
+            .unwrap()
+            .into_vec();
+        let scales = scales
+            .to_host::<m![Hidden / 64, Rows]>(&mut device.pdma)
+            .await
+            .unwrap()
+            .into_vec();
+        for row in 0..Rows::SIZE {
+            let values = &input[row * Hidden::SIZE..(row + 1) * Hidden::SIZE];
+            let maximum = values
+                .iter()
+                .map(|v| v.to_f32().abs())
+                .fold(0.0_f32, f32::max);
+            let scale = (maximum / 448.0).max(1.0 / (448.0 * 512.0));
+            for slice in 0..64 {
+                assert_eq!(
+                    scales[slice * Rows::SIZE + row].to_bits(),
+                    scale.to_bits(),
+                    "row {row}, slice {slice}"
+                );
+            }
+            for (column, value) in values.iter().enumerate() {
+                let expected = f8e4m3::from_f32(value.to_f32() / scale);
+                assert_eq!(
+                    codes[row * Hidden::SIZE + column].to_f32(),
+                    expected.to_f32(),
+                    "row {row}, column {column}"
+                );
+            }
+        }
     }
 }

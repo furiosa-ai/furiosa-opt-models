@@ -8,7 +8,7 @@
 //! - The envelope a launch is compiled for is the size's [`Decode`].
 
 use super::{CatalogBody, Groups, Hidden, LmHead};
-use crate::models::decoder::attention::{ForCausalLM, Geometry, Head, KvHeads};
+use crate::models::decoder::attention::{ForCausalLM, Head, KvHeads};
 use crate::models::decoder::form::Affine;
 use crate::modules::attention::{self, key_value};
 use crate::modules::language::{self, Call, Selected};
@@ -69,20 +69,13 @@ pub type Over<S, B, P = Affine> = ForCausalLM<
     P,
 >;
 
-/// The slots of an attention's front: its projections', then its norms'; none holds anything.
-type Front = (((), (), ()), (), ());
-
-/// A layer's state slot: its attention's (its front's, its cache blocks, which it writes and
-/// reads, and its output projection's), then its MLP's, which holds none.
-pub type Layer<'b> = ((Front, &'b mut Blocks<KvHeads, Head>, ()), ());
-
-/// A launch's state, as its decoder's readout takes it: its body's (the hidden rows the embedding
-/// writes, each layer's slot, the final norm's, which holds none), then its tokens.
+/// A launch shares one table of BF16 cache block descriptors across its layers. Each
+/// layer keeps its physical cache allocation and addresses its own range of entries.
 pub type State<'s, 'b, S> = &'s mut (
     (
         (
             HbmTensor<bf16, Chip, Blocked<Hidden<S>, Capacity<S>>>,
-            <S as Geometry>::Layers<Layer<'b>>,
+            &'b mut Blocks<KvHeads, Head>,
         ),
         (),
     ),

@@ -22,7 +22,7 @@ impl<
             (
                 &Wide<KvHeads, Head, Waves>,
                 Shape,
-                (&Gather, &Blocks<KvHeads, Head>),
+                (&Gather, Layer<&Blocks<KvHeads, Head>>),
             ),
             ((&H, &mut S), usize),
         ),
@@ -47,11 +47,47 @@ where
             (
                 &Wide<KvHeads, Head, Waves>,
                 Shape,
-                (&Gather, &Blocks<KvHeads, Head>),
+                (&Gather, Layer<&Blocks<KvHeads, Head>>),
             ),
             ((&H, &mut S), usize),
         ),
     ) {
+        self.run_wide::<Waves, Rows, H, S, Env, false>(
+            context,
+            env,
+            (query, attended),
+            (items, shape, pool),
+            (boundary, state, guests),
+        );
+    }
+}
+
+impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> Attention<KvHeads, Groups, Head> {
+    pub(in super::super) fn run_wide<
+        Waves: AxisName,
+        Rows: AxisName,
+        H,
+        S,
+        Env: Copy,
+        const SINGLE: bool,
+    >(
+        &self,
+        context: &mut Device,
+        env: Env,
+        (query, attended): (
+            &HeadRows<Rows, KvHeads, Groups, Head>,
+            &mut HeadRows<Rows, KvHeads, Groups, Head>,
+        ),
+        (items, shape, pool): (
+            &Wide<KvHeads, Head, Waves>,
+            Shape,
+            (&Gather, Layer<&Blocks<KvHeads, Head>>),
+        ),
+        (boundary, state, guests): (&H, &mut S, usize),
+    ) -> Self::WideRounded<Waves>
+    where
+        H: for<'d, 's> Module<&'s mut S, Env, &'d mut (), Output = ()>,
+    {
         // Wave `wave`'s history, in flight.
         let history = |context: &mut Device, wave: usize| -> Self::WideInDm {
             let tables = &items.tables;
@@ -223,12 +259,7 @@ where
                 )
             };
         // Waves after the first; the whole layer's work of a domain without rows runs no trip.
-        let (any, rest) = (shape.waves.min(1), shape.waves.max(1) - 1);
-        for _ in 0..any {
-            let mut kept = (
-                <Self::WidePartials<Columns>>::new(),
-                <Self::WideScales<Columns>>::new(),
-            );
+        if const { SINGLE } {
             let mut rounded = <Self::WideRounded<Waves>>::new();
             let mut queries = <Self::WideQueries<Waves>>::new();
             // Only while the layer attends: a launch-long table on chip would hold its memory
@@ -250,50 +281,83 @@ where
                         rounded,
                     )
                 };
-            // Two waves a trip into alternating buffers, each under the other's chain; a history
-            // issues once the last arrives, behind the next pair's queries or this pair's rows.
-            for pair in 0..rest / 2 {
-                let next = history(context, 2 * pair + 1);
-                let first = chain(context, &queries, &in_dm, (2 * pair, &mut rounded));
-                to_dm(context, (&mut queries, pair + 1));
-                keep(context, 2 * pair, first, &mut kept);
-                in_dm = history(context, 2 * pair + 2);
-                let second = chain(context, &queries, &next, (2 * pair + 1, &mut rounded));
-                store(context, pair, &rounded, attended.view_mut());
-                keep(context, 2 * pair + 1, second, &mut kept);
-            }
-            // The weight queues behind the last wave's history and the stores issued before it: a
-            // store behind the weight would hold the chain that rounds into the stored rows.
-            for _ in 0..rest % 2 {
-                let other = history(context, rest);
-                let first = chain(context, &queries, &in_dm, (rest - 1, &mut rounded));
-                keep(context, rest - 1, first, &mut kept);
-                for _ in 0..guests {
-                    boundary.forward(&mut *context, env, &mut (), &mut *state);
-                }
-                let second = chain(context, &queries, &other, (rest, &mut rounded));
-                store(context, rest / 2, &rounded, attended.view_mut());
-                keep(context, rest, second, &mut kept);
-            }
-            // A last wave alone: its pair's second wave is past the last, whose rows go to the
-            // sinks.
-            for _ in 0..1 - rest % 2 {
-                for _ in 0..guests {
-                    boundary.forward(&mut *context, env, &mut (), &mut *state);
-                }
-                let only = chain(context, &queries, &in_dm, (rest, &mut rounded));
-                store(context, rest / 2, &rounded, attended.view_mut());
-                keep(context, rest, only, &mut kept);
-            }
-            for tile in 0..shape.merges {
-                let merge = (&kept.0, &kept.1);
-                self.forward(
-                    &mut *context,
-                    env,
-                    &mut (),
-                    (items, merge, tile, attended.view_mut()),
+            boundary.forward(&mut *context, env, &mut (), &mut *state);
+            chain(context, &queries, &in_dm, (0, &mut rounded));
+            rounded
+        } else {
+            let (any, rest) = (shape.waves.min(1), shape.waves.max(1) - 1);
+            for _ in 0..any {
+                let mut kept = (
+                    <Self::WidePartials<Columns>>::new(),
+                    <Self::WideScales<Columns>>::new(),
                 );
+                let mut rounded = <Self::WideRounded<Waves>>::new();
+                let mut queries = <Self::WideQueries<Waves>>::new();
+                // Only while the layer attends: a launch-long table on chip would hold its memory
+                // through every other module.
+                let keys: Self::WideKeys = items.keys.to_dm(&mut context.tdma);
+                // Every wave's at once: a transfer queued between two histories delays the second.
+                let limits: Self::WideLimits<Waves> = items.limits.to_dm(&mut context.tdma);
+                to_dm(context, (&mut queries, 0));
+                let mut in_dm = history(context, 0);
+                let chain =
+                    |context: &mut Device,
+                     queries: &Self::WideQueries<Waves>,
+                     in_dm: &Self::WideInDm,
+                     (wave, rounded): (usize, &mut Self::WideRounded<Waves>)| {
+                        attend(
+                            context,
+                            (shape, (&keys, &limits)),
+                            ((queries, in_dm), wave),
+                            rounded,
+                        )
+                    };
+                // Two waves a trip into alternating buffers, each under the other's chain; a history
+                // issues once the last arrives, behind the next pair's queries or this pair's rows.
+                for pair in 0..rest / 2 {
+                    let next = history(context, 2 * pair + 1);
+                    let first = chain(context, &queries, &in_dm, (2 * pair, &mut rounded));
+                    to_dm(context, (&mut queries, pair + 1));
+                    keep(context, 2 * pair, first, &mut kept);
+                    in_dm = history(context, 2 * pair + 2);
+                    let second = chain(context, &queries, &next, (2 * pair + 1, &mut rounded));
+                    store(context, pair, &rounded, attended.view_mut());
+                    keep(context, 2 * pair + 1, second, &mut kept);
+                }
+                // The weight queues behind the last wave's history and the stores issued before it: a
+                // store behind the weight would hold the chain that rounds into the stored rows.
+                for _ in 0..rest % 2 {
+                    let other = history(context, rest);
+                    let first = chain(context, &queries, &in_dm, (rest - 1, &mut rounded));
+                    keep(context, rest - 1, first, &mut kept);
+                    for _ in 0..guests {
+                        boundary.forward(&mut *context, env, &mut (), &mut *state);
+                    }
+                    let second = chain(context, &queries, &other, (rest, &mut rounded));
+                    store(context, rest / 2, &rounded, attended.view_mut());
+                    keep(context, rest, second, &mut kept);
+                }
+                // A last wave alone: its pair's second wave is past the last, whose rows go to the
+                // sinks.
+                for _ in 0..1 - rest % 2 {
+                    for _ in 0..guests {
+                        boundary.forward(&mut *context, env, &mut (), &mut *state);
+                    }
+                    let only = chain(context, &queries, &in_dm, (rest, &mut rounded));
+                    store(context, rest / 2, &rounded, attended.view_mut());
+                    keep(context, rest, only, &mut kept);
+                }
+                for tile in 0..shape.merges {
+                    let merge = (&kept.0, &kept.1);
+                    self.forward(
+                        &mut *context,
+                        env,
+                        &mut (),
+                        (items, merge, tile, attended.view_mut()),
+                    );
+                }
             }
+            Self::WideRounded::<Waves>::new()
         }
     }
 }

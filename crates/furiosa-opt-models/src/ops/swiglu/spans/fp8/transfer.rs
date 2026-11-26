@@ -179,54 +179,26 @@ impl<'a, Intermediate: AxisName, Rows: AxisName>
             &'a mut HbmTensor<bf16, Chip, Stores<Intermediate, Rows>>,
         ),
     ) {
-        if rows > 128 {
-            packed.view().tile::<m![Rows % (Rows / 8) / 16], 2,
-                m![{ Out<Intermediate> } / 64, Rows % (Rows / 8) / 16 = 2 # (Rows / 128),
-                    Rows % 16 / 8, Rows % 8, Intermediate % 64]>(0)
-                .to_hbm_view(&mut context.tdma, stored.view_mut()
-                    .tile::<m![Rows % (Rows / 8) / 16], 2, m![{ Cluster<Intermediate> },
-                        Intermediate % (Intermediate / 2) / 64,
-                        Rows % (Rows / 8) / 16 = 2 #{!} (Rows / 128), Rows % 16 / 8,
-                        Rows / (Rows / 8), Rows % 8, Intermediate % 64]>(0));
-        } else {
-            let packed = packed.view().tile::<m![Rows % (Rows / 8) / 16], 1,
-                m![{ Out<Intermediate> } / 64, Rows % (Rows / 8) / 16 = 1 # (Rows / 128),
-                    Rows % 16 / 8, Rows % 8, Intermediate % 64]>(0);
-            let wave = stored.view_mut().tile::<m![Rows % (Rows / 8) / 16], 1, m![
-                { Cluster<Intermediate> },
-                Intermediate % (Intermediate / 2) / 64,
-                Rows % (Rows / 8) / 16 = 1 #{!} (Rows / 128),
-                Rows % 16 / 8,
-                Rows / (Rows / 8),
-                Rows % 8,
-                Intermediate % 64
-            ]>(0);
-            if rows > 64 {
-                packed.to_hbm_view(&mut context.tdma, wave);
-            } else {
-                let packed = packed.tile::<m![Rows % 16 / 8], 1,
-                    m![{ Out<Intermediate> } / 64, Rows % (Rows / 8) / 16 = 1 # (Rows / 128),
-                        Rows % 16 / 8 = 1 # 2, Rows % 8, Intermediate % 64]>(0);
-                let half =
-                    wave.tile::<m![Rows % 16 / 8], 1, m![{ Cluster<Intermediate> },
-                        Intermediate % (Intermediate / 2) / 64,
-                        Rows % (Rows / 8) / 16 = 1 #{!} (Rows / 128), Rows % 16 / 8 = 1 #{!} 2,
-                        Rows / (Rows / 8), Rows % 8, Intermediate % 64]>(0);
-                if rows > 8 {
-                    packed.to_hbm_view(&mut context.tdma, half);
-                } else {
-                    packed.slice_tile::<m![Rows / (Rows / 8)], 1,
-                        m![{ Blocks<Intermediate> }, Rows / (Rows / 8) = 1 # 8]>(0)
-                        .to_hbm_view(&mut context.tdma, half.tile::<m![Rows / (Rows / 8)], 1,
-                            m![{ Cluster<Intermediate> }, Intermediate % (Intermediate / 2) / 64,
-                                Rows % (Rows / 8) / 16 = 1 #{!} (Rows / 128),
-                                Rows % 16 / 8 = 1 #{!} 2, Rows / (Rows / 8) = 1 #{!} 8,
-                                Rows % 8, Intermediate % 64]>(0));
-                }
-            }
-        }
+        // SAFETY: split the contiguous owner/panel digit without moving any row or feature.
+        let packed = packed.view();
+        let stored = unsafe {
+            stored.view_mut().reshape::<Chip, ProductStore<
+                Intermediate,
+                Rows,
+                m![{Out<Intermediate>} / 64],
+                m![Intermediate % 64],
+            >>()
+        };
+        store_rows(context, packed, stored, rows);
     }
 }
+
+/// A product store's owner, optional panel digit, canonical row digits and local features.
+/// The panel digit is one for a native-width owner, or three for Qwen's packed 64-feature bands.
+pub(super) type ProductStore<I, R, Outer, Inner> = m![
+    {Cluster<I>}, {Blocks<I>}, {Outer},
+    R % (R / 8) / 16, R % 16 / 8, R / (R / 8), R % 8, {Inner}
+];
 
 /// Panel `panel` of the stored products of a span of at most two waves, written as the down
 /// projection's input: the first rows' power-of-two prefix.
@@ -259,48 +231,129 @@ impl<'a, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName>
         };
         let panel =
             chunks.tile::<m![{ Out<Intermediate> } / 64], 1, ChunkPanel<Intermediate, Rows>>(panel);
-        if live > 2 {
-        } else if rows > 128 {
-            Prefix::<256>.forward(&mut *context, (panel, &mut output));
-        } else if rows > 64 {
-            Prefix::<128>.forward(&mut *context, (panel, &mut output));
-        } else if rows > 8 {
-            Prefix::<64>.forward(&mut *context, (panel, &mut output));
-        } else {
-            Prefix::<8>.forward(&mut *context, (panel, &mut output));
+        if live <= 2 {
+            // SAFETY: grouping the leading owner digits preserves their physical strides.
+            let panel = unsafe {
+                panel.reshape::<Chip, m![
+                {m![{Cluster<Intermediate>}, {Blocks<Intermediate>}, {Out<Intermediate>} / 64 = 1 # ({Out<Intermediate>} / 64)]},
+                Rows, Intermediate % 64]>()
+            };
+            load_rows(context, panel, output.view_mut(), rows);
         }
         output
     }
 }
 
-/// The first `LEN` rows of a stored product panel, written in the down projection's input.
-struct Prefix<const LEN: usize>;
-
-impl<'p, 'a, Hidden: AxisName, Intermediate: AxisName, Rows: AxisName, const LEN: usize>
-    Op<(
-        HbmTensorView<'p, bf16, Chip, ChunkPanel<Intermediate, Rows>>,
-        &'a mut Product<Hidden, Intermediate, Rows>,
-    )> for Prefix<LEN>
-{
-    type Output = ();
-
-    fn forward(
-        &self,
-        context: &mut Device,
-        (panel, output): (
-            HbmTensorView<'p, bf16, Chip, ChunkPanel<Intermediate, Rows>>,
-            &'a mut Product<Hidden, Intermediate, Rows>,
-        ),
-    ) {
-        panel
-            .tile::<m![Rows], LEN, m![{ Cluster<Intermediate> }, { Blocks<Intermediate> },
-            { Out<Intermediate> } / 64 = 1 # ({ Out<Intermediate> } / 64), Rows = { LEN } # Rows,
-            Intermediate % 64]>(0)
-            .to_dm_view(
-                &mut context.tdma,
-                output
-                    .view_mut()
-                    .tile::<m![Rows], LEN, m![Rows = { LEN } #{!} Rows, Intermediate % 64]>(0),
-            );
+/// Qwen's live-row transfer windows, shared by packed panels and native-width products.
+pub(super) fn store_rows<Intermediate: AxisName, Rows: AxisName, Outer: M, Inner: M>(
+    context: &mut Device,
+    packed: DmTensorView<
+        '_,
+        bf16,
+        Chip,
+        Cluster<Intermediate>,
+        Slice<Intermediate, Rows>,
+        m![
+            { Outer },
+            Rows % (Rows / 8) / 16,
+            Rows % 16 / 8,
+            Rows % 8,
+            { Inner }
+        ],
+    >,
+    stored: HbmTensorViewMut<'_, bf16, Chip, ProductStore<Intermediate, Rows, Outer, Inner>>,
+    rows: usize,
+) {
+    if rows > 128 {
+        packed.tile::<m![Rows % (Rows / 8) / 16], 2,
+                m![{Outer}, Rows % (Rows / 8) / 16 = 2 # (Rows / 128),
+                    Rows % 16 / 8, Rows % 8, {Inner}]>(0)
+                .to_hbm_view(&mut context.tdma, stored
+                    .tile::<m![Rows % (Rows / 8) / 16], 2, m![{ Cluster<Intermediate> },
+                        {Blocks<Intermediate>}, {Outer},
+                        Rows % (Rows / 8) / 16 = 2 #{!} (Rows / 128), Rows % 16 / 8,
+                        Rows / (Rows / 8), Rows % 8, {Inner}]>(0));
+    } else {
+        let packed = packed.tile::<m![Rows % (Rows / 8) / 16], 1,
+                m![{Outer}, Rows % (Rows / 8) / 16 = 1 # (Rows / 128),
+                    Rows % 16 / 8, Rows % 8, {Inner}]>(0);
+        let wave = stored.tile::<m![Rows % (Rows / 8) / 16], 1, m![
+            { Cluster<Intermediate> },
+            {Blocks<Intermediate>}, {Outer},
+            Rows % (Rows / 8) / 16 = 1 #{!} (Rows / 128),
+            Rows % 16 / 8,
+            Rows / (Rows / 8),
+            Rows % 8,
+            {Inner}
+        ]>(0);
+        if rows > 64 {
+            packed.to_hbm_view(&mut context.tdma, wave);
+        } else {
+            let packed = packed
+                .tile::<m![Rows % 16 / 8], 1, m![{Outer}, Rows % (Rows / 8) / 16 = 1 # (Rows / 128),
+                        Rows % 16 / 8 = 1 # 2, Rows % 8, {Inner}]>(0);
+            let half = wave.tile::<m![Rows % 16 / 8], 1, m![{ Cluster<Intermediate> },
+                        {Blocks<Intermediate>}, {Outer},
+                        Rows % (Rows / 8) / 16 = 1 #{!} (Rows / 128), Rows % 16 / 8 = 1 #{!} 2,
+                        Rows / (Rows / 8), Rows % 8, {Inner}]>(0);
+            if rows > 8 {
+                packed.to_hbm_view(&mut context.tdma, half);
+            } else {
+                packed.slice_tile::<m![Rows / (Rows / 8)], 1,
+                        m![{ Blocks<Intermediate> }, Rows / (Rows / 8) = 1 # 8]>(0)
+                        .to_hbm_view(&mut context.tdma, half.tile::<m![Rows / (Rows / 8)], 1,
+                            m![{ Cluster<Intermediate> }, {Blocks<Intermediate>}, {Outer},
+                                Rows % (Rows / 8) / 16 = 1 #{!} (Rows / 128),
+                                Rows % 16 / 8 = 1 #{!} 2, Rows / (Rows / 8) = 1 #{!} 8,
+                                Rows % 8, {Inner}]>(0));
+            }
+        }
     }
+}
+/// Load only the selected power-of-two row prefix, preserving source padding and destination
+/// ownership. Feature axes may differ in stride (e.g. the native 32-wide tail of a 224-wide owner).
+pub(super) fn load_rows<
+    R: AxisName,
+    D: MaterializableScalar,
+    Before: M,
+    From: M,
+    C: M,
+    S: M,
+    To: M,
+>(
+    device: &mut Device,
+    source: HbmTensorView<'_, D, Chip, m![{ Before }, R, { From }]>,
+    output: DmTensorViewMut<'_, D, Chip, C, S, m![R, { To }]>,
+    rows: usize,
+) {
+    if rows > 128 {
+        load_prefix::<R, 256, _, _, _, _, _, _>(device, source, output);
+    } else if rows > 64 {
+        load_prefix::<R, 128, _, _, _, _, _, _>(device, source, output);
+    } else if rows > 8 {
+        load_prefix::<R, 64, _, _, _, _, _, _>(device, source, output);
+    } else {
+        load_prefix::<R, 8, _, _, _, _, _, _>(device, source, output);
+    }
+}
+pub(super) fn load_prefix<
+    R: AxisName,
+    const N: usize,
+    D: MaterializableScalar,
+    Before: M,
+    From: M,
+    C: M,
+    S: M,
+    To: M,
+>(
+    device: &mut Device,
+    source: HbmTensorView<'_, D, Chip, m![{ Before }, R, { From }]>,
+    output: DmTensorViewMut<'_, D, Chip, C, S, m![R, { To }]>,
+) {
+    source
+        .tile::<m![R], N, m![{Before}, R = {N} # R, {From}]>(0)
+        .to_dm_view(
+            &mut device.tdma,
+            output.tile::<m![R], N, m![R = {N} #{!} R, {To}]>(0),
+        );
 }

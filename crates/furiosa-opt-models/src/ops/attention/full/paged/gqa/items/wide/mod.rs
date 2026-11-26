@@ -190,7 +190,7 @@ impl<Waves: AxisName> Tables<Waves> {
 
 impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> Attention<KvHeads, Groups, Head> {
     /// An item tensor on the token slices of a cluster's 16 columns, `E` its elements.
-    type WideDm<D: Scalar, E: M> = Self::ItemDm<ColumnSlices<m![Block]>, D, E>;
+    pub(super) type WideDm<D: Scalar, E: M> = Self::ItemDm<ColumnSlices<m![Block]>, D, E>;
     type WideVrf<D: MaterializableScalar, E: M> = Self::ItemVrf<ColumnSlices<m![Block]>, D, E>;
     type WideInDm = Self::WideDm<bf16, m![Time, KeyValue, KvHeads % ({ Local<KvHeads> }), Head]>;
     type WideKeys = Self::WideDm<i32, m![Time]>;
@@ -209,9 +209,10 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName> Attention<KvHeads, Gro
         m![Waves % 4, Head],
     >;
     /// A slice's query rows: its item's groups of every KV head the slice holds.
-    type WideRows = m![KvHeads % ({ Local<KvHeads> }), Groups];
+    pub(super) type WideRows = m![KvHeads % ({ Local<KvHeads> }), Groups];
     /// Two consecutive waves' rounded rows, wave `w`'s at `w % 2`, stored together.
-    type WideRounded<Waves: AxisName> = Self::WideDm<bf16, m![Waves % 2, { Self::WideRows }, Head]>;
+    pub(super) type WideRounded<Waves: AxisName> =
+        Self::WideDm<bf16, m![Waves % 2, { Self::WideRows }, Head]>;
     /// What a merge keeps of a wave: each item's f32 output, mass and largest score.
     type WideKept = Self::Kept<ColumnSlices<m![Block]>, Self::WideRows>;
     type WideLocal = Self::WideDm<f32, m![KvHeads % ({ Local<KvHeads> }), Groups, 1 # 8]>;

@@ -60,9 +60,11 @@ impl<
     }
 }
 
-impl<In, Out, W: View<N>, S: View<N>, const N: usize> View<N> for fp8::Rows<In, Out, W, S> {
+impl<In, Out, W: View<N>, S: View<N>, Format, const N: usize> View<N>
+    for fp8::Rows<In, Out, W, S, Format>
+{
     type Storage = (W::Storage, S::Storage);
-    type Layer = fp8::Rows<In, Out, W::Layer, S::Layer>;
+    type Layer = fp8::Rows<In, Out, W::Layer, S::Layer, Format>;
 
     fn view(storage: &Self::Storage, layer: usize) -> Self::Layer {
         fp8::Rows::new(W::view(&storage.0, layer), S::view(&storage.1, layer))

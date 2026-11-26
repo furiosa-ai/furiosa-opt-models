@@ -13,7 +13,7 @@ impl<KvHeads: AxisName, Groups: AxisName, Head: AxisName, Rows: AxisName, H, S, 
             (
                 &Packed<KvHeads, Head>,
                 Shape,
-                (&Gather, &Blocks<KvHeads, Head>),
+                (&Gather, Layer<&Blocks<KvHeads, Head>>),
             ),
             ((&H, &mut S), usize),
         ),
@@ -38,7 +38,7 @@ where
             (
                 &Packed<KvHeads, Head>,
                 Shape,
-                (&Gather, &Blocks<KvHeads, Head>),
+                (&Gather, Layer<&Blocks<KvHeads, Head>>),
             ),
             ((&H, &mut S), usize),
         ),
