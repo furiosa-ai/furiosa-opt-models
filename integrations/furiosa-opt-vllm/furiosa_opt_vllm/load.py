@@ -67,4 +67,4 @@ def bind(runner: Runner, *, load_dummy_weights: bool = False) -> None:
         assert spec is not None, "a load for adapters selects a model that runs them"
         runner.adapters = lora.Adapters(config.lora_config, spec, config.model_config.max_model_len)
     runner.model = decoder
-    runner.selection = selection.choose(config, runner.speculative, cache, runner.requests)
+    runner.selection = selection.choose(config, runner.speculative, decoder, runner.requests)

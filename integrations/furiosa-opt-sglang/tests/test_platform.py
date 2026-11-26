@@ -4,12 +4,16 @@ import pytest
 from sglang.srt.server_args import ServerArgs, prepare_server_args
 
 from furiosa_opt_sglang.platform import (
+    DRAFT_PLACEMENT_ENV,
+    DraftPlacement,
     Hierarchical,
     Platform,
     Recurrent,
     Refused,
     Requested,
     Resolved,
+    Speculations,
+    Standalone,
 )
 
 
@@ -22,7 +26,7 @@ from furiosa_opt_sglang.platform import (
             ["--speculative-algorithm", "EAGLE"],
             "speculative_algorithm",
             marks=pytest.mark.feature(
-                "Speculative decoding (EAGLE, MTP, Medusa, MLP, parallel draft models)"
+                "Speculative decoding (EAGLE, MTP, Medusa, MLP, parallel drafting)"
             ),
         ),
         pytest.param(
@@ -107,6 +111,57 @@ STANDALONE = (
     "--speculative-draft-model-path",
     "Qwen/Qwen3-0.6B",
 )
+
+
+def test_reads_draft_placement_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Standalone drafts accept a physical placement through the plugin environment setting."""
+    monkeypatch.setenv(DRAFT_PLACEMENT_ENV, '{"chips":[2],"pes":[0,8]}')
+    arguments = prepare_server_args(["--model-path", "Qwen/Qwen3-1.7B", *STANDALONE])
+
+    options = Speculations.parse(arguments)
+
+    assert isinstance(options, Standalone)
+    assert options.draft_placement == DraftPlacement(chips=(2,), pes=(0, 8))
+
+
+@pytest.mark.parametrize(
+    "placement",
+    [
+        "{",
+        '{"chips":[],"pes":[0,8]}',
+        '{"chips":[2,2],"pes":[0,8]}',
+        '{"chips":[2],"pes":[0,0]}',
+        '{"chips":[2],"pes":[0,9]}',
+    ],
+    ids=["json", "empty", "duplicate-chip", "empty-pes-range", "unknown-pe"],
+)
+def test_refuses_invalid_draft_placement_environment(
+    monkeypatch: pytest.MonkeyPatch, placement: str
+) -> None:
+    """Malformed IDs, PE ranges and JSON fail before the draft worker loads."""
+    monkeypatch.setenv(DRAFT_PLACEMENT_ENV, placement)
+    arguments = prepare_server_args(["--model-path", "Qwen/Qwen3-1.7B", *STANDALONE])
+
+    with pytest.raises(Refused) as error:
+        _ = Speculations.parse(arguments)
+
+    assert error.value.option == DRAFT_PLACEMENT_ENV
+    assert error.value.requirement.startswith("invalid placement:")
+
+
+@pytest.mark.parametrize("flags", [(), NGRAM], ids=["disabled", "ngram"])
+def test_requires_standalone_for_draft_placement(
+    monkeypatch: pytest.MonkeyPatch, flags: tuple[str, ...]
+) -> None:
+    """The plugin placement setting cannot silently do nothing for another algorithm."""
+    monkeypatch.setenv(DRAFT_PLACEMENT_ENV, '{"chips":[2],"pes":[0,8]}')
+    arguments = prepare_server_args(["--model-path", "Qwen/Qwen3-1.7B", *flags])
+
+    with pytest.raises(Refused) as error:
+        _ = Speculations.parse(arguments)
+
+    assert error.value.option == DRAFT_PLACEMENT_ENV
+    assert error.value.requirement == "requires speculative_algorithm=STANDALONE"
 
 
 def test_accepts_embedding_offload_options_without_the_offload() -> None:

@@ -8,8 +8,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, final
+from typing import TYPE_CHECKING, final, overload
 
 import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -19,11 +20,11 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from typing_extensions import override
 
-from furiosa_opt_sglang.batch import Batch
+from furiosa_opt_engine.batch import Batch
 from furiosa_opt_sglang.generation import Sampled, integers, sequence
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable
 
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -48,13 +49,42 @@ class Speculative:
     width: int
 
 
+@final
+@dataclass(frozen=True, slots=True)
+class _Tokens(Sequence[int]):
+    """An indexable view of SGLang's prompt and generated tokens, without copying their prefix."""
+
+    prompt: Sequence[int]
+    output: Sequence[int]
+
+    def __len__(self) -> int:
+        return len(self.prompt) + len(self.output)
+
+    @overload
+    def __getitem__(self, index: int, /) -> int: ...
+
+    @overload
+    def __getitem__(self, index: slice, /) -> tuple[int, ...]: ...
+
+    def __getitem__(self, index: int | slice, /) -> int | tuple[int, ...]:
+        size = len(self)
+        if isinstance(index, slice):
+            return tuple(self[position] for position in range(*index.indices(size)))
+        position = index + size if index < 0 else index
+        if not 0 <= position < size:
+            raise IndexError("token position out of range")
+        if position < len(self.prompt):
+            return self.prompt[position]
+        return self.output[position - len(self.prompt)]
+
+
 @dataclass(frozen=True, slots=True)
 class Decoding:
-    """A decoding request as a proposer reads it."""
+    """A decoding request as a proposer reads it, with a live token view through its call."""
 
     rid: str
-    # The target caches every token but the last.
-    tokens: tuple[int, ...]
+    # The target caches every token but the last; source lists stay stable through propose.
+    tokens: Sequence[int]
     # The most drafts the request's context leaves room for.
     drafts: int
     # The request's cache blocks up to its last draft.
@@ -68,7 +98,9 @@ class Decoding:
     def parse(cls, request: Req, cached: int, room: int, blocks: tuple[int, ...]) -> Decoding:
         """`request`, of which SGLang caches `cached` tokens, with `room` positions from its last
         token on in `blocks`."""
-        tokens = (*request.origin_input_ids, *request.output_ids)
+        tokens = _Tokens(request.origin_input_ids, request.output_ids)
+        if type(room) is not int or room < 1:
+            raise ValueError("decode room must include the request's last known token")
         if cached != len(tokens) - 1:
             raise ValueError(f"SGLang caches {cached} of a decoding request's {len(tokens)} tokens")
         return cls(request.rid, tokens, room - 1, blocks)
@@ -114,10 +146,10 @@ class Worker(BaseSpecWorker):
 
         def pack(committed: tuple[tuple[int, ...], ...]) -> torch.Tensor:
             # SGLang reads a request's committed tokens at a stride of the verification's width.
-            strided = torch.zeros((len(committed), width), dtype=torch.int64)
-            for row, tokens in zip(strided, committed, strict=True):
-                row[: len(tokens)] = torch.tensor(tokens)
-            return strided.flatten()
+            if any(len(tokens) > width for tokens in committed):
+                raise ValueError("committed tokens exceed the speculative verification width")
+            padded = [list(tokens) + [0] * (width - len(tokens)) for tokens in committed]
+            return torch.tensor(padded, dtype=torch.int64).flatten()
 
         match batch.forward_mode:
             case ForwardMode.EXTEND:

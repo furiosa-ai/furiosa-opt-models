@@ -1,4 +1,4 @@
-"""A decoder the engine loaded onto a scheduler's chips, and the rows and blocks its calls take.
+"""A decoder the engine loaded onto a physical placement, and the rows and blocks its calls take.
 
 - `Decoder.load` loads a checkpoint as its causal model, whose calls return each kept row's greedy
   token, or as its base model, whose calls return the kept rows' hidden values.
@@ -9,7 +9,8 @@
   back by a new load. With a backup, the decoder loads a copy of the checkpoint's tensors in host
   memory and keeps it, so the weights come back as the server loaded them whatever happens to the
   files.
-- `chips` maps SGLang's device index of a scheduler to the physical chips it drives.
+- For a target, `chips` maps SGLang's scheduler device index to physical chips; a standalone draft
+  may instead specify its own physical placement.
 """
 
 from __future__ import annotations
@@ -19,12 +20,14 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Final
 
 import furiosa_opt_engine as engine
+from furiosa_opt_engine.placement import PE_COUNT
+from furiosa_opt_engine.speculative import cache_blocks_for_memory
 
 if TYPE_CHECKING:
     from pydantic import JsonValue
 
 # Every PE of an RNGD chip.
-PES: Final = range(8)
+PES: Final = range(PE_COUNT)
 
 RELEASED: Final = "SGLang's memory saver released the device memory this call reads: resume it"
 
@@ -58,8 +61,8 @@ class Location:
 @dataclass(frozen=True, slots=True)
 class Decoder:
     """A loaded decoder, where its checkpoint is and the options it loads with, the device it runs
-    on, the vocabulary its token IDs index, and the block format and layers of its paged cache
-    group."""
+    on, the vocabulary its token IDs index, and the spec of its paged cache, which it keeps when
+    SGLang releases the weights."""
 
     # None while SGLang's memory saver released the weights.
     model: engine.Decoder | None
@@ -70,6 +73,7 @@ class Decoder:
     options: engine.LoadOptions
     device: engine.Device
     vocabulary: int
+    cache_spec: engine.decoder.CacheSpec
     pool: engine.decoder.Pool
     layers: range
 
@@ -83,7 +87,7 @@ class Decoder:
         *,
         backup: bool = False,
     ) -> Decoder:
-        """`checkpoint` loaded with `options` onto `device`, whose token IDs lie below `vocabulary`;
+        """`checkpoint` loaded with `options` onto `device`; token IDs lie below `vocabulary`;
         with `backup`, loaded from a copy of its tensors in host memory, which the decoder keeps.
         Refuses a decoder whose calls return scores or whose cache is not one paged full-history
         group."""
@@ -95,11 +99,20 @@ class Decoder:
                 pass
             case _:
                 raise NotImplementedError(f"{type(loaded).__name__} is no served decoder")
-        match loaded.cache.groups:
+        cache_spec = loaded.cache
+        match cache_spec.groups:
             case [engine.decoder.Group(kind=engine.decoder.Kind.Paged(), window=None) as group]:
-                pool = loaded.cache.pools[group.pool]
+                pool = cache_spec.pools[group.pool]
                 return cls(
-                    loaded, copy, checkpoint, options, device, vocabulary, pool, group.layers
+                    loaded,
+                    copy,
+                    checkpoint,
+                    options,
+                    device,
+                    vocabulary,
+                    cache_spec,
+                    pool,
+                    group.layers,
                 )
             case _:
                 raise NotImplementedError("the plugin pages only one full-history attention group")
@@ -119,6 +132,4 @@ class Decoder:
     def blocks(self, memory: int, *others: Decoder) -> int:
         """Cache blocks that `memory` bytes a chip hold for this decoder and `others`, which number
         their blocks alike, within the I32 byte offsets a layer addresses its blocks by."""
-        decoders = (self, *others)
-        page = sum(decoder.pool.bytes * len(decoder.layers) for decoder in decoders)
-        return min(max(0, memory) // page, *(2**31 // decoder.pool.bytes for decoder in decoders))
+        return cache_blocks_for_memory(memory, *(decoder.cache_spec for decoder in (self, *others)))

@@ -8,6 +8,7 @@ from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
 import furiosa_opt_engine as engine
+from furiosa_opt_engine.speculative import cache_memory_budget
 from furiosa_opt_vllm.cache import assigned
 from furiosa_opt_vllm.decoder import RELEASED, Decoder
 from furiosa_opt_vllm.multimodal import Media
@@ -64,19 +65,24 @@ def available(runner: Runner) -> int:
     config = runner.vllm_config.cache_config
     block_bytes = sum(layer.page_size_bytes for layer in spec.values())
     device = model.device
-    memory = device.available - runner.state.workspace
     if config.kv_cache_memory_bytes is not None:
+        memory = device.available - runner.state.workspace
         if config.kv_cache_memory_bytes > memory:
             raise ValueError("requested KV memory exceeds available memory after workspace")
         memory = config.kv_cache_memory_bytes
     else:
-        memory -= int(device.capacity * (1 - config.gpu_memory_utilization))
+        memory = cache_memory_budget(
+            device.available,
+            device.capacity,
+            config.gpu_memory_utilization,
+            runner.state.workspace,
+        )
     # A cache layer addresses its pages by I32 byte offsets.
     max_blocks = min((2**31) // layer.page_size_bytes for layer in spec.values())
     match model:
         case Decoder():
             blocks = min(max(0, memory) // block_bytes, max_blocks)
-            return runner.selection.capacity(blocks) * block_bytes
+            return runner.selection.capacity(blocks, block_bytes) * block_bytes
         case Media():
             return max(0, min(memory, max_blocks * block_bytes))
         case _:

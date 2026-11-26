@@ -10,6 +10,7 @@ The platform accepts these values:
 | Option | Accepted values |
 | --- | --- |
 | `--kv-cache-dtype` | `auto`, `bf16`, `bfloat16`; startup refuses a dtype the model does not cache in with the engine's reason ([FP8 KV cache](index.md#features-not-supported-yet) is not supported yet) |
+| `--speculative-draft-kv-cache-dtype` | `auto`, `bf16`, `bfloat16`, `fp8_e4m3`; unset follows `--kv-cache-dtype` for `STANDALONE` drafts |
 | `--dtype` | `auto`, `bfloat16` |
 | `--load-format` | `auto`, `safetensors` |
 | `--device` | Unset or `cpu` (framework tensors stay on the host; the model runs on RNGD) |
@@ -30,6 +31,7 @@ These features are not supported yet, and the plugin refuses them at startup rat
 
 - LoRA and speculative algorithms other than NGRAM and STANDALONE.
 - Speculative decoding with more than one candidate a position, adaptive speculation or an external n-gram corpus.
+- Non-default speculative accept thresholds, rejection sampling, block verification, token maps, speculative attention modes, draft attention/DSA/MoE backend overrides, draft load formats other than `auto` or `safetensors`, draft quantization, draft sliding windows or attention sinks, and draft W4A4 settings. The engine owns draft and verification attention; a draft-only KV dtype remains configurable as described below.
 - Watermarking (`--enable-watermark`) and strict thinking (`--enable-strict-thinking`), which change the scores of each step.
 - Quantization and quantization parameter files.
 - Hierarchical cache storage backends, HiSparse, unified memory, LMCache, FlexKV and the unified cache external linker.
@@ -60,9 +62,19 @@ python -m sglang.launch_server --model-path Qwen/Qwen3-1.7B \
   --speculative-algorithm NGRAM --speculative-ngram-max-bfs-breadth 1
 python -m sglang.launch_server --model-path Qwen/Qwen3-1.7B \
   --speculative-algorithm STANDALONE --speculative-draft-model-path Qwen/Qwen3-0.6B
+python -m sglang.launch_server --model-path Qwen/Qwen3-1.7B \
+  --speculative-algorithm STANDALONE --speculative-draft-model-path amd/PARD-Qwen3-0.6B
 ```
 
-A STANDALONE draft model loads on the target's chips and shares their memory; it must share the target's token-to-id mapping, vocabulary and cache block size, and its window must hold the context.
+`STANDALONE` is SGLang's upstream `SpeculativeAlgorithm` value for draft-model decoding; the plugin does not introduce this name. Its worker builds the draft worker with the target worker's server arguments and GPU ID. By default, this plugin follows that placement. `--speculative-draft-kv-cache-dtype` selects the draft cache dtype; when unset, it follows SGLang's resolved target `--kv-cache-dtype`. To request a Furiosa physical placement, set `FURIOSA_DRAFT_PLACEMENT` to JSON with `chips` and a half-open `pes` range:
+
+```bash
+FURIOSA_DRAFT_PLACEMENT='{"chips":[2],"pes":[0,8]}' \
+  python -m sglang.launch_server --model-path Qwen/Qwen3-1.7B \
+    --speculative-algorithm STANDALONE --speculative-draft-model-path Qwen/Qwen3-0.6B
+```
+
+The chips are ordered physical chip IDs, with one chip per draft tensor-parallel rank. Omit the variable to share the target placement. An explicit placement may match the target's full chip and PE placement or use disjoint chips; partial chip overlap is refused. A colocated target and draft share the `mem_fraction_static` cache budget; disjoint placement applies the same configured fraction to the separate draft cache. That margin is not a measured bound on peak decoder scratch memory. The plugin checks the complete tokenizer mapping and configured vocabulary size before opening the draft device or loading its weights. The draft must share the target's token-to-id mapping, vocabulary and cache block size, and its window must hold the context. If the draft config names a mask token (`dflash_config.mask_token_id`, `mask_token_id`, `dspark_noise_token_id`, `pard_token` or `ptd_token_id`), the plugin uses parallel mask drafting; otherwise it generates each position from the previous draft. It batches active requests' rows in decoder calls up to the engine's compiled row capacity.
 
 ## Requests
 

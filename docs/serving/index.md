@@ -8,6 +8,13 @@ Install a plugin first ([Installation](../getting-started/installation.md)); [Qu
 
 ## Feature support
 
+Speculative algorithm names and selection follow each framework's API; adapters translate common
+draft-model execution to the engine. We do not add algorithms just to equalize feature lists: vLLM
+0.31.0 has an optional Arctic-backed suffix proposer, while SGLang 0.5.22 has no built-in
+`SUFFIX` algorithm, though it lets plugins register custom algorithms. This adapter does not add a
+suffix proposer. Neither framework exposes physical chip selection for its draft worker, so
+chip-level placement is a plugin extension for both; target placement remains the default.
+
 | Feature | vLLM | SGLang | Details |
 | --- | --- | --- | --- |
 | Text generation | <span class="support support-yes">Supported</span> (greedy decoding) | <span class="support support-yes">Supported</span> (greedy decoding) | [Quickstart](../getting-started/quickstart.md#serve-over-http) |
@@ -20,8 +27,8 @@ Install a plugin first ([Installation](../getting-started/installation.md)); [Qu
 | Prompt embeddings | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Custom logits processors | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Watermarking | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
-| Speculative decoding (ngram, suffix, draft model) | <span class="support support-yes">Supported</span> (ngram and suffix; no draft model yet) | <span class="support support-yes">Supported</span> (ngram and draft model; no suffix decoding in SGLang) | [ngram or suffix](#speculate-with-ngram-or-suffix-decoding), [draft model](#speculate-with-a-draft-model) |
-| Speculative decoding (EAGLE, MTP, Medusa, MLP, parallel draft models) | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
+| Speculative decoding (ngram, suffix, draft model) | <span class="support support-yes">Supported</span> (`ngram`, `suffix`, draft model) | <span class="support support-yes">Supported</span> (`NGRAM`, `STANDALONE` draft model; no built-in `SUFFIX`) | [ngram or suffix](#speculate-with-ngram-or-suffix-decoding), [draft model](#speculate-with-a-draft-model) |
+| Speculative decoding (EAGLE, MTP, Medusa, MLP, parallel drafting) | <span class="support support-yes">Supported</span> (parallel drafting; no EAGLE, MTP, Medusa or MLP yet) | <span class="support support-yes">Supported</span> (parallel mask drafts through STANDALONE; no EAGLE, MTP, Medusa or MLP yet) | [parallel drafting](#speculate-with-a-draft-model) |
 | Automatic prefix caching | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Reuse cached prefixes](#reuse-cached-prefixes) |
 | FP8 KV cache | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Quantized checkpoints (FP8, NVFP4) | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
@@ -94,7 +101,7 @@ The parser names depend on the checkpoint's chat template.
 
 With vLLM, `--speculative-config '{"method": "ngram", "num_speculative_tokens": 5, "prompt_lookup_min": 2, "prompt_lookup_max": 4}'` drafts tokens by copying from the request's own text, and `{"method": "suffix"}` also from earlier responses; the target verifies the drafts, so greedy output does not change.
 
-With SGLang, `--speculative-algorithm NGRAM --speculative-ngram-max-bfs-breadth 1` drafts from the requests' own text; SGLang has no suffix decoding.
+With SGLang, `--speculative-algorithm NGRAM --speculative-ngram-max-bfs-breadth 1` drafts from the requests' own text. Pinned SGLang 0.5.22 has no built-in `SUFFIX` value, but exposes `SpeculativeAlgorithm.register` for plugin-defined algorithms. This adapter does not register a suffix proposer. Adding one would need a proposer and request-history cache, such as the optional Arctic Inference implementation used by vLLM, plus adapter configuration and lifecycle handling; SGLang does not need an upstream change for that extension.
 [SGLang options](sglang.md#speculative-decoding) lists the flags it accepts.
 
 Suffix decoding runs through Arctic Inference, which builds from source with a C++ compiler, such as `sudo apt install g++`.
@@ -109,14 +116,19 @@ Its message pins an older Arctic Inference release; the extra pins the one the p
 
 ## Speculate with a draft model
 
-With SGLang, a smaller causal language model that shares the target's tokenizer drafts the tokens on the target's chips:
+vLLM selects draft-model decoding with `method=draft_model`; `"parallel_drafting": true` enables mask drafting for checkpoints that name a mask token. The [vLLM](vllm.md#speculative-decoding) and [SGLang](sglang.md#speculative-decoding) option pages document tokenizer, context, placement, cache sizing and batching requirements.
+
+```bash
+vllm serve Qwen/Qwen3-1.7B \
+  --speculative-config '{"method": "draft_model", "model": "amd/PARD-Qwen3-0.6B", "num_speculative_tokens": 4, "parallel_drafting": true}'
+```
+
+SGLang's framework-specific algorithm name is `STANDALONE`:
 
 ```bash
 python -m sglang.launch_server --model-path Qwen/Qwen3-1.7B \
-  --speculative-algorithm STANDALONE --speculative-draft-model-path Qwen/Qwen3-0.6B
+  --speculative-algorithm STANDALONE --speculative-draft-model-path amd/PARD-Qwen3-0.6B
 ```
-
-[SGLang options](sglang.md#speculative-decoding) lists what the draft model shares with the target.
 
 ## Reuse cached prefixes
 
@@ -378,7 +390,7 @@ Asking for a feature that is not supported yet has one of three outcomes:
 
 - **Refused** before it runs, with the reason: an option the [vLLM](vllm.md#options) or [SGLang](sglang.md#options) page names stops startup, and so does a checkpoint config no served decoder holds, such as a rope type the engine does not compute; a request field [SGLang requests](sglang.md#requests) names fails its request with HTTP 400, and vLLM refuses a request that is not greedy or holds prompt embeddings.
 - **Not verified**: tool calling and reasoning outputs with vLLM and `tool_choice` `auto` may work, as its parsers read the greedy answer, but no test runs them on RNGD yet.
-- **Not refused**: any other way to ask may fail with an internal error or not take effect. A vLLM draft model (`"method": "draft_model"`) passes the option check, then fails at load.
+- **Not refused**: any other way to ask may fail with an internal error or not take effect.
 
 Why each feature is not served yet:
 
@@ -386,7 +398,7 @@ Why each feature is not served yet:
 - **Reranking and score heads**: SGLang's reranking reads the logprobs of two tokens; vLLM's reranking and either plugin's classification run a score head, which the engine loads but neither plugin calls yet.
 - **Prompt embeddings**: a decoder call takes token IDs.
 - **Multimodal inputs**: no served checkpoint answers about images, video or audio; Gemma 4 unified's media encoder runs [on an encoder-only instance](#embed-media-on-an-encoder-only-instance), but the engine serves no language model of it.
-- **Speculative methods other than ngram and suffix** (vLLM, which also has no draft model yet) or NGRAM and STANDALONE (SGLang).
+- **Speculative methods other than ngram, suffix and a draft model** (vLLM) or NGRAM and STANDALONE (SGLang).
 - **FP8 KV cache and quantized checkpoints**: the served checkpoints load BF16 weights and cache keys and values in BF16.
 - **Online quantization** with SGLang, and with vLLM any method but `fp8_per_tensor`: the other methods quantize the activations too or use other formats, and the SGLang plugin passes no quantization to the load.
 - **Tensor, pipeline, expert and context parallelism**, and serving across nodes: each served checkpoint runs on one chip.

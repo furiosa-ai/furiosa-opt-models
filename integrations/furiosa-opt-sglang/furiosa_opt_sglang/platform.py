@@ -16,10 +16,25 @@ from typing import (
     final,
 )
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, RootModel, ValidationError
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    RootModel,
+    ValidationError,
+    field_validator,
+)
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
 from typing_extensions import override
+
+from furiosa_opt_engine.placement import (
+    MAX_CHIP_ID,
+    PE_COUNT,
+    has_distinct_chips,
+    is_nonempty_pe_range,
+)
 
 if TYPE_CHECKING:
     from pydantic import JsonValue
@@ -27,6 +42,10 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
 CacheDtype = Literal["auto", "bf16", "bfloat16", "fp8", "fp8_e4m3"]
+DraftCacheDtype = Literal["auto", "bf16", "bfloat16", "fp8_e4m3"]
+Chip = Annotated[int, Field(strict=True, ge=0, le=MAX_CHIP_ID)]
+PE = Annotated[int, Field(strict=True, ge=0, le=PE_COUNT)]
+DRAFT_PLACEMENT_ENV = "FURIOSA_DRAFT_PLACEMENT"
 # SGLang's spellings of a `--kv-cache-dtype` of one element type, under the engine's dtype name;
 # `auto` keeps the engine's. Whether a model caches in that dtype is the engine's to decide.
 CACHE_DTYPES: Final[Mapping[CacheDtype, str | None]] = MappingProxyType(
@@ -193,6 +212,49 @@ class Speculation(Served):
     speculative_adaptive: Unset
     speculative_ngram_external_corpus_path: Unset
     speculative_ngram_external_sam_budget: Unset
+    speculative_adaptive_config: Unset = Field(
+        default=None, description="does not use an adaptive speculative config"
+    )
+    speculative_accept_threshold_single: Literal[1.0] = Field(
+        default=1.0,
+        description="requires speculative_accept_threshold_single=1.0",
+    )
+    speculative_accept_threshold_acc: Literal[1.0] = Field(
+        default=1.0,
+        description="requires speculative_accept_threshold_acc=1.0",
+    )
+    speculative_use_rejection_sampling: Literal[False] = Field(
+        default=False, description="requires speculative_use_rejection_sampling=false"
+    )
+    speculative_use_block_verification: Literal[False] = Field(
+        default=False, description="requires speculative_use_block_verification=false"
+    )
+    speculative_token_map: None = Field(
+        default=None, description="uses identical target and draft token IDs without a token map"
+    )
+
+
+class DraftPlacement(BaseModel):
+    """Physical chips and the half-open PE range for a draft decoder."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
+
+    chips: tuple[Chip, ...]
+    pes: tuple[PE, PE]
+
+    @field_validator("chips")
+    @classmethod
+    def distinct(cls, chips: tuple[int, ...]) -> tuple[int, ...]:
+        if not has_distinct_chips(chips):
+            raise ValueError("chips must contain one or more distinct physical chip IDs")
+        return chips
+
+    @field_validator("pes")
+    @classmethod
+    def ascending(cls, pes: tuple[int, int]) -> tuple[int, int]:
+        if not is_nonempty_pe_range(pes):
+            raise ValueError("pes must be a nonempty half-open range")
+        return pes
 
 
 class Ngram(Speculation):
@@ -221,6 +283,26 @@ class Standalone(Speculation):
     )
     speculative_draft_model_path: str
     speculative_draft_model_revision: str | None
+    speculative_draft_kv_cache_dtype: DraftCacheDtype | None = Field(
+        default=None,
+        description=(
+            "uses the target KV-cache dtype when unset; supports auto, bf16, bfloat16 "
+            "or fp8_e4m3 for the draft"
+        ),
+    )
+    speculative_draft_load_format: Literal["auto", "safetensors"] | None = Field(
+        default=None, description="loads auto or safetensors draft checkpoints"
+    )
+    speculative_draft_model_quantization: None = Field(
+        default=None, description="loads an unquantized draft model"
+    )
+    speculative_draft_window_size: None = Field(
+        default=None, description="uses the draft model's full attention window"
+    )
+    speculative_draft_sink_size: None = Field(
+        default=None, description="does not add draft attention sink tokens"
+    )
+    draft_placement: DraftPlacement | None = None
 
 
 class Speculations(
@@ -233,10 +315,62 @@ class Speculations(
     @classmethod
     def parse(cls, source: object) -> Ngram | Standalone | None:
         """`source`'s speculative decoding, as its algorithm's options, or none."""
+        algorithm = getattr(source, "speculative_algorithm", None)
+        raw = getattr(source, "_raw_input", None)
+        if algorithm is not None and isinstance(raw, dict):
+            controls = (
+                (
+                    "speculative_attention_mode",
+                    {None, "prefill"},
+                    "uses the engine's draft and verification attention path",
+                ),
+                (
+                    "speculative_draft_attention_backend",
+                    {None},
+                    "uses the engine's draft attention implementation",
+                ),
+            )
+            if algorithm == "STANDALONE":
+                controls += (
+                    (
+                        "speculative_moe_runner_backend",
+                        {None},
+                        "uses the engine's draft model implementation",
+                    ),
+                    (
+                        "speculative_moe_a2a_backend",
+                        {None},
+                        "uses the engine's draft model implementation",
+                    ),
+                    (
+                        "speculative_dsa_topk_backend",
+                        {None},
+                        "uses the engine's draft model implementation",
+                    ),
+                    (
+                        "speculative_enable_w4a4_mxfp4_megamoe",
+                        {None},
+                        "uses the engine's draft model implementation",
+                    ),
+                )
+            for option, accepted, requirement in controls:
+                if option in raw and raw[option] not in accepted:
+                    raise Refused(option, requirement)
+        raw_placement = os.environ.get(DRAFT_PLACEMENT_ENV)
+        placement = None
+        if raw_placement is not None:
+            try:
+                placement = DraftPlacement.model_validate_json(raw_placement)
+            except ValidationError as error:
+                raise Refused(
+                    DRAFT_PLACEMENT_ENV, f"invalid placement: {error.errors()[0]['msg']}"
+                ) from None
         if getattr(source, "speculative_algorithm", None) is None:
+            if placement is not None:
+                raise Refused(DRAFT_PLACEMENT_ENV, "requires speculative_algorithm=STANDALONE")
             return None
         try:
-            return cls.model_validate(source).root
+            options = cls.model_validate(source).root
         except ValidationError as error:
             match error.errors()[0]:
                 case {"type": "union_tag_invalid", "ctx": {"expected_tags": str() as tags}}:
@@ -251,6 +385,11 @@ class Speculations(
                     ) from None
                 case _:
                     raise
+        if placement is None:
+            return options
+        if isinstance(options, Standalone):
+            return options.model_copy(update={"draft_placement": placement})
+        raise Refused(DRAFT_PLACEMENT_ENV, "requires speculative_algorithm=STANDALONE")
 
 
 class Recurrent(Served):

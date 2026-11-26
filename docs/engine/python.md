@@ -52,6 +52,40 @@ The second request appends `token` after the three positions the first call wrot
 The engine cannot check what the block holds: `cached` must count positions this sequence already wrote.
 `token` stays on the device, so the next call takes it without a copy to the host.
 
+## Plan framework batches
+
+`furiosa_opt_engine.batch` provides shared host-side helpers for adapters that turn framework rows into decoder calls:
+
+- `Batch.parse` snapshots a flat token buffer into per-sequence rows and cache positions.
+- `Call.plan` groups contiguous rows by sequence and reports which output rows to read.
+- `chunks` fairly partitions per-sequence row counts into calls within `decoder.rows`, with one run per sequence in each call.
+- `operand` checks token IDs against the vocabulary and converts them to `int32` for upload.
+
+The adapters use these helpers where their framework's request and cache representation fits, then map the planned rows to `engine.decoder.Request` and `Keep` values.
+
+## Draft with another decoder
+
+`furiosa_opt_engine.speculative.DraftSession` runs a causal draft model over framework-owned token
+and block tables. An adapter supplies each request's full known-token source, the prefix the target
+cache guarantees, one block table per draft-cache group and its requested draft count. A token source
+can read lazily from framework storage, so the adapter need not copy the whole token matrix.
+
+Without a mask, the session feeds each proposed token into the next decoder call. With a mask token,
+it appends the known tokens and masks together, then reads all proposed rows from those calls. Both
+paths split work fairly across `decoder.rows`, cap proposals at the decoder window and every cache
+group's block capacity, and retain draft cache prefixes between calls. Call `retire` when the
+framework releases a request's blocks; call `retain` when only a supplied set of requests remains
+active, or `reset` after clearing the framework cache pool.
+
+The framework still owns speculative configuration, target scheduling, verification and accepted
+token commits. Its adapter translates request IDs, tokens and block tables to `DraftRequest`, then
+maps proposed token IDs back to framework order.
+
+The engine also owns the checks both adapters share: draft and target vocabulary size, causal token
+output, paged-cache block layout and minimum context. `validate_mask_token` checks mask IDs after an
+adapter applies its framework's checkpoint-field priority. Cache helpers calculate bytes and block
+limits from engine cache specs; adapters still choose each framework's memory budget.
+
 ## Run calls asynchronously
 
 `forward` returns its output once the device accepted the call, before the device finishes, as PyTorch and JAX calls do.

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, ClassVar, Final
 from vllm.platforms import current_platform
 
 import furiosa_opt_engine as engine
+from furiosa_opt_engine.placement import PE_COUNT
 from furiosa_opt_vllm import checkpoint
 from furiosa_opt_vllm.admission import Refused, options
 
@@ -28,7 +29,7 @@ if TYPE_CHECKING:
     from furiosa_opt_vllm.checkpoint import Location
 
 # Every PE of an RNGD chip.
-PES: Final = range(8)
+PES: Final = range(PE_COUNT)
 
 RELEASED: Final = "no weights are on the device: wake them up, or reload them after a failed reload"
 
@@ -58,11 +59,19 @@ class Decoder:
         model = config.model_config
         tensor = config.parallel_config.tensor_parallel_size
         chips = [current_platform.device_id_to_physical_device_id(rank) for rank in range(tensor)]
-        device = engine.Device(engine.Placement(chips, PES))
+        placement = engine.Placement(chips, PES)
+        device = engine.Device(placement)
         located = checkpoint.located(model, config.load_config.download_dir)
         mapped = located.mapped()
         copy = mapped.read() if model.enable_sleep_mode else None
-        decoder = cls(None, copy, located, options(config), device, model.get_vocab_size())
+        decoder = cls(
+            None,
+            copy,
+            located,
+            options(config),
+            device,
+            model.get_vocab_size(),
+        )
         loaded = decoder.loaded(mapped if copy is None else copy)
         match loaded.model:
             case engine.Decoder(window=window) if model.max_model_len > window:

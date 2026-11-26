@@ -218,10 +218,10 @@ impl LoadOptions {
             Part::Whole => Some(Decoder::class(config.class()).ok_or_else(unbound)?),
         };
         let model = py.detach(|| {
-            let mut context = device.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut context = device.shared.lock().unwrap_or_else(PoisonError::into_inner);
             self.0.load(&mut context.device, &checkpoint.0)
         })?;
-        let context = device.0.clone();
+        let context = device.shared.clone();
         Ok(match (model, class) {
             (Model::Decoder(served), Some(class)) => {
                 let decoder = Decoder {

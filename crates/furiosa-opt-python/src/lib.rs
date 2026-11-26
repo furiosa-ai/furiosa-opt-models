@@ -3,8 +3,9 @@
 //! a device, checkpoints and the options that load a model from one, and the requests and cache of
 //! a decoder's calls.
 //!
-//! - `Device(placement)` opens chips; every tensor, buffer and cache on it keeps it open. Any
-//!   thread may use and drop them; the transfers and calls on one device run one at a time.
+//! - `Device(placement)` opens chips and retains that placement; every tensor, buffer and cache on
+//!   it keeps the device open. Any thread may use and drop them; the transfers and calls on one
+//!   device run one at a time.
 //! - A load returns a `Decoder`, which serves every model alike, as an object of its model type's
 //!   class: each model type that loads has a submodule of its own for its classes, such as `qwen3`.
 //!   A load of a model's media encoder alone returns an `Encoder`, whatever its model.

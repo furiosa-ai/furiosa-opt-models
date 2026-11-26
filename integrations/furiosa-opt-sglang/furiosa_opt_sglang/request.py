@@ -11,7 +11,7 @@ from sglang.srt.entrypoints.openai.protocol import RerankContent
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.sampling.sampling_params import SamplingParams
 
-from furiosa_opt_sglang.batch import admit
+from furiosa_opt_engine.batch import admit
 from furiosa_opt_sglang.platform import Served, Unset
 
 if TYPE_CHECKING:

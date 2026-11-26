@@ -55,17 +55,21 @@ def release(runner: Runner, tags: Collection[str], copy: engine.Checkpoint | Non
             "sleeps only with enable_sleep_mode, whose loads keep the weights' copy for level 1",
         )
     served = decoder(runner)
+    served.device.synchronize()
+    runner.selection.synchronize()
     for tag in reversed(TAGS):
         if tag not in tags or tag in runner.asleep:
             continue
         match tag:
             case "weights":
+                runner.selection.release_weights(preserve_copy=copy is not None)
                 runner.model = replace(served, model=None, copy=None)
                 runner.asleep[tag] = Weights(copy)
             case "kv_cache":
                 if runner.cache is None:
                     raise RuntimeError("initialize_kv_cache must precede sleep mode")
                 runner.asleep[tag] = Storage(runner.cache.spec, runner.cache.blocks)
+                runner.selection.release_cache()
                 runner.cache = None
 
 
@@ -78,12 +82,25 @@ def wake_up(runner: Runner, tags: Collection[str] | None) -> None:
             case Weights(copy):
                 released = decoder(runner)
                 copy = released.checkpoint.mapped().read() if copy is None else copy
-                runner.model = replace(released, copy=copy).loaded(copy)
+                restored = replace(released, copy=copy).loaded(copy)
+                runner.model = restored
+                try:
+                    runner.selection.restore_weights(restored, runner.vllm_config.model_config)
+                except Exception:
+                    runner.model = released
+                    raise
             case Storage(spec, blocks):
                 runner.cache = engine.decoder.Cache(spec, blocks)
+                try:
+                    runner.selection.restore_cache()
+                except Exception:
+                    runner.cache = None
+                    raise
             case None:
                 continue
         del runner.asleep[tag]
+    decoder(runner).device.synchronize()
+    runner.selection.synchronize()
 
 
 def reload(runner: Runner) -> None:

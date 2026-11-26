@@ -4,6 +4,8 @@
 
 Load model weights and expose composed NPU functions to Python.
 The engine owns checkpoint I/O, parameter upload and submission.
+The `furiosa_opt_engine.batch` and `furiosa_opt_engine.speculative` modules provide shared row
+planning, token operands, draft forwards and reuse of draft cache prefixes for framework adapters.
 
 - [Installation](https://developer.furiosa.ai/furiosa-opt-models/getting-started/installation/): each framework plugin installs the engine, the `furiosa_opt_engine` Python package, as a dependency.
 - [Using the engine](https://developer.furiosa.ai/furiosa-opt-models/engine/python/)

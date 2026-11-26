@@ -30,6 +30,10 @@ The framework assigns blocks, and the plugin translates its assignment into bloc
     ```
 
 A scheduler step can hold more rows than one call takes, so the plugin splits it into bounded calls in order.
+The engine's `DraftSession` shares sequential and mask-based draft forwards, fair row batching and
+reuse of draft cache prefixes. Each adapter translates its framework's token source and block tables to
+`DraftRequest`, then returns proposal IDs in framework order. Framework scheduling, verification,
+acceptance and commit remain framework-owned.
 
 ## Return the rows the framework needs
 

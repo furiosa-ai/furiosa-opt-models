@@ -88,7 +88,10 @@ impl Placement {
 /// bytes per chip.
 #[gen_stub_pyclass]
 #[pyclass(module = "engine")]
-pub(super) struct Device(pub(super) Shared);
+pub(super) struct Device {
+    pub(super) shared: Shared,
+    placement: Placement,
+}
 
 #[gen_stub_pymethods]
 #[pymethods]
@@ -99,20 +102,34 @@ impl Device {
     ///     RuntimeError: The chips are taken or fail to open.
     #[new]
     fn new(py: Python<'_>, placement: &Placement) -> Result<Self, Error> {
+        let opened = placement.clone();
         let placement = placement.0.clone();
-        Ok(Self(py.detach(|| Context::open(placement))?))
+        Ok(Self {
+            shared: py.detach(|| Context::open(placement))?,
+            placement: opened,
+        })
+    }
+
+    /// The placement used to open this device.
+    #[getter]
+    fn placement(&self) -> Placement {
+        self.placement.clone()
     }
 
     /// Total device memory in bytes per chip.
     #[getter]
     fn capacity(&self, py: Python<'_>) -> PyResult<usize> {
-        Ok(Context::lock(&self.0, py).device.memory().capacity())
+        Ok(Context::lock(&self.shared, py).device.memory().capacity())
     }
 
     /// Unallocated device memory in bytes per chip.
     #[getter]
     fn available(&self, py: Python<'_>) -> PyResult<usize> {
-        Ok(Context::lock(&self.0, py).device.memory().usage().available)
+        Ok(Context::lock(&self.shared, py)
+            .device
+            .memory()
+            .usage()
+            .available)
     }
 
     /// Wait until every call submitted on the device before this one has ended.
@@ -120,7 +137,7 @@ impl Device {
     /// Raises:
     ///     RuntimeError: The device failed.
     fn synchronize(&self, py: Python<'_>) -> Result<(), Error> {
-        Context::transfer(&self.0, py, async |device| device.synchronize().await)
+        Context::transfer(&self.shared, py, async |device| device.synchronize().await)
     }
 }
 
@@ -146,10 +163,10 @@ impl HbmBuffer {
     ///     RuntimeError: The allocation fails.
     #[new]
     fn new(py: Python<'_>, device: &Device, size: usize) -> Result<Self, Error> {
-        let inner = prelude::HbmBuffer::alloc(&Context::lock(&device.0, py).device, size)?;
+        let inner = prelude::HbmBuffer::alloc(&Context::lock(&device.shared, py).device, size)?;
         Ok(Self {
             inner,
-            context: device.0.clone(),
+            context: device.shared.clone(),
         })
     }
 
@@ -656,7 +673,7 @@ impl HostTensor {
     /// Raises:
     ///     RuntimeError: The transfer fails.
     fn to_hbm(&self, py: Python<'_>, device: &Device) -> PyResult<HbmTensor> {
-        let chips = usize::from(Context::lock(&device.0, py).device.topology().chips);
+        let chips = usize::from(Context::lock(&device.shared, py).device.topology().chips);
         let copies;
         let source = match chips {
             1 => &self.buffer,
@@ -665,12 +682,12 @@ impl HostTensor {
                 &copies
             }
         };
-        let inner = Context::transfer(&device.0, py, async move |device| {
+        let inner = Context::transfer(&device.shared, py, async move |device| {
             source.to_hbm(&mut device.pdma).await
         })?;
         let buffer = HbmBuffer {
             inner,
-            context: device.0.clone(),
+            context: device.shared.clone(),
         };
         HbmTensor::new(&buffer, self.shape(), self.dtype())
     }
@@ -1024,7 +1041,20 @@ pub(crate) mod tests {
             let scope = PyDict::new(py);
             scope.set_item("engine", engine).unwrap();
             scope
-                .set_item("device", Py::new(py, Device(context)).unwrap())
+                .set_item(
+                    "device",
+                    Py::new(
+                        py,
+                        Device {
+                            shared: context,
+                            placement: Placement(furiosa_opt_std::Placement {
+                                chips: vec![0],
+                                pes: 0..8,
+                            }),
+                        },
+                    )
+                    .unwrap(),
+                )
                 .unwrap();
             let result = py.run(code, Some(&scope), None);
             // Functions `code` defines hold `scope` as their globals; clearing it breaks that cycle,
