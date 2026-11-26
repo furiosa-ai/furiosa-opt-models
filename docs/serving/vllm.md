@@ -31,7 +31,7 @@ vLLM keeps block selection, admission and eviction; the plugin implements its na
 
 The filesystem tier uses vLLM's `TieringOffloadingSpec`. Its native `secondary_tiers` field belongs in `kv_connector_extra_config`; Furiosa supplies the tier manager over engine-pinned slots.
 
-Keep `blocks_per_chunk` and `eviction_policy` in vLLM's `kv_connector_extra_config`. The Furiosa-only `coalescing` option is disabled by default; set `"coalescing":true` beside `secondary_tiers` to enable it.
+Keep `blocks_per_chunk` and `eviction_policy` in vLLM's `kv_connector_extra_config`.
 
 ### Coalesce worker-step loads
 
