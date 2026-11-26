@@ -223,7 +223,9 @@ impl Staging {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::{Cache, CacheSpec, Group, Keep, Kind, Limits, Pool, Request};
+    use super::super::super::{
+        Cache, CacheSpec, Group, Keep, Kind, Limits, PageFormat, Pool, Request,
+    };
     use super::*;
     use furiosa_opt_models::tensor::parallel::Chip;
 
@@ -252,15 +254,17 @@ mod tests {
                 window: 64,
                 rows: Envelope::SIZE,
                 cache: CacheSpec {
+                    layer_count: 1,
                     pools: vec![Pool {
                         block: 16,
                         bytes: 64,
+                        format: PageFormat::contiguous(vec![16, 4], 1).unwrap(),
                     }],
                     groups: vec![Group {
                         pool: 0,
-                        layers: 0..1,
-                        kind: Kind::Paged,
-                        window: None,
+                        layers: vec![0],
+                        logical_group: 0,
+                        kind: Kind::Paged { window: None },
                     }],
                 },
                 adapters: 0,

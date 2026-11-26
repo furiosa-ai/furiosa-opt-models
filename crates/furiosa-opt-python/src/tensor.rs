@@ -216,8 +216,8 @@ impl HbmBuffer {
 #[gen_stub_pyclass]
 #[pyclass(frozen, module = "engine")]
 pub(super) struct HostBuffer {
-    memory: Arc<Mutex<prelude::HostBuffer>>,
-    bytes: Range<usize>,
+    pub(super) memory: Arc<Mutex<prelude::HostBuffer>>,
+    pub(super) bytes: Range<usize>,
 }
 
 /// All of `memory`.
@@ -230,11 +230,18 @@ impl From<prelude::HostBuffer> for HostBuffer {
     }
 }
 
+impl HostBuffer {
+    pub(super) fn shared(memory: Arc<Mutex<prelude::HostBuffer>>, bytes: Range<usize>) -> Self {
+        Self { memory, bytes }
+    }
+}
+
 #[gen_stub_pymethods]
 #[pymethods]
 impl HostBuffer {
     /// `source` zeroed bytes, or a copy of the bytes of a C-contiguous buffer such as `bytes` or a
-    /// NumPy array.
+    /// NumPy array. The memory is page-locked when the system permits it; check `is_pinned` when a
+    /// cache backing needs asynchronous DMA.
     ///
     /// Raises:
     ///     OverflowError: `source` is a negative integer.
@@ -257,6 +264,15 @@ impl HostBuffer {
     /// Size in bytes.
     fn __len__(&self) -> usize {
         self.bytes.len()
+    }
+
+    /// Whether this memory is page-locked for asynchronous device transfers.
+    #[getter]
+    fn is_pinned(&self) -> bool {
+        self.memory
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_pinned()
     }
 
     /// Return a view of a byte range that shares this memory; views may overlap, and of two copies
