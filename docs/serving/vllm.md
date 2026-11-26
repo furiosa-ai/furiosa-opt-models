@@ -60,7 +60,7 @@ Offloading supports causal full-attention and sliding-window `Paged` cache group
 
 ### Failures and metrics
 
-A failed transfer poisons the touched memory, and the adapter reports the error when the copy ends. The `vllm:kv_offload_store_bytes` and `vllm:kv_offload_load_bytes` metrics count bytes moved in each direction.
+The adapter propagates transfer errors through vLLM's native offload worker; the [shared transfer guide](../engine/frameworks.md#completion-and-failures) documents page reuse after failure. The `vllm:kv_offload_store_bytes` and `vllm:kv_offload_load_bytes` metrics count bytes moved in each direction.
 
 These features are not supported yet, and the plugin refuses them at startup rather than ignore them:
 

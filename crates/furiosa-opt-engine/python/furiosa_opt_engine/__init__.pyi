@@ -71,8 +71,9 @@ class Copier:
 
     `copy_in` and `copy_out` return a `Copy` handle without waiting for its DMA. The caller owns
     host-slot and device-page lifetimes: before submitting work that reuses either, it must wait
-    for the earlier `Copy` to finish. An overlapping submission raises `BlockingIOError` and queues
-    no work. A failed copy poisons its touched memory, which cannot be reused by this copier.
+    for the earlier `Copy` to finish. An in-flight device-page overlap raises `BlockingIOError` and
+    queues no work; host-slot reuse is serialized by its per-slot gate. A failed copy leaves its
+    device pages unavailable to this copier.
     Python serializes queue mutation under the GIL; completions can move to framework worker threads.
     Layer groups are numbered contiguously from zero.
     """
@@ -98,9 +99,9 @@ class Copier:
         Submit device-to-host copies without waiting for their DMA to finish.
 
         `pages` names host slots and their `(group, device_block)` routes. The caller must wait for
-        earlier copies that use any of these host slots or device pages. An in-flight overlap raises
-        `BlockingIOError` and submits no work. Reusing memory touched by a failed copy raises an
-        error; restart the process to recover it.
+        earlier copies before reusing their host slots or device pages. An in-flight device-page
+        overlap raises `BlockingIOError`; an overlapping host slot is serialized by its slot gate.
+        A failed copy leaves its device pages unavailable to this copier.
         Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
         transient pinned memory for one batched runtime transfer.
         """
@@ -117,9 +118,9 @@ class Copier:
         Submit host-to-device copies without waiting for their DMA to finish.
 
         `pages` names host slots and their `(group, device_block)` routes. The caller must wait for
-        earlier copies that use any of these host slots or device pages. An in-flight overlap raises
-        `BlockingIOError` and submits no work. Reusing memory touched by a failed copy raises an
-        error; restart the process to recover it.
+        earlier copies before reusing their host slots or device pages. An in-flight device-page
+        overlap raises `BlockingIOError`; an overlapping host slot is serialized by its slot gate.
+        A failed copy leaves its device pages unavailable to this copier.
         Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
         transient pinned memory for one batched runtime transfer.
         """
@@ -459,11 +460,11 @@ class HostCache:
     ) -> HostCache:
         r"""
         Allocate one pinned host-page pool for this copier. Other pools may share the copier; their
-        slot indices and DMA reservations are independent. `backing`, when supplied, must be a
-        pinned buffer of exactly `slots` times one host block's size. The pool retains that
-        allocation and presents each host block as one slot. Before reusing this backing for a
-        replacement pool, shut down its old copier and finish all copies and `HostSlot.access()`
-        leases; distinct pools over one backing have independent slot-access gates.
+        slot indices and access gates are independent, while device-page reservations are shared.
+        `backing`, when supplied, must be a pinned buffer of exactly `slots` times one host block's
+        size. The pool retains that allocation and presents each host block as one slot. Before
+        reusing this backing for a replacement pool, shut down its old copier and finish all copies
+        and `HostSlot.access()` leases; distinct pools over one backing have independent slot gates.
         """
     def _backing_buffer(self) -> HostBuffer:
         r"""
