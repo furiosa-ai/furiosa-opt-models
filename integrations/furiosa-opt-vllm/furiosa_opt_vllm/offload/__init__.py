@@ -3,6 +3,8 @@ platform makes `--kv-offloading-size` select.
 
 - Its scheduler side keeps vLLM's offloading and tiering policies.
 - Its worker side moves pages through the engine's pinned HostCache and DMA queue.
+- Its only secondary tier is the local filesystem adapter. Shared Mooncake storage uses the native
+  `FuriosaMooncakeStoreConnector` in `furiosa_opt_vllm.mooncake_store`.
 """
 
 from __future__ import annotations

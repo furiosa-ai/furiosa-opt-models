@@ -18,6 +18,8 @@ if TYPE_CHECKING:
 # The connector selected for vLLM's native host and filesystem offloading.
 CONNECTOR: Final = "RNGDOffloadingConnector"
 CONNECTOR_MODULE: Final = "furiosa_opt_vllm.offload"
+MOONCAKE_STORE_CONNECTOR: Final = "FuriosaMooncakeStoreConnector"
+MOONCAKE_STORE_CONNECTOR_MODULE: Final = "furiosa_opt_vllm.mooncake_store"
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,13 +194,26 @@ def offloading_contracts(
 
 
 def direct_connector_contracts() -> tuple[Contract, ...]:
-    """The connectors accepted by the filesystem offload adapter without composition."""
+    """The direct KV connectors implemented by the Furiosa worker."""
 
-    def direct_offloading(config: VllmConfig) -> bool:
+    def accepted_connector(config: VllmConfig) -> bool:
         transfer = config.kv_transfer_config
         return transfer is None or (
-            transfer.kv_connector == CONNECTOR
-            and transfer.kv_connector_module_path == CONNECTOR_MODULE
+            (
+                transfer.kv_connector == CONNECTOR
+                and transfer.kv_connector_module_path == CONNECTOR_MODULE
+            )
+            or (
+                transfer.kv_connector == MOONCAKE_STORE_CONNECTOR
+                and transfer.kv_connector_module_path == MOONCAKE_STORE_CONNECTOR_MODULE
+            )
+        )
+
+    def mooncake_store(config: VllmConfig) -> bool:
+        transfer = config.kv_transfer_config
+        return transfer is not None and (
+            transfer.kv_connector == MOONCAKE_STORE_CONNECTOR
+            and transfer.kv_connector_module_path == MOONCAKE_STORE_CONNECTOR_MODULE
         )
 
     return (
@@ -213,7 +228,16 @@ def direct_connector_contracts() -> tuple[Contract, ...]:
         ),
         Contract(
             "kv_transfer_config",
-            direct_offloading,
-            f"serves no KV connector but {CONNECTOR}, which --kv-offloading-size selects",
+            accepted_connector,
+            f"serves {CONNECTOR} for host offloading and "
+            f"{MOONCAKE_STORE_CONNECTOR} for shared storage",
+        ),
+        Contract(
+            "kv_offloading_size",
+            lambda config: (
+                not mooncake_store(config) or config.cache_config.kv_offloading_size is None
+            ),
+            f"uses {MOONCAKE_STORE_CONNECTOR} for shared prefix storage "
+            "without --kv-offloading-size",
         ),
     )

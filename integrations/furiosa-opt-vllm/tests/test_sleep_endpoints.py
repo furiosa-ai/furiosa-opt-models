@@ -6,9 +6,10 @@ import urllib.request
 from typing import TYPE_CHECKING, Final
 
 import pytest
-from conftest import post, serve
 from pydantic import TypeAdapter
 from test_sleep import CHECKPOINT, PROMPTS
+
+from conftest import post, serve
 
 if TYPE_CHECKING:
     from collections.abc import Generator

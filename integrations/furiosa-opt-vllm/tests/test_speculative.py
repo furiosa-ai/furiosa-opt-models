@@ -10,8 +10,9 @@ from vllm.sampling_params import RequestOutputKind
 from vllm.v1.metrics.reader import Counter
 
 if TYPE_CHECKING:
-    from conftest import Options, Row
     from transformers import PreTrainedTokenizerBase
+
+    from conftest import Options, Row
 
 TASK = "text"
 TEXT = "The quick brown fox jumps over the lazy dog. " * 8

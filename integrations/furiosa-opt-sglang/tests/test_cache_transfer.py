@@ -320,6 +320,32 @@ def test_aligned_file_io_uses_direct_io_for_aligned_pages(tmp_path, monkeypatch)
             mapping.close()
 
 
+def test_aligned_file_io_preserves_prepare_error_when_cleanup_fails(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "prepare-failure.bin"
+    original_close = os.close
+    close_calls = 0
+
+    def close_then_fail(descriptor: int) -> None:
+        nonlocal close_calls
+        close_calls += 1
+        original_close(descriptor)
+        if close_calls == 1:
+            raise OSError("close failed")
+
+    def truncate_then_fail(*_args) -> None:
+        raise OSError("truncate failed")
+
+    monkeypatch.setattr(os, "ftruncate", truncate_then_fail)
+    monkeypatch.setattr(os, "close", close_then_fail)
+    io = AlignedFileIO(str(tmp_path), use_direct=False)
+
+    with pytest.raises(OSError, match="truncate failed") as error:
+        io.prepare(str(path), 64, 1)
+
+    assert any("close failed" in note for note in error.value.__notes__)
+    assert not path.exists()
+
+
 def test_host_region_registrar_registers_once_and_unregisters_on_close() -> None:
     with ExitStack() as leases:
         registered = []

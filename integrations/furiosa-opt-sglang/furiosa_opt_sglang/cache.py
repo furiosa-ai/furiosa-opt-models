@@ -42,10 +42,26 @@ class Pages:
             raise RuntimeError(RELEASED)
         # PyTorch exposes its named dtypes through an untyped module lookup.
         dtype = cast("torch.dtype", getattr(torch, decoder.model.kv_cache))
-        size = decoder.pool.block * 2 * heads * width * dtype.itemsize
+        pool = decoder.pool
+        expected_shape = (pool.block, 2, heads, width)
+        expected_strides = (
+            2 * heads * width * dtype.itemsize,
+            heads * width * dtype.itemsize,
+            width * dtype.itemsize,
+            dtype.itemsize,
+        )
+        if (
+            pool.element_bytes != dtype.itemsize
+            or tuple(pool.shape) != expected_shape
+            or tuple(pool.strides) != expected_strides
+        ):
+            raise ValueError(
+                "SGLang cache pages require contiguous [block, key/value, heads, width] layout"
+            )
+        size = pool.block * 2 * heads * width * dtype.itemsize
         if size != decoder.pool.bytes:
             raise ValueError(f"the engine pages {decoder.pool.bytes} bytes a block, SGLang {size}")
-        return cls(decoder.pool, decoder.layers, decoder.model.parallel, dtype, heads, width)
+        return cls(pool, decoder.layers, decoder.model.parallel, dtype, heads, width)
 
 
 @final

@@ -13,8 +13,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, assert_never
 
 import pytest
-from conftest import Reference
 from pydantic import JsonValue, TypeAdapter
+
+from conftest import Reference
 
 if TYPE_CHECKING:
     import torch

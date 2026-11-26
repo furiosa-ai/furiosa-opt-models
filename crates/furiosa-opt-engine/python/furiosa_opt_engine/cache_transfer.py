@@ -91,10 +91,20 @@ class AlignedFileIO:
         descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         try:
             os.ftruncate(descriptor, size)
-        except Exception:
-            os.close(descriptor)
-            with contextlib.suppress(OSError):
+        except BaseException as operation_error:
+            cleanup_errors: list[BaseException] = []
+            try:
+                os.close(descriptor)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            try:
                 os.remove(path)
+            except FileNotFoundError:
+                pass
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            for cleanup_failure in cleanup_errors:
+                operation_error.add_note(f"file preparation cleanup failed: {cleanup_failure!r}")
             raise
         os.close(descriptor)
 

@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING, Final, final
 
 import pytest
 import torch
-from conftest import post, serve
 from test_preemption import CHECKPOINT, CONTEXT, PREEMPTED, counter, greedy
 from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
@@ -27,6 +26,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
 )
 
+from conftest import post, serve
 from furiosa_opt_engine.cache_transfer import (
     submit as submit_transfers,
 )

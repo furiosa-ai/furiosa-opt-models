@@ -74,6 +74,26 @@ def _take_coalescing_option(
     return coalescing, storage_options
 
 
+def _resolve_storage_backend(
+    backend: str | None, options: dict[str, object] | None
+) -> tuple[str | None, dict[str, object] | None]:
+    if backend == "file":
+        return "dynamic", {
+            **(options or {}),
+            "backend_name": "furiosa_file",
+            "module_path": "furiosa_opt_sglang.storage",
+            "class_name": "FuriosaHiCacheFile",
+        }
+    if backend == "mooncake":
+        return "dynamic", {
+            **(options or {}),
+            "backend_name": "furiosa_mooncake",
+            "module_path": "furiosa_opt_sglang.mooncake",
+            "class_name": "FuriosaHiCacheMooncake",
+        }
+    return backend, options
+
+
 if TYPE_CHECKING:
     from threading import Event
 
@@ -107,10 +127,10 @@ class Strategy(StackStrategy):
         enable_storage_metrics: bool = False,
     ) -> StackBuildResult:
         assert isinstance(kvcache, Cache)
-        if storage_backend not in (None, "file"):
+        if storage_backend not in (None, "file", "mooncake"):
             raise ValueError(
                 "the Furiosa engine cache supports SGLang HiCache storage only "
-                "with its file backend"
+                "with the file or Mooncake backend"
             )
         if params.mtp_draft_device_pools:
             raise ValueError(
@@ -129,14 +149,9 @@ class Strategy(StackStrategy):
             params.page_size,
             coalescing=coalescing,
         )
-        if storage_backend == "file":
-            storage_backend = "dynamic"
-            storage_backend_extra_config = {
-                **(storage_options or {}),
-                "backend_name": "furiosa_file",
-                "module_path": "furiosa_opt_sglang.storage",
-                "class_name": "FuriosaHiCacheFile",
-            }
+        storage_backend, storage_backend_extra_config = _resolve_storage_backend(
+            storage_backend, storage_options
+        )
         layers = kvcache.layer_num
         group = HostPoolGroup(
             [
