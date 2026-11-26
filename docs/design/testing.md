@@ -39,7 +39,7 @@ Parse each once into a refined type with `TryFrom` or a validating `new`, and na
 ## Level 3: runtime check
 
 When no type can hold a value, check it where it enters:
-`LoadOptions::parse` in [`load.rs`](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/crates/furiosa-opt-engine/src/load.rs) rejects a chip count that no model in the registry serves with `LoadError::Unsupported`; a level 4 test only pins that the check fires.
+`DecoderLoadOptions::parse` in [`load.rs`](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/crates/furiosa-opt-engine/src/load.rs) rejects a chip count that no model in the registry serves with `LoadError::Unsupported`; a level 4 test only pins that the check fires.
 
 ## Level 4: tests
 

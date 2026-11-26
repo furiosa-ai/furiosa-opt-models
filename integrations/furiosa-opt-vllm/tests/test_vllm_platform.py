@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Final, Literal, TypedDict, get_args
 
 import pytest
@@ -36,7 +37,7 @@ from vllm.v1.sample.logits_processor.builtin import MinPLogitsProcessor
 import furiosa_opt_engine as engine
 from furiosa_opt_vllm import offload
 from furiosa_opt_vllm.additional import Placement, Section
-from furiosa_opt_vllm.admission import Draft, Method, Refused, quantization
+from furiosa_opt_vllm.admission import Draft, Method, Refused, encoder_options, quantization
 from furiosa_opt_vllm.platform import FuriosaPlatform
 
 # Every speculative method vLLM names.
@@ -92,6 +93,14 @@ def test_refuses_unserved_requests(
     with pytest.raises(Refused) as error:
         FuriosaPlatform.validate_request(inputs, params)
     assert error.value.option == option
+
+
+def test_refuses_tensor_parallel_encoder_only() -> None:
+    """The encoder-only loader uses rank 0's chip and refuses tensor parallelism it cannot honor."""
+    config = SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=2))
+    with pytest.raises(Refused) as error:
+        encoder_options(config)
+    assert error.value.option == "tensor_parallel_size"
 
 
 @pytest.mark.parametrize("name", sorted(UPSTREAM - set(Method)))
@@ -687,7 +696,7 @@ def test_refuses_kernels(served: Path) -> None:
         # and asks one with a checkpoint loader for its fields.
         checkpoint = engine.Checkpoint(served, config={"architectures": [architecture]})
         try:
-            engine.LoadOptions().parse(checkpoint)
+            engine.DecoderLoadOptions().parse(checkpoint)
         except NotImplementedError:
             return True
         except ValueError:

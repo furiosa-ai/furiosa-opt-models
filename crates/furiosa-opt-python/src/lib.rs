@@ -9,7 +9,7 @@
 //!   class: each model type that loads has a submodule of its own for its classes, such as `qwen3`.
 //!   A load of a model's media encoder alone returns an `Encoder`, whatever its model.
 //! - The submodule `decoder` holds the requests and cache a decoder's calls take, and what they
-//!   return; `vision_language` holds the images and audio a media encoder's calls take.
+//!   return; `encoder` holds the image and audio inputs an `Encoder` takes.
 //! - A failure raises `ValueError` for invalid input or data, `NotImplementedError` for what the
 //!   engine does not serve, `RuntimeError` for a device failure and `OSError` for a file that
 //!   cannot be read.
@@ -30,10 +30,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use tokio::runtime::Runtime;
 
 mod decoder;
+mod encoder;
 mod model;
 mod stub;
 mod tensor;
-mod vision_language;
 
 pub use stub::stub_info;
 
@@ -43,7 +43,8 @@ fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     let _ = pyo3_log::try_init();
     // Load
     module.add_class::<model::Checkpoint>()?;
-    module.add_class::<model::LoadOptions>()?;
+    module.add_class::<model::DecoderLoadOptions>()?;
+    module.add_class::<model::EncoderLoadOptions>()?;
     module.add_class::<model::Decoder>()?;
     module.add_class::<model::Encoder>()?;
     module.add_class::<tensor::Placement>()?;
@@ -56,7 +57,7 @@ fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<tensor::HbmTensor>()?;
     // Calls
     submodule(module, "decoder", decoder::register)?;
-    submodule(module, "vision_language", vision_language::register)?;
+    submodule(module, "encoder", encoder::register)?;
     for (name, register, _) in model::FAMILIES {
         submodule(module, name, register)?;
     }

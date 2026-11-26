@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use furiosa_opt_engine::decoder::{Cache, Decoder, Instance, Keep, Request, Rows};
-use furiosa_opt_engine::{AsyncModule, Checkpoint, Hbm, Load, LoadError, LoadOptions, Tiling};
+use furiosa_opt_engine::{
+    AsyncModule, Checkpoint, DecoderLoadOptions, Hbm, Load, LoadError, Tiling,
+};
 use furiosa_opt_models::load::Context;
 use furiosa_opt_models::models::decoder::attention::qwen3;
 use furiosa_opt_models::models::decoder::form;
@@ -337,7 +339,7 @@ fn loads_for_adapters_only_lines_that_take_them() {
     let config = |model: &str, revision: &str| {
         Checkpoint::new(snapshot(model, revision, &["config.json"]), None).unwrap()
     };
-    let options = LoadOptions::new().adapters();
+    let options = DecoderLoadOptions::new().adapters();
     let small = options.parse(&config("Qwen/Qwen3-0.6B", REVISION)).unwrap();
     assert_eq!(small.size(), "0.6B");
     match options.parse(&config("Qwen/Qwen3-8B", EIGHT)) {

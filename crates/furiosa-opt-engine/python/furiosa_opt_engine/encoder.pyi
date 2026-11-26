@@ -10,6 +10,8 @@ import furiosa_opt_engine as engine
 __all__ = [
     "Audio",
     "Image",
+    "audio_from_dlpack",
+    "image_from_dlpack",
 ]
 
 @typing.final
@@ -17,8 +19,6 @@ class Audio:
     r"""
     Audio: `frames`, BF16 rows `[n, samples]` of samples each.
     """
-    @property
-    def frames(self) -> engine.HbmTensor: ...
     def __new__(cls, frames: engine.HbmTensor) -> Audio:
         r"""
         `frames` lie on the model's device.
@@ -30,21 +30,24 @@ class Audio:
 @typing.final
 class Image:
     r"""
-    An image or a video's frames: `pixels`, merged patches as BF16 rows `[n, features]`, and the
+    An image or a video's frames: `patches`, merged patch features as BF16 rows `[n, features]`, and the
     (x, y) position of each patch in its frame.
     """
-    @property
-    def pixels(self) -> engine.HbmTensor: ...
-    @property
-    def positions(self) -> builtins.list[builtins.list[builtins.int]]: ...
     def __new__(
         cls,
-        pixels: engine.HbmTensor,
+        patches: engine.HbmTensor,
         positions: collections.abc.Sequence[collections.abc.Sequence[int]],
     ) -> Image:
         r"""
-        `pixels` lie on the model's device; `positions` name the valid patches only.
+        `patches` lie on the model's device; `positions` name the valid patches only.
 
         Raises:
-            ValueError: `pixels` are not two-dimensional BF16 rows, one for each position.
+            ValueError: `patches` are not two-dimensional BF16 rows, one for each position.
         """
+
+def image_from_dlpack(
+    patches: builtins.object,
+    positions: collections.abc.Sequence[collections.abc.Sequence[builtins.int]],
+    device: engine.Device,
+) -> Image: ...
+def audio_from_dlpack(frames: builtins.object, device: engine.Device) -> Audio: ...

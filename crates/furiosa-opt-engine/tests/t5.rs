@@ -7,7 +7,7 @@ mod common;
 
 use std::io;
 
-use furiosa_opt_engine::{Config, LoadError, LoadOptions};
+use furiosa_opt_engine::{Config, DecoderLoadOptions, LoadError};
 use furiosa_opt_models::models::Family;
 use furiosa_opt_models::models::encoder_decoder::{mt5, t5};
 use serde_json::{Value, json};
@@ -77,7 +77,7 @@ fn assert_refused(parsed: Result<Config, LoadError>, architecture: &str) {
 #[test]
 fn t5_is_refused_until_its_root_exists() {
     for published in [T5_SMALL, T5_V1_1_SMALL] {
-        let parsed = LoadOptions::new().parse(&published.checkpoint());
+        let parsed = DecoderLoadOptions::new().parse(&published.checkpoint());
         assert_refused(parsed, "T5ForConditionalGeneration");
     }
 }
@@ -86,7 +86,7 @@ fn t5_is_refused_until_its_root_exists() {
 /// name yet.
 #[test]
 fn mt5_is_refused_until_its_root_exists() {
-    let parsed = LoadOptions::new().parse(&MT5_SMALL.checkpoint());
+    let parsed = DecoderLoadOptions::new().parse(&MT5_SMALL.checkpoint());
     assert_refused(parsed, "MT5ForConditionalGeneration");
 }
 
@@ -94,7 +94,7 @@ fn mt5_is_refused_until_its_root_exists() {
 /// name yet.
 #[test]
 fn t5_encoder_is_refused_until_its_root_exists() {
-    let options = LoadOptions::new().architecture("T5EncoderModel");
+    let options = DecoderLoadOptions::new().architecture("T5EncoderModel");
     let parsed = options.and_then(|options| options.parse(&T5_V1_1_SMALL.checkpoint()));
     assert_refused(parsed, "T5EncoderModel");
 }

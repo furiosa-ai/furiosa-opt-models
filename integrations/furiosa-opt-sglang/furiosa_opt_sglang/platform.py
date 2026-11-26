@@ -126,8 +126,8 @@ class Resolved(Served):
     enable_flexkv: Unset
     enable_unified_cache_external_linker: Unset
     prefill_only_disable_kv_cache: Unset
-    # No encoder output leaves the device for another instance.
-    encoder_only: Unset
+    # The engine runs registered encoder-only media producers; it serves no other EPD role.
+    encoder_only: bool
     language_only: Unset
     # The engine places every weight it loads; SGLang's per-layer embedding offload moves tables of
     # its own model, and its backend and directory options take effect only with it.
@@ -319,6 +319,10 @@ class Platform(SRTPlatform):
         # the engine reads the operator's degree, which SGLang's ranks would each load whole.
         # Each data-parallel replica's first chip then lies that many chips past the last one's.
         tensor = cast("int", raw.get("tp_size") or 1)
+        if resolved.encoder_only and tensor != 1:
+            raise Refused(
+                "tp_size", "loads the encoder-only model on one chip, which requires tp_size=1"
+            )
         server_args.gpu_id_step = tensor
         server_args.tp_size = 1
         # The engine allocates each chip's cache whole, so a model split over chips needs the
@@ -334,17 +338,26 @@ class Platform(SRTPlatform):
         from furiosa_opt_sglang.load import options
 
         overrides = cast("dict[str, JsonValue]", model_config.model_override_args)
+        hf_config = cast("PretrainedConfig", model_config.hf_config)
         try:
-            options(
-                model_config,
-                tensor,
-                resolved.kv_cache_dtype,
-                deterministic=resolved.enable_deterministic_inference,
-            ).parse(configured(server_args.model_path, server_args.revision, overrides))
+            checkpoint = configured(server_args.model_path, server_args.revision, overrides)
+            if resolved.encoder_only:
+                import furiosa_opt_engine as engine
+                from furiosa_opt_sglang.media_adapter import require_adapter
+
+                architectures = getattr(hf_config, "architectures", ()) or ()
+                _ = require_adapter(architectures)
+                engine.EncoderLoadOptions().parse(checkpoint)
+            else:
+                options(
+                    model_config,
+                    tensor,
+                    resolved.kv_cache_dtype,
+                    deterministic=resolved.enable_deterministic_inference,
+                ).parse(checkpoint)
         except (NotImplementedError, ValueError) as error:
             raise Refused("model_path", str(error)) from None
         # SGLang leaves the checkpoint's Transformers config untyped.
-        hf_config = cast("PretrainedConfig", model_config.hf_config)
         model_type = hf_config.model_type
         state = recurrent(model_type)
         if state:

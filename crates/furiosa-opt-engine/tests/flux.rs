@@ -7,7 +7,7 @@ mod common;
 
 use std::io::ErrorKind;
 
-use furiosa_opt_engine::{LoadError, LoadOptions};
+use furiosa_opt_engine::{DecoderLoadOptions, LoadError};
 use furiosa_opt_models::models::Family;
 use furiosa_opt_models::models::diffusion::flux;
 
@@ -26,7 +26,7 @@ const FLUX_1_SCHNELL: Published = Published::new(
 /// refuses: no type serves the name yet.
 #[test]
 fn flux_is_refused_until_its_root_exists() {
-    match LoadOptions::new().parse(&FLUX_1_SCHNELL.checkpoint()) {
+    match DecoderLoadOptions::new().parse(&FLUX_1_SCHNELL.checkpoint()) {
         Err(LoadError::Unsupported { name, reason }) => {
             assert_eq!(name, "FluxTransformer2DModel");
             assert_eq!(reason, "no model type is implemented");

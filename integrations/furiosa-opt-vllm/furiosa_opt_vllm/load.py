@@ -9,9 +9,10 @@ from vllm.platforms import current_platform
 
 import furiosa_opt_engine as engine
 from furiosa_opt_vllm import checkpoint, lora, selection
-from furiosa_opt_vllm.admission import options
+from furiosa_opt_vllm.admission import encoder_options
 from furiosa_opt_vllm.decoder import PES, Decoder
-from furiosa_opt_vllm.multimodal import Media
+from furiosa_opt_vllm.encoder import Encoder
+from furiosa_opt_vllm.media_adapter import adapter_for
 from furiosa_opt_vllm.runner import Labels, Vocabulary
 
 if TYPE_CHECKING:
@@ -35,15 +36,13 @@ def bind(runner: Runner, *, load_dummy_weights: bool = False) -> None:
             pass
     if config.is_mm_encoder_only:
         # An encoder cache producer runs no language model: rank 0's chip holds the encoder.
+        adapter = adapter_for(config.model_config.architectures)
         device = engine.Device(
             engine.Placement([current_platform.device_id_to_physical_device_id(0)], PES)
         )
         located = checkpoint.located(config.model_config, config.load_config.download_dir)
-        match options(config).load(located.mapped(), device):
-            case engine.Encoder() as encoder:
-                runner.model = Media(encoder, device)
-            case loaded:
-                raise NotImplementedError(f"{type(loaded).__name__} is no media encoder")
+        encoder = encoder_options(config).load(located.mapped(), device)
+        runner.model = Encoder(encoder, device, adapter)
         runner.selection = selection.choose(config, runner.speculative, None, runner.requests)
         return
     decoder = Decoder.load(config)

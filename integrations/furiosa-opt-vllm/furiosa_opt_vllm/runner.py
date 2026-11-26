@@ -13,7 +13,7 @@ import furiosa_opt_engine as engine
 from furiosa_opt_vllm.additional import Section
 from furiosa_opt_vllm.admission import speculative
 from furiosa_opt_vllm.decoder import Decoder
-from furiosa_opt_vllm.multimodal import Media
+from furiosa_opt_vllm.encoder import Encoder
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -90,7 +90,7 @@ class Runner:
         self.vllm_config: VllmConfig = vllm_config
         # The speculative method the platform admitted before the runner starts.
         self.speculative: Speculative | None = speculative(vllm_config, Section.parse(vllm_config))
-        self.model: Decoder | Media | None = None
+        self.model: Decoder | Encoder | None = None
         self.cache: engine.decoder.Cache | None = None
         # vLLM's driver of the KV connector around each step, which does nothing without one.
         self.kv_connector: KVConnector = NO_OP_KV_CONNECTOR
@@ -139,7 +139,7 @@ class Runner:
         match self.model:
             case Decoder():
                 return self.model
-            case None | Media():
+            case None | Encoder():
                 raise RuntimeError("no sequence model is loaded")
             case _:
                 assert_never(self.model)

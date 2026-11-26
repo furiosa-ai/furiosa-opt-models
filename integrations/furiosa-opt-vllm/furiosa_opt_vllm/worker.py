@@ -30,8 +30,8 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from furiosa_opt_vllm import cache, residency
 from furiosa_opt_vllm.admission import Refused
 from furiosa_opt_vllm.decoder import Decoder
+from furiosa_opt_vllm.encoder import Encoder
 from furiosa_opt_vllm.model_runner import FuriosaModelRunner
-from furiosa_opt_vllm.multimodal import Media
 from furiosa_opt_vllm.selection import Sampling, Speculation
 
 if TYPE_CHECKING:
@@ -135,8 +135,7 @@ class FuriosaWorker(WorkerBase):
     def reset_encoder_cache(self) -> None:
         model = self._runner().model
         match model:
-            case Media():
-                model.features.clear()
+            case Encoder():
                 model.transfers.clear()
             case None | Decoder():
                 pass

@@ -7,7 +7,7 @@ mod common;
 
 use std::io::ErrorKind;
 
-use furiosa_opt_engine::{LoadError, LoadOptions};
+use furiosa_opt_engine::{DecoderLoadOptions, LoadError};
 use furiosa_opt_models::models::Family;
 use furiosa_opt_models::models::diffusion::autoencoder;
 
@@ -24,7 +24,7 @@ const SD_VAE_FT_MSE: Published = Published::new(
 /// name yet.
 #[test]
 fn autoencoder_is_refused_until_its_root_exists() {
-    match LoadOptions::new().parse(&SD_VAE_FT_MSE.checkpoint()) {
+    match DecoderLoadOptions::new().parse(&SD_VAE_FT_MSE.checkpoint()) {
         Err(LoadError::Unsupported { name, reason }) => {
             assert_eq!(name, "AutoencoderKL");
             assert_eq!(reason, "no model type is implemented");

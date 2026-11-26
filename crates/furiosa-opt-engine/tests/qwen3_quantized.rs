@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use furiosa_opt_engine::decoder::{self, Cache, Keep, Request, Rows};
-use furiosa_opt_engine::{Checkpoint, Hbm, Load, LoadError, LoadOptions, Quantization};
+use furiosa_opt_engine::{Checkpoint, DecoderLoadOptions, Hbm, Load, LoadError, Quantization};
 use furiosa_opt_models::load::Context;
 use furiosa_opt_models::models::Implements;
 use furiosa_opt_models::models::decoder::attention::{Geometry, KvHeads, qwen3};
@@ -256,7 +256,7 @@ fn continues_the_prompt_quantized_at_load() {
     let checkpoint = checkpoint();
     let mut device = device();
     for quantization in [Quantization::Fp8PerTensor, Quantization::Fp8PerChannel] {
-        let model = LoadOptions::new()
+        let model = DecoderLoadOptions::new()
             .quantization(quantization)
             .load(&mut device, &checkpoint)
             .unwrap()
@@ -295,21 +295,22 @@ fn selects_the_line_of_the_quantization_from_the_config() {
         config["quantization_config"] = declared;
         Checkpoint::new(directory.path(), Some(config)).unwrap()
     };
-    let online = |quantization| LoadOptions::new().quantization(quantization);
-    let precision = |options: &LoadOptions, checkpoint: &Checkpoint| {
+    let online = |quantization| DecoderLoadOptions::new().quantization(quantization);
+    let precision = |options: &DecoderLoadOptions, checkpoint: &Checkpoint| {
         let selected = options.parse(checkpoint).unwrap();
         (selected.size(), selected.precision())
     };
-    let refusal = |options: &LoadOptions, checkpoint: &Checkpoint| match options.parse(checkpoint) {
-        Err(LoadError::InvalidData { name, .. }) => name,
-        other => panic!("{:?} is not `InvalidData`", other.map(drop)),
-    };
+    let refusal =
+        |options: &DecoderLoadOptions, checkpoint: &Checkpoint| match options.parse(checkpoint) {
+            Err(LoadError::InvalidData { name, .. }) => name,
+            other => panic!("{:?} is not `InvalidData`", other.map(drop)),
+        };
     for stored in [
         Checkpoint::new(directory.path(), Some(config.clone())).unwrap(),
         declaring(serde_json::Value::Null),
     ] {
         assert_eq!(
-            precision(&LoadOptions::new(), &stored),
+            precision(&DecoderLoadOptions::new(), &stored),
             ("0.6B", Dtype::BF16)
         );
         assert_eq!(Line::<form::Affine>::scope(&stored).unwrap(), "");
@@ -331,7 +332,10 @@ fn selects_the_line_of_the_quantization_from_the_config() {
     let blocks = declaring(serde_json::json!({
         "quant_method": "fp8", "activation_scheme": "dynamic", "weight_block_size": [128, 128],
     }));
-    assert_eq!(refusal(&LoadOptions::new(), &blocks), "Qwen3ForCausalLM");
+    assert_eq!(
+        refusal(&DecoderLoadOptions::new(), &blocks),
+        "Qwen3ForCausalLM"
+    );
     let quantized = refusal(&online(Quantization::Fp8PerTensor), &blocks);
     assert_eq!(quantized, "config.json:quantization_config");
 }

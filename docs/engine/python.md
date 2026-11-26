@@ -11,7 +11,7 @@ from huggingface_hub import snapshot_download
 import furiosa_opt_engine as engine
 
 checkpoint = engine.Checkpoint(snapshot_download("Qwen/Qwen3-0.6B"))
-options = engine.LoadOptions()
+options = engine.DecoderLoadOptions()
 options.parse(checkpoint)  # (1)!
 device = engine.Device(engine.Placement([0], range(8)))  # (2)!
 decoder = options.load(checkpoint, device)  # (3)!
@@ -72,7 +72,7 @@ transfer.wait()
 
 ## Run requests with LoRA adapters
 
-A decoder whose projections take LoRA adapters describes them as `decoder.adapters`, an `engine.decoder.AdapterSpec`, and any other decoder as `None`; a load for adapters, `engine.LoadOptions().adapters()`, refuses any other one from its config.
+A decoder whose projections take LoRA adapters describes them as `decoder.adapters`, an `engine.decoder.AdapterSpec`, and any other decoder as `None`; a load for adapters, `engine.DecoderLoadOptions().adapters()`, refuses any other one from its config.
 An `Adapter` is a PEFT checkpoint loaded onto the decoder's device, and a call takes a list of adapters that each request names one of by its index:
 
 ```python

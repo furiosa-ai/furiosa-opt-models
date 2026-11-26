@@ -70,10 +70,10 @@ Installation registers the platform and worker through SGLang's plugin entry poi
 
 ## Verify the installation
 
-To check that the compiled engine loads, run this command; it prints a `LoadOptions` object without opening a device:
+To check that the compiled engine loads, run this command; it prints a `DecoderLoadOptions` object without opening a device:
 
 ```bash
-python -c "import furiosa_opt_engine as engine; print(engine.LoadOptions())"
+python -c "import furiosa_opt_engine as engine; print(engine.DecoderLoadOptions())"
 ```
 
 [Quickstart](quickstart.md) checks that a server runs on RNGD.

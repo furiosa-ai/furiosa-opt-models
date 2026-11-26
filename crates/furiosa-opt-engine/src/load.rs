@@ -30,9 +30,9 @@ use furiosa_opt_std::prelude::Device;
 use safetensors::Dtype;
 use serde_json::Value;
 
-/// The choices of one load; a choice the registry refuses is reported before any weight is read.
+/// Shared state for a typed decoder or encoder load.
 #[derive(Clone, Debug, Default)]
-pub struct LoadOptions {
+struct Options {
     chips: Option<NonZeroUsize>,
     kv_cache: Option<Dtype>,
     architecture: Option<&'static str>,
@@ -42,6 +42,16 @@ pub struct LoadOptions {
     part: Part,
     adapters: bool,
 }
+
+/// Choices for loading a decoder; a choice the registry refuses is reported before any weight is
+/// read.
+#[derive(Clone, Debug, Default)]
+pub struct DecoderLoadOptions(Options);
+
+/// Choices for loading a media encoder alone. Its type makes the loaded part explicit and keeps
+/// decoder-only choices out of the encoder load API.
+#[derive(Clone, Debug)]
+pub struct EncoderLoadOptions(Options);
 
 /// The quantization a load gives the projections of a checkpoint that stores them in BF16: E4M3
 /// codes, restored to BF16 before each contraction, under FP32 scales of the largest magnitude
@@ -69,13 +79,9 @@ pub struct Config {
     tiling: Tiling,
 }
 
-impl LoadOptions {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
+impl Options {
     /// Load onto `chips` chips instead of the one count the selected model allows; refuses zero.
-    pub fn chips(self, chips: usize) -> Result<Self, LoadError> {
+    fn chips(self, chips: usize) -> Result<Self, LoadError> {
         let chips = NonZeroUsize::new(chips).ok_or_else(|| LoadError::InvalidData {
             name: "chips".into(),
             reason: "a model loads onto at least one chip".into(),
@@ -87,7 +93,7 @@ impl LoadOptions {
     }
 
     /// Cache keys and values as `dtype` instead of BF16.
-    pub fn kv_cache(self, dtype: Dtype) -> Self {
+    fn kv_cache(self, dtype: Dtype) -> Self {
         Self {
             kv_cache: Some(dtype),
             ..self
@@ -97,7 +103,7 @@ impl LoadOptions {
     /// Load the architecture `name` instead of the one the checkpoint's config names; refuses a
     /// name the registry does not hold as invalid, and one it lists no implementation of as
     /// unsupported.
-    pub fn architecture(self, name: &str) -> Result<Self, LoadError> {
+    fn architecture(self, name: &str) -> Result<Self, LoadError> {
         let (name, _) = Implementation::listed(&[name])?;
         Ok(Self {
             architecture: Some(name),
@@ -106,7 +112,7 @@ impl LoadOptions {
     }
 
     /// Load only the layers `layers`, at their positions in the whole model.
-    pub fn layers(self, layers: Range<usize>) -> Self {
+    fn layers(self, layers: Range<usize>) -> Self {
         Self {
             layers: Some(layers),
             ..self
@@ -115,7 +121,7 @@ impl LoadOptions {
 
     /// Serve calls whose rows keep their values' bits whatever other rows share the calls: their
     /// attention tiles each row's history by itself alone, `Tiling::Fixed`.
-    pub fn batch_invariant(self) -> Self {
+    fn batch_invariant(self) -> Self {
         Self {
             tiling: Tiling::Fixed,
             ..self
@@ -123,24 +129,16 @@ impl LoadOptions {
     }
 
     /// Quantize a BF16 checkpoint's projections at load as `quantization` says.
-    pub fn quantization(self, quantization: Quantization) -> Self {
+    fn quantization(self, quantization: Quantization) -> Self {
         Self {
             quantization: Some(quantization),
             ..self
         }
     }
 
-    /// Load the model's media encoder alone, whose rows its language model reads.
-    pub fn encoder(self) -> Self {
-        Self {
-            part: Part::Encoder,
-            ..self
-        }
-    }
-
     /// Load for calls that run LoRA adapters: an implementation whose projections take none is
     /// unsupported.
-    pub fn adapters(self) -> Self {
+    fn adapters(self) -> Self {
         Self {
             adapters: true,
             ..self
@@ -149,16 +147,15 @@ impl LoadOptions {
 
     /// The implementation `checkpoint` loads as with these choices, from its config and its names
     /// alone: no weight is read and no device is needed.
-    pub fn parse(&self, checkpoint: &Checkpoint) -> Result<Config, LoadError> {
+    fn parse(&self, checkpoint: &Checkpoint) -> Result<Config, LoadError> {
         self.read(checkpoint, |checkpoint| self.select(checkpoint))
     }
 
     /// The implementation `checkpoint` loads as with these choices, loaded strictly into HBM of
-    /// `device` as the model a framework serves: a decoder, or the media encoder of a load of the
-    /// encoder alone; a refused choice is reported before any weight is read. A decoder serves its
-    /// calls with the config's tiling. Dropping the model frees its device memory, and a new load
-    /// of the same implementation serves the caches the dropped one did.
-    pub fn load(&self, device: &mut Device, checkpoint: &Checkpoint) -> Result<Model, LoadError> {
+    /// `device` as the decoder a framework serves; a refused choice is reported before any weight
+    /// is read. Dropping the model frees its device memory, and a new load of the same
+    /// implementation serves the caches the dropped one did.
+    fn load(&self, device: &mut Device, checkpoint: &Checkpoint) -> Result<Model, LoadError> {
         self.read(checkpoint, |checkpoint| {
             let Config {
                 implementation,
@@ -261,6 +258,112 @@ impl LoadOptions {
     }
 }
 
+impl EncoderLoadOptions {
+    pub fn new() -> Self {
+        Self(Options {
+            part: Part::Encoder,
+            ..Options::default()
+        })
+    }
+
+    /// Load onto `chips` chips instead of the one count the selected encoder allows; refuses zero.
+    pub fn chips(self, chips: usize) -> Result<Self, LoadError> {
+        Ok(Self(self.0.chips(chips)?))
+    }
+
+    /// Load the architecture `name` instead of the one the checkpoint's config names.
+    pub fn architecture(self, name: &str) -> Result<Self, LoadError> {
+        Ok(Self(self.0.architecture(name)?))
+    }
+
+    /// Quantize a BF16 checkpoint's projections at load as `quantization` says.
+    pub fn quantization(self, quantization: Quantization) -> Self {
+        Self(self.0.quantization(quantization))
+    }
+
+    /// The encoder implementation `checkpoint` loads as with these choices, from config and names
+    /// alone: no weight is read and no device is needed.
+    pub fn parse(&self, checkpoint: &Checkpoint) -> Result<Config, LoadError> {
+        self.0.parse(checkpoint)
+    }
+
+    /// Load the media encoder `checkpoint` selects strictly into HBM of `device`.
+    pub fn load(
+        &self,
+        device: &mut Device,
+        checkpoint: &Checkpoint,
+    ) -> Result<Box<dyn crate::encoder::Encoder>, LoadError> {
+        match self.0.load(device, checkpoint)? {
+            Model::Encoder(encoder) => Ok(encoder),
+            Model::Decoder(_) => {
+                unreachable!("encoder load options select a media encoder implementation")
+            }
+        }
+    }
+}
+
+impl Default for EncoderLoadOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DecoderLoadOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Load onto `chips` chips instead of the one count the selected model allows; refuses zero.
+    pub fn chips(self, chips: usize) -> Result<Self, LoadError> {
+        Ok(Self(self.0.chips(chips)?))
+    }
+
+    /// Cache keys and values as `dtype` instead of BF16.
+    pub fn kv_cache(self, dtype: Dtype) -> Self {
+        Self(self.0.kv_cache(dtype))
+    }
+
+    /// Load the architecture `name` instead of the one the checkpoint's config names; refuses a
+    /// name the registry does not hold as invalid, and one it lists no implementation of as
+    /// unsupported.
+    pub fn architecture(self, name: &str) -> Result<Self, LoadError> {
+        Ok(Self(self.0.architecture(name)?))
+    }
+
+    /// Load only the layers `layers`, at their positions in the whole model.
+    pub fn layers(self, layers: Range<usize>) -> Self {
+        Self(self.0.layers(layers))
+    }
+
+    /// Serve calls whose rows keep their values' bits whatever other rows share the calls: their
+    /// attention tiles each row's history by itself alone, `Tiling::Fixed`.
+    pub fn batch_invariant(self) -> Self {
+        Self(self.0.batch_invariant())
+    }
+
+    /// Quantize a BF16 checkpoint's projections at load as `quantization` says.
+    pub fn quantization(self, quantization: Quantization) -> Self {
+        Self(self.0.quantization(quantization))
+    }
+
+    /// Load for calls that run LoRA adapters: an implementation whose projections take none is
+    /// unsupported.
+    pub fn adapters(self) -> Self {
+        Self(self.0.adapters())
+    }
+
+    /// The implementation `checkpoint` loads as with these choices, from its config and names
+    /// alone: no weight is read and no device is needed.
+    pub fn parse(&self, checkpoint: &Checkpoint) -> Result<Config, LoadError> {
+        self.0.parse(checkpoint)
+    }
+
+    /// Load the decoder implementation `checkpoint` selects strictly into HBM of `device`.
+    pub fn load(&self, device: &mut Device, checkpoint: &Checkpoint) -> Result<Model, LoadError> {
+        self.0.load(device, checkpoint)
+    }
+}
+
 impl Config {
     /// The architecture as the registry spells it.
     pub fn architecture(&self) -> &'static str {
@@ -327,7 +430,7 @@ impl FromStr for Quantization {
 
 #[cfg(test)]
 mod tests {
-    use super::LoadOptions;
+    use super::DecoderLoadOptions;
     use furiosa_opt_models::load::{Checkpoint, LoadError};
     use serde_json::json;
 
@@ -338,7 +441,7 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         let refusal = |config| {
             let checkpoint = Checkpoint::new(empty.path(), Some(config)).unwrap();
-            match LoadOptions::new().parse(&checkpoint) {
+            match DecoderLoadOptions::new().parse(&checkpoint) {
                 Err(LoadError::InvalidData { name, .. }) => ("invalid", name),
                 Err(LoadError::Unsupported { name, .. }) => ("unsupported", name),
                 other => panic!("{:?}", other.map(|chosen| chosen.architecture())),

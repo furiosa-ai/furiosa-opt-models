@@ -6,10 +6,10 @@ from typing import TYPE_CHECKING, assert_never, final
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.v1.worker.gpu.kv_connector import get_kv_connector
 
-from furiosa_opt_vllm import embedding, generation, load, multimodal, paging, request
+from furiosa_opt_vllm import embedding, encoder, generation, load, paging, request
 from furiosa_opt_vllm.decoder import Decoder
+from furiosa_opt_vllm.encoder import Encoder
 from furiosa_opt_vllm.generation import sequence
-from furiosa_opt_vllm.multimodal import Media
 from furiosa_opt_vllm.offload import RNGDOffloadingConnector
 from furiosa_opt_vllm.runner import Runner
 
@@ -54,8 +54,8 @@ class FuriosaModelRunner(Runner):
         if self.pending is not None:
             raise RuntimeError("sample_tokens must collect the previous execution")
         request.update(self, scheduler_output)
-        if isinstance(self.model, Media):
-            return multimodal.step(self.model, scheduler_output, self.requests)
+        if isinstance(self.model, Encoder):
+            return encoder.step(self.model, scheduler_output, self.requests)
         if not scheduler_output.num_scheduled_tokens:
             return self.kv_connector.no_forward(scheduler_output)
         self.kv_connector.pre_forward(scheduler_output)

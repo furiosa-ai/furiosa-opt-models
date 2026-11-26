@@ -4,6 +4,8 @@
 
 Test a model and run the framework tests. You need an RNGD device, `uv` (fixtures download checkpoints with it) and `cargo-furiosa-opt` on your `PATH`; see [Installation](../getting-started/installation.md).
 
+Build or test code with `#[device]` through `cargo furiosa-opt`, using the compiler archive named by the exact `furiosa-opt-std.rev` in `Cargo.toml` and its matching Rust SDK. Plain `cargo` uses the ordinary Rust compiler; its const-evaluation errors do not establish that the pinned kernel compiler fails. CI installs the matching pair with [the toolchain action](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/.github/actions/toolchain/action.yml).
+
 ## Test a model
 
 Run the model type's tests on a chip. They load the checkpoint, decode on the device and check the output against Transformers:

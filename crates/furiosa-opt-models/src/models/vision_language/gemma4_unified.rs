@@ -15,6 +15,7 @@
 use furiosa_opt_std::prelude::*;
 use serde::Deserialize;
 
+use crate::encoder::{self, Coordinate};
 use crate::load::{Checkpoint, Load, LoadError, Named};
 use crate::models::config::{self, Constant, Literal};
 use crate::models::{Class, Implements};
@@ -23,7 +24,7 @@ use crate::ops::embedding::Factorized;
 use crate::ops::linear::{Affine, Linear};
 use crate::ops::normalization::{LayerNorm, UnitRmsNorm};
 use crate::ops::pointwise::add::Add;
-use crate::tensor::memory::Memory;
+use crate::tensor::memory::{Hbm, Memory};
 use crate::tensor::parallel::Chip;
 use crate::{Identity, Module, Sequential, Then};
 
@@ -33,7 +34,9 @@ axes![
     Text = 3840,
     Samples = 640,
     Positions = 1120,
-    Coordinates = 2
+    Coordinates = 2,
+    SmallRows = 512,
+    LargeRows = 2304
 ];
 
 /// A merged patch's features: 48 x 48 pixels of three channels.
@@ -46,7 +49,7 @@ pub type Frames<R> = HbmTensor<bf16, Chip, m![R, Samples]>;
 pub type Rows<R> = HbmTensor<bf16, Chip, m![R, Text]>;
 
 /// The byte offset of each patch's row in the factorized position table for one coordinate:
-/// [`offset`] of its x, or of its y.
+/// [`offset`](encoder::Vision::offset) of its x, or of its y.
 pub type Offsets<R> = HbmTensor<i32, Chip, m![R]>;
 
 /// The factorized position table as stored, `[positions, coordinates, features]`: a table of rows
@@ -263,11 +266,38 @@ where
     }
 }
 
-/// The byte offset of the [`Table`] row a patch's `coordinate` (0 for x, 1 for y) at `position`
-/// reads.
-pub const fn offset(position: usize, coordinate: usize) -> i32 {
-    ((Coordinates::SIZE * position + coordinate) * Embed::SIZE * size_of::<bf16>()) as i32
+/// Launches of 512 or 2304 rows; a patch's operand is the byte offset of the [`Table`] row its
+/// coordinate reads.
+impl encoder::Encoder for Encoder<Hbm> {
+    type Text = Text;
+    type View<'a> = Encoder<&'a Hbm>;
 }
+
+impl encoder::Vision for Encoder<Hbm> {
+    type SmallRows = SmallRows;
+    type LargeRows = LargeRows;
+    type Patch = Patch;
+    type Positions = Positions;
+    type VisionState = (VisionState, ProjectionState);
+
+    fn offset(position: usize, coordinate: Coordinate) -> i32 {
+        ((Coordinates::SIZE * position + coordinate.index()) * Embed::SIZE * size_of::<bf16>())
+            as i32
+    }
+}
+
+impl encoder::Audio for Encoder<Hbm> {
+    type SmallRows = SmallRows;
+    type LargeRows = LargeRows;
+    type Samples = Samples;
+    type AudioState = ProjectionState;
+}
+
+/// A [`VisionEmbedder`]'s state: its patch path's and its position table's, then its last norm's.
+type VisionState = (((((), ()), ()), ()), ());
+
+/// A [`MultimodalEmbedder`]'s state: its norm's and the identity's, then its projection's.
+type ProjectionState = (((), ()), ());
 
 #[cfg(test)]
 mod tests {

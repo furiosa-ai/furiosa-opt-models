@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 def options(
     model_config: ModelConfig, tensor: int, dtype: CacheDtype, *, deterministic: bool
-) -> engine.LoadOptions:
+) -> engine.DecoderLoadOptions:
     """The engine's options of the load of `model_config`'s checkpoint: on `tensor` chips, with the
     cache dtype SGLang spells `dtype`, batch invariant under deterministic inference, as its base
     model when SGLang pools the hidden rows of a causal checkpoint."""
@@ -35,7 +35,7 @@ def options(
     import furiosa_opt_engine as engine
 
     hf_config = cast("PretrainedConfig", model_config.hf_config)
-    loads = engine.LoadOptions().chips(tensor)
+    loads = engine.DecoderLoadOptions().chips(tensor)
     if (cache_dtype := CACHE_DTYPES[dtype]) is not None:
         loads = loads.kv_cache(cache_dtype)
     if deterministic:

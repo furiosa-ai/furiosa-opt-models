@@ -40,7 +40,7 @@ class Drafter:
                 "speculative_config.model",
                 "speculative_config.model requires a target whose attention cache takes token IDs",
             )
-        options = engine.LoadOptions().parallelism(
+        options = engine.DecoderLoadOptions().parallelism(
             tensor=draft.parallel.tensor_parallel_size,
             pipeline=draft.parallel.pipeline_parallel_size,
         )

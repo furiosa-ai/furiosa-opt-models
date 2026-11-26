@@ -55,3 +55,15 @@ Evicting a request releases its block assignments, not the cache allocation, and
 - Mixed chunks interleave prompt chunks with the running requests' decode rows in one step.
 
 The full step logic is in [`generation/sequence.py` of vLLM](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/integrations/furiosa-opt-vllm/furiosa_opt_vllm/generation/sequence.py) and [of SGLang](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/integrations/furiosa-opt-sglang/furiosa_opt_sglang/generation/sequence.py).
+
+## Encoder-only media
+
+The [engine encoder contract](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/crates/furiosa-opt-engine/src/encoder/mod.rs) returns one BF16 `[rows, output_width]` tensor per input item, in input order, with one output row per input row. A model must compute each row independently: the engine leaves unused compiled launch rows uninitialized and discards their outputs. The plugins rely on that contract for engine item-count, rank, and output-width guarantees.
+
+`EncoderLoadOptions` directly expresses encoder-only loads; `DecoderLoadOptions` expresses decoder loads. In the Python API their `load()` methods return `Encoder` and `Decoder`, respectively. The generated stubs preserve this distinction, so neither plugin needs a runtime type cast. See [vLLM's load options](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/integrations/furiosa-opt-vllm/furiosa_opt_vllm/admission.py) and [SGLang's encoder loader](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/integrations/furiosa-opt-sglang/furiosa_opt_sglang/encoder.py).
+
+Both encoder-only loaders use one chip. SGLang rejects `tp_size != 1` during platform config resolution; vLLM now rejects `tensor_parallel_size != 1` before checkpoint verification. Neither silently drops a requested multi-chip layout.
+
+### Framework boundary checks
+
+The frameworks own scheduling, cache lifetime, and EPD token accounting. vLLM's plugin checks output rows against placeholders because it calls the engine outside vLLM's multimodal model callback. SGLang's EPD path owns request cardinality and returned token counts. Adapters validate only processor-specific tensor axes, padding masks, and video grouping needed to build typed engine inputs; nearby comments identify those boundaries. Recheck these hook contracts when updating the pinned [vLLM 0.31.0](https://github.com/vllm-project/vllm/blob/v0.31.0/vllm/v1/worker/utils.py) and [SGLang 0.5.22](https://github.com/sgl-project/sglang/blob/v0.5.22/python/sglang/srt/disaggregation/encoder/server.py) versions.

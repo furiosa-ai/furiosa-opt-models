@@ -7,7 +7,7 @@ mod common;
 
 use std::io;
 
-use furiosa_opt_engine::{LoadError, LoadOptions};
+use furiosa_opt_engine::{DecoderLoadOptions, LoadError};
 use furiosa_opt_models::models::Family;
 use furiosa_opt_models::models::vision_language::mllama;
 use serde_json::{Value, json};
@@ -25,7 +25,7 @@ const MLLAMA_11B: Published = Published::new(
 /// refuses: no type serves the name yet.
 #[test]
 fn mllama_is_refused_until_its_root_exists() {
-    match LoadOptions::new().parse(&MLLAMA_11B.checkpoint()) {
+    match DecoderLoadOptions::new().parse(&MLLAMA_11B.checkpoint()) {
         Err(LoadError::Unsupported { name, reason }) => {
             assert_eq!(name, "MllamaForConditionalGeneration");
             assert_eq!(reason, "no model type is implemented");

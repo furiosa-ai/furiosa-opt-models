@@ -10,7 +10,7 @@ from vllm.v1.worker.gpu_input_batch import InputBatch
 import furiosa_opt_engine as engine
 from furiosa_opt_vllm.cache import assigned
 from furiosa_opt_vllm.decoder import RELEASED, Decoder
-from furiosa_opt_vllm.multimodal import Media
+from furiosa_opt_vllm.encoder import Encoder
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
@@ -22,7 +22,7 @@ def describe(runner: Runner) -> dict[str, KVCacheSpec]:
     match runner.model:
         case None:
             raise RuntimeError("load_model must precede cache configuration")
-        case Media():
+        case Encoder():
             return {}
         case Decoder(model=loaded):
             if loaded is None:
@@ -77,7 +77,7 @@ def available(runner: Runner) -> int:
         case Decoder():
             blocks = min(max(0, memory) // block_bytes, max_blocks)
             return runner.selection.capacity(blocks) * block_bytes
-        case Media():
+        case Encoder():
             return max(0, min(memory, max_blocks * block_bytes))
         case _:
             assert_never(model)
@@ -113,7 +113,7 @@ def initialize(runner: Runner, config: KVCacheConfig) -> None:
         num_spec_tokens=runner.vllm_config.num_speculative_tokens,
     )
     match model:
-        case Media():
+        case Encoder():
             if config.kv_cache_groups:
                 raise ValueError("the encoder has no persistent cache")
         case Decoder(model=loaded):

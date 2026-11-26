@@ -82,7 +82,9 @@ def draft(config: VllmConfig) -> Draft:
 def standalone() -> engine.relation.CausalLM[engine.Sequence]:
     """The draft model loaded alone, on the first free chips, as a target loads."""
     parser: type[engine.Model[engine.relation.CausalLM[engine.Sequence]]] = engine.Model
-    return engine.LoadOptions().load(parser.from_pretrained(snapshot_download("Qwen/Qwen3-0.6B")))
+    return engine.DecoderLoadOptions().load(
+        parser.from_pretrained(snapshot_download("Qwen/Qwen3-0.6B"))
+    )
 
 
 def test_matches_standalone(
@@ -190,7 +192,7 @@ def test_refuses_another_vocabulary(draft: Draft) -> None:
     vocabulary is not Qwen3-0.6B's."""
     parser: type[engine.Model[engine.Sequence]] = engine.Model
     target = (
-        engine.LoadOptions()
+        engine.DecoderLoadOptions()
         .drop("head")
         .load(parser.from_pretrained(snapshot_download("Qwen/Qwen3-Embedding-0.6B")))
     )

@@ -1,4 +1,7 @@
 //! Vision-language families and the catalog of multimodal compositions.
+//!
+//! - Gemma 4's media encoder is one composition in this family; its generic contracts live in
+//!   [`crate::encoder`].
 
 use super::decoder::attention::MuseGlimmerBody;
 use crate::modules::{

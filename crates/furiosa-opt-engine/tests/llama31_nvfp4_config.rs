@@ -1,5 +1,5 @@
 //! Registry selection for the pinned NVFP4 checkpoint, without opening a device.
-use furiosa_opt_engine::{Checkpoint, LoadError, LoadOptions};
+use furiosa_opt_engine::{Checkpoint, DecoderLoadOptions, LoadError};
 use safetensors::Dtype;
 use serde_json::{Value, json};
 
@@ -33,7 +33,7 @@ fn source(config: Value) -> Checkpoint {
 #[test]
 fn selects_nvfp4_with_bf16_cache_from_config_alone() {
     let source = source(config());
-    let selected = LoadOptions::new().parse(&source).unwrap();
+    let selected = DecoderLoadOptions::new().parse(&source).unwrap();
     assert_eq!(
         (selected.architecture(), selected.size(), selected.chips()),
         ("LlamaForCausalLM", "8B", 1)
@@ -49,12 +49,12 @@ fn refuses_unsupported_cache_and_adapter_choices() {
     let source = source(config());
     for (options, field, expected) in [
         (
-            LoadOptions::new().kv_cache(Dtype::F8_E4M3),
+            DecoderLoadOptions::new().kv_cache(Dtype::F8_E4M3),
             "kv_cache",
             "every implementation caches keys and values in BF16",
         ),
         (
-            LoadOptions::new().adapters(),
+            DecoderLoadOptions::new().adapters(),
             "adapters",
             "the LlamaForCausalLM 8B implementation takes no adapter",
         ),
@@ -77,7 +77,7 @@ fn incompatible_nvfp4_does_not_fall_back_to_bf16() {
     // One invalid geometry pins registry selection; the model parser owns field coverage.
     let mut document = config();
     document["intermediate_size"] = json!(12288);
-    match LoadOptions::new()
+    match DecoderLoadOptions::new()
         .parse(&source(document))
         .err()
         .expect("no compatible implementation")

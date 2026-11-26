@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use furiosa_opt_engine::decoder::{Cache, HbmTensor, Instance, Keep, Request, Rows, Served};
-use furiosa_opt_engine::{Checkpoint, Hbm, Load, LoadError, LoadOptions, Tiling};
+use furiosa_opt_engine::{Checkpoint, DecoderLoadOptions, Hbm, Load, LoadError, Tiling};
 use furiosa_opt_models::load::Context;
 use furiosa_opt_models::models::decoder::attention::{Geometry, qwen3};
 use furiosa_opt_models::models::decoder::form;
@@ -191,7 +191,7 @@ fn device() -> Device {
 
 /// The decoder `checkpoint` selects, loaded onto `device` by the options' selection.
 fn causal(checkpoint: &Checkpoint, device: &mut Device) -> Box<dyn Served> {
-    LoadOptions::new()
+    DecoderLoadOptions::new()
         .load(device, checkpoint)
         .unwrap()
         .decoder()
@@ -290,7 +290,7 @@ macro_rules! continues {
         fn $test() {
             let checkpoint = checkpoint(($published.repo, $published.revision));
             let mut device = device();
-            let model = LoadOptions::new().load(&mut device, &checkpoint).unwrap().decoder().unwrap();
+            let model = DecoderLoadOptions::new().load(&mut device, &checkpoint).unwrap().decoder().unwrap();
             runtime().block_on(async {
                 let cache = Cache::new(&mut device, &model.limits().cache, CACHED).unwrap();
                 let (mut selected, mut continued) = (0, Vec::new());
@@ -531,7 +531,7 @@ macro_rules! body_rows {
         fn $test() {
             let checkpoint = checkpoint(($published.repo, $published.revision));
             let mut device = device();
-            let options = LoadOptions::new().architecture("Qwen3Model").unwrap();
+            let options = DecoderLoadOptions::new().architecture("Qwen3Model").unwrap();
             let base = options.load(&mut device, &checkpoint).unwrap().decoder().unwrap();
             let causal: Causal<$size> =
                 Load::load(&mut Context::new(&mut device), &checkpoint).unwrap();
@@ -676,7 +676,7 @@ macro_rules! scores {
             }
             let checkpoint = Checkpoint::new(directory, Some(config)).unwrap();
             let mut device = device();
-            let model = LoadOptions::new().load(&mut device, &checkpoint).unwrap().decoder().unwrap();
+            let model = DecoderLoadOptions::new().load(&mut device, &checkpoint).unwrap().decoder().unwrap();
             let score = runtime().block_on(async {
                 let cache = Cache::new(&mut device, &model.limits().cache, CACHED).unwrap();
                 let mut last = [0; 4];
@@ -723,7 +723,7 @@ macro_rules! embeds {
         fn $test() {
             let checkpoint = checkpoint(($embedder.repo, $embedder.revision));
             let mut device = device();
-            let options = LoadOptions::new().architecture("Qwen3Model").unwrap();
+            let options = DecoderLoadOptions::new().architecture("Qwen3Model").unwrap();
             let model = options.load(&mut device, &checkpoint).unwrap().decoder().unwrap();
             let last = runtime().block_on(async {
                 let cache = Cache::new(&mut device, &model.limits().cache, CACHED).unwrap();
@@ -774,7 +774,10 @@ embeds! {
 fn batch_invariant_rows_keep_their_bits() {
     let checkpoint = checkpoint((QWEN3_0_6B.repo, QWEN3_0_6B.revision));
     let mut device = device();
-    let options = (LoadOptions::new().architecture("Qwen3Model").unwrap()).batch_invariant();
+    let options = (DecoderLoadOptions::new()
+        .architecture("Qwen3Model")
+        .unwrap())
+    .batch_invariant();
     let model = options
         .load(&mut device, &checkpoint)
         .unwrap()
@@ -865,7 +868,7 @@ fn refusals_read_no_weight() {
     std::fs::write(directory.path().join("config.json"), &config).unwrap();
     let checkpoint = Checkpoint::new(directory.path(), None).unwrap();
 
-    let selected = LoadOptions::new().parse(&checkpoint).unwrap();
+    let selected = DecoderLoadOptions::new().parse(&checkpoint).unwrap();
     assert_eq!(
         (selected.architecture(), selected.size(), selected.chips()),
         ("Qwen3ForCausalLM", "0.6B", 1)
@@ -876,13 +879,13 @@ fn refusals_read_no_weight() {
         Err(LoadError::Unsupported { name, reason }) => ("unsupported", name, reason),
         other => panic!("{other:?} is no refusal of a choice"),
     };
-    let named = |name| LoadOptions::new().architecture(name).map(drop);
-    let parse = |options: LoadOptions| options.parse(&checkpoint).map(drop);
+    let named = |name| DecoderLoadOptions::new().architecture(name).map(drop);
+    let parse = |options: DecoderLoadOptions| options.parse(&checkpoint).map(drop);
     let edited = |edit: fn(&mut serde_json::Value)| {
         let mut edited: serde_json::Value = serde_json::from_slice(&config).unwrap();
         edit(&mut edited);
         let checkpoint = Checkpoint::new(directory.path(), Some(edited)).unwrap();
-        LoadOptions::new().parse(&checkpoint).map(drop)
+        DecoderLoadOptions::new().parse(&checkpoint).map(drop)
     };
     // Every implementation of the name refuses the checkpoint, the BF16 sizes, the block-FP8
     // Qwen3-8B line, which refuses the BF16 checkpoint by its quantization before its width, and
@@ -913,7 +916,7 @@ fn refusals_read_no_weight() {
             ),
         ),
         (
-            LoadOptions::new().chips(0).map(drop),
+            DecoderLoadOptions::new().chips(0).map(drop),
             (
                 "invalid",
                 "chips",
@@ -921,7 +924,7 @@ fn refusals_read_no_weight() {
             ),
         ),
         (
-            parse(LoadOptions::new().chips(4).unwrap()),
+            parse(DecoderLoadOptions::new().chips(4).unwrap()),
             (
                 "unsupported",
                 "chips",
@@ -929,7 +932,7 @@ fn refusals_read_no_weight() {
             ),
         ),
         (
-            parse(LoadOptions::new().kv_cache(Dtype::F8_E4M3)),
+            parse(DecoderLoadOptions::new().kv_cache(Dtype::F8_E4M3)),
             (
                 "unsupported",
                 "kv_cache",
@@ -937,7 +940,7 @@ fn refusals_read_no_weight() {
             ),
         ),
         (
-            parse(LoadOptions::new().layers(0..14)),
+            parse(DecoderLoadOptions::new().layers(0..14)),
             (
                 "unsupported",
                 "layers",

@@ -34,6 +34,11 @@ def register() -> None:
     from transformers import AutoConfig
 
     from furiosa_opt_sglang import speculative
+    from furiosa_opt_sglang.encoder import (
+        allow_registered_encoder_disaggregation,
+        load_encoder_model,
+        update_media_token_counts,
+    )
     from furiosa_opt_sglang.generation import Sampled
     from furiosa_opt_sglang.offload import Strategy
     from furiosa_opt_sglang.paging import assign
@@ -129,6 +134,26 @@ def register() -> None:
     for target, kind, function in (
         # The engine executes the scheduled batches.
         ("sglang.srt.managers.tp_worker.TpModelWorker", HookType.REPLACE, Worker),
+        # SGLang's EPD service keeps preprocessing, caching and transport; the engine runs a
+        # registered media encoder through its model-specific processor adapter.
+        (
+            "sglang.srt.disaggregation.encoder.server.load_model",
+            HookType.AROUND,
+            load_encoder_model,
+        ),
+        # SGLang's EPD allowlist can lag the architectures exposed through engine adapters.
+        (
+            "sglang.srt.arg_groups.pd_disaggregation_hook.handle_encoder_disaggregation",
+            HookType.AROUND,
+            allow_registered_encoder_disaggregation,
+        ),
+        # A model adapter can replace SGLang's generic modality token count when its processor
+        # defines a different output-row contract.
+        (
+            "sglang.srt.disaggregation.encoder.preprocessor.EncoderPreprocessor.process_mm_items",
+            HookType.AROUND,
+            update_media_token_counts,
+        ),
         # SGLang's speculative workers run torch draft models; the engine drafts and verifies.
         (
             "sglang.srt.speculative.spec_info.SpeculativeAlgorithm.create_worker",

@@ -33,8 +33,8 @@ def test_refuses_multimodal(tmp_path: Path) -> None:
     AutoConfig.from_pretrained("unsloth/gemma-4-12b-it-NVFP4").save_pretrained(tmp_path)
     checkpoint = engine.Checkpoint(tmp_path)
     with pytest.raises(NotImplementedError, match="a media encoder loads alone"):
-        engine.LoadOptions().parse(checkpoint)
-    engine.LoadOptions().encoder().parse(checkpoint)
+        engine.DecoderLoadOptions().parse(checkpoint)
+    engine.EncoderLoadOptions().parse(checkpoint)
 
 
 @pytest.mark.usefixtures("platform_env")

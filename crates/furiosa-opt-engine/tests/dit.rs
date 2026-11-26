@@ -7,7 +7,7 @@ mod common;
 
 use std::io::ErrorKind;
 
-use furiosa_opt_engine::{LoadError, LoadOptions};
+use furiosa_opt_engine::{DecoderLoadOptions, LoadError};
 use furiosa_opt_models::models::Family;
 use furiosa_opt_models::models::diffusion::dit;
 
@@ -26,7 +26,7 @@ const DIT_XL_2_256: Published = Published::new(
 /// type serves the name yet.
 #[test]
 fn dit_is_refused_until_its_root_exists() {
-    match LoadOptions::new().parse(&DIT_XL_2_256.checkpoint()) {
+    match DecoderLoadOptions::new().parse(&DIT_XL_2_256.checkpoint()) {
         Err(LoadError::Unsupported { name, reason }) => {
             assert_eq!(name, "Transformer2DModel");
             assert_eq!(reason, "no model type is implemented");

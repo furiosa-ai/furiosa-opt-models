@@ -35,7 +35,7 @@ Install a plugin first ([Installation](../getting-started/installation.md)); [Qu
 | Pipeline, expert and context parallelism | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | LoRA | <span class="support support-yes">Supported</span> | <span class="support support-no">Not yet</span> | [Serve LoRA adapters](#serve-lora-adapters) |
 | Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache) | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
-| Disaggregated encoder and encoder caches | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
+| Disaggregated encoder and encoder caches | <span class="support support-yes">Supported</span> (Gemma 4 producer only) | <span class="support support-yes">Supported</span> (Gemma 4 producer only) | [Embed media on an encoder-only instance](#embed-media-on-an-encoder-only-instance) |
 | Per-request metrics | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Report per-request metrics](#report-per-request-metrics) |
 | Batch invariance | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Keep outputs independent of the batch](#keep-outputs-independent-of-the-batch) |
 
@@ -353,14 +353,26 @@ Measured on Qwen3-0.6B and Qwen3-8B, a call takes within 5% of the default time 
 
 ## Embed media on an encoder-only instance
 
-An encoder-only vLLM instance, the producer half of a disaggregated encoder, embeds the images, video and audio of each request on the device and saves each item's rows through an encoder cache connector, for a language-only instance to read. The plugin runs Gemma 4 unified's media encoder this way through vLLM's `ECExampleConnector`:
+An encoder-only instance embeds images, video and audio on the device, then sends each item's rows to a language-only instance. Both plugins support Gemma 4 unified as the producer; neither plugin serves the consumer role.
+
+The producer's batching, cache and transfer paths are model-neutral. Each framework selects a processor adapter by architecture to map its input fields and any model-specific placeholder counts into the engine's media API. Adding a model requires its engine encoder plus one processor adapter in each framework plugin; Gemma 4 is the only registered adapter today.
+
+With vLLM, the producer uses `ECExampleConnector`:
 
 ```bash
 vllm serve unsloth/gemma-4-12b-it-NVFP4 \
   --ec-transfer-config '{"ec_connector": "ECExampleConnector", "ec_role": "ec_producer", "ec_connector_extra_config": {"shared_storage_path": "/tmp/encoder-cache"}}'
 ```
 
-Each item's rows, one for each of its placeholder tokens, are written to `<shared_storage_path>/<item hash>/encoder_cache.safetensors`. No instance reads them yet: the engine serves no language model of the checkpoint, so the plugin refuses the `ec_consumer` and `ec_both` roles, and SGLang serves neither half.
+Each item's rows, one for each of its placeholder tokens, are written to `<shared_storage_path>/<item hash>/encoder_cache.safetensors`.
+
+With SGLang, start its EPD encoder server:
+
+```bash
+python -m sglang.launch_server --model-path unsloth/gemma-4-12b-it-NVFP4 --encoder-only
+```
+
+Pair the producer with a compatible language-only SGLang instance using SGLang's encoder-disaggregation settings. This plugin refuses `--language-only`; it serves the Gemma 4 producer only.
 
 ## Choose the chips
 
@@ -385,10 +397,10 @@ Why each feature is not served yet:
 - **Sampling, logprobs and logit changes**: structured outputs (and so a `required` or named tool choice), custom logits processors, watermarking, penalties and logit bias. A decoder call returns each row's greedy token, not the scores of the vocabulary.
 - **Reranking and score heads**: SGLang's reranking reads the logprobs of two tokens; vLLM's reranking and either plugin's classification run a score head, which the engine loads but neither plugin calls yet.
 - **Prompt embeddings**: a decoder call takes token IDs.
-- **Multimodal inputs**: no served checkpoint answers about images, video or audio; Gemma 4 unified's media encoder runs [on an encoder-only instance](#embed-media-on-an-encoder-only-instance), but the engine serves no language model of it.
+- **Multimodal generation requests**: neither plugin's generation endpoint accepts images, video or audio. Gemma 4 unified's media encoder runs [on an encoder-only instance](#embed-media-on-an-encoder-only-instance), but neither plugin serves its language-only consumer.
 - **Speculative methods other than ngram and suffix** (vLLM, which also has no draft model yet) or NGRAM and STANDALONE (SGLang).
 - **FP8 KV cache and quantized checkpoints**: the served checkpoints load BF16 weights and cache keys and values in BF16.
 - **Online quantization** with SGLang, and with vLLM any method but `fp8_per_tensor`: the other methods quantize the activations too or use other formats, and the SGLang plugin passes no quantization to the load.
 - **Tensor, pipeline, expert and context parallelism**, and serving across nodes: each served checkpoint runs on one chip.
 - **LoRA with SGLang**: `--enable-lora` and `--lora-paths` are refused; the SGLang plugin runs no adapter yet.
-- **Disaggregated prefill, KV connectors and a disaggregated encoder**: no cache row moves to another instance, and of a disaggregated encoder only the [encoder-only instance](#embed-media-on-an-encoder-only-instance) runs.
+- **Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache)**: no decoder cache row moves to another instance. The [Gemma 4 encoder-only producer](#embed-media-on-an-encoder-only-instance) is supported separately.
