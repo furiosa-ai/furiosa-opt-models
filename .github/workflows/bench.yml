@@ -102,6 +102,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: ./.github/actions/rngd
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: '3.11'
@@ -115,8 +116,13 @@ jobs:
         with:
           name: build-wheel
           path: products
-      # triton-cpu and torch.compile build vLLM's host sampling kernels with a C compiler.
-      - run: command -v cc > /dev/null || { sudo apt-get update -qq; sudo apt-get install -yqq gcc; }
+      # vLLM's CPU extension links libnuma and its host sampling kernels need a compiler.
+      - run: |
+          if ! command -v cc > /dev/null ||
+             [ "$(dpkg-query -W -f='${db:Status-Status}' libnuma1 2>/dev/null)" != installed ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -yqq gcc libnuma1
+          fi
       - run: |
           tar xzf products/products.tar.gz -C products
           # The serving sweep writes its summary with pandas, which vLLM does not install.

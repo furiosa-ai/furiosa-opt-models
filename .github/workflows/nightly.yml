@@ -37,6 +37,9 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/rngd
+        with:
+          min-chips: '2'
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: '3.11'
@@ -55,12 +58,16 @@ jobs:
       # suffix extra builds arctic-inference's extension with a C++ one; g++ installs both.
       - if: matrix.framework == 'vllm'
         run: |
-          command -v c++ > /dev/null || { sudo apt-get update -qq; sudo apt-get install -yqq g++; }
+          if ! command -v c++ > /dev/null ||
+             [ "$(dpkg-query -W -f='${db:Status-Status}' libnuma1 2>/dev/null)" != installed ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -yqq g++ libnuma1
+          fi
           # The omni extra installs vLLM-Omni, whose diffusion pipelines the contract tests also run,
           # and the suffix extra arctic-inference (built from source), which suffix decoding's tests
           # use.
           wheel=(products/furiosa_opt_vllm-*.whl)
-          uv pip install --torch-backend cpu products/furiosa_opt_engine-*.whl "${wheel[0]}[omni,suffix]" pytest
+          uv pip install --torch-backend cpu products/furiosa_opt_engine-*.whl "${wheel[0]}[omni,suffix]" 'pytest>=9.1'
           # The omni extra's OpenCV loads libGL and GLib. When it cannot, it leaves its directory on
           # sys.path, and every process vLLM spawns imports its `typing` module instead of Python's.
           python -c 'import cv2' 2> /dev/null && exit
@@ -75,6 +82,7 @@ jobs:
         run: pytest -p no:cacheprovider "$GITHUB_WORKSPACE/integrations/furiosa-opt-$FRAMEWORK/tests"
         env:
           FRAMEWORK: ${{ matrix.framework }}
+          FURIOSA_NIGHTLY_CONTRACTS: '1'
       # A contract test of a task that `vllm bench serve` cannot send records its request latency.
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}

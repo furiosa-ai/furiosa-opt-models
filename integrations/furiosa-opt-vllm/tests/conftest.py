@@ -144,6 +144,63 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
             metafunc.parametrize("row", rows, ids=[row["id"] for row in rows], scope="module")
 
 
+# Contracts for requests that currently require vocabulary scores. Keep these running so that
+# support landing is reported as XPASS, while setup errors and other refusals still fail.
+SCORE_CONTRACTS: Final = {
+    "test_generation.py": {
+        "test_bad_words_never_appear",
+        "test_logit_bias_and_allowed_tokens_bound_the_choice",
+        "test_logprob_token_ids_match_the_full_distribution",
+        "test_logprobs_keep_greedy_tokens",
+        "test_min_p_of_one_samples_the_greedy_tokens",
+        "test_min_tokens_hold_back_the_stop",
+        "test_next_token_matches_transformers",
+        "test_one_kept_token_samples_the_greedy_tokens",
+        "test_parallel_samples_are_seeded_children",
+        "test_presence_and_frequency_penalties_lower_repeated_tokens",
+        "test_repetition_penalty_applies_to_its_request_alone",
+        "test_sampling_and_logprobs",
+        "test_structured_choice",
+        "test_structured_json_and_regex",
+    },
+    "test_preemption.py": {"test_keeps_reset"},
+    "test_prompt_logprobs.py": {"test_scores_prompt"},
+    "test_reasoning.py": {"test_thinking_ends_within_the_budget"},
+    "test_replay.py": {"test_reports_support", "test_scores_trace"},
+    "test_speculative.py": {"test_sampling_finishes"},
+    "test_watermark_detection.py": {
+        "test_detects_watermark",
+        "test_honors_optout",
+        "test_repeats_seeded",
+    },
+}
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    if os.environ.get("FURIOSA_NIGHTLY_CONTRACTS") != "1":
+        return
+
+    from furiosa_opt_vllm.admission import Refused
+
+    unsupported = pytest.mark.xfail(
+        reason="the current decoder returns greedy tokens without vocabulary scores",
+        raises=pytest.RaisesExc(
+            Refused,
+            match=(
+                r"^furiosa-opt-vllm serves only greedy decoding, "
+                r"without logprobs or logit changes$"
+            ),
+            check=lambda error: error.option == "sampling_params",
+        ),
+        strict=True,
+    )
+    for item in items:
+        if isinstance(item, pytest.Function) and item.originalname in SCORE_CONTRACTS.get(
+            item.path.name, ()
+        ):
+            item.add_marker(unsupported)
+
+
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_protocol(
     item: pytest.Item, nextitem: pytest.Item | None

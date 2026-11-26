@@ -1,0 +1,57 @@
+name: RNGD devices
+description: Validate the runner's visible RNGD chips and publish their physical IDs for adapter workers.
+inputs:
+  min-chips:
+    description: Minimum number of chips needed by the job.
+    default: '1'
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        MIN_CHIPS: ${{ inputs.min-chips }}
+      run: |
+        echo "Runner: ${RUNNER_NAME:-unknown}"
+        echo "FURIOSA_VISIBLE_CHIPS on entry: ${FURIOSA_VISIBLE_CHIPS:-<unset>}"
+        ls -l /dev/rngd || true
+
+        usable() {
+          local chip="$1" node
+          for node in "/dev/rngd/npu${chip}mgmt" "/dev/rngd/npu${chip}dmar"; do
+            [[ -c "$node" && -r "$node" && -w "$node" ]] || return 1
+          done
+        }
+
+        chips=()
+        if [[ -n "${FURIOSA_VISIBLE_CHIPS:-}" ]]; then
+          if [[ ! "$FURIOSA_VISIBLE_CHIPS" =~ ^(0|[1-9][0-9]*)(,(0|[1-9][0-9]*))*$ ]]; then
+            echo "::error::FURIOSA_VISIBLE_CHIPS must contain comma-separated physical chip IDs"
+            exit 1
+          fi
+          IFS=, read -ra chips <<< "$FURIOSA_VISIBLE_CHIPS"
+          declare -A seen=()
+          for chip in "${chips[@]}"; do
+            if [[ -n "${seen[$chip]:-}" ]] || ! usable "$chip"; then
+              echo "::error::Assigned RNGD chip $chip is duplicated or lacks accessible mgmt/dmar nodes"
+              exit 1
+            fi
+            seen[$chip]=1
+          done
+        else
+          for node in /dev/rngd/npu*dmar; do
+            [[ "$node" =~ /npu(0|[1-9][0-9]*)dmar$ ]] || continue
+            chip="${BASH_REMATCH[1]}"
+            if usable "$chip"; then chips+=("$chip"); fi
+          done
+          if (( ${#chips[@]} > 0 )); then
+            mapfile -t chips < <(printf '%s\n' "${chips[@]}" | sort -n)
+          fi
+        fi
+
+        if (( ${#chips[@]} < MIN_CHIPS )); then
+          echo "::error::Runner exposes ${#chips[@]} usable RNGD chip(s); this job needs $MIN_CHIPS"
+          exit 1
+        fi
+        visible="$(IFS=,; echo "${chips[*]}")"
+        echo "Using physical RNGD chips $visible"
+        echo "FURIOSA_VISIBLE_CHIPS=$visible" >> "$GITHUB_ENV"
