@@ -23,14 +23,38 @@ permissions: {contents: read}
 # request built and tested the tree before it queued; its skipped jobs still report the statuses
 # the branch requires.
 jobs:
+  mooncake-scope:
+    runs-on: ubuntu-latest
+    permissions: {contents: read, pull-requests: read}
+    outputs:
+      changed: ${{ steps.filter.outputs.mooncake || 'false' }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          filters: |
+            mooncake:
+              - '.github/workflows/{ci,build,test}.yml'
+              - 'crates/furiosa-opt-engine/**'
+              - 'crates/furiosa-opt-python/**'
+              - 'integrations/furiosa-opt-sglang/furiosa_opt_sglang/**'
+              - 'integrations/furiosa-opt-sglang/pyproject.toml'
+              - 'integrations/furiosa-opt-sglang/tests/test_{mooncake,cache_transfer,platform}.py'
+              - 'integrations/furiosa-opt-vllm/furiosa_opt_vllm/**'
+              - 'integrations/furiosa-opt-vllm/pyproject.toml'
+              - 'integrations/furiosa-opt-vllm/tests/test_{mooncake,cache_transfer,platform}.py'
+              - 'integrations/mooncake-contract-tests/**'
+
   build:
     if: >-
       github.event_name != 'workflow_dispatch' &&
       (github.event.action != 'labeled' || github.event.label.name == 'bench')
+    needs: mooncake-scope
     uses: ./.github/workflows/build.yml
     with:
       build: ${{ github.event_name != 'merge_group' }}
-      wheel: ${{ contains(github.event.pull_request.labels.*.name, 'bench') }}
+      wheel: ${{ contains(github.event.pull_request.labels.*.name, 'bench') || needs.mooncake-scope.outputs.changed == 'true' }}
     permissions: {actions: read, contents: write}
 
   lint:
@@ -41,11 +65,13 @@ jobs:
 
   # A build the merge queue skips leaves its dependents to report their statuses.
   test:
-    needs: build
+    needs: [build, mooncake-scope]
     if: >-
       !cancelled() && needs.build.result != 'failure' &&
       (github.event.action != 'labeled' || github.event.label.name == 'bench')
     uses: ./.github/workflows/test.yml
+    with:
+      mooncake_contract: ${{ needs.mooncake-scope.outputs.changed == 'true' }}
 
   bench:
     if: >-

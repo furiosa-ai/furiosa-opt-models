@@ -2,6 +2,11 @@ name: test
 
 on:
   workflow_call:
+    inputs:
+      mooncake_contract:
+        description: Run Mooncake adapter contracts on RNGD at the minimum and latest allowed versions.
+        type: boolean
+        default: false
 
 permissions: {contents: read}
 
@@ -50,3 +55,143 @@ jobs:
           [ ${#failed[@]} -eq 0 ] || { printf 'failed: %s\n' "${failed[@]}"; exit 1; }
         env:
           FURIOSA_OPT_PROFILE: info
+      - name: Install Mooncake native runtime dependencies
+        if: inputs.mooncake_contract
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -yqq ibverbs-providers libcurl4 libibverbs1 libnuma1
+      - name: Resolve newest stable Mooncake release
+        id: mooncake_versions
+        if: inputs.mooncake_contract
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import tomllib
+          from pathlib import Path
+          from urllib.request import urlopen
+
+          requirement_pattern = re.compile(
+              r"mooncake-transfer-engine-non-cuda>=(0\.3\.\d+),<0\.4\.0"
+          )
+          minimums = []
+          for path in (
+              Path("integrations/furiosa-opt-vllm/pyproject.toml"),
+              Path("integrations/furiosa-opt-sglang/pyproject.toml"),
+          ):
+              with path.open("rb") as project_file:
+                  project = tomllib.load(project_file)
+              requirements = [
+                  requirement
+                  for requirement in project["project"]["optional-dependencies"]["mooncake"]
+                  if requirement.startswith("mooncake-transfer-engine-non-cuda")
+              ]
+              if len(requirements) != 1:
+                  raise SystemExit(f"{path} must declare one Mooncake Transfer Engine requirement")
+              match = requirement_pattern.fullmatch(requirements[0])
+              if match is None:
+                  raise SystemExit(f"unsupported Mooncake version range in {path}: {requirements[0]}")
+              minimums.append(match.group(1))
+          if len(set(minimums)) != 1:
+              raise SystemExit(f"vLLM and SGLang Mooncake minimums differ: {minimums}")
+          minimum = minimums[0]
+          minimum_patch = int(minimum.rsplit(".", 1)[1])
+
+          with urlopen("https://pypi.org/pypi/mooncake-transfer-engine-non-cuda/json") as response:
+              data = json.load(response)
+          candidates = []
+          for release, files in data["releases"].items():
+              match = re.fullmatch(r"0\.3\.(\d+)", release)
+              if match is None or int(match.group(1)) < minimum_patch:
+                  continue
+              if any(
+                  "cp311-cp311-" in file["filename"]
+                  and "manylinux" in file["filename"]
+                  and file["filename"].endswith("x86_64.whl")
+                  and not file["yanked"]
+                  for file in files
+              ):
+                  candidates.append((int(match.group(1)), release))
+          if not candidates:
+              raise SystemExit("PyPI has no stable Mooncake 0.3.x wheel for this CI runner")
+          latest = max(candidates)[1]
+          with open(os.environ["GITHUB_ENV"], "a") as env_file:
+              env_file.write(f"MOONCAKE_MINIMUM={minimum}\nMOONCAKE_LATEST={latest}\n")
+          print(f"Minimum stable Mooncake in range: {minimum}", file=sys.stderr)
+          print(f"Latest stable Mooncake in range: {latest}", file=sys.stderr)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"minimum_is_latest={str(latest == minimum).lower()}\n")
+          PY
+      - name: Install vLLM Mooncake contract environment
+        if: inputs.mooncake_contract
+        run: |
+          python -m venv "$RUNNER_TEMP/mooncake-vllm"
+          shopt -s nullglob
+          engine_wheels=(products/build-wheel/furiosa_opt_engine-*.whl)
+          vllm_wheels=(products/build-wheel/furiosa_opt_vllm-*.whl)
+          if (( ${#engine_wheels[@]} != 1 || ${#vllm_wheels[@]} != 1 )); then
+            echo "expected one engine and one vLLM wheel under products/build-wheel" >&2
+            exit 1
+          fi
+          uv pip install --python "$RUNNER_TEMP/mooncake-vllm/bin/python" --torch-backend cpu \
+            "${engine_wheels[0]}" \
+            "${vllm_wheels[0]}[mooncake]" \
+            "mooncake-transfer-engine-non-cuda==$MOONCAKE_LATEST" \
+            pytest
+          "$RUNNER_TEMP/mooncake-vllm/bin/python" -c 'from importlib.metadata import version; print("Mooncake", version("mooncake-transfer-engine-non-cuda"))'
+      - name: Test latest allowed Mooncake with vLLM
+        if: inputs.mooncake_contract
+        working-directory: ${{ runner.temp }}
+        run: |
+          python="$RUNNER_TEMP/mooncake-vllm/bin/python"
+          "$python" -m pytest -p no:cacheprovider "$GITHUB_WORKSPACE/integrations/furiosa-opt-vllm/tests/test_mooncake.py"
+          "$python" -m pytest -p no:cacheprovider "$GITHUB_WORKSPACE/integrations/mooncake-contract-tests/test_vllm.py"
+      - name: Test minimum Mooncake version with vLLM
+        if: inputs.mooncake_contract && steps.mooncake_versions.outputs.minimum_is_latest != 'true'
+        working-directory: ${{ runner.temp }}
+        run: |
+          python="$RUNNER_TEMP/mooncake-vllm/bin/python"
+          uv pip install --python "$python" --reinstall \
+            "mooncake-transfer-engine-non-cuda==$MOONCAKE_MINIMUM"
+          "$python" -c 'from importlib.metadata import version; print("Mooncake", version("mooncake-transfer-engine-non-cuda"))'
+          "$python" -m pytest -p no:cacheprovider "$GITHUB_WORKSPACE/integrations/furiosa-opt-vllm/tests/test_mooncake.py"
+          "$python" -m pytest -p no:cacheprovider "$GITHUB_WORKSPACE/integrations/mooncake-contract-tests/test_vllm.py"
+          rm -rf "$RUNNER_TEMP/mooncake-vllm"
+      - name: Install SGLang Mooncake contract environment
+        if: inputs.mooncake_contract
+        run: |
+          python -m venv "$RUNNER_TEMP/mooncake-sglang"
+          shopt -s nullglob
+          engine_wheels=(products/build-wheel/furiosa_opt_engine-*.whl)
+          sglang_wheels=(products/build-wheel/furiosa_opt_sglang-*.whl)
+          if (( ${#engine_wheels[@]} != 1 || ${#sglang_wheels[@]} != 1 )); then
+            echo "expected one engine and one SGLang wheel under products/build-wheel" >&2
+            exit 1
+          fi
+          uv pip install --python "$RUNNER_TEMP/mooncake-sglang/bin/python" --prerelease=allow \
+            "${engine_wheels[0]}" \
+            "${sglang_wheels[0]}[mooncake]" \
+            "mooncake-transfer-engine-non-cuda==$MOONCAKE_LATEST" \
+            pytest
+          "$RUNNER_TEMP/mooncake-sglang/bin/python" -c 'from importlib.metadata import version; print("Mooncake", version("mooncake-transfer-engine-non-cuda"))'
+      - name: Test latest allowed Mooncake with SGLang
+        if: inputs.mooncake_contract
+        working-directory: ${{ runner.temp }}
+        run: |
+          python="$RUNNER_TEMP/mooncake-sglang/bin/python"
+          "$python" -m pytest -p no:cacheprovider "$GITHUB_WORKSPACE/integrations/furiosa-opt-sglang/tests/test_cache_transfer.py"
+          "$python" -m pytest -p no:cacheprovider "$GITHUB_WORKSPACE/integrations/furiosa-opt-sglang/tests/test_mooncake.py"
+          "$python" -m pytest -p no:cacheprovider "$GITHUB_WORKSPACE/integrations/mooncake-contract-tests/test_sglang.py"
+      - name: Test minimum Mooncake version with SGLang
+        if: inputs.mooncake_contract && steps.mooncake_versions.outputs.minimum_is_latest != 'true'
+        working-directory: ${{ runner.temp }}
+        run: |
+          python="$RUNNER_TEMP/mooncake-sglang/bin/python"
+          uv pip install --python "$python" --reinstall \
+            "mooncake-transfer-engine-non-cuda==$MOONCAKE_MINIMUM"
+          "$python" -c 'from importlib.metadata import version; print("Mooncake", version("mooncake-transfer-engine-non-cuda"))'
+          "$python" -m pytest -p no:cacheprovider "$GITHUB_WORKSPACE/integrations/furiosa-opt-sglang/tests/test_mooncake.py"
+          "$python" -m pytest -p no:cacheprovider "$GITHUB_WORKSPACE/integrations/mooncake-contract-tests/test_sglang.py"
+          rm -rf "$RUNNER_TEMP/mooncake-sglang"
