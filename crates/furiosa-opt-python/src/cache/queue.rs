@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::ops::DerefMut;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak, mpsc};
 use std::time::{Duration, Instant};
 
@@ -142,14 +142,22 @@ struct Job {
     completion: Arc<Completion>,
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChunkStatus {
+    Pending,
+    Succeeded,
+    Failed,
+}
+
 pub(super) struct Completion {
     result: Mutex<Option<Result<(), String>>>,
     changed: Condvar,
 }
 
 pub(super) struct ChunkCompletion {
-    // Conflict checks only need to know whether this page's DMA has finished.
-    finished: AtomicBool,
+    // Keep failed pages reserved after DMA ends; successful pages can be reused independently.
+    status: AtomicU8,
     // Every chunk of one copy shares the error and drain result.
     job: Arc<Completion>,
 }
@@ -431,7 +439,7 @@ impl Queue {
             Ok(_) => Ok(()),
             Err(error) => {
                 let message = error.to_string();
-                completion.finish();
+                completion.finish(false);
                 job.finish(Err(io::Error::other(message)));
                 Err(error)
             }
@@ -556,12 +564,12 @@ impl Chunk {
             self.transfer(executor, core, pdma)
         }))
         .unwrap_or_else(|_| Err(io::Error::other("cache copy worker panicked")));
-        self.completion.finish();
+        self.completion.finish(result.is_ok());
         self.job.finish(result);
     }
 
     pub(super) fn fail(&self, error: io::Error) {
-        self.completion.finish();
+        self.completion.finish(false);
         self.job.finish(Err(error));
     }
 
@@ -1032,16 +1040,21 @@ impl Transfers {
         self.0.entry(key).or_default().push(completion);
     }
 
-    pub(super) fn conflicts(&mut self, reservations: &[TransferKey]) -> bool {
+    pub(super) fn conflicts(&mut self, reservations: &[TransferKey]) -> io::Result<bool> {
         let mut conflict = false;
+        let mut poisoned = false;
         for &reservation in reservations {
             let remove = if let Some(copies) = self.0.get_mut(&reservation) {
-                copies.retain(|copy| {
-                    if copy.is_finished() {
-                        return false;
+                copies.retain(|copy| match copy.status() {
+                    ChunkStatus::Pending => {
+                        conflict = true;
+                        true
                     }
-                    conflict = true;
-                    true
+                    ChunkStatus::Succeeded => false,
+                    ChunkStatus::Failed => {
+                        poisoned = true;
+                        true
+                    }
                 });
                 copies.is_empty()
             } else {
@@ -1051,7 +1064,12 @@ impl Transfers {
                 self.0.remove(&reservation);
             }
         }
-        conflict
+        if poisoned {
+            return Err(io::Error::other(
+                "a failed cache transfer poisoned this host slot or device page",
+            ));
+        }
+        Ok(conflict)
     }
 
     pub(super) fn remove(&mut self, reservations: &[TransferKey]) {
@@ -1134,17 +1152,27 @@ impl Default for Completion {
 impl ChunkCompletion {
     fn new(job: Arc<Completion>) -> Self {
         Self {
-            finished: AtomicBool::new(false),
+            status: AtomicU8::new(ChunkStatus::Pending as u8),
             job,
         }
     }
 
-    fn finish(&self) {
-        self.finished.store(true, Ordering::Release);
+    fn finish(&self, succeeded: bool) {
+        let status = if succeeded {
+            ChunkStatus::Succeeded
+        } else {
+            ChunkStatus::Failed
+        };
+        self.status.store(status as u8, Ordering::Release);
     }
 
-    fn is_finished(&self) -> bool {
-        self.finished.load(Ordering::Acquire)
+    fn status(&self) -> ChunkStatus {
+        match self.status.load(Ordering::Acquire) {
+            status if status == ChunkStatus::Pending as u8 => ChunkStatus::Pending,
+            status if status == ChunkStatus::Succeeded as u8 => ChunkStatus::Succeeded,
+            status if status == ChunkStatus::Failed as u8 => ChunkStatus::Failed,
+            _ => unreachable!("invalid cache chunk completion status"),
+        }
     }
 
     pub(super) fn wait(&self) -> io::Result<()> {
@@ -1266,27 +1294,41 @@ mod tests {
             transfers.0.entry(key).or_default().push(completion);
         }
         let page = [TransferKey::Device(0, 4)];
-        assert!(transfers.conflicts(&page));
-        chunks[0].completion.finish();
-        assert!(transfers.conflicts(&page));
-        chunks[1].completion.finish();
-        assert!(!transfers.conflicts(&page));
+        assert!(transfers.conflicts(&page).unwrap());
+        chunks[0].completion.finish(true);
+        assert!(transfers.conflicts(&page).unwrap());
+        chunks[1].completion.finish(true);
+        assert!(!transfers.conflicts(&page).unwrap());
     }
 
     #[test]
-    fn chunk_completion_checks_finished_without_locking_result() {
+    fn chunk_completion_tracks_success_without_locking_result() {
         let completion = ChunkCompletion::new(Arc::new(Completion::default()));
 
-        assert!(!completion.is_finished());
-        completion.finish();
-        assert!(completion.is_finished());
+        assert_eq!(completion.status(), ChunkStatus::Pending);
+        completion.finish(true);
+        assert_eq!(completion.status(), ChunkStatus::Succeeded);
+    }
+
+    #[test]
+    fn failed_chunk_keeps_its_reservations_poisoned() {
+        let key = TransferKey::Device(0, 7);
+        let completion = Arc::new(ChunkCompletion::new(Arc::new(Completion::default())));
+        completion.finish(false);
+        let mut transfers = Transfers::default();
+        transfers.insert(key, completion);
+
+        let error = transfers.conflicts(&[key]).unwrap_err();
+
+        assert!(error.to_string().contains("poisoned"));
+        assert!(transfers.0.contains_key(&key));
     }
 
     #[test]
     fn chunk_completion_wait_returns_the_shared_job_error() {
         let job = Arc::new(Completion::default());
         let chunk = ChunkCompletion::new(Arc::clone(&job));
-        chunk.finish();
+        chunk.finish(false);
         job.finish(Err(io::Error::other("transfer failed")));
 
         assert_eq!(chunk.wait().unwrap_err().to_string(), "transfer failed");

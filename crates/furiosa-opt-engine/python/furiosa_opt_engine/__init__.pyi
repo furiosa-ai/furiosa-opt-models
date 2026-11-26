@@ -72,8 +72,8 @@ class Copier:
     `copy_in` and `copy_out` return a `Copy` handle without waiting for its DMA. The caller owns
     host-slot and device-page lifetimes: before submitting work that reuses either, it must wait
     for the earlier `Copy` to finish. An overlapping submission raises `BlockingIOError` and queues
-    no work. Python serializes queue mutation under the GIL; completions can move to framework
-    worker threads.
+    no work. A failed copy poisons its touched memory, which cannot be reused by this copier.
+    Python serializes queue mutation under the GIL; completions can move to framework worker threads.
     Layer groups are numbered contiguously from zero.
     """
     def __new__(
@@ -99,7 +99,8 @@ class Copier:
 
         `pages` names host slots and their `(group, device_block)` routes. The caller must wait for
         earlier copies that use any of these host slots or device pages. An in-flight overlap raises
-        `BlockingIOError` and submits no work.
+        `BlockingIOError` and submits no work. Reusing memory touched by a failed copy raises an
+        error; restart the process to recover it.
         Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
         transient pinned memory for one batched runtime transfer.
         """
@@ -117,7 +118,8 @@ class Copier:
 
         `pages` names host slots and their `(group, device_block)` routes. The caller must wait for
         earlier copies that use any of these host slots or device pages. An in-flight overlap raises
-        `BlockingIOError` and submits no work.
+        `BlockingIOError` and submits no work. Reusing memory touched by a failed copy raises an
+        error; restart the process to recover it.
         Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
         transient pinned memory for one batched runtime transfer.
         """

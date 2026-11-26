@@ -35,8 +35,8 @@ static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 /// `copy_in` and `copy_out` return a `Copy` handle without waiting for its DMA. The caller owns
 /// host-slot and device-page lifetimes: before submitting work that reuses either, it must wait
 /// for the earlier `Copy` to finish. An overlapping submission raises `BlockingIOError` and queues
-/// no work. Python serializes queue mutation under the GIL; completions can move to framework
-/// worker threads.
+/// no work. A failed copy poisons its touched memory, which cannot be reused by this copier.
+/// Python serializes queue mutation under the GIL; completions can move to framework worker threads.
 /// Layer groups are numbered contiguously from zero.
 #[gen_stub_pyclass]
 #[pyclass(name = "Copier", module = "engine")]
@@ -204,7 +204,8 @@ impl PyCopier {
     ///
     /// `pages` names host slots and their `(group, device_block)` routes. The caller must wait for
     /// earlier copies that use any of these host slots or device pages. An in-flight overlap raises
-    /// `BlockingIOError` and submits no work.
+    /// `BlockingIOError` and submits no work. Reusing memory touched by a failed copy raises an
+    /// error; restart the process to recover it.
     /// Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
     /// transient pinned memory for one batched runtime transfer.
     #[pyo3(signature = (pages, host, *, coalesce=false))]
@@ -221,7 +222,8 @@ impl PyCopier {
     ///
     /// `pages` names host slots and their `(group, device_block)` routes. The caller must wait for
     /// earlier copies that use any of these host slots or device pages. An in-flight overlap raises
-    /// `BlockingIOError` and submits no work.
+    /// `BlockingIOError` and submits no work. Reusing memory touched by a failed copy raises an
+    /// error; restart the process to recover it.
     /// Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
     /// transient pinned memory for one batched runtime transfer.
     #[pyo3(signature = (pages, host, *, coalesce=false))]
@@ -322,7 +324,11 @@ impl PyCopier {
             }
         }
         reservations.dedup();
-        if self.pending.conflicts(&reservations) {
+        if self
+            .pending
+            .conflicts(&reservations)
+            .map_err(crate::Error::from)?
+        {
             return Err(PyBlockingIOError::new_err(
                 "cache transfer overlaps an in-flight DMA; wait for the prior Copy before reusing its host slot or device page",
             ));
