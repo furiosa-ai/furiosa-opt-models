@@ -347,7 +347,7 @@ class Platform(SRTPlatform):
 
                 architectures = getattr(hf_config, "architectures", ()) or ()
                 _ = require_adapter(architectures)
-                engine.LoadOptions().encoder().parse(checkpoint)
+                engine.EncoderLoadOptions().parse(checkpoint)
             else:
                 options(
                     model_config,

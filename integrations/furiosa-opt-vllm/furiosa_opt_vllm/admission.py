@@ -519,7 +519,9 @@ class Draft:
         import furiosa_opt_engine as engine
 
         cache_dtype = CACHE_DTYPES[dtype]
-        loads = engine.LoadOptions().chips(settings.draft_parallel_config.tensor_parallel_size)
+        loads = engine.DecoderLoadOptions().chips(
+            settings.draft_parallel_config.tensor_parallel_size
+        )
         verify_checkpoint(
             settings.draft_model_config,
             load,
@@ -536,7 +538,7 @@ class Draft:
         )
 
 
-def options(config: VllmConfig) -> engine.LoadOptions:
+def options(config: VllmConfig) -> engine.DecoderLoadOptions:
     """The engine's options of the decoder load of `config`'s checkpoint: the model on vLLM's
     tensor degree of chips with vLLM's cache dtype
     and batch invariance, as its base model when vLLM pools the hidden rows of a causal model, and
@@ -550,7 +552,7 @@ def options(config: VllmConfig) -> engine.LoadOptions:
     import furiosa_opt_engine as engine
 
     model = config.model_config
-    loads = engine.LoadOptions().chips(config.parallel_config.tensor_parallel_size)
+    loads = engine.DecoderLoadOptions().chips(config.parallel_config.tensor_parallel_size)
     if (dtype := CACHE_DTYPES[config.cache_config.cache_dtype]) is not None:
         loads = loads.kv_cache(dtype)
     if envs.VLLM_BATCH_INVARIANT:
@@ -582,7 +584,7 @@ def encoder_options(config: VllmConfig) -> engine.EncoderLoadOptions:
             "tensor_parallel_size",
             "loads the encoder-only model on one chip, which requires tensor_parallel_size=1",
         )
-    loads = engine.LoadOptions().encoder()
+    loads = engine.EncoderLoadOptions()
     quantized = quantization(config.model_config)
     return loads if quantized is None else loads.quantization(quantized)
 
@@ -591,7 +593,7 @@ def verify_checkpoint(
     model: ModelConfig,
     load: LoadConfig,
     option: str,
-    options: engine.LoadOptions | engine.EncoderLoadOptions,
+    options: engine.DecoderLoadOptions | engine.EncoderLoadOptions,
 ) -> None:
     """Refuse under `option` the checkpoint of `model`, where `load` finds it, if the engine cannot
     load it with `options`: an architecture the engine does not serve, a configuration that no

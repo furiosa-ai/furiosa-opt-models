@@ -44,7 +44,7 @@ class Decoder:
     # None without sleep mode, and while sleep mode holds it for the released weights.
     copy: engine.Checkpoint | None
     checkpoint: Location
-    options: engine.LoadOptions
+    options: engine.DecoderLoadOptions
     device: engine.Device
     vocabulary: int
     # A call allocates its buffers as it runs, from the memory the cache leaves free.

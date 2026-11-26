@@ -67,7 +67,7 @@ class Decoder:
     # without one, and while the released weights hold it.
     copy: engine.Checkpoint | None
     checkpoint: Location
-    options: engine.LoadOptions
+    options: engine.DecoderLoadOptions
     device: engine.Device
     vocabulary: int
     pool: engine.decoder.Pool
@@ -77,7 +77,7 @@ class Decoder:
     def load(
         cls,
         checkpoint: Location,
-        options: engine.LoadOptions,
+        options: engine.DecoderLoadOptions,
         device: engine.Device,
         vocabulary: int,
         *,

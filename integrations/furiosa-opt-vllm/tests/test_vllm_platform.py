@@ -696,7 +696,7 @@ def test_refuses_kernels(served: Path) -> None:
         # and asks one with a checkpoint loader for its fields.
         checkpoint = engine.Checkpoint(served, config={"architectures": [architecture]})
         try:
-            engine.LoadOptions().parse(checkpoint)
+            engine.DecoderLoadOptions().parse(checkpoint)
         except NotImplementedError:
             return True
         except ValueError:

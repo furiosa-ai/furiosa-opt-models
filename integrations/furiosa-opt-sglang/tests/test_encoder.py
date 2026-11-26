@@ -45,7 +45,7 @@ def test_gemma4_adapter_runs_sglang_image_video_and_audio_items() -> None:
     )
     config = AutoConfig.from_pretrained(directory)
     device = engine.Device(engine.Placement(chips(0, 1), PES))
-    encoder = engine.LoadOptions().encoder().load(engine.Checkpoint(directory), device)
+    encoder = engine.EncoderLoadOptions().load(engine.Checkpoint(directory), device)
     assert isinstance(encoder, engine.Encoder)
     adapter = require_adapter(config.architectures)
     model = EncoderModel(encoder, device, adapter)

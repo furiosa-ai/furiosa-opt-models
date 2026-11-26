@@ -172,7 +172,7 @@ def _load_encoder_model(
     config.update(model_config.model_override_args or {})
     checkpoint = Location(directory, config).mapped()
     device = engine.Device(engine.Placement(chips(first_chip, 1), PES))
-    encoder = engine.LoadOptions().encoder().load(checkpoint, device)
+    encoder = engine.EncoderLoadOptions().load(checkpoint, device)
     return EncoderModel(encoder, device, adapter)
 
 

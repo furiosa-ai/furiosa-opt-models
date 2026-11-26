@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use furiosa_opt_engine::decoder::{Cache, Keep, Request, Rows};
-use furiosa_opt_engine::{Checkpoint, LoadOptions};
+use furiosa_opt_engine::{Checkpoint, DecoderLoadOptions};
 use furiosa_opt_std::prelude::{Device, HostBufferSlice, Topology};
 use tracing::Instrument;
 
@@ -49,7 +49,7 @@ forward! {
 fn measure((repo, revision): (&str, &str)) {
     let checkpoint = Checkpoint::new(snapshot((repo, revision)), None).unwrap();
     let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
-    let model = LoadOptions::new()
+    let model = DecoderLoadOptions::new()
         .load(&mut device, &checkpoint)
         .unwrap()
         .decoder()

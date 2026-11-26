@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use furiosa_opt_engine::decoder::{Cache, HbmTensor, Keep, Request, Rows};
-use furiosa_opt_engine::{Checkpoint, LoadOptions};
+use furiosa_opt_engine::{Checkpoint, DecoderLoadOptions};
 use furiosa_opt_std::prelude::{Device, HostBufferSlice, Topology};
 
 /// The hub repository and revision of Llama-3-8B this test reads.
@@ -102,7 +102,7 @@ async fn token(device: &mut Device, tokens: HbmTensor) -> i32 {
 fn continuation(hub: (&str, &str), prompt: &[i32], count: usize) -> Vec<i32> {
     let checkpoint = checkpoint(hub);
     let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
-    let model = LoadOptions::new()
+    let model = DecoderLoadOptions::new()
         .load(&mut device, &checkpoint)
         .unwrap()
         .decoder()
@@ -170,7 +170,7 @@ fn the_config_selects_the_8b_implementation() {
     let config = std::fs::read(snapshot(LLAMA, &["config.json"]).join("config.json")).unwrap();
     std::fs::write(directory.path().join("config.json"), &config).unwrap();
     let checkpoint = Checkpoint::new(directory.path(), None).unwrap();
-    let selected = LoadOptions::new().parse(&checkpoint).unwrap();
+    let selected = DecoderLoadOptions::new().parse(&checkpoint).unwrap();
     assert_eq!(
         (selected.architecture(), selected.size(), selected.chips()),
         ("LlamaForCausalLM", "8B", 1)
@@ -184,7 +184,7 @@ fn the_config_selects_the_mistral_implementation() {
     let config = std::fs::read(snapshot(MISTRAL, &["config.json"]).join("config.json")).unwrap();
     std::fs::write(directory.path().join("config.json"), &config).unwrap();
     let checkpoint = Checkpoint::new(directory.path(), None).unwrap();
-    let selected = LoadOptions::new().parse(&checkpoint).unwrap();
+    let selected = DecoderLoadOptions::new().parse(&checkpoint).unwrap();
     assert_eq!(
         (selected.architecture(), selected.size(), selected.chips()),
         ("MistralForCausalLM", "Mistral-7B", 1)

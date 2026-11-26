@@ -1,12 +1,12 @@
 //! Checkpoints, typed options that load a registry decoder or media encoder onto a device, and the
 //! loaded object.
 //!
-//! A framework opens a `Checkpoint`, states decoder choices in `LoadOptions` or encoder choices in
-//! `EncoderLoadOptions`, then loads once; a refused choice raises before any weight is read. A
-//! decoder load returns a `Decoder`, which serves every model alike, as an object of its model
-//! type's class in a submodule of its own, such as `qwen3.ForCausalLM`; an encoder load returns an
-//! `Encoder`, whatever its model. A decoder whose projections take LoRA adapters loads them from
-//! PEFT checkpoints too.
+//! A framework opens a `Checkpoint`, states decoder choices in `DecoderLoadOptions` or encoder
+//! choices in `EncoderLoadOptions`, then loads once; a refused choice raises before any weight is
+//! read. A decoder load returns a `Decoder`, which serves every model alike, as an object of its
+//! model type's class in a submodule of its own, such as `qwen3.ForCausalLM`; an encoder load
+//! returns an `Encoder`, whatever its model. A decoder whose projections take LoRA adapters loads
+//! them from PEFT checkpoints too.
 
 use super::decoder::{self, Adapter, AdapterSpec, Cache, CacheSpec, Output, Request};
 use super::encoder::{Audio, Image};
@@ -92,19 +92,18 @@ impl Checkpoint {
     }
 }
 
-/// A load's architecture, chips, KV cache form, layers, batch invariance, quantization and LoRA
-/// adapters: a method returns new options or raises for a choice no model holds, and `parse` and
-/// `load` for one its model refuses.
+/// Decoder load choices: a method returns new options or raises for a choice no model holds, and
+/// `parse` and `load` for one its model refuses.
 #[gen_stub_pyclass]
 #[pyclass(frozen, module = "engine")]
-pub(super) struct LoadOptions(engine::LoadOptions);
+pub(super) struct DecoderLoadOptions(engine::DecoderLoadOptions);
 
 #[gen_stub_pymethods]
 #[pymethods]
-impl LoadOptions {
+impl DecoderLoadOptions {
     #[new]
     fn new() -> Self {
-        Self(engine::LoadOptions::new())
+        Self(engine::DecoderLoadOptions::new())
     }
 
     /// Load onto `chips` chips instead of the one count the model allows.
@@ -168,12 +167,6 @@ impl LoadOptions {
         Ok(Self(self.0.clone().quantization(name.parse()?)))
     }
 
-    /// Load the model's media encoder alone, whose rows its language model reads: the producer
-    /// of an encoder cache, for one.
-    fn encoder(&self) -> EncoderLoadOptions {
-        EncoderLoadOptions(self.0.clone().encoder())
-    }
-
     /// Load for calls that run LoRA adapters: `parse` and `load` refuse a model whose projections
     /// take none.
     fn adapters(&self) -> Self {
@@ -235,7 +228,7 @@ impl LoadOptions {
     }
 }
 
-/// Options to load a model's media encoder alone.
+/// Encoder load choices for loading a model's media encoder alone.
 #[gen_stub_pyclass]
 #[pyclass(frozen, module = "engine")]
 pub(super) struct EncoderLoadOptions(engine::EncoderLoadOptions);
@@ -243,6 +236,11 @@ pub(super) struct EncoderLoadOptions(engine::EncoderLoadOptions);
 #[gen_stub_pymethods]
 #[pymethods]
 impl EncoderLoadOptions {
+    #[new]
+    fn new() -> Self {
+        Self(engine::EncoderLoadOptions::new())
+    }
+
     /// Load onto `chips` chips instead of the one count the model allows.
     ///
     /// Raises:
@@ -535,7 +533,7 @@ mod tests {
             let scope = PyDict::new(py);
             let classes = [
                 ("Checkpoint", py.get_type::<Checkpoint>()),
-                ("LoadOptions", py.get_type::<LoadOptions>()),
+                ("DecoderLoadOptions", py.get_type::<DecoderLoadOptions>()),
             ];
             for (name, class) in classes {
                 scope.set_item(name, class).unwrap();
@@ -543,9 +541,9 @@ mod tests {
             let code = c"
 cases = (
     (lambda: Checkpoint('.', {'a': float('nan')}), 'config: expected value at line 1 column 7'),
-    (lambda: LoadOptions().layers(range(0, 4, 2)), 'layers are a range of consecutive layers'),
-    (lambda: LoadOptions().layers(range(-1, 2)), 'layers are a range of consecutive layers'),
-    (lambda: LoadOptions().layers(range(0, -1)), 'layers are a range of consecutive layers'),
+    (lambda: DecoderLoadOptions().layers(range(0, 4, 2)), 'layers are a range of consecutive layers'),
+    (lambda: DecoderLoadOptions().layers(range(-1, 2)), 'layers are a range of consecutive layers'),
+    (lambda: DecoderLoadOptions().layers(range(0, -1)), 'layers are a range of consecutive layers'),
 )
 for refused, reason in cases:
     try:
@@ -554,7 +552,7 @@ for refused, reason in cases:
         assert str(error) == reason, error
     else:
         raise AssertionError(reason)
-LoadOptions().layers(range(2, 4))
+DecoderLoadOptions().layers(range(2, 4))
 ";
             py.run(code, Some(&scope), None).unwrap();
         });

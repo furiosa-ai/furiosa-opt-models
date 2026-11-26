@@ -6,11 +6,11 @@ For a walkthrough, see [Using the engine](../engine/python.md).
 
 ## Load a checkpoint
 
-`LoadOptions` checks its choices against a `Checkpoint` before any weight is read, then loads the model the registry selects onto a `Device`.
+`DecoderLoadOptions` checks its choices against a `Checkpoint` before any weight is read, then loads the model the registry selects onto a `Device`.
 
 ::: furiosa_opt_engine.Checkpoint
 
-::: furiosa_opt_engine.LoadOptions
+::: furiosa_opt_engine.DecoderLoadOptions
 
 ## Device memory
 
@@ -43,7 +43,7 @@ Every `forward` returns its device outputs once the device accepted the call; a 
 
 ::: furiosa_opt_engine.llama.ForCausalLM
 
-Calling `LoadOptions.encoder()` selects a model's media encoder and returns typed `EncoderLoadOptions`. Its `load()` returns an `Encoder`, whatever the model, whose calls turn media below into rows of the language model's width.
+`EncoderLoadOptions` selects a model's media encoder directly. Its `load()` returns an `Encoder`, whatever the model, whose calls turn media below into rows of the language model's width.
 
 ::: furiosa_opt_engine.EncoderLoadOptions
 

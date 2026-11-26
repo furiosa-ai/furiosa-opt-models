@@ -7,7 +7,7 @@ mod common;
 
 use std::io;
 
-use furiosa_opt_engine::{LoadError, LoadOptions};
+use furiosa_opt_engine::{DecoderLoadOptions, LoadError};
 use furiosa_opt_models::models::Family;
 use furiosa_opt_models::models::encoder_decoder::whisper;
 use serde_json::{Value, json};
@@ -29,7 +29,7 @@ const WHISPER_TINY_EN: Published = Published::new(
 /// type serves the name yet.
 #[test]
 fn whisper_is_refused_until_its_root_exists() {
-    match LoadOptions::new().parse(&WHISPER_TINY.checkpoint()) {
+    match DecoderLoadOptions::new().parse(&WHISPER_TINY.checkpoint()) {
         Err(LoadError::Unsupported { name, reason }) => {
             assert_eq!(name, "WhisperForConditionalGeneration");
             assert_eq!(reason, "no model type is implemented");

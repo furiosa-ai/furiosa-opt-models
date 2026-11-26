@@ -7,7 +7,7 @@ mod common;
 
 use std::io;
 
-use furiosa_opt_engine::{LoadError, LoadOptions};
+use furiosa_opt_engine::{DecoderLoadOptions, LoadError};
 use furiosa_opt_models::models::Family;
 use furiosa_opt_models::models::vision_language::llava;
 use serde_json::{Value, json};
@@ -25,7 +25,7 @@ const LLAVA_1_5_7B: Published = Published::new(
 /// type serves the name yet.
 #[test]
 fn llava_is_refused_until_its_root_exists() {
-    match LoadOptions::new().parse(&LLAVA_1_5_7B.checkpoint()) {
+    match DecoderLoadOptions::new().parse(&LLAVA_1_5_7B.checkpoint()) {
         Err(LoadError::Unsupported { name, reason }) => {
             assert_eq!(name, "LlavaForConditionalGeneration");
             assert_eq!(reason, "no model type is implemented");

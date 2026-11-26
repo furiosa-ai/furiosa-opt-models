@@ -37,8 +37,8 @@ Mapping reads no weight; a load converts and uploads one tensor at a time ([`che
 Turns a checkpoint's config into the model it loads as, and loads it.
 
 - **The registry:** every upstream architecture once, with the concrete types its checkpoints load as, or a refusal ([The model registry](../develop/compose.md#the-model-registry)).
-- **`LoadOptions::parse`:** reads the config and the tensor names only, with no weight or device. It takes the architecture the options name, else the config's, and the one registered type that serves the config, then checks the load's choices: chips, KV cache form and layers.
-- **`LoadOptions::load`:** loads that type strictly into HBM.
+- **`DecoderLoadOptions::parse`:** reads the config and the tensor names only, with no weight or device. It takes the architecture the options name, else the config's, and the one registered type that serves the config, then checks the load's choices: chips, KV cache form and layers.
+- **`DecoderLoadOptions::load`:** loads that type strictly into HBM.
 - **Refuses early:** an unknown architecture as invalid, and a refused architecture or a choice that no registered type serves as unsupported, before any weight is read.
 
 ## 3. Models crate
@@ -67,14 +67,14 @@ Views retain their allocations, so a row slice remains valid after its source ob
 
 ## 6. Python surface
 
-A framework opens a `Checkpoint`, states its choices in `LoadOptions` and loads once onto a `Device` it opened.
+A framework opens a `Checkpoint`, states its choices in `DecoderLoadOptions` and loads once onto a `Device` it opened.
 The load returns a `Decoder` as an object of the model type's class, such as `qwen3.ForCausalLM`, whose `forward` takes the requests and the cache.
 Checking the choices reads no weight and opens no device.
 
 | Rung | Refused | When |
 | --- | --- | --- |
 | Type | Mismatched composition | Engine compile |
-| Construction | Weights for another model | `LoadOptions.load` |
+| Construction | Weights for another model | `DecoderLoadOptions.load` |
 | Runtime | A request that breaks the call's rules, a tensor on another device | Each call |
 
 ## Enabling a model family

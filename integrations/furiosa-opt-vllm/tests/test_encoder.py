@@ -110,7 +110,7 @@ def test_encoder_embeds_each_item_as_transformers_does(
         of `clips` from another, read before the device objects drop."""
         chip = int(os.environ.get("FURIOSA_VISIBLE_CHIPS", "0").split(",")[0])
         device = engine.Device(engine.Placement([chip], range(8)))
-        encoder = engine.LoadOptions().encoder().load(engine.Checkpoint(directory), device)
+        encoder = engine.EncoderLoadOptions().load(engine.Checkpoint(directory), device)
         assert isinstance(encoder, engine.Encoder)
 
         def host(call: list[engine.HbmTensor]) -> list[torch.Tensor]:

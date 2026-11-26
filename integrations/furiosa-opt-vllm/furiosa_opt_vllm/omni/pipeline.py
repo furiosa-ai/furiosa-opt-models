@@ -16,7 +16,7 @@ def build(*, od_config: OmniDiffusionConfig) -> NoReturn:
 
     if od_config.model is None:
         raise ValueError("a pipeline checkpoint is required")
-    engine.LoadOptions().parse(engine.Checkpoint(od_config.model))
+    engine.DecoderLoadOptions().parse(engine.Checkpoint(od_config.model))
     raise NotImplementedError(f"{od_config.model_class_name}: the engine loads no pipeline")
 
 

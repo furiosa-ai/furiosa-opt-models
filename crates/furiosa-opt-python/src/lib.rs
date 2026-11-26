@@ -43,7 +43,7 @@ fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     let _ = pyo3_log::try_init();
     // Load
     module.add_class::<model::Checkpoint>()?;
-    module.add_class::<model::LoadOptions>()?;
+    module.add_class::<model::DecoderLoadOptions>()?;
     module.add_class::<model::EncoderLoadOptions>()?;
     module.add_class::<model::Decoder>()?;
     module.add_class::<model::Encoder>()?;

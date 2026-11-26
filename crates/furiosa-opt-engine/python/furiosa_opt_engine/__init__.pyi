@@ -16,6 +16,7 @@ from . import decoder, encoder, llama, mistral, qwen3
 __all__ = [
     "Checkpoint",
     "Decoder",
+    "DecoderLoadOptions",
     "Device",
     "Encoder",
     "EncoderLoadOptions",
@@ -23,7 +24,6 @@ __all__ = [
     "HbmTensor",
     "HostBuffer",
     "HostTensor",
-    "LoadOptions",
     "Placement",
     "Transfer",
     "decoder",
@@ -131,6 +131,82 @@ class Decoder:
         """
 
 @typing.final
+class DecoderLoadOptions:
+    r"""
+    Decoder load choices: a method returns new options or raises for a choice no model holds, and
+    `parse` and `load` for one its model refuses.
+    """
+    def __new__(cls) -> DecoderLoadOptions: ...
+    def chips(self, chips: builtins.int) -> DecoderLoadOptions:
+        r"""
+        Load onto `chips` chips instead of the one count the model allows.
+
+        Raises:
+            ValueError: `chips` is zero.
+        """
+    def kv_cache(self, dtype: builtins.str) -> DecoderLoadOptions:
+        r"""
+        Cache keys and values as `dtype`, a tensor dtype name, instead of `bfloat16`.
+
+        Raises:
+            ValueError: `dtype` names no tensor dtype.
+        """
+    def architecture(self, name: builtins.str) -> DecoderLoadOptions:
+        r"""
+        Select the architecture `name` instead of the one the checkpoint's config names.
+
+        Raises:
+            ValueError: The model list holds no architecture `name`.
+            NotImplementedError: The list refuses `name`.
+        """
+    def layers(self, layers: range) -> DecoderLoadOptions:
+        r"""
+        Load only the layers `layers`, at their positions in the whole model.
+
+        Raises:
+            ValueError: `layers` has a step other than 1 or a negative bound.
+        """
+    def batch_invariant(self) -> DecoderLoadOptions:
+        r"""
+        Serve calls whose rows keep their values' bits whatever other rows share the calls: each
+        row's attention is tiled by its own history alone.
+        """
+    def quantization(self, name: builtins.str) -> DecoderLoadOptions:
+        r"""
+        Quantize a BF16 checkpoint's projections at load as `name` says: `fp8_per_tensor` or
+        `fp8_per_channel`, E4M3 weights under one scale per tensor or per output row.
+
+        Raises:
+            ValueError: `name` names no quantization.
+        """
+    def adapters(self) -> DecoderLoadOptions:
+        r"""
+        Load for calls that run LoRA adapters: `parse` and `load` refuse a model whose projections
+        take none.
+        """
+    def parse(self, checkpoint: Checkpoint) -> None:
+        r"""
+        Check the choices against `checkpoint`'s config and names, reading no weight and opening no
+        device.
+
+        Raises:
+            ValueError: The config names no listed architecture, no listed model of it serves the
+                checkpoint, or a quantized checkpoint is given a quantization.
+            NotImplementedError: The list refuses the architecture, or a choice.
+        """
+    def load(self, checkpoint: Checkpoint, device: Device) -> Decoder:
+        r"""
+        Load the decoder `checkpoint` selects strictly into HBM of `device`, as an object of its
+        model type's class such as `qwen3.ForCausalLM`. Dropping the object frees its device memory,
+        and a new load of the same model serves the caches the dropped one did.
+
+        Raises:
+            ValueError: As `parse` does, or a tensor is missing, unexpected or malformed.
+            NotImplementedError: As `parse` does, or no class holds the model yet.
+            RuntimeError: The device fails.
+        """
+
+@typing.final
 class Device:
     r"""
     An opened device, which every tensor, buffer and cache on it keeps open; its memory sizes are
@@ -207,8 +283,9 @@ class Encoder:
 @typing.final
 class EncoderLoadOptions:
     r"""
-    Options to load a model's media encoder alone.
+    Encoder load choices for loading a model's media encoder alone.
     """
+    def __new__(cls) -> EncoderLoadOptions: ...
     def chips(self, chips: builtins.int) -> EncoderLoadOptions:
         r"""
         Load onto `chips` chips instead of the one count the model allows.
@@ -458,88 +535,6 @@ class HostTensor:
 
         Raises:
             RuntimeError: The transfer fails.
-        """
-
-@typing.final
-class LoadOptions:
-    r"""
-    A load's architecture, chips, KV cache form, layers, batch invariance, quantization and LoRA
-    adapters: a method returns new options or raises for a choice no model holds, and `parse` and
-    `load` for one its model refuses.
-    """
-    def __new__(cls) -> LoadOptions: ...
-    def chips(self, chips: builtins.int) -> LoadOptions:
-        r"""
-        Load onto `chips` chips instead of the one count the model allows.
-
-        Raises:
-            ValueError: `chips` is zero.
-        """
-    def kv_cache(self, dtype: builtins.str) -> LoadOptions:
-        r"""
-        Cache keys and values as `dtype`, a tensor dtype name, instead of `bfloat16`.
-
-        Raises:
-            ValueError: `dtype` names no tensor dtype.
-        """
-    def architecture(self, name: builtins.str) -> LoadOptions:
-        r"""
-        Select the architecture `name` instead of the one the checkpoint's config names.
-
-        Raises:
-            ValueError: The model list holds no architecture `name`.
-            NotImplementedError: The list refuses `name`.
-        """
-    def layers(self, layers: range) -> LoadOptions:
-        r"""
-        Load only the layers `layers`, at their positions in the whole model.
-
-        Raises:
-            ValueError: `layers` has a step other than 1 or a negative bound.
-        """
-    def batch_invariant(self) -> LoadOptions:
-        r"""
-        Serve calls whose rows keep their values' bits whatever other rows share the calls: each
-        row's attention is tiled by its own history alone.
-        """
-    def quantization(self, name: builtins.str) -> LoadOptions:
-        r"""
-        Quantize a BF16 checkpoint's projections at load as `name` says: `fp8_per_tensor` or
-        `fp8_per_channel`, E4M3 weights under one scale per tensor or per output row.
-
-        Raises:
-            ValueError: `name` names no quantization.
-        """
-    def encoder(self) -> EncoderLoadOptions:
-        r"""
-        Load the model's media encoder alone, whose rows its language model reads: the producer
-        of an encoder cache, for one.
-        """
-    def adapters(self) -> LoadOptions:
-        r"""
-        Load for calls that run LoRA adapters: `parse` and `load` refuse a model whose projections
-        take none.
-        """
-    def parse(self, checkpoint: Checkpoint) -> None:
-        r"""
-        Check the choices against `checkpoint`'s config and names, reading no weight and opening no
-        device.
-
-        Raises:
-            ValueError: The config names no listed architecture, no listed model of it serves the
-                checkpoint, or a quantized checkpoint is given a quantization.
-            NotImplementedError: The list refuses the architecture, or a choice.
-        """
-    def load(self, checkpoint: Checkpoint, device: Device) -> Decoder:
-        r"""
-        Load the decoder `checkpoint` selects strictly into HBM of `device`, as an object of its
-        model type's class such as `qwen3.ForCausalLM`. Dropping the object frees its device memory,
-        and a new load of the same model serves the caches the dropped one did.
-
-        Raises:
-            ValueError: As `parse` does, or a tensor is missing, unexpected or malformed.
-            NotImplementedError: As `parse` does, or no class holds the model yet.
-            RuntimeError: The device fails.
         """
 
 @typing.final

@@ -5,7 +5,7 @@
 
 mod common;
 
-use furiosa_opt_engine::LoadOptions;
+use furiosa_opt_engine::DecoderLoadOptions;
 use furiosa_opt_models::load::{Context, Load, LoadError, Shapes};
 use furiosa_opt_models::models::Implements;
 use furiosa_opt_models::models::decoder::attention::qwen3;
@@ -47,6 +47,6 @@ fn one_line_serves_each_precision() {
     ));
     assert_eq!(qwen3::fp8::ForCausalLM::scope(&fp8).unwrap(), "");
     assert!(qwen3::fp8::ForCausalLM::scope(&bf16).is_err());
-    let config = LoadOptions::new().parse(&bf16).unwrap();
+    let config = DecoderLoadOptions::new().parse(&bf16).unwrap();
     assert_eq!((config.size(), config.precision()), ("8B", Dtype::BF16));
 }

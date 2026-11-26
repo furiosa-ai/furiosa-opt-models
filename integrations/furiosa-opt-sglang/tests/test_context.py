@@ -53,7 +53,7 @@ def test_refuses_extension(tmp_path: Path) -> None:
     config = AutoConfig.from_pretrained("Qwen/Qwen3-0.6B").to_dict()
     config["rope_parameters"] = {"rope_type": "dynamic", "factor": 2.0, "rope_theta": 1000000.0}
     with pytest.raises(NotImplementedError, match=r'rope_type "dynamic"'):
-        engine.LoadOptions().parse(engine.Checkpoint(tmp_path, config=config))
+        engine.DecoderLoadOptions().parse(engine.Checkpoint(tmp_path, config=config))
 
 
 @pytest.mark.feature("Context extension past the trained length")

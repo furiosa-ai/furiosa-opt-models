@@ -3,7 +3,8 @@
 //! - `Checkpoint` maps a checkpoint directory; a weight tree loads from it into HBM tensor by
 //!   tensor.
 //! - The `registry` lists every upstream architecture name with the decoders and media encoders
-//!   that implement it. `LoadOptions` loads a decoder; `EncoderLoadOptions` loads a media encoder.
+//!   that implement it. `DecoderLoadOptions` loads a decoder; `EncoderLoadOptions` loads a media
+//!   encoder.
 //!   A choice the registry refuses is reported before any weight is read.
 //! - A `Function` runs a module of a loaded tree through a compiled entry, as an `AsyncModule`.
 //! - A `decoder` root serves requests on a `decoder::Cache`: a call validates and plans them, then
@@ -28,4 +29,4 @@ pub use function::{AsyncModule, Function, forward};
 pub use furiosa_opt_models::load::{Checkpoint, Load, LoadError};
 pub use furiosa_opt_models::ops::attention::full::paged::Tiling;
 pub use furiosa_opt_models::tensor::memory::Hbm;
-pub use load::{Config, EncoderLoadOptions, LoadOptions, Quantization};
+pub use load::{Config, DecoderLoadOptions, EncoderLoadOptions, Quantization};
