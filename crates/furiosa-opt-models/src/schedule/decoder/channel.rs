@@ -58,12 +58,12 @@ struct Staged {
     attended: Live<Owned<Width, Span>, Capacity>,
 }
 
-fn front<const SPLIT_QUERY: bool>(device: &mut Device, layer: &Layer) -> Front {
+fn front<const SPLIT_QUERY: bool>(device: &mut Device, layer: &Layer, defer_first: bool) -> Front {
     let Sequential(Residual(norm, attention, _), _) = layer;
     let Projection { query, key, value } = &attention.0.qkv.projection.projection;
     let value = qkv::prepare(device, &value.0.weight);
     let key = qkv::prepare(device, &key.0.weight);
-    let query = qkv::prepare_weight::<_, _, _, SPLIT_QUERY>(device, &query.0.weight);
+    let query = qkv::prepare_weight::<_, _, _, SPLIT_QUERY>(device, &query.0.weight, defer_first);
     let gain = crate::Op::forward(&Stage, device, &norm.0);
     Front {
         gain,
@@ -332,7 +332,7 @@ impl<'l, 'c, 'a, 's>
         tile: Live<(), Capacity>,
     ) -> Self::Output {
         let Self(embedded, layer) = *self;
-        let front = front::<false>(device, layer);
+        let front = front::<false>(device, layer, false);
         let rows = tile.with(embedded.fill(&mut *device, tile));
         start(
             device,
@@ -373,14 +373,20 @@ impl<'l, 'c, 'a, 'p, 's>
         );
         let Sequential(Residual(_, attention, _), _) = next;
         let query = &attention.0.qkv.projection.projection.query.0.weight;
+        let defer_first = call.live.rows() == 1 && short_decode(call);
         let (rows, front) = update(
             device,
             layer,
             staged,
             &first.0,
             (
-                |device| front::<true>(device, next),
-                |device, front| qkv::finish_query(device, query, &mut front.query),
+                |device| front::<true>(device, next, defer_first),
+                |device, front| {
+                    if defer_first {
+                        qkv::load_query_half::<0, _, _, _>(device, query, &mut front.query);
+                    }
+                    qkv::load_query_half::<1, _, _, _>(device, query, &mut front.query)
+                },
             ),
         );
         start(device, call, next, front, rows, (stored, input), projecting)

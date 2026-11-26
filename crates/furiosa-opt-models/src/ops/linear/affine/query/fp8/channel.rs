@@ -282,10 +282,10 @@ pub(crate) fn prepare<Hidden: AxisName, Heads: AxisName, Head: AxisName>(
     device: &mut Device,
     projection: &Weights<Hidden, Heads, Head>,
 ) -> Prepared<Hidden, Heads, Head> {
-    prepare_weight::<_, _, _, false>(device, projection)
+    prepare_weight::<_, _, _, false>(device, projection, false)
 }
 
-/// When split, only channels 0..64 of every head land here. The exchange queues the other half.
+/// A split query can defer its first half until the down exchange on single-row decode.
 pub(crate) fn prepare_weight<
     Hidden: AxisName,
     Heads: AxisName,
@@ -294,10 +294,14 @@ pub(crate) fn prepare_weight<
 >(
     device: &mut Device,
     projection: &Weights<Hidden, Heads, Head>,
+    defer_first: bool,
 ) -> Prepared<Hidden, Heads, Head> {
     let (mut weight, mut scale) = (DmTensor::new(), DmTensor::new());
     if const { SPLIT } {
-        source::Half::<_, _, _, 0>(&projection.0).forward(device, &mut weight);
+        match defer_first {
+            false => source::Half::<_, _, _, 0>(&projection.0).forward(device, &mut weight),
+            true => (),
+        }
     } else {
         source::Panel(&projection.0).forward(device, &mut weight);
     }
@@ -309,12 +313,17 @@ pub(crate) fn prepare_weight<
     Prepared { weight, scale }
 }
 
-pub(crate) fn finish_query<Hidden: AxisName, Heads: AxisName, Head: AxisName>(
+pub(crate) fn load_query_half<
+    const HALF: usize,
+    Hidden: AxisName,
+    Heads: AxisName,
+    Head: AxisName,
+>(
     device: &mut Device,
     projection: &Weights<Hidden, Heads, Head>,
     query: &mut Prepared<Hidden, Heads, Head>,
 ) {
-    source::Half::<_, _, _, 1>(&projection.0).forward(device, &mut query.weight);
+    source::Half::<_, _, _, HALF>(&projection.0).forward(device, &mut query.weight);
 }
 
 #[cfg(test)]
