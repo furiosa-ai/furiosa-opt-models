@@ -67,7 +67,7 @@ The file tier preserves each framework's existing byte layout.
 
 Each `Copier` owns a six-worker queue with no job-count cap. An ordinary DMA batch contains up to two pages with distinct host slots; each page carries all requested layer routes. Slot uniqueness applies within a batch, so a later batch may reuse a slot. Pages are ordered by host slot within a batch to keep concurrent lock acquisition in one order.
 
-The ordinary path moves KV data directly between pinned host slots and existing HBM pages, without a CPU staging copy. A device-page overlap with an in-flight copy fails with `BlockingIOError`; a host-slot conflict blocks on that slot's gate. A live host-slot lease prevents DMA until Python or filesystem access ends, while unrelated transfers proceed independently.
+The ordinary path moves KV data directly between pinned host slots and existing HBM pages, without a CPU staging copy. A device-page overlap with an in-flight copy fails with `BlockingIOError`; conflict checks read atomic copy status instead of locking each completion result. A host-slot conflict blocks on that slot's gate. A live host-slot lease prevents DMA until Python or filesystem access ends, while unrelated transfers proceed independently.
 
 For separately allocated slots, one per-slot mutex owns the pinned buffer and its DMA/lease state. The direct path holds that mutex through DMA, so the buffer needs no second mutex. Each queue worker also owns a clone of the same PDMA device handle. It can build and submit transfers without taking the decoder's context mutex; the clone shares the opened device and memory rather than opening another device.
 
