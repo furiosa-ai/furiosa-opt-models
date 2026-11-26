@@ -24,7 +24,7 @@ The platform accepts these values:
 | `rope_parameters` or `rope_scaling` and `max_position_embeddings` in `--json-model-override-args` | A `rope_type` the engine computes, within the compiled window ([Extend the context](index.md#extend-the-context-past-the-trained-length)) |
 | `--mem-fraction-static` | Unset defaults to 0.9, leaving the headroom a model split over chips needs |
 | `--enable-deterministic-inference` | Off, or on to load the model [batch invariant](index.md#keep-outputs-independent-of-the-batch) with the radix cache on |
-| `--enable-hierarchical-cache` | A model without recurrent state, with the host tier sized by `--hicache-ratio` or `--hicache-size`; see [Hierarchical cache](#hierarchical-cache) for required modes and storage options |
+| `--enable-hierarchical-cache` | A model without recurrent state, with the host tier sized by `--hicache-ratio` or `--hicache-size`; use storage backend `file` or `mooncake` with the required modes ([details](#hierarchical-cache)) |
 
 ## Hierarchical cache
 
@@ -32,7 +32,7 @@ The platform accepts these values:
 
 The plugin connects SGLang's HiCache page selection and lifecycle to engine-pinned host slots. Choose a host-tier size with `--hicache-ratio` or `--hicache-size`; the [serving task guide](index.md#offload-the-kv-cache-to-host-memory) has the filesystem launch command.
 
-The filesystem tier uses SGLang's `file` option and `FuriosaHiCacheFile`. Set `--hicache-host-memory-mode cache`, `--hicache-io-backend kernel` and `--hicache-mem-layout page_first`. The storage backend must be unset or `file`; other backends need their own host-buffer integration. Automatic sizing from free host memory is available only for pools SGLang allocates itself.
+The filesystem tier uses SGLang's `file` option and `FuriosaHiCacheFile`; the [serving task guide](index.md#offload-the-kv-cache-to-host-memory) has the launch command. Set `--hicache-host-memory-mode cache`, `--hicache-io-backend kernel` and `--hicache-mem-layout page_first`. The storage backend must be unset, `file` or `mooncake`; other backends need their own host-buffer integration. Automatic sizing from free host memory is available only for pools SGLang allocates itself.
 
 The adapter loads through SGLang's `dynamic` storage-backend factory and preserves SGLang's cache keys and file-tier lifecycle. The [shared filesystem guide](../engine/frameworks.md#filesystem-layout-and-io) defines the file format and I/O alignment behavior.
 
@@ -64,12 +64,29 @@ Failed copies surface at SGLang's next HiCache completion check after the engine
 
 A `/generate` response reports reused tokens by tier in `meta_info.cached_tokens_details`.
 
-These features are not supported yet, and the plugin refuses them at startup rather than ignore them:
+### Mooncake storage
+
+Install the optional `mooncake` extra as described in [Installation](../getting-started/installation.md#install-optional-mooncake-storage-support), configure SGLang's Mooncake Store, and select the native HiCache backend:
+
+```bash
+SGLANG_HICACHE_MOONCAKE_CONFIG_PATH=/etc/mooncake/sglang.json \
+python -m sglang.launch_server --model-path Qwen/Qwen3-1.7B \
+  --enable-hierarchical-cache --hicache-ratio 2 \
+  --hicache-host-memory-mode cache --hicache-io-backend kernel --hicache-mem-layout page_first \
+  --hicache-storage-backend mooncake
+```
+
+The Mooncake backend preserves SGLang's lookup lifecycle and stores one complete engine page per key. Its namespace includes model, parallelism and page layout, so instances share entries only when those match. It does not fingerprint checkpoint revisions; change `extra_backend_tag` when weights change under the same model name. `standalone_storage` is unsupported because Mooncake must register engine-owned host pages.
+
+## Features not supported yet
+
+The plugin refuses these framework features at startup rather than ignore them:
 
 - LoRA and speculative algorithms other than NGRAM and STANDALONE.
 - Speculative decoding with more than one candidate a position, adaptive speculation or an external n-gram corpus.
 - Watermarking (`--enable-watermark`) and strict thinking (`--enable-strict-thinking`), which change the scores of each step.
 - Quantization and quantization parameter files.
+- HiSparse, unified memory, LMCache, FlexKV and the unified cache external linker; this plugin supports `file` and `mooncake` storage backends.
 - The memory saver (`--enable-memory-saver`) with speculative decoding, whose worker and draft model keep device memory a release does not reach yet.
 - Per-layer embedding offload (`ple_offload_embedding`).
 - Returning hidden states, routed experts or indexer top-k.

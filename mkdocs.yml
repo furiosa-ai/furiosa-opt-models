@@ -159,6 +159,7 @@ nav:
   - Developer guide:
       - design/architecture.md
       - develop/compose.md
+      - develop/compatibility.md
       - develop/add-model.md
       - develop/kernel.md
       - engine/frameworks.md
