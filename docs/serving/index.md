@@ -149,6 +149,7 @@ Both servers copy the cache blocks of computed prompts to a tier of host memory,
     ```bash
     python -m sglang.launch_server --model-path Qwen/Qwen3-1.7B \
       --enable-hierarchical-cache --hicache-ratio 2 --hicache-storage-backend file \
+      --hicache-host-memory-mode cache --hicache-io-backend kernel --hicache-mem-layout page_first \
       --hicache-storage-backend-extra-config '{"file_storage_path":"/mnt/kv-cache"}'
     ```
 

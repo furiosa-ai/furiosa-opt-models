@@ -50,7 +50,7 @@ Evicting a request releases its block assignments, not the cache allocation, and
 
 ## Offload cache pages
 
-Frameworks keep cache selection, keys, eviction and tier lifecycle; the engine owns pinned host slots, page routing and DMA. The [serving guide](../serving/index.md#offload-the-kv-cache-to-host-memory) has setup recipes. The [vLLM](../serving/vllm.md#kv-cache-offloading) and [SGLang](../serving/sglang.md#hierarchical-cache) references define each adapter's options and framework-specific behavior.
+Frameworks keep cache selection, keys, eviction and tier lifecycle; the engine owns pinned host slots, page routing, DMA and aligned file I/O. This section is the source for those shared mechanics. The [serving guide](../serving/index.md#offload-the-kv-cache-to-host-memory) has launch recipes; the [vLLM](../serving/vllm.md#kv-cache-offloading) and [SGLang](../serving/sglang.md#hierarchical-cache) references define each adapter's options and framework-specific behavior.
 
 ### Filesystem layout and I/O
 
@@ -61,17 +61,17 @@ The file tier preserves each framework's existing byte layout.
 | SGLang | One raw cache page per file. |
 | vLLM | Native layer-major chunks, including trailing chunk-alignment padding. |
 
-The engine package's shared `AlignedFileIO` utility enables `O_DIRECT` only after querying the filesystem's memory and offset alignments and completing an aligned probe. Offset or vector-length misalignment falls back to buffered I/O from pinned slots. For a single-buffer transfer, a misaligned address uses a per-thread aligned buffer for direct I/O; for a vectored transfer, any misaligned address in that range falls back to buffered I/O. vLLM submits each chunk's layer ranges in one file-I/O batch, reusing at most one direct and one buffered file handle; the engine splits each range only at the operating system's vector limit.
+`AlignedFileIO` enables `O_DIRECT` only after querying the filesystem's memory and offset alignments and completing an aligned probe. An offset or vector-length misalignment uses buffered I/O from pinned slots. A single buffer with a misaligned address uses a per-thread aligned buffer for direct I/O; for vectored I/O, one misaligned address switches the whole vector to buffered I/O. vLLM submits each chunk's layer ranges in one file-I/O batch, reusing at most one direct and one buffered file handle. The engine splits vectors only at the operating system's vector limit.
 
 ### DMA batches and ownership
 
-The shared copier has six workers and no job-count cap. An ordinary DMA batch contains up to two pages with distinct host slots; each page carries all requested layer routes. Slot uniqueness applies within a batch, so a later batch may reuse a slot. Pages are ordered by host slot within a batch to keep concurrent lock acquisition in one order.
+Each `Copier` owns a six-worker queue with no job-count cap. An ordinary DMA batch contains up to two pages with distinct host slots; each page carries all requested layer routes. Slot uniqueness applies within a batch, so a later batch may reuse a slot. Pages are ordered by host slot within a batch to keep concurrent lock acquisition in one order.
 
-The ordinary path moves KV data directly between pinned host slots and existing HBM pages. It does not copy KV through a CPU staging buffer. A device-page overlap with an in-flight copy fails with `BlockingIOError`; an overlapping host slot waits on the same per-slot mutex that protects its DMA buffer. Callers await each `Copy` before reusing its pages. A live host-slot lease prevents DMA until Python or filesystem access ends, while unrelated transfers proceed independently.
+The ordinary path moves KV data directly between pinned host slots and existing HBM pages, without a CPU staging copy. A device-page overlap with an in-flight copy fails with `BlockingIOError`; a host-slot conflict blocks on that slot's gate. A live host-slot lease prevents DMA until Python or filesystem access ends, while unrelated transfers proceed independently.
 
-For separately allocated slots, one per-slot mutex owns both the pinned buffer and its DMA/lease state. The direct path holds that mutex through DMA; the owned buffer needs no second host-buffer mutex. Each queue worker owns a clone of the same PDMA device handle, so it builds and submits transfers without taking the decoder's context mutex. Cloning the runtime context shares the opened device and its memory; it does not open another device. This preserves submission overlap with decoder calls while keeping each mutable PDMA context owned by one worker.
+For separately allocated slots, one per-slot mutex owns the pinned buffer and its DMA/lease state. The direct path holds that mutex through DMA, so the buffer needs no second mutex. Each queue worker also owns a clone of the same PDMA device handle. It can build and submit transfers without taking the decoder's context mutex; the clone shares the opened device and memory rather than opening another device.
 
-A shared backing uses the same direct route over per-slot byte ranges. The engine takes each slot's logical DMA gate, then holds the allocation-wide backing mutex while it builds borrowed runtime views and submits the request. It releases the backing mutex before awaiting DMA. This serializes setup and submission for transfers using that backing; DMA can still overlap after submission. The filesystem L3 adapters use separately allocated slots.
+A pool backed by one contiguous allocation uses the same direct route over per-slot byte ranges. Each slot gate remains active through DMA. The engine holds the allocation-wide mutex only while building borrowed runtime views and submitting the request, then releases it before awaiting DMA. This serializes setup for transfers using that backing, while submitted DMA can still overlap. The filesystem L3 adapters use separately allocated slots.
 
 ### Optional coalescing
 
@@ -91,7 +91,7 @@ No NPU measurement establishes the end-to-end performance of these paths.
 
 ### Completion and failures
 
-`copy_in` and `copy_out` return after queueing their chunks, without waiting for runtime submission or DMA. Callers must retain and await a `Copy` before reusing its host slots or device pages. A failed copy leaves every routed device page reserved for the copier's lifetime; host-slot reuse remains governed by its mutex and the caller's cache policy. Each framework adapter reports the failure through its native completion path.
+`copy_in` and `copy_out` return after queueing their chunks, without waiting for runtime submission or DMA. Callers must retain and await a `Copy` before reusing its host slots or device pages; this gives the caller transfer ordering and errors as well as safe cache reuse. A failed copy leaves every routed device page reserved for the copier's lifetime. Host-slot reuse remains governed by its gate and the caller's cache policy. Each framework adapter reports failures through its native completion path.
 
 `Copier.shutdown()` drains submitted copies and joins the workers while releasing the Python GIL. Callers must release every host-slot access lease before shutdown, because an active lease blocks DMA until the access ends.
 

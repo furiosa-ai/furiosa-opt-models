@@ -27,24 +27,15 @@ The platform accepts these values:
 
 ### Configure the host tier
 
-vLLM keeps block selection, admission and eviction; the plugin implements vLLM's native CPU offloading contract through `RNGDOffloadingConnector`. Without a secondary tier, `--kv-offloading-size` sets the pinned host-tier capacity in GiB:
+vLLM keeps block selection, admission and eviction; the plugin implements its native CPU offloading contract through `RNGDOffloadingConnector`. Without a secondary tier, `--kv-offloading-size` sets pinned host-tier capacity in GiB. The [serving task guide](index.md#offload-the-kv-cache-to-host-memory) has the filesystem launch command.
 
-```bash
-vllm serve Qwen/Qwen3-0.6B --kv-offloading-size 16
-```
-
-Add a filesystem tier through vLLM's `TieringOffloadingSpec`. `secondary_tiers` is vLLM's native `kv_connector_extra_config` field; Furiosa supplies the filesystem-tier manager over engine-pinned slots:
-
-```bash
-vllm serve Qwen/Qwen3-0.6B --kv-offloading-size 16 \
-  --kv-transfer-config '{"kv_connector_extra_config":{"secondary_tiers":[{"type":"fs","root_dir":"/mnt/kv-cache"}]}}'
-```
+The filesystem tier uses vLLM's `TieringOffloadingSpec`. Its native `secondary_tiers` field belongs in `kv_connector_extra_config`; Furiosa supplies the tier manager over engine-pinned slots.
 
 Keep `blocks_per_chunk` and `eviction_policy` in vLLM's `kv_connector_extra_config`. The Furiosa-only `coalescing` option is disabled by default; set `"coalescing":true` beside `secondary_tiers` to enable it.
 
 ### Coalesce worker-step loads
 
-Coalescing combines every load job started for one worker step into one engine staging transfer while vLLM tracks each job separately. The engine has no job-count cap, but staging memory grows with the step's aggregate load size. The [shared transfer guide](../engine/frameworks.md#optional-coalescing) describes the common costs and mechanics.
+The Furiosa-only `coalescing` option defaults to `false`; set it to `true` beside `secondary_tiers` in `kv_connector_extra_config`. vLLM still tracks each load job separately while the engine combines that worker step's loads into one staging transfer. The [shared transfer guide](../engine/frameworks.md#optional-coalescing) documents staging cost and memory growth.
 
 ### Filesystem tier
 
