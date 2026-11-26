@@ -34,9 +34,9 @@ static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 ///
 /// `copy_in` and `copy_out` return a `Copy` handle without waiting for its DMA. The caller owns
 /// host-slot and device-page lifetimes: before submitting work that reuses either, it must wait
-/// for the earlier `Copy` to finish. `submitted()` only waits for runtime submission, not DMA. An
-/// submission that overlaps an in-flight DMA raises `BlockingIOError` and queues no work. Python
-/// serializes queue mutation under the GIL; completions can move to framework worker threads.
+/// for the earlier `Copy` to finish. An overlapping submission raises `BlockingIOError` and queues
+/// no work. Python serializes queue mutation under the GIL; completions can move to framework
+/// worker threads.
 /// Layer groups are numbered contiguously from zero.
 #[gen_stub_pyclass]
 #[pyclass(name = "Copier", module = "engine")]
@@ -203,8 +203,8 @@ impl PyCopier {
     /// Submit device-to-host copies without waiting for their DMA to finish.
     ///
     /// `pages` names host slots and their `(group, device_block)` routes. The caller must wait for
-    /// earlier copies that use any of these host slots or device pages; `Copy.submitted()` is not
-    /// sufficient. An in-flight overlap raises `BlockingIOError` and submits no work.
+    /// earlier copies that use any of these host slots or device pages. An in-flight overlap raises
+    /// `BlockingIOError` and submits no work.
     /// Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
     /// transient pinned memory for one batched runtime transfer.
     #[pyo3(signature = (pages, host, *, coalesce=false))]
@@ -220,8 +220,8 @@ impl PyCopier {
     /// Submit host-to-device copies without waiting for their DMA to finish.
     ///
     /// `pages` names host slots and their `(group, device_block)` routes. The caller must wait for
-    /// earlier copies that use any of these host slots or device pages; `Copy.submitted()` is not
-    /// sufficient. An in-flight overlap raises `BlockingIOError` and submits no work.
+    /// earlier copies that use any of these host slots or device pages. An in-flight overlap raises
+    /// `BlockingIOError` and submits no work.
     /// Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
     /// transient pinned memory for one batched runtime transfer.
     #[pyo3(signature = (pages, host, *, coalesce=false))]
@@ -635,34 +635,10 @@ impl PyCopy {
 
     /// Wait until every copy in the request completes, raising its transfer error if any. Waiting
     /// before resubmitting an overlapping host slot or device page satisfies the caller's reuse
-    /// contract; `submitted()` does not.
+    /// contract.
     fn wait(&self, py: Python<'_>) -> PyResult<()> {
         Ok(py
             .detach(|| self.0.done(None).map(drop))
-            .map_err(crate::Error::from)?)
-    }
-
-    /// Wait until every runtime batch was submitted, without waiting for DMA completion. This does
-    /// not make host slots or device pages safe to reuse; call `wait()` first.
-    fn submitted(&self, py: Python<'_>) -> PyResult<()> {
-        Ok(py
-            .detach(|| {
-                let submitted = self.0.wait_submitted();
-                if let Err(error) = submitted {
-                    // A later chunk can fail to enqueue after earlier chunks have started. Keep the
-                    // pinned slots alive until every already-enqueued DMA has drained.
-                    if let Err(drain_error) = self.0.done(None) {
-                        return Err(io::Error::new(
-                            error.kind(),
-                            format!(
-                                "{error}; draining earlier cache copies also failed: {drain_error}"
-                            ),
-                        ));
-                    }
-                    return Err(error);
-                }
-                Ok(())
-            })
             .map_err(crate::Error::from)?)
     }
 }

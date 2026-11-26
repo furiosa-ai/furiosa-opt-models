@@ -138,7 +138,6 @@ type PageLayer = (usize, u32, usize);
 
 struct Job {
     left: AtomicUsize,
-    submit_left: AtomicUsize,
     failure: Mutex<Option<io::Error>>,
     completion: Arc<Completion>,
 }
@@ -146,8 +145,6 @@ struct Job {
 pub(super) struct Completion {
     result: Mutex<Option<Result<(), String>>>,
     changed: Condvar,
-    submission: Mutex<Option<Result<(), String>>>,
-    submission_changed: Condvar,
 }
 
 pub(super) struct ChunkCompletion {
@@ -468,7 +465,6 @@ impl Chunk {
     ) -> (Vec<Self>, Vec<(TransferKey, Arc<ChunkCompletion>)>) {
         let chunks = Self::partition_pages(pages, coalesced);
         if chunks.is_empty() {
-            completion.mark_submitted(Ok(()));
             completion.finish(Ok(()));
             return (Vec::new(), Vec::new());
         }
@@ -501,7 +497,6 @@ impl Chunk {
             .collect();
         let job = Arc::new(Job {
             left: AtomicUsize::new(chunks.len()),
-            submit_left: AtomicUsize::new(chunks.len()),
             failure: Mutex::new(None),
             completion: Arc::clone(completion),
         });
@@ -609,7 +604,6 @@ impl Chunk {
                 pairs.push((source, destination));
             }
             let submitted = pdma.to_hbm(pairs).submit();
-            self.job.submitted();
             executor.block_on(submitted).map_err(io::Error::other)
         } else {
             let mut pairs = Vec::with_capacity(route_count);
@@ -648,7 +642,6 @@ impl Chunk {
                 return Err(io::Error::other("cache transfer has unrouted host layers"));
             }
             let submitted = pdma.to_host(pairs).submit();
-            self.job.submitted();
             executor.block_on(submitted).map_err(io::Error::other)
         }
     }
@@ -700,7 +693,6 @@ impl Chunk {
                 }
                 pdma.to_hbm(pairs).submit()
             };
-            self.job.submitted();
             executor.block_on(submitted).map_err(io::Error::other)
         } else {
             let submitted = {
@@ -741,7 +733,6 @@ impl Chunk {
                 }
                 pdma.to_host(pairs).submit()
             };
-            self.job.submitted();
             executor.block_on(submitted).map_err(io::Error::other)
         }
     }
@@ -811,7 +802,6 @@ impl Chunk {
             .collect::<Vec<_>>();
         let mut layout = staging::Layout::new(&self.pages, &core.groups, &layers, self.loading)?;
         if layout.bytes == 0 {
-            self.job.submitted();
             return Ok(());
         }
         let mut stages = (0..core.chips)
@@ -854,7 +844,6 @@ impl Chunk {
                 }
             }
             let submitted = pdma.to_hbm(pairs).submit();
-            self.job.submitted();
             executor.block_on(submitted).map_err(io::Error::other)?;
         } else {
             let mut aliases = staging_aliases(&layout, core)?;
@@ -884,7 +873,6 @@ impl Chunk {
                 }
             }
             let submitted = pdma.to_host(pairs).submit();
-            self.job.submitted();
             executor.block_on(submitted).map_err(io::Error::other)?;
 
             for group in &slot_items {
@@ -1023,20 +1011,12 @@ fn staging_aliases(
 }
 
 impl Job {
-    fn submitted(&self) {
-        if self.submit_left.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.completion.mark_submitted(Ok(()));
-        }
-    }
-
     fn finish(&self, result: io::Result<()>) {
         let mut failure = self
             .failure
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         if let Err(error) = result {
-            self.completion
-                .mark_submitted(Err(io::Error::other(error.to_string())));
             failure.get_or_insert(error);
         }
         if self.left.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -1097,36 +1077,6 @@ impl Transfers {
 }
 
 impl Completion {
-    fn mark_submitted(&self, result: io::Result<()>) {
-        let mut submission = self
-            .submission
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if submission.is_none() {
-            *submission = Some(result.map_err(|error| error.to_string()));
-            self.submission_changed.notify_all();
-        }
-    }
-
-    pub(super) fn wait_submitted(&self) -> io::Result<()> {
-        let mut submission = self
-            .submission
-            .lock()
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        loop {
-            if let Some(result) = &*submission {
-                return result
-                    .as_ref()
-                    .map(|()| ())
-                    .map_err(|error| io::Error::other(error.clone()));
-            }
-            submission = self
-                .submission_changed
-                .wait(submission)
-                .map_err(|error| io::Error::other(error.to_string()))?;
-        }
-    }
-
     fn finish(&self, result: io::Result<()>) {
         *self
             .result
@@ -1177,8 +1127,6 @@ impl Default for Completion {
         Self {
             result: Mutex::new(None),
             changed: Condvar::new(),
-            submission: Mutex::new(None),
-            submission_changed: Condvar::new(),
         }
     }
 }

@@ -407,7 +407,6 @@ class Host(HostKVCache):
         if copies is not None:
             copies.append(copy)
             return
-        copy.submitted()
         copy.wait()
 
     def _create_copy(

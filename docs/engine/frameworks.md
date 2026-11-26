@@ -91,7 +91,7 @@ No NPU measurement establishes the end-to-end performance of these paths.
 
 ### Completion and failures
 
-Callers must retain and await a `Copy` before reusing its host slots or device pages; `Copy.submitted()` confirms runtime submission, not DMA completion. A failed copy poisons the memory it touched, and the engine does not recover that memory. Each framework adapter reports the failure through its native completion path.
+`copy_in` and `copy_out` return after queueing their chunks, without waiting for runtime submission or DMA. Callers must retain and await a `Copy` before reusing its host slots or device pages. A failed copy poisons the memory it touched, and the engine does not recover that memory. Each framework adapter reports the failure through its native completion path.
 
 `Copier.shutdown()` drains submitted copies and joins the workers while releasing the Python GIL. Callers must release every host-slot access lease before shutdown, because an active lease blocks DMA until the access ends.
 

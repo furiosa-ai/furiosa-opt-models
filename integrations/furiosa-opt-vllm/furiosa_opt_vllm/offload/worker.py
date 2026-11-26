@@ -6,8 +6,8 @@
   ranges.
   Six native workers submit two-slot DMA batches, each batching every routed layer into one runtime
   call.
-- Copies return after submission so later device work can queue behind them. `Jobs` keeps each copy
-  until DMA completes and vLLM can reuse its source or destination blocks.
+- Copies return after their chunks enter the engine queue. `Jobs` keeps each copy until DMA
+  completes and vLLM can reuse its source or destination blocks.
 """
 
 from __future__ import annotations
@@ -390,7 +390,6 @@ class Host(OffloadingWorker):
         ]
         pages = [page for _, groups in grouped for page in self.routed_pages(groups)]
         transfer = self.copier.copy_in(pages, self.host_cache, coalesce=True)
-        transfer.submitted()
         self.jobs.submit_batch(
             ((job_id, self._size(groups)) for job_id, groups in grouped),
             (transfer,),
@@ -432,7 +431,6 @@ class Host(OffloadingWorker):
             if store
             else self.copier.copy_in(routed_pages, self.host_cache)
         )
-        transfer.submitted()
         yield transfer
 
     def routed_pages(self, groups: list[GroupWork]) -> list[tuple[int, list[tuple[int, int]]]]:
