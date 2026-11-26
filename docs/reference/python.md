@@ -1,7 +1,7 @@
 # Python reference
 
 The engine is the `furiosa_opt_engine` package, which both plugins install as a dependency.
-This page is generated from its type stubs and grouped by task.
+This page documents the public Python API and groups its symbols by task.
 For a walkthrough, see [Using the engine](../engine/python.md).
 
 ## Load a checkpoint

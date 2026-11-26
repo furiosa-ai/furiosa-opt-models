@@ -115,20 +115,6 @@ class Draft:
         checkpoint = Location(directory, None)
         if target.model is None:
             raise RuntimeError(RELEASED)
-        requested = options.draft_placement
-        placement = (
-            None
-            if requested is None
-            else engine.Placement(list(requested.chips), range(*requested.pes))
-        )
-        try:
-            device = draft_device(
-                target.device,
-                placement,
-                target.model.parallel,
-            )
-        except ValueError as error:
-            raise Refused(DRAFT_PLACEMENT_ENV, str(error)) from None
         try:
             mapped = checkpoint.mapped()
         except (NotImplementedError, ValueError) as error:
@@ -147,6 +133,20 @@ class Draft:
             loads.parse(mapped)
         except (NotImplementedError, ValueError) as error:
             raise Refused("speculative_draft_model_path", str(error)) from error
+        requested = options.draft_placement
+        placement = (
+            None
+            if requested is None
+            else engine.Placement(list(requested.chips), range(*requested.pes))
+        )
+        try:
+            device = draft_device(
+                target.device,
+                placement,
+                target.model.parallel,
+            )
+        except ValueError as error:
+            raise Refused(DRAFT_PLACEMENT_ENV, str(error)) from None
         try:
             draft = Decoder.load(
                 checkpoint,
