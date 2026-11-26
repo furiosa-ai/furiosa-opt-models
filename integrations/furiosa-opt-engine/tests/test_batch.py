@@ -39,9 +39,7 @@ def test_batch_refuses_wrong_framing() -> None:
     assert refused.value.scheduled == 2
 
 
-@pytest.mark.parametrize(
-    ("lengths", "totals"), [((0, 1), (1, 2)), ((-1, 2), (1, 2)), ((1,), (0,))]
-)
+@pytest.mark.parametrize(("lengths", "totals"), [((0, 1), (1, 2)), ((-1, 2), (1, 2)), ((1,), (0,))])
 def test_batch_refuses_invalid_lengths(lengths: tuple[int, ...], totals: tuple[int, ...]) -> None:
     with pytest.raises(batch.Framing):
         _ = batch.Batch.parse([1] * sum(lengths), lengths, totals)

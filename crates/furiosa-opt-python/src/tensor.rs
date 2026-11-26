@@ -1041,7 +1041,20 @@ pub(crate) mod tests {
             let scope = PyDict::new(py);
             scope.set_item("engine", engine).unwrap();
             scope
-                .set_item("device", Py::new(py, Device(context)).unwrap())
+                .set_item(
+                    "device",
+                    Py::new(
+                        py,
+                        Device {
+                            shared: context,
+                            placement: Placement(furiosa_opt_std::Placement {
+                                chips: vec![0],
+                                pes: 0..8,
+                            }),
+                        },
+                    )
+                    .unwrap(),
+                )
                 .unwrap();
             let result = py.run(code, Some(&scope), None);
             // Functions `code` defines hold `scope` as their globals; clearing it breaks that cycle,
