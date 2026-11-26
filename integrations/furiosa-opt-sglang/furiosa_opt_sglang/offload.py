@@ -7,10 +7,9 @@ adapter tracks engine copies so SGLang's native events are recorded only after D
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 from threading import Lock, local
-from typing import TYPE_CHECKING, Final, Protocol, final
+from typing import TYPE_CHECKING, Final, final
 
 import torch
 from sglang.srt.mem_cache.hicache_storage import PoolName
@@ -61,16 +60,6 @@ class _PageKey:
         return self is other or (
             isinstance(other, _PageKey) and self.device == other.device and self.host == other.host
         )
-
-
-class _CopySubmit(Protocol):
-    def __call__(
-        self,
-        pages: Sequence[tuple[int, Sequence[tuple[int, int]]]],
-        host: engine.HostCache,
-        *,
-        coalesce: bool = False,
-    ) -> engine.Copy: ...
 
 
 def _take_coalescing_option(
@@ -256,7 +245,6 @@ class Host(HostKVCache):
         self.host_cache = engine.HostCache(self.copier, self.page_num)
         self._pending_loads: dict[_PageKey, set[int]] = {}
         self._pending_loads_lock = Lock()
-        self._copier_lock = Lock()
         self._copy_batch = local()
         return [self.host_cache]
 
@@ -311,7 +299,7 @@ class Host(HostKVCache):
             (target, [(ENGINE_CACHE_GROUP, source)])
             for source, target in zip(device, host, strict=True)
         ]
-        copy = self._create_copy(self.copier.copy_out, transfers)
+        copy = self.copier.copy_out(transfers, self.host_cache)
         self._submit_copy(copy)
 
     @override
@@ -369,8 +357,8 @@ class Host(HostKVCache):
         if new_copy:
             # SGLang calls once per layer; Copier moves every layer in one page batch.
             try:
-                copy = self._create_copy(
-                    self.copier.copy_in, route.transfers, coalesce=self.coalescing
+                copy = self.copier.copy_in(
+                    route.transfers, self.host_cache, coalesce=self.coalescing
                 )
                 self._submit_copy(copy)
             except BaseException:
@@ -408,19 +396,6 @@ class Host(HostKVCache):
             copies.append(copy)
             return
         copy.wait()
-
-    def _create_copy(
-        self,
-        submit: _CopySubmit,
-        transfers: list[tuple[int, list[tuple[int, int]]]],
-        *,
-        coalesce: bool = False,
-    ) -> engine.Copy:
-        copier_lock = getattr(self, "_copier_lock", None)
-        if copier_lock is None:
-            return submit(transfers, self.host_cache, coalesce=coalesce)
-        with copier_lock:
-            return submit(transfers, self.host_cache, coalesce=coalesce)
 
     @override
     def get_data_page(self, index: int, flat: bool = True) -> torch.Tensor:
