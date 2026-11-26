@@ -3,7 +3,7 @@ blocks a copy to or from host memory moves at once."""
 
 from __future__ import annotations
 
-from itertools import pairwise
+from collections import defaultdict
 from typing import TYPE_CHECKING, Final
 
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
@@ -12,11 +12,44 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheGroupSpec, KVCacheSpec
 
+    import furiosa_opt_engine as engine
 
-# The layouts in which each layer's blocks fill one contiguous range, as a layer's view reads them.
-LAYOUTS: Final = tuple(
-    layout.name for layout in KVCacheLayout if layout.is_layer_compact and layout.is_block_compact
-)
+
+# Preserve each upstream layout name for vLLM's cache layout selection.
+LAYOUTS: Final = tuple(layout.name for layout in KVCacheLayout)
+
+
+def group_indices(
+    cache: engine.decoder.CacheSpec, groups: list[KVCacheGroupSpec]
+) -> dict[int, int]:
+    """Map stable engine group IDs to vLLM's current group order by layer set."""
+    engine_groups: dict[int, set[str]] = defaultdict(set)
+    layer_owner: dict[int, int] = {}
+    for group in cache.groups:
+        for layer_id in group.layers:
+            if layer_id in layer_owner:
+                raise ValueError(f"engine cache layer {layer_id} belongs to multiple groups")
+            layer_owner[layer_id] = group.logical_group
+            engine_groups[group.logical_group].add(f"layers.{layer_id}")
+
+    vllm_groups: dict[frozenset[str], int] = {}
+    for index, group in enumerate(groups):
+        names = frozenset(group.layer_names)
+        if not names or len(names) != len(group.layer_names):
+            raise ValueError(f"vLLM cache group {index} has no layers or duplicate layer names")
+        if names in vllm_groups:
+            raise ValueError("vLLM cache groups contain duplicate layer sets")
+        vllm_groups[names] = index
+
+    if len(engine_groups) != len(vllm_groups):
+        raise ValueError("engine and vLLM cache groups differ")
+    indices: dict[int, int] = {}
+    for engine_group, names in engine_groups.items():
+        index = vllm_groups.get(frozenset(names))
+        if index is None:
+            raise ValueError(f"engine cache group {engine_group} differs from vLLM's layer groups")
+        indices[engine_group] = index
+    return indices
 
 
 def assigned(group: KVCacheGroupSpec, layer: str) -> KVCacheSpec:
@@ -26,18 +59,3 @@ def assigned(group: KVCacheGroupSpec, layer: str) -> KVCacheSpec:
             return specs[layer]
         case shared:
             return shared
-
-
-def runs(device: list[int], host: list[int], chips: int) -> list[tuple[int, int, int]]:
-    """`device` blocks beside the `host` rows they move to or from, as `(block, row, length)`
-    runs that each move in one copy: blocks and rows that both step by one. A copy moves each
-    chip's part of its blocks in turn while a row holds every chip's part of one block, so on more
-    than one chip a run is one block."""
-    starts = [
-        i
-        for i in range(len(device))
-        if i == 0 or chips > 1 or (device[i] - device[i - 1], host[i] - host[i - 1]) != (1, 1)
-    ]
-    return [
-        (device[start], host[start], end - start) for start, end in pairwise([*starts, len(device)])
-    ]

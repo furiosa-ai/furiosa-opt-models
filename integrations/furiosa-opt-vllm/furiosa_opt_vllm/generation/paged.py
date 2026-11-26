@@ -44,6 +44,15 @@ class Feed:
     slots: Mapping[str, int]
 
 
+def storage_group_block_ids(
+    logical_groups: tuple[list[int], ...], engine_group_indices: tuple[int, ...]
+) -> list[list[int]]:
+    """Expand vLLM's one block table per logical group to each engine storage group."""
+    if any(index < 0 or index >= len(logical_groups) for index in engine_group_indices):
+        raise ValueError("engine cache group has no matching vLLM block table")
+    return [logical_groups[index] for index in engine_group_indices]
+
+
 def upload(
     decoder: Decoder, ids: list[int], fed: Mapping[int, tuple[engine.HbmTensor, int]]
 ) -> engine.HbmTensor | None:
@@ -66,7 +75,10 @@ def forward(runner: Runner, entry: Entry, call: Call[str], feed: Feed) -> engine
     requests: list[engine.decoder.Request] = []
     for request in call.requests:
         run = list(request.rows)
-        blocks = runner.requests[request.sequence].block_ids
+        blocks = storage_group_block_ids(
+            runner.requests[request.sequence].block_ids,
+            runner.engine_group_block_table_indices,
+        )
         last = engine.decoder.Keep.LAST if request.complete else engine.decoder.Keep.NONE
         slot = feed.slots.get(request.sequence)
         # Kept rows end a run, so a run kept from its first row returns every row.
