@@ -178,7 +178,8 @@ def copy(
     pages, page, dtype = cache.pages, cache.page_size, cache.dtype
     shape = (2, pages.heads, pages.width)
     if indices.numel() == 0:
-        return torch.empty((0, *shape), dtype=dtype)
+        # Match torch.frombuffer's CPU output even if PyTorch's default device changed.
+        return torch.empty((0, *shape), dtype=dtype, device="cpu")
     # PyTorch's overloads leave the inverse-index form of unique untyped.
     unique = cast("Callable[..., tuple[torch.Tensor, torch.Tensor]]", torch.unique)
     blocks, inverse = unique(indices // page, sorted=True, return_inverse=True)
