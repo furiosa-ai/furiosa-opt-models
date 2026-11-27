@@ -1,7 +1,7 @@
 # Integrating frameworks
 
-A plugin turns each scheduler step into engine requests and returns the rows the framework needs from them.
-This page shows that mapping for vLLM and SGLang; [Using the engine](python.md) introduces requests and the cache.
+A plugin maps framework scheduling and cache policy onto `opt-engine`, which runs model work and owns the shared KV transfer path.
+This page defines that boundary for vLLM and SGLang: request mapping, cache allocation ownership and filesystem offload mechanics. [Using the engine](python.md) documents the Python API; the [serving guide](../serving/index.md) gives launch recipes.
 
 ## Map a scheduled chunk to a request
 
