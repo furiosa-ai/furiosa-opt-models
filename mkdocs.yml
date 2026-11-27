@@ -133,6 +133,7 @@ nav:
       - getting-started/quickstart.md
   - User guide:
       - serving/index.md
+      - serving/disaggregated-kv-transfer.md
       - engine/python.md
       - concepts.md
       - reference/troubleshooting.md
