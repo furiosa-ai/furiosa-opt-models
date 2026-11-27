@@ -73,7 +73,7 @@ class Copier:
     host-slot and device-page lifetimes: before submitting work that reuses either, it must wait
     for the earlier `Copy` to finish. An in-flight device-page overlap raises `BlockingIOError` and
     queues no work; host-slot reuse is serialized by its per-slot gate. A failed copy leaves its
-    device pages unavailable to this copier.
+    device pages unavailable for this copier's lifetime.
     Python serializes queue mutation under the GIL; completions can move to framework worker threads.
     Layer groups are numbered contiguously from zero.
     """
@@ -101,7 +101,7 @@ class Copier:
         `pages` names host slots and their `(group, device_block)` routes. The caller must wait for
         earlier copies before reusing their host slots or device pages. An in-flight device-page
         overlap raises `BlockingIOError`; an overlapping host slot is serialized by its slot gate.
-        A failed copy leaves its device pages unavailable to this copier.
+        A failed copy leaves its device pages unavailable for this copier's lifetime.
         Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
         transient pinned memory for one batched runtime transfer.
         """
@@ -120,7 +120,7 @@ class Copier:
         `pages` names host slots and their `(group, device_block)` routes. The caller must wait for
         earlier copies before reusing their host slots or device pages. An in-flight device-page
         overlap raises `BlockingIOError`; an overlapping host slot is serialized by its slot gate.
-        A failed copy leaves its device pages unavailable to this copier.
+        A failed copy leaves its device pages unavailable for this copier's lifetime.
         Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
         transient pinned memory for one batched runtime transfer.
         """

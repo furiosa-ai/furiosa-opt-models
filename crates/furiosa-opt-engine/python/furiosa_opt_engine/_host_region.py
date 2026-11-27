@@ -128,17 +128,17 @@ class HostRegionRegistrar:
                 self._registered[address] = registered
             if failures:
                 self._retain_until_exit()
-                error = RuntimeError(
+                close_error = RuntimeError(
                     f"failed to unregister {len(failures)} of {region_count} host regions"
                 )
                 for failure in failures:
-                    error.add_note(repr(failure))
+                    close_error.add_note(repr(failure))
                 failures.clear()
                 del failure
                 # The raised traceback keeps this frame alive; drop the bound callback so a later
                 # successful close can release its owner even while the first error is retained.
                 unregister = None
-                raise error
+                raise close_error
             self._register = None
             self._unregister = None
 

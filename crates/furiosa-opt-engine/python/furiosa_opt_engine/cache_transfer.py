@@ -561,7 +561,7 @@ class CacheStagingLease:
 
 class _FreeRun(NamedTuple):
     start: int
-    count: int
+    length: int
 
 
 class _BoundedPageSlots:
@@ -588,10 +588,10 @@ class _BoundedPageSlots:
             first_fit = None
             exact_fit = None
             for index, run in enumerate(self._free_runs):
-                if run.count == page_count:
+                if run.length == page_count:
                     exact_fit = index
                     break
-                if first_fit is None and run.count > page_count:
+                if first_fit is None and run.length > page_count:
                     first_fit = index
             free_index = exact_fit if exact_fit is not None else first_fit
             if free_index is not None:
@@ -602,7 +602,7 @@ class _BoundedPageSlots:
                 else:
                     self._free_runs[free_index] = _FreeRun(start + page_count, count - page_count)
             else:
-                if sum(run.count for run in self._free_runs) < page_count:
+                if sum(run.length for run in self._free_runs) < page_count:
                     return None
                 selected: list[int] = []
                 remaining_runs: list[_FreeRun] = []
@@ -673,11 +673,11 @@ class _BoundedPageSlots:
                 run = returned_runs[returned_index]
                 returned_index += 1
 
-            if merged and merged[-1].start + merged[-1].count > run.start:
+            if merged and merged[-1].start + merged[-1].length > run.start:
                 raise RuntimeError("cache staging free runs overlap")
-            if merged and merged[-1].start + merged[-1].count == run.start:
+            if merged and merged[-1].start + merged[-1].length == run.start:
                 previous = merged[-1]
-                merged[-1] = _FreeRun(previous.start, previous.count + run.count)
+                merged[-1] = _FreeRun(previous.start, previous.length + run.length)
             else:
                 merged.append(run)
         self._free_runs = merged
