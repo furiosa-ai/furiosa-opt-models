@@ -26,6 +26,14 @@ diffusion = [
     "imageio-ffmpeg==0.5.1",
     "omegaconf==2.4.0",
 ]
+nixl = [
+    # SGLang declares no package bound; match the pinned vLLM connector's NIXL requirement.
+    "nixl==1.4.1",
+]
+mooncake = [
+    # vLLM's 0.3.12 minimum is stricter than SGLang's 0.3.4.post2 code-level minimum.
+    "mooncake-transfer-engine-non-cuda>=0.3.12,<0.4.0",
+]
 
 # --8<-- [start:entry-points]
 [project.entry-points."sglang.srt.platforms"]

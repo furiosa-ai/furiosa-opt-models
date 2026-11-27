@@ -26,11 +26,8 @@ import torch
 from typing_extensions import override
 
 from furiosa_opt_vllm.contracts import Contract
-from furiosa_opt_vllm.offloading import (
-    direct_connector_contracts,
-    direct_offloadings,
-    offloading_contracts,
-)
+from furiosa_opt_vllm.offloading import engine_cache, mooncake
+from furiosa_opt_vllm.transfer import TRANSFER
 
 if TYPE_CHECKING:
     from vllm.config import (
@@ -124,6 +121,28 @@ LORA: Final[tuple[tuple[str, Callable[[LoRAConfig], bool], str], ...]] = (
 )
 
 
+def configure_mooncake(config: VllmConfig) -> None:
+    """Pin engine-pinned staging to TCP because Mooncake RDMA cannot register it."""
+    transfer = config.kv_transfer_config
+    if not mooncake(transfer):
+        return
+    assert transfer is not None
+    if config.cache_config.kv_offloading_size is not None:
+        raise Refused(
+            "kv_offloading_size",
+            "does not combine Mooncake disaggregation with a KV offload tier yet",
+        )
+    extra = dict(transfer.kv_connector_extra_config)
+    protocol = extra.get("mooncake_protocol")
+    if protocol not in (None, "tcp"):
+        raise Refused(
+            "kv_transfer_config",
+            "uses Mooncake TCP because RDMA cannot register engine-pinned dma-heap staging",
+        )
+    extra["mooncake_protocol"] = "tcp"
+    transfer.kv_connector_extra_config = extra
+
+
 CONTRACTS: Final = (
     Contract(
         "data_parallel_size",
@@ -148,6 +167,16 @@ CONTRACTS: Final = (
         "pipeline_parallel_size",
         lambda c: c.parallel_config.pipeline_parallel_size == 1,
         "requires pipeline_parallel_size=1",
+    ),
+    Contract(
+        "tensor_parallel_size",
+        lambda c: not mooncake(c.kv_transfer_config) or c.parallel_config.tensor_parallel_size == 1,
+        "requires tensor_parallel_size=1 for the engine's per-page ordering across chips",
+    ),
+    Contract(
+        "kv_transfer_config",
+        lambda c: not mooncake(c.kv_transfer_config) or engine_cache(c.model_config),
+        "connects the attention cache of a decoder, not recurrent state or encoder memory",
     ),
     Contract(
         "prefill_context_parallel_size",
@@ -178,8 +207,10 @@ CONTRACTS: Final = (
         lambda c: not c.aux_output_config.enable_return_routed_experts,
         "returns no routed experts",
     ),
-    *offloading_contracts(direct_offloadings),
-    *direct_connector_contracts(),
+    *(
+        Contract(option=transfer.option, accepts=transfer.accepts, requirement=transfer.requirement)
+        for transfer in TRANSFER
+    ),
     # A consumer needs the checkpoint's language model, which the engine does not serve; of vLLM's
     # connectors, the example one saves a producer's host rows as they are.
     Contract(

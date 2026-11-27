@@ -16,10 +16,16 @@ from furiosa_opt_vllm.admission import (
     CONTRACTS,
     Refused,
     adapters,
-    offload,
+    configure_mooncake,
     options,
     speculative,
     verify_checkpoint,
+)
+from furiosa_opt_vllm.transfer import (
+    CONNECTOR,
+    CONNECTOR_MODULE,
+    configure_nixl,
+    offload,
 )
 
 if TYPE_CHECKING:
@@ -34,7 +40,8 @@ if TYPE_CHECKING:
 
 @final
 class FuriosaPlatform(Platform):
-    """vLLM platform for RNGD: host tensors, the plugin worker and no attention backend."""
+    """vLLM platform for RNGD: host tensors, the plugin worker and an attention backend that only
+    names the engine's cache pages."""
 
     _enum: PlatformEnum = PlatformEnum.OOT
     # vLLM's process groups place their tensors on this torch device; framework tensors are on
@@ -50,9 +57,21 @@ class FuriosaPlatform(Platform):
     @classmethod
     @override
     def pre_register_and_update(cls, parser: FlexibleArgumentParser | None = None) -> None:
+        from vllm.config import KVTransferConfig
+        from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
         from vllm.model_executor.models import ModelRegistry
 
         ModelRegistry.register_model("BambaForCausalLM", "furiosa_opt_vllm.recurrent:Bamba")
+        # vLLM's MultiConnector finds a connector's stats class by its registered name when its
+        # stats arrive serialized; vLLM calls this hook again for each config it creates.
+        try:
+            KVConnectorFactory.register_connector(CONNECTOR, CONNECTOR_MODULE, CONNECTOR)
+        except ValueError:
+            registered = KVConnectorFactory.get_connector_class(
+                KVTransferConfig(kv_connector=CONNECTOR)
+            )
+            if (registered.__module__, registered.__name__) != (CONNECTOR_MODULE, CONNECTOR):
+                raise
 
     @classmethod
     @override
@@ -82,9 +101,11 @@ class FuriosaPlatform(Platform):
                 ),
             ) from None
         offload(vllm_config)
+        configure_mooncake(vllm_config)
         for contract in CONTRACTS:
             if not contract.accepts(vllm_config):
                 raise Refused(contract.option, contract.requirement)
+        configure_nixl(vllm_config)
         _ = speculative(vllm_config, section)
         # One process drives every chip of a replica; vLLM would start a process per rank.
         parallel_config.distributed_executor_backend = "uni"
@@ -126,9 +147,14 @@ class FuriosaPlatform(Platform):
         attn_selector_config: AttentionSelectorConfig,
         num_heads: int | None = None,
     ) -> str:
-        raise NotImplementedError(
-            "furiosa-opt-vllm runs attention inside the extension, so vLLM selects no backend"
-        )
+        # The engine runs attention; vLLM's NIXL connectors read the backend's name.
+        return "furiosa_opt_vllm.connector.Attention"
+
+    @classmethod
+    @override
+    def get_nixl_supported_devices(cls) -> dict[str, tuple[str, ...]]:
+        # NIXL stages blocks in host buffers, between which and the device the runner copies them.
+        return {cls.device_type: ("cpu",)}
 
     @classmethod
     @override

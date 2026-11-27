@@ -1,7 +1,11 @@
 # SGLang options
 
 This page lists the SGLang options the plugin overrides or checks; other options keep SGLang's behavior.
-[Serving](index.md) shows each serving task, and [Integrating frameworks](../engine/frameworks.md#return-the-rows-the-framework-needs) explains which steps take their tokens from the device.
+[Serving](index.md) compares supported features, [Disaggregated KV transfer](disaggregated-kv-transfer.md) gives paired-role recipes, and [Integrating frameworks](../engine/frameworks.md) explains the shared engine data paths.
+
+## Compatibility
+
+The plugin targets SGLang 0.5.22's native manager, receiver and staging APIs. The pinned framework and optional NIXL/Mooncake dependency bounds are declared in `integrations/furiosa-opt-sglang/pyproject.toml`; the [transfer guide](disaggregated-kv-transfer.md#compatibility) owns shared transport constraints and upgrade policy. Recheck upstream lifecycle APIs, then run the SGLang adapter suite in [Testing](../develop/testing.md#run-the-framework-tests) before changing the framework pin.
 
 ## Options
 
@@ -15,7 +19,7 @@ The platform accepts these values:
 | `--device` | Unset or `cpu` (framework tensors stay on the host; the model runs on RNGD) |
 | `--attention-backend`, `--prefill-attention-backend`, `--decode-attention-backend` | Unset or `torch_native` (the engine runs attention) |
 | `startup_weight_load_mode` | `serial` |
-| `disaggregation_mode` | `null` |
+| `disaggregation_mode` | `null`, `prefill` or `decode`; uses `--disaggregation-transfer-backend mooncake_tcp` (Mooncake TCP) or `nixl`, with `SGLANG_DISAGG_STAGING_BUFFER=1` for either backend ([paired-role recipes](disaggregated-kv-transfer.md); [compatibility](#compatibility)) |
 | Attention data, expert, context parallelism (`attn_dp_size`, `ep_size`, `dcp_size`, `attn_cp_size`) and `nnodes` | 1 |
 | `--tp-size` | A chip count the model is compiled for; one scheduler drives every chip, so `/server_info` reports `tp_size` 1 |
 | `--dp-size` | Any, or 1 with speculative decoding; replica `i` runs on the `--tp-size` chips from position `i` × `--tp-size` of `FURIOSA_VISIBLE_CHIPS`, or of every installed chip when it is unset |
@@ -75,6 +79,7 @@ These features are not supported yet, and the plugin refuses them at startup rat
 - Returning hidden states, routed experts or indexer top-k.
 - Diffusion LM algorithms (`dllm_algorithm`) and `prefill_only_disable_kv_cache`.
 - Encoder disaggregation (`--encoder-only`, `--language-only`).
+- With prefill-decode disaggregation: a backend other than `mooncake_tcp` or `nixl` with `SGLANG_DISAGG_STAGING_BUFFER=1` (`fake` moves no KV), a model split over chips, host receive (`--disaggregation-decode-host-receive-threshold` below 1: SGLang receives into a host pool only beside a token pool of separate key and value buffers), decode-side cache offload, which needs a storage backend, KV checksums, which SGLang computes with a CUDA kernel, a `host_pool` retraction backup, which SGLang backs up only from an MHA token pool, and speculative decoding with NIXL.
 
 The platform disables CUDA graphs and piecewise CUDA graphs, and sets the scheduling options by model kind:
 
@@ -87,6 +92,16 @@ The platform disables CUDA graphs and piecewise CUDA graphs, and sets the schedu
 
 A model that keeps recurrent state also requires `mamba_ssm_dtype` unset or `float32` and `mamba_radix_cache_strategy` `auto` or `no_buffer`, and does not support `enable_int8_mamba_checkpoint`, `enable_linear_replayssm` or `enable_linear_replayssm_spec` yet.
 [Integrating frameworks](../engine/frameworks.md#sglang-specifics) explains the overlap schedule and mixed chunks.
+
+## Disaggregated serving
+
+The adapter preserves SGLang's bounded staging ring and transfer-completion lifecycle for NIXL and Mooncake TCP. The prefill side copies each chunk's selected pages into its registered staging region, and decode copies received pages into the device cache before the scheduler publishes or runs the request. Cached prefixes and pages restored from hierarchical cache use the same path. The prefill side pins one chunk per native transfer worker; `SGLANG_DISAGG_STAGING_POOL_SIZE_MB` sets the decode ring size (4096 MiB by default), and SGLang's watermarks control backpressure.
+
+Both roles require the same model, engine chip topology (`--tp-size`) and cache page geometry because the adapter transfers raw engine pages without converting attention-TP layouts. The engine owns the chip topology while SGLang's scheduler metadata remains 1; the adapter preserves the peer's actual TP metadata during chunk transfer. The common pinned-host staging path and its per-chunk DMA cost are described in [Integrating frameworks](../engine/frameworks.md#disaggregated-kv-transfer).
+
+See the [Disaggregated KV transfer guide](disaggregated-kv-transfer.md) for NIXL and Mooncake TCP launch recipes. Decode host receive is not enabled; received pages land in the engine cache after transfer completion. Filesystem HiCache remains a separate tier with separate host buffers, so a page may also be copied for the L3 tier when both are enabled. HiCache does not reuse the transfer ring's transient staging regions.
+
+SGLang's early send of a cached prefix records a CUDA event. Prefill roles and servers started with `--enable-pd-role-switch` use non-overlap scheduling. Retraction with `/pause_generation` can receive pages again; memory retraction restores from the decode server's host backup. If the post-transfer device-cache copy fails, the adapter uses SGLang's native failed-transfer path so the request is aborted and its cache rows are released. The memory saver, hierarchical cache on both roles, decode-side radix cache, data-parallel replicas, STANDALONE speculative decoding and role switching work with disaggregation; startup refusals are listed in [Options](#options).
 
 ## Speculative decoding
 

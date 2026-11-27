@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Final
 
 from pydantic import TypeAdapter
 from vllm import envs
@@ -18,14 +18,15 @@ if TYPE_CHECKING:
 # The connector selected for vLLM's native host and filesystem offloading.
 CONNECTOR: Final = "RNGDOffloadingConnector"
 CONNECTOR_MODULE: Final = "furiosa_opt_vllm.offload"
+MOONCAKE_CONNECTOR: Final = "FuriosaMooncakeConnector"
+MOONCAKE_MODULE: Final = "furiosa_opt_vllm.mooncake"
 
 
 @dataclass(frozen=True, slots=True)
 class Offloading:
-    """The supported spec and load failure policy of one offload connector."""
+    """The supported vLLM offloading spec."""
 
     supported_spec: bool
-    load_failure_policy: Literal["recompute", "fail"]
 
     @classmethod
     def of(cls, transfer: KVTransferConfig) -> Offloading:
@@ -39,10 +40,7 @@ class Offloading:
             (spec_name == "CPUOffloadingSpec" and not secondary_tiers)
             or spec_name == "TieringOffloadingSpec"
         )
-        return cls(
-            supported_spec=supported_spec,
-            load_failure_policy=transfer.kv_load_failure_policy,
-        )
+        return cls(supported_spec=supported_spec)
 
 
 def offloading(config: VllmConfig) -> Offloading | None:
@@ -51,6 +49,14 @@ def offloading(config: VllmConfig) -> Offloading | None:
     if transfer is None or transfer.kv_connector != CONNECTOR:
         return None
     return Offloading.of(transfer)
+
+
+def mooncake(transfer: KVTransferConfig | None) -> bool:
+    """Whether `transfer` selects this plugin's host-image adapter for vLLM Mooncake."""
+    return transfer is not None and (
+        transfer.kv_connector == MOONCAKE_CONNECTOR
+        and transfer.kv_connector_module_path == MOONCAKE_MODULE
+    )
 
 
 def direct_offloadings(config: VllmConfig) -> tuple[Offloading, ...]:
@@ -144,13 +150,6 @@ def offloading_contracts(
             + "secondary_tiers are configured",
         ),
         Contract(
-            "kv_load_failure_policy",
-            lambda config: all(
-                settings.load_failure_policy == "fail" for settings in settings_for(config)
-            ),
-            "stops the engine when an offloaded block fails to copy: kv_load_failure_policy=fail",
-        ),
-        Contract(
             "pipeline_parallel_size",
             lambda config: (
                 not settings_for(config) or config.parallel_config.pipeline_parallel_size == 1
@@ -196,9 +195,13 @@ def direct_connector_contracts() -> tuple[Contract, ...]:
 
     def direct_offloading(config: VllmConfig) -> bool:
         transfer = config.kv_transfer_config
-        return transfer is None or (
-            transfer.kv_connector == CONNECTOR
-            and transfer.kv_connector_module_path == CONNECTOR_MODULE
+        return (
+            transfer is None
+            or (
+                transfer.kv_connector == CONNECTOR
+                and transfer.kv_connector_module_path == CONNECTOR_MODULE
+            )
+            or mooncake(transfer)
         )
 
     return (
@@ -214,6 +217,7 @@ def direct_connector_contracts() -> tuple[Contract, ...]:
         Contract(
             "kv_transfer_config",
             direct_offloading,
-            f"serves no KV connector but {CONNECTOR}, which --kv-offloading-size selects",
+            f"serves no KV connector but {CONNECTOR}, which --kv-offloading-size selects, and "
+            f"{MOONCAKE_CONNECTOR}, which stages the engine cache in host memory",
         ),
     )

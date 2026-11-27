@@ -2,18 +2,63 @@
 inference takes, its response encoder, its host-pool strategy, and each SGLang function it replaces
 or precedes, beside the reason."""
 
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import cast
+
+
+def select_transfer_manager(
+    original: Callable[..., object], transfer_backend: object, class_type: object
+) -> object:
+    """Select engine adapters while retaining SGLang's native transfer backend."""
+    result = original(transfer_backend, class_type)
+    backend = getattr(transfer_backend, "value", None)
+    kind = getattr(class_type, "value", None)
+    if backend == "nixl":
+        from furiosa_opt_sglang.nixl import FuriosaNixlKVManager, FuriosaNixlKVReceiver
+
+        return {"manager": FuriosaNixlKVManager, "receiver": FuriosaNixlKVReceiver}.get(
+            kind, result
+        )
+    if backend == "mooncake":
+        from furiosa_opt_sglang.mooncake import (
+            FuriosaMooncakeKVManager,
+            FuriosaMooncakeKVReceiver,
+        )
+
+        return {"manager": FuriosaMooncakeKVManager, "receiver": FuriosaMooncakeKVReceiver}.get(
+            kind, result
+        )
+    return result
+
+
+def attach_transfer_manager(
+    original: Callable[..., object], owner: object, *args: object, **kwargs: object
+) -> object:
+    """Attach the engine cache after either native transfer manager initializes."""
+    manager = original(owner, *args, **kwargs)
+    from furiosa_opt_sglang.cache import Cache
+    from furiosa_opt_sglang.mooncake import FuriosaMooncakeKVManager
+    from furiosa_opt_sglang.nixl import FuriosaNixlKVManager
+
+    if isinstance(manager, (FuriosaNixlKVManager, FuriosaMooncakeKVManager)):
+        cache = getattr(owner, "token_to_kv_pool", None)
+        if not isinstance(cache, Cache):
+            raise TypeError("SGLang transfer adapter requires the engine-owned token cache")
+        manager.attach_cache(cache)
+    return manager
+
 
 def register() -> None:
     """Register extensions before SGLang starts its workers."""
-    from collections.abc import Callable
-    from typing import cast
-
     import torch
     from fastapi.encoders import ENCODERS_BY_TYPE
     from sglang.srt.configs.linear_attn_model_registry import (
         LinearAttnModelSpec,
         register_linear_attn_model,
     )
+    from sglang.srt.disaggregation.base.conn import DisaggregationMode
     from sglang.srt.managers.io_struct import (
         ReleaseMemoryOccupationReqInput,
         ReleaseMemoryOccupationReqOutput,
@@ -41,6 +86,7 @@ def register() -> None:
     from furiosa_opt_sglang.request import render, validate_request
     from furiosa_opt_sglang.residency import release, resume
     from furiosa_opt_sglang.runner import Module
+    from furiosa_opt_sglang.staging import EngineDecodeStagingHandler
     from furiosa_opt_sglang.worker import Worker
 
     def unbound(*, device: str) -> None:
@@ -75,19 +121,63 @@ def register() -> None:
         # SGLang leaves the updater's worker untyped; the plugin replaces SGLang's worker.
         return cast("Worker", updater.tp_worker).runner.model
 
+    def transfer_managers(updater: SchedulerWeightUpdaterManager) -> tuple[object, ...]:
+        """Read the same active queues SGLang releases and resumes for the current P/D role."""
+        scheduler = updater.scheduler
+        if scheduler is None:
+            return ()
+        match scheduler.disaggregation_mode:
+            case DisaggregationMode.DECODE:
+                queue_names = ("disagg_decode_transfer_queue", "disagg_decode_prealloc_queue")
+            case DisaggregationMode.PREFILL:
+                queue_names = ("disagg_prefill_bootstrap_queue",)
+            case _:
+                return ()
+
+        managers = []
+        seen = set()
+        for name in queue_names:
+            queue = getattr(scheduler, name, None)
+            manager = getattr(queue, "kv_manager", None)
+            if manager is not None and id(manager) not in seen:
+                seen.add(id(manager))
+                managers.append(manager)
+        return tuple(managers)
+
+    def check_transfer_staging(
+        updater: SchedulerWeightUpdaterManager, request: ReleaseMemoryOccupationReqInput
+    ) -> None:
+        """Keep upstream release untouched while an adapter still owns staging leases."""
+        tags = request.tags
+        if tags and "kv_cache" not in tags:
+            return
+        for transfer_manager in transfer_managers(updater):
+            check = getattr(transfer_manager, "ensure_staging_quiescent", None)
+            if check is not None:
+                check()
+
     def released(
         _result: ReleaseMemoryOccupationReqOutput,
         updater: SchedulerWeightUpdaterManager,
         request: ReleaseMemoryOccupationReqInput,
     ) -> None:
-        release(module(updater), request.tags, updater.flush_cache)
+        release(
+            module(updater),
+            request.tags,
+            updater.flush_cache,
+            transfer_managers=transfer_managers(updater),
+        )
 
     def resumed(
         _result: ResumeMemoryOccupationReqOutput,
         updater: SchedulerWeightUpdaterManager,
         request: ResumeMemoryOccupationReqInput,
     ) -> None:
-        resume(module(updater), request.tags)
+        resume(
+            module(updater),
+            request.tags,
+            transfer_managers=transfer_managers(updater),
+        )
 
     # SGLang stacks pooled tensors before HTTP serialization and exposes no response encoder hook.
     ENCODERS_BY_TYPE[torch.Tensor] = cast(
@@ -127,6 +217,32 @@ def register() -> None:
 
     manager = f"{SchedulerWeightUpdaterManager.__module__}.{SchedulerWeightUpdaterManager.__name__}"
     for target, kind, function in (
+        # Keep native sender/receiver protocols, routing engine KV through bounded staging.
+        (
+            "sglang.srt.disaggregation.decode.get_kv_class",
+            HookType.AROUND,
+            select_transfer_manager,
+        ),
+        (
+            "sglang.srt.disaggregation.prefill.get_kv_class",
+            HookType.AROUND,
+            select_transfer_manager,
+        ),
+        (
+            "sglang.srt.disaggregation.decode.DecodeTransferQueue._init_kv_manager",
+            HookType.AROUND,
+            attach_transfer_manager,
+        ),
+        (
+            "sglang.srt.disaggregation.prefill.PrefillBootstrapQueue._init_kv_manager",
+            HookType.AROUND,
+            attach_transfer_manager,
+        ),
+        (
+            "sglang.srt.disaggregation.common.staging_handler.DecodeStagingHandler",
+            HookType.REPLACE,
+            EngineDecodeStagingHandler,
+        ),
         # The engine executes the scheduled batches.
         ("sglang.srt.managers.tp_worker.TpModelWorker", HookType.REPLACE, Worker),
         # SGLang's speculative workers run torch draft models; the engine drafts and verifies.
@@ -162,6 +278,7 @@ def register() -> None:
             saver,
         ),
         # Releasing and resuming memory by tag move the engine's weights and cache storage.
+        (f"{manager}.release_memory_occupation", HookType.BEFORE, check_transfer_staging),
         (f"{manager}.release_memory_occupation", HookType.AFTER, released),
         (f"{manager}.resume_memory_occupation", HookType.AFTER, resumed),
         # Watermarking keeps every other check SGLang makes of its options.

@@ -70,6 +70,10 @@ jobs:
       # SGLang pins a pre-release dependency, which uv resolves only when allowed.
       - if: matrix.framework == 'sglang'
         run: uv pip install --prerelease=allow products/furiosa_opt_{engine,sglang}-*.whl pytest
+      # Run shared host-transfer helper tests once against the installed engine wheel.
+      - if: matrix.framework == 'vllm'
+        working-directory: ${{ runner.temp }}
+        run: pytest -p no:cacheprovider "$GITHUB_WORKSPACE/integrations/furiosa-opt-engine/tests"
       # Run outside the checkout so the installed wheel, not the source package, is imported.
       - working-directory: ${{ runner.temp }}
         run: pytest -p no:cacheprovider "$GITHUB_WORKSPACE/integrations/furiosa-opt-$FRAMEWORK/tests"

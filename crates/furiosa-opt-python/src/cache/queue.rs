@@ -34,12 +34,26 @@ pub(super) struct Core {
 pub(super) struct Pool {
     pub(super) slots: Vec<Slot>,
     pub(super) block_bytes: usize,
+    pub(super) layer_offsets: Vec<Option<usize>>,
+    pub(super) included_groups: Vec<bool>,
     pub(super) core: Weak<Core>,
     // Backed slots are ranges in this single pool-owned allocation.
     pub(super) backing: Option<HostBacking>,
 }
 
 impl Pool {
+    pub(super) fn includes_group(&self, group: usize) -> bool {
+        self.included_groups.get(group).copied().unwrap_or(false)
+    }
+
+    pub(super) fn layer_offset(&self, layer: usize) -> io::Result<usize> {
+        self.layer_offsets
+            .get(layer)
+            .copied()
+            .flatten()
+            .ok_or_else(|| io::Error::other("host cache does not include routed layer"))
+    }
+
     pub(super) fn backing(&self) -> Option<&HostBacking> {
         self.backing.as_ref()
     }
@@ -555,12 +569,12 @@ impl Chunk {
                     .page_bytes
                     .checked_mul(core.chips)
                     .ok_or_else(|| io::Error::other("host page size overflows"))?;
-                let end = layer
-                    .host_offset
+                let offset = self.pool.layer_offset(layer_id)?;
+                let end = offset
                     .checked_add(length)
                     .ok_or_else(|| io::Error::other("host page end overflows"))?;
                 let source = hosts[page_index]
-                    .slice(layer.host_offset..end)
+                    .slice(offset..end)
                     .map_err(io::Error::other)?;
                 let destination = destination.slice_mut(.., ..).map_err(io::Error::other)?;
                 pairs.push((source, destination));
@@ -578,7 +592,7 @@ impl Chunk {
                         break;
                     }
                     let layer = &core.layers[layer_id];
-                    let offset = layer.host_offset;
+                    let offset = self.pool.layer_offset(layer_id)?;
                     let length = layer
                         .page_bytes
                         .checked_mul(core.chips)
@@ -639,7 +653,7 @@ impl Chunk {
                         backing.slot_range(self.pages[page_index].slot, self.pool.block_bytes)?;
                     let start = slot_range
                         .start
-                        .checked_add(layer.host_offset)
+                        .checked_add(self.pool.layer_offset(layer_id)?)
                         .ok_or_else(|| io::Error::other("host layer offset overflows"))?;
                     let length = layer
                         .page_bytes
@@ -673,7 +687,7 @@ impl Chunk {
                         backing.slot_range(self.pages[page_index].slot, self.pool.block_bytes)?;
                     let start = slot_range
                         .start
-                        .checked_add(layer.host_offset)
+                        .checked_add(self.pool.layer_offset(layer_id)?)
                         .ok_or_else(|| io::Error::other("host layer offset overflows"))?;
                     let length = layer
                         .page_bytes
@@ -722,19 +736,21 @@ impl Chunk {
         for (page_index, page) in self.pages.iter().enumerate() {
             for &(group, block) in &page.routes {
                 for &layer_id in &core.groups[group] {
-                    page_layers.push((page_index, block, layer_id));
+                    page_layers.push((
+                        page_index,
+                        block,
+                        layer_id,
+                        self.pool.layer_offset(layer_id)?,
+                    ));
                 }
             }
         }
-        page_layers.sort_unstable_by_key(|&(page_index, _, layer_id)| {
-            (
-                self.pages[page_index].slot,
-                core.layers[layer_id].host_offset,
-            )
+        page_layers.sort_unstable_by_key(|&(page_index, _, _, host_offset)| {
+            (self.pages[page_index].slot, host_offset)
         });
 
         let mut aliases = Vec::with_capacity(route_count);
-        for &(_, block, layer_id) in &page_layers {
+        for &(_, block, layer_id, _) in &page_layers {
             let layer = &core.layers[layer_id];
             let start = usize::try_from(block)
                 .map_err(io::Error::other)?
@@ -745,7 +761,13 @@ impl Chunk {
                 .ok_or_else(|| io::Error::other("device page end overflows"))?;
             aliases.push(layer.buffer.alias(start..end).map_err(io::Error::other)?);
         }
-        Ok((page_layers, aliases))
+        Ok((
+            page_layers
+                .into_iter()
+                .map(|(page, block, layer, _)| (page, block, layer))
+                .collect(),
+            aliases,
+        ))
     }
 
     fn transfer_coalesced(
@@ -757,9 +779,10 @@ impl Chunk {
         let layers = core
             .layers
             .iter()
-            .map(|layer| staging::LayerLayout {
+            .enumerate()
+            .map(|(index, layer)| staging::LayerLayout {
                 page_bytes: layer.page_bytes,
-                host_offset: layer.host_offset,
+                host_offset: self.pool.layer_offsets[index],
             })
             .collect::<Vec<_>>();
         let mut layout = staging::Layout::new(&self.pages, &core.groups, &layers, self.loading)?;
@@ -1199,6 +1222,8 @@ mod tests {
         let pool = Arc::new(Pool {
             slots: Vec::new(),
             block_bytes: 0,
+            layer_offsets: Vec::new(),
+            included_groups: Vec::new(),
             core: Weak::new(),
             backing: None,
         });
@@ -1251,6 +1276,8 @@ mod tests {
         let pool = Arc::new(Pool {
             slots: Vec::new(),
             block_bytes: 0,
+            layer_offsets: Vec::new(),
+            included_groups: Vec::new(),
             core: Weak::new(),
             backing: None,
         });

@@ -286,7 +286,8 @@ def copy_blocks() -> None:
     from transformers import AutoConfig
 
     import furiosa_opt_engine as engine
-    from furiosa_opt_sglang.cache import Cache, Pages
+    from furiosa_opt_sglang.cache import Cache
+    from furiosa_opt_sglang.cache.pages import Pages
     from furiosa_opt_sglang.decoder import PES, Decoder, Location, chips
 
     # Hub overloads include untyped progress and user-agent parameters.
@@ -325,7 +326,8 @@ def follow_layout() -> None:
     from transformers import AutoConfig, AutoTokenizer
 
     import furiosa_opt_engine as engine
-    from furiosa_opt_sglang.cache import Cache, Pages
+    from furiosa_opt_sglang.cache import Cache
+    from furiosa_opt_sglang.cache.pages import Pages
     from furiosa_opt_sglang.decoder import PES, Decoder, Location, chips
 
     # Hub overloads include untyped progress and user-agent parameters.

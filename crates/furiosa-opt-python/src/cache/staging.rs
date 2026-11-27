@@ -10,8 +10,8 @@ use super::queue::TransferPage;
 pub(super) struct LayerLayout {
     /// Bytes in one layer page on one chip.
     pub(super) page_bytes: usize,
-    /// Byte offset of this layer's page in the host slot.
-    pub(super) host_offset: usize,
+    /// Byte offset in the host slot, or `None` when the pool excludes this layer.
+    pub(super) host_offset: Option<usize>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -128,7 +128,10 @@ impl Layout {
                     let layout = layers
                         .get(layer)
                         .ok_or_else(|| io::Error::other("cache staging names an unknown layer"))?;
-                    routes.push((layout.host_offset, layer, block, page, layout.page_bytes));
+                    let host_offset = layout.host_offset.ok_or_else(|| {
+                        io::Error::other("host cache does not include routed layer")
+                    })?;
+                    routes.push((host_offset, layer, block, page, layout.page_bytes));
                 }
             }
         }
@@ -146,7 +149,7 @@ impl Layout {
         let mut bytes = 0usize;
         let mut items = Vec::with_capacity(routes.len());
         let mut segments: Vec<Segment> = Vec::new();
-        for (_, layer, block, page, page_bytes) in routes {
+        for (host_offset, layer, block, page, page_bytes) in routes {
             let end = bytes
                 .checked_add(page_bytes)
                 .ok_or_else(|| io::Error::other("cache staging size overflows"))?;
@@ -161,7 +164,7 @@ impl Layout {
                 page,
                 layer,
                 page_bytes,
-                host_offset: layers[layer].host_offset,
+                host_offset,
                 stage: bytes..end,
             };
             match segments.last_mut() {
@@ -211,11 +214,11 @@ mod tests {
         let layers = [
             LayerLayout {
                 page_bytes: 4,
-                host_offset: 0,
+                host_offset: Some(0),
             },
             LayerLayout {
                 page_bytes: 8,
-                host_offset: 16,
+                host_offset: Some(16),
             },
         ];
 
@@ -283,7 +286,7 @@ mod tests {
             &[vec![0]],
             &[LayerLayout {
                 page_bytes: 8,
-                host_offset: 0,
+                host_offset: Some(0),
             }],
             true,
         )
@@ -313,11 +316,11 @@ mod tests {
             &[
                 LayerLayout {
                     page_bytes: 2,
-                    host_offset: 0,
+                    host_offset: Some(0),
                 },
                 LayerLayout {
                     page_bytes: 2,
-                    host_offset: 4,
+                    host_offset: Some(4),
                 },
             ],
             true,
@@ -374,7 +377,7 @@ mod tests {
             &[vec![0]],
             &[LayerLayout {
                 page_bytes: 4,
-                host_offset: 0,
+                host_offset: Some(0),
             }],
             true,
         )

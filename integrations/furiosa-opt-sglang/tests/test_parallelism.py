@@ -81,7 +81,7 @@ def test_refuses_speculation() -> None:
     """Data-parallel replicas with speculative decoding are refused by name and reason."""
     from sglang.srt.server_args import prepare_server_args
 
-    from furiosa_opt_sglang.platform import Refused
+    from furiosa_opt_sglang.admission import Refused
 
     flags = ["--dp-size", "2", "--speculative-algorithm", "NGRAM"]
     flags += ["--speculative-ngram-max-bfs-breadth", "1"]

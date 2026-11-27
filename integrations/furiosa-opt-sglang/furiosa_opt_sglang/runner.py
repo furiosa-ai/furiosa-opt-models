@@ -15,10 +15,10 @@ from typing_extensions import override
 
 import furiosa_opt_engine as engine
 from furiosa_opt_sglang import load
+from furiosa_opt_sglang.admission import Ngram, Refused, Speculations, Standalone
 from furiosa_opt_sglang.cache import Attention
 from furiosa_opt_sglang.decoder import Decoder
 from furiosa_opt_sglang.generation.model import Model
-from furiosa_opt_sglang.platform import Ngram, Refused, Speculations, Standalone
 from furiosa_opt_sglang.speculative import Speculative
 from furiosa_opt_sglang.speculative.ngram import Corpus
 from furiosa_opt_sglang.speculative.standalone import Draft

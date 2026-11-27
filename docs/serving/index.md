@@ -3,8 +3,8 @@
 # Serving
 
 The serving plugins expose model functions through their frameworks' Python and HTTP APIs, and the model computation runs on RNGD.
-This page is the task guide: it compares feature support and gives recipes for each supported framework; the tabs switch together.
-The [vLLM](vllm.md) and [SGLang](sglang.md) pages are configuration references for accepted options and startup refusals.
+This page compares feature support and gives recipes for common serving tasks; the tabs switch together.
+The [disaggregated KV transfer guide](disaggregated-kv-transfer.md) owns NIXL and Mooncake role-pairing recipes, shared dependency constraints and upgrade checks. The [vLLM](vllm.md) and [SGLang](sglang.md) references own framework options, compatibility and startup refusals. [Integrating frameworks](../engine/frameworks.md) explains shared engine data paths.
 Install a plugin first ([Installation](../getting-started/installation.md)); [Quickstart](../getting-started/quickstart.md) shows text generation.
 
 ## Feature support
@@ -35,7 +35,7 @@ Install a plugin first ([Installation](../getting-started/installation.md)); [Qu
 | Data parallelism | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Run data-parallel replicas](#run-data-parallel-replicas) |
 | Pipeline, expert and context parallelism | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | LoRA | <span class="support support-yes">Supported</span> | <span class="support support-no">Not yet</span> | [Serve LoRA adapters](#serve-lora-adapters) |
-| Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache) | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
+| Disaggregated prefill and KV transfer | <span class="support support-yes">Supported</span> (NIXL and Mooncake TCP) | <span class="support support-yes">Supported</span> (NIXL and Mooncake TCP) | [Disaggregated KV transfer](disaggregated-kv-transfer.md) |
 | Disaggregated encoder and encoder caches | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Per-request metrics | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Report per-request metrics](#report-per-request-metrics) |
 | Batch invariance | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Keep outputs independent of the batch](#keep-outputs-independent-of-the-batch) |
@@ -386,4 +386,4 @@ Why each feature is not served yet:
 - **Online quantization** with SGLang, and with vLLM any method but `fp8_per_tensor`: the other methods quantize the activations too or use other formats, and the SGLang plugin passes no quantization to the load.
 - **Tensor, pipeline, expert and context parallelism**, and serving across nodes: each served checkpoint runs on one chip.
 - **LoRA with SGLang**: `--enable-lora` and `--lora-paths` are refused; the SGLang plugin runs no adapter yet.
-- **Disaggregated prefill, KV connectors and a disaggregated encoder**: no cache row moves to another instance, and of a disaggregated encoder only the [encoder-only instance](#embed-media-on-an-encoder-only-instance) runs.
+- **Disaggregated prefill with another transport, or disaggregated encoder/cache**: the [transfer guide](disaggregated-kv-transfer.md) covers NIXL and Mooncake TCP; the encoder plugin supports only a standalone [encoder-only instance](#embed-media-on-an-encoder-only-instance).

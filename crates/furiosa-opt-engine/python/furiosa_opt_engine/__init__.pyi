@@ -453,18 +453,25 @@ class HostCache:
     r"""
     A pool of page-locked host pages for device transfers and external host I/O. Multiple pools can
     share one copier when consumers need independent capacities or lifetimes. Without `backing`,
-    slots are separately allocated. A supplied backing aliases one contiguous page-major region.
+    slots are separately allocated. `layers`, when supplied, packs those complete cache groups in
+    selection order. A supplied backing aliases one contiguous page-major region.
     """
     def __new__(
-        cls, copier: Copier, slots: builtins.int, *, backing: HostBuffer | None = None
+        cls,
+        copier: Copier,
+        slots: builtins.int,
+        *,
+        backing: HostBuffer | None = None,
+        layers: typing.Sequence[builtins.int] | None = None,
     ) -> HostCache:
         r"""
         Allocate one pinned host-page pool for this copier. Other pools may share the copier; their
         slot indices and access gates are independent, while device-page reservations are shared.
-        `backing`, when supplied, must be a pinned buffer of exactly `slots` times one host block's
-        size. The pool retains that allocation and presents each host block as one slot. Before
-        reusing this backing for a replacement pool, shut down its old copier and finish all copies
-        and `HostSlot.access()` leases; distinct pools over one backing have independent slot gates.
+        Each slot covers the full host block by default. `layers` selects complete cache groups and
+        packs them into each slot in selection order. A supplied `backing` must be pinned and have
+        exactly `slots` times the resulting slot size. Before reusing it for a replacement pool,
+        shut down the old copier and finish all copies and `HostSlot.access()` leases; distinct
+        pools over one backing have independent slot gates.
         """
     def _backing_buffer(self) -> HostBuffer:
         r"""

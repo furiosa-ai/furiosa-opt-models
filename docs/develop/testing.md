@@ -2,7 +2,7 @@
 {%- set served = benchmarks.models | selectattr("tier", "equalto", "gate") | selectattr("task", "equalto", "text") | first -%}
 # Testing and benchmarking
 
-Test a model and run the framework tests. You need an RNGD device, `uv` (fixtures download checkpoints with it) and `cargo-furiosa-opt` on your `PATH`; see [Installation](../getting-started/installation.md).
+Model and framework test fixtures use `uv` to download checkpoints. Model tests also need `cargo-furiosa-opt` on `PATH`; see [Installation](../getting-started/installation.md).
 
 ## Test a model
 
@@ -23,7 +23,7 @@ A gated checkpoint needs the token that `hf auth login` stores there.
 
 ## Run the framework tests
 
-Install a plugin as in [Installation](../getting-started/installation.md), the vLLM plugin with its `omni` extra, then run its tests on RNGD ([what they check](../design/testing.md)):
+Framework adapter suites require RNGD. Install the relevant plugin as in [Installation](../getting-started/installation.md), with the vLLM `omni` extra, then run its tests ([what they check](../design/testing.md)):
 
 ```bash
 python -m pytest integrations/furiosa-opt-vllm/tests    # vLLM
@@ -31,6 +31,16 @@ python -m pytest integrations/furiosa-opt-sglang/tests  # SGLang
 ```
 
 A test that compares with [reference outputs](#reference-outputs) reads them from [`FURIOSA_OPT_REFERENCES`](../reference/environment.md#tests).
+
+## Run shared host-transfer tests
+
+These tests cover engine transfer helpers and do not exercise RNGD kernels. Install either serving plugin to provide the engine package, then run:
+
+```bash
+python -m pytest integrations/furiosa-opt-engine/tests
+```
+
+The nightly contract job runs the shared suite once against the installed engine wheel and runs each framework suite in a separate RNGD environment.
 
 ## Reference outputs
 

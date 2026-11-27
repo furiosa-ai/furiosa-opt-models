@@ -14,7 +14,7 @@ loads or allocates it again.
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 import furiosa_opt_engine as engine
 from furiosa_opt_vllm.admission import Refused
@@ -42,6 +42,13 @@ def decoder(runner: Runner) -> Decoder:
             raise NotImplementedError("sleep mode moves the memory of a decoder only")
 
 
+def cache(runner: Runner) -> engine.decoder.Cache:
+    """The KV cache the runner holds now, which sleep mode releases and waking allocates anew."""
+    if runner.cache is None:
+        raise RuntimeError("wake_up must restore the KV cache before its blocks move")
+    return runner.cache
+
+
 def sleep(runner: Runner, level: int) -> None:
     """Release the weights and the KV cache; level 1 keeps the weights' copy."""
     release(runner, TAGS, decoder(runner).copy if level == 1 else None)
@@ -65,7 +72,9 @@ def release(runner: Runner, tags: Collection[str], copy: engine.Checkpoint | Non
             case "kv_cache":
                 if runner.cache is None:
                     raise RuntimeError("initialize_kv_cache must precede sleep mode")
-                runner.asleep[tag] = Storage(runner.cache.spec, runner.cache.blocks)
+                cache = runner.cache
+                _release_furiosa_cache_connectors(cache)
+                runner.asleep[tag] = Storage(cache.spec, cache.blocks)
                 runner.cache = None
 
 
@@ -80,10 +89,63 @@ def wake_up(runner: Runner, tags: Collection[str] | None) -> None:
                 copy = released.checkpoint.mapped().read() if copy is None else copy
                 runner.model = replace(released, copy=copy).loaded(copy)
             case Storage(spec, blocks):
-                runner.cache = engine.decoder.Cache(spec, blocks)
+                if runner.cache is None:
+                    runner.cache = engine.decoder.Cache(spec, blocks)
+                _restore_furiosa_cache_connectors(runner.cache)
             case None:
                 continue
         del runner.asleep[tag]
+
+
+def _cache_connectors() -> list[Any]:
+    from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+
+    if not has_kv_transfer_group():
+        return []
+    from furiosa_opt_vllm.model_runner import leaves
+
+    return leaves(get_kv_transfer_group())
+
+
+def _cache_connector_hooks() -> list[tuple[Any, Any]]:
+    hooks = []
+    for connector in _cache_connectors():
+        release_cache = getattr(connector, "_release_furiosa_engine_cache", None)
+        restore_cache = getattr(connector, "_restore_furiosa_engine_cache", None)
+        if release_cache is None and restore_cache is None:
+            continue
+        if not callable(release_cache) or not callable(restore_cache):
+            raise TypeError(
+                "Furiosa cache connectors must implement release and restore hooks together"
+            )
+        hooks.append((release_cache, restore_cache))
+    return hooks
+
+
+def _release_furiosa_cache_connectors(cache: engine.decoder.Cache) -> None:
+    attempted = []
+    try:
+        for release_cache, restore_cache in _cache_connector_hooks():
+            attempted.append(restore_cache)
+            release_cache(cache)
+    except BaseException as release_error:
+        restore_errors = []
+        for restore_cache in reversed(attempted):
+            try:
+                restore_cache(cache)
+            except BaseException as error:
+                restore_errors.append(error)
+        if restore_errors:
+            raise BaseExceptionGroup(
+                "connector cache release and rollback failed",
+                [release_error, *restore_errors],
+            ) from None
+        raise
+
+
+def _restore_furiosa_cache_connectors(cache: engine.decoder.Cache) -> None:
+    for _, restore_cache in _cache_connector_hooks():
+        restore_cache(cache)
 
 
 def reload(runner: Runner) -> None:

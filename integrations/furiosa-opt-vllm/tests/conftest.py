@@ -28,7 +28,7 @@ from vllm.config.cache import CacheDType
 from vllm.config.model import ConvertOption, ModelDType, RunnerOption
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Generator, Mapping
     from http.client import HTTPResponse
 
     import torch
@@ -187,9 +187,13 @@ def server(
 
 
 @contextmanager
-def serve(arguments: list[str], tmp_path_factory: pytest.TempPathFactory) -> Generator[str]:
-    """The URL of `vllm serve` with `arguments`, until it and every process it started exited, so
-    that a server started next finds the chips free."""
+def serve(
+    arguments: list[str],
+    tmp_path_factory: pytest.TempPathFactory,
+    env: Mapping[str, str] | None = None,
+) -> Generator[str]:
+    """The URL of `vllm serve` with `arguments` and `env` over this process's environment, until
+    it and every process it started exited, so that a server started next finds the chips free."""
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port: int = probe.getsockname()[1]
@@ -200,6 +204,7 @@ def serve(arguments: list[str], tmp_path_factory: pytest.TempPathFactory) -> Gen
             ["vllm", "serve", *arguments, "--port", str(port)],
             stdout=output,
             stderr=subprocess.STDOUT,
+            env=os.environ | dict(env or {}),
             process_group=0,
         )
     url = f"http://127.0.0.1:{port}"
@@ -250,11 +255,15 @@ def stop(process: subprocess.Popen[bytes], timeout: float) -> None:
     raise TimeoutError(f"processes of group {process.pid} outlived SIGKILL by {timeout} s")
 
 
-def post(url: str, request: BaseModel, reply: type[Reply]) -> Reply:
-    """The server's answer to `request` posted to `url`, parsed as vLLM's `reply`."""
+def post(
+    url: str, request: BaseModel, reply: type[Reply], *, headers: Mapping[str, str] | None = None
+) -> Reply:
+    """The server's answer to `request` posted to `url` with `headers`, parsed as vLLM's
+    `reply`."""
     body = request.model_dump_json(exclude_unset=True).encode()
+    sent = {"Content-Type": "application/json", **(headers or {})}
     response: HTTPResponse = urllib.request.urlopen(
-        urllib.request.Request(url, body, {"Content-Type": "application/json"}), timeout=300
+        urllib.request.Request(url, body, sent), timeout=300
     )
     with response:
         return reply.model_validate_json(response.read())

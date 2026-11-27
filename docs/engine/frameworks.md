@@ -52,6 +52,25 @@ Evicting a request releases its block assignments, not the cache allocation, and
 
 Frameworks keep cache selection, keys, eviction and tier lifecycle; the engine owns pinned host slots, page routing, DMA and aligned file I/O. This section is the source for those shared mechanics. The [serving guide](../serving/index.md#offload-the-kv-cache-to-host-memory) has launch recipes; the [vLLM](../serving/vllm.md#kv-cache-offloading) and [SGLang](../serving/sglang.md#hierarchical-cache) references define each adapter's options and framework-specific behavior.
 
+## Disaggregated KV transfer
+
+The design keeps framework request behavior native and shares the host staging and DMA path.
+
+| Component | Responsibility |
+| --- | --- |
+| vLLM/SGLang | Owns page assignment, peer pairing, admission, retries and request completion policy through its native connector and scheduler. |
+| Furiosa adapter | Maps framework page IDs to engine routes, exposes the pinned host region through native registration, and calls the engine copy API at upstream lifecycle hooks. |
+| `opt-engine` | Owns bounded `HostCache` slots and the `Copier` path between those slots and HBM. `copy_pages()` submits DMA and returns a completion handle; callers wait before releasing or reusing slots. |
+| NIXL/Mooncake | Moves bytes between registered host regions using the framework's native transfer protocol. It does not access engine HBM directly. |
+
+Each transfer uses pinned host memory as an explicit intermediate:
+
+1. **Prefill:** The adapter maps framework page IDs to engine routes. `opt-engine` submits HBM-to-host DMA; the native send starts after that copy completes.
+2. **Transport:** NIXL or Mooncake moves the registered host bytes between servers. Engine cache allocations are not registered directly.
+3. **Decode:** Native receive writes into pinned host slots. `opt-engine` submits host-to-HBM DMA; the adapter reports completion after that copy finishes.
+
+This costs one DMA copy on each server while pinned capacity stays bounded independently of KV cache size. The [serving guide](../serving/disaggregated-kv-transfer.md) owns paired-role recipes; framework references own startup refusals and framework-specific behavior.
+
 ### Filesystem layout and I/O
 
 The file tier preserves each framework's existing byte layout.
