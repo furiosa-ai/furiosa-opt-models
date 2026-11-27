@@ -13,6 +13,7 @@ loads or allocates it again.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import replace
 from typing import TYPE_CHECKING, Final, assert_never, cast
 
@@ -41,7 +42,13 @@ def served(module: Module) -> tuple[Model, Decoder, Cache]:
             raise NotImplementedError("the memory saver moves the memory of a decoder only")
 
 
-def release(module: Module, tags: Collection[str] | None, flush: Callable[[], bool]) -> None:
+def release(
+    module: Module,
+    tags: Collection[str] | None,
+    flush: Callable[[], bool],
+    *,
+    transfer_managers: Iterable[object] = (),
+) -> None:
     """Release the memory of the awake `tags`, or of every tag when none are named, as SGLang
     names them; `flush` drops SGLang's cache."""
     from sglang.srt.runtime_context import get_exec
@@ -55,8 +62,44 @@ def release(module: Module, tags: Collection[str] | None, flush: Callable[[], bo
             continue
         match tag:
             case "kv_cache":
-                assert cache.storage is not None, "an awake KV cache holds its storage"
-                module.asleep[tag] = Storage(cache.storage.spec, cache.storage.blocks)
+                storage = cache.storage
+                assert storage is not None, "an awake KV cache holds its storage"
+                from furiosa_opt_sglang.staging import (
+                    attach_manager_staging,
+                    release_manager_staging,
+                )
+
+                managers = tuple(
+                    manager
+                    for manager in transfer_managers
+                    if getattr(manager, "engine_cache", None) is cache
+                )
+                errors = []
+                for manager in managers:
+                    try:
+                        release_manager_staging(manager)
+                    except BaseException as error:
+                        errors.append(error)
+                try:
+                    cache.release_copy_copier()
+                except BaseException as error:
+                    errors.append(error)
+                if errors:
+                    restore_errors = []
+                    for manager in managers:
+                        try:
+                            attach_manager_staging(manager, storage, cache.pages.chips)
+                        except BaseException as error:
+                            restore_errors.append(error)
+                    if restore_errors:
+                        raise BaseExceptionGroup(
+                            "SGLang cache release and staging restore failed",
+                            [*errors, *restore_errors],
+                        ) from None
+                    raise BaseExceptionGroup(
+                        "SGLang cache release and staging teardown failed", errors
+                    ) from None
+                module.asleep[tag] = Storage(storage.spec, storage.blocks)
                 cache.storage = None
             case "weights":
                 module.loaded = replace(model, core=replace(decoder, model=None, copy=None))
@@ -68,7 +111,12 @@ def release(module: Module, tags: Collection[str] | None, flush: Callable[[], bo
                 assert_never(tag)
 
 
-def resume(module: Module, tags: Collection[str] | None) -> None:
+def resume(
+    module: Module,
+    tags: Collection[str] | None,
+    *,
+    transfer_managers: Iterable[object] = (),
+) -> None:
     """Restore the memory of `tags`, or of every tag when none are named."""
     for tag in TAGS:
         if tags and tag not in tags:
@@ -80,7 +128,34 @@ def resume(module: Module, tags: Collection[str] | None) -> None:
                 source = decoder.checkpoint.mapped() if copy is None else copy
                 module.loaded = replace(model, core=replace(decoder, copy=copy).loaded(source))
             case Storage(spec, blocks):
-                cache.storage = engine.decoder.Cache(spec, blocks)
+                storage = engine.decoder.Cache(spec, blocks)
+                cache.storage = storage
+                from furiosa_opt_sglang.staging import (
+                    attach_manager_staging,
+                    release_manager_staging,
+                )
+
+                attached = []
+                try:
+                    for manager in transfer_managers:
+                        if getattr(manager, "engine_cache", None) is not cache:
+                            continue
+                        attached.append(manager)
+                        attach_manager_staging(manager, storage, cache.pages.chips)
+                except BaseException as attach_error:
+                    cleanup_errors = []
+                    for manager in reversed(attached):
+                        try:
+                            release_manager_staging(manager)
+                        except BaseException as error:
+                            cleanup_errors.append(error)
+                    cache.storage = None
+                    if cleanup_errors:
+                        raise BaseExceptionGroup(
+                            "SGLang cache resume and staging cleanup failed",
+                            [attach_error, *cleanup_errors],
+                        ) from None
+                    raise
             case None:
                 continue
             case _:

@@ -256,11 +256,10 @@ impl PyCopier {
         loading: bool,
         coalesce: bool,
     ) -> PyResult<PyCopy> {
-        if pool.block_bytes != self.core.block_bytes
-            || !pool
-                .core
-                .upgrade()
-                .is_some_and(|core| Arc::ptr_eq(&core, &self.core))
+        if !pool
+            .core
+            .upgrade()
+            .is_some_and(|core| Arc::ptr_eq(&core, &self.core))
         {
             return Err(PyValueError::new_err(
                 "host cache was allocated for a different copier",
@@ -303,6 +302,11 @@ impl PyCopier {
                 let blocks = self.core.group_blocks.get(group).ok_or_else(|| {
                     PyValueError::new_err(format!("cache transfer names unknown group {group}"))
                 })?;
+                if !pool.includes_group(group) {
+                    return Err(PyValueError::new_err(format!(
+                        "host cache does not include cache group {group}"
+                    )));
+                }
                 if block as usize >= *blocks {
                     return Err(PyValueError::new_err(format!(
                         "cache transfer for host slot {slot} names block {block} outside group {group}"
@@ -382,21 +386,77 @@ impl PyHostCache {
     #[new]
     /// Allocate one pinned host-page pool for this copier. Other pools may share the copier; their
     /// slot indices and access gates are independent, while device-page reservations are shared.
-    /// `backing`, when supplied, must be a pinned buffer of exactly `slots` times one host block's
-    /// size. The pool retains that allocation and presents each host block as one slot. Before
-    /// reusing this backing for a replacement pool, shut down its old copier and finish all copies
-    /// and `HostSlot.access()` leases; distinct pools over one backing have independent slot gates.
-    #[pyo3(signature = (copier, slots, *, backing=None))]
+    /// By default each slot covers the full host block. `layers` selects complete cache groups and
+    /// packs them into compact slots in selection order. A supplied `backing` must be pinned and
+    /// exactly `slots` times the resulting slot size. Before reusing it for a replacement pool,
+    /// shut down the old copier and finish all copies and `HostSlot.access()` leases; distinct
+    /// pools over one backing have independent slot gates.
+    #[pyo3(signature = (copier, slots, *, backing=None, layers=None))]
     fn new(
         py: Python<'_>,
         copier: PyRef<'_, PyCopier>,
         slots: usize,
         backing: Option<PyRef<'_, PyHostBuffer>>,
+        layers: Option<Vec<usize>>,
     ) -> PyResult<Self> {
-        let block_bytes = copier.core.block_bytes;
         if slots == 0 {
             return Err(PyValueError::new_err("host cache needs at least one slot"));
         }
+        let (block_bytes, layer_offsets) = if let Some(layers) = layers {
+            if layers.is_empty() {
+                return Err(PyValueError::new_err(
+                    "projected host cache needs at least one layer",
+                ));
+            }
+            let mut offsets = vec![None; copier.core.layers.len()];
+            let mut block_bytes = 0usize;
+            for layer in layers {
+                let description = copier.core.layers.get(layer).ok_or_else(|| {
+                    PyValueError::new_err(format!("host cache names unknown layer {layer}"))
+                })?;
+                if offsets[layer].is_some() {
+                    return Err(PyValueError::new_err(format!(
+                        "host cache repeats layer {layer}"
+                    )));
+                }
+                offsets[layer] = Some(block_bytes);
+                let layer_bytes = description
+                    .page_bytes
+                    .checked_mul(copier.core.chips)
+                    .ok_or_else(|| PyValueError::new_err("host layer size overflows"))?;
+                block_bytes = block_bytes
+                    .checked_add(layer_bytes)
+                    .ok_or_else(|| PyValueError::new_err("host cache block size overflows"))?;
+            }
+            (block_bytes, offsets)
+        } else {
+            (
+                copier.core.block_bytes,
+                copier
+                    .core
+                    .layers
+                    .iter()
+                    .map(|layer| Some(layer.host_offset))
+                    .collect(),
+            )
+        };
+        let included_groups = copier
+            .core
+            .groups
+            .iter()
+            .map(|group| {
+                let included = group
+                    .iter()
+                    .filter(|&&layer| layer_offsets[layer].is_some())
+                    .count();
+                if included != 0 && included != group.len() {
+                    return Err(PyValueError::new_err(
+                        "projected host cache must include complete cache groups",
+                    ));
+                }
+                Ok(included == group.len())
+            })
+            .collect::<PyResult<Vec<_>>>()?;
         let total = slots
             .checked_mul(block_bytes)
             .ok_or_else(|| PyValueError::new_err("host cache allocation size overflows"))?;
@@ -483,6 +543,8 @@ impl PyHostCache {
             pool: Arc::new(Pool {
                 slots: pool_slots,
                 block_bytes,
+                layer_offsets,
+                included_groups,
                 core: Arc::downgrade(&copier.core),
                 backing: backing_region,
             }),
@@ -655,6 +717,8 @@ mod tests {
             pool: Arc::new(Pool {
                 slots: host_slots,
                 block_bytes,
+                layer_offsets: Vec::new(),
+                included_groups: Vec::new(),
                 core: Weak::new(),
                 backing: Some(backing),
             }),
@@ -697,6 +761,8 @@ mod tests {
             pool: Arc::new(Pool {
                 slots: vec![Slot::owned(HostBuffer::zero(16))],
                 block_bytes: 16,
+                layer_offsets: Vec::new(),
+                included_groups: Vec::new(),
                 core: Weak::new(),
                 backing: None,
             }),

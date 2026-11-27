@@ -25,6 +25,14 @@ dependencies = [
 
 [project.optional-dependencies]
 diffusion = ["diffusers==0.40.0"]
+nixl = [
+    # Match vLLM 0.31.0's upstream KV connector requirement.
+    "nixl==1.4.1",
+]
+mooncake = [
+    # Match vLLM 0.31.0's minimum; stay below Mooncake's next breaking minor.
+    "mooncake-transfer-engine-non-cuda>=0.3.12,<0.4.0",
+]
 omni = ["vllm-omni==0.31.0rc1"]
 suffix = ["arctic-inference==0.3.0"]
 

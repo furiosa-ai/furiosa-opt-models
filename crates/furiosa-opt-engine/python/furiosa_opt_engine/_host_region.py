@@ -44,6 +44,13 @@ class HostRegionLease:
         self._retained = False
         self._released = False
 
+    @property
+    def view(self) -> memoryview:
+        """Export the leased bytes for an API that needs a Python buffer object."""
+        if self._released:
+            raise RuntimeError("cannot view a released host region")
+        return self._view[:]
+
     def retain(self) -> None:
         """Keep the lease alive when an external operation's completion is unknown."""
         if self._released:
@@ -161,6 +168,16 @@ def host_slot_region(slot: engine.HostSlot) -> Iterator[HostRegionLease]:
         yield region
     finally:
         region.release()
+
+
+def host_buffer_region(buffer: Buffer) -> HostRegionLease:
+    """Lease a stable engine host allocation for a foreign pointer API."""
+    view = _byte_view(buffer)
+    try:
+        return HostRegionLease(view, keepalive=buffer)
+    except BaseException:
+        view.release()
+        raise
 
 
 def _byte_view(buffer: Buffer | engine.HostSlot) -> memoryview:

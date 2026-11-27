@@ -12,7 +12,7 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import prepare_server_args
 from transformers import PretrainedConfig
 
-from furiosa_opt_sglang.platform import Refused
+from furiosa_opt_sglang.admission import Refused
 from furiosa_opt_sglang.request import validate_request
 
 Value: TypeAlias = float | int | str | dict[str, float] | dict[str, bool]

@@ -18,7 +18,14 @@ from typing_extensions import Buffer
 
 import furiosa_opt_engine as engine
 
-from ._host_region import HostRegionLease, _byte_view, retain_until_exit
+from ._host_region import (
+    HostRegionLease,
+    _byte_view,
+    retain_until_exit,
+)
+from ._host_region import (
+    host_buffer_region as host_buffer_region,
+)
 
 ByteBuffer: TypeAlias = Buffer | engine.HostSlot
 DEFAULT_READ_THREADS = 8
@@ -45,6 +52,23 @@ class LayerPageRoutes(NamedTuple):
 
     device_pages: Sequence[int]
     host_slots: Sequence[int]
+
+
+@dataclass(frozen=True, slots=True)
+class CacheStagingLayerLayout:
+    """One layer's byte range within each page-major host slot."""
+
+    byte_offset: int
+    page_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class CacheStagingLayout:
+    """Immutable page-major geometry shared by transfer adapters."""
+
+    slot_bytes: int
+    capacity_pages: int
+    layers: tuple[CacheStagingLayerLayout, ...]
 
 
 class AlignedFileIO:
@@ -554,8 +578,8 @@ class _FreeRun(NamedTuple):
     count: int
 
 
-class _BoundedPageSlots:
-    """Allocate page IDs for ``BoundedCacheStaging`` without allocating host memory."""
+class CacheStagingSlots:
+    """Allocate and reserve page IDs shared across framework scheduling boundaries."""
 
     def __init__(self, capacity_pages: int) -> None:
         if capacity_pages <= 0:
@@ -610,6 +634,40 @@ class _BoundedPageSlots:
             self._next_identifier += 1
             self._leases[identifier] = slots
             return CacheStagingLease(identifier, slots, self._owner)
+
+    def reserve(self, slots: Sequence[int]) -> CacheStagingLease:
+        """Reserve exact slot IDs received from a separate scheduler process."""
+        requested = tuple(sorted(slots))
+        if not requested:
+            raise ValueError("cache staging leases require at least one page")
+        if len(set(requested)) != len(requested):
+            raise ValueError("cache staging reservation repeats a page slot")
+        if requested[0] < 0 or requested[-1] >= self.capacity_pages:
+            raise ValueError("cache staging slot index is out of range")
+
+        with self._lock:
+            requested_index = 0
+            free_runs: list[_FreeRun] = []
+            for run in self._free_runs:
+                cursor = run.start
+                end = run.start + run.count
+                while requested_index < len(requested) and requested[requested_index] < end:
+                    slot = requested[requested_index]
+                    if slot < cursor:
+                        raise ValueError("cache staging slots are already reserved")
+                    if cursor < slot:
+                        free_runs.append(_FreeRun(cursor, slot - cursor))
+                    cursor = slot + 1
+                    requested_index += 1
+                if cursor < end:
+                    free_runs.append(_FreeRun(cursor, end - cursor))
+            if requested_index < len(requested):
+                raise ValueError("cache staging slots are already reserved")
+            self._free_runs = free_runs
+            identifier = self._next_identifier
+            self._next_identifier += 1
+            self._leases[identifier] = requested
+            return CacheStagingLease(identifier, requested, self._owner)
 
     def release(self, lease: CacheStagingLease) -> None:
         """Return a lease's slots exactly once."""
@@ -680,6 +738,8 @@ class BoundedCacheStaging:
     reserves slots shared by all layers. Adapters gather or scatter through the lease, then release
     it after network transfer completion. Capacity does not depend on cache size. The backing stays
     registered while the engine cache is released and binds to a replacement cache after wake-up.
+    A supplied backing and Copier let a framework's registered staging region share the same
+    engine transfer queue.
     """
 
     def __init__(
@@ -687,6 +747,9 @@ class BoundedCacheStaging:
         cache: engine.decoder.Cache,
         chips: int,
         capacity_pages: int,
+        *,
+        backing: engine.HostBuffer | None = None,
+        copier: engine.Copier | None = None,
     ) -> None:
         if chips <= 0:
             raise ValueError("cache staging requires at least one chip")
@@ -695,29 +758,58 @@ class BoundedCacheStaging:
         self._cache: engine.decoder.Cache | None = cache
         self._blocks = cache.blocks
         self._chips = chips
-        self.capacity_pages = capacity_pages
         self._page_bytes = _cache_page_bytes(cache)
-        self.host_page_bytes = cache_layer_page_bytes(cache, chips)
-        self.layer_offsets = cache_layer_offsets(cache, chips)
-        self.host_block_bytes = sum(self.host_page_bytes)
-        total_bytes = capacity_pages * self.host_block_bytes
-        backing = engine.HostBuffer(total_bytes)
-        active_copier = cache_copier(cache, chips)
+        host_page_bytes = cache_layer_page_bytes(cache, chips)
+        layer_offsets = cache_layer_offsets(cache, chips)
+        slot_bytes = sum(host_page_bytes)
+        self._layout = CacheStagingLayout(
+            slot_bytes=slot_bytes,
+            capacity_pages=capacity_pages,
+            layers=tuple(
+                CacheStagingLayerLayout(byte_offset=offset, page_bytes=page_bytes)
+                for offset, page_bytes in zip(layer_offsets, host_page_bytes, strict=True)
+            ),
+        )
+        total_bytes = capacity_pages * slot_bytes
+        if backing is None:
+            backing = engine.HostBuffer(total_bytes)
+        elif len(backing) != total_bytes:
+            raise ValueError(
+                f"cache staging backing has {len(backing)} bytes; expected {total_bytes}"
+            )
+        active_copier = copier if copier is not None else cache_copier(cache, chips)
+        self._owns_copier = copier is None
         self._copier: engine.Copier | None = active_copier
         try:
             self._host_cache: engine.HostCache | None = engine.HostCache(
                 active_copier, capacity_pages, backing=backing
             )
         except BaseException as operation_error:
-            _shutdown_copier_after_failure(active_copier, operation_error)
+            if self._owns_copier:
+                _shutdown_copier_after_failure(active_copier, operation_error)
             raise
         self._detached_backing: engine.HostBuffer | None = None
 
-        self._slots = _BoundedPageSlots(capacity_pages)
+        self._slots = CacheStagingSlots(capacity_pages)
         self._copying: set[int] = set()
         self._transport_access: dict[int, tuple[engine.HostSlotAccess, ...]] = {}
         self._lock = threading.Lock()
         self._cache_releasing = False
+
+    @property
+    def layout(self) -> CacheStagingLayout:
+        """The stable page-major layout for transport tensor views."""
+        return self._layout
+
+    @property
+    def capacity_pages(self) -> int:
+        """Number of page slots available in this pool."""
+        return self._layout.capacity_pages
+
+    def matches_binding(self, cache: engine.decoder.Cache, copier: engine.Copier) -> bool:
+        """Whether this pool aliases the given cache generation and Copier."""
+        with self._lock:
+            return self._cache is cache and self._copier is copier and self._host_cache is not None
 
     def try_acquire(self, page_count: int) -> CacheStagingLease | None:
         """Reserve page slots, or return `None` while full or detached from the engine cache."""
@@ -725,6 +817,13 @@ class BoundedCacheStaging:
             if self._cache is None or self._cache_releasing:
                 return None
             return self._slots.try_acquire(page_count)
+
+    def reserve_slots(self, slots: Sequence[int]) -> CacheStagingLease:
+        """Reserve exact page IDs supplied by a framework scheduler."""
+        with self._lock:
+            if self._cache is None or self._cache_releasing:
+                raise RuntimeError("cannot reserve slots while the engine cache is released")
+            return self._slots.reserve(slots)
 
     def lease_host_region(self) -> HostRegionLease:
         """Lease complete pinned staging allocation for contiguous external I/O."""
@@ -743,6 +842,8 @@ class BoundedCacheStaging:
     def release_engine_cache(self, cache: engine.decoder.Cache) -> None:
         """Drain and drop Copier's HBM aliases before vLLM releases its cache."""
         with self._lock:
+            if not self._owns_copier:
+                raise RuntimeError("shared Copier lifecycle belongs to its owner")
             if self._cache is None:
                 return
             self._require_cache(cache)
@@ -777,6 +878,8 @@ class BoundedCacheStaging:
     def restore_engine_cache(self, cache: engine.decoder.Cache) -> None:
         """Bind a replacement engine cache to the existing registered host buffer."""
         with self._lock:
+            if not self._owns_copier:
+                raise RuntimeError("shared Copier lifecycle belongs to its owner")
             if self._cache is cache:
                 return
             if self._cache is not None or self._cache_releasing:
@@ -795,7 +898,9 @@ class BoundedCacheStaging:
     ) -> tuple[engine.Copier, engine.HostCache]:
         if cache.blocks != self._blocks or _cache_page_bytes(cache) != self._page_bytes:
             raise ValueError("new engine cache does not match bounded staging geometry")
-        if cache_layer_offsets(cache, self._chips) != self.layer_offsets:
+        if cache_layer_offsets(cache, self._chips) != tuple(
+            layer.byte_offset for layer in self._layout.layers
+        ):
             raise ValueError("new engine cache layer offsets differ from registered staging")
         copier = cache_copier(cache, self._chips)
         try:

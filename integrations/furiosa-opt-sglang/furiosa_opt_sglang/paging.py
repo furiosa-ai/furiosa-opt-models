@@ -8,11 +8,12 @@ from typing import TYPE_CHECKING, assert_never, cast, final
 import torch
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.model_runner_components.layer_setup import ModelLayerInfo
-from sglang.srt.runtime_context import get_memory, get_schedule
+from sglang.srt.runtime_context import get_memory, get_schedule, get_server_args
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from typing_extensions import override
 
-from furiosa_opt_sglang.cache import Allocator, Cache, Pages
+from furiosa_opt_sglang.cache import Allocator, Cache
+from furiosa_opt_sglang.cache.pages import Pages
 from furiosa_opt_sglang.decoder import RELEASED, Decoder
 from furiosa_opt_sglang.generation.model import Model
 from furiosa_opt_sglang.speculative import Speculative
@@ -59,7 +60,12 @@ def tokens(runner: Runner, limits: Limits, decoder: Decoder, pages: Pages) -> Ca
         raise ValueError(f"max_total_tokens must be in 1..{capacity}")
     runner.max_total_num_tokens = (limits.tokens or capacity) // block * block
     runner.max_running_requests = limits.requests or decoder.rows
-    cache = Cache(decoder.model.cache, pages, runner.max_total_num_tokens)
+    cache = Cache(
+        decoder.model.cache,
+        pages,
+        runner.max_total_num_tokens,
+        get_server_args().disaggregation_transfer_backend,
+    )
     if draft is not None:
         assert cache.storage is not None, "a new token pool holds its storage"
         # The draft caches each request in the blocks the target's table names.
@@ -106,15 +112,16 @@ def assign(
         offset += end - start
 
 
-def requests(runner: Runner) -> None:
+def requests(runner: Runner, cache: Cache) -> None:
     from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 
     # SGLang reserves table entries past the context for a speculative step's draft slots.
-    runner.req_to_token_pool = Requests(
+    pool = Requests(
         runner.max_running_requests,
         runner.model_config.context_len + get_req_to_token_extra_context_len(),
         runner.selected,
     )
+    runner.req_to_token_pool = pool
 
 
 def initialize(runner: Runner, loaded: Model) -> Model:
@@ -166,8 +173,9 @@ def model(runner: Runner, limits: Limits, loaded: Model) -> tuple[Model, int]:
                 raise ValueError("the framework must resolve the attention head width")
             heads = runner.model_config.get_num_kv_heads(1)
             pages = Pages.parse(core, heads, limits.head)
-            loaded = replace(loaded, cache=tokens(runner, limits, core, pages))
-            requests(runner)
+            cache = tokens(runner, limits, core, pages)
+            loaded = replace(loaded, cache=cache)
+            requests(runner, cache)
             return loaded, pool.block
         case _:
             assert_never(core)

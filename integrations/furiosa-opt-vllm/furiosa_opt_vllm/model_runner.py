@@ -4,6 +4,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, assert_never, final
 
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 from vllm.v1.worker.gpu.kv_connector import get_kv_connector
 
 from furiosa_opt_vllm import embedding, generation, load, multimodal, paging, request
@@ -15,6 +16,7 @@ from furiosa_opt_vllm.runner import Runner
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
     from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
@@ -40,13 +42,27 @@ class FuriosaModelRunner(Runner):
         if not has_kv_transfer_group():
             return
         connector = get_kv_transfer_group()
-        # The platform admits only the offloading connector, for the cache of a decoder the engine
-        # holds.
-        assert isinstance(connector, RNGDOffloadingConnector) and self.cache is not None
-        assert isinstance(self.model, Decoder) and self.model.model is not None
-        connector.register(self.cache, self.model.model.parallel)
-        # vLLM's attention layers, which the engine replaces, hold no cache tensors to register.
-        self.kv_connector = get_kv_connector(self.vllm_config, {})
+        if self.cache is None:
+            raise RuntimeError("vLLM configured a KV connector without an engine cache")
+        if not isinstance(self.model, Decoder) or self.model.model is None:
+            raise RuntimeError("KV transfer requires a loaded engine decoder")
+        children = leaves(connector)
+        from furiosa_opt_vllm.mooncake import FuriosaMooncakeConnector
+        from furiosa_opt_vllm.nixl import cache_views
+        from furiosa_opt_vllm.transfer import nixl
+
+        for child in children:
+            if isinstance(child, RNGDOffloadingConnector):
+                child.register(self.cache, self.model.model.parallel)
+            elif isinstance(child, FuriosaMooncakeConnector):
+                child.register_engine_cache(self, kv_cache_config)
+        if nixl(self.vllm_config):
+            # NIXL keeps its native protocol and registers only the engine's bounded host slots.
+            views = cache_views(self, kv_cache_config)
+            self.kv_connector = get_kv_connector(self.vllm_config, views)
+        else:
+            # Engine attention owns the cache; framework KV tensors need no registration.
+            self.kv_connector = get_kv_connector(self.vllm_config, {})
 
     def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput | None:
         if self.model is None:
@@ -75,3 +91,11 @@ class FuriosaModelRunner(Runner):
         self, grammar_output: GrammarOutput | None
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return generation.sample(self, grammar_output)
+
+
+def leaves(connector: KVConnectorBase_V1) -> list[KVConnectorBase_V1]:
+    """The connectors that move blocks for `connector`: those vLLM's MultiConnector runs, or
+    `connector` itself."""
+    if isinstance(connector, MultiConnector):
+        return [leaf for child in connector.sub_connectors for leaf in leaves(child)]
+    return [connector]

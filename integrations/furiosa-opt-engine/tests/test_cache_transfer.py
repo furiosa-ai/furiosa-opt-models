@@ -23,8 +23,12 @@ from furiosa_opt_engine._host_region import (
 from furiosa_opt_engine.cache_transfer import (
     AlignedFileIO,
     BoundedCacheStaging,
+    CacheStagingSlots,
+    LayerPageRoutes,
     _probe_direct_io,
     _probe_o_direct,
+    settle,
+    submit,
 )
 
 
@@ -259,65 +263,252 @@ def test_vectored_file_io_many_keeps_per_range_alignment_fallback(tmp_path, monk
         del storage
 
 
-def test_aligned_file_io_uses_direct_io_for_aligned_pages(tmp_path, monkeypatch) -> None:
-    alignment = cache_transfer_module._probe_direct_io(str(tmp_path))
-    if alignment is None:
-        pytest.skip("temporary filesystem does not support O_DIRECT")
+class _Pending:
+    def __init__(self, failure: RuntimeError | None = None) -> None:
+        self.failure = failure
+        self.waited = False
 
-    memory_alignment, offset_alignment = alignment
-    size = offset_alignment
-    io = AlignedFileIO(str(tmp_path), use_direct=True)
-    assert io.use_direct
-    opened_flags: list[tuple[str, int]] = []
-    original_open = os.open
+    def done(self) -> bool:
+        return self.waited
 
-    def track_open(path, flags, *args, **kwargs):
-        opened_flags.append((os.fspath(path), flags))
-        return original_open(path, flags, *args, **kwargs)
+    def wait(self) -> None:
+        self.waited = True
+        if self.failure is not None:
+            raise self.failure
 
-    monkeypatch.setattr(os, "open", track_open)
-    path = tmp_path / "direct-aligned.bin"
-    mappings = []
-    views = []
-    offsets = []
-    try:
-        for _ in range(2):
-            mapping = mmap.mmap(-1, size + 2 * memory_alignment)
-            mappings.append(mapping)
-            base_address = ctypes.addressof(ctypes.c_ubyte.from_buffer(mapping))
-            offset = (-base_address) % memory_alignment
-            offsets.append(offset)
-            views.append(memoryview(mapping)[offset : offset + size])
 
-        source, destination = views
-        source[:] = bytes(index % 251 for index in range(size))
-        io.write(str(path), source)
-        io.read(str(path), destination)
+def test_failed_submission_drains_already_submitted_copies() -> None:
+    first = _Pending(RuntimeError("copy failed"))
 
-        assert bytes(destination) == bytes(source)
-        assert any(
-            open_path == str(path) and flags & os.O_DIRECT for open_path, flags in opened_flags
-        )
+    def transfers():
+        yield first
+        raise ValueError("submission failed")
 
-        if memory_alignment > 1:
-            unaligned_source = memoryview(mappings[0])[offsets[0] + 1 : offsets[0] + 1 + size]
-            unaligned_destination = memoryview(mappings[1])[offsets[1] + 1 : offsets[1] + 1 + size]
-            views.extend((unaligned_source, unaligned_destination))
-            assert io._direct_address(unaligned_source) is None
-            unaligned_source[:] = bytes((index + 17) % 251 for index in range(size))
-            bounced_path = tmp_path / "direct-unaligned-buffer.bin"
-            io.write(str(bounced_path), unaligned_source)
-            io.read(str(bounced_path), unaligned_destination)
-            assert bytes(unaligned_destination) == bytes(unaligned_source)
-            assert any(
-                open_path == str(bounced_path) and flags & os.O_DIRECT
-                for open_path, flags in opened_flags
-            )
-    finally:
-        for view in views:
-            view.release()
-        for mapping in mappings:
-            mapping.close()
+    with pytest.raises(ValueError, match="submission failed"):
+        submit(transfers())
+    assert first.waited
+
+
+def test_settle_drains_every_copy_and_returns_the_first_failure() -> None:
+    first, second, third = (
+        _Pending(RuntimeError("first")),
+        _Pending(),
+        _Pending(RuntimeError("third")),
+    )
+
+    failure = settle([first, second, third])
+
+    assert failure is first.failure
+    assert first.waited and second.waited and third.waited
+
+
+class _Copy:
+    def __init__(self, finish) -> None:
+        self.finish = finish
+
+    def wait(self) -> None:
+        self.finish()
+
+
+class _CopierLayer:
+    def __init__(self, buffer, page_bytes: int, host_offset: int, group: int) -> None:
+        self.buffer = buffer
+        self.page_bytes = page_bytes
+        self.host_offset = host_offset
+        self.group = group
+
+
+class _Copier:
+    def __init__(self, layers, host_block_bytes: int) -> None:
+        self.layers = layers
+        self.host_block_bytes = host_block_bytes
+
+    def _copy(self, routes, *, to_host: bool):
+        for slot, layer_routes in routes:
+            for group, page in layer_routes:
+                layer = self.layers[group]
+                host_offset = slot * self.host_block_bytes + layer.host_offset
+                device_offset = page * layer.page_bytes
+                if to_host:
+                    layer.buffer.events.append(
+                        ("hbm-to-host", layer.buffer.layer, device_offset, host_offset)
+                    )
+                else:
+                    layer.buffer.events.append(
+                        ("host-to-hbm", layer.buffer.layer, host_offset, device_offset)
+                    )
+        return _Copy(lambda: None)
+
+    def copy_out(self, routes, _host):
+        return self._copy(routes, to_host=True)
+
+    def copy_in(self, routes, _host):
+        return self._copy(routes, to_host=False)
+
+
+class _HostCache:
+    def __init__(self, _copier, slots: int, *, backing) -> None:
+        self.slots = [object() for _ in range(slots)]
+        self.backing = backing
+
+    def slot(self, index: int):
+        slot = self.slots[index]
+        return SimpleNamespace(access=lambda: slot)
+
+    def _backing_buffer(self):
+        return self.backing
+
+
+class _HostBuffer(bytearray):
+    def __new__(cls, size: int):
+        return super().__new__(cls, size)
+
+    def __init__(self, size: int) -> None:
+        super().__init__(size)
+
+
+class _DeviceBuffer:
+    def __init__(self, layer: int, size: int, chips: int, events) -> None:
+        self.layer = layer
+        self.size = size
+        self.chips = chips
+        self.events = events
+
+    def __len__(self) -> int:
+        return self.size
+
+
+def _cache(chips: int = 2):
+    blocks, page_sizes = 4, (8, 12)
+    events: list[tuple[object, ...]] = []
+    layers = [
+        _DeviceBuffer(index, blocks * page_bytes, chips, events)
+        for index, page_bytes in enumerate(page_sizes)
+    ]
+    groups = [SimpleNamespace(pool=index, layers=[index]) for index in range(len(layers))]
+    spec = SimpleNamespace(
+        groups=groups,
+        pools=[SimpleNamespace(bytes=size) for size in page_sizes],
+    )
+    cache = SimpleNamespace(blocks=blocks, layers=layers, spec=spec)
+    return cache, events, blocks, page_sizes
+
+
+def test_cache_staging_slots_exhaustion_and_reuse() -> None:
+    slots = CacheStagingSlots(capacity_pages=3)
+    first = slots.try_acquire(2)
+    second = slots.try_acquire(1)
+    assert first is not None and second is not None
+    assert first.slots == (0, 1)
+    assert second.slots == (2,)
+    assert slots.try_acquire(1) is None
+
+    slots.release(first)
+    reused = slots.try_acquire(2)
+    assert reused is not None
+    assert reused.slots == first.slots
+    slots.release(reused)
+    slots.release(second)
+
+
+def test_cache_staging_slots_preserves_larger_runs_with_exact_fit() -> None:
+    slots = CacheStagingSlots(capacity_pages=10)
+    first = slots.try_acquire(3)
+    second = slots.try_acquire(2)
+    third = slots.try_acquire(3)
+    fourth = slots.try_acquire(2)
+    assert first is not None and second is not None and third is not None and fourth is not None
+
+    slots.release(first)
+    slots.release(fourth)
+    exact_fit = slots.try_acquire(2)
+
+    assert exact_fit is not None
+    assert exact_fit.slots == fourth.slots
+    slots.release(exact_fit)
+    slots.release(second)
+    slots.release(third)
+
+
+def test_cache_staging_slots_uses_capacity_across_fragmented_runs() -> None:
+    slots = CacheStagingSlots(capacity_pages=6)
+    first = slots.try_acquire(2)
+    second = slots.try_acquire(2)
+    third = slots.try_acquire(2)
+    assert first is not None and second is not None and third is not None
+
+    slots.release(first)
+    slots.release(third)
+    fragmented = slots.try_acquire(4)
+
+    assert fragmented is not None
+    assert fragmented.slots == (0, 1, 4, 5)
+    assert set(fragmented.slots).isdisjoint(second.slots)
+    slots.release(fragmented)
+    slots.release(second)
+
+    all_slots = slots.try_acquire(6)
+    assert all_slots is not None
+    assert all_slots.slots == tuple(range(6))
+    slots.release(all_slots)
+
+
+def test_cache_staging_slots_reserves_exact_ids_from_scheduler() -> None:
+    slots = CacheStagingSlots(capacity_pages=6)
+    lease = slots.reserve([5, 1, 3])
+
+    assert lease.slots == (1, 3, 5)
+    with pytest.raises(ValueError, match="already reserved"):
+        slots.reserve([3, 4])
+
+    slots.release(lease)
+    assert slots.try_acquire(6) is not None
+
+
+def test_bounded_cache_staging_copies_only_leased_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import furiosa_opt_engine as engine
+
+    cache, events, blocks, page_sizes = _cache()
+    monkeypatch.setattr(engine, "HostBuffer", _HostBuffer)
+    monkeypatch.setattr(engine, "CopierLayer", _CopierLayer)
+    monkeypatch.setattr(engine, "Copier", _Copier)
+    monkeypatch.setattr(engine, "HostCache", _HostCache)
+    staging = BoundedCacheStaging(cache, chips=2, capacity_pages=2)
+    lease = staging.try_acquire(2)
+    assert lease is not None
+    layout = staging.layout
+    assert layout.capacity_pages < blocks
+    assert tuple(layer.byte_offset for layer in layout.layers) == (0, page_sizes[0] * 2)
+    assert layout.slot_bytes == sum(page_sizes) * 2
+    region = staging.lease_host_region()
+    assert region.region.size == 2 * layout.slot_bytes
+    region.release()
+
+    pages = {
+        0: LayerPageRoutes([1, 2], [0, 1]),
+        1: LayerPageRoutes([3], [0]),
+    }
+    staging.copy_pages(cache, pages, lease, to_host=True).wait()
+    assert events == [
+        ("hbm-to-host", 0, 8, 0),
+        ("hbm-to-host", 1, 36, 16),
+        ("hbm-to-host", 0, 16, 40),
+    ]
+
+    events.clear()
+    staging.begin_transport(lease)
+    with pytest.raises(RuntimeError, match="network transfer"):
+        staging.copy_pages(cache, pages, lease, to_host=False).wait()
+    staging.complete_transport(lease)
+    staging.copy_pages(cache, pages, lease, to_host=False).wait()
+    assert events == [
+        ("host-to-hbm", 0, 0, 8),
+        ("host-to-hbm", 1, 16, 36),
+        ("host-to-hbm", 0, 40, 16),
+    ]
+    staging.release(lease)
 
 
 def test_host_region_registrar_registers_once_and_unregisters_on_close() -> None:
@@ -695,7 +886,7 @@ def test_bounded_staging_uses_hostcache_backing_across_cache_rebind(monkeypatch)
 
     assert len(allocations) == 1
     assert not hasattr(staging, "_buffer")
-    assert region.region.size == staging.capacity_pages * staging.host_block_bytes
+    assert region.region.size == staging.capacity_pages * staging.layout.slot_bytes
     assert old_host_cache.backing_requests == 1
 
     try:

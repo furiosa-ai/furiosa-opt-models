@@ -3,7 +3,7 @@ from typing import Final, Literal, TypedDict, get_args
 
 import pytest
 import torch
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 from transformers import (
     AutoConfig,
     BambaConfig,
@@ -24,9 +24,15 @@ from vllm.config import (
     speculative,
 )
 from vllm.config.cache import CacheDType, KVOffloadingBackend
+from vllm.config.lora import MaxLoRARanks
 from vllm.config.speculative import DraftSampleMethod, RejectionSampleMethod, SpeculativeMethod
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorLogging
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+)
 from vllm.engine.arg_utils import EngineArgs
+from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 from vllm.inputs import EngineInput, embeds_input, tokens_input
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.models import ModelRegistry
@@ -38,9 +44,35 @@ from furiosa_opt_vllm import offload
 from furiosa_opt_vllm.additional import Placement, Section
 from furiosa_opt_vllm.admission import Draft, Method, Refused, quantization
 from furiosa_opt_vllm.platform import FuriosaPlatform
+from furiosa_opt_vllm.transfer import CONNECTOR, CONNECTOR_MODULE
 
 # Every speculative method vLLM names.
 UPSTREAM: Final = frozenset(map(str, get_args(SpeculativeMethod)))
+
+
+@pytest.mark.parametrize(
+    ("registered_module", "raises"),
+    [(CONNECTOR_MODULE, False), ("another_connector", True)],
+    ids=["same-connector", "name-conflict"],
+)
+def test_pre_register_accepts_only_its_own_duplicate(
+    monkeypatch: pytest.MonkeyPatch, registered_module: str, raises: bool
+) -> None:
+    """Repeated hooks tolerate this connector's entry, and reject a conflicting class name."""
+    registered = type(CONNECTOR, (), {"__module__": registered_module})
+
+    def duplicate(*_: object) -> None:
+        raise ValueError(f"Connector '{CONNECTOR}' is already registered.")
+
+    monkeypatch.setattr(ModelRegistry, "register_model", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(KVConnectorFactory, "register_connector", duplicate)
+    monkeypatch.setattr(KVConnectorFactory, "get_connector_class", lambda *_args: registered)
+
+    if raises:
+        with pytest.raises(ValueError, match="already registered"):
+            FuriosaPlatform.pre_register_and_update()
+    else:
+        FuriosaPlatform.pre_register_and_update()
 
 
 @pytest.mark.usefixtures("platform_env")
@@ -81,9 +113,14 @@ def test_opens_visible_chips(monkeypatch: pytest.MonkeyPatch) -> None:
     [
         (tokens_input([1, 2]), SamplingParams(temperature=1.0), "sampling_params"),
         (tokens_input([1, 2]), SamplingParams(temperature=0, logprobs=1), "sampling_params"),
+        (
+            tokens_input([1, 2]),
+            SamplingParams(temperature=0, extra_args={"a": 1}),
+            "sampling_params",
+        ),
         (embeds_input(torch.zeros(2, 8)), SamplingParams(temperature=0), "prompt_embeds"),
     ],
-    ids=["sampling", "logprobs", "embeddings"],
+    ids=["sampling", "logprobs", "extra-arguments", "embeddings"],
 )
 def test_refuses_unserved_requests(
     inputs: EngineInput, params: SamplingParams, option: str
@@ -435,6 +472,37 @@ def test_offloads_through_the_rngd_connector(
     assert transfer.kv_connector_extra_config == {"cpu_bytes_to_use": 1 << 30, **options}
 
 
+# The refusals that name a single worker's ranks.
+RANKS = "{}: vLLM awaits each rank; one worker drives all chips"
+NO_CONNECTOR: Final = (
+    "serves no KV connector but RNGDOffloadingConnector, which --kv-offloading-size selects, "
+    + "the plugin's standalone TCP Mooncake adapter, and vLLM's NIXL connectors with "
+    + "kv_buffer_device=cpu, or a MultiConnector of NIXL and local offloading"
+)
+
+
+@pytest.mark.usefixtures("platform_env")
+def test_selects_furiosa_mooncake_over_tcp(served: Path) -> None:
+    """vLLM's Mooncake control plane registers the engine's bounded host staging over TCP."""
+    transfer = KVTransferConfig(
+        kv_connector="FuriosaMooncakeConnector",
+        kv_connector_module_path="furiosa_opt_vllm.mooncake",
+        kv_role="kv_both",
+    )
+    arguments = EngineArgs(
+        model=str(served),
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        kv_transfer_config=transfer,
+    )
+    configured = arguments.create_engine_config().kv_transfer_config
+    assert configured is not None
+    assert configured.kv_connector_extra_config == {"mooncake_protocol": "tcp"}
+    from furiosa_opt_vllm.mooncake import FuriosaMooncakeConnector
+
+    assert KVConnectorFactory.get_connector_class(configured) is FuriosaMooncakeConnector
+
+
 @pytest.mark.usefixtures("platform_env")
 @pytest.mark.parametrize(
     ("ignored", "option", "requirement"),
@@ -454,28 +522,44 @@ def test_offloads_through_the_rngd_connector(
             Ignored(kv_transfer_config=connector("RNGDOffloadingConnector", "example.offloading")),
             "kv_transfer_config",
             "serves no KV connector but RNGDOffloadingConnector, which --kv-offloading-size "
-            + "selects",
+            + "selects, the plugin's standalone TCP Mooncake adapter, and vLLM's NIXL connectors "
+            + "with kv_buffer_device=cpu, or a MultiConnector of NIXL and local offloading",
+        ),
+        (
+            Ignored(kv_transfer_config=connector("MooncakeConnector")),
+            "kv_transfer_config",
+            "serves no Mooncake connector: it registers the cache's device memory, which the "
+            + "engine does not map for it, rather than staging blocks in host buffers",
+        ),
+        (
+            Ignored(
+                kv_transfer_config=KVTransferConfig(
+                    kv_connector="FuriosaMooncakeConnector",
+                    kv_connector_module_path="furiosa_opt_vllm.mooncake",
+                    kv_role="kv_both",
+                    kv_connector_extra_config={"mooncake_protocol": "rdma"},
+                )
+            ),
+            "kv_transfer_config",
+            "uses Mooncake TCP because RDMA cannot register engine-pinned dma-heap staging",
+        ),
+        (
+            Ignored(
+                kv_transfer_config=KVTransferConfig(
+                    kv_connector="FuriosaMooncakeConnector",
+                    kv_connector_module_path="furiosa_opt_vllm.mooncake",
+                    kv_role="kv_both",
+                ),
+                tensor_parallel_size=2,
+            ),
+            "tensor_parallel_size",
+            "requires tensor_parallel_size=1 for the engine's host cache staging",
         ),
         (
             Ignored(kv_offloading_size=1, kv_transfer_config=extra(spec_name="ExampleSpec")),
             "kv_connector_extra_config",
             "uses vLLM's CPUOffloadingSpec for host offload or TieringOffloadingSpec when "
             + "secondary_tiers are configured",
-        ),
-        (
-            Ignored(
-                kv_offloading_size=1,
-                kv_transfer_config=KVTransferConfig(kv_load_failure_policy="recompute"),
-            ),
-            "kv_load_failure_policy",
-            "stops the engine when an offloaded block fails to copy: kv_load_failure_policy=fail",
-        ),
-        pytest.param(
-            Ignored(kv_offloading_size=1, pipeline_parallel_size=2),
-            "pipeline_parallel_size",
-            "offloads at pipeline_parallel_size=1: vLLM awaits each rank; "
-            "one worker drives all chips",
-            marks=pytest.mark.skip(reason="pending: pipeline parallelism, refused for every model"),
         ),
         (
             Ignored(kv_offloading_size=1, data_parallel_size=2),
@@ -487,16 +571,25 @@ def test_offloads_through_the_rngd_connector(
             "enable_sleep_mode",
             "offloads the KV cache without sleep mode, which frees the cache its host tier copies",
         ),
+        pytest.param(
+            Ignored(kv_offloading_size=1, pipeline_parallel_size=2),
+            "pipeline_parallel_size",
+            "offloads at pipeline_parallel_size=1: vLLM awaits each rank; "
+            "one worker drives all chips",
+            marks=pytest.mark.skip(reason="pending: pipeline parallelism, refused for every model"),
+        ),
     ],
     ids=[
         "lmcache",
         "vllm-connector",
         "module",
+        "native-mooncake",
+        "mooncake-rdma",
+        "mooncake-tp",
         "unsupported-spec",
-        "recompute",
-        "pp",
         "dp",
-        "sleep",
+        "sleep-mode",
+        "pp",
     ],
 )
 @pytest.mark.feature("KV cache offloading")
@@ -556,6 +649,436 @@ def test_refuses_ignored(ignored: Ignored, option: str, served: Path) -> None:
     """Startup names each requested option the plugin cannot honor."""
     arguments = EngineArgs(model=str(served), dtype="bfloat16", skip_tokenizer_init=True, **ignored)
     assert refusal(arguments) == option
+
+
+def nixl(name: str = "NixlConnector", device: str = "cpu") -> KVTransferConfig:
+    """A transfer config naming vLLM's NIXL connector `name`, staging blocks on `device`."""
+    return KVTransferConfig(kv_connector=name, kv_role="kv_both", kv_buffer_device=device)
+
+
+@pytest.mark.usefixtures("platform_env")
+@pytest.mark.feature("Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache)")
+@pytest.mark.parametrize("name", ["NixlConnector", "NixlPullConnector", "NixlPushConnector"])
+def test_connects_through_nixl(name: str, served: Path) -> None:
+    """Startup admits vLLM's own NIXL connectors staging blocks in host buffers, which vLLM's
+    factory builds."""
+    arguments = EngineArgs(
+        model=str(served), dtype="bfloat16", skip_tokenizer_init=True, kv_transfer_config=nixl(name)
+    )
+    transfer = arguments.create_engine_config().kv_transfer_config
+    assert transfer is not None
+    built = KVConnectorFactory.get_connector_class(transfer)
+    assert built.__module__ == "vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector"
+
+
+class Beside(TypedDict, total=False):
+    """Engine settings beside a KV connector."""
+
+    data_parallel_size: int
+    speculative_config: dict[str, object]
+    enable_sleep_mode: bool
+    enable_lora: bool
+    max_lora_rank: MaxLoRARanks
+    quantization: QuantizationMethods
+
+
+@pytest.mark.usefixtures("platform_env")
+@pytest.mark.feature("Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache)")
+@pytest.mark.parametrize(
+    "beside",
+    [
+        Beside(data_parallel_size=2),
+        Beside(speculative_config={"method": "ngram", "num_speculative_tokens": 3}),
+        Beside(speculative_config={"method": "suffix", "num_speculative_tokens": 3}),
+        Beside(enable_sleep_mode=True),
+        Beside(enable_lora=True, max_lora_rank=32),
+        Beside(quantization="fp8_per_tensor"),
+    ],
+    ids=["data-parallel", "ngram", "suffix", "sleep-mode", "lora", "fp8"],
+)
+def test_connects_through_nixl_beside(beside: Beside, served: Path) -> None:
+    """A setting the plugin serves alone stays served with a NIXL connector: vLLM's NIXL carries
+    each of them itself."""
+    arguments = EngineArgs(
+        model=str(served),
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        kv_transfer_config=nixl(),
+        **beside,
+    )
+    transfer = arguments.create_engine_config().kv_transfer_config
+    assert transfer is not None
+    assert (transfer.kv_connector, transfer.kv_buffer_device) == ("NixlConnector", "cpu")
+
+
+# Connectors that register the cache's device memory, or copy its torch tensors themselves,
+# rather than stage blocks through host buffers.
+DEVICE_MEMORY: Final = (
+    "registers the cache's device memory, which the engine does not map for it, rather than "
+    + "staging blocks in host buffers"
+)
+
+
+@pytest.mark.usefixtures("platform_env")
+@pytest.mark.feature("Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache)")
+@pytest.mark.parametrize(
+    ("transfer", "option", "requirement"),
+    [
+        (
+            KVTransferConfig(kv_connector="MooncakeConnector", kv_role="kv_both"),
+            "kv_transfer_config",
+            f"serves no Mooncake connector: it {DEVICE_MEMORY}",
+        ),
+        (
+            KVTransferConfig(kv_connector="MooncakeStoreConnector", kv_role="kv_both"),
+            "kv_transfer_config",
+            f"serves no Mooncake connector: it {DEVICE_MEMORY}",
+        ),
+        (
+            KVTransferConfig(kv_connector="MoRIIOConnector", kv_role="kv_both"),
+            "kv_transfer_config",
+            f"serves no MoRIIOConnector: it {DEVICE_MEMORY}",
+        ),
+        (
+            KVTransferConfig(kv_connector="LMCacheConnectorV1", kv_role="kv_both"),
+            "kv_transfer_config",
+            "serves no LMCache connector: it copies blocks of the cache's torch tensors itself, "
+            + "rather than staging blocks in host buffers",
+        ),
+        (
+            KVTransferConfig(kv_connector="LMCacheMPConnector", kv_role="kv_both"),
+            "kv_transfer_config",
+            "serves no LMCache connector: it copies blocks of the cache's torch tensors itself, "
+            + "rather than staging blocks in host buffers",
+        ),
+        (
+            KVTransferConfig(
+                kv_connector="NixlConnector",
+                kv_connector_module_path="vllm.distributed.kv_transfer.kv_connector.v1.nixl",
+                kv_role="kv_both",
+                kv_buffer_device="cpu",
+            ),
+            "kv_transfer_config",
+            NO_CONNECTOR,
+        ),
+        (
+            KVTransferConfig(kv_connector="NixlConnector", kv_role="kv_both"),
+            "kv_transfer_config.kv_buffer_device",
+            "stages NIXL's blocks in host buffers, so it takes kv_buffer_device=cpu: NIXL cannot "
+            + "register device memory, which the engine does not map for it",
+        ),
+    ],
+    ids=["mooncake", "mooncake-store", "moriio", "lmcache", "lmcache-mp", "module", "device"],
+)
+def test_refuses_connectors(
+    transfer: KVTransferConfig, option: str, requirement: str, served: Path
+) -> None:
+    """Startup names each KV connector setting the plugin cannot honor, with its reason."""
+    arguments = EngineArgs(
+        model=str(served), dtype="bfloat16", skip_tokenizer_init=True, kv_transfer_config=transfer
+    )
+    refusal = refused(arguments)
+    assert (refusal.option, refusal.requirement) == (option, requirement)
+
+
+@pytest.mark.usefixtures("platform_env")
+@pytest.mark.feature("Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache)")
+def test_refuses_nixl_over_tensor_ranks(served: Path) -> None:
+    """NIXL hands each tensor-parallel rank's worker its own heads, while one worker drives every
+    chip of the engine's split."""
+    arguments = EngineArgs(
+        model=str(served),
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        kv_transfer_config=nixl(),
+        tensor_parallel_size=2,
+    )
+    refusal = refused(arguments)
+    assert (refusal.option, refusal.requirement) == (
+        "tensor_parallel_size",
+        RANKS.format("connects through NIXL at tensor_parallel_size=1"),
+    )
+
+
+@pytest.mark.feature("Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache)")
+def test_refuses_connecting_recurrent_state(hybrid: Path) -> None:
+    """A NIXL connector moves the attention cache the engine holds, not a recurrent model's
+    state."""
+    arguments = EngineArgs(model=str(hybrid), dtype="bfloat16", kv_transfer_config=nixl())
+    refusal = refused(arguments)
+    assert (refusal.option, refusal.requirement) == (
+        "kv_transfer_config",
+        "connects the attention cache of a decoder, not recurrent state or encoder memory",
+    )
+
+
+@pytest.mark.usefixtures("platform_env")
+@pytest.mark.feature("Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache)")
+def test_refuses_connecting_an_encoder_only_instance(tmp_path: Path) -> None:
+    """An encoder-only instance runs a checkpoint's media encoder alone, which caches no
+    attention for a KV connector to move."""
+    AutoConfig.from_pretrained("unsloth/gemma-4-12b-it-NVFP4").save_pretrained(tmp_path)
+    producer = ECTransferConfig(ec_connector="ECExampleConnector", ec_role="ec_producer")
+    arguments = EngineArgs(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        ec_transfer_config=producer,
+        kv_transfer_config=nixl(),
+    )
+    refusal = refused(arguments)
+    assert (refusal.option, refusal.requirement) == (
+        "kv_transfer_config",
+        "connects the attention cache of a decoder, which an encoder-only instance does not run",
+    )
+
+
+@pytest.mark.feature("Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache)")
+def test_admits_requests_a_connector_routes() -> None:
+    """A greedy request stays served when vLLM passes its KV connector parameters among its
+    sampling extra arguments."""
+    request = CompletionRequest.model_validate(
+        {"prompt": "p", "temperature": 0, "kv_transfer_params": {"do_remote_decode": True}}
+    )
+    FuriosaPlatform.validate_request(tokens_input([1, 2]), request.to_sampling_params(1))
+
+
+# MultiConnector's entries of a NIXL connector and of the plugin's offloading connector.
+NIXL_ENTRY: Final[dict[str, object]] = {
+    "kv_connector": "NixlConnector",
+    "kv_role": "kv_both",
+    "kv_buffer_device": "cpu",
+}
+OFFLOADING_ENTRY: Final[dict[str, object]] = {
+    "kv_connector": "RNGDOffloadingConnector",
+    "kv_connector_module_path": offload.__name__,
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {"cpu_bytes_to_use": 1 << 30},
+}
+
+
+def multi(*entries: dict[str, object]) -> KVTransferConfig:
+    """vLLM's MultiConnector over the connectors `entries` name."""
+    return KVTransferConfig(
+        kv_connector="MultiConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={"connectors": list(entries)},
+    )
+
+
+@pytest.mark.usefixtures("platform_env")
+@pytest.mark.feature("Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache)")
+@pytest.mark.feature("KV cache offloading")
+@pytest.mark.parametrize(
+    ("entries", "built"),
+    [
+        ((NIXL_ENTRY, OFFLOADING_ENTRY), ["NixlPullConnector", "RNGDOffloadingConnector"]),
+        (
+            ({**NIXL_ENTRY, "kv_connector": "NixlPushConnector"}, OFFLOADING_ENTRY),
+            ["NixlPushConnector", "RNGDOffloadingConnector"],
+        ),
+        ((OFFLOADING_ENTRY, NIXL_ENTRY), ["RNGDOffloadingConnector", "NixlPullConnector"]),
+    ],
+    ids=["pull", "push", "offloading-first"],
+)
+def test_connects_through_a_multi_connector(
+    entries: tuple[dict[str, object], ...], built: list[str], served: Path
+) -> None:
+    """vLLM's MultiConnector over a NIXL connector and the plugin's offloading connector starts,
+    and vLLM's factory builds each connector it names."""
+    arguments = EngineArgs(
+        model=str(served),
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        kv_transfer_config=multi(*entries),
+    )
+    transfer = arguments.create_engine_config().kv_transfer_config
+    assert transfer is not None
+    assert transfer.kv_connector == "MultiConnector"
+    children = TypeAdapter(list[KVTransferConfig]).validate_python(
+        transfer.kv_connector_extra_config["connectors"]
+    )
+    assert [KVConnectorFactory.get_connector_class(c).__name__ for c in children] == built
+
+
+@pytest.mark.usefixtures("platform_env")
+@pytest.mark.feature("Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache)")
+@pytest.mark.feature("KV cache offloading")
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {
+            **OFFLOADING_ENTRY,
+            "kv_connector_extra_config": {"cpu_bytes_to_use": 1 << 30, "canonical_layout": True},
+        },
+        {
+            **OFFLOADING_ENTRY,
+            "kv_connector_extra_config": {
+                "cpu_bytes_to_use": 1 << 30,
+                "secondary_tiers": [{"type": "fs", "root_dir": "/cache"}],
+                "spec_name": "TieringOffloadingSpec",
+            },
+        },
+    ],
+    ids=["canonical-layout", "filesystem-tier"],
+)
+def test_connects_with_filesystem_offload_options(entry: dict[str, object], served: Path) -> None:
+    """NIXL MultiConnector preserves supported filesystem and canonical-layout offload options."""
+    arguments = EngineArgs(
+        model=str(served),
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        kv_transfer_config=multi(NIXL_ENTRY, entry),
+    )
+    transfer = arguments.create_engine_config().kv_transfer_config
+    assert transfer is not None and transfer.kv_connector == "MultiConnector"
+
+
+@pytest.mark.usefixtures("platform_env")
+@pytest.mark.feature("Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache)")
+@pytest.mark.feature("KV cache offloading")
+@pytest.mark.parametrize(
+    "transfer",
+    [nixl(), multi(NIXL_ENTRY)],
+    ids=["single-nixl", "multi-connector"],
+)
+def test_offloading_size_preserves_nixl(transfer: KVTransferConfig, served: Path) -> None:
+    """`--kv-offloading-size` adds the offload adapter without replacing configured NIXL."""
+    arguments = EngineArgs(
+        model=str(served),
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        kv_offloading_size=1,
+        kv_transfer_config=transfer,
+    )
+    combined = arguments.create_engine_config().kv_transfer_config
+    assert combined is not None and combined.kv_connector == "MultiConnector"
+    children = TypeAdapter(list[KVTransferConfig]).validate_python(
+        combined.kv_connector_extra_config["connectors"]
+    )
+    assert [child.kv_connector for child in children] == [
+        "NixlConnector",
+        "RNGDOffloadingConnector",
+    ]
+    assert children[1].kv_connector_extra_config["cpu_bytes_to_use"] == 1 << 30
+
+
+@pytest.mark.usefixtures("platform_env")
+@pytest.mark.feature("Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache)")
+@pytest.mark.feature("KV cache offloading")
+@pytest.mark.parametrize(
+    ("beside", "option", "requirement"),
+    [
+        (
+            Beside(data_parallel_size=2),
+            "data_parallel_size",
+            "offloads at data_parallel_size=1: vLLM ranks each replica's worker among all replicas",
+        ),
+        (
+            Beside(enable_sleep_mode=True),
+            "enable_sleep_mode",
+            "offloads the KV cache without sleep mode, which frees the cache its host tier copies",
+        ),
+    ],
+    ids=["data-parallel", "sleep-mode"],
+)
+def test_refuses_a_multi_connector_beside_unsupported_offloading(
+    beside: Beside, option: str, requirement: str, served: Path
+) -> None:
+    """NIXL support does not broaden the offloading connector's data-parallel or sleep contract."""
+    arguments = EngineArgs(
+        model=str(served),
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        kv_transfer_config=multi(NIXL_ENTRY, OFFLOADING_ENTRY),
+        **beside,
+    )
+    refusal = refused(arguments)
+    assert (refusal.option, refusal.requirement) == (option, requirement)
+
+
+@pytest.mark.usefixtures("platform_env")
+@pytest.mark.feature("Disaggregated prefill and KV connectors (NIXL, Mooncake, MoRIIO, LMCache)")
+@pytest.mark.feature("KV cache offloading")
+@pytest.mark.parametrize(
+    ("entry", "tensor", "option", "requirement"),
+    [
+        (
+            {"kv_connector": "NixlConnector", "kv_role": "kv_both"},
+            1,
+            "kv_transfer_config.kv_buffer_device",
+            "stages NIXL's blocks in host buffers, so it takes kv_buffer_device=cpu: NIXL cannot "
+            + "register device memory, which the engine does not map for it",
+        ),
+        (
+            {"kv_connector": "OffloadingConnector", "kv_role": "kv_both"},
+            1,
+            "kv_transfer_config",
+            "offloads through RNGDOffloadingConnector, which --kv-offloading-size selects: vLLM's "
+            + "OffloadingConnector copies through CUDA streams",
+        ),
+        (
+            {"kv_connector": "MooncakeConnector", "kv_role": "kv_both"},
+            1,
+            "kv_transfer_config",
+            f"serves no Mooncake connector: it {DEVICE_MEMORY}",
+        ),
+        (
+            {
+                **OFFLOADING_ENTRY,
+                "kv_connector_extra_config": {
+                    "cpu_bytes_to_use": 1 << 30,
+                    "spec_name": "ExampleSpec",
+                },
+            },
+            1,
+            "kv_connector_extra_config",
+            "uses vLLM's CPUOffloadingSpec for host offload or stock TieringOffloadingSpec when "
+            + "secondary tiers are configured",
+        ),
+        (
+            OFFLOADING_ENTRY,
+            2,
+            "tensor_parallel_size",
+            RANKS.format("connects through NIXL at tensor_parallel_size=1"),
+        ),
+    ],
+    ids=["device", "vllm-offloading", "mooncake", "unsupported-spec", "tp"],
+)
+def test_refuses_multi_connector_entries(
+    entry: dict[str, object], tensor: int, option: str, requirement: str, served: Path
+) -> None:
+    """Startup names a MultiConnector's connector setting the plugin cannot honor as it names that
+    setting of a single connector."""
+    arguments = EngineArgs(
+        model=str(served),
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        kv_transfer_config=multi(NIXL_ENTRY, entry),
+        tensor_parallel_size=tensor,
+    )
+    refusal = refused(arguments)
+    assert (refusal.option, refusal.requirement) == (option, requirement)
+
+
+@pytest.mark.usefixtures("platform_env")
+@pytest.mark.feature("KV cache offloading")
+def test_logs_offloading_beside_another_connector(served: Path) -> None:
+    """vLLM's frontend reads the offloading stats a MultiConnector's engine reports for the
+    plugin's connector, which arrive serialized under the connector's class name."""
+    config = EngineArgs(
+        model=str(served),
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        kv_transfer_config=multi(NIXL_ENTRY, OFFLOADING_ENTRY),
+    ).create_engine_config()
+    stats = OffloadingConnectorStats()
+    stats.increase_counter("vllm:kv_offload_load_bytes", 128)
+    logging = KVConnectorLogging(config.kv_transfer_config)
+    logging.observe({offload.RNGDOffloadingConnector.__name__: stats.to_dict()})
+    assert logging.transfer_stats_accumulator is not None
+    assert logging.transfer_stats_accumulator.reduce() == {
+        offload.RNGDOffloadingConnector.__name__: {"vllm:kv_offload_load_bytes": 128}
+    }
 
 
 class Online(TypedDict, total=False):
