@@ -106,3 +106,54 @@ With overlap enabled, SGLang schedules the next step and processes the previous 
 Mixed chunks interleave prompt chunks with running requests' decode rows in one step.
 
 The full step logic is in [`generation/sequence.py` of vLLM](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/integrations/furiosa-opt-vllm/furiosa_opt_vllm/generation/sequence.py) and [of SGLang](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/integrations/furiosa-opt-sglang/furiosa_opt_sglang/generation/sequence.py).
+
+### Mooncake Store upgrades
+
+SGLang storage depends on private Store hooks and HiCache host-pool ownership; revalidate these boundaries after a SGLang upgrade.
+
+- Review `FuriosaHiCacheMooncake` in `integrations/furiosa-opt-sglang/furiosa_opt_sglang/mooncake.py`.
+- Check `_load_config`, `_tag_keys`, and `_batch_exist` signatures, initialization order, key semantics, and return values.
+- Recheck `register_mem_pool_host`, `register_mem_host_pool_v2`, `batch_exists`, `batch_exists_v2`, `batch_get_v1/v2`, and `batch_set_v1/v2`, including `PoolName`, `PoolTransfer`, and `PoolTransferResult` shapes.
+- Revalidate `_FuriosaHostPool` ownership and fields: `host_cache`, `_page_index`, `page_num`, `page_size`, `dtype`, `layer_num`, `start_layer`, `end_layer`, `chips`, and `sizes`.
+- Check that `offload.py` selects the backend through SGLang's dynamic storage configuration and that `platform.py` accepts `mooncake`.
+- Recheck the host-node lock through storage-write acknowledgment, synchronous backup writes, and prefetch completion before host-index release in `srt/managers/cache_controller.py` and `srt/mem_cache/unified_radix_cache.py`.
+
+## vLLM specifics
+
+vLLM storage uses its native Store scheduler and connector lifecycle; revalidate those upstream boundaries after a vLLM upgrade.
+
+- Review `FuriosaMooncakeStoreConnector` and `FuriosaMooncakeStoreWorker` in `integrations/furiosa-opt-vllm/furiosa_opt_vllm/mooncake_store.py`.
+- Revalidate the inherited `MooncakeStoreScheduler` and `MooncakeStoreConnector` lifecycle: lookup, block pinning, completion metadata, request retirement, events, and shutdown.
+- Revalidate `ChunkedTokenDatabase`, `ReqMeta`, coordinator masks, Store layout, and projection of cache groups into request metadata.
+- Recheck engine group mapping, page byte counts, one slab registration, bounded page leases, and uncertain-I/O retention. Keep supported cache groups and namespace inputs aligned with the [vLLM serving contract](../serving/vllm.md#shared-mooncake-store-prefix-cache).
+- The connector replaces upstream's receiver; preserve its disk GET budget, usable-ratio, batch splitting, and oversized-key failure behavior.
+- Recheck `MooncakeStoreConfig`, `setup_mooncake_store`, `ReplicateConfig`, Store disk-budget configuration, and `VLLM_MOONCAKE_LOAD_RECV_THREADS`.
+
+## Shared Mooncake storage compatibility
+
+The adapters share engine page-lifetime and result-validation rules while retaining their frameworks' native Store lifecycles.
+
+### Dependency and version checks
+
+Each plugin manifest owns its framework dependency and optional Mooncake range. The Mooncake contract workflow in `.github/workflows/test.yml` checks that both Mooncake ranges match and tests their minimum and newest allowed stable versions on RNGD.
+
+### Shared pointer and page-format contracts
+
+These invariants apply to both adapters and are implemented once in the shared engine modules.
+
+- `HostRegionRegistrar` retains a `HostSlot` allocation while its address is registered. Successful unregistration releases it; failed unregistration keeps the registrar, Store owner, and allocations rooted until process exit.
+- `MooncakeIOGuard` retains page leases and Store state when pointer-I/O completion is uncertain. Keep GET and PUT outcomes in the shared classifier; widen them only when the Mooncake contract proves pointer access has stopped, and update its tests.
+- `ENGINE_PAGE_FORMAT_VERSION` in `crates/furiosa-opt-engine/python/furiosa_opt_engine/_mooncake.py` changes when serialized page bytes or byte order change. Framework cache identity is separate and is documented in each serving page.
+- Existence responses must remain one integer `0` or `1` per key. Reject malformed responses before passing page pointers to a transfer call.
+- The vLLM adapter uses `batch_is_exist`, `batch_get_into_multi_buffers`, and `batch_put_from_multi_buffers`. SGLang reaches `batch_is_exist`, `batch_get_into`, and `batch_put_from` through `MooncakeStore`.
+
+### Transport and contract tests
+
+The current RNGD contract suite establishes TCP storage only. It covers registration, PUT, GET, unregistration, and shutdown with real engine host memory; it does not establish RDMA support or measure performance.
+
+| Framework | Upgrade contract tests |
+| --- | --- |
+| vLLM | `integrations/furiosa-opt-vllm/tests/test_mooncake.py`; `integrations/mooncake-contract-tests/test_vllm.py` |
+| SGLang | `integrations/furiosa-opt-sglang/tests/test_cache_transfer.py`; `integrations/furiosa-opt-sglang/tests/test_mooncake.py`; `integrations/mooncake-contract-tests/test_sglang.py` |
+
+Before documenting another storage transport, run the registration and pointer-I/O contracts on RNGD with that transport. Host fakes cannot validate DMA-heap registration. Never simulate RNGD kernels on CPU.

@@ -78,6 +78,13 @@ python -m sglang.launch_server --model-path Qwen/Qwen3-1.7B \
   --hicache-storage-backend mooncake
 ```
 
+#### Compatibility
+
+The adapter must match the SGLang version pinned in
+`integrations/furiosa-opt-sglang/pyproject.toml`; that manifest's optional `mooncake` extra owns
+the Mooncake version range. The [shared Mooncake compatibility contract](../engine/frameworks.md#shared-mooncake-storage-compatibility)
+describes upgrade validation.
+
 The Mooncake backend preserves SGLang's lookup lifecycle and stores one complete engine page per key. Its namespace includes model, parallelism and page layout, so instances share entries only when those match. It does not fingerprint checkpoint revisions; change `extra_backend_tag` when weights change under the same model name. `standalone_storage` is unsupported because Mooncake must register engine-owned host pages.
 
 ## Features not supported yet

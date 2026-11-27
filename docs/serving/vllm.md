@@ -63,6 +63,13 @@ vllm serve Qwen/Qwen3-0.6B \
   --kv-transfer-config '{"kv_connector":"FuriosaMooncakeStoreConnector","kv_connector_module_path":"furiosa_opt_vllm.mooncake_store","kv_role":"kv_both","kv_connector_extra_config":{"cache_prefix":"production","staging_buffer_size_mb":1024}}'
 ```
 
+### Compatibility
+
+The adapter must match the vLLM version pinned in `integrations/furiosa-opt-vllm/pyproject.toml`;
+that manifest's optional `mooncake` extra owns the Mooncake version range. The [shared Mooncake
+compatibility contract](../engine/frameworks.md#shared-mooncake-storage-compatibility) describes
+upgrade validation.
+
 Use the same `cache_prefix` and model identifier on instances that share KV. The adapter adds an engine page-format, cache-spec, dtype, layout and parallelism namespace. vLLM's Store key does not fingerprint checkpoint revisions; change `cache_prefix` when weights change under the same model identifier. Use `kv_role` `kv_producer` or `kv_consumer` when an instance should only write or read.
 
 The adapter registers one bounded staging slab and passes page buffers to Mooncake's native multi-buffer Store API. `staging_buffer_size_mb` controls that pinned slab and defaults to 1024 MiB. If the Mooncake Store service has its own disk tier, configure it on the Mooncake deployment; the vLLM connector uses that tier through the same Store API. This option is separate from the local filesystem `secondary_tiers` configuration above. The Mooncake disk path has not been performance-compared with the local filesystem tier.

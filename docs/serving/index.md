@@ -175,7 +175,7 @@ filesystem secondary tiers and from disaggregated KV transfer between prefill an
 
     Configure SGLang's Mooncake HiCache backend as described in [SGLang Mooncake storage](sglang.md#mooncake-storage).
 
-If Mooncake I/O fails without confirmed completion, or page unregistration fails, the adapter retains affected pages and Store state until process exit. Restart the server; [Mooncake compatibility](../develop/compatibility.md#shared-storage-safety-contracts) documents this safety rule.
+If Mooncake I/O fails without confirmed completion, or page unregistration fails, the adapter retains affected pages and Store state until process exit. Restart the server; [shared Mooncake compatibility](../engine/frameworks.md#shared-mooncake-storage-compatibility) documents this safety rule.
 
 ## Put the server to sleep
 
