@@ -24,17 +24,19 @@ The platform accepts these values:
 | `rope_parameters` or `rope_scaling` and `max_position_embeddings` in `--json-model-override-args` | A `rope_type` the engine computes, within the compiled window ([Extend the context](index.md#extend-the-context-past-the-trained-length)) |
 | `--mem-fraction-static` | Unset defaults to 0.9, leaving the headroom a model split over chips needs |
 | `--enable-deterministic-inference` | Off, or on to load the model [batch invariant](index.md#keep-outputs-independent-of-the-batch) with the radix cache on |
-| `--enable-hierarchical-cache` | A model without recurrent state, with the host tier sized by `--hicache-ratio` or `--hicache-size`; use storage backend `file` or `mooncake` with the required modes ([details](#hierarchical-cache)) |
+| `--enable-hierarchical-cache` | Models without recurrent state; configure host-tier size, storage backend, and required modes as described in [Hierarchical cache](#hierarchical-cache) |
 
 ## Hierarchical cache
 
 ### Configure the host tier
 
-The plugin connects SGLang's HiCache page selection and lifecycle to engine-pinned host slots. Choose a host-tier size with `--hicache-ratio` or `--hicache-size`; the [serving task guide](index.md#offload-the-kv-cache-to-host-memory) has the filesystem launch command.
+The plugin connects SGLang's HiCache page selection and lifecycle to engine-pinned host slots. Choose a host-tier size with `--hicache-ratio` or `--hicache-size` and use `--hicache-host-memory-mode cache`, `--hicache-io-backend kernel`, and `--hicache-mem-layout page_first`.
 
-The filesystem tier uses SGLang's `file` option and `FuriosaHiCacheFile`; the [serving task guide](index.md#offload-the-kv-cache-to-host-memory) has the launch command. Set `--hicache-host-memory-mode cache`, `--hicache-io-backend kernel` and `--hicache-mem-layout page_first`. The storage backend must be unset, `file` or `mooncake`; other backends need their own host-buffer integration. Automatic sizing from free host memory is available only for pools SGLang allocates itself.
+The accepted storage backends are unset, `file`, and `mooncake`; other backends need their own host-buffer integration. Automatic sizing from free host memory is available only for pools SGLang allocates itself.
 
-The adapter loads through SGLang's `dynamic` storage-backend factory and preserves SGLang's cache keys and file-tier lifecycle. The [shared filesystem guide](../engine/frameworks.md#filesystem-layout-and-io) defines the file format and I/O alignment behavior.
+### Filesystem tier
+
+The `file` backend selects `FuriosaHiCacheFile`; the [serving task guide](index.md#offload-the-kv-cache-to-host-memory) has its launch command. The adapter uses SGLang's `dynamic` storage-backend factory and preserves SGLang's cache keys and file-tier lifecycle. The [shared filesystem guide](../engine/frameworks.md#filesystem-layout-and-io) owns the file format and I/O alignment rules.
 
 ### Coalesce page restores
 

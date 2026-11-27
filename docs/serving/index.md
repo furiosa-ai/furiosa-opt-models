@@ -28,6 +28,7 @@ Install a plugin first ([Installation](../getting-started/installation.md)); [Qu
 | Quantized checkpoints (FP8, NVFP4) | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Online quantization | <span class="support support-yes">Supported</span> | <span class="support support-no">Not yet</span> | [Quantize a BF16 checkpoint at load](#quantize-a-bf16-checkpoint-at-load) |
 | KV cache offloading | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Offload the KV cache to host memory](#offload-the-kv-cache-to-host-memory) |
+| Shared prompt-prefix storage (Mooncake Store) | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Share prefix KV through Mooncake Store](#share-prefix-kv-through-mooncake-store) |
 | Sleep mode | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> (without speculative decoding) | [Put the server to sleep](#put-the-server-to-sleep) |
 | Long contexts, up to the compiled window | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Serve long contexts](#serve-long-contexts) |
 | Context extension past the trained length | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Extend the context past the trained length](#extend-the-context-past-the-trained-length) |
@@ -35,7 +36,7 @@ Install a plugin first ([Installation](../getting-started/installation.md)); [Qu
 | Data parallelism | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Run data-parallel replicas](#run-data-parallel-replicas) |
 | Pipeline, expert and context parallelism | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | LoRA | <span class="support support-yes">Supported</span> | <span class="support support-no">Not yet</span> | [Serve LoRA adapters](#serve-lora-adapters) |
-| Disaggregated KV transfer (NIXL, Mooncake, MoRIIO, LMCache) | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
+| Disaggregated KV transfer (NIXL, Mooncake Transfer Engine, MoRIIO, LMCache) | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Disaggregated encoder and encoder caches | <span class="support support-no">Not yet</span> | <span class="support support-no">Not yet</span> | [Not supported yet](#features-not-supported-yet) |
 | Per-request metrics | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Report per-request metrics](#report-per-request-metrics) |
 | Batch invariance | <span class="support support-yes">Supported</span> | <span class="support support-yes">Supported</span> | [Keep outputs independent of the batch](#keep-outputs-independent-of-the-batch) |
@@ -145,8 +146,6 @@ Both servers copy the cache blocks of computed prompts to a tier of host memory,
 
     `--kv-offloading-size` sets the host tier capacity in GiB. The vLLM plugin keeps vLLM's tier policy and supplies its filesystem tier; see [vLLM KV cache offloading](vllm.md#kv-cache-offloading) for configuration and compatibility details.
 
-    To share prefix KV through Mooncake Store, see [vLLM Mooncake storage](vllm.md#shared-mooncake-store-prefix-cache) for installation and configuration. This uses vLLM's direct Store connector, not `secondary_tiers`.
-
 === "SGLang"
 
     ```bash
@@ -156,13 +155,27 @@ Both servers copy the cache blocks of computed prompts to a tier of host memory,
       --hicache-storage-backend-extra-config '{"file_storage_path":"/mnt/kv-cache"}'
     ```
 
-    SGLang's HiCache keeps its page selection and lifecycle; the plugin connects its `file` or `mooncake` tier to engine storage. See [SGLang hierarchical cache](sglang.md#hierarchical-cache) for configuration and compatibility details.
+    SGLang's HiCache keeps its page selection and lifecycle; the plugin connects the `file`
+    backend to engine storage. See [SGLang hierarchical cache](sglang.md#hierarchical-cache) for
+    configuration and compatibility details.
 
-    To share pages through Mooncake, see [SGLang Mooncake storage](sglang.md#mooncake-storage) for installation and configuration.
+Both plugins preserve their framework's scheduling and cache policy while using the shared engine transfer path. [Integrating frameworks](../engine/frameworks.md#offload-cache-pages) documents the common data path; the [vLLM](vllm.md#kv-cache-offloading) and [SGLang](sglang.md#hierarchical-cache) references define local host-tier behavior.
 
-Both plugins preserve their framework's scheduling and cache policy while using the shared engine transfer path. [Integrating frameworks](../engine/frameworks.md#offload-cache-pages) documents the common data path; the [vLLM](vllm.md#kv-cache-offloading) and [SGLang](sglang.md#hierarchical-cache) references define local host-tier behavior. The [vLLM Mooncake Store connector](vllm.md#shared-mooncake-store-prefix-cache) defines remote prefix sharing.
+## Share prefix KV through Mooncake Store
 
-If Mooncake I/O fails without confirmed completion, or page unregister fails, the adapter retains affected pages and Store state until process exit. Restart the server; [Mooncake compatibility](../develop/compatibility.md#shared-storage-safety-contracts) documents this safety rule.
+Mooncake Store lets a server reuse completed prompt KV written by another server through each
+framework's native storage integration. This remote prefix-storage path is separate from local
+filesystem secondary tiers and from disaggregated KV transfer between prefill and decode servers.
+
+=== "vLLM"
+
+    Configure vLLM's native Mooncake Store connector as described in [vLLM Mooncake Store prefix cache](vllm.md#shared-mooncake-store-prefix-cache).
+
+=== "SGLang"
+
+    Configure SGLang's Mooncake HiCache backend as described in [SGLang Mooncake storage](sglang.md#mooncake-storage).
+
+If Mooncake I/O fails without confirmed completion, or page unregistration fails, the adapter retains affected pages and Store state until process exit. Restart the server; [Mooncake compatibility](../develop/compatibility.md#shared-storage-safety-contracts) documents this safety rule.
 
 ## Put the server to sleep
 
@@ -393,4 +406,6 @@ Why each feature is not served yet:
 - **Online quantization** with SGLang, and with vLLM any method but `fp8_per_tensor`: the other methods quantize the activations too or use other formats, and the SGLang plugin passes no quantization to the load.
 - **Tensor, pipeline, expert and context parallelism**, and serving across nodes: each served checkpoint runs on one chip.
 - **LoRA with SGLang**: `--enable-lora` and `--lora-paths` are refused; the SGLang plugin runs no adapter yet.
-- **Disaggregated KV transfer and encoder caches**: request KV is not transferred directly between prefill and decode instances; shared secondary storage is described under [KV cache offloading](#offload-the-kv-cache-to-host-memory). Of a disaggregated encoder, only the [encoder-only instance](#embed-media-on-an-encoder-only-instance) runs.
+- **Disaggregated KV transfer and encoder caches**: request KV is not transferred directly between prefill and decode instances. This limitation is separate from the supported [Mooncake Store prefix-sharing
+  path](#share-prefix-kv-through-mooncake-store). Of a disaggregated encoder, only the
+  [encoder-only instance](#embed-media-on-an-encoder-only-instance) runs.

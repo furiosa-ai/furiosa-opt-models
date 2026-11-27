@@ -84,8 +84,8 @@ Mooncake storage adds an optional Python extra to the serving plugin; install it
     CARGO=cargo-furiosa-opt uv pip install --prerelease=allow './integrations/furiosa-opt-sglang[mooncake]'
     ```
 
-The Mooncake Store extension also needs system runtime libraries. On Ubuntu, install them with
-`sudo apt install ibverbs-providers libcurl4 libibverbs1 libnuma1`; other distributions need their
+The Mooncake Store extension also needs system runtime libraries. From the repository root on
+Ubuntu, run `sudo ./scripts/install_mooncake_runtime_dependencies.sh`; other distributions need
 equivalent packages.
 
 The [vLLM](../serving/vllm.md#shared-mooncake-store-prefix-cache) and [SGLang](../serving/sglang.md#mooncake-storage) references show Store configuration.

@@ -8,7 +8,8 @@ Exact version ranges live in plugin manifests, which the Mooncake contract workf
 
 ## Adapter paths
 
-The two storage adapters preserve their frameworks' native prefix-cache lifecycles.
+Each adapter follows its framework's native prefix-cache lifecycle, using framework-specific hooks
+and shared engine page-lifetime primitives.
 
 | Framework | Storage integration | Upstream boundary |
 | --- | --- | --- |
@@ -61,9 +62,9 @@ vLLM storage depends on upstream's native Store scheduler and key contract. Revi
   vLLM's cache groups are projected to the prefix-cacheable groups in request metadata.
 - Recheck engine cache group mapping, page byte counts, one host slab registration, bounded page
   leases, and the uncertain-I/O retention path.
-- Preserve the namespace over engine page format, vLLM cache specs, dtype, layout and topology.
-  The checkpoint revision remains the operator's `cache_prefix` responsibility, matching upstream.
-- Keep Paged full/sliding support explicit; the adapter rejects `State` and `Cross` cache groups.
+- Revalidate cache-group support and namespace inputs against the [vLLM serving
+  contract](../serving/vllm.md#shared-mooncake-store-prefix-cache); that page owns published
+  support and sharing-identity behavior.
 - The adapter replaces upstream's receiver, so retain upstream's Mooncake disk GET budget,
   usable-ratio, batch-splitting and oversized-key failure behavior.
 
@@ -121,11 +122,10 @@ on RNGD with that transport; host fakes cannot validate DMA-heap registration.
 
 ## Version-change verification
 
-The required Mooncake contract workflow in `.github/workflows/test.yml` builds wheels and tests the
-minimum declared Mooncake version plus the newest stable allowed 0.3.x release on RNGD. It derives
-the minimum from both plugin manifests and runs one matrix entry if minimum and latest match.
+The required Mooncake contract workflow in `.github/workflows/test.yml` owns version selection and
+the RNGD matrix. This table lists the framework contract tests it runs.
 
-| Framework | Minimum/latest and RNGD contract tests |
+| Framework | Contract tests |
 | --- | --- |
 | vLLM | `integrations/furiosa-opt-vllm/tests/test_mooncake.py`; `integrations/mooncake-contract-tests/test_vllm.py` |
 | SGLang | `integrations/furiosa-opt-sglang/tests/test_cache_transfer.py`; `integrations/furiosa-opt-sglang/tests/test_mooncake.py`; `integrations/mooncake-contract-tests/test_sglang.py` |
