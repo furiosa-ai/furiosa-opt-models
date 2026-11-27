@@ -57,9 +57,7 @@ jobs:
           FURIOSA_OPT_PROFILE: info
       - name: Install Mooncake native runtime dependencies
         if: inputs.mooncake_contract
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -yqq ibverbs-providers libcurl4 libibverbs1 libnuma1
+        run: sudo ./scripts/install_mooncake_runtime_dependencies.sh
       - name: Resolve newest stable Mooncake release
         id: mooncake_versions
         if: inputs.mooncake_contract
