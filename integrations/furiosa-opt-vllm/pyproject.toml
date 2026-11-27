@@ -25,6 +25,7 @@ dependencies = [
 
 [project.optional-dependencies]
 diffusion = ["diffusers==0.40.0"]
+mooncake = ["mooncake-transfer-engine-non-cuda>=0.3.12,<0.4.0"]
 omni = ["vllm-omni==0.31.0rc1"]
 suffix = ["arctic-inference==0.3.0"]
 

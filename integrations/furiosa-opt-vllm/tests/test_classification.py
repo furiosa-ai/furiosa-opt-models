@@ -7,13 +7,15 @@ from collections.abc import Generator
 from typing import TYPE_CHECKING, Final
 
 import pytest
+
 from conftest import Reference, post
 
 if TYPE_CHECKING:
     import torch
-    from conftest import Options, Row
     from vllm import LLM
     from vllm.entrypoints.pooling.scoring.typing import ScoreInput
+
+    from conftest import Options, Row
 
 TASK = "classification"
 PROMPTS: Final = [

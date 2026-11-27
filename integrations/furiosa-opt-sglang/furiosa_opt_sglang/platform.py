@@ -155,15 +155,15 @@ class Hierarchical(Served):
     hicache_ratio: float
     hicache_size: int
     hicache_write_policy: str
-    hicache_storage_backend: Literal["file"] | None = Field(
+    hicache_storage_backend: Literal["file", "mooncake"] | None = Field(
         default=None,
-        description="uses SGLang's file backend for L3; omit --hicache-storage-backend otherwise",
+        description="uses SGLang's file or Mooncake HiCache storage; omit otherwise",
     )
     hicache_storage_backend_extra_config: str | None = Field(
         default=None,
         description=(
             "accepts Furiosa's coalescing flag and passes remaining options "
-            "to SGLang's file backend"
+            "to the selected storage backend"
         ),
     )
     hicache_host_memory_mode: Literal["cache"] = Field(

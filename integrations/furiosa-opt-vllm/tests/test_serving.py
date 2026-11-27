@@ -10,6 +10,7 @@ from contextlib import suppress
 from typing import TYPE_CHECKING, Final
 
 import pytest
+
 from conftest import post, stop
 
 if TYPE_CHECKING:

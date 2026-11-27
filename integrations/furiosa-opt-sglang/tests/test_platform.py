@@ -3,6 +3,7 @@
 import pytest
 from sglang.srt.server_args import ServerArgs, prepare_server_args
 
+import furiosa_opt_sglang.offload as offload
 from furiosa_opt_sglang.platform import (
     Hierarchical,
     Platform,
@@ -135,11 +136,6 @@ HIERARCHICAL = ("--enable-hierarchical-cache", "--hicache-ratio", "2")
     ("flags", "option", "requirement"),
     [
         (
-            ("--hicache-storage-backend", "mooncake"),
-            "hicache_storage_backend",
-            "uses SGLang's file backend for L3; omit --hicache-storage-backend otherwise",
-        ),
-        (
             ("--hicache-host-memory-mode", "buffer_only"),
             "hicache_host_memory_mode",
             "keeps host pages as a cache tier; omit --hicache-host-memory-mode",
@@ -219,6 +215,56 @@ def test_accepts_file_storage_backend() -> None:
     )
     arguments.resolve_once()
     assert arguments.hicache_storage_backend == "file"
+
+
+@pytest.mark.feature("KV cache offloading")
+def test_accepts_mooncake_storage_backend() -> None:
+    arguments = prepare_server_args(
+        [
+            "--model-path",
+            "Qwen/Qwen3-1.7B",
+            *HIERARCHICAL,
+            "--hicache-storage-backend",
+            "mooncake",
+        ]
+    )
+    arguments.resolve_once()
+    assert arguments.hicache_storage_backend == "mooncake"
+
+
+@pytest.mark.feature("KV cache offloading")
+@pytest.mark.parametrize(
+    ("backend", "options", "expected"),
+    [
+        (
+            "file",
+            {"root_dir": "/cache"},
+            {
+                "root_dir": "/cache",
+                "backend_name": "furiosa_file",
+                "module_path": "furiosa_opt_sglang.storage",
+                "class_name": "FuriosaHiCacheFile",
+            },
+        ),
+        (
+            "mooncake",
+            {"prefix": "test"},
+            {
+                "prefix": "test",
+                "backend_name": "furiosa_mooncake",
+                "module_path": "furiosa_opt_sglang.mooncake",
+                "class_name": "FuriosaHiCacheMooncake",
+            },
+        ),
+    ],
+)
+def test_storage_backend_selects_adapter(
+    backend: str, options: dict[str, object], expected: dict[str, object]
+) -> None:
+    resolved_backend, resolved_options = offload._resolve_storage_backend(backend, options)
+
+    assert resolved_backend == "dynamic"
+    assert resolved_options == expected
 
 
 @pytest.mark.parametrize(

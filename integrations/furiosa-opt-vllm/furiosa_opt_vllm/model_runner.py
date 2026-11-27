@@ -9,6 +9,7 @@ from vllm.v1.worker.gpu.kv_connector import get_kv_connector
 from furiosa_opt_vllm import embedding, generation, load, multimodal, paging, request
 from furiosa_opt_vllm.decoder import Decoder
 from furiosa_opt_vllm.generation import sequence
+from furiosa_opt_vllm.mooncake_store import FuriosaMooncakeStoreConnector
 from furiosa_opt_vllm.multimodal import Media
 from furiosa_opt_vllm.offload import RNGDOffloadingConnector
 from furiosa_opt_vllm.runner import Runner
@@ -40,11 +41,15 @@ class FuriosaModelRunner(Runner):
         if not has_kv_transfer_group():
             return
         connector = get_kv_transfer_group()
-        # The platform admits only the offloading connector, for the cache of a decoder the engine
-        # holds.
-        assert isinstance(connector, RNGDOffloadingConnector) and self.cache is not None
-        assert isinstance(self.model, Decoder) and self.model.model is not None
-        connector.register(self.cache, self.model.model.parallel)
+        if self.cache is None or not isinstance(self.model, Decoder) or self.model.model is None:
+            raise RuntimeError("KV cache connectors require a loaded decoder cache")
+        chips = self.model.model.parallel
+        if isinstance(connector, RNGDOffloadingConnector):
+            connector.register(self.cache, chips)
+        elif isinstance(connector, FuriosaMooncakeStoreConnector):
+            connector.register_engine_cache(self.cache, chips)
+        else:
+            raise TypeError(f"unsupported Furiosa KV connector: {type(connector).__name__}")
         # vLLM's attention layers, which the engine replaces, hold no cache tensors to register.
         self.kv_connector = get_kv_connector(self.vllm_config, {})
 

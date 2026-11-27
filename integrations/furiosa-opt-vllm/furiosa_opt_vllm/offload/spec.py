@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from typing_extensions import override
 from vllm.v1.kv_offload.base import OffloadingManager, OffloadingMetricMetadata
@@ -13,6 +13,30 @@ from vllm.v1.kv_offload.tiering.manager import (
     TieringOffloadingManager,
 )
 from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
+
+
+def _secondary_tier_configs(extra_config: dict[str, Any]) -> list[dict[str, Any]]:
+    secondary_configs = extra_config.get("secondary_tiers", [])
+    if not isinstance(secondary_configs, list):
+        raise ValueError("secondary_tiers must be a list of tier configurations")
+    for index, config in enumerate(secondary_configs):
+        if not isinstance(config, dict):
+            raise ValueError(f"secondary_tiers[{index}] must be a tier configuration object")
+    return cast(list[dict[str, Any]], secondary_configs)
+
+
+def _tier_factory_config(tier_config: dict[str, Any]) -> dict[str, Any]:
+    tier_type = tier_config.get("type")
+    if tier_type == "fs":
+        manager_type = "FuriosaFileSystemTierManager"
+        module_path = "furiosa_opt_vllm.offload.storage"
+    else:
+        raise ValueError(
+            f"unsupported secondary tier type {tier_type!r}; "
+            "Furiosa vLLM offload supports only 'fs'; use the native Mooncake Store connector "
+            "for shared Mooncake storage"
+        )
+    return {**tier_config, "type": manager_type, "module_path": module_path}
 
 
 class _LayoutView:
@@ -67,40 +91,36 @@ class FuriosaOffloadingSpec(CPUOffloadingSpec):
     def build_metric_definitions(
         cls, extra_config: dict[str, Any]
     ) -> dict[str, OffloadingMetricMetadata]:
-        if extra_config.get("secondary_tiers"):
-            return TieringOffloadingSpec.build_metric_definitions(extra_config)
+        secondary_configs = _secondary_tier_configs(extra_config)
+        if secondary_configs:
+            metric_config = {
+                **extra_config,
+                "secondary_tiers": [
+                    _tier_factory_config(tier_config) for tier_config in secondary_configs
+                ],
+            }
+            return TieringOffloadingSpec.build_metric_definitions(metric_config)
         return CPUOffloadingSpec.build_metric_definitions(extra_config)
 
     @override
     def get_manager(self) -> OffloadingManager:
         if self._manager is not None:
             return self._manager
-        secondary_configs = self.extra_config.get("secondary_tiers", [])
+        secondary_configs = _secondary_tier_configs(self.extra_config)
         if not secondary_configs:
             self._manager = super().get_manager()
             return self._manager
 
         if int(self.extra_config.get("store_threshold", 0)) >= 2:
-            raise ValueError("store_threshold is not supported with filesystem offload")
-        if not isinstance(secondary_configs, list):
-            raise ValueError("secondary_tiers must be a list of tier configurations")
+            raise ValueError("store_threshold is not supported with secondary storage offload")
 
         primary = _PinnedPrimaryTier(self)
         secondary_tiers = []
         try:
             for tier_config in secondary_configs:
-                if not isinstance(tier_config, dict) or tier_config.get("type") != "fs":
-                    raise ValueError(
-                        "Furiosa vLLM offload supports the filesystem tier in this release"
-                    )
-                options = {
-                    **tier_config,
-                    "type": "FuriosaFileSystemTierManager",
-                    "module_path": "furiosa_opt_vllm.offload.storage",
-                }
                 secondary_tiers.append(
                     SecondaryTierFactory.create_secondary_tier(
-                        options, primary.get_kv_memoryview(), self
+                        _tier_factory_config(tier_config), primary.get_kv_memoryview(), self
                     )
                 )
             self._manager = TieringOffloadingManager(primary, secondary_tiers)

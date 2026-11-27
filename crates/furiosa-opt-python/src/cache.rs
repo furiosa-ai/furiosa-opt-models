@@ -619,7 +619,10 @@ unsafe fn fill_slot_buffer(
 #[pymethods]
 impl PyCopy {
     /// Return whether the copy finished before `timeout` elapsed.
-    #[pyo3(signature = (timeout=Some(0.0)))]
+    #[pyo3(
+        signature = (timeout=Some(0.0)),
+        text_signature = "($self, timeout=0.0)"
+    )]
     fn done(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<bool> {
         let timeout = timeout
             .map(Duration::try_from_secs_f64)

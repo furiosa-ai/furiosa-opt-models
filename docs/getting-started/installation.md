@@ -68,6 +68,28 @@ Installation registers the platform and worker through SGLang's plugin entry poi
 
 `--prerelease=allow` is needed because SGLang pins a pre-release dependency (`cuda-tile`), which uv does not resolve by default.
 
+## Install optional Mooncake storage support
+
+Mooncake storage adds an optional Python extra to the serving plugin; install it in the same framework environment as that plugin.
+
+=== "vLLM"
+
+    ```bash
+    CARGO=cargo-furiosa-opt uv pip install --torch-backend cpu './integrations/furiosa-opt-vllm[mooncake]'
+    ```
+
+=== "SGLang"
+
+    ```bash
+    CARGO=cargo-furiosa-opt uv pip install --prerelease=allow './integrations/furiosa-opt-sglang[mooncake]'
+    ```
+
+The Mooncake Store extension also needs system runtime libraries. From the repository root on
+Ubuntu, run `sudo ./scripts/install_mooncake_runtime_dependencies.sh`; other distributions need
+equivalent packages.
+
+The [vLLM](../serving/vllm.md#shared-mooncake-store-prefix-cache) and [SGLang](../serving/sglang.md#mooncake-storage) references show Store configuration.
+
 ## Verify the installation
 
 To check that the compiled engine loads, run this command; it prints a `LoadOptions` object without opening a device:
