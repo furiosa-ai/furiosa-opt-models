@@ -21,7 +21,46 @@ The platform accepts these values:
 | `--logits-processors` | Processors of vLLM's V1 interface, under `VLLM_USE_V2_MODEL_RUNNER=0` |
 | `VLLM_BATCH_INVARIANT` | `0`, or `1` to load the model [batch invariant](index.md#keep-outputs-independent-of-the-batch) |
 | `--ec-transfer-config` | An encoder-only instance (`ec_role` `ec_producer`) through `ECExampleConnector`, for a checkpoint whose media encoder the engine loads alone |
-| `--kv-offloading-size` | Native offloading through `RNGDOffloadingConnector` ([Offload the KV cache to host memory](index.md#offload-the-kv-cache-to-host-memory)), at tensor, pipeline and data parallel degrees 1, without sleep mode, for a model without recurrent state or encoder memory and not on an encoder-only instance; `--kv-transfer-config` beside it adds `kv_connector_extra_config` options of vLLM's CPU offloading |
+| `--kv-offloading-size` | Enables native offloading through `RNGDOffloadingConnector`; [KV cache offloading](#kv-cache-offloading) lists supported layouts, settings and limits |
+
+## KV cache offloading
+
+### Configure the host tier
+
+vLLM keeps block selection, admission and eviction; the plugin implements vLLM's native CPU offloading contract through `RNGDOffloadingConnector`. Without a secondary tier, `--kv-offloading-size` sets the pinned host-tier capacity in GiB:
+
+```bash
+vllm serve Qwen/Qwen3-0.6B --kv-offloading-size 16
+```
+
+Add a filesystem tier through vLLM's `TieringOffloadingSpec`. `secondary_tiers` is vLLM's native `kv_connector_extra_config` field; Furiosa supplies the filesystem-tier manager over engine-pinned slots:
+
+```bash
+vllm serve Qwen/Qwen3-0.6B --kv-offloading-size 16 \
+  --kv-transfer-config '{"kv_connector_extra_config":{"secondary_tiers":[{"type":"fs","root_dir":"/mnt/kv-cache"}]}}'
+```
+
+Keep `blocks_per_chunk` and `eviction_policy` in vLLM's `kv_connector_extra_config`. The Furiosa-only `coalescing` option is disabled by default; set `"coalescing":true` beside `secondary_tiers` to enable it.
+
+### Coalesce worker-step loads
+
+Coalescing combines every load job started for one worker step into one engine staging transfer while vLLM tracks each job separately. The engine has no job-count cap, but staging memory grows with the step's aggregate load size. The [shared transfer guide](../engine/frameworks.md#optional-coalescing) describes the common costs and mechanics.
+
+### Filesystem tier
+
+The filesystem tier has no capacity limit or automatic stale-directory cleanup; operators remove old directories. Its file layout and direct-I/O rules are in the [shared filesystem guide](../engine/frameworks.md#filesystem-layout-and-io).
+
+### Page layout
+
+`canonical_layout` is accepted only when its page mapping is byte-identical to the engine layout and each vLLM worker maps to one engine chip. Startup rejects other mappings instead of converting page fragments. Without `canonical_layout`, each worker uses its local page layout. Offloading supports the model's compiled tensor-parallel chip counts, transfers each chip's page in rank order and reports completion only after the full transfer.
+
+### Cache groups and parallelism
+
+Offloading supports causal full-attention and sliding-window `Paged` cache groups; it does not support recurrent `State` or encoder `Cross` groups. It requires `CPUOffloadingSpec`, a compiled tensor-parallel chip count, pipeline and data parallel degrees of one, `kv_load_failure_policy` `fail`, and sleep mode off. A deployment remains single-replica because vLLM ranks each replica's worker among all data-parallel workers.
+
+### Failures and metrics
+
+A failed transfer poisons the touched memory, and the adapter reports the error when the copy ends. The `vllm:kv_offload_store_bytes` and `vllm:kv_offload_load_bytes` metrics count bytes moved in each direction.
 
 These features are not supported yet, and the plugin refuses them at startup rather than ignore them:
 
@@ -30,7 +69,7 @@ These features are not supported yet, and the plugin refuses them at startup rat
 - Speculative decoding with a method other than `ngram`, `suffix` or `draft_model`, with a `rejection_sample_method` other than `standard`, or with a recurrent model; suffix decoding with a batch-size schedule (`num_speculative_tokens_per_batch_size`); a draft model with `draft_sample_method` `probabilistic`, `use_heterogeneous_vocab`, or a `kv_cache_dtype` outside the values above.
 - Expert parallelism.
 - KV connectors other than `RNGDOffloadingConnector` (`--kv-transfer-config`), among them vLLM's own `OffloadingConnector`, an encoder cache connector other than the encoder-only one above (`--ec-transfer-config`), and weight offloading to the host (`--cpu-offload-gb`, `--offload-group-size`).
-- KV offloading through LMCache (`--kv-offloading-backend lmcache`), the simple CPU connector (`VLLM_USE_SIMPLE_KV_OFFLOAD=1`), an offloading spec other than `CPUOffloadingSpec` or `canonical_layout` in `kv_connector_extra_config`, `kv_load_failure_policy` `recompute`, over several chips (`--tensor-parallel-size`, `--pipeline-parallel-size`) or replicas (`--data-parallel-size`), or with sleep mode (`--enable-sleep-mode`).
+- Alternative KV-offload paths: LMCache (`--kv-offloading-backend lmcache`) and the simple CPU connector (`VLLM_USE_SIMPLE_KV_OFFLOAD=1`).
 - Quantizing at load: `--quantization` must name a quantized checkpoint's own method; a BF16 checkpoint takes only `fp8_per_tensor`, or `online` with `quantization_config.linear` `fp8_per_tensor`, without `ignore`, `targets` or an activation override.
 - `--prefix-match-unit` for a hybrid model with `--mamba-cache-mode align`, because the plugin copies no cache blocks.
 

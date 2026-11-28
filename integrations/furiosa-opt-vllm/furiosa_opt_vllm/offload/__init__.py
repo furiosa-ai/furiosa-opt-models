@@ -1,10 +1,8 @@
 """vLLM's KV cache offloading to host memory on RNGD: `RNGDOffloadingConnector`, the connector the
 platform makes `--kv-offloading-size` select.
 
-- Its scheduler side is vLLM's offloading scheduler over vLLM's CPU offloading spec: which blocks to
-  store and load, their eviction, and the host tier's size.
-- Its worker side, `worker.Worker`, follows vLLM's offloading worker on the engine cache that
-  `register` gives it.
+- Its scheduler side keeps vLLM's offloading and tiering policies.
+- Its worker side moves pages through the engine's pinned HostCache and DMA queue.
 """
 
 from __future__ import annotations
@@ -21,7 +19,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import build_offloading_config
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+    build_offloading_config,
+    get_offloading_group_ids,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
     OffloadPromMetrics,
@@ -29,9 +30,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
 )
-from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 
 from furiosa_opt_vllm.offload.worker import Host, Worker
+
+from .spec import FuriosaOffloadingSpec
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -65,12 +68,37 @@ class RNGDOffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig
     ) -> None:
         super().__init__(vllm_config, role, kv_cache_config)
-        self._spec = CPUOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+        self._vllm_config = vllm_config
+        transfer = vllm_config.kv_transfer_config
+        if transfer is not None:
+            extra = transfer.kv_connector_extra_config
+            requested_spec = extra.get("spec_name")
+            if requested_spec not in (None, "CPUOffloadingSpec", "TieringOffloadingSpec"):
+                raise ValueError(f"unsupported vLLM offloading spec: {requested_spec}")
+            if extra.get("spec_module_path") is not None:
+                raise ValueError("out-of-tree vLLM offloading specs are not supported")
+            if extra.get("spec_name") is None:
+                if extra.get("secondary_tiers"):
+                    extra["spec_name"] = "TieringOffloadingSpec"
+                else:
+                    extra.pop("spec_name", None)
+            extra["spec_name"] = "FuriosaOffloadingSpec"
+            extra["spec_module_path"] = "furiosa_opt_vllm.offload.spec"
+        offloading_config = build_offloading_config(vllm_config, kv_cache_config)
+        spec = OffloadingSpecFactory.create_spec(offloading_config)
+        if not isinstance(spec, FuriosaOffloadingSpec):
+            raise TypeError(f"unsupported vLLM offloading spec: {type(spec).__name__}")
+        self._spec = spec
+        self._coalescing = spec.coalescing
         self._scheduler = (
             OffloadingConnectorScheduler(self._spec, vllm_config, kv_cache_config)
             if role == KVConnectorRole.SCHEDULER
             else None
         )
+        if self._scheduler is not None:
+            # This process's Furiosa worker owns every tensor-parallel chip, so vLLM receives
+            # one transfer completion for each job rather than one from every TP rank.
+            self._scheduler.config = self._scheduler.config._replace(num_workers=1)
         self._worker: Worker | None = None
 
     def register(self, cache: engine.decoder.Cache, chips: int) -> None:
@@ -79,7 +107,27 @@ class RNGDOffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         chunks = self._spec.num_chunks
         if chunks == 0:
             raise ValueError("kv_offloading_size must hold at least one chunk of cache blocks")
-        self._worker = Worker(Host(cache, chips, chunks, self._spec.blocks_per_chunk))
+        if self._worker is not None:
+            raise RuntimeError("the cache transfer worker is already registered")
+        parallel = self._spec.config.parallel
+        if parallel.rank != 0 or parallel.world_size != parallel.tp_size:
+            raise ValueError("one Furiosa worker must own every rank of a single TP replica")
+        if chips != parallel.tp_size:
+            raise ValueError(
+                f"the engine cache spans {chips} chips, but vLLM configured TP size "
+                f"{parallel.tp_size}"
+            )
+        self._worker = Worker(
+            Host(
+                cache,
+                chips,
+                self._spec,
+                self._vllm_config,
+                self._kv_cache_config,
+                get_offloading_group_ids(self._kv_cache_config),
+            ),
+            coalescing=self._coalescing,
+        )
 
     @property
     def scheduler(self) -> OffloadingConnectorScheduler:
@@ -158,7 +206,7 @@ class RNGDOffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:
-        # The engine cache is one group, so no other group bounds what a load may reach.
+        # vLLM's scheduler applies the matched-token bound across every selected cache group.
         return self.scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
 
     @override

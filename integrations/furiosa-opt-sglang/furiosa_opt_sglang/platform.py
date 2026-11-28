@@ -155,8 +155,16 @@ class Hierarchical(Served):
     hicache_ratio: float
     hicache_size: int
     hicache_write_policy: str
-    hicache_storage_backend: Unset = Field(
-        description="keeps the hierarchical cache in host memory; omit --hicache-storage-backend"
+    hicache_storage_backend: Literal["file"] | None = Field(
+        default=None,
+        description="uses SGLang's file backend for L3; omit --hicache-storage-backend otherwise",
+    )
+    hicache_storage_backend_extra_config: str | None = Field(
+        default=None,
+        description=(
+            "accepts Furiosa's coalescing flag and passes remaining options "
+            "to SGLang's file backend"
+        ),
     )
     hicache_host_memory_mode: Literal["cache"] = Field(
         description="keeps host pages as a cache tier; omit --hicache-host-memory-mode"

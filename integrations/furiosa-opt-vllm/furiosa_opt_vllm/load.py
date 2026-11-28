@@ -60,8 +60,16 @@ def bind(runner: Runner, *, load_dummy_weights: bool = False) -> None:
         case _:
             pass
     cache = model.cache
-    if any(pool.block != config.cache_config.block_size for pool in cache.pools):
-        raise ValueError(f"the compiled cache uses block_size={cache.pools[0].block}")
+    block_sizes: dict[int, set[int]] = {}
+    for group in cache.groups:
+        block_sizes.setdefault(group.logical_group, set()).add(cache.pools[group.pool].block)
+    if len(block_sizes) == 1:
+        (group_block_sizes,) = block_sizes.values()
+        if len(group_block_sizes) != 1:
+            raise ValueError("the compiled cache groups disagree on block_size")
+        (compiled_block_size,) = group_block_sizes
+        if compiled_block_size != config.cache_config.block_size:
+            raise ValueError(f"the compiled cache uses block_size={compiled_block_size}")
     if config.lora_config is not None:
         spec = model.adapters
         assert spec is not None, "a load for adapters selects a model that runs them"

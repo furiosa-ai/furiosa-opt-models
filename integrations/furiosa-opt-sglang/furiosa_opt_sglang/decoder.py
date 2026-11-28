@@ -98,8 +98,20 @@ class Decoder:
         match loaded.cache.groups:
             case [engine.decoder.Group(kind=engine.decoder.Kind.Paged(), window=None) as group]:
                 pool = loaded.cache.pools[group.pool]
+                layers = group.layers
+                if not layers or layers != list(range(layers[0], layers[0] + len(layers))):
+                    raise NotImplementedError(
+                        "the plugin requires one contiguous full-history attention group"
+                    )
                 return cls(
-                    loaded, copy, checkpoint, options, device, vocabulary, pool, group.layers
+                    loaded,
+                    copy,
+                    checkpoint,
+                    options,
+                    device,
+                    vocabulary,
+                    pool,
+                    range(layers[0], layers[0] + len(layers)),
                 )
             case _:
                 raise NotImplementedError("the plugin pages only one full-history attention group")

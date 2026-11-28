@@ -70,6 +70,45 @@ transfer.wait()
 1. The first cached layer's device storage.
 2. `len(layer)` bytes for each chip of the device, here one.
 
+## Share a contiguous host cache
+
+`HostCache` normally allocates each host slot separately. Pass a pinned `HostBuffer` as `backing`
+to map its page-major host blocks onto one contiguous allocation. Its size must equal the slot count
+times the Copier's host block size. The pool retains the allocation and maps each slot to a range
+within it. Slot access and DMA keep their usual per-slot gates; backing-lock scope is documented in
+the [shared transfer guide](frameworks.md#dma-batches-and-ownership).
+`HostBuffer` falls back to pageable memory when the system cannot lock it, so check `is_pinned`
+before passing it as `backing`.
+Engine adapters that need to register the whole region can use its internal `_backing_buffer()`
+handle:
+
+```python
+backing = engine.HostBuffer(slot_bytes * slot_count)
+if not backing.is_pinned:
+    raise RuntimeError("host cache backing requires page-locked memory")
+host_cache = engine.HostCache(copier, slot_count, backing=backing)
+region = host_cache._backing_buffer()  # Same allocation and address, not a copy.
+```
+
+Keep this internal handle only for address registration and allocation lifetime. Do not read or
+write through it: that bypasses per-slot access exclusion. Use `HostSlot.access()` for external I/O.
+Keep the handle while an external registration uses the region. After shutting down the old Copier
+and dropping its `HostCache`, pass the handle to the replacement pool to keep the address stable.
+First finish all copies and drop every `HostSlot.access()` lease from the old pool. Recreated pools
+have independent per-slot access gates even when they share the same backing:
+
+```python
+copier.shutdown()
+host_cache = engine.HostCache(replacement_copier, slot_count, backing=region)
+```
+
+`_backing_buffer()` raises `ValueError` for a pool created without a contiguous backing. It is a
+private adapter hook and is not supported as a general user API; its private type declaration is
+present in the stub for adapter type checking. Slot access leases serialize external I/O with
+Copier access to each slot, but do not reserve a cache value throughout coalesced DMA. Await the
+relevant `Copy` before reusing that value. The [transfer guide](frameworks.md#optional-coalescing)
+describes lock scope and shared-backing tradeoffs.
+
 ## Run requests with LoRA adapters
 
 A decoder whose projections take LoRA adapters describes them as `decoder.adapters`, an `engine.decoder.AdapterSpec`, and any other decoder as `None`; a load for adapters, `engine.LoadOptions().adapters()`, refuses any other one from its config.

@@ -73,7 +73,7 @@ class Cache:
     @property
     def layers(self) -> builtins.list[engine.HbmBuffer]:
         r"""
-        Each layer's storage, group by group, for host snapshots of assigned blocks; a copy to the
+        Each model layer's storage, indexed by stable layer ID, for host snapshots of assigned blocks; a copy to the
         host waits for the calls submitted before it that write these bytes.
         """
     @property
@@ -93,9 +93,14 @@ class Cache:
 @typing.final
 class CacheSpec:
     r"""
-    The cache a loaded decoder's calls read: block formats, and the groups of layers that use
-    them. `Cache(spec, blocks)` allocates its storage on the decoder's device.
+    The cache a loaded decoder's calls read: page formats and engine storage groups. `Cache(spec,
+    blocks)` allocates one storage buffer per model layer on the decoder's device.
     """
+    @property
+    def layer_count(self) -> builtins.int:
+        r"""
+        Number of decoder layers covered by the cache groups.
+        """
     @property
     def pools(self) -> builtins.list[Pool]:
         r"""
@@ -104,7 +109,7 @@ class CacheSpec:
     @property
     def groups(self) -> builtins.list[Group]:
         r"""
-        The cached layers, a kind and a pool each; a request names its blocks of every group.
+        Engine storage groups. Groups with the same logical cache group share one block table.
         """
 
 @typing.final
@@ -118,9 +123,14 @@ class Group:
         Index of the pool in `CacheSpec.pools`.
         """
     @property
-    def layers(self) -> range:
+    def layers(self) -> builtins.list[builtins.int]:
         r"""
-        The model layers the group caches.
+        Stable model layer IDs the group caches; the list may be non-contiguous.
+        """
+    @property
+    def logical_group(self) -> builtins.int:
+        r"""
+        Logical cache group shared by this engine storage group.
         """
     @property
     def kind(self) -> Kind:
@@ -185,6 +195,21 @@ class Pool:
         r"""
         Bytes one block of one layer spans: a page.
         """
+    @property
+    def element_bytes(self) -> builtins.int:
+        r"""
+        Bytes occupied by one logical page element.
+        """
+    @property
+    def shape(self) -> builtins.list[builtins.int]:
+        r"""
+        Logical page dimensions, with token block first.
+        """
+    @property
+    def strides(self) -> builtins.list[builtins.int]:
+        r"""
+        Logical page byte strides.
+        """
 
 @typing.final
 class Keep(enum.Enum):
@@ -227,13 +252,16 @@ class Output(enum.Enum):
 @typing.final
 class Request:
     r"""
-    One sequence's `tokens` after the `cached` positions its blocks hold: row `i`, position
-    `p = cached + i`, writes slot `p % block` of block `rows[0][p // block]` and attends `0..=p`.
+    One sequence's `tokens` after the `cached` positions its blocks hold. For each engine cache
+    group `g`, row `i` at position `p = cached + i` writes slot `p % B_g` of block
+    `rows[g][p // B_g]` and attends `0..=p`. Groups sharing a logical group use the same active
+    block IDs.
     """
     @property
     def rows(self) -> builtins.list[builtins.list[builtins.int]]:
         r"""
-        The sequence's block IDs, a list for each group of the cache.
+        One block-ID list per engine cache group in `CacheSpec::groups` order. Groups sharing a
+        logical group must name the same active block IDs.
         """
     @property
     def cached(self) -> builtins.int:

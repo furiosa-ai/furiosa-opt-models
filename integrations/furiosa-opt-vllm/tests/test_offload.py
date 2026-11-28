@@ -1,9 +1,8 @@
 """vLLM's KV cache offloading keeps evicted prompt blocks in host memory, and a prompt answers with
 them as with its blocks in the device cache.
 
-- The jobs that copy blocks report each ended job once and raise a failed copy once every copy
-  submitted before it ended, here over stand-in transfers; blocks whose host rows follow each other
-  share one copy.
+- The transfer tracker reports each ended job once and drains submitted copies after a submission
+  failure, here over stand-in completions.
 - On RNGD, `vllm serve --kv-offloading-size` answers an evicted prompt as a server without
   offloading answers it from its device cache. Under batch invariance a prompt reloaded from
   chunks, or resumed after preemption, answers as it does with no block cached.
@@ -12,6 +11,7 @@ them as with its blocks in the device cache.
 from __future__ import annotations
 
 import urllib.request
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Final, final
 
 import pytest
@@ -21,8 +21,15 @@ from test_preemption import CHECKPOINT, CONTEXT, PREEMPTED, counter, greedy
 from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
 from vllm.inputs import TokensPrompt
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+)
 
-from furiosa_opt_vllm import cache
+from furiosa_opt_engine.cache_transfer import (
+    submit as submit_transfers,
+)
 from furiosa_opt_vllm.offload import worker
 
 if TYPE_CHECKING:
@@ -67,6 +74,31 @@ SERVED: Final = [
     "9",
     "--enable-prompt-tokens-details",
 ]
+
+
+def test_vllm_routes_preserve_transfer_page_order() -> None:
+    """The engine groups consecutive page pairs before sorting slots within each DMA batch."""
+    host = worker.Host.__new__(worker.Host)
+    host.blocks = 8
+    host.group_indices = {4: 0}
+    groups = [
+        worker.GroupWork(
+            group_id=4,
+            chunks=(
+                worker.ChunkWork(
+                    chunk_id=1,
+                    device_blocks=(9, 3, 7),
+                    host_slots=(2, 0, 1),
+                ),
+            ),
+        )
+    ]
+
+    assert host.routed_pages(groups) == [
+        (10, [(0, 9)]),
+        (8, [(0, 3)]),
+        (9, [(0, 7)]),
+    ]
 
 
 @final
@@ -163,12 +195,39 @@ def test_failed_submission_waits_for_submitted_copies() -> None:
     assert running.finished() == []
 
 
+def test_shared_core_submission_drains_copies_on_failure() -> None:
+    first = Copies(RuntimeError("copy failed"))
+
+    def submitted() -> Iterator[Copies]:
+        yield first
+        raise RuntimeError("submission failed")
+
+    with pytest.raises(RuntimeError, match="submission failed") as error:
+        _ = submit_transfers(submitted())
+    assert first.waited
+    assert isinstance(error.value.__cause__, RuntimeError)
+    assert str(error.value.__cause__) == "copy failed"
+
+
 def test_raises_failed_copy() -> None:
     """A poll that finds a failed copy raises its error instead of reporting the job."""
     failure = RuntimeError("copy failed")
     running = jobs(Copies(), Copies(failure))
     with pytest.raises(RuntimeError, match="copy failed"):
         _ = running.finished()
+
+
+def test_poll_drains_every_copy_of_a_failed_job() -> None:
+    """A poll that finds one failed copy waits for every submitted copy before it raises."""
+    copies = (Copies(), Copies(RuntimeError("copy failed")), Copies())
+    copies[0].ended = True
+    running = worker.Jobs()
+    running.submit(0, copies, 192)
+
+    with pytest.raises(RuntimeError, match="copy failed"):
+        _ = running.finished()
+
+    assert all(transfer.waited for transfer in copies)
 
 
 def test_shutdown_ends_every_job_then_raises() -> None:
@@ -182,22 +241,225 @@ def test_shutdown_ends_every_job_then_raises() -> None:
 
 
 @pytest.mark.parametrize(
-    ("blocks", "rows", "chips", "moved"),
-    [
-        ([4, 5, 6], [10, 11, 12], 1, [(4, 10, 3)]),
-        ([4, 5, 7, 8], [0, 1, 2, 3], 1, [(4, 0, 2), (7, 2, 2)]),
-        ([4, 5, 6], [0, 1, 3], 1, [(4, 0, 2), (6, 3, 1)]),
-        ([6, 5, 4], [0, 1, 2], 1, [(6, 0, 1), (5, 1, 1), (4, 2, 1)]),
-        ([4, 5], [0, 1], 2, [(4, 0, 1), (5, 1, 1)]),
-    ],
-    ids=["adjacent", "block-gap", "row-gap", "descending", "two-chips"],
+    ("strides", "portable"),
+    [((4, 2, 2, 1), False), ((2, 4, 2, 1), True)],
+    ids=["opaque-layout", "certified-layout"],
 )
-def test_moves_adjacent_blocks_in_one_copy(
-    blocks: list[int], rows: list[int], chips: int, moved: list[tuple[int, int, int]]
+def test_canonical_mapping_uses_metadata_views_and_fails_closed(
+    strides: tuple[int, int, int, int], portable: bool
 ) -> None:
-    """Blocks whose host rows follow theirs move in one copy on a cache of one chip, and one block
-    a copy on more chips, whose copy writes chip after chip."""
-    assert cache.runs(blocks, rows, chips) == moved
+    """Canonical mapping consumes a meta view of the exact page strides, then certifies or falls
+    back through vLLM's own tiling check."""
+    pool = SimpleNamespace(
+        bytes=8,
+        element_bytes=1,
+        shape=[2, 2, 1, 2],
+        strides=list(strides),
+    )
+    engine_group = SimpleNamespace(pool=0, layers=[0], logical_group=0)
+    cache_instance = SimpleNamespace(spec=SimpleNamespace(pools=[pool], groups=[engine_group]))
+    layer_spec = FullAttentionSpec(block_size=2, num_kv_heads=1, head_size=2, dtype=torch.uint8)
+    cache_config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=["layers.0"], kv_cache_spec=layer_spec)],
+    )
+    layer_owner = {0: (0, 0)}
+    view = worker._metadata_cache_views(cache_instance, cache_config, layer_owner)["layers.0"]
+    assert view.device.type == "meta"
+    assert tuple(view.shape) == (4, 2, 2, 1, 2)
+    assert tuple(view.stride()) == (8, strides[1], strides[0], strides[2], strides[3])
+
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            world_size=1,
+            cp_kv_cache_interleave_size=1,
+            rank=0,
+        ),
+        model_config=SimpleNamespace(get_total_num_kv_heads=lambda: 1),
+    )
+    mappings = worker.derive_canonical_mappings(config, cache_config, {"layers.0": view})
+    mapping = mappings["layers.0"]
+    assert (mapping.local_page_size_bytes, mapping.canonical_page_size_bytes) == (8, 8)
+    assert mapping.parallelism_agnostic is portable
+
+
+def test_canonical_layout_requires_an_identity_page_mapping(monkeypatch) -> None:
+    class FakeCopier:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def shutdown(self) -> None:
+            pass
+
+    class FakeHostCache:
+        def __init__(self, _copier: FakeCopier, _slots: int) -> None:
+            pass
+
+    monkeypatch.setattr(worker.engine, "Copier", FakeCopier)
+    monkeypatch.setattr(worker.engine, "HostCache", FakeHostCache)
+    monkeypatch.setattr(worker.host_pool, "register", lambda *_args: None)
+    monkeypatch.setattr(worker.host_pool, "unregister", lambda *_args: None)
+
+    group = KVCacheGroupSpec(
+        layer_names=["layers.0"],
+        kv_cache_spec=FullAttentionSpec(
+            block_size=2,
+            num_kv_heads=1,
+            head_size=2,
+            dtype=torch.uint8,
+        ),
+    )
+    cache_config = KVCacheConfig(num_blocks=4, kv_cache_tensors=[], kv_cache_groups=[group])
+    pool = SimpleNamespace(
+        block=2,
+        bytes=8,
+        element_bytes=1,
+        shape=[2, 2, 1, 2],
+        strides=[4, 2, 2, 1],
+    )
+    cache = SimpleNamespace(
+        blocks=4,
+        layers=[bytearray(32)],
+        spec=SimpleNamespace(
+            pools=[pool],
+            groups=[SimpleNamespace(pool=0, layers=[0], logical_group=0)],
+        ),
+    )
+    spec = SimpleNamespace(
+        blocks_per_chunk=2,
+        num_chunks=2,
+        kv_bytes_per_chunk=16,
+        config=SimpleNamespace(
+            canonical_layout=True,
+            parallel=SimpleNamespace(is_parallelism_agnostic=False),
+            engine_id="canonical-layout-test",
+        ),
+    )
+
+    def canonical_mapping(canonical_offset: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            local_page_size_bytes=8,
+            canonical_page_size_bytes=8,
+            num_writers=1,
+            writer_index=0,
+            runs=[
+                SimpleNamespace(
+                    local_offset=0,
+                    canonical_offset=canonical_offset,
+                    local_stride=1,
+                    canonical_stride=1,
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        worker,
+        "derive_canonical_mappings",
+        lambda *_args: {"layers.0": canonical_mapping(0)},
+    )
+    host = worker.Host(cache, 1, spec, SimpleNamespace(), cache_config, (0,))
+    host.shutdown()
+
+    monkeypatch.setattr(
+        worker,
+        "derive_canonical_mappings",
+        lambda *_args: {"layers.0": canonical_mapping(1)},
+    )
+    with pytest.raises(ValueError, match="not the engine page byte-for-byte"):
+        worker.Host(cache, 1, spec, SimpleNamespace(), cache_config, (0,))
+
+
+def test_vllm_tiering_uses_engine_owned_primary_layout(tmp_path) -> None:
+    from vllm.v1.kv_offload.tiering.manager import TieringOffloadingManager
+
+    from furiosa_opt_vllm.offload.spec import _PinnedPrimaryTier
+    from furiosa_opt_vllm.offload.storage import FuriosaFileSystemTierManager
+
+    config = SimpleNamespace(
+        canonical_layout=False,
+        replicated_layout=False,
+        model=SimpleNamespace(name="engine-cache-test", dtype="bfloat16"),
+        cache=SimpleNamespace(tokens_per_hash=16),
+        groups=[],
+        parallel=SimpleNamespace(
+            tp_size=1,
+            pp_size=1,
+            pcp_size=1,
+            dcp_size=1,
+            rank=0,
+            is_parallelism_agnostic=False,
+        ),
+        engine_id="engine-cache-test",
+    )
+    spec = SimpleNamespace(
+        num_chunks=2,
+        kv_bytes_per_chunk=4096,
+        eviction_policy="lru",
+        cache_policy_module_path=None,
+        kv_events_config=SimpleNamespace(enable_kv_cache_events=False),
+        blocks_per_chunk=2,
+        config=config,
+    )
+    primary = _PinnedPrimaryTier(spec)
+    storage = None
+    try:
+        view = primary.get_kv_memoryview()
+        assert view.strides == (4096, 1)
+
+        storage = FuriosaFileSystemTierManager(
+            spec,
+            view,
+            "fs",
+            root_dir=str(tmp_path),
+        )
+        manager = TieringOffloadingManager(primary, [storage])
+
+        assert manager.primary_tier is primary
+        assert storage._primary_kv_view is view
+        assert storage.block_size_bytes == 4096
+    finally:
+        if storage is not None:
+            storage.shutdown()
+        primary.shutdown()
+
+
+def test_vllm_chunk_store_round_trips_layer_major_pages(tmp_path) -> None:
+    from furiosa_opt_engine.cache_transfer import AlignedFileIO
+    from furiosa_opt_vllm.offload.pool import FilePageSegment
+    from furiosa_opt_vllm.offload.storage import (
+        FuriosaFileSystemTierManager,
+        _ChunkStore,
+        _LoadProgress,
+    )
+
+    class Slot:
+        def __init__(self, contents: bytes) -> None:
+            self.contents = bytearray(contents)
+
+        def access(self) -> memoryview:
+            return memoryview(self.contents)
+
+    file_io = AlignedFileIO(str(tmp_path), use_direct=False)
+    path = tmp_path / "cache" / "chunk.bin"
+    layout = (FilePageSegment(0, 3), FilePageSegment(3, 4))
+    slots = [Slot(b"abcWXYZ"), Slot(b"def1234")]
+    chunk = _ChunkStore(file_io, str(path), 7, 2, 16, layout)
+
+    chunk.write(slots)
+
+    assert path.read_bytes() == b"abcdefWXYZ1234\0\0"
+    restored = [Slot(bytes(7)), Slot(bytes(7))]
+    manager = FuriosaFileSystemTierManager.__new__(FuriosaFileSystemTierManager)
+    manager._file_io = file_io
+    manager._load_progress = {}
+    progress = _LoadProgress(job_id=9, files=1)
+    manager._load_chunk(str(path), 0, restored, layout, progress)
+    assert [bytes(slot.contents) for slot in restored] == [b"abcWXYZ", b"def1234"]
+    assert manager._load_progress == {9: 1}
 
 
 def ask(tokenizer: PreTrainedTokenizerBase, people: tuple[tuple[str, str, str], ...]) -> list[int]:
