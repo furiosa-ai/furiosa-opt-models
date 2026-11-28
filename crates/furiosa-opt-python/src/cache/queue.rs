@@ -79,8 +79,6 @@ pub(super) struct TransferPage {
     pub(super) routes: Vec<(usize, u32)>,
 }
 
-type PageLayer = (usize, u32, usize);
-
 struct Job {
     left: AtomicUsize,
     failure: Mutex<Option<io::Error>>,
@@ -397,18 +395,28 @@ impl Chunk {
             .iter()
             .map(|page| self.pool.slots[page.slot].acquire_dma())
             .collect::<io::Result<Vec<_>>>()?;
-        let (page_layers, mut aliases) = self.direct_routes(core)?;
-        let route_count = page_layers.len();
+        let route_count = self
+            .pages
+            .iter()
+            .flat_map(|page| &page.routes)
+            .map(|(group, _)| core.groups[*group].len())
+            .sum();
 
         if self.loading {
             let mut pairs = Vec::with_capacity(route_count);
-            for (&(page_index, _, layer_id), destination) in page_layers.iter().zip(&mut aliases) {
-                let range = &self.pool.layout.layer_ranges[layer_id];
-                let source = hosts[page_index]
-                    .slice(range.clone())
-                    .map_err(io::Error::other)?;
-                let destination = destination.slice_mut(.., ..).map_err(io::Error::other)?;
-                pairs.push((source, destination));
+            for (page_index, page) in self.pages.iter().enumerate() {
+                for &(group, block) in &page.routes {
+                    for &layer_id in &core.groups[group] {
+                        let range = &self.pool.layout.layer_ranges[layer_id];
+                        let source = hosts[page_index]
+                            .slice(range.clone())
+                            .map_err(io::Error::other)?;
+                        let destination = layer_page(&core.layers[layer_id], block)?
+                            .slice_mut(.., ..)
+                            .map_err(io::Error::other)?;
+                        pairs.push((source, destination));
+                    }
+                }
             }
             let submitted = {
                 let mut context = core.lock_context();
@@ -417,34 +425,28 @@ impl Chunk {
             executor.block_on(submitted).map_err(io::Error::other)
         } else {
             let mut pairs = Vec::with_capacity(route_count);
-            let mut route_index = 0;
-            for (page_index, host) in hosts.iter_mut().enumerate() {
+            for (page, host) in self.pages.iter().zip(&mut hosts) {
                 let mut rest = host.slice_mut(..).map_err(io::Error::other)?;
                 let mut cursor = 0;
-                while let Some(&(route_page, _, layer_id)) = page_layers.get(route_index) {
-                    if route_page != page_index {
-                        break;
+                for &(group, block) in &page.routes {
+                    for &layer_id in &core.groups[group] {
+                        let range = &self.pool.layout.layer_ranges[layer_id];
+                        let gap = range
+                            .start
+                            .checked_sub(cursor)
+                            .ok_or_else(|| io::Error::other("host layer ranges overlap"))?;
+                        let (before, tail) = rest.split_at(gap).map_err(io::Error::other)?;
+                        drop(before);
+                        let (destination, tail) =
+                            tail.split_at(range.len()).map_err(io::Error::other)?;
+                        let source = layer_page(&core.layers[layer_id], block)?
+                            .slice(.., ..)
+                            .map_err(io::Error::other)?;
+                        pairs.push((source, destination));
+                        rest = tail;
+                        cursor = range.end;
                     }
-                    let range = &self.pool.layout.layer_ranges[layer_id];
-                    let gap = range
-                        .start
-                        .checked_sub(cursor)
-                        .ok_or_else(|| io::Error::other("host layer ranges overlap"))?;
-                    let (before, tail) = rest.split_at(gap).map_err(io::Error::other)?;
-                    drop(before);
-                    let (destination, tail) =
-                        tail.split_at(range.len()).map_err(io::Error::other)?;
-                    let source = aliases[route_index]
-                        .slice(.., ..)
-                        .map_err(io::Error::other)?;
-                    pairs.push((source, destination));
-                    rest = tail;
-                    cursor = range.end;
-                    route_index += 1;
                 }
-            }
-            if route_index != page_layers.len() {
-                return Err(io::Error::other("cache transfer has unrouted host layers"));
             }
             let submitted = {
                 let mut context = core.lock_context();
@@ -452,40 +454,6 @@ impl Chunk {
             };
             executor.block_on(submitted).map_err(io::Error::other)
         }
-    }
-
-    fn direct_routes(&self, core: &Core) -> io::Result<(Vec<PageLayer>, Vec<prelude::HbmBuffer>)> {
-        let route_count = self
-            .pages
-            .iter()
-            .flat_map(|page| &page.routes)
-            .map(|(group, _)| core.groups[*group].len())
-            .sum();
-        let mut page_layers = Vec::with_capacity(route_count);
-        for (page_index, page) in self.pages.iter().enumerate() {
-            for &(group, block) in &page.routes {
-                for &layer_id in &core.groups[group] {
-                    page_layers.push((page_index, block, layer_id));
-                }
-            }
-        }
-        // Submission sorts each page's groups, and two-page chunks sort their slots. Expanding
-        // those routes already follows the packed slot layout; sorting every layer route again
-        // would repeat that work for each DMA chunk.
-
-        let mut aliases = Vec::with_capacity(route_count);
-        for &(_, block, layer_id) in &page_layers {
-            let layer = &core.layers[layer_id];
-            let start = usize::try_from(block)
-                .map_err(io::Error::other)?
-                .checked_mul(layer.page_bytes)
-                .ok_or_else(|| io::Error::other("device page offset overflows"))?;
-            let end = start
-                .checked_add(layer.page_bytes)
-                .ok_or_else(|| io::Error::other("device page end overflows"))?;
-            aliases.push(layer.buffer.alias(start..end).map_err(io::Error::other)?);
-        }
-        Ok((page_layers, aliases))
     }
 
     fn transfer_coalesced(
@@ -610,6 +578,17 @@ impl Chunk {
         }
         groups
     }
+}
+
+fn layer_page(layer: &Layer, block: u32) -> io::Result<prelude::HbmBuffer> {
+    let start = usize::try_from(block)
+        .map_err(io::Error::other)?
+        .checked_mul(layer.page_bytes)
+        .ok_or_else(|| io::Error::other("device page offset overflows"))?;
+    let end = start
+        .checked_add(layer.page_bytes)
+        .ok_or_else(|| io::Error::other("device page end overflows"))?;
+    layer.buffer.alias(start..end).map_err(io::Error::other)
 }
 
 struct SlotItems {
