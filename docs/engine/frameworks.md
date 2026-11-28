@@ -29,6 +29,7 @@ The framework assigns blocks, and the plugin translates its assignment into bloc
     ```
 
 A scheduler step can hold more rows than one call takes, so the plugin splits it into bounded calls in order.
+See the [vLLM step implementation](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/integrations/furiosa-opt-vllm/furiosa_opt_vllm/generation/sequence.py) and [SGLang scheduling](../serving/sglang.md#model-loading-and-scheduling).
 
 ## Return the rows the framework needs
 
@@ -59,7 +60,7 @@ Framework adapters own cache selection, keys, eviction and tier lifecycle. They 
 
 Each `Copier` owns a six-worker queue, with ordinary DMA batches of up to two distinct host slots. A batch carries all requested layer routes for its pages. It acquires slot gates in index order, and a later batch can reuse a slot. The queue can hold any number of jobs.
 
-The direct path transfers bytes between pinned slots and HBM while holding the relevant slot gates. Each worker submits through a clone of the device's DMA handle, so transfers can proceed independently of the decoder's context mutex.
+The direct path transfers bytes between pinned slots and HBM while holding the relevant slot gates. Workers build DMA routes before taking the shared device context lock. They hold it through submission and wait for DMA completion outside it. DMA submission and decoder calls share that context lock.
 
 ### Optional coalescing
 
@@ -78,15 +79,3 @@ No NPU measurement establishes the end-to-end performance of these paths.
 A `Copy` covers the whole request, including every DMA batch and staging step. Submission returns once the work is queued. Wait for its result before reusing the request's host slots or device pages. An overlapping device request raises `BlockingIOError` while the earlier copy is pending. A failed copy leaves its device pages reserved until the copier shuts down.
 
 A view from `HostCache.access()` blocks DMA on its slot until the view and its derived views are released. The framework coordinates its host users and decides when a cache value can be reused. Release host views before calling `Copier.shutdown()`, which drains the queue and joins the workers.
-
-## SGLang specifics
-
-SGLang's scheduler and checkpoint conventions require adapter-specific handling beyond request mapping.
-
-The plugin loads the engine from the original checkpoint config with the user's overrides because SGLang rewrites some geometry for its own kernels.
-
-With overlap enabled, SGLang schedules the next step and processes the previous step while the device runs. The plugin disables overlap for recurrent state and embeddings because they are read back within their step.
-
-Mixed chunks interleave prompt chunks with running requests' decode rows in one step.
-
-The full step logic is in [`generation/sequence.py` of vLLM](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/integrations/furiosa-opt-vllm/furiosa_opt_vllm/generation/sequence.py) and [of SGLang](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/integrations/furiosa-opt-sglang/furiosa_opt_sglang/generation/sequence.py).

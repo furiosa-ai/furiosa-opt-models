@@ -83,13 +83,7 @@ impl PyCopier {
     /// layer order determine the packed host slot layout. A layer can appear in at most one group.
     #[new]
     fn new(py: Python<'_>, cache: &Cache, groups: Vec<Vec<usize>>) -> PyResult<Self> {
-        let (chips, pdma) = {
-            let context = Context::lock(&cache.context, py);
-            (
-                usize::from(context.device.topology().chips),
-                context.device.pdma.clone(),
-            )
-        };
+        let chips = usize::from(Context::lock(&cache.context, py).device.topology().chips);
         let (layout, slot_bytes) = layout::pack(cache.inner.layer_page_bytes(), &groups, chips)
             .map_err(PyValueError::new_err)?;
         let mut layers = Vec::new();
@@ -110,7 +104,7 @@ impl PyCopier {
             packed_groups.push((first..layers.len()).collect());
         }
         let core = Arc::new(Core {
-            pdma,
+            context: Arc::clone(&cache.context),
             layers,
             groups: packed_groups,
             blocks: cache.inner.blocks(),

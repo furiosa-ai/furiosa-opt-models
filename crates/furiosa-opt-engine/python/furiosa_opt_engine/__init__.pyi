@@ -74,17 +74,6 @@ class Copier:
     Coalescing gathers or scatters through temporary pinned buffers to reduce DMA commands.
     Number groups from zero in the order supplied to the constructor.
     """
-    def __new__(
-        cls,
-        cache: decoder.Cache,
-        groups: typing.Sequence[typing.Sequence[builtins.int]],
-    ) -> Copier:
-        r"""
-        Build a transfer queue over an allocated decoder cache.
-
-        Each group lists the stable layer IDs that move together for one logical block. Group and
-        layer order determine the packed host slot layout. A layer can appear in at most one group.
-        """
     @property
     def slot_bytes(self) -> builtins.int:
         r"""
@@ -94,6 +83,15 @@ class Copier:
     def layer_ranges(self) -> builtins.list[builtins.list[tuple[builtins.int, builtins.int]]]:
         r"""
         Host-slot byte offsets and lengths in transfer group and layer order.
+        """
+    def __new__(
+        cls, cache: decoder.Cache, groups: typing.Sequence[typing.Sequence[builtins.int]]
+    ) -> Copier:
+        r"""
+        Build a transfer queue over an allocated decoder cache.
+
+        Each group lists the stable layer IDs that move together for one logical block. Group and
+        layer order determine the packed host slot layout. A layer can appear in at most one group.
         """
     def copy_out(
         self,
@@ -422,14 +420,14 @@ class HostCache:
     A pool that owns page-locked host slots for transfers and host I/O. Pools on the same copier
     share its device-page reservations and hold independent host-slot gates.
     """
-    def __new__(cls, copier: Copier, slots: builtins.int) -> HostCache:
-        r"""
-        Allocate pinned host slots for the copier's page layout.
-        """
     @property
     def slot_bytes(self) -> builtins.int:
         r"""
         Bytes in one slot.
+        """
+    def __new__(cls, copier: Copier, slots: builtins.int) -> HostCache:
+        r"""
+        Allocate pinned host slots for the copier's page layout.
         """
     def access(self, index: builtins.int) -> builtins.memoryview:
         r"""

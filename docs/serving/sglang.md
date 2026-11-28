@@ -76,6 +76,12 @@ These features are not supported yet, and the plugin refuses them at startup rat
 - Diffusion LM algorithms (`dllm_algorithm`) and `prefill_only_disable_kv_cache`.
 - Encoder disaggregation (`--encoder-only`, `--language-only`).
 
+## Model loading and scheduling
+
+The plugin loads the original checkpoint config with the user's overrides because SGLang rewrites some geometry for its own kernels.
+
+With overlap enabled, SGLang schedules the next step and processes the previous step while the device runs. Recurrent state and embeddings are read back within their step, so the plugin disables overlap for those models. Mixed chunks let one step interleave prompt chunks with running requests' decode rows.
+
 The platform disables CUDA graphs and piecewise CUDA graphs, and sets the scheduling options by model kind:
 
 | Model | Page size | Overlap schedule | Mixed chunks |
@@ -86,7 +92,7 @@ The platform disables CUDA graphs and piecewise CUDA graphs, and sets the schedu
 | Speculative decoding | 16 | Off | Off |
 
 A model that keeps recurrent state also requires `mamba_ssm_dtype` unset or `float32` and `mamba_radix_cache_strategy` `auto` or `no_buffer`, and does not support `enable_int8_mamba_checkpoint`, `enable_linear_replayssm` or `enable_linear_replayssm_spec` yet.
-[Integrating frameworks](../engine/frameworks.md#sglang-specifics) explains the overlap schedule and mixed chunks.
+The [SGLang step implementation](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/integrations/furiosa-opt-sglang/furiosa_opt_sglang/generation/sequence.py) defines the scheduling behavior.
 
 ## Speculative decoding
 

@@ -4,16 +4,16 @@ use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::ops::DerefMut;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 use furiosa_opt_std::prelude::{self, HostBuffer};
 
 use super::{layout::SlotLayout, staging};
+use crate::{Context, Shared};
 
 const COPY_THREADS: usize = 6;
 const COPY_CHUNK_BLOCKS: usize = 2;
-pub(super) type Pdma = prelude::DmaContext<{ prelude::Dma::Pcie }>;
 
 pub(super) struct Layer {
     pub(super) buffer: prelude::HbmBuffer,
@@ -21,11 +21,18 @@ pub(super) struct Layer {
 }
 
 pub(super) struct Core {
-    pub(super) pdma: Pdma,
+    pub(super) context: Shared,
     pub(super) layers: Vec<Layer>,
     pub(super) groups: Vec<Vec<usize>>,
     pub(super) blocks: usize,
     pub(super) chips: usize,
+}
+
+impl Core {
+    /// Lock the model context for submission. Drop the guard before waiting for the DMA.
+    fn lock_context(&self) -> MutexGuard<'_, Context> {
+        self.context.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 pub(super) struct Pool {
@@ -222,14 +229,13 @@ impl Queue {
                     return Err(error);
                 }
             };
-            let (receiver, core, mut pdma) =
-                (Arc::clone(&receiver), Arc::clone(&core), core.pdma.clone());
+            let (receiver, core) = (Arc::clone(&receiver), Arc::clone(&core));
             match std::thread::Builder::new()
                 .name("kv-copy".into())
                 .spawn(move || {
                     // A poisoned receiver means another copy thread panicked while holding it.
                     while let Some(chunk) = receiver.lock().ok().and_then(|next| next.recv().ok()) {
-                        chunk.run(&executor, &core, &mut pdma);
+                        chunk.run(&executor, &core);
                     }
                 }) {
                 Ok(worker) => workers.push(worker),
@@ -269,13 +275,12 @@ impl Queue {
         // Match the reference data path: coalesced copies stage and submit on their own thread,
         // outside the six-worker queue used for two-page copies.
         let core = Arc::clone(&self.core);
-        let mut pdma = self.core.pdma.clone();
         let job = Arc::clone(&chunk.job);
         let spawned = std::thread::Builder::new()
             .name("kv-copy-later".into())
             .spawn(
                 move || match tokio::runtime::Builder::new_current_thread().build() {
-                    Ok(executor) => chunk.run(&executor, &core, &mut pdma),
+                    Ok(executor) => chunk.run(&executor, &core),
                     Err(error) => chunk.fail(error),
                 },
             );
@@ -371,9 +376,9 @@ impl Chunk {
         chunks
     }
 
-    fn run(self, executor: &tokio::runtime::Runtime, core: &Core, pdma: &mut Pdma) {
+    fn run(self, executor: &tokio::runtime::Runtime, core: &Core) {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.transfer(executor, core, pdma)
+            self.transfer(executor, core)
         }))
         .unwrap_or_else(|_| Err(io::Error::other("cache copy worker panicked")));
         self.job.finish(result);
@@ -383,14 +388,9 @@ impl Chunk {
         self.job.finish(Err(error));
     }
 
-    fn transfer(
-        &self,
-        executor: &tokio::runtime::Runtime,
-        core: &Core,
-        pdma: &mut Pdma,
-    ) -> io::Result<()> {
+    fn transfer(&self, executor: &tokio::runtime::Runtime, core: &Core) -> io::Result<()> {
         if self.coalesced {
-            return self.transfer_coalesced(executor, core, pdma);
+            return self.transfer_coalesced(executor, core);
         }
         let mut hosts = self
             .pages
@@ -410,7 +410,10 @@ impl Chunk {
                 let destination = destination.slice_mut(.., ..).map_err(io::Error::other)?;
                 pairs.push((source, destination));
             }
-            let submitted = pdma.to_hbm(pairs).submit();
+            let submitted = {
+                let mut context = core.lock_context();
+                context.device.pdma.to_hbm(pairs).submit()
+            };
             executor.block_on(submitted).map_err(io::Error::other)
         } else {
             let mut pairs = Vec::with_capacity(route_count);
@@ -443,7 +446,10 @@ impl Chunk {
             if route_index != page_layers.len() {
                 return Err(io::Error::other("cache transfer has unrouted host layers"));
             }
-            let submitted = pdma.to_host(pairs).submit();
+            let submitted = {
+                let mut context = core.lock_context();
+                context.device.pdma.to_host(pairs).submit()
+            };
             executor.block_on(submitted).map_err(io::Error::other)
         }
     }
@@ -489,7 +495,6 @@ impl Chunk {
         &self,
         executor: &tokio::runtime::Runtime,
         core: &Core,
-        pdma: &mut Pdma,
     ) -> io::Result<()> {
         let layers = core
             .layers
@@ -540,7 +545,10 @@ impl Chunk {
                     pairs.push((source, destination));
                 }
             }
-            let submitted = pdma.to_hbm(pairs).submit();
+            let submitted = {
+                let mut context = core.lock_context();
+                context.device.pdma.to_hbm(pairs).submit()
+            };
             executor.block_on(submitted).map_err(io::Error::other)?;
         } else {
             let mut aliases = staging_aliases(&layout, core)?;
@@ -569,7 +577,10 @@ impl Chunk {
                     return Err(io::Error::other("cache staging has unrouted bytes"));
                 }
             }
-            let submitted = pdma.to_host(pairs).submit();
+            let submitted = {
+                let mut context = core.lock_context();
+                context.device.pdma.to_host(pairs).submit()
+            };
             executor.block_on(submitted).map_err(io::Error::other)?;
 
             for group in &slot_items {
