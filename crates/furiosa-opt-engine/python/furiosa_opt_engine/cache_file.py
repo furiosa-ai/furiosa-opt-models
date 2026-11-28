@@ -23,7 +23,7 @@ _STATX_DIO_ALIGNMENT_OFFSET = 152
 
 
 class AlignedFileIO:
-    """Keep framework-native page bytes; use O_DIRECT only for aligned pages."""
+    """Keep framework-native page bytes; bounce aligned O_DIRECT transfers through scratch."""
 
     def __init__(self, directory: str, *, use_direct: bool | None = None) -> None:
         self.offset_alignment = mmap.PAGESIZE
@@ -101,8 +101,8 @@ class AlignedFileIO:
         if offset < 0 or not source:
             raise ValueError("file writes require a nonempty buffer and nonnegative offset")
         direct = self._direct_compatible(offset, (source,))
-        source_address = self._direct_address(source) if direct else None
-        bounce = direct and source_address is None
+        bounce = direct
+        # HostCache exposes DMA-BUF mappings, which O_DIRECT cannot use as its I/O buffer.
         target = self._buffer(len(source)) if bounce else source
         try:
             if bounce:
@@ -122,8 +122,7 @@ class AlignedFileIO:
         if offset < 0 or not destination:
             raise ValueError("file reads require a nonempty buffer and nonnegative offset")
         direct = self._direct_compatible(offset, (destination,))
-        destination_address = self._direct_address(destination) if direct else None
-        bounce = direct and destination_address is None
+        bounce = direct
         source = self._buffer(len(destination)) if bounce else destination
         try:
             descriptor = os.open(path, os.O_RDONLY | self._direct_flag(direct))
@@ -134,9 +133,7 @@ class AlignedFileIO:
             finally:
                 os.close(descriptor)
             if bounce:
-                if destination_address is None:
-                    destination_address = ctypes.addressof(ctypes.c_ubyte.from_buffer(destination))
-                ctypes.memmove(destination_address, self.local.address, len(destination))
+                destination[:] = source
         finally:
             if bounce:
                 source.release()
@@ -200,8 +197,7 @@ class AlignedFileIO:
                     direct = self._direct_compatible(offset, views)
                     if len(views) == 1:
                         view = views[0]
-                        address = self._direct_address(view) if direct else None
-                        bounce = direct and address is None
+                        bounce = direct
                         target = self._buffer(len(view)) if bounce else view
                         try:
                             if writing:
@@ -216,34 +212,62 @@ class AlignedFileIO:
                                     f"short {operation} of {path}: {actual} of {len(target)} bytes"
                                 )
                             if bounce and not writing:
-                                if address is None:
-                                    address = ctypes.addressof(ctypes.c_ubyte.from_buffer(view))
-                                ctypes.memmove(address, self.local.address, len(view))
+                                view[:] = target
                         finally:
                             if bounce:
                                 target.release()
                         continue
 
-                    direct = direct and all(
-                        self._direct_address(view) is not None for view in views
-                    )
                     file_descriptor = descriptor(direct)
+                    expected = sum(map(len, views))
+                    if direct:
+                        # Collapse vectors into aligned scratch; DMA-BUF views stay off O_DIRECT.
+                        target = self._buffer(expected)
+                        try:
+                            if writing:
+                                cursor = 0
+                                for view in views:
+                                    end = cursor + len(view)
+                                    target[cursor:end] = view
+                                    cursor = end
+                                actual = os.pwrite(file_descriptor, target, offset)
+                            else:
+                                actual = os.preadv(file_descriptor, [target], offset)
+                            if actual != expected:
+                                operation = "write" if writing else "read"
+                                raise OSError(
+                                    f"short {operation} of {path}: {actual} of {expected} bytes"
+                                )
+                            if not writing:
+                                cursor = 0
+                                for view in views:
+                                    end = cursor + len(view)
+                                    part = target[cursor:end]
+                                    try:
+                                        view[:] = part
+                                    finally:
+                                        part.release()
+                                    cursor = end
+                        finally:
+                            target.release()
+                        continue
+
                     current_offset = offset
                     limit = iov_limit()
                     for start in range(0, len(views), limit):
                         batch = views[start : start + limit]
-                        expected = sum(map(len, batch))
+                        batch_bytes = sum(map(len, batch))
                         actual = (
                             os.pwritev(file_descriptor, batch, current_offset)
                             if writing
                             else os.preadv(file_descriptor, batch, current_offset)
                         )
-                        if actual != expected:
+                        if actual != batch_bytes:
                             operation = "write" if writing else "read"
                             raise OSError(
-                                f"short {operation} of {path}: {actual} of {expected} bytes"
+                                f"short {operation} of {path}: {actual} of {batch_bytes} bytes"
                             )
-                        current_offset += expected
+                        current_offset += batch_bytes
                 finally:
                     for view in views:
                         view.release()
@@ -254,19 +278,16 @@ class AlignedFileIO:
         return getattr(os, "O_DIRECT", 0) if direct else 0
 
     def _direct_compatible(self, offset: int, views: Iterable[memoryview]) -> bool:
-        return (
-            self.use_direct
-            and offset >= 0
-            and offset % self.offset_alignment == 0
-            and all(len(view) > 0 and len(view) % self.offset_alignment == 0 for view in views)
-        )
-
-    def _direct_address(self, buffer: memoryview) -> int | None:
-        """Return the pinned address only when it satisfies the probed memory alignment."""
-        if buffer.readonly:
-            return None
-        address = ctypes.addressof(ctypes.c_ubyte.from_buffer(buffer))
-        return address if address % self.memory_alignment == 0 else None
+        if not self.use_direct or offset < 0 or offset % self.offset_alignment != 0:
+            return False
+        total = 0
+        found = False
+        for view in views:
+            if not view:
+                return False
+            total += len(view)
+            found = True
+        return found and total % self.offset_alignment == 0
 
     def _buffer(self, size: int) -> memoryview:
         if size <= 0:

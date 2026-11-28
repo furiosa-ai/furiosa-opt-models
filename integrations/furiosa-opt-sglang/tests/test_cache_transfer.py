@@ -100,12 +100,19 @@ def test_vectored_file_io_uses_o_direct_for_aligned_buffers(tmp_path, monkeypatc
 
     flags = []
     open_file = os.open
+    bounce_sizes = []
+    aligned_buffer = io._buffer
+
+    def observe_bounce(size: int) -> memoryview:
+        bounce_sizes.append(size)
+        return aligned_buffer(size)
 
     def observe_open(path, mode, *args, **kwargs):
         flags.append(mode)
         return open_file(path, mode, *args, **kwargs)
 
     monkeypatch.setattr(os, "open", observe_open)
+    monkeypatch.setattr(io, "_buffer", observe_bounce)
     destination_owners = [_aligned_view(length, memory_alignment) for _ in range(2)]
     destination_views = [view for _, view in destination_owners]
     try:
@@ -113,6 +120,7 @@ def test_vectored_file_io_uses_o_direct_for_aligned_buffers(tmp_path, monkeypatc
         io.readv_at(str(path), offset, destination_views)
         assert [bytes(view) for view in destination_views] == payloads
         assert any(mode & os.O_DIRECT for mode in flags)
+        assert bounce_sizes == [2 * length, 2 * length]
     finally:
         for view in (*source_views, *destination_views):
             view.release()
@@ -120,7 +128,7 @@ def test_vectored_file_io_uses_o_direct_for_aligned_buffers(tmp_path, monkeypatc
             mapping.close()
 
 
-def test_vectored_file_io_falls_back_for_misaligned_address(tmp_path, monkeypatch) -> None:
+def test_vectored_file_io_bounces_misaligned_addresses_for_o_direct(tmp_path, monkeypatch) -> None:
     alignment = _probe_direct_io(str(tmp_path))
     if alignment is None:
         pytest.skip("temporary filesystem does not support O_DIRECT")
@@ -146,7 +154,7 @@ def test_vectored_file_io_falls_back_for_misaligned_address(tmp_path, monkeypatc
     try:
         io.writev_at(str(path), 0, (source, aligned))
         assert path.read_bytes() == b"x" * length + b"y" * length
-        assert flags and all(not mode & os.O_DIRECT for mode in flags)
+        assert flags and all(mode & os.O_DIRECT for mode in flags)
     finally:
         source.release()
         aligned.release()
@@ -205,7 +213,7 @@ def test_vectored_file_io_many_keeps_per_range_alignment_fallback(tmp_path, monk
     io = AlignedFileIO(str(tmp_path), use_direct=True)
     path = tmp_path / "mixed-ranges.bin"
     length = offset_alignment
-    io.prepare(str(path), length, 4)
+    io.prepare(str(path), length, 5)
 
     storage, misaligned = _misaligned_view(length, memory_alignment)
     aligned_owner, aligned = _aligned_view(length, memory_alignment)
@@ -222,9 +230,11 @@ def test_vectored_file_io_many_keeps_per_range_alignment_fallback(tmp_path, monk
     try:
         io.writev_at_many(
             str(path),
-            ((0, (misaligned, aligned)), (2 * length, (aligned, aligned))),
+            ((1, (misaligned, aligned)), (3 * length, (aligned, aligned))),
         )
-        assert path.read_bytes() == b"m" * length + b"a" * (3 * length)
+        assert path.read_bytes() == (
+            b"\0" + b"m" * length + b"a" * length + b"\0" * (length - 1) + b"a" * (2 * length)
+        )
         assert len(flags) == 2
         assert any(mode & os.O_DIRECT for mode in flags)
         assert any(not mode & os.O_DIRECT for mode in flags)

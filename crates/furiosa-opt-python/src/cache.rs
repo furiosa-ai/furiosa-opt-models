@@ -514,12 +514,51 @@ mod tests {
             scope
                 .set_item("cache", Py::new(py, Cache { inner, context }).unwrap())
                 .unwrap();
-            let result = py.run(
+            let setup = py.run(
                 c"
 copier = engine.Copier(cache, [[0]])
 assert copier.slot_bytes == 8
 assert copier.layer_ranges == [[(0, 8)]]
-pool = engine.HostCache(copier, 2)
+",
+                Some(&scope),
+                None,
+            );
+            setup.unwrap();
+
+            let copier = scope
+                .get_item("copier")
+                .unwrap()
+                .unwrap()
+                .extract::<PyRef<'_, PyCopier>>()
+                .unwrap();
+            let pinned = HostBuffer::zero(8).is_pinned();
+            let (host, coalescing) = match PyHostCache::new(py, &copier, 2) {
+                Ok(host) => {
+                    assert!(pinned, "HostCache unexpectedly allocated pageable memory");
+                    (host, true)
+                }
+                Err(error) => {
+                    assert!(
+                        !pinned,
+                        "HostCache failed despite available pinned memory: {error}"
+                    );
+                    assert!(error.to_string().contains("page-locked"), "{error}");
+                    let pool = Arc::new(Pool {
+                        slots: (0..2)
+                            .map(|_| Slot::new(HostBuffer::from_vec(vec![0; 8])))
+                            .collect(),
+                        layout: Arc::clone(&copier.layout),
+                        core: Arc::downgrade(&copier.core),
+                    });
+                    (PyHostCache { pool }, false)
+                }
+            };
+            scope.set_item("pool", Py::new(py, host).unwrap()).unwrap();
+            scope.set_item("coalescing_supported", coalescing).unwrap();
+            drop(copier);
+
+            let result = py.run(
+                c"
 assert pool.slot_bytes == 8
 payload = bytes(range(1, 9))
 view = pool.access(0)
@@ -530,7 +569,7 @@ view.release()
 assert pending
 copy.wait()
 
-for coalesced in (False, True):
+for coalesced in ((False, True) if coalescing_supported else (False,)):
     copier.copy_in([(0, [(0, 0)])], pool, coalesce=coalesced).wait()
     copier.copy_out([(1, [(0, 0)])], pool, coalesce=coalesced).wait()
     with pool.access(1) as restored:
