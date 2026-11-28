@@ -24,7 +24,45 @@ The platform accepts these values:
 | `rope_parameters` or `rope_scaling` and `max_position_embeddings` in `--json-model-override-args` | A `rope_type` the engine computes, within the compiled window ([Extend the context](index.md#extend-the-context-past-the-trained-length)) |
 | `--mem-fraction-static` | Unset defaults to 0.9, leaving the headroom a model split over chips needs |
 | `--enable-deterministic-inference` | Off, or on to load the model [batch invariant](index.md#keep-outputs-independent-of-the-batch) with the radix cache on |
-| `--enable-hierarchical-cache` | A model without recurrent state, with the host tier sized by `--hicache-ratio` or `--hicache-size` and kept in memory: `--hicache-host-memory-mode cache`, `--hicache-io-backend kernel`, `--hicache-mem-layout page_first`, no `--hicache-storage-backend` and no memory saver |
+| `--enable-hierarchical-cache` | A model without recurrent state, with the host tier sized by `--hicache-ratio` or `--hicache-size`; see [Hierarchical cache](#hierarchical-cache) for required modes and storage options |
+
+## Hierarchical cache
+
+### Configure the host tier
+
+Set the HiCache host-tier size with `--hicache-ratio` or `--hicache-size`. See the [serving task guide](index.md#offload-the-kv-cache-to-host-memory) for a filesystem launch command.
+
+The filesystem tier uses SGLang's `file` option and `FuriosaHiCacheFile`. Set `--hicache-host-memory-mode cache`, `--hicache-io-backend kernel` and `--hicache-mem-layout page_first`. The storage backend must be unset or `file`; other backends need their own host-buffer integration. Automatic sizing from free host memory is available only for pools SGLang allocates itself.
+
+The adapter loads through SGLang's `dynamic` storage-backend factory and preserves SGLang's cache keys and file-tier lifecycle. It writes one raw cache page per file. See [Aligned filesystem I/O](../engine/frameworks.md#aligned-filesystem-io) for aligned I/O rules.
+
+### Coalesce page restores
+
+The Furiosa-only `coalescing` option defaults to `false`; set it to `true` beside `file_storage_path` in `--hicache-storage-backend-extra-config` to stage each selected all-layer page batch.
+
+The adapter submits one all-layer engine copy for the selected page batch when its first per-layer callback arrives. Separate restore calls remain separate.
+
+See [Optional coalescing](../engine/frameworks.md#optional-coalescing) for the shared costs and mechanics.
+
+### Restore timing
+
+SGLang normally makes a restored layer available as soon as it is ready. This adapter reports all layer-ready callbacks only after the full engine copy finishes, so early layers may wait for later layers and lose compute/transfer overlap. Splitting the copy per layer could restore that overlap, but would add runtime submissions and change the all-layer DMA schedule.
+
+### Supported cache pages
+
+The adapter transfers only engine-owned target-model attention KV pages, so recurrent state and MTP draft pools are unsupported.
+
+### Memory saver
+
+The memory saver cannot run with HiCache because it frees cache storage that the host tier still uses.
+
+### Failures
+
+Failed copies surface at SGLang's next HiCache completion check after the engine copy drains.
+
+### Observe cache hits
+
+A `/generate` response reports reused tokens by tier in `meta_info.cached_tokens_details`.
 
 These features are not supported yet, and the plugin refuses them at startup rather than ignore them:
 
@@ -32,12 +70,17 @@ These features are not supported yet, and the plugin refuses them at startup rat
 - Speculative decoding with more than one candidate a position, adaptive speculation or an external n-gram corpus.
 - Watermarking (`--enable-watermark`) and strict thinking (`--enable-strict-thinking`), which change the scores of each step.
 - Quantization and quantization parameter files.
-- Hierarchical cache storage backends, HiSparse, unified memory, LMCache, FlexKV and the unified cache external linker.
-- The memory saver (`--enable-memory-saver`) with speculative decoding, whose worker and draft model keep device memory a release does not reach yet, and with the hierarchical cache, whose host tier copies the cache storage a release frees.
+- The memory saver (`--enable-memory-saver`) with speculative decoding, whose worker and draft model keep device memory a release does not reach yet.
 - Per-layer embedding offload (`ple_offload_embedding`).
 - Returning hidden states, routed experts or indexer top-k.
 - Diffusion LM algorithms (`dllm_algorithm`) and `prefill_only_disable_kv_cache`.
 - Encoder disaggregation (`--encoder-only`, `--language-only`).
+
+## Model loading and scheduling
+
+The plugin loads the original checkpoint config with the user's overrides because SGLang rewrites some geometry for its own kernels.
+
+With overlap enabled, SGLang schedules the next step and processes the previous step while the device runs. Recurrent state and embeddings are read back within their step, so the plugin disables overlap for those models. Mixed chunks let one step interleave prompt chunks with running requests' decode rows.
 
 The platform disables CUDA graphs and piecewise CUDA graphs, and sets the scheduling options by model kind:
 
@@ -49,7 +92,7 @@ The platform disables CUDA graphs and piecewise CUDA graphs, and sets the schedu
 | Speculative decoding | 16 | Off | Off |
 
 A model that keeps recurrent state also requires `mamba_ssm_dtype` unset or `float32` and `mamba_radix_cache_strategy` `auto` or `no_buffer`, and does not support `enable_int8_mamba_checkpoint`, `enable_linear_replayssm` or `enable_linear_replayssm_spec` yet.
-[Integrating frameworks](../engine/frameworks.md#sglang-specifics) explains the overlap schedule and mixed chunks.
+The [SGLang step implementation](https://github.com/furiosa-ai/furiosa-opt-models/blob/{{ git.commit }}/integrations/furiosa-opt-sglang/furiosa_opt_sglang/generation/sequence.py) defines the scheduling behavior.
 
 ## Speculative decoding
 

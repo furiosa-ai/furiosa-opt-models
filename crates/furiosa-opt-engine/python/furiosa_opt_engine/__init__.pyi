@@ -15,12 +15,15 @@ from . import decoder, llama, mistral, qwen3, vision_language
 
 __all__ = [
     "Checkpoint",
+    "Copier",
+    "Copy",
     "Decoder",
     "Device",
     "Encoder",
     "HbmBuffer",
     "HbmTensor",
     "HostBuffer",
+    "HostCache",
     "HostTensor",
     "LoadOptions",
     "Placement",
@@ -55,6 +58,82 @@ class Checkpoint:
         r"""
         This checkpoint with every tensor copied into host memory, where neither the page cache's
         eviction nor a later change to its files reaches them.
+        """
+
+@typing.final
+class Copier:
+    r"""
+    Python handle for asynchronous device-cache copies. Submit calls from one caller at a time;
+    returned `Copy` handles can be waited or queried from worker threads.
+
+    `copy_in` and `copy_out` return a `Copy` handle without waiting for its DMA. The caller owns
+    host-slot and device-page lifetimes: before submitting work that reuses either, it must wait
+    for the earlier `Copy` to finish. An in-flight device-page overlap raises `BlockingIOError` and
+    queues no work; host-slot reuse is serialized by its per-slot gate. A failed copy leaves its
+    device pages unavailable for this copier's lifetime.
+    Coalescing gathers or scatters through temporary pinned buffers to reduce DMA commands.
+    Number groups from zero in the order supplied to the constructor.
+    """
+    @property
+    def slot_bytes(self) -> builtins.int:
+        r"""
+        Bytes in one host slot.
+        """
+    @property
+    def layer_ranges(self) -> builtins.list[builtins.list[tuple[builtins.int, builtins.int]]]:
+        r"""
+        Host-slot byte offsets and lengths in transfer group and layer order.
+        """
+    def __new__(
+        cls, cache: decoder.Cache, groups: typing.Sequence[typing.Sequence[builtins.int]]
+    ) -> Copier:
+        r"""
+        Build a transfer queue over an allocated decoder cache.
+
+        Each group lists the stable layer IDs that move together for one logical block. Group and
+        layer order determine the packed host slot layout. A layer can appear in at most one group.
+        """
+    def copy_out(
+        self,
+        pages: typing.Sequence[
+            tuple[builtins.int, typing.Sequence[tuple[builtins.int, builtins.int]]]
+        ],
+        host: HostCache,
+        *,
+        coalesce: builtins.bool = False,
+    ) -> Copy:
+        r"""
+        Queue device-to-host copies for host slots and their `(group, device_block)` routes.
+        """
+    def copy_in(
+        self,
+        pages: typing.Sequence[
+            tuple[builtins.int, typing.Sequence[tuple[builtins.int, builtins.int]]]
+        ],
+        host: HostCache,
+        *,
+        coalesce: builtins.bool = False,
+    ) -> Copy:
+        r"""
+        Queue host-to-device copies for host slots and their `(group, device_block)` routes.
+        """
+    def shutdown(self) -> None:
+        r"""
+        Wait for every submitted copy and stop the workers. Drop all host-slot access leases first.
+        """
+
+@typing.final
+class Copy:
+    r"""
+    Completion handle for asynchronous cache copies.
+    """
+    def done(self, timeout: builtins.float | None = 0.0) -> builtins.bool:
+        r"""
+        Return whether the copy finished before `timeout` elapsed.
+        """
+    def wait(self) -> None:
+        r"""
+        Wait for the whole request and raise its transfer error, if any.
         """
 
 @typing_extensions.disjoint_base
@@ -333,6 +412,27 @@ class HostBuffer:
             ValueError: The size is not `len(buffer)` times the chip count.
             RuntimeError: The transfer failed before this returns; the `Transfer` raises a later
                 failure.
+        """
+
+@typing.final
+class HostCache:
+    r"""
+    A pool that owns page-locked host slots for transfers and host I/O. Pools on the same copier
+    share its device-page reservations and hold independent host-slot gates.
+    """
+    @property
+    def slot_bytes(self) -> builtins.int:
+        r"""
+        Bytes in one slot.
+        """
+    def __new__(cls, copier: Copier, slots: builtins.int) -> HostCache:
+        r"""
+        Allocate pinned host slots for the copier's page layout.
+        """
+    def access(self, index: builtins.int) -> builtins.memoryview:
+        r"""
+        Borrow one slot as a writable memoryview. DMA waits until every view of this borrow is
+        released. Coordinate other host users yourself and wait for relevant copies before reuse.
         """
 
 @typing.final

@@ -2,8 +2,9 @@
 {%- set embedding = benchmarks.models | selectattr("id", "equalto", "Qwen/Qwen3-Embedding-0.6B") | first -%}
 # Serving
 
-The vLLM and SGLang plugins serve model functions through each framework's own Python and HTTP APIs, and the model computation runs on RNGD.
-This page shows each serving task for both frameworks; the tabs switch together.
+The serving plugins expose model functions through their frameworks' Python and HTTP APIs, and the model computation runs on RNGD.
+This page is the task guide: it compares feature support and gives recipes for each supported framework; the tabs switch together.
+The [vLLM](vllm.md) and [SGLang](sglang.md) pages are configuration references for accepted options and startup refusals.
 Install a plugin first ([Installation](../getting-started/installation.md)); [Quickstart](../getting-started/quickstart.md) shows text generation.
 
 ## Feature support
@@ -132,35 +133,29 @@ Both servers reuse the cache rows of a prompt prefix they computed before, as lo
 
 ## Offload the KV cache to host memory
 
-Both servers copy the cache blocks of computed prompts to a tier of host memory, and copy them back into the device cache when a later prompt shares a prefix whose blocks the device has evicted, instead of computing it again:
+KV cache offload keeps evicted prefix blocks in host memory or on disk so a later request can reload them. These recipes enable the filesystem tier.
 
 === "vLLM"
 
     ```bash
-    vllm serve Qwen/Qwen3-0.6B --kv-offloading-size 16
+    vllm serve Qwen/Qwen3-0.6B --kv-offloading-size 16 \
+      --kv-transfer-config '{"kv_connector_extra_config":{"secondary_tiers":[{"type":"fs","root_dir":"/mnt/kv-cache"}]}}'
     ```
 
-    `--kv-offloading-size` sets the host tier in GiB, as on a GPU.
-    The platform serves it through the plugin's `RNGDOffloadingConnector` instead of vLLM's `OffloadingConnector`, which copies with CUDA streams; vLLM's scheduler still decides what to store, load and evict.
-    Options of vLLM's CPU offloading, such as `blocks_per_chunk` and `eviction_policy`, go in `--kv-transfer-config '{"kv_connector_extra_config": {...}}'` beside the size.
-    vLLM completes a transfer once the worker of each rank reports it, and one worker drives every chip, so offloading serves one chip a replica.
-    It also serves one replica: with data parallelism vLLM ranks each replica's worker among all of them.
-    Sleep mode frees the cache storage the host tier copies, so startup refuses `--enable-sleep-mode` beside offloading.
-    The `vllm:kv_offload_store_bytes` and `vllm:kv_offload_load_bytes` metrics count the bytes moved each way.
+    See [vLLM KV cache offloading](vllm.md#kv-cache-offloading) for settings and limits.
 
 === "SGLang"
 
     ```bash
-    python -m sglang.launch_server --model-path Qwen/Qwen3-1.7B --enable-hierarchical-cache --hicache-ratio 2
+    python -m sglang.launch_server --model-path Qwen/Qwen3-1.7B \
+      --enable-hierarchical-cache --hicache-ratio 2 --hicache-storage-backend file \
+      --hicache-host-memory-mode cache --hicache-io-backend kernel --hicache-mem-layout page_first \
+      --hicache-storage-backend-extra-config '{"file_storage_path":"/mnt/kv-cache"}'
     ```
 
-    `--hicache-ratio` sizes the host tier as a multiple of the device cache, `--hicache-size` in GB; SGLang sizes it from the free host memory only for the device pools it builds itself, so one of them is required.
-    The memory saver frees the cache storage the host tier copies, so startup refuses `--enable-memory-saver` beside the hierarchical cache.
-    A `/generate` response reports reused tokens by tier in `meta_info.cached_tokens_details`.
+    See [SGLang hierarchical cache](sglang.md#hierarchical-cache) for settings and limits.
 
-Only the attention cache moves, so both servers refuse offloading at startup for a model with recurrent state, and vLLM also for one with encoder memory; the [vLLM](vllm.md#options) and [SGLang](sglang.md#options) option pages name the other refused settings.
-A failed copy poisons the memory it touched, and neither server recovers once it observes the failure, so vLLM's `kv_load_failure_policy` takes only `fail`.
-vLLM observes the failure as soon as the copy ends; SGLang may observe it only later, when a call or copy next uses that memory.
+See [Integrating frameworks](../engine/frameworks.md#offload-cache-pages) for how the engine moves cache pages.
 
 ## Put the server to sleep
 
@@ -366,7 +361,7 @@ Each item's rows, one for each of its placeholder tokens, are written to `<share
 
 Set `FURIOSA_VISIBLE_CHIPS` to a comma-separated list of chip indices, such as `FURIOSA_VISIBLE_CHIPS=2,3`; the server then places the model on those chips in that order, and on chips `0`, `1` and so on when it is unset.
 
-## What both plugins accept
+## Shared serving options
 
 - Each plugin overrides or checks some framework options and refuses unsupported values at startup: [vLLM options](vllm.md), [SGLang options](sglang.md). Other options keep the framework's behavior.
 - The engine accepts a tensor degree of 1 or a chip count the model is compiled to split over, and a pipeline degree of 1; startup refuses any other with the engine's reason.

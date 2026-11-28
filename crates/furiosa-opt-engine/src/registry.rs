@@ -1044,7 +1044,9 @@ impl Implementation {
 #[cfg(test)]
 mod tests {
     use super::{ARCHITECTURES, Implementation, Tiling};
-    use crate::decoder::{Batch, Decoder, Limits, Output, Rows};
+    use crate::decoder::{
+        Batch, CacheSpec, Decoder, Group, Kind, Limits, Output, PageFormat, Pool, Rows,
+    };
     use furiosa_opt_models::load::{Checkpoint, Context, Load, LoadError};
     use furiosa_opt_models::models::{Class, Implements};
     use furiosa_opt_std::prelude::{Broadcast, Device, HbmBuffer, m};
@@ -1090,7 +1092,25 @@ mod tests {
         type Adapter = std::convert::Infallible;
 
         fn limits(&self) -> Limits {
-            unreachable!("a registry test calls no decoder")
+            Limits {
+                window: 1,
+                rows: 1,
+                cache: CacheSpec {
+                    layer_count: 1,
+                    pools: vec![Pool {
+                        block: 1,
+                        bytes: 1,
+                        format: PageFormat::contiguous(vec![1], 1).unwrap(),
+                    }],
+                    groups: vec![Group {
+                        pool: 0,
+                        layers: vec![0],
+                        logical_group: 0,
+                        kind: Kind::Paged { window: None },
+                    }],
+                },
+                adapters: 0,
+            }
         }
 
         fn layers(_: &[HbmBuffer]) -> io::Result<()> {

@@ -135,9 +135,9 @@ HIERARCHICAL = ("--enable-hierarchical-cache", "--hicache-ratio", "2")
     ("flags", "option", "requirement"),
     [
         (
-            ("--hicache-storage-backend", "file"),
+            ("--hicache-storage-backend", "mooncake"),
             "hicache_storage_backend",
-            "keeps the hierarchical cache in host memory; omit --hicache-storage-backend",
+            "uses SGLang's file backend for L3; omit --hicache-storage-backend otherwise",
         ),
         (
             ("--hicache-host-memory-mode", "buffer_only"),
@@ -165,7 +165,7 @@ HIERARCHICAL = ("--enable-hierarchical-cache", "--hicache-ratio", "2")
             "releases no memory under a hierarchical cache yet; omit --enable-memory-saver",
         ),
     ],
-    ids=["storage", "buffer-only", "io-backend", "layout", "recurrent", "memory-saver"],
+    ids=["unsupported-storage", "buffer-only", "io-backend", "layout", "recurrent", "memory-saver"],
 )
 @pytest.mark.feature("KV cache offloading")
 def test_refuses_hierarchical_cache(flags: tuple[str, ...], option: str, requirement: str) -> None:
@@ -203,6 +203,22 @@ def test_accepts_hierarchical_cache_of_given_size(size: tuple[str, str]) -> None
     )
     arguments.resolve_once()
     assert arguments.resolved_dict()["enable_hierarchical_cache"]
+
+
+@pytest.mark.feature("KV cache offloading")
+def test_accepts_file_storage_backend() -> None:
+    """The engine's hierarchical host pool can persist pages through SGLang HiCacheFile."""
+    arguments = prepare_server_args(
+        [
+            "--model-path",
+            "Qwen/Qwen3-1.7B",
+            *HIERARCHICAL,
+            "--hicache-storage-backend",
+            "file",
+        ]
+    )
+    arguments.resolve_once()
+    assert arguments.hicache_storage_backend == "file"
 
 
 @pytest.mark.parametrize(

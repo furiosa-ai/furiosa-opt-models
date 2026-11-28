@@ -92,6 +92,9 @@ class Runner:
         self.speculative: Speculative | None = speculative(vllm_config, Section.parse(vllm_config))
         self.model: Decoder | Media | None = None
         self.cache: engine.decoder.Cache | None = None
+        # Engine storage groups may share one vLLM block table; entries map engine-group order to
+        # the actual KVCacheConfig group index for request block IDs.
+        self.engine_group_block_table_indices: tuple[int, ...] = ()
         # vLLM's driver of the KV connector around each step, which does nothing without one.
         self.kv_connector: KVConnector = NO_OP_KV_CONNECTOR
         # The memory sleep mode released, by its tag, and what waking restores it from.

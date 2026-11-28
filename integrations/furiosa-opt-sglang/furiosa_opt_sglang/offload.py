@@ -1,23 +1,17 @@
-"""SGLang's hierarchical cache over the engine cache: a host-pool stack SGLang assembles for the
-engine's token pool, whose pages move to and from the engine cache's layers.
+"""SGLang's host-pool adapter over the engine cache.
 
-- Each layer's host pages lie in one host buffer, page after page; a host page holds the layer's
-  cache page as the device holds it, every chip's part chip after chip.
-- SGLang moves whole pages: `pages` reads its tensor of token slots as pages of `page_size`
-  consecutive slots from a multiple of `page_size`, on the device as on the host. Pages that follow
-  each other on both move in one copy.
-- A backup or load returns once submitted. The device orders each copy after the calls and copies
-  that wrote its bytes and before the ones that read or overwrite them, which is all SGLang's
-  completion events stand for here.
+Each pinned slot holds one whole page across all layers. Six native workers batch up to two slots,
+with every layer copy in one runtime DMA batch. SGLang keeps page selection and lifecycle; the
+adapter tracks engine copies so SGLang's native events are recorded only after DMA completion.
 """
 
 from __future__ import annotations
 
-from itertools import pairwise
-from typing import TYPE_CHECKING, Final, cast, final
+from dataclasses import dataclass, field
+from threading import Lock, local
+from typing import TYPE_CHECKING, Final, final
 
 import torch
-from pydantic import ConfigDict, TypeAdapter
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import HybridCacheController
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -33,6 +27,52 @@ from typing_extensions import override
 import furiosa_opt_engine as engine
 from furiosa_opt_sglang.cache import Cache
 from furiosa_opt_sglang.platform import Hierarchical
+from furiosa_opt_sglang.transfer import AsyncL2TransferEngine
+
+ENGINE_CACHE_GROUP = 0
+
+
+@dataclass(frozen=True)
+class _LoadRoute:
+    """One SGLang page batch, reused by its per-layer callbacks."""
+
+    device_indices: torch.Tensor
+    host_indices: torch.Tensor
+    page_key: _PageKey
+    transfers: list[tuple[int, list[tuple[int, int]]]]
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _PageKey:
+    """Content key with a cached hash for repeated per-layer lookups."""
+
+    device: tuple[int, ...]
+    host: tuple[int, ...]
+    _hash: int = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_hash", hash((self.device, self.host)))
+
+    def __hash__(self) -> int:
+        return self._hash
+
+    def __eq__(self, other: object) -> bool:
+        return self is other or (
+            isinstance(other, _PageKey) and self.device == other.device and self.host == other.host
+        )
+
+
+def _take_coalescing_option(
+    options: dict[str, object] | None,
+) -> tuple[bool, dict[str, object] | None]:
+    if options is None:
+        return False, None
+    storage_options = dict(options)
+    coalescing = storage_options.pop("coalescing", False)
+    if type(coalescing) is not bool:
+        raise ValueError("coalescing must be a boolean")
+    return coalescing, storage_options
+
 
 if TYPE_CHECKING:
     from threading import Event
@@ -67,12 +107,36 @@ class Strategy(StackStrategy):
         enable_storage_metrics: bool = False,
     ) -> StackBuildResult:
         assert isinstance(kvcache, Cache)
-        # The platform refuses storage backends, and the plugin's speculation packs no draft pools.
-        assert storage_backend is None and not params.mtp_draft_device_pools
+        if storage_backend not in (None, "file"):
+            raise ValueError(
+                "the Furiosa engine cache supports SGLang HiCache storage only "
+                "with its file backend"
+            )
+        if params.mtp_draft_device_pools:
+            raise ValueError(
+                "Furiosa HiCache cannot offload SGLang MTP draft pools: its host pool covers only "
+                "the engine-owned target-model KV layers"
+            )
         # The scheduler's cache parameters carry its tensor-parallel group.
         assert params.tp_cache_group is not None
+        coalescing, storage_options = _take_coalescing_option(storage_backend_extra_config)
+        storage_backend_extra_config = storage_options
         options = Hierarchical.parse(get_memory())
-        host = Host(kvcache, options.hicache_ratio, options.hicache_size, params.page_size)
+        host = Host(
+            kvcache,
+            options.hicache_ratio,
+            options.hicache_size,
+            params.page_size,
+            coalescing=coalescing,
+        )
+        if storage_backend == "file":
+            storage_backend = "dynamic"
+            storage_backend_extra_config = {
+                **(storage_options or {}),
+                "backend_name": "furiosa_file",
+                "module_path": "furiosa_opt_sglang.storage",
+                "class_name": "FuriosaHiCacheFile",
+            }
         layers = kvcache.layer_num
         group = HostPoolGroup(
             [
@@ -97,12 +161,17 @@ class Strategy(StackStrategy):
             pp_group=params.pp_cache_group,
             write_policy=options.hicache_write_policy,
             io_backend=options.hicache_io_backend,
+            storage_backend=storage_backend,
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
             transfer_layer_id_max=layers,
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=options.hicache_host_memory_mode,
         )
+        transfer_engine = AsyncL2TransferEngine(controller.l2_transfer_engine)
+        controller.l2_transfer_engine = transfer_engine
+        host.transfer_engine = transfer_engine
         return StackBuildResult(
             host_pool_group=group,
             cache_controller=controller,
@@ -115,20 +184,31 @@ class Strategy(StackStrategy):
 class Host(HostKVCache):
     """A host tier of `cache`'s pages, `ratio` times its tokens or `size` GB when that is set."""
 
-    def __init__(self, cache: Cache, ratio: float, size: int, page_size: int) -> None:
+    def __init__(
+        self,
+        cache: Cache,
+        ratio: float,
+        size: int,
+        page_size: int,
+        *,
+        coalescing: bool = False,
+    ) -> None:
         # The platform refuses the memory saver beside this tier, so the storage is never released.
         assert cache.storage is not None, "a token pool holds its storage until it is released"
-        self.layers = cache.storage.layers
-        # Bytes one page of each layer takes on each chip.
-        self.sizes = [len(layer) // cache.storage.blocks for layer in self.layers]
-        self.chips = cache.pages.chips
+        self.copier = engine.Copier(cache.storage, [list(range(cache.storage.spec.layer_count))])
+        item_bytes = cache.dtype.itemsize
+        page_bytes = self.copier.slot_bytes
+        if page_size <= 0 or page_bytes % (page_size * item_bytes):
+            raise ValueError("the host cache page must align to its token count and storage dtype")
         # SGLang's pool reads these while it allocates the pages.
         self.device_pool = cache
         self.layer_num = self.target_layer_num = cache.layer_num
+        self.transfer_engine = None
+        self.coalescing = coalescing
         super().__init__(
             dtype=cache.dtype,
             device_capacity_tokens=cache.size,
-            size_per_token=sum(self.sizes) * self.chips // page_size,
+            size_per_token=page_bytes // page_size,
             start_layer=cache.start_layer,
             end_layer=cache.end_layer,
             host_to_device_ratio=ratio,
@@ -144,8 +224,47 @@ class Host(HostKVCache):
         return self.size_per_token
 
     @override
-    def init_kv_buffer(self) -> list[engine.HostBuffer]:
-        return [engine.HostBuffer(self.page_num * size * self.chips) for size in self.sizes]
+    def init_kv_buffer(self) -> list[engine.HostCache]:
+        self.host_cache = engine.HostCache(self.copier, self.page_num)
+        self._pending_loads: dict[_PageKey, set[int]] = {}
+        self._pending_loads_lock = Lock()
+        self._copy_batch = local()
+        return [self.host_cache]
+
+    @override
+    def get_hybrid_pool_buffer(self) -> list[engine.HostCache]:
+        return [self.host_cache]
+
+    @override
+    def destroy(self) -> None:
+        transfer_engine = self.transfer_engine
+        failure: BaseException | None = None
+        try:
+            if transfer_engine is not None:
+                transfer_engine.shutdown()
+        except BaseException as error:
+            failure = error
+        copier = getattr(self, "copier", None)
+        try:
+            if copier is not None:
+                copier.shutdown()
+        except BaseException as error:
+            if failure is None:
+                failure = error
+            else:
+                failure = BaseExceptionGroup("multiple cache shutdown failures", [failure, error])
+        self.transfer_engine = None
+        self.host_cache = None
+        self.copier = None
+        try:
+            super().destroy()
+        except BaseException as error:
+            if failure is None:
+                failure = error
+            else:
+                failure = BaseExceptionGroup("multiple cache shutdown failures", [failure, error])
+        if failure is not None:
+            raise failure
 
     @override
     def backup_from_device_all_layer(
@@ -155,15 +274,16 @@ class Host(HostKVCache):
         device_indices: torch.Tensor,
         io_backend: str,
     ) -> None:
-        device, host = pages(device_indices, self.page_size), pages(host_indices, self.page_size)
-        moved = runs(device, host, self.chips)
-        for layer, size, buffer in zip(self.layers, self.sizes, self.buffers, strict=True):
-            # Bytes of one host page.
-            stride = size * self.chips
-            for block, page, length in moved:
-                _ = layer.slice(block * size, length * size).to_host(
-                    buffer.slice(page * stride, length * stride)
-                )
+        device = pages(device_indices, self.page_size)
+        host = pages(host_indices, self.page_size)
+        if len(device) != len(host):
+            raise ValueError("hierarchical cache backup source and destination pages differ")
+        transfers = [
+            (target, [(ENGINE_CACHE_GROUP, source)])
+            for source, target in zip(device, host, strict=True)
+        ]
+        copy = self.copier.copy_out(transfers, self.host_cache)
+        self._submit_copy(copy)
 
     @override
     def load_to_device_per_layer(
@@ -176,62 +296,146 @@ class Host(HostKVCache):
         *,
         is_draft: bool = False,
     ) -> None:
-        layer, size, buffer = self.layers[layer_id], self.sizes[layer_id], self.buffers[layer_id]
-        device, host = pages(device_indices, self.page_size), pages(host_indices, self.page_size)
-        stride = size * self.chips
-        for block, page, length in runs(device, host, self.chips):
-            _ = buffer.slice(page * stride, length * stride).to_hbm(
-                layer.slice(block * size, length * size)
-            )
+        if not 0 <= layer_id < self.layer_num:
+            raise ValueError("hierarchical cache load names an unknown layer")
+        copy_batch = getattr(self, "_copy_batch", None)
+        load_routes = None if copy_batch is None else getattr(copy_batch, "load_routes", None)
+        # SGLang reuses each transfer's tensors across its per-layer callbacks. Keeping the refs
+        # prevents id reuse while this batch memo avoids a CUDA-to-host sync for every layer.
+        route_id = (id(device_indices), id(host_indices))
+        route = None if load_routes is None else load_routes.get(route_id)
+        if (
+            route is None
+            or route.device_indices is not device_indices
+            or route.host_indices is not host_indices
+        ):
+            device = tuple(pages(device_indices, self.page_size))
+            host = tuple(pages(host_indices, self.page_size))
+            if len(device) != len(host):
+                raise ValueError("hierarchical cache load source and destination pages differ")
+            transfers = [
+                (target, [(ENGINE_CACHE_GROUP, source)])
+                for source, target in zip(device, host, strict=True)
+            ]
+            route = _LoadRoute(device_indices, host_indices, _PageKey(device, host), transfers)
+            if load_routes is not None:
+                load_routes[route_id] = route
+        if not route.page_key.device:
+            return
+
+        key = route.page_key
+        pending_loads_lock = getattr(self, "_pending_loads_lock", None)
+        if pending_loads_lock is None:
+            pending_loads_lock = self._pending_loads_lock = Lock()
+        with pending_loads_lock:
+            seen = self._pending_loads.get(key)
+            new_copy = seen is None
+            if seen is None:
+                seen = set()
+                self._pending_loads[key] = seen
+            seen.add(layer_id)
+            if len(seen) == self.layer_num:
+                del self._pending_loads[key]
+
+        if new_copy:
+            # SGLang calls once per layer; Copier moves every layer in one page batch.
+            try:
+                copy = self.copier.copy_in(
+                    route.transfers, self.host_cache, coalesce=self.coalescing
+                )
+                self._submit_copy(copy)
+            except BaseException:
+                with pending_loads_lock:
+                    self._pending_loads.pop(key, None)
+                raise
+            if copy_batch is not None and hasattr(copy_batch, "load_keys"):
+                copy_batch.load_keys.append(key)
+
+    def begin_async_copy_batch(self) -> None:
+        if hasattr(self._copy_batch, "copies"):
+            raise RuntimeError("nested SGLang cache copy batch")
+        self._copy_batch.copies = []
+        self._copy_batch.load_keys = []
+        self._copy_batch.load_routes = {}
+
+    def finish_async_copy_batch(self) -> list[engine.Copy]:
+        batch = getattr(self, "_copy_batch", None)
+        copies = None if batch is None else getattr(batch, "copies", None)
+        if copies is None:
+            return []
+        del batch.copies
+        load_keys = batch.load_keys
+        del batch.load_keys
+        del batch.load_routes
+        with self._pending_loads_lock:
+            for key in load_keys:
+                self._pending_loads.pop(key, None)
+        return copies
+
+    def _submit_copy(self, copy: engine.Copy) -> None:
+        batch = getattr(self, "_copy_batch", None)
+        copies = None if batch is None else getattr(batch, "copies", None)
+        if copies is not None:
+            copies.append(copy)
+            return
+        copy.wait()
 
     @override
     def get_data_page(self, index: int, flat: bool = True) -> torch.Tensor:
-        raise NotImplementedError("the engine's host pool serves no storage backend")
+        if not flat:
+            raise ValueError("the engine cache exposes opaque flat pages to storage")
+        page = self._page_index(index)
+        slot = self.host_cache.access(page)
+        return torch.frombuffer(slot, dtype=torch.uint8).view(self.dtype)
 
     @override
     def get_dummy_flat_data_page(self) -> torch.Tensor:
-        raise NotImplementedError("the engine's host pool serves no storage backend")
+        item_bytes = self.dtype.itemsize
+        return torch.empty(self._page_bytes // item_bytes, dtype=self.dtype, device="cpu")
 
     @override
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
-        raise NotImplementedError("the engine's host pool serves no storage backend")
+        if data_page.device.type != "cpu":
+            raise ValueError("the file storage backend returns host pages on CPU")
+        page = self._page_index(index)
+        source = memoryview(data_page.contiguous().view(torch.uint8).reshape(-1).numpy()).cast("B")
+        if len(source) != self._page_bytes:
+            raise ValueError("stored page size differs from the engine cache page")
+        with self.host_cache.access(page) as destination:
+            destination[:] = source
 
     @property
-    def buffers(self) -> list[engine.HostBuffer]:
-        """Each layer's pages, as `init_kv_buffer` allocated them."""
-        return cast("list[engine.HostBuffer]", self.kv_buffer)
+    def _page_bytes(self) -> int:
+        return self.host_cache.slot_bytes
+
+    def _page_index(self, index: int) -> int:
+        if index < 0 or index % self.page_size:
+            raise ValueError("storage pages must start at an aligned token slot")
+        page = index // self.page_size
+        if page >= self.page_num:
+            raise ValueError("storage page is outside the engine host pool")
+        return page
 
 
 # The dtypes in which SGLang's pools name token slots.
 SLOTS: Final = frozenset({torch.int32, torch.int64})
-PAGES: Final = TypeAdapter(list[int], config=ConfigDict(strict=True))
 
 
 def pages(indices: torch.Tensor, size: int) -> list[int]:
     """The pages of `size` token slots whose slots `indices` lists, each page whole and in order."""
+    if size <= 0:
+        raise ValueError("hierarchical cache page size must be positive")
     if indices.dim() != 1 or indices.dtype not in SLOTS:
         raise ValueError("hierarchical cache transfers name token slots by a 1-D integer tensor")
     if len(indices) % size:
         raise ValueError("hierarchical cache transfers move whole pages")
     rows = indices.reshape(-1, size)
     first = rows[:, :1]
-    offsets = torch.arange(size, dtype=rows.dtype).expand_as(rows)
-    if (first % size).any() or not torch.equal(rows - first, offsets):
+    offsets = torch.arange(size, dtype=rows.dtype, device=rows.device).expand_as(rows)
+    valid = (first >= 0) & (first % size == 0) & (rows - first == offsets)
+    result = torch.cat(
+        ((valid.all().reshape(1).to(indices.dtype)), first.flatten() // size)
+    ).tolist()
+    if not result[0]:
         raise ValueError("a hierarchical cache page is a page's consecutive token slots")
-    return PAGES.validate_python((first.flatten() // size).tolist())
-
-
-def runs(device: list[int], host: list[int], chips: int) -> list[tuple[int, int, int]]:
-    """`device` pages beside the `host` pages they move to or from, as `(block, page, length)`
-    runs that each move in one copy: pages that both step by one. A copy moves each chip's part of
-    its pages in turn while a host page holds every chip's part of one page, so on more than one
-    chip a run is one page."""
-    assert len(device) == len(host)
-    starts = [
-        i
-        for i in range(len(device))
-        if i == 0 or chips > 1 or (device[i] - device[i - 1], host[i] - host[i - 1]) != (1, 1)
-    ]
-    return [
-        (device[start], host[start], end - start) for start, end in pairwise([*starts, len(device)])
-    ]
+    return result[1:]

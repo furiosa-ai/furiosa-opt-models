@@ -70,6 +70,22 @@ transfer.wait()
 1. The first cached layer's device storage.
 2. `len(layer)` bytes for each chip of the device, here one.
 
+## Copy cache pages to host memory
+
+`Copier` transfers pages from an allocated decoder cache to a `HostCache` of pinned host slots and back. Pass the layer IDs for each group that shares a block index. Group and layer order determine the packed host layout.
+
+```python
+copier = engine.Copier(cache, [[0, 1]])  # Layers 0 and 1 move together.
+host = engine.HostCache(copier, 4)
+pages = [(0, [(0, 2)])]  # Host slot 0, group 0, device block 2.
+copier.copy_out(pages, host).wait()
+with host.access(0) as view:
+    page_bytes = bytes(view)
+copier.shutdown()
+```
+
+`copier.layer_ranges` reports the byte offset and length of each layer in a slot. See [Offload cache pages](frameworks.md#offload-cache-pages) for transfer completion, slot access and batching rules.
+
 ## Run requests with LoRA adapters
 
 A decoder whose projections take LoRA adapters describes them as `decoder.adapters`, an `engine.decoder.AdapterSpec`, and any other decoder as `None`; a load for adapters, `engine.LoadOptions().adapters()`, refuses any other one from its config.

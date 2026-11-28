@@ -1,6 +1,6 @@
 # Python reference
 
-The engine is the `furiosa_opt_engine` package, which both plugins install as a dependency.
+The serving plugins install the engine as the `furiosa_opt_engine` package.
 This page is generated from its type stubs and grouped by task.
 For a walkthrough, see [Using the engine](../engine/python.md).
 
@@ -70,3 +70,11 @@ A call takes one `Request` per sequence and the `Cache` they append to; `Cache(s
 ::: furiosa_opt_engine.decoder.Group
 
 ::: furiosa_opt_engine.decoder.Kind
+
+## Cache page transfers
+
+::: furiosa_opt_engine.Copier
+
+::: furiosa_opt_engine.HostCache
+
+::: furiosa_opt_engine.Copy

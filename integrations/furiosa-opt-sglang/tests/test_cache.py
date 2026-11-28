@@ -32,6 +32,71 @@ def test_hierarchical_cache_moves_whole_pages(slots: Sequence[int], pages: list[
     assert offload.pages(torch.tensor(list(slots), dtype=torch.int64), 16) == pages
 
 
+def test_hierarchical_cache_requires_positive_page_size() -> None:
+    import torch
+
+    from furiosa_opt_sglang import offload
+
+    with pytest.raises(ValueError, match="page size must be positive"):
+        _ = offload.pages(torch.empty(0, dtype=torch.int64), 0)
+
+
+@pytest.mark.parametrize("coalescing", [False, True], ids=["direct", "coalesced"])
+def test_layer_load_callbacks_submit_one_engine_copy(coalescing: bool) -> None:
+    import torch
+
+    from furiosa_opt_sglang.offload import Host
+
+    class Copy:
+        def __init__(self) -> None:
+            self.wait_count = 0
+
+        def wait(self) -> None:
+            self.wait_count += 1
+
+    class Copier:
+        def __init__(self) -> None:
+            self.calls = []
+            self.copy = Copy()
+
+        def copy_in(self, pages, host_cache, *, coalesce=False):
+            self.calls.append((pages, host_cache, coalesce))
+            return self.copy
+
+    host = Host.__new__(Host)
+    host.page_size = 2
+    host.layer_num = 2
+    host.coalescing = coalescing
+    host.host_cache = object()
+    host.copier = Copier()
+    host._pending_loads = {}
+    host_indices = torch.tensor([4, 5], dtype=torch.int64)
+    device_indices = torch.tensor([2, 3], dtype=torch.int64)
+
+    host.load_to_device_per_layer(None, host_indices, device_indices, 0, "cpu")
+    host.load_to_device_per_layer(None, host_indices, device_indices, 1, "cpu")
+
+    assert host.copier.calls == [([(2, [(0, 1)])], host.host_cache, coalescing)]
+    assert host.copier.copy.wait_count == 1
+    assert host._pending_loads == {}
+
+
+def test_sglang_coalescing_option_leaves_storage_config_unchanged() -> None:
+    from furiosa_opt_sglang.offload import _take_coalescing_option
+
+    options = {"coalescing": True, "file_storage_path": "/tmp/cache"}
+
+    assert _take_coalescing_option(options) == (True, {"file_storage_path": "/tmp/cache"})
+    assert options == {"coalescing": True, "file_storage_path": "/tmp/cache"}
+
+
+def test_sglang_coalescing_option_must_be_boolean() -> None:
+    from furiosa_opt_sglang.offload import _take_coalescing_option
+
+    with pytest.raises(ValueError, match="coalescing must be a boolean"):
+        _ = _take_coalescing_option({"coalescing": "yes"})
+
+
 @pytest.mark.parametrize(
     ("slots", "reason"),
     [
@@ -68,25 +133,66 @@ def test_hierarchical_cache_refuses_other_slot_tensors(
         _ = offload.pages(torch.arange(16, 32, dtype=dtype).reshape(shape), 16)
 
 
-@pytest.mark.parametrize(
-    ("device", "host", "chips", "moved"),
-    [
-        ([4, 5, 6], [10, 11, 12], 1, [(4, 10, 3)]),
-        ([4, 5, 7, 8], [0, 1, 2, 3], 1, [(4, 0, 2), (7, 2, 2)]),
-        ([4, 5, 6], [0, 1, 3], 1, [(4, 0, 2), (6, 3, 1)]),
-        ([6, 5, 4], [0, 1, 2], 1, [(6, 0, 1), (5, 1, 1), (4, 2, 1)]),
-        ([4, 5], [0, 1], 2, [(4, 0, 1), (5, 1, 1)]),
-    ],
-    ids=["adjacent", "device-gap", "host-gap", "descending", "two-chips"],
-)
-def test_hierarchical_cache_moves_adjacent_pages_in_one_copy(
-    device: list[int], host: list[int], chips: int, moved: list[tuple[int, int, int]]
-) -> None:
-    """Pages that follow each other on the device and on the host move in one copy on a cache of
-    one chip, and one page a copy on more chips, whose copy writes chip after chip."""
-    from furiosa_opt_sglang import offload
+def test_file_storage_round_trips_engine_host_slots(tmp_path) -> None:
+    import torch
+    from sglang.srt.mem_cache.hicache_storage import (
+        HiCacheStorageConfig,
+        PoolName,
+        PoolTransfer,
+    )
 
-    assert offload.runs(device, host, chips) == moved
+    from furiosa_opt_sglang.offload import Host
+    from furiosa_opt_sglang.storage import FuriosaHiCacheFile
+
+    class HostCache:
+        slot_bytes = 12
+
+        def __init__(self) -> None:
+            self.pages = [bytearray(self.slot_bytes) for _ in range(2)]
+
+        def access(self, index: int) -> memoryview:
+            return memoryview(self.pages[index])
+
+    host = Host.__new__(Host)
+    host.page_size = 4
+    host.page_num = 2
+    host.dtype = torch.uint8
+    host_cache = HostCache()
+    host.host_cache = host_cache
+    expected = bytes(range(1, 13))
+    host_cache.pages[1][:] = expected
+
+    assert host.get_dummy_flat_data_page().numel() == 12
+    page = host.get_data_page(4)
+    assert page.tolist() == list(expected)
+    config = HiCacheStorageConfig(
+        tp_rank=0,
+        tp_size=1,
+        pp_rank=0,
+        pp_size=1,
+        attn_cp_rank=0,
+        attn_cp_size=1,
+        is_mla_model=False,
+        enable_storage_metrics=False,
+        is_page_first_layout=True,
+        model_name="engine-cache-test",
+        extra_config={"file_storage_path": str(tmp_path)},
+    )
+    storage = FuriosaHiCacheFile(config)
+    storage.register_mem_host_pool_v2(host, PoolName.KV)
+    transfer = PoolTransfer(
+        name=PoolName.KV,
+        host_indices=torch.tensor([4, 5, 6, 7]),
+        keys=["page-key"],
+    )
+    try:
+        assert storage.batch_set_v2([transfer]) == {PoolName.KV: [True]}
+        host_cache.pages[1][:] = bytes(12)
+        assert storage.batch_get_v2([transfer]) == {PoolName.KV: [True]}
+        assert bytes(host_cache.pages[1]) == expected
+    finally:
+        storage._read_io.shutdown()
+        storage._write_io.shutdown()
 
 
 def test_mamba_pool_copies_and_restores_slots() -> None:

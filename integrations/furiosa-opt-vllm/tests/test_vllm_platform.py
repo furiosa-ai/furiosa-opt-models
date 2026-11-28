@@ -401,9 +401,26 @@ def connector(name: str, module: str | None = None) -> KVTransferConfig:
             Ignored(kv_offloading_size=1, kv_transfer_config=extra(blocks_per_chunk=2)),
             {"blocks_per_chunk": 2},
         ),
+        (
+            Ignored(
+                kv_offloading_size=1,
+                kv_transfer_config=extra(
+                    secondary_tiers=[{"type": "fs", "root_dir": "/cache"}],
+                    spec_name=None,
+                ),
+            ),
+            {
+                "secondary_tiers": [{"type": "fs", "root_dir": "/cache"}],
+                "spec_name": "TieringOffloadingSpec",
+            },
+        ),
+        (
+            Ignored(kv_offloading_size=1, kv_transfer_config=extra(canonical_layout=True)),
+            {"canonical_layout": True},
+        ),
         (Ignored(kv_transfer_config=connector("RNGDOffloadingConnector", offload.__name__)), {}),
     ],
-    ids=["size", "size-and-options", "connector"],
+    ids=["size", "size-and-options", "filesystem-tier", "canonical-layout", "connector"],
 )
 @pytest.mark.feature("KV cache offloading")
 def test_offloads_through_the_rngd_connector(
@@ -416,10 +433,6 @@ def test_offloads_through_the_rngd_connector(
     assert transfer is not None
     assert KVConnectorFactory.get_connector_class(transfer) is offload.RNGDOffloadingConnector
     assert transfer.kv_connector_extra_config == {"cpu_bytes_to_use": 1 << 30, **options}
-
-
-# The refusals that name a single worker's ranks.
-RANKS = "{}: vLLM awaits each rank; one worker drives all chips"
 
 
 @pytest.mark.usefixtures("platform_env")
@@ -444,17 +457,10 @@ RANKS = "{}: vLLM awaits each rank; one worker drives all chips"
             + "selects",
         ),
         (
-            Ignored(
-                kv_offloading_size=1, kv_transfer_config=extra(spec_name="TieringOffloadingSpec")
-            ),
+            Ignored(kv_offloading_size=1, kv_transfer_config=extra(spec_name="ExampleSpec")),
             "kv_connector_extra_config",
-            "keeps offloaded blocks in host memory by vLLM's CPUOffloadingSpec, so it takes no "
-            + "other spec_name or spec_module_path",
-        ),
-        (
-            Ignored(kv_offloading_size=1, kv_transfer_config=extra(canonical_layout=True)),
-            "kv_connector_extra_config",
-            "keeps offloaded blocks in the device's order, so it takes no canonical_layout",
+            "uses vLLM's CPUOffloadingSpec for host offload or TieringOffloadingSpec when "
+            + "secondary_tiers are configured",
         ),
         (
             Ignored(
@@ -464,15 +470,11 @@ RANKS = "{}: vLLM awaits each rank; one worker drives all chips"
             "kv_load_failure_policy",
             "stops the engine when an offloaded block fails to copy: kv_load_failure_policy=fail",
         ),
-        (
-            Ignored(kv_offloading_size=1, tensor_parallel_size=2),
-            "tensor_parallel_size",
-            RANKS.format("offloads at tensor_parallel_size=1"),
-        ),
         pytest.param(
             Ignored(kv_offloading_size=1, pipeline_parallel_size=2),
             "pipeline_parallel_size",
-            RANKS.format("offloads at pipeline_parallel_size=1"),
+            "offloads at pipeline_parallel_size=1: vLLM awaits each rank; "
+            "one worker drives all chips",
             marks=pytest.mark.skip(reason="pending: pipeline parallelism, refused for every model"),
         ),
         (
@@ -490,10 +492,8 @@ RANKS = "{}: vLLM awaits each rank; one worker drives all chips"
         "lmcache",
         "vllm-connector",
         "module",
-        "tiering",
-        "canonical",
+        "unsupported-spec",
         "recompute",
-        "tp",
         "pp",
         "dp",
         "sleep",
