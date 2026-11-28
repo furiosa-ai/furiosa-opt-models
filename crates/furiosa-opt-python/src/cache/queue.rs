@@ -469,12 +469,9 @@ impl Chunk {
                 }
             }
         }
-        page_layers.sort_unstable_by_key(|&(page_index, _, layer_id)| {
-            (
-                self.pages[page_index].slot,
-                self.pool.layout.layer_ranges[layer_id].start,
-            )
-        });
+        // Submission sorts each page's groups, and two-page chunks sort their slots. Expanding
+        // those routes already follows the packed slot layout; sorting every layer route again
+        // would repeat that work for each DMA chunk.
 
         let mut aliases = Vec::with_capacity(route_count);
         for &(_, block, layer_id) in &page_layers {
