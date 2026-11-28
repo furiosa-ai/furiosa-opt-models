@@ -141,34 +141,31 @@ class Worker:
         self.host.shutdown()
 
 
-@dataclass(frozen=True, slots=True)
-class LayerRoute:
-    layer_id: int
-    group_index: int
-    device_page_bytes: int
-    host_page_bytes: int
-    host_offset: int
+def _layer_id(name: str) -> int:
+    prefix = "layers."
+    if not name.startswith(prefix):
+        raise ValueError(f"vLLM layer name {name!r} is not an engine layer ID")
+    try:
+        return int(name.removeprefix(prefix))
+    except ValueError as error:
+        raise ValueError(f"vLLM layer name {name!r} is malformed") from error
 
 
 def _metadata_cache_views(
-    cache: engine.decoder.Cache,
+    cache: engine.decoder.CacheSpec,
     config: KVCacheConfig,
     layer_owner: dict[int, tuple[int, int]],
 ) -> dict[str, torch.Tensor]:
     """Build metadata-only views for vLLM's canonical-layout validator."""
     views: dict[str, torch.Tensor] = {}
+    pools = cache.pools
     for group_id, group in enumerate(config.kv_cache_groups):
         for name in group.layer_names:
-            if not name.startswith("layers."):
-                raise ValueError(f"vLLM layer name {name!r} is not an engine layer ID")
-            try:
-                layer_id = int(name.removeprefix("layers."))
-            except ValueError as error:
-                raise ValueError(f"vLLM layer name {name!r} is malformed") from error
+            layer_id = _layer_id(name)
             owner = layer_owner.get(layer_id)
             if owner is None or owner[0] != group_id:
                 raise ValueError(f"engine cache metadata for {name} differs from vLLM's group")
-            pool = cache.spec.pools[owner[1]]
+            pool = pools[owner[1]]
             spec = assigned(group, name)
             element_bytes = pool.element_bytes
             shape = tuple(pool.shape)
@@ -235,18 +232,17 @@ class Host(OffloadingWorker):
     ) -> None:
         if chips <= 0 or cache.blocks <= 0:
             raise ValueError("cache transfer requires positive chip and block counts")
-        self.layers = cache.layers
         self.device_blocks = cache.blocks
         self.blocks = spec.blocks_per_chunk
         self.chunks = spec.num_chunks
         self.row_stride = spec.kv_bytes_per_chunk
-        engine_group_indices = group_indices(cache.spec, kv_cache_config.kv_cache_groups)
-        layer_owner: dict[int, tuple[int, int]] = {}
-        for group in cache.spec.groups:
-            for layer_id in group.layers:
-                if not 0 <= layer_id < len(cache.layers):
-                    raise ValueError(f"engine cache group names unknown layer {layer_id}")
-                layer_owner[layer_id] = (engine_group_indices[group.logical_group], group.pool)
+        cache_spec = cache.spec
+        engine_group_indices = group_indices(cache_spec, kv_cache_config.kv_cache_groups)
+        layer_owner = {
+            layer_id: (engine_group_indices[group.logical_group], group.pool)
+            for group in cache_spec.groups
+            for layer_id in group.layers
+        }
 
         mappings: dict[str, CanonicalPageMapping] = {}
         if spec.config.canonical_layout:
@@ -255,7 +251,7 @@ class Host(OffloadingWorker):
             mappings = derive_canonical_mappings(
                 vllm_config,
                 kv_cache_config,
-                _metadata_cache_views(cache, kv_cache_config, layer_owner),
+                _metadata_cache_views(cache_spec, kv_cache_config, layer_owner),
             )
             if spec.config.parallel.is_parallelism_agnostic and any(
                 not mapping.parallelism_agnostic for mapping in mappings.values()
@@ -265,102 +261,60 @@ class Host(OffloadingWorker):
                     "topology-specific"
                 )
 
-        self.routes: dict[int, tuple[LayerRoute, ...]] = {}
-        self.group_indices: dict[int, int] = {}
-        group_offset = 0
-        for group_index, group_id in enumerate(selected_group_ids):
+        if not selected_group_ids:
+            raise ValueError("vLLM selected no cache groups for offloading")
+        if self.chunks <= 0 or self.blocks <= 0 or self.row_stride <= 0:
+            raise ValueError("offloading allocation cannot hold one cache chunk")
+        self.group_indices = {group_id: index for index, group_id in enumerate(selected_group_ids)}
+        layer_groups: list[list[int]] = []
+        pools = cache_spec.pools
+        for group_id in selected_group_ids:
             if not 0 <= group_id < len(kv_cache_config.kv_cache_groups):
                 raise ValueError(f"offloading selected unknown KV cache group {group_id}")
             kv_group = kv_cache_config.kv_cache_groups[group_id]
             names = tuple(kv_group.layer_names)
-            try:
-                expected = {
-                    int(name.removeprefix("layers."))
-                    for name in names
-                    if name.startswith("layers.")
-                }
-            except ValueError as error:
-                raise ValueError(f"vLLM group {group_id} has a malformed layer name") from error
-            if len(expected) != len(names):
+            layers = [_layer_id(name) for name in names]
+            if len(set(layers)) != len(names):
                 raise ValueError(f"vLLM group {group_id} has a malformed layer name")
             actual = {layer_id for layer_id, (owner, _) in layer_owner.items() if owner == group_id}
-            if expected != actual:
+            if set(layers) != actual:
                 raise ValueError(
                     f"engine cache layers for KV group {group_id} differ from vLLM's group"
                 )
 
-            self.group_indices[group_id] = group_index
-            layer_routes: list[LayerRoute] = []
-            layer_offset = 0
-            for name in names:
-                layer_id = int(name.removeprefix("layers."))
-                layer = cache.layers[layer_id]
-                if len(layer) % cache.blocks:
-                    raise ValueError(f"engine cache layer {name} has a partial block")
-                page_bytes = len(layer) // cache.blocks
-                host_page_bytes = page_bytes * chips
-                if page_bytes == 0 or page_bytes % 8:
-                    raise ValueError(f"engine cache layer {name} has an invalid page size")
-                owner, pool_index = layer_owner[layer_id]
-                described_page_bytes = cache.spec.pools[pool_index].bytes
-                if owner != group_id or described_page_bytes != page_bytes:
-                    raise ValueError(
-                        f"engine cache metadata for {name} disagrees with its allocation"
-                    )
+            for name, layer_id in zip(names, layers, strict=True):
+                page_bytes = pools[layer_owner[layer_id][1]].bytes
                 if assigned(kv_group, name).page_size_bytes != page_bytes:
                     raise ValueError(
                         f"vLLM page size for {name} differs from the engine allocation"
                     )
                 if spec.config.canonical_layout:
                     _require_identity_mapping(mappings.get(name), name, page_bytes)
-                layer_routes.append(
-                    LayerRoute(
-                        layer_id,
-                        group_index,
-                        page_bytes,
-                        host_page_bytes,
-                        group_offset + layer_offset,
-                    )
-                )
-                layer_offset += host_page_bytes
-            self.routes[group_id] = tuple(layer_routes)
-            group_offset += layer_offset
+            layer_groups.append(layers)
 
-        if not selected_group_ids:
-            raise ValueError("vLLM selected no cache groups for offloading")
-        self.group_page_bytes = {
-            group_id: sum(route.host_page_bytes for route in routes)
-            for group_id, routes in self.routes.items()
-        }
-        if self.chunks <= 0 or self.blocks <= 0 or self.row_stride <= 0:
-            raise ValueError("offloading allocation cannot hold one cache chunk")
-        if group_offset * self.blocks > self.row_stride:
-            raise ValueError(
-                "engine cache pages exceed vLLM's host chunk layout "
-                f"({group_offset * self.blocks} > {self.row_stride} bytes)"
-            )
-        copy_layers = [
-            engine.CopierLayer(
-                buffer=cache.layers[route.layer_id],
-                page_bytes=route.device_page_bytes,
-                host_offset=route.host_offset,
-                group=route.group_index,
-            )
-            for routes in self.routes.values()
-            for route in routes
-        ]
-        self.copier = engine.Copier(copy_layers, group_offset)
-        self.host_cache = engine.HostCache(self.copier, self.chunks * self.blocks)
-        self.engine_id = spec.config.engine_id
-        self.jobs = Jobs()
-        file_layout = tuple(
-            host_pool.FilePageSegment(route.host_offset, route.host_page_bytes)
-            for routes in self.routes.values()
-            for route in routes
-        )
+        self.copier = engine.Copier(cache, layer_groups)
         try:
+            chunk_bytes = self.copier.slot_bytes * self.blocks
+            if chunk_bytes > self.row_stride:
+                raise ValueError(
+                    "engine cache pages exceed vLLM's host chunk layout "
+                    f"({chunk_bytes} > {self.row_stride} bytes)"
+                )
+            layer_ranges = self.copier.layer_ranges
+            self.group_page_bytes = {
+                group_id: sum(size for _, size in ranges)
+                for group_id, ranges in zip(selected_group_ids, layer_ranges, strict=True)
+            }
+            file_layout = tuple(
+                host_pool.FilePageSegment(offset, size)
+                for ranges in layer_ranges
+                for offset, size in ranges
+            )
+            self.host_cache = engine.HostCache(self.copier, self.chunks * self.blocks)
+            self.engine_id = spec.config.engine_id
+            self.jobs = Jobs()
             host_pool.register(self.engine_id, self.host_cache, file_layout)
-        except Exception:
+        except BaseException:
             self.copier.shutdown()
             raise
 
@@ -457,7 +411,7 @@ class Host(OffloadingWorker):
             block_indices = (0,)
         group_sizes = tuple(int(size) for size in group_sizes)
         block_indices = tuple(int(index) for index in block_indices)
-        if len(group_sizes) != len(self.routes) or len(block_indices) != len(group_sizes):
+        if len(group_sizes) != len(self.group_indices) or len(block_indices) != len(group_sizes):
             raise ValueError("vLLM transfer group ranges differ from selected cache groups")
         if sum(group_sizes) != len(device.block_ids):
             raise ValueError("vLLM transfer block IDs do not match its group ranges")
@@ -471,7 +425,7 @@ class Host(OffloadingWorker):
         block_offset = 0
         chunk_offset = 0
         for group_id, count, start_index in zip(
-            self.routes, group_sizes, block_indices, strict=True
+            self.group_indices, group_sizes, block_indices, strict=True
         ):
             group_blocks = tuple(
                 int(block) for block in device.block_ids[block_offset : block_offset + count]

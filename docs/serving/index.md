@@ -133,7 +133,7 @@ Both servers reuse the cache rows of a prompt prefix they computed before, as lo
 
 ## Offload the KV cache to host memory
 
-Both servers copy the cache blocks of computed prompts to a tier of host memory, and copy them back into the device cache when a later prompt shares a prefix whose blocks the device has evicted, instead of computing it again:
+KV cache offload keeps evicted prefix blocks in host memory or on disk so a later request can reload them. These recipes enable the filesystem tier.
 
 === "vLLM"
 
@@ -142,7 +142,7 @@ Both servers copy the cache blocks of computed prompts to a tier of host memory,
       --kv-transfer-config '{"kv_connector_extra_config":{"secondary_tiers":[{"type":"fs","root_dir":"/mnt/kv-cache"}]}}'
     ```
 
-    `--kv-offloading-size` sets the host tier capacity in GiB. The vLLM plugin keeps vLLM's tier policy and supplies its filesystem tier; see [vLLM KV cache offloading](vllm.md#kv-cache-offloading) for configuration and compatibility details.
+    See [vLLM KV cache offloading](vllm.md#kv-cache-offloading) for settings and limits.
 
 === "SGLang"
 
@@ -153,9 +153,9 @@ Both servers copy the cache blocks of computed prompts to a tier of host memory,
       --hicache-storage-backend-extra-config '{"file_storage_path":"/mnt/kv-cache"}'
     ```
 
-    SGLang's HiCache keeps its page selection and lifecycle; the plugin connects its file tier to engine storage. See [SGLang hierarchical cache](sglang.md#hierarchical-cache) for configuration and compatibility details.
+    See [SGLang hierarchical cache](sglang.md#hierarchical-cache) for settings and limits.
 
-Both plugins preserve their framework's scheduling and tier policy while using the shared engine transfer path. [Integrating frameworks](../engine/frameworks.md#offload-cache-pages) documents the common data path; the [vLLM](vllm.md#kv-cache-offloading) and [SGLang](sglang.md#hierarchical-cache) references define each adapter's options and behavior.
+See [Integrating frameworks](../engine/frameworks.md#offload-cache-pages) for how the engine moves cache pages.
 
 ## Put the server to sleep
 
@@ -361,7 +361,7 @@ Each item's rows, one for each of its placeholder tokens, are written to `<share
 
 Set `FURIOSA_VISIBLE_CHIPS` to a comma-separated list of chip indices, such as `FURIOSA_VISIBLE_CHIPS=2,3`; the server then places the model on those chips in that order, and on chips `0`, `1` and so on when it is unset.
 
-## What both plugins accept
+## Shared serving options
 
 - Each plugin overrides or checks some framework options and refuses unsupported values at startup: [vLLM options](vllm.md), [SGLang options](sglang.md). Other options keep the framework's behavior.
 - The engine accepts a tensor degree of 1 or a chip count the model is compiled to split over, and a pipeline degree of 1; startup refuses any other with the engine's reason.

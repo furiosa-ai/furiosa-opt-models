@@ -144,26 +144,23 @@ def test_file_storage_round_trips_engine_host_slots(tmp_path) -> None:
     from furiosa_opt_sglang.offload import Host
     from furiosa_opt_sglang.storage import FuriosaHiCacheFile
 
-    class HostSlot(bytearray):
-        def access(self):
-            return self
+    class HostCache:
+        slot_bytes = 12
 
-    class HostSlots:
         def __init__(self) -> None:
-            self.pages = [HostSlot(12), HostSlot(12)]
+            self.pages = [bytearray(self.slot_bytes) for _ in range(2)]
 
-        def slot(self, index: int) -> HostSlot:
-            return self.pages[index]
+        def access(self, index: int) -> memoryview:
+            return memoryview(self.pages[index])
 
     host = Host.__new__(Host)
-    host.sizes = [2, 4]
-    host.chips = 2
     host.page_size = 4
     host.page_num = 2
     host.dtype = torch.uint8
-    host.host_cache = HostSlots()
+    host_cache = HostCache()
+    host.host_cache = host_cache
     expected = bytes(range(1, 13))
-    host.host_cache.slot(1)[:] = expected
+    host_cache.pages[1][:] = expected
 
     assert host.get_dummy_flat_data_page().numel() == 12
     page = host.get_data_page(4)
@@ -190,9 +187,9 @@ def test_file_storage_round_trips_engine_host_slots(tmp_path) -> None:
     )
     try:
         assert storage.batch_set_v2([transfer]) == {PoolName.KV: [True]}
-        host.host_cache.slot(1)[:] = bytes(12)
+        host_cache.pages[1][:] = bytes(12)
         assert storage.batch_get_v2([transfer]) == {PoolName.KV: [True]}
-        assert bytes(host.host_cache.slot(1)) == expected
+        assert bytes(host_cache.pages[1]) == expected
     finally:
         storage._read_io.shutdown()
         storage._write_io.shutdown()

@@ -7,7 +7,7 @@ import logging
 import os
 import uuid
 from collections.abc import Iterable
-from dataclasses import dataclass
+from contextlib import ExitStack
 from threading import Lock
 from typing import TYPE_CHECKING
 
@@ -15,7 +15,7 @@ from typing_extensions import override
 from vllm.v1.kv_offload.tiering.base import JobResult, TransferJob
 from vllm.v1.kv_offload.tiering.fs.manager import FileSystemTierManager
 
-from furiosa_opt_engine.cache_transfer import (
+from furiosa_opt_engine.cache_file import (
     DEFAULT_READ_THREADS,
     DEFAULT_WRITE_THREADS,
     AlignedFileIO,
@@ -32,12 +32,6 @@ logger = logging.getLogger(__name__)
 
 def _noop() -> None:
     pass
-
-
-@dataclass(frozen=True, slots=True)
-class _ChunkLayer:
-    host_offset: int
-    page_bytes: int
 
 
 class _ChunkStore:
@@ -58,25 +52,18 @@ class _ChunkStore:
         self.page_bytes = page_bytes
         self.pages = pages
         self.file_bytes = file_bytes
-        self.layout: list[_ChunkLayer] = []
-        file_offset = 0
+        self.layout = file_layout
         host_bytes = 0
         for segment in file_layout:
-            if segment.host_offset < 0 or segment.page_bytes <= 0:
+            if segment.host_offset != host_bytes or segment.page_bytes <= 0:
                 raise ValueError("vLLM filesystem layout has an invalid layer segment")
-            if segment.host_offset + segment.page_bytes > page_bytes:
-                raise ValueError("vLLM filesystem layer segment exceeds its host slot")
-            self.layout.append(_ChunkLayer(segment.host_offset, segment.page_bytes))
             host_bytes += segment.page_bytes
-            file_offset += segment.page_bytes * pages
         if host_bytes != page_bytes:
             raise ValueError("vLLM filesystem layer pages do not cover the host slot")
-        if file_offset > file_bytes:
+        if host_bytes * pages > file_bytes:
             raise ValueError("vLLM filesystem layer pages exceed the chunk file size")
 
-    def write(self, slots: list[engine.HostSlot]) -> None:
-        accesses = []
-        views = []
+    def write(self, cache: engine.HostCache, slots: range) -> None:
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             self.file_io.prepare(
@@ -85,23 +72,17 @@ class _ChunkStore:
                 self.pages,
                 file_bytes=self.file_bytes,
             )
-            for slot in slots:
-                access = slot.access()
-                accesses.append(access)
-                views.append(_slot_view(access))
-            if len(views) == 1:
-                # One-block chunks already have the native layer-major byte order.
-                self.file_io.writev_at(self.temporary, 0, views)
-            else:
-                self.file_io.writev_at_many(self.temporary, _layer_vectors(views, self.layout))
-            os.replace(self.temporary, self.path)
+            with ExitStack() as leases:
+                views = [leases.enter_context(cache.access(slot)) for slot in slots]
+                if len(views) == 1:
+                    # One-block chunks already have the native layer-major byte order.
+                    self.file_io.writev_at(self.temporary, 0, views)
+                else:
+                    self.file_io.writev_at_many(self.temporary, _layer_vectors(views, self.layout))
+                os.replace(self.temporary, self.path)
         except BaseException:
             self.abort()
             raise
-        finally:
-            for view in views:
-                view.release()
-            accesses.clear()
 
     def abort(self) -> None:
         try:
@@ -143,6 +124,7 @@ class FuriosaFileSystemTierManager(FileSystemTierManager):
         directory = os.path.dirname(self.file_mapper.get_config_file_path())
         self._file_io = AlignedFileIO(directory, use_direct=self._use_o_direct)
         self._blocks_per_chunk = offloading_spec.blocks_per_chunk
+        self._num_chunks = offloading_spec.num_chunks
         self._engine_id = offloading_spec.config.engine_id
         self._job_transfer_bytes: dict[int, int] = {}
 
@@ -164,18 +146,17 @@ class FuriosaFileSystemTierManager(FileSystemTierManager):
                 if os.path.exists(path):
                     tasks.append(_noop)
                     continue
-                first = chunk_id * self._blocks_per_chunk
-                slots = [cache.slot(first + index) for index in range(self._blocks_per_chunk)]
+                slots = self._chunk_slots(chunk_id)
                 batch = _ChunkStore(
                     self._file_io,
                     path,
-                    len(slots[0]),
+                    cache.slot_bytes,
                     len(slots),
                     self._block_size,
                     file_layout,
                 )
                 batches.append(batch)
-                tasks.append(functools.partial(batch.write, slots))
+                tasks.append(functools.partial(batch.write, cache, slots))
         except Exception:
             for batch in batches:
                 batch.abort()
@@ -202,13 +183,13 @@ class FuriosaFileSystemTierManager(FileSystemTierManager):
         progress = _LoadProgress(job_id, len(paths))
         tasks = []
         for file_index, (path, chunk_id) in enumerate(zip(paths, chunk_ids, strict=True)):
-            first = chunk_id * self._blocks_per_chunk
-            slots = [cache.slot(first + index) for index in range(self._blocks_per_chunk)]
+            slots = self._chunk_slots(chunk_id)
             tasks.append(
                 functools.partial(
                     self._load_chunk,
                     path,
                     file_index,
+                    cache,
                     slots,
                     file_layout,
                     progress,
@@ -230,26 +211,29 @@ class FuriosaFileSystemTierManager(FileSystemTierManager):
                 result.transfer_bytes = transfer_bytes
             yield result
 
+    def _chunk_slots(self, chunk_id: int) -> range:
+        if not 0 <= chunk_id < self._num_chunks:
+            raise ValueError(f"vLLM filesystem chunk {chunk_id} is outside the host pool")
+        first = chunk_id * self._blocks_per_chunk
+        return range(first, first + self._blocks_per_chunk)
+
     def _load_chunk(
         self,
         path: str,
         file_index: int,
-        slots: list[engine.HostSlot],
+        cache: engine.HostCache,
+        slots: range,
         file_layout: tuple[host_pool.FilePageSegment, ...],
         progress: _LoadProgress,
     ) -> None:
         succeeded = False
-        accesses = []
-        views = []
         try:
-            for slot in slots:
-                access = slot.access()
-                accesses.append(access)
-                views.append(_slot_view(access))
-            if len(views) == 1:
-                self._file_io.readv_at(path, 0, views)
-            else:
-                self._file_io.readv_at_many(path, _layer_vectors(views, file_layout))
+            with ExitStack() as leases:
+                views = [leases.enter_context(cache.access(slot)) for slot in slots]
+                if len(views) == 1:
+                    self._file_io.readv_at(path, 0, views)
+                else:
+                    self._file_io.readv_at_many(path, _layer_vectors(views, file_layout))
             succeeded = True
         except OSError as error:
             if "short read" in str(error).lower():
@@ -259,23 +243,12 @@ class FuriosaFileSystemTierManager(FileSystemTierManager):
                     logger.debug("Could not remove short cache file %s", path)
             raise
         finally:
-            for view in views:
-                view.release()
-            accesses.clear()
             progress.file_done(self._load_progress, file_index, succeeded)
-
-
-def _slot_view(access: engine.HostSlotAccess) -> memoryview:
-    base = memoryview(access)
-    try:
-        return base.cast("B")
-    finally:
-        base.release()
 
 
 def _layer_vectors(
     slots: list[memoryview],
-    layout: Iterable[_ChunkLayer | host_pool.FilePageSegment],
+    layout: Iterable[host_pool.FilePageSegment],
 ) -> Iterable[tuple[int, list[memoryview]]]:
     file_offset = 0
     for layer in layout:

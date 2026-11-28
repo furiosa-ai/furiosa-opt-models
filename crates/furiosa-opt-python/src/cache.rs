@@ -1,9 +1,8 @@
 //! Python bindings for pinned host-cache slots and transfer submission.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::ffi::c_int;
 use std::io;
-use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -12,18 +11,19 @@ use furiosa_opt_std::prelude::HostBuffer;
 use pyo3::exceptions::{PyBlockingIOError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
+use pyo3::types::PyMemoryView;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 
 use crate::Context;
-use crate::tensor::{HbmBuffer as PyHbmBuffer, HostBuffer as PyHostBuffer};
+use crate::decoder::Cache;
 
 mod huge;
+mod layout;
 mod queue;
 mod staging;
 
-use queue::{
-    Chunk, Completion, Core, DevicePage, HostBacking, Layer, Pdma, Pool, Queue, Slot, Transfers,
-};
+use layout::SlotLayout;
+use queue::{Chunk, Completion, Core, DevicePage, Layer, Pool, Queue, Slot, Transfers};
 
 const ALLOCATORS: usize = 8;
 const ALLOCATION_GROUP_BYTES: usize = 256 << 20;
@@ -36,52 +36,30 @@ const ALLOCATION_GROUP_BYTES: usize = 256 << 20;
 /// for the earlier `Copy` to finish. An in-flight device-page overlap raises `BlockingIOError` and
 /// queues no work; host-slot reuse is serialized by its per-slot gate. A failed copy leaves its
 /// device pages unavailable for this copier's lifetime.
-/// Python serializes queue mutation under the GIL; completions can move to framework worker threads.
-/// Layer groups are numbered contiguously from zero.
+/// Coalescing gathers or scatters through temporary pinned buffers to reduce DMA commands.
+/// Number groups from zero in the order supplied to the constructor.
 #[gen_stub_pyclass]
 #[pyclass(name = "Copier", module = "engine")]
 pub(crate) struct PyCopier {
     core: Arc<Core>,
+    layout: Arc<SlotLayout>,
     queue: Queue,
     pending: Transfers,
 }
 
-/// One layer's byte layout in the device cache and each pinned host-cache block.
-#[gen_stub_pyclass]
-#[pyclass(name = "CopierLayer", module = "engine", frozen)]
-pub(crate) struct PyCopierLayer {
-    buffer: Py<PyHbmBuffer>,
-    page_bytes: usize,
-    host_offset: usize,
-    group: usize,
-}
-
-/// A pool of page-locked host pages for device transfers and external host I/O. Multiple pools can
-/// share one copier when consumers need independent capacities or lifetimes. Without `backing`,
-/// slots are separately allocated. A supplied backing aliases one contiguous page-major region.
+/// A pool that owns page-locked host slots for transfers and host I/O. Pools on the same copier
+/// share its device-page reservations and hold independent host-slot gates.
 #[gen_stub_pyclass]
 #[pyclass(name = "HostCache", module = "engine", frozen)]
 pub(crate) struct PyHostCache {
     pool: Arc<Pool>,
 }
 
-/// A handle to one pinned host page.
-#[gen_stub_pyclass]
-#[pyclass(name = "HostSlot", module = "engine", frozen)]
-#[derive(Clone)]
-pub(crate) struct PyHostSlot {
+/// The buffer exporter retained by a slot's memoryviews until the last view is released.
+#[pyclass(frozen)]
+struct HostSlotAccess {
     pool: Arc<Pool>,
-    slot: usize,
-    bytes: Range<usize>,
-}
-
-/// A writable pinned-buffer lease. Keep it alive through CPU or external asynchronous I/O; the
-/// copier cannot use this page until the lease drops. Multiple leases may coexist, so adapters
-/// must serialize their own users of a slot.
-#[gen_stub_pyclass]
-#[pyclass(name = "HostSlotAccess", module = "engine", frozen)]
-pub(crate) struct PyHostSlotAccess {
-    slot: PyHostSlot,
+    index: usize,
 }
 
 /// Completion handle for asynchronous cache copies.
@@ -90,124 +68,91 @@ pub(crate) struct PyHostSlotAccess {
 #[derive(Clone)]
 pub(crate) struct PyCopy(Arc<Completion>);
 
-impl Drop for PyHostSlotAccess {
+impl Drop for HostSlotAccess {
     fn drop(&mut self) {
-        self.slot.pool.slots[self.slot.slot].access.release_lease();
+        self.pool.slots[self.index].release_lease();
     }
 }
 
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyCopier {
-    /// Build one transfer queue over the layer buffers.
+    /// Build a transfer queue over an allocated decoder cache.
     ///
-    /// Each layer names its own page size (bytes per chip), byte offset in a host slot, and cache
-    /// group, so one layer's metadata cannot accidentally drift from another's buffer.
+    /// Each group lists the stable layer IDs that move together for one logical block. Group and
+    /// layer order determine the packed host slot layout. A layer can appear in at most one group.
     #[new]
-    fn new(
-        py: Python<'_>,
-        layers: Vec<PyRef<'_, PyCopierLayer>>,
-        host_block_bytes: usize,
-    ) -> PyResult<Self> {
-        let first = layers
-            .first()
-            .ok_or_else(|| PyValueError::new_err("cache copies require nonempty layer buffers"))?;
-        if host_block_bytes == 0 {
-            return Err(PyValueError::new_err(
-                "host cache blocks must contain bytes",
-            ));
-        }
-        let context = first.buffer.bind(py).borrow().context.clone();
-        let (chips, pdma): (usize, Pdma) = {
-            let context = Context::lock(&context, py);
+    fn new(py: Python<'_>, cache: &Cache, groups: Vec<Vec<usize>>) -> PyResult<Self> {
+        let (chips, pdma) = {
+            let context = Context::lock(&cache.context, py);
             (
                 usize::from(context.device.topology().chips),
                 context.device.pdma.clone(),
             )
         };
-        let mut core_layers = Vec::with_capacity(layers.len());
-        let mut core_groups = BTreeMap::<usize, Vec<usize>>::new();
-        let mut ranges = Vec::with_capacity(layers.len());
-        for (index, description) in layers.iter().enumerate() {
-            let layer = description.buffer.bind(py).borrow();
-            let page = description.page_bytes;
-            let offset = description.host_offset;
-            let group = description.group;
-            if !Arc::ptr_eq(&context, &layer.context) {
-                return Err(PyValueError::new_err("cache layers must share a device"));
+        let (layout, slot_bytes) = layout::pack(cache.inner.layer_page_bytes(), &groups, chips)
+            .map_err(PyValueError::new_err)?;
+        let mut layers = Vec::new();
+        let mut layer_ranges = Vec::new();
+        let mut packed_groups = Vec::with_capacity(layout.len());
+        for group in layout {
+            let first = layers.len();
+            for entry in group {
+                let buffer = cache.inner.layers()[entry.id]
+                    .alias(..)
+                    .map_err(crate::Error::from)?;
+                layers.push(Layer {
+                    buffer,
+                    page_bytes: entry.page_bytes,
+                });
+                layer_ranges.push(entry.host_range);
             }
-            let bytes = layer.inner.size();
-            if bytes == 0 || page == 0 || !page.is_multiple_of(8) || bytes % page != 0 {
-                return Err(PyValueError::new_err(
-                    "cache layers need nonempty, eight-byte-aligned whole pages",
-                ));
-            }
-            let host_page = page
-                .checked_mul(chips)
-                .ok_or_else(|| PyValueError::new_err("cache page size overflows"))?;
-            let end = offset
-                .checked_add(host_page)
-                .filter(|&end| end <= host_block_bytes)
-                .ok_or_else(|| PyValueError::new_err("cache page exceeds its host block"))?;
-            ranges.push((offset, end));
-            let buffer = layer.inner.alias(..).map_err(crate::Error::from)?;
-            core_layers.push(Layer {
-                buffer,
-                page_bytes: page,
-                host_offset: offset,
-                blocks: bytes / page,
-            });
-            core_groups.entry(group).or_default().push(index);
+            packed_groups.push((first..layers.len()).collect());
         }
-        ranges.sort_unstable();
-        if ranges.windows(2).any(|window| window[0].1 > window[1].0) {
-            return Err(PyValueError::new_err("cache layer host ranges overlap"));
-        }
-        if core_groups
-            .keys()
-            .copied()
-            .enumerate()
-            .any(|(expected, actual)| expected != actual)
-        {
-            return Err(PyValueError::new_err(
-                "cache group IDs must be contiguous starting at zero",
-            ));
-        }
-        let groups = core_groups.into_values().collect::<Vec<_>>();
-        let group_blocks = groups
-            .iter()
-            .map(|layers| {
-                layers
-                    .iter()
-                    .map(|&index| core_layers[index].blocks)
-                    .min()
-                    .unwrap_or(0)
-            })
-            .collect();
         let core = Arc::new(Core {
             pdma,
-            layers: core_layers,
-            groups,
-            group_blocks,
+            layers,
+            groups: packed_groups,
+            blocks: cache.inner.blocks(),
             chips,
-            block_bytes: host_block_bytes,
         });
         let queue = Queue::start(Arc::clone(&core)).map_err(crate::Error::from)?;
         Ok(Self {
             core,
+            layout: Arc::new(SlotLayout {
+                slot_bytes,
+                layer_ranges,
+            }),
             queue,
             pending: Transfers::default(),
         })
     }
 
-    /// Submit device-to-host copies without waiting for their DMA to finish.
-    ///
-    /// `pages` names host slots and their `(group, device_block)` routes. The caller must wait for
-    /// earlier copies before reusing their host slots or device pages. An in-flight device-page
-    /// overlap raises `BlockingIOError`; an overlapping host slot is serialized by its slot gate.
-    /// A failed copy leaves its device pages unavailable for this copier's lifetime.
-    /// Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
-    /// transient pinned memory for one batched runtime transfer.
+    /// Bytes in one host slot.
+    #[getter]
+    fn slot_bytes(&self) -> usize {
+        self.layout.slot_bytes
+    }
+
+    /// Host-slot byte offsets and lengths in transfer group and layer order.
+    #[getter]
+    fn layer_ranges(&self) -> Vec<Vec<(usize, usize)>> {
+        self.core
+            .groups
+            .iter()
+            .map(|group| {
+                group
+                    .iter()
+                    .map(|&layer| {
+                        let range = &self.layout.layer_ranges[layer];
+                        (range.start, range.len())
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Queue device-to-host copies for host slots and their `(group, device_block)` routes.
     #[pyo3(signature = (pages, host, *, coalesce=false))]
     fn copy_out(
         &mut self,
@@ -218,14 +163,7 @@ impl PyCopier {
         self.submit(pages, &host.pool, false, coalesce)
     }
 
-    /// Submit host-to-device copies without waiting for their DMA to finish.
-    ///
-    /// `pages` names host slots and their `(group, device_block)` routes. The caller must wait for
-    /// earlier copies before reusing their host slots or device pages. An in-flight device-page
-    /// overlap raises `BlockingIOError`; an overlapping host slot is serialized by its slot gate.
-    /// A failed copy leaves its device pages unavailable for this copier's lifetime.
-    /// Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
-    /// transient pinned memory for one batched runtime transfer.
+    /// Queue host-to-device copies for host slots and their `(group, device_block)` routes.
     #[pyo3(signature = (pages, host, *, coalesce=false))]
     fn copy_in(
         &mut self,
@@ -256,11 +194,10 @@ impl PyCopier {
         loading: bool,
         coalesce: bool,
     ) -> PyResult<PyCopy> {
-        if pool.block_bytes != self.core.block_bytes
-            || !pool
-                .core
-                .upgrade()
-                .is_some_and(|core| Arc::ptr_eq(&core, &self.core))
+        if !pool
+            .core
+            .upgrade()
+            .is_some_and(|core| Arc::ptr_eq(&core, &self.core))
         {
             return Err(PyValueError::new_err(
                 "host cache was allocated for a different copier",
@@ -300,10 +237,12 @@ impl PyCopier {
                 )));
             }
             for &(group, block) in routes {
-                let blocks = self.core.group_blocks.get(group).ok_or_else(|| {
-                    PyValueError::new_err(format!("cache transfer names unknown group {group}"))
-                })?;
-                if block as usize >= *blocks {
+                if group >= self.core.groups.len() {
+                    return Err(PyValueError::new_err(format!(
+                        "cache transfer names unknown group {group}"
+                    )));
+                }
+                if block as usize >= self.core.blocks {
                     return Err(PyValueError::new_err(format!(
                         "cache transfer for host slot {slot} names block {block} outside group {group}"
                     )));
@@ -359,259 +298,140 @@ impl PyCopier {
 
 #[gen_stub_pymethods]
 #[pymethods]
-impl PyCopierLayer {
-    /// Describe one cache layer's device page and its location in each host block.
-    ///
-    /// `page_bytes` is per chip; `host_offset` is a byte offset; `group` is the zero-based cache
-    /// group index.
-    #[pyo3(signature = (buffer, page_bytes, host_offset, group))]
-    #[new]
-    fn new(buffer: Py<PyHbmBuffer>, page_bytes: usize, host_offset: usize, group: usize) -> Self {
-        Self {
-            buffer,
-            page_bytes,
-            host_offset,
-            group,
-        }
-    }
-}
-
-#[gen_stub_pymethods]
-#[pymethods]
 impl PyHostCache {
+    /// Allocate pinned host slots for the copier's page layout.
     #[new]
-    /// Allocate one pinned host-page pool for this copier. Other pools may share the copier; their
-    /// slot indices and access gates are independent, while device-page reservations are shared.
-    /// `backing`, when supplied, must be a pinned buffer of exactly `slots` times one host block's
-    /// size. The pool retains that allocation and presents each host block as one slot. Before
-    /// reusing this backing for a replacement pool, shut down its old copier and finish all copies
-    /// and `HostSlot.access()` leases; distinct pools over one backing have independent slot gates.
-    #[pyo3(signature = (copier, slots, *, backing=None))]
-    fn new(
-        py: Python<'_>,
-        copier: PyRef<'_, PyCopier>,
-        slots: usize,
-        backing: Option<PyRef<'_, PyHostBuffer>>,
-    ) -> PyResult<Self> {
-        let block_bytes = copier.core.block_bytes;
+    fn new(py: Python<'_>, copier: &PyCopier, slots: usize) -> PyResult<Self> {
+        let slot_bytes = copier.layout.slot_bytes;
         if slots == 0 {
             return Err(PyValueError::new_err("host cache needs at least one slot"));
         }
         let total = slots
-            .checked_mul(block_bytes)
+            .checked_mul(slot_bytes)
             .ok_or_else(|| PyValueError::new_err("host cache allocation size overflows"))?;
-        let (pool_slots, backing_region) = if let Some(backing) = backing {
-            if backing.bytes.len() != total {
-                return Err(PyValueError::new_err(format!(
-                    "host cache backing has {} bytes; expected {total}",
-                    backing.bytes.len()
-                )));
-            }
-            let region = HostBacking {
-                memory: Arc::clone(&backing.memory),
-                bytes: backing.bytes.clone(),
-            };
-            let memory = region
-                .memory
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !memory.is_pinned() {
-                return Err(PyValueError::new_err(
-                    "host cache backing must be page-locked",
-                ));
-            }
-            drop(memory);
-            ((0..slots).map(|_| Slot::backed()).collect(), Some(region))
-        } else {
-            let group_bytes = (ALLOCATION_GROUP_BYTES / block_bytes).max(1);
-            let allocator_count = ((slots - 1) / group_bytes + 1).min(ALLOCATORS);
-            let next = AtomicUsize::new(0);
-            let allocate = || -> io::Result<Vec<(usize, Vec<HostBuffer>)>> {
-                let mut groups = Vec::new();
-                loop {
-                    let first = next.fetch_add(group_bytes, Ordering::Relaxed);
-                    if first >= slots {
-                        break;
-                    }
-                    let count = group_bytes.min(slots - first);
-                    // Faulting and releasing THPs compacts memory before the dma-heap allocates slots.
-                    drop(huge::Pages::fault(count * block_bytes)?);
-                    let pinned = (0..count)
-                        .map(|_| {
-                            let buffer = HostBuffer::zero(block_bytes);
-                            if !buffer.is_pinned() {
-                                return Err(io::Error::other(
-                                    "the runtime did not provide page-locked host memory",
-                                ));
-                            }
-                            Ok(buffer)
-                        })
-                        .collect::<io::Result<Vec<_>>>()?;
-                    groups.push((first, pinned));
+        let slots_per_group = (ALLOCATION_GROUP_BYTES / slot_bytes).max(1);
+        let allocator_count = ((slots - 1) / slots_per_group + 1).min(ALLOCATORS);
+        let next = AtomicUsize::new(0);
+        let allocate = || -> io::Result<Vec<(usize, Vec<HostBuffer>)>> {
+            let mut groups = Vec::new();
+            loop {
+                let first = next.fetch_add(slots_per_group, Ordering::Relaxed);
+                if first >= slots {
+                    break;
                 }
-                Ok(groups)
-            };
-            let mut groups = py
-                .detach(|| {
-                    std::thread::scope(|scope| {
-                        let allocators = (0..allocator_count)
-                            .map(|_| std::thread::Builder::new().spawn_scoped(scope, allocate))
-                            .collect::<io::Result<Vec<_>>>()?;
-                        let mut groups = Vec::new();
-                        for allocator in allocators {
-                            groups.extend(allocator.join().map_err(|_| {
-                                io::Error::other("a host slot allocator panicked")
-                            })??);
+                let count = slots_per_group.min(slots - first);
+                // Faulting and releasing THPs compacts memory before the dma-heap allocates slots.
+                drop(huge::Pages::fault(count * slot_bytes)?);
+                let pinned = (0..count)
+                    .map(|_| {
+                        let buffer = HostBuffer::zero(slot_bytes);
+                        if !buffer.is_pinned() {
+                            return Err(io::Error::other(
+                                "the runtime did not provide page-locked host memory",
+                            ));
                         }
-                        groups.sort_unstable_by_key(|(first, _)| *first);
-                        Ok::<_, io::Error>(groups)
+                        Ok(buffer)
                     })
-                })
-                .map_err(crate::Error::from)?;
-            let allocated = groups.iter().map(|(_, slots)| slots.len()).sum::<usize>();
-            if allocated != slots || total != allocated * block_bytes {
-                return Err(PyValueError::new_err("host cache allocation is incomplete"));
+                    .collect::<io::Result<Vec<_>>>()?;
+                groups.push((first, pinned));
             }
-            let pool_slots = groups
-                .iter_mut()
-                .flat_map(|(_, buffers)| std::mem::take(buffers))
-                .map(Slot::owned)
-                .collect();
-            (pool_slots, None)
+            Ok(groups)
         };
+        let mut groups = py
+            .detach(|| {
+                std::thread::scope(|scope| {
+                    let allocators = (0..allocator_count)
+                        .map(|_| std::thread::Builder::new().spawn_scoped(scope, allocate))
+                        .collect::<io::Result<Vec<_>>>()?;
+                    let mut groups = Vec::new();
+                    for allocator in allocators {
+                        groups.extend(
+                            allocator.join().map_err(|_| {
+                                io::Error::other("a host slot allocator panicked")
+                            })??,
+                        );
+                    }
+                    groups.sort_unstable_by_key(|(first, _)| *first);
+                    Ok::<_, io::Error>(groups)
+                })
+            })
+            .map_err(crate::Error::from)?;
+        let allocated = groups.iter().map(|(_, slots)| slots.len()).sum::<usize>();
+        if allocated != slots || total != allocated * slot_bytes {
+            return Err(PyValueError::new_err("host cache allocation is incomplete"));
+        }
+        let slots = groups
+            .iter_mut()
+            .flat_map(|(_, buffers)| std::mem::take(buffers))
+            .map(Slot::new)
+            .collect();
         Ok(Self {
             pool: Arc::new(Pool {
-                slots: pool_slots,
-                block_bytes,
+                slots,
+                layout: Arc::clone(&copier.layout),
                 core: Arc::downgrade(&copier.core),
-                backing: backing_region,
             }),
         })
     }
 
-    /// Return an internal `HostBuffer` alias for retaining/registering the contiguous address range.
-    ///
-    /// Do not read or write through this view. Those accesses bypass per-slot exclusion; use
-    /// `HostSlot.access()` for external I/O. This alias shares and retains the pool allocation and
-    /// can be passed as `backing=` when creating its replacement after the Copier is shut down.
-    ///
-    /// Raises:
-    ///     ValueError: This pool was allocated with separate slot buffers.
-    fn _backing_buffer(&self) -> PyResult<PyHostBuffer> {
-        self.pool
-            .backing()
-            .map(|backing| PyHostBuffer::shared(backing.memory.clone(), backing.bytes.clone()))
-            .ok_or_else(|| PyValueError::new_err("host cache has no contiguous backing"))
+    /// Bytes in one slot.
+    #[getter]
+    fn slot_bytes(&self) -> usize {
+        self.pool.layout.slot_bytes
     }
 
-    /// Return a handle to one pinned host page. Call `access()` to lease its zero-copy buffer.
-    ///
-    /// The slot index is local to this pool.
-    fn slot(&self, index: usize) -> PyResult<PyHostSlot> {
-        if index >= self.pool.slots.len() {
-            return Err(PyValueError::new_err("host slot is outside the pool"));
-        }
-        Ok(PyHostSlot {
-            pool: Arc::clone(&self.pool),
-            slot: index,
-            bytes: 0..self.pool.block_bytes,
-        })
-    }
-}
-
-#[gen_stub_pymethods]
-#[pymethods]
-impl PyHostSlot {
-    fn __len__(&self) -> usize {
-        self.bytes.len()
-    }
-
-    /// Lease the page for CPU or external I/O. The lease excludes Copier access to host-page bytes,
-    /// but does not reserve a cache value for an entire transfer. Wait for relevant `Copy` handles
-    /// before using or reusing that value when ordering or errors matter. This lease does not
-    /// serialize other CPU or external users, and it does not report copy failures.
-    fn access(&self, py: Python<'_>) -> PyResult<PyHostSlotAccess> {
-        let slot = &self.pool.slots[self.slot];
-        py.detach(|| slot.access.acquire_lease())
+    /// Borrow one slot as a writable memoryview. DMA waits until every view of this borrow is
+    /// released. Coordinate other host users yourself and wait for relevant copies before reuse.
+    #[gen_stub(override_return_type(type_repr = "builtins.memoryview"))]
+    fn access<'py>(&self, py: Python<'py>, index: usize) -> PyResult<Bound<'py, PyMemoryView>> {
+        let slot = self
+            .pool
+            .slots
+            .get(index)
+            .ok_or_else(|| PyValueError::new_err("host slot is outside the pool"))?;
+        py.detach(|| slot.acquire_lease())
             .map_err(crate::Error::from)?;
-        Ok(PyHostSlotAccess { slot: self.clone() })
+        let lease = Bound::new(
+            py,
+            HostSlotAccess {
+                pool: Arc::clone(&self.pool),
+                index,
+            },
+        )?;
+        PyMemoryView::from(lease.as_any())
     }
 }
 
-#[gen_stub_pymethods]
 #[pymethods]
-impl PyHostSlotAccess {
-    fn __len__(&self) -> usize {
-        self.slot.bytes.len()
-    }
-
-    #[gen_stub(skip)]
+impl HostSlotAccess {
     unsafe fn __getbuffer__(
         slf: Bound<'_, Self>,
         view: *mut ffi::Py_buffer,
         flags: c_int,
     ) -> PyResult<()> {
-        let slot = &slf.get().slot;
-        let host_slot = slot
-            .pool
-            .slots
-            .get(slot.slot)
-            .ok_or_else(|| PyValueError::new_err("host cache slot storage is unavailable"))?;
-        if let Some(backing) = slot.pool.backing() {
-            let slot_range = backing
-                .slot_range(slot.slot, slot.pool.block_bytes)
+        let lease = slf.get();
+        let length = ffi::Py_ssize_t::try_from(lease.pool.layout.slot_bytes)
+            .map_err(|_| PyValueError::new_err("host slot is too large for Python"))?;
+        lease.pool.slots[lease.index].with_buffer(|buffer| {
+            let mut bytes = buffer
+                .slice_mut(..)
+                .and_then(|slice| slice.into_bytes())
                 .map_err(crate::Error::from)?;
-            let start = slot_range
-                .start
-                .checked_add(slot.bytes.start)
-                .ok_or_else(|| PyValueError::new_err("host slot offset overflows"))?;
-            let end = start
-                .checked_add(slot.bytes.len())
-                .filter(|&end| end <= slot_range.end)
-                .ok_or_else(|| PyValueError::new_err("host slot exceeds its backing"))?;
-            let mut memory = backing
-                .memory
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            unsafe {
-                fill_slot_buffer(slf.py(), slf.as_ptr(), &mut memory, start..end, view, flags)
-            }
-        } else {
-            let mut memory = host_slot.access.lock_buffer().map_err(crate::Error::from)?;
-            unsafe {
-                fill_slot_buffer(
-                    slf.py(),
-                    slf.as_ptr(),
-                    &mut memory,
-                    slot.bytes.clone(),
+            // SAFETY: the exported view retains slf, which owns the pool and holds the slot lease.
+            match unsafe {
+                ffi::PyBuffer_FillInfo(
                     view,
+                    slf.as_ptr(),
+                    bytes.as_mut_ptr().cast(),
+                    length,
+                    0,
                     flags,
                 )
+            } {
+                0 => Ok(()),
+                _ => Err(PyErr::fetch(slf.py())),
             }
-        }
-    }
-}
-
-unsafe fn fill_slot_buffer(
-    py: Python<'_>,
-    object: *mut ffi::PyObject,
-    buffer: &mut HostBuffer,
-    range: Range<usize>,
-    view: *mut ffi::Py_buffer,
-    flags: c_int,
-) -> PyResult<()> {
-    let mut bytes = buffer
-        .slice_mut(range.clone())
-        .and_then(|slice| slice.into_bytes())
-        .map_err(crate::Error::from)?;
-    let length = ffi::Py_ssize_t::try_from(range.len())
-        .map_err(|_| PyValueError::new_err("host slot is too large for Python"))?;
-    // SAFETY: caller holds a slot lease and `object` keeps the pinned allocation alive.
-    match unsafe {
-        ffi::PyBuffer_FillInfo(view, object, bytes.as_mut_ptr().cast(), length, 0, flags)
-    } {
-        0 => Ok(()),
-        _ => Err(PyErr::fetch(py)),
+        })
     }
 }
 
@@ -630,9 +450,7 @@ impl PyCopy {
             .map_err(crate::Error::from)?)
     }
 
-    /// Wait until every copy in the request completes, raising its transfer error if any. Waiting
-    /// before resubmitting an overlapping host slot or device page satisfies the caller's reuse
-    /// contract.
+    /// Wait for the whole request and raise its transfer error, if any.
     fn wait(&self, py: Python<'_>) -> PyResult<()> {
         Ok(py
             .detach(|| self.0.done(None).map(drop))
@@ -643,146 +461,93 @@ impl PyCopy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use furiosa_opt_engine::decoder::{
+        Cache as DeviceCache, CacheSpec, Group, Kind, PageFormat, Pool as Format,
+    };
+    use pyo3::types::PyDict;
     use std::sync::Weak;
 
-    fn cache_from_backing(backing: &PyHostBuffer, slots: usize, block_bytes: usize) -> PyHostCache {
-        let backing = HostBacking {
-            memory: Arc::clone(&backing.memory),
-            bytes: backing.bytes.clone(),
-        };
-        let host_slots = (0..slots).map(|_| Slot::backed()).collect();
-        PyHostCache {
-            pool: Arc::new(Pool {
-                slots: host_slots,
-                block_bytes,
-                core: Weak::new(),
-                backing: Some(backing),
-            }),
-        }
-    }
-
-    fn buffer_address(buffer: &PyHostBuffer) -> usize {
-        let mut memory = buffer
-            .memory
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut bytes = memory
-            .slice_mut(buffer.bytes.clone())
-            .and_then(|slice| slice.into_bytes())
-            .unwrap();
-        bytes.as_mut_ptr() as usize
-    }
-
     #[test]
-    fn backing_view_retains_the_same_allocation_for_replacement_pools() {
-        let source: PyHostBuffer = HostBuffer::zero(48).into();
-        let address = buffer_address(&source);
-        let first = cache_from_backing(&source, 3, 16);
-        drop(source);
-
-        let region = first._backing_buffer().unwrap();
-        assert_eq!(region.bytes.len(), 48);
-        assert_eq!(buffer_address(&region), address);
-        drop(first);
-
-        let replacement = cache_from_backing(&region, 3, 16);
-        let replacement_region = replacement._backing_buffer().unwrap();
-        assert_eq!(replacement_region.bytes.len(), 48);
-        assert_eq!(buffer_address(&replacement_region), address);
-    }
-
-    #[test]
-    fn separately_allocated_cache_has_no_whole_pool_backing() {
+    fn host_view_keeps_slot_alive() {
         let cache = PyHostCache {
             pool: Arc::new(Pool {
-                slots: vec![Slot::owned(HostBuffer::zero(16))],
-                block_bytes: 16,
+                slots: vec![Slot::new(HostBuffer::zero(8))],
+                layout: Arc::new(SlotLayout {
+                    slot_bytes: 8,
+                    layer_ranges: Vec::new(),
+                }),
                 core: Weak::new(),
-                backing: None,
             }),
         };
-
-        assert!(cache._backing_buffer().is_err());
+        let pool = Arc::downgrade(&cache.pool);
+        Python::initialize();
+        Python::attach(|py| {
+            assert!(cache.access(py, 1).is_err());
+            let view = cache.access(py, 0).unwrap();
+            let slice = view.call_method1("cast", ("B",)).unwrap();
+            view.call_method0("release").unwrap();
+            drop(cache);
+            assert!(pool.upgrade().is_some());
+            slice.call_method0("release").unwrap();
+            assert!(pool.upgrade().is_none());
+        });
     }
 
     #[test]
-    fn python_backing_requires_page_lock_and_survives_copier_replacement() {
-        crate::tensor::tests::run_on_device(
-            c"
-import ctypes
+    fn python_host_cache_copies_after_access_ends() {
+        Python::initialize();
+        let context = crate::tests::context();
+        Python::attach(|py| {
+            let engine = PyModule::new(py, "engine").unwrap();
+            crate::register(&engine).unwrap();
+            let spec = CacheSpec {
+                layer_count: 1,
+                pools: vec![Format {
+                    block: 1,
+                    bytes: 8,
+                    format: PageFormat::contiguous(vec![1, 8], 1).unwrap(),
+                }],
+                groups: vec![Group {
+                    pool: 0,
+                    layers: vec![0],
+                    logical_group: 0,
+                    kind: Kind::Paged { window: None },
+                }],
+            };
+            let inner = DeviceCache::new(&Context::lock(&context, py).device, &spec, 2).unwrap();
+            let scope = PyDict::new(py);
+            scope.set_item("engine", engine).unwrap();
+            scope
+                .set_item("cache", Py::new(py, Cache { inner, context }).unwrap())
+                .unwrap();
+            let result = py.run(
+                c"
+copier = engine.Copier(cache, [[0]])
+assert copier.slot_bytes == 8
+assert copier.layer_ranges == [[(0, 8)]]
+pool = engine.HostCache(copier, 2)
+assert pool.slot_bytes == 8
+payload = bytes(range(1, 9))
+view = pool.access(0)
+view[:] = payload
+copy = copier.copy_in([(0, [(0, 0)])], pool)
+pending = not copy.done()
+view.release()
+assert pending
+copy.wait()
 
-def address(buffer):
-    return ctypes.addressof(ctypes.c_ubyte.from_buffer(memoryview(buffer)))
-
-device_buffer = engine.HbmBuffer(device, 8)
-def copier():
-    layer = engine.CopierLayer(device_buffer, 8, 0, 0)
-    return engine.Copier([layer], 8)
-
-old_copier = copier()
-source = engine.HostBuffer(16)
-
-def check_pinned_backing(source_owner):
-    source = source_owner.pop()
-    old_cache = engine.HostCache(old_copier, 2, backing=source)
-    del source
-    region = old_cache._backing_buffer()
-    base = address(region)
-    assert len(region) == 16
-    for slot in range(2):
-        lease = old_cache.slot(slot).access()
-        assert address(lease) == base + slot * 8
-        del lease
-
-    separate = engine.HostCache(old_copier, 1)
-    assert len(separate.slot(0)) == 8
-    try:
-        separate._backing_buffer()
-    except ValueError as error:
-        assert str(error) == 'host cache has no contiguous backing', error
-    else:
-        raise AssertionError('separate slot allocations cannot provide one whole-pool region')
-
-    payload = bytes(range(1, 9))
-    lease = old_cache.slot(0).access()
-    view = memoryview(lease)
-    view[:] = payload
-    view.release()
-    copy_in = old_copier.copy_in([(0, [(0, 0)])], old_cache)
-    assert not copy_in.done()
-    del lease  # The pending DMA starts only after the slot-access lease is released.
-    copy_in.wait()
-    old_copier.copy_out([(1, [(0, 0)])], old_cache).wait()
-    lease = old_cache.slot(1).access()
-    assert bytes(memoryview(lease)) == payload
-    del lease
-
-    old_copier.copy_in([(0, [(0, 0)])], old_cache, coalesce=True).wait()
-    old_copier.copy_out([(1, [(0, 0)])], old_cache, coalesce=True).wait()
-    lease = old_cache.slot(1).access()
-    assert bytes(memoryview(lease)) == payload
-    del lease
-
-    old_copier.shutdown()
-    del old_cache, separate
-    new_copier = copier()
-    new_cache = engine.HostCache(new_copier, 2, backing=region)
-    assert address(new_cache._backing_buffer()) == base
-    new_copier.shutdown()
-
-if source.is_pinned:
-    source_owner = [source]
-    source = None
-    check_pinned_backing(source_owner)
-else:
-    try:
-        engine.HostCache(old_copier, 2, backing=source)
-    except ValueError as error:
-        assert str(error) == 'host cache backing must be page-locked', error
-    else:
-        raise AssertionError('a pageable host buffer cannot back a DMA cache pool')
-    old_copier.shutdown()
+for coalesced in (False, True):
+    copier.copy_in([(0, [(0, 0)])], pool, coalesce=coalesced).wait()
+    copier.copy_out([(1, [(0, 0)])], pool, coalesce=coalesced).wait()
+    with pool.access(1) as restored:
+        assert bytes(restored) == payload
+copier.shutdown()
 ",
-        );
+                Some(&scope),
+                None,
+            );
+            scope.clear();
+            result.unwrap();
+        });
     }
 }

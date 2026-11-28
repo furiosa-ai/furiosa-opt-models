@@ -16,7 +16,6 @@ from . import decoder, llama, mistral, qwen3, vision_language
 __all__ = [
     "Checkpoint",
     "Copier",
-    "CopierLayer",
     "Copy",
     "Decoder",
     "Device",
@@ -25,8 +24,6 @@ __all__ = [
     "HbmTensor",
     "HostBuffer",
     "HostCache",
-    "HostSlot",
-    "HostSlotAccess",
     "HostTensor",
     "LoadOptions",
     "Placement",
@@ -74,17 +71,29 @@ class Copier:
     for the earlier `Copy` to finish. An in-flight device-page overlap raises `BlockingIOError` and
     queues no work; host-slot reuse is serialized by its per-slot gate. A failed copy leaves its
     device pages unavailable for this copier's lifetime.
-    Python serializes queue mutation under the GIL; completions can move to framework worker threads.
-    Layer groups are numbered contiguously from zero.
+    Coalescing gathers or scatters through temporary pinned buffers to reduce DMA commands.
+    Number groups from zero in the order supplied to the constructor.
     """
     def __new__(
-        cls, layers: typing.Sequence[CopierLayer], host_block_bytes: builtins.int
+        cls,
+        cache: decoder.Cache,
+        groups: typing.Sequence[typing.Sequence[builtins.int]],
     ) -> Copier:
         r"""
-        Build one transfer queue over the layer buffers.
+        Build a transfer queue over an allocated decoder cache.
 
-        Each layer names its own page size (bytes per chip), byte offset in a host slot, and cache
-        group, so one layer's metadata cannot accidentally drift from another's buffer.
+        Each group lists the stable layer IDs that move together for one logical block. Group and
+        layer order determine the packed host slot layout. A layer can appear in at most one group.
+        """
+    @property
+    def slot_bytes(self) -> builtins.int:
+        r"""
+        Bytes in one host slot.
+        """
+    @property
+    def layer_ranges(self) -> builtins.list[builtins.list[tuple[builtins.int, builtins.int]]]:
+        r"""
+        Host-slot byte offsets and lengths in transfer group and layer order.
         """
     def copy_out(
         self,
@@ -96,14 +105,7 @@ class Copier:
         coalesce: builtins.bool = False,
     ) -> Copy:
         r"""
-        Submit device-to-host copies without waiting for their DMA to finish.
-
-        `pages` names host slots and their `(group, device_block)` routes. The caller must wait for
-        earlier copies before reusing their host slots or device pages. An in-flight device-page
-        overlap raises `BlockingIOError`; an overlapping host slot is serialized by its slot gate.
-        A failed copy leaves its device pages unavailable for this copier's lifetime.
-        Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
-        transient pinned memory for one batched runtime transfer.
+        Queue device-to-host copies for host slots and their `(group, device_block)` routes.
         """
     def copy_in(
         self,
@@ -115,37 +117,11 @@ class Copier:
         coalesce: builtins.bool = False,
     ) -> Copy:
         r"""
-        Submit host-to-device copies without waiting for their DMA to finish.
-
-        `pages` names host slots and their `(group, device_block)` routes. The caller must wait for
-        earlier copies before reusing their host slots or device pages. An in-flight device-page
-        overlap raises `BlockingIOError`; an overlapping host slot is serialized by its slot gate.
-        A failed copy leaves its device pages unavailable for this copier's lifetime.
-        Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
-        transient pinned memory for one batched runtime transfer.
+        Queue host-to-device copies for host slots and their `(group, device_block)` routes.
         """
     def shutdown(self) -> None:
         r"""
         Wait for every submitted copy and stop the workers. Drop all host-slot access leases first.
-        """
-
-@typing.final
-class CopierLayer:
-    r"""
-    One layer's byte layout in the device cache and each pinned host-cache block.
-    """
-    def __new__(
-        cls,
-        buffer: HbmBuffer,
-        page_bytes: builtins.int,
-        host_offset: builtins.int,
-        group: builtins.int,
-    ) -> CopierLayer:
-        r"""
-        Describe one cache layer's device page and its location in each host block.
-
-        `page_bytes` is per chip; `host_offset` is a byte offset; `group` is the zero-based cache
-        group index.
         """
 
 @typing.final
@@ -159,9 +135,7 @@ class Copy:
         """
     def wait(self) -> None:
         r"""
-        Wait until every copy in the request completes, raising its transfer error if any. Waiting
-        before resubmitting an overlapping host slot or device page satisfies the caller's reuse
-        contract.
+        Wait for the whole request and raise its transfer error, if any.
         """
 
 @typing_extensions.disjoint_base
@@ -406,16 +380,10 @@ class HostBuffer:
     copy through any view of the same bytes reads or writes them while the export is held, so wait
     for that copy's `Transfer` before using the export.
     """
-    @property
-    def is_pinned(self) -> builtins.bool:
-        r"""
-        Whether this memory is page-locked for asynchronous device transfers.
-        """
     def __new__(cls, source: int | typing_extensions.Buffer) -> HostBuffer:
         r"""
         `source` zeroed bytes, or a copy of the bytes of a C-contiguous buffer such as `bytes` or a
-        NumPy array. The memory is page-locked when the system permits it; check `is_pinned` when a
-        cache backing needs asynchronous DMA.
+        NumPy array.
 
         Raises:
             OverflowError: `source` is a negative integer.
@@ -451,61 +419,23 @@ class HostBuffer:
 @typing.final
 class HostCache:
     r"""
-    A pool of page-locked host pages for device transfers and external host I/O. Multiple pools can
-    share one copier when consumers need independent capacities or lifetimes. Without `backing`,
-    slots are separately allocated. A supplied backing aliases one contiguous page-major region.
+    A pool that owns page-locked host slots for transfers and host I/O. Pools on the same copier
+    share its device-page reservations and hold independent host-slot gates.
     """
-    def __new__(
-        cls, copier: Copier, slots: builtins.int, *, backing: HostBuffer | None = None
-    ) -> HostCache:
+    def __new__(cls, copier: Copier, slots: builtins.int) -> HostCache:
         r"""
-        Allocate one pinned host-page pool for this copier. Other pools may share the copier; their
-        slot indices and access gates are independent, while device-page reservations are shared.
-        `backing`, when supplied, must be a pinned buffer of exactly `slots` times one host block's
-        size. The pool retains that allocation and presents each host block as one slot. Before
-        reusing this backing for a replacement pool, shut down its old copier and finish all copies
-        and `HostSlot.access()` leases; distinct pools over one backing have independent slot gates.
+        Allocate pinned host slots for the copier's page layout.
         """
-    def _backing_buffer(self) -> HostBuffer:
+    @property
+    def slot_bytes(self) -> builtins.int:
         r"""
-        Return an internal `HostBuffer` alias for retaining/registering the contiguous address range.
-
-        Do not read or write through this view. Those accesses bypass per-slot exclusion; use
-        `HostSlot.access()` for external I/O. This alias shares and retains the pool allocation and
-        can be passed as `backing=` when creating its replacement after the Copier is shut down.
-
-        Raises:
-            ValueError: This pool was allocated with separate slot buffers.
+        Bytes in one slot.
         """
-    def slot(self, index: builtins.int) -> HostSlot:
+    def access(self, index: builtins.int) -> builtins.memoryview:
         r"""
-        Return a handle to one pinned host page. Call `access()` to lease its zero-copy buffer.
-
-        The slot index is local to this pool.
+        Borrow one slot as a writable memoryview. DMA waits until every view of this borrow is
+        released. Coordinate other host users yourself and wait for relevant copies before reuse.
         """
-
-@typing.final
-class HostSlot:
-    r"""
-    A handle to one pinned host page.
-    """
-    def __len__(self) -> builtins.int: ...
-    def access(self) -> HostSlotAccess:
-        r"""
-        Lease the page for CPU or external I/O. The lease excludes Copier access to host-page bytes,
-        but does not reserve a cache value for an entire transfer. Wait for relevant `Copy` handles
-        before using or reusing that value when ordering or errors matter. This lease does not
-        serialize other CPU or external users, and it does not report copy failures.
-        """
-
-@typing.final
-class HostSlotAccess:
-    r"""
-    A writable pinned-buffer lease. Keep it alive through CPU or external asynchronous I/O; the
-    copier cannot use this page until the lease drops. Multiple leases may coexist, so adapters
-    must serialize their own users of a slot.
-    """
-    def __len__(self) -> builtins.int: ...
 
 @typing.final
 class HostTensor:

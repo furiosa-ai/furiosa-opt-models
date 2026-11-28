@@ -257,7 +257,7 @@ def test_canonical_mapping_uses_metadata_views_and_fails_closed(
         strides=list(strides),
     )
     engine_group = SimpleNamespace(pool=0, layers=[0], logical_group=0)
-    cache_instance = SimpleNamespace(spec=SimpleNamespace(pools=[pool], groups=[engine_group]))
+    cache_spec = SimpleNamespace(pools=[pool], groups=[engine_group])
     layer_spec = FullAttentionSpec(block_size=2, num_kv_heads=1, head_size=2, dtype=torch.uint8)
     cache_config = KVCacheConfig(
         num_blocks=4,
@@ -265,7 +265,7 @@ def test_canonical_mapping_uses_metadata_views_and_fails_closed(
         kv_cache_groups=[KVCacheGroupSpec(layer_names=["layers.0"], kv_cache_spec=layer_spec)],
     )
     layer_owner = {0: (0, 0)}
-    view = worker._metadata_cache_views(cache_instance, cache_config, layer_owner)["layers.0"]
+    view = worker._metadata_cache_views(cache_spec, cache_config, layer_owner)["layers.0"]
     assert view.device.type == "meta"
     assert tuple(view.shape) == (4, 2, 2, 1, 2)
     assert tuple(view.stride()) == (8, strides[1], strides[0], strides[2], strides[3])
@@ -289,6 +289,9 @@ def test_canonical_mapping_uses_metadata_views_and_fails_closed(
 
 def test_canonical_layout_requires_an_identity_page_mapping(monkeypatch) -> None:
     class FakeCopier:
+        slot_bytes = 8
+        layer_ranges = [[(0, 8)]]
+
         def __init__(self, *_args: object) -> None:
             pass
 
@@ -428,7 +431,7 @@ def test_vllm_tiering_uses_engine_owned_primary_layout(tmp_path) -> None:
 
 
 def test_vllm_chunk_store_round_trips_layer_major_pages(tmp_path) -> None:
-    from furiosa_opt_engine.cache_transfer import AlignedFileIO
+    from furiosa_opt_engine.cache_file import AlignedFileIO
     from furiosa_opt_vllm.offload.pool import FilePageSegment
     from furiosa_opt_vllm.offload.storage import (
         FuriosaFileSystemTierManager,
@@ -436,29 +439,29 @@ def test_vllm_chunk_store_round_trips_layer_major_pages(tmp_path) -> None:
         _LoadProgress,
     )
 
-    class Slot:
-        def __init__(self, contents: bytes) -> None:
-            self.contents = bytearray(contents)
+    class HostCache:
+        def __init__(self, *pages: bytes) -> None:
+            self.pages = [bytearray(page) for page in pages]
 
-        def access(self) -> memoryview:
-            return memoryview(self.contents)
+        def access(self, index: int) -> memoryview:
+            return memoryview(self.pages[index])
 
     file_io = AlignedFileIO(str(tmp_path), use_direct=False)
     path = tmp_path / "cache" / "chunk.bin"
     layout = (FilePageSegment(0, 3), FilePageSegment(3, 4))
-    slots = [Slot(b"abcWXYZ"), Slot(b"def1234")]
+    cache = HostCache(b"abcWXYZ", b"def1234")
     chunk = _ChunkStore(file_io, str(path), 7, 2, 16, layout)
 
-    chunk.write(slots)
+    chunk.write(cache, range(2))
 
     assert path.read_bytes() == b"abcdefWXYZ1234\0\0"
-    restored = [Slot(bytes(7)), Slot(bytes(7))]
+    restored = HostCache(bytes(7), bytes(7))
     manager = FuriosaFileSystemTierManager.__new__(FuriosaFileSystemTierManager)
     manager._file_io = file_io
     manager._load_progress = {}
     progress = _LoadProgress(job_id=9, files=1)
-    manager._load_chunk(str(path), 0, restored, layout, progress)
-    assert [bytes(slot.contents) for slot in restored] == [b"abcWXYZ", b"def1234"]
+    manager._load_chunk(str(path), 0, restored, range(2), layout, progress)
+    assert [bytes(page) for page in restored.pages] == [b"abcWXYZ", b"def1234"]
     assert manager._load_progress == {9: 1}
 
 

@@ -222,18 +222,27 @@ impl CacheSpec {
         if blocks == 0 {
             return Err(invalid("cache blocks must be positive"));
         }
+        self.layer_page_bytes()
+            .into_iter()
+            .map(|bytes| {
+                // A device table holds a page's byte offset within its layer as an I32.
+                blocks
+                    .checked_mul(bytes)
+                    .filter(|&size| size <= 1 << 31)
+                    .ok_or_else(|| invalid("cache blocks pass I32 byte offsets"))
+            })
+            .collect()
+    }
+
+    /// Bytes in one page per chip, indexed by stable layer ID. The spec must be validated.
+    fn layer_page_bytes(&self) -> Vec<usize> {
         let mut sizes = vec![0; self.layer_count];
         for group in &self.groups {
-            let pool = &self.pools[group.pool];
-            // A device table holds a page's byte offset within its layer as an I32.
-            let size = (blocks.checked_mul(pool.bytes))
-                .filter(|&size| size <= 1 << 31)
-                .ok_or_else(|| invalid("cache blocks pass I32 byte offsets"))?;
             for &layer in &group.layers {
-                sizes[layer] = size;
+                sizes[layer] = self.pools[group.pool].bytes;
             }
         }
-        Ok(sizes)
+        sizes
     }
 }
 
@@ -277,6 +286,11 @@ impl Cache {
     /// Each layer's storage, indexed by stable model layer ID.
     pub fn layers(&self) -> &[HbmBuffer] {
         &self.layers
+    }
+
+    /// Bytes per chip in one cache page of each model layer.
+    pub fn layer_page_bytes(&self) -> Vec<usize> {
+        self.spec.layer_page_bytes()
     }
 
     /// Blocks per layer.

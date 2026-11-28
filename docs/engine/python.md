@@ -70,34 +70,21 @@ transfer.wait()
 1. The first cached layer's device storage.
 2. `len(layer)` bytes for each chip of the device, here one.
 
-## Share a contiguous host cache
+## Copy cache pages to host memory
 
-`HostCache(backing=...)` maps its fixed-size page slots into one contiguous, pinned `HostBuffer` and
-retains that allocation. The backing size must equal the slot count times the `Copier` host-block
-size. Because `HostBuffer` can fall back to pageable memory, check `is_pinned` first. The engine's
-shared transfer guide defines slot gates and backing-lock scope.
-
-An adapter that registers the complete address range can obtain an internal handle to the same
-allocation:
+`Copier` transfers pages from an allocated decoder cache to a `HostCache` of pinned host slots and back. Pass the layer IDs for each group that shares a block index. Group and layer order determine the packed host layout.
 
 ```python
-backing = engine.HostBuffer(slot_bytes * slot_count)
-if not backing.is_pinned:
-    raise RuntimeError("host cache backing requires page-locked memory")
-host_cache = engine.HostCache(copier, slot_count, backing=backing)
-region = host_cache._backing_buffer()  # Same allocation and address, not a copy.
+copier = engine.Copier(cache, [[0, 1]])  # Layers 0 and 1 move together.
+host = engine.HostCache(copier, 4)
+pages = [(0, [(0, 2)])]  # Host slot 0, group 0, device block 2.
+copier.copy_out(pages, host).wait()
+with host.access(0) as view:
+    page_bytes = bytes(view)
+copier.shutdown()
 ```
 
-Use this handle only to retain or register the address; reading or writing through it bypasses slot
-exclusion. Use `HostSlot.access()` for external I/O. Keep the handle while an external registration
-uses the region. To replace the pool without moving its address, finish every copy, drop every slot
-lease, shut down the old `Copier`, then drop the old `HostCache` and pass the handle to the new pool.
-Each pool has independent slot gates, so never serve transfers through both pools at once.
-
-`_backing_buffer()` raises `ValueError` when the pool has separately allocated slots. It is a private
-adapter hook, not a general user API; its private stub declaration exists for adapter type checking.
-The [shared transfer guide](frameworks.md#dma-batches-and-ownership) defines backed-slot locking;
-its [coalescing section](frameworks.md#optional-coalescing) defines cache-value reuse.
+`copier.layer_ranges` reports the byte offset and length of each layer in a slot. See [Offload cache pages](frameworks.md#offload-cache-pages) for transfer completion, slot access and batching rules.
 
 ## Run requests with LoRA adapters
 

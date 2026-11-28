@@ -15,7 +15,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from typing_extensions import override
 
-from furiosa_opt_engine.cache_transfer import (
+from furiosa_opt_engine.cache_file import (
     DEFAULT_READ_THREADS,
     DEFAULT_WRITE_THREADS,
     AlignedFileIO,
@@ -126,7 +126,8 @@ class FuriosaHiCacheFile(HiCacheFile):
         suffixed = self._get_suffixed_key(storage_key)
         path = os.path.join(self.file_path, f"{suffixed}.bin")
         try:
-            self.file_io.read(path, host_pool.host_cache.slot(host_pool._page_index(page_offset)))
+            with host_pool.host_cache.access(host_pool._page_index(page_offset)) as page:
+                self.file_io.read(path, page)
         except FileNotFoundError:
             if self.metadata_cache is not None:
                 self.metadata_cache.remove(suffixed)
@@ -148,14 +149,15 @@ class FuriosaHiCacheFile(HiCacheFile):
             self._evictor.touch(suffixed, path)
             return True
 
-        slot = host_pool.host_cache.slot(host_pool._page_index(page_offset))
-        size = len(slot)
+        index = host_pool._page_index(page_offset)
+        size = host_pool.host_cache.slot_bytes
         if not self._evictor.reserve(suffixed, size, key=storage_key):
             return False
 
         temporary = os.path.join(self.file_path, f".{uuid.uuid4().hex}.tmp")
         try:
-            self.file_io.write(temporary, slot)
+            with host_pool.host_cache.access(index) as page:
+                self.file_io.write(temporary, page)
             os.replace(temporary, path)
             self._evictor.commit(suffixed)
             if self.metadata_cache is not None:

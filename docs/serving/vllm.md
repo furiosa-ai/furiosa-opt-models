@@ -27,7 +27,7 @@ The platform accepts these values:
 
 ### Configure the host tier
 
-vLLM keeps block selection, admission and eviction; the plugin implements its native CPU offloading contract through `RNGDOffloadingConnector`. Without a secondary tier, `--kv-offloading-size` sets pinned host-tier capacity in GiB. The [serving task guide](index.md#offload-the-kv-cache-to-host-memory) has the filesystem launch command.
+Set `--kv-offloading-size` to the pinned host-tier capacity in GiB. The plugin uses vLLM's CPU offloading contract through `RNGDOffloadingConnector`. See the [serving task guide](index.md#offload-the-kv-cache-to-host-memory) for a filesystem launch command.
 
 The filesystem tier uses vLLM's `TieringOffloadingSpec`. Its native `secondary_tiers` field belongs in `kv_connector_extra_config`; Furiosa supplies the tier manager over engine-pinned slots.
 
@@ -39,11 +39,11 @@ The Furiosa-only `coalescing` option defaults to `false`; set it to `true` besid
 
 ### Filesystem tier
 
-The filesystem tier has no capacity limit or automatic stale-directory cleanup; operators remove old directories. Its file layout and direct-I/O rules are in the [shared filesystem guide](../engine/frameworks.md#filesystem-layout-and-io).
+The filesystem tier writes vLLM's native layer-major chunks, including trailing alignment padding. It leaves capacity and stale-directory cleanup to the operator. See [Aligned filesystem I/O](../engine/frameworks.md#aligned-filesystem-io) for aligned I/O rules.
 
 ### Page layout
 
-`canonical_layout` is accepted only when its page mapping is byte-identical to the engine layout and each vLLM worker maps to one engine chip. Startup rejects other mappings instead of converting page fragments. Without `canonical_layout`, each worker uses its local page layout. Offloading supports the model's compiled tensor-parallel chip counts, transfers each chip's page in rank order and reports completion only after the full transfer.
+`canonical_layout` requires a byte-identical engine page and one engine chip per vLLM worker. A prefix key can match while two tensor-parallel layouts put the same attention heads in different byte ranges. To keep direct DMA, startup checks the mapping and rejects any case that would need page conversion. With `canonical_layout` disabled, the adapter uses the worker's local layout and copies chip pages in rank order.
 
 ### Cache groups and parallelism
 

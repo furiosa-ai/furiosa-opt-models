@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use furiosa_opt_std::prelude::{self, HostBuffer};
 
-use super::staging;
+use super::{layout::SlotLayout, staging};
 
 const COPY_THREADS: usize = 6;
 const COPY_CHUNK_BLOCKS: usize = 2;
@@ -18,99 +18,39 @@ pub(super) type Pdma = prelude::DmaContext<{ prelude::Dma::Pcie }>;
 pub(super) struct Layer {
     pub(super) buffer: prelude::HbmBuffer,
     pub(super) page_bytes: usize,
-    pub(super) host_offset: usize,
-    pub(super) blocks: usize,
 }
 
 pub(super) struct Core {
     pub(super) pdma: Pdma,
     pub(super) layers: Vec<Layer>,
     pub(super) groups: Vec<Vec<usize>>,
-    pub(super) group_blocks: Vec<usize>,
+    pub(super) blocks: usize,
     pub(super) chips: usize,
-    pub(super) block_bytes: usize,
 }
 
 pub(super) struct Pool {
     pub(super) slots: Vec<Slot>,
-    pub(super) block_bytes: usize,
+    pub(super) layout: Arc<SlotLayout>,
     pub(super) core: Weak<Core>,
-    // Backed slots are ranges in this single pool-owned allocation.
-    pub(super) backing: Option<HostBacking>,
 }
 
-impl Pool {
-    pub(super) fn backing(&self) -> Option<&HostBacking> {
-        self.backing.as_ref()
-    }
-}
-
-/// Shared owner retained by every backed slot in one cache pool.
-pub(super) struct HostBacking {
-    pub(super) memory: Arc<Mutex<HostBuffer>>,
-    pub(super) bytes: std::ops::Range<usize>,
-}
-
-impl HostBacking {
-    pub(super) fn slot_range(
-        &self,
-        slot: usize,
-        block_bytes: usize,
-    ) -> io::Result<std::ops::Range<usize>> {
-        let start = slot
-            .checked_mul(block_bytes)
-            .and_then(|offset| self.bytes.start.checked_add(offset))
-            .ok_or_else(|| io::Error::other("host slot offset overflows"))?;
-        let end = start
-            .checked_add(block_bytes)
-            .filter(|&end| end <= self.bytes.end)
-            .ok_or_else(|| io::Error::other("host slot exceeds backing"))?;
-        Ok(start..end)
-    }
-}
-
+/// One pinned allocation and the gate that protects its bytes from overlapping DMA and host I/O.
 pub(super) struct Slot {
-    pub(super) access: SlotAccess,
-}
-
-impl Slot {
-    pub(super) fn owned(buffer: HostBuffer) -> Self {
-        Self {
-            access: SlotAccess::owned(buffer),
-        }
-    }
-
-    pub(super) fn backed() -> Self {
-        Self {
-            access: SlotAccess::default(),
-        }
-    }
-}
-
-// One slot mutex protects its owned buffer and the lifetime state for both owned and backed slots.
-#[derive(Default)]
-pub(super) struct SlotAccess {
-    state: Mutex<SlotAccessState>,
+    state: Mutex<SlotState>,
     changed: Condvar,
 }
 
-#[derive(Default)]
-struct SlotAccessState {
-    buffer: Option<HostBuffer>,
-    dma: bool,
+struct SlotState {
+    buffer: HostBuffer,
     leases: usize,
     waiting_dma: usize,
     waiting_leases: usize,
 }
 
+/// Exclusive access to one slot during direct DMA or a coalescing gather/scatter.
 struct DmaSlot<'a> {
-    access: &'a SlotAccess,
-    state: std::sync::MutexGuard<'a, SlotAccessState>,
-    release_on_drop: bool,
-}
-
-pub(super) struct SlotBuffer<'a> {
-    state: std::sync::MutexGuard<'a, SlotAccessState>,
+    slot: &'a Slot,
+    state: std::sync::MutexGuard<'a, SlotState>,
 }
 
 pub(super) struct Queue {
@@ -162,28 +102,13 @@ pub(super) struct DevicePage(pub(super) usize, pub(super) u32);
 pub(super) struct Transfers(BTreeMap<DevicePage, Arc<Completion>>);
 
 impl Slot {
-    fn acquire_dma(&self) -> io::Result<DmaSlot<'_>> {
-        let slot = self.access.acquire_dma()?;
-        if slot.state.buffer.is_none() {
-            drop(slot);
-            return Err(io::Error::other(
-                "a shared host-cache slot has no owned buffer",
-            ));
-        }
-        Ok(slot)
-    }
-
-    fn acquire_dma_lease(&self) -> io::Result<DmaLease<'_>> {
-        Ok(self.access.acquire_dma()?.into_lease())
-    }
-}
-
-impl SlotAccess {
-    fn owned(buffer: HostBuffer) -> Self {
+    pub(super) fn new(buffer: HostBuffer) -> Self {
         Self {
-            state: Mutex::new(SlotAccessState {
-                buffer: Some(buffer),
-                ..SlotAccessState::default()
+            state: Mutex::new(SlotState {
+                buffer,
+                leases: 0,
+                waiting_dma: 0,
+                waiting_leases: 0,
             }),
             changed: Condvar::new(),
         }
@@ -194,7 +119,7 @@ impl SlotAccess {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while state.dma || state.leases != 0 {
+        while state.leases != 0 {
             state.waiting_dma = state
                 .waiting_dma
                 .checked_add(1)
@@ -205,28 +130,7 @@ impl SlotAccess {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.waiting_dma -= 1;
         }
-        state.dma = true;
-        Ok(DmaSlot {
-            access: self,
-            state,
-            release_on_drop: true,
-        })
-    }
-
-    fn release_dma(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Self::release_dma_state(&mut state, &self.changed);
-    }
-
-    fn release_dma_state(state: &mut SlotAccessState, changed: &Condvar) {
-        debug_assert!(state.dma);
-        state.dma = false;
-        if state.waiting_dma != 0 || state.waiting_leases != 0 {
-            changed.notify_all();
-        }
+        Ok(DmaSlot { slot: self, state })
     }
 
     pub(super) fn acquire_lease(&self) -> io::Result<()> {
@@ -234,7 +138,7 @@ impl SlotAccess {
             .state
             .lock()
             .map_err(|error| io::Error::other(error.to_string()))?;
-        while state.dma || state.waiting_dma != 0 {
+        while state.waiting_dma != 0 {
             state.waiting_leases = state
                 .waiting_leases
                 .checked_add(1)
@@ -252,17 +156,14 @@ impl SlotAccess {
         Ok(())
     }
 
-    pub(super) fn lock_buffer(&self) -> io::Result<SlotBuffer<'_>> {
-        let state = self
+    /// Expose the buffer while its caller holds a host lease.
+    pub(super) fn with_buffer<T>(&self, f: impl FnOnce(&mut HostBuffer) -> T) -> T {
+        let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.buffer.is_none() {
-            return Err(io::Error::other(
-                "shared host-cache slot has no owned buffer",
-            ));
-        }
-        Ok(SlotBuffer { state })
+        debug_assert_ne!(state.leases, 0);
+        f(&mut state.buffer)
     }
 
     pub(super) fn release_lease(&self) {
@@ -284,66 +185,21 @@ impl std::ops::Deref for DmaSlot<'_> {
     type Target = HostBuffer;
 
     fn deref(&self) -> &Self::Target {
-        self.state
-            .buffer
-            .as_ref()
-            .expect("owned host slot has no buffer")
+        &self.state.buffer
     }
 }
 
 impl DerefMut for DmaSlot<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.state
-            .buffer
-            .as_mut()
-            .expect("owned host slot has no buffer")
-    }
-}
-
-impl<'a> DmaSlot<'a> {
-    fn into_lease(mut self) -> DmaLease<'a> {
-        self.release_on_drop = false;
-        DmaLease {
-            access: self.access,
-        }
+        &mut self.state.buffer
     }
 }
 
 impl Drop for DmaSlot<'_> {
     fn drop(&mut self) {
-        if self.release_on_drop {
-            SlotAccess::release_dma_state(&mut self.state, &self.access.changed);
+        if self.state.waiting_dma != 0 || self.state.waiting_leases != 0 {
+            self.slot.changed.notify_all();
         }
-    }
-}
-
-struct DmaLease<'a> {
-    access: &'a SlotAccess,
-}
-
-impl Drop for DmaLease<'_> {
-    fn drop(&mut self) {
-        self.access.release_dma();
-    }
-}
-
-impl std::ops::Deref for SlotBuffer<'_> {
-    type Target = HostBuffer;
-
-    fn deref(&self) -> &Self::Target {
-        self.state
-            .buffer
-            .as_ref()
-            .expect("owned host slot has no buffer")
-    }
-}
-
-impl DerefMut for SlotBuffer<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.state
-            .buffer
-            .as_mut()
-            .expect("owned host slot has no buffer")
     }
 }
 
@@ -536,9 +392,6 @@ impl Chunk {
         if self.coalesced {
             return self.transfer_coalesced(executor, core, pdma);
         }
-        if self.pool.backing().is_some() {
-            return self.transfer_backed(executor, core, pdma);
-        }
         let mut hosts = self
             .pages
             .iter()
@@ -550,17 +403,9 @@ impl Chunk {
         if self.loading {
             let mut pairs = Vec::with_capacity(route_count);
             for (&(page_index, _, layer_id), destination) in page_layers.iter().zip(&mut aliases) {
-                let layer = &core.layers[layer_id];
-                let length = layer
-                    .page_bytes
-                    .checked_mul(core.chips)
-                    .ok_or_else(|| io::Error::other("host page size overflows"))?;
-                let end = layer
-                    .host_offset
-                    .checked_add(length)
-                    .ok_or_else(|| io::Error::other("host page end overflows"))?;
+                let range = &self.pool.layout.layer_ranges[layer_id];
                 let source = hosts[page_index]
-                    .slice(layer.host_offset..end)
+                    .slice(range.clone())
                     .map_err(io::Error::other)?;
                 let destination = destination.slice_mut(.., ..).map_err(io::Error::other)?;
                 pairs.push((source, destination));
@@ -577,26 +422,21 @@ impl Chunk {
                     if route_page != page_index {
                         break;
                     }
-                    let layer = &core.layers[layer_id];
-                    let offset = layer.host_offset;
-                    let length = layer
-                        .page_bytes
-                        .checked_mul(core.chips)
-                        .ok_or_else(|| io::Error::other("host page size overflows"))?;
-                    let gap = offset
+                    let range = &self.pool.layout.layer_ranges[layer_id];
+                    let gap = range
+                        .start
                         .checked_sub(cursor)
                         .ok_or_else(|| io::Error::other("host layer ranges overlap"))?;
                     let (before, tail) = rest.split_at(gap).map_err(io::Error::other)?;
                     drop(before);
-                    let (destination, tail) = tail.split_at(length).map_err(io::Error::other)?;
+                    let (destination, tail) =
+                        tail.split_at(range.len()).map_err(io::Error::other)?;
                     let source = aliases[route_index]
                         .slice(.., ..)
                         .map_err(io::Error::other)?;
                     pairs.push((source, destination));
                     rest = tail;
-                    cursor = offset
-                        .checked_add(length)
-                        .ok_or_else(|| io::Error::other("host layer end overflows"))?;
+                    cursor = range.end;
                     route_index += 1;
                 }
             }
@@ -606,109 +446,6 @@ impl Chunk {
             let submitted = pdma.to_host(pairs).submit();
             executor.block_on(submitted).map_err(io::Error::other)
         }
-    }
-
-    fn transfer_backed(
-        &self,
-        executor: &tokio::runtime::Runtime,
-        core: &Core,
-        pdma: &mut Pdma,
-    ) -> io::Result<()> {
-        let backing = self
-            .pool
-            .backing()
-            .ok_or_else(|| io::Error::other("shared host-cache backing is missing"))?;
-        let _slots = self.acquire_dma_leases()?;
-        let (page_layers, mut aliases) = self.direct_routes(core)?;
-        let route_count = page_layers.len();
-
-        // Submission retains the pinned DMA-buf in the runtime request. Keep the Pool Arc and
-        // page leases through completion; release the backing mutex after submission.
-        if self.loading {
-            let submitted = {
-                let memory = backing
-                    .memory
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let mut pairs = Vec::with_capacity(route_count);
-                for (&(page_index, _, layer_id), destination) in
-                    page_layers.iter().zip(&mut aliases)
-                {
-                    let layer = &core.layers[layer_id];
-                    let slot_range =
-                        backing.slot_range(self.pages[page_index].slot, self.pool.block_bytes)?;
-                    let start = slot_range
-                        .start
-                        .checked_add(layer.host_offset)
-                        .ok_or_else(|| io::Error::other("host layer offset overflows"))?;
-                    let length = layer
-                        .page_bytes
-                        .checked_mul(core.chips)
-                        .ok_or_else(|| io::Error::other("host page size overflows"))?;
-                    let end = start
-                        .checked_add(length)
-                        .filter(|&end| end <= slot_range.end)
-                        .ok_or_else(|| io::Error::other("cache transfer exceeds host slot"))?;
-                    let source = memory.slice(start..end).map_err(io::Error::other)?;
-                    let destination = destination.slice_mut(.., ..).map_err(io::Error::other)?;
-                    pairs.push((source, destination));
-                }
-                pdma.to_hbm(pairs).submit()
-            };
-            executor.block_on(submitted).map_err(io::Error::other)
-        } else {
-            let submitted = {
-                let mut memory = backing
-                    .memory
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let mut rest = memory
-                    .slice_mut(backing.bytes.clone())
-                    .map_err(io::Error::other)?;
-                let mut cursor = backing.bytes.start;
-                let mut pairs = Vec::with_capacity(route_count);
-                for (&(page_index, _, layer_id), source) in page_layers.iter().zip(&mut aliases) {
-                    let layer = &core.layers[layer_id];
-                    let slot_range =
-                        backing.slot_range(self.pages[page_index].slot, self.pool.block_bytes)?;
-                    let start = slot_range
-                        .start
-                        .checked_add(layer.host_offset)
-                        .ok_or_else(|| io::Error::other("host layer offset overflows"))?;
-                    let length = layer
-                        .page_bytes
-                        .checked_mul(core.chips)
-                        .ok_or_else(|| io::Error::other("host page size overflows"))?;
-                    let end = start
-                        .checked_add(length)
-                        .filter(|&end| end <= slot_range.end)
-                        .ok_or_else(|| io::Error::other("cache transfer exceeds host slot"))?;
-                    let gap = start
-                        .checked_sub(cursor)
-                        .ok_or_else(|| io::Error::other("cache host ranges overlap"))?;
-                    let (before, tail) = rest.split_at(gap).map_err(io::Error::other)?;
-                    drop(before);
-                    let (destination, tail) = tail.split_at(length).map_err(io::Error::other)?;
-                    pairs.push((source.slice(.., ..).map_err(io::Error::other)?, destination));
-                    rest = tail;
-                    cursor = end;
-                }
-                pdma.to_host(pairs).submit()
-            };
-            executor.block_on(submitted).map_err(io::Error::other)
-        }
-    }
-
-    fn acquire_dma_leases(&self) -> io::Result<Vec<DmaLease<'_>>> {
-        let mut leases = Vec::with_capacity(self.pages.len());
-        let mut previous_slot = None;
-        for page in &self.pages {
-            if previous_slot != Some(page.slot) {
-                leases.push(self.pool.slots[page.slot].acquire_dma_lease()?);
-                previous_slot = Some(page.slot);
-            }
-        }
-        Ok(leases)
     }
 
     fn direct_routes(&self, core: &Core) -> io::Result<(Vec<PageLayer>, Vec<prelude::HbmBuffer>)> {
@@ -729,7 +466,7 @@ impl Chunk {
         page_layers.sort_unstable_by_key(|&(page_index, _, layer_id)| {
             (
                 self.pages[page_index].slot,
-                core.layers[layer_id].host_offset,
+                self.pool.layout.layer_ranges[layer_id].start,
             )
         });
 
@@ -757,9 +494,10 @@ impl Chunk {
         let layers = core
             .layers
             .iter()
-            .map(|layer| staging::LayerLayout {
+            .zip(&self.pool.layout.layer_ranges)
+            .map(|(layer, range)| staging::LayerLayout {
                 page_bytes: layer.page_bytes,
-                host_offset: layer.host_offset,
+                host_offset: range.start,
             })
             .collect::<Vec<_>>();
         let mut layout = staging::Layout::new(&self.pages, &core.groups, &layers, self.loading)?;
@@ -778,16 +516,13 @@ impl Chunk {
 
         if self.loading {
             for group in &slot_items {
-                let dma = self.pool.slots[group.slot].access.acquire_dma()?;
-                self.place_coalesced_slot(
-                    group.slot,
-                    &layout.items[group.items.clone()],
-                    &mut stages,
-                    core.chips,
-                    &dma,
-                )?;
-                // Staging now owns the load snapshot; do not hold the slot through DMA.
-                drop(dma);
+                let dma = self.pool.slots[group.slot].acquire_dma()?;
+                let source = dma.slice(..).map_err(io::Error::other)?;
+                let source = source.bytes().map_err(io::Error::other)?;
+                for item in &layout.items[group.items.clone()] {
+                    item.place(&mut stages, &source)?;
+                }
+                // Staging now owns the load snapshot; release the slot before DMA.
             }
         }
 
@@ -838,14 +573,12 @@ impl Chunk {
             executor.block_on(submitted).map_err(io::Error::other)?;
 
             for group in &slot_items {
-                let mut dma = self.pool.slots[group.slot].access.acquire_dma()?;
-                self.take_coalesced_slot(
-                    group.slot,
-                    &layout.items[group.items.clone()],
-                    &stages,
-                    core.chips,
-                    &mut dma,
-                )?;
+                let mut dma = self.pool.slots[group.slot].acquire_dma()?;
+                let destination = dma.slice_mut(..).map_err(io::Error::other)?;
+                let mut destination = destination.into_bytes().map_err(io::Error::other)?;
+                for item in &layout.items[group.items.clone()] {
+                    item.take(&stages, &mut destination)?;
+                }
             }
         }
         Ok(())
@@ -868,86 +601,6 @@ impl Chunk {
             start = end;
         }
         groups
-    }
-
-    fn place_coalesced_slot(
-        &self,
-        slot_index: usize,
-        items: &[staging::Item],
-        stages: &mut [HostBuffer],
-        chips: usize,
-        dma: &DmaSlot<'_>,
-    ) -> io::Result<()> {
-        if let Some(backing) = self.pool.backing() {
-            let range = self.coalesced_backing_range(backing, slot_index, items, chips)?;
-            let memory = backing
-                .memory
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let source = memory.slice(range).map_err(io::Error::other)?;
-            let source = source.bytes().map_err(io::Error::other)?;
-            for item in items {
-                item.place(stages, &source)?;
-            }
-        } else {
-            let source = dma.slice(..).map_err(io::Error::other)?;
-            let source = source.bytes().map_err(io::Error::other)?;
-            for item in items {
-                item.place(stages, &source)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn take_coalesced_slot(
-        &self,
-        slot_index: usize,
-        items: &[staging::Item],
-        stages: &[HostBuffer],
-        chips: usize,
-        dma: &mut DmaSlot<'_>,
-    ) -> io::Result<()> {
-        if let Some(backing) = self.pool.backing() {
-            let range = self.coalesced_backing_range(backing, slot_index, items, chips)?;
-            let mut memory = backing
-                .memory
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let destination = memory.slice_mut(range).map_err(io::Error::other)?;
-            let mut destination = destination.into_bytes().map_err(io::Error::other)?;
-            for item in items {
-                item.take(stages, &mut destination)?;
-            }
-        } else {
-            let destination = dma.slice_mut(..).map_err(io::Error::other)?;
-            let mut destination = destination.into_bytes().map_err(io::Error::other)?;
-            for item in items {
-                item.take(stages, &mut destination)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn coalesced_backing_range(
-        &self,
-        backing: &HostBacking,
-        slot_index: usize,
-        items: &[staging::Item],
-        chips: usize,
-    ) -> io::Result<std::ops::Range<usize>> {
-        let slot = backing.slot_range(slot_index, self.pool.block_bytes)?;
-        for item in items {
-            let layer_end = item
-                .page_bytes
-                .checked_mul(chips)
-                .and_then(|length| item.host_offset.checked_add(length))
-                .ok_or_else(|| io::Error::other("host page size overflows"))?;
-            if layer_end > slot.len() {
-                return Err(io::Error::other("cache transfer exceeds host slot"));
-            }
-        }
-        // Item::place/take applies its layer offset relative to the complete host slot.
-        Ok(slot)
     }
 }
 
@@ -1110,7 +763,7 @@ mod tests {
 
     #[test]
     fn slot_access_prioritizes_waiting_dma_over_new_leases() {
-        let access = Arc::new(SlotAccess::default());
+        let access = Arc::new(Slot::new(HostBuffer::zero(16)));
         access.acquire_lease().unwrap();
 
         let (started_tx, started_rx) = mpsc::channel();
@@ -1167,7 +820,7 @@ mod tests {
 
     #[test]
     fn uncontended_dma_skips_waiter_bookkeeping() {
-        let access = SlotAccess::default();
+        let access = Slot::new(HostBuffer::zero(16));
 
         let dma = access.acquire_dma().unwrap();
 
@@ -1176,31 +829,19 @@ mod tests {
         drop(dma);
 
         let state = access.state.lock().unwrap();
-        assert!(!state.dma);
         assert_eq!(state.waiting_dma, 0);
         assert_eq!(state.waiting_leases, 0);
-    }
-
-    #[test]
-    fn contiguous_backing_maps_consecutive_slots_and_checks_bounds() {
-        let backing = HostBacking {
-            memory: Arc::new(Mutex::new(HostBuffer::zero(48))),
-            bytes: 0..48,
-        };
-
-        assert_eq!(backing.slot_range(0, 16).unwrap(), 0..16);
-        assert_eq!(backing.slot_range(1, 16).unwrap(), 16..32);
-        assert_eq!(backing.slot_range(2, 16).unwrap(), 32..48);
-        assert!(backing.slot_range(3, 16).is_err());
     }
 
     #[test]
     fn page_reservations_follow_the_whole_copy_completion() {
         let pool = Arc::new(Pool {
             slots: Vec::new(),
-            block_bytes: 0,
+            layout: Arc::new(SlotLayout {
+                slot_bytes: 0,
+                layer_ranges: Vec::new(),
+            }),
             core: Weak::new(),
-            backing: None,
         });
         let completion = Arc::new(Completion::default());
         let chunks = Chunk::split(
@@ -1250,9 +891,11 @@ mod tests {
     fn coalesced_copies_keep_all_pages_in_one_stage_batch() {
         let pool = Arc::new(Pool {
             slots: Vec::new(),
-            block_bytes: 0,
+            layout: Arc::new(SlotLayout {
+                slot_bytes: 0,
+                layer_ranges: Vec::new(),
+            }),
             core: Weak::new(),
-            backing: None,
         });
         let job = Arc::new(Completion::default());
         let chunks = Chunk::split(

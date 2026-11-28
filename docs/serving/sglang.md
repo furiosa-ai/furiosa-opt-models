@@ -30,11 +30,11 @@ The platform accepts these values:
 
 ### Configure the host tier
 
-The plugin connects SGLang's HiCache page selection and lifecycle to engine-pinned host slots. Choose a host-tier size with `--hicache-ratio` or `--hicache-size`; the [serving task guide](index.md#offload-the-kv-cache-to-host-memory) has the filesystem launch command.
+Set the HiCache host-tier size with `--hicache-ratio` or `--hicache-size`. See the [serving task guide](index.md#offload-the-kv-cache-to-host-memory) for a filesystem launch command.
 
 The filesystem tier uses SGLang's `file` option and `FuriosaHiCacheFile`. Set `--hicache-host-memory-mode cache`, `--hicache-io-backend kernel` and `--hicache-mem-layout page_first`. The storage backend must be unset or `file`; other backends need their own host-buffer integration. Automatic sizing from free host memory is available only for pools SGLang allocates itself.
 
-The adapter loads through SGLang's `dynamic` storage-backend factory and preserves SGLang's cache keys and file-tier lifecycle. The [shared filesystem guide](../engine/frameworks.md#filesystem-layout-and-io) defines the file format and I/O alignment behavior.
+The adapter loads through SGLang's `dynamic` storage-backend factory and preserves SGLang's cache keys and file-tier lifecycle. It writes one raw cache page per file. See [Aligned filesystem I/O](../engine/frameworks.md#aligned-filesystem-io) for aligned I/O rules.
 
 ### Coalesce page restores
 

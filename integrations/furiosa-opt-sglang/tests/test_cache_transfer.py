@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-from furiosa_opt_engine.cache_transfer import AlignedFileIO, _probe_direct_io, _probe_o_direct
+from furiosa_opt_engine.cache_file import AlignedFileIO, _probe_direct_io, _probe_o_direct
 
 
 def _aligned_view(size: int, alignment: int) -> tuple[mmap.mmap, memoryview]:
@@ -63,7 +63,6 @@ def test_aligned_file_io_reports_short_writes(tmp_path, monkeypatch) -> None:
     io = AlignedFileIO(str(tmp_path), use_direct=False)
     path = tmp_path / "short-write.bin"
     source = bytearray(5003)
-    io.prepare(str(path), len(source), 1)
     monkeypatch.setattr(os, "pwrite", lambda fd, buffer, offset: len(buffer) - 1)
 
     with pytest.raises(OSError, match="short write"):

@@ -195,12 +195,9 @@ class Host(HostKVCache):
     ) -> None:
         # The platform refuses the memory saver beside this tier, so the storage is never released.
         assert cache.storage is not None, "a token pool holds its storage until it is released"
-        self.layers = cache.storage.layers
-        # Bytes one page of each layer takes on each chip.
-        self.sizes = [len(layer) // cache.storage.blocks for layer in self.layers]
-        self.chips = cache.pages.chips
+        self.copier = engine.Copier(cache.storage, [list(range(cache.storage.spec.layer_count))])
         item_bytes = cache.dtype.itemsize
-        page_bytes = sum(self.sizes) * self.chips
+        page_bytes = self.copier.slot_bytes
         if page_size <= 0 or page_bytes % (page_size * item_bytes):
             raise ValueError("the host cache page must align to its token count and storage dtype")
         # SGLang's pool reads these while it allocates the pages.
@@ -211,7 +208,7 @@ class Host(HostKVCache):
         super().__init__(
             dtype=cache.dtype,
             device_capacity_tokens=cache.size,
-            size_per_token=sum(self.sizes) * self.chips // page_size,
+            size_per_token=page_bytes // page_size,
             start_layer=cache.start_layer,
             end_layer=cache.end_layer,
             host_to_device_ratio=ratio,
@@ -228,20 +225,6 @@ class Host(HostKVCache):
 
     @override
     def init_kv_buffer(self) -> list[engine.HostCache]:
-        copy_layers: list[engine.CopierLayer] = []
-        offset = 0
-        for layer, page_bytes in zip(self.layers, self.sizes, strict=True):
-            copy_layers.append(
-                engine.CopierLayer(
-                    buffer=layer,
-                    page_bytes=page_bytes,
-                    host_offset=offset,
-                    group=0,
-                )
-            )
-
-            offset += page_bytes * self.chips
-        self.copier = engine.Copier(copy_layers, offset)
         self.host_cache = engine.HostCache(self.copier, self.page_num)
         self._pending_loads: dict[_PageKey, set[int]] = {}
         self._pending_loads_lock = Lock()
@@ -402,7 +385,7 @@ class Host(HostKVCache):
         if not flat:
             raise ValueError("the engine cache exposes opaque flat pages to storage")
         page = self._page_index(index)
-        slot = self.host_cache.slot(page).access()
+        slot = self.host_cache.access(page)
         return torch.frombuffer(slot, dtype=torch.uint8).view(self.dtype)
 
     @override
@@ -418,16 +401,12 @@ class Host(HostKVCache):
         source = memoryview(data_page.contiguous().view(torch.uint8).reshape(-1).numpy()).cast("B")
         if len(source) != self._page_bytes:
             raise ValueError("stored page size differs from the engine cache page")
-        slot = self.host_cache.slot(page).access()
-        destination = memoryview(slot).cast("B")
-        try:
+        with self.host_cache.access(page) as destination:
             destination[:] = source
-        finally:
-            destination.release()
 
     @property
     def _page_bytes(self) -> int:
-        return sum(self.sizes) * self.chips
+        return self.host_cache.slot_bytes
 
     def _page_index(self, index: int) -> int:
         if index < 0 or index % self.page_size:

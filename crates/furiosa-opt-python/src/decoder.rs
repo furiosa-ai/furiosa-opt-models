@@ -429,8 +429,8 @@ pub(super) enum Kind {
 #[gen_stub_pyclass]
 #[pyclass(frozen, module = "engine.decoder")]
 pub(super) struct Cache {
-    inner: decoder::Cache,
-    context: Shared,
+    pub(super) inner: decoder::Cache,
+    pub(super) context: Shared,
 }
 
 #[gen_stub_pymethods]
