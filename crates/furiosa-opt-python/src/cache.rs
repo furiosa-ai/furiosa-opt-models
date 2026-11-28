@@ -5,7 +5,7 @@ use std::ffi::c_int;
 use std::io;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use furiosa_opt_std::prelude::HostBuffer;
@@ -22,21 +22,21 @@ mod queue;
 mod staging;
 
 use queue::{
-    Chunk, Completion, Core, HostBacking, Layer, Pdma, Pool, Queue, Slot, TransferKey, Transfers,
+    Chunk, Completion, Core, DevicePage, HostBacking, Layer, Pdma, Pool, Queue, Slot, Transfers,
 };
 
 const ALLOCATORS: usize = 8;
 const ALLOCATION_GROUP_BYTES: usize = 256 << 20;
-static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Python handle for asynchronous device-cache copies. Submit calls from one caller at a time;
 /// returned `Copy` handles can be waited or queried from worker threads.
 ///
 /// `copy_in` and `copy_out` return a `Copy` handle without waiting for its DMA. The caller owns
 /// host-slot and device-page lifetimes: before submitting work that reuses either, it must wait
-/// for the earlier `Copy` to finish. `submitted()` only waits for runtime submission, not DMA. An
-/// submission that overlaps an in-flight DMA raises `BlockingIOError` and queues no work. Python
-/// serializes queue mutation under the GIL; completions can move to framework worker threads.
+/// for the earlier `Copy` to finish. An in-flight device-page overlap raises `BlockingIOError` and
+/// queues no work; host-slot reuse is serialized by its per-slot gate. A failed copy leaves its
+/// device pages unavailable for this copier's lifetime.
+/// Python serializes queue mutation under the GIL; completions can move to framework worker threads.
 /// Layer groups are numbered contiguously from zero.
 #[gen_stub_pyclass]
 #[pyclass(name = "Copier", module = "engine")]
@@ -203,8 +203,9 @@ impl PyCopier {
     /// Submit device-to-host copies without waiting for their DMA to finish.
     ///
     /// `pages` names host slots and their `(group, device_block)` routes. The caller must wait for
-    /// earlier copies that use any of these host slots or device pages; `Copy.submitted()` is not
-    /// sufficient. An in-flight overlap raises `BlockingIOError` and submits no work.
+    /// earlier copies before reusing their host slots or device pages. An in-flight device-page
+    /// overlap raises `BlockingIOError`; an overlapping host slot is serialized by its slot gate.
+    /// A failed copy leaves its device pages unavailable for this copier's lifetime.
     /// Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
     /// transient pinned memory for one batched runtime transfer.
     #[pyo3(signature = (pages, host, *, coalesce=false))]
@@ -220,8 +221,9 @@ impl PyCopier {
     /// Submit host-to-device copies without waiting for their DMA to finish.
     ///
     /// `pages` names host slots and their `(group, device_block)` routes. The caller must wait for
-    /// earlier copies that use any of these host slots or device pages; `Copy.submitted()` is not
-    /// sufficient. An in-flight overlap raises `BlockingIOError` and submits no work.
+    /// earlier copies before reusing their host slots or device pages. An in-flight device-page
+    /// overlap raises `BlockingIOError`; an overlapping host slot is serialized by its slot gate.
+    /// A failed copy leaves its device pages unavailable for this copier's lifetime.
     /// Coalescing stages the whole call through per-chip pinned buffers and trades CPU copies and
     /// transient pinned memory for one batched runtime transfer.
     #[pyo3(signature = (pages, host, *, coalesce=false))]
@@ -278,7 +280,7 @@ impl PyCopier {
             }
         }
 
-        let mut reservations = Vec::new();
+        let mut device_pages = Vec::new();
         for (slot, routes) in &pages {
             if *slot >= pool.slots.len() {
                 return Err(PyValueError::new_err(format!(
@@ -291,7 +293,6 @@ impl PyCopier {
                     "cache transfer for host slot {slot} has no device routes"
                 )));
             }
-            reservations.push(TransferKey::Host(pool.id, *slot));
             if let Some(pair) = routes.windows(2).find(|pair| pair[0].0 == pair[1].0) {
                 return Err(PyValueError::new_err(format!(
                     "cache transfer for host slot {slot} repeats group {}",
@@ -307,29 +308,32 @@ impl PyCopier {
                         "cache transfer for host slot {slot} names block {block} outside group {group}"
                     )));
                 }
-                reservations.push(TransferKey::Device(group, block));
+                device_pages.push(DevicePage(group, block));
             }
         }
-        reservations.sort_unstable();
-        for pair in reservations.windows(2) {
+        device_pages.sort_unstable();
+        for pair in device_pages.windows(2) {
             if pair[0] != pair[1] || !loading {
                 continue;
             }
-            if let TransferKey::Device(group, block) = pair[0] {
-                return Err(PyValueError::new_err(format!(
-                    "cache load writes group {group} block {block} more than once"
-                )));
-            }
+            let DevicePage(group, block) = pair[0];
+            return Err(PyValueError::new_err(format!(
+                "cache load writes group {group} block {block} more than once"
+            )));
         }
-        reservations.dedup();
-        if self.pending.conflicts(&reservations) {
+        device_pages.dedup();
+        if self
+            .pending
+            .conflicts(&device_pages)
+            .map_err(crate::Error::from)?
+        {
             return Err(PyBlockingIOError::new_err(
-                "cache transfer overlaps an in-flight DMA; wait for the prior Copy before reusing its host slot or device page",
+                "cache transfer overlaps an in-flight device page; wait for the prior Copy before reusing it",
             ));
         }
 
         let completion = Arc::new(Completion::default());
-        let (chunks, chunk_completions) = Chunk::split(pages, pool, loading, coalesce, &completion);
+        let chunks = Chunk::split(pages, pool, loading, coalesce, &completion);
         let mut chunks = chunks.into_iter();
         while let Some(chunk) = chunks.next() {
             if let Err(error) = self.queue.send(chunk) {
@@ -345,13 +349,10 @@ impl PyCopier {
                         ),
                     ),
                 };
-                self.pending.remove(&reservations);
                 return Err(crate::Error::from(error).into());
             }
         }
-        for (key, completion) in chunk_completions {
-            self.pending.insert(key, completion);
-        }
+        self.pending.insert(&device_pages, Arc::clone(&completion));
         Ok(PyCopy(completion))
     }
 }
@@ -380,11 +381,11 @@ impl PyCopierLayer {
 impl PyHostCache {
     #[new]
     /// Allocate one pinned host-page pool for this copier. Other pools may share the copier; their
-    /// slot indices and DMA reservations are independent. `backing`, when supplied, must be a
-    /// pinned buffer of exactly `slots` times one host block's size. The pool retains that
-    /// allocation and presents each host block as one slot. Before reusing this backing for a
-    /// replacement pool, shut down its old copier and finish all copies and `HostSlot.access()`
-    /// leases; distinct pools over one backing have independent slot-access gates.
+    /// slot indices and access gates are independent, while device-page reservations are shared.
+    /// `backing`, when supplied, must be a pinned buffer of exactly `slots` times one host block's
+    /// size. The pool retains that allocation and presents each host block as one slot. Before
+    /// reusing this backing for a replacement pool, shut down its old copier and finish all copies
+    /// and `HostSlot.access()` leases; distinct pools over one backing have independent slot gates.
     #[pyo3(signature = (copier, slots, *, backing=None))]
     fn new(
         py: Python<'_>,
@@ -478,12 +479,8 @@ impl PyHostCache {
                 .collect();
             (pool_slots, None)
         };
-        let id = NEXT_POOL_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map_err(|_| PyValueError::new_err("host cache pool ID space exhausted"))?;
         Ok(Self {
             pool: Arc::new(Pool {
-                id,
                 slots: pool_slots,
                 block_bytes,
                 core: Arc::downgrade(&copier.core),
@@ -635,34 +632,10 @@ impl PyCopy {
 
     /// Wait until every copy in the request completes, raising its transfer error if any. Waiting
     /// before resubmitting an overlapping host slot or device page satisfies the caller's reuse
-    /// contract; `submitted()` does not.
+    /// contract.
     fn wait(&self, py: Python<'_>) -> PyResult<()> {
         Ok(py
             .detach(|| self.0.done(None).map(drop))
-            .map_err(crate::Error::from)?)
-    }
-
-    /// Wait until every runtime batch was submitted, without waiting for DMA completion. This does
-    /// not make host slots or device pages safe to reuse; call `wait()` first.
-    fn submitted(&self, py: Python<'_>) -> PyResult<()> {
-        Ok(py
-            .detach(|| {
-                let submitted = self.0.wait_submitted();
-                if let Err(error) = submitted {
-                    // A later chunk can fail to enqueue after earlier chunks have started. Keep the
-                    // pinned slots alive until every already-enqueued DMA has drained.
-                    if let Err(drain_error) = self.0.done(None) {
-                        return Err(io::Error::new(
-                            error.kind(),
-                            format!(
-                                "{error}; draining earlier cache copies also failed: {drain_error}"
-                            ),
-                        ));
-                    }
-                    return Err(error);
-                }
-                Ok(())
-            })
             .map_err(crate::Error::from)?)
     }
 }
@@ -680,7 +653,6 @@ mod tests {
         let host_slots = (0..slots).map(|_| Slot::backed()).collect();
         PyHostCache {
             pool: Arc::new(Pool {
-                id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),
                 slots: host_slots,
                 block_bytes,
                 core: Weak::new(),
@@ -723,7 +695,6 @@ mod tests {
     fn separately_allocated_cache_has_no_whole_pool_backing() {
         let cache = PyHostCache {
             pool: Arc::new(Pool {
-                id: 1,
                 slots: vec![Slot::owned(HostBuffer::zero(16))],
                 block_bytes: 16,
                 core: Weak::new(),

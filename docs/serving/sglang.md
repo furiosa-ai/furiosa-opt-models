@@ -30,27 +30,15 @@ The platform accepts these values:
 
 ### Configure the host tier
 
-The plugin connects SGLang's HiCache page selection and lifecycle to engine-pinned host slots. Choose a host-tier size with `--hicache-ratio` or `--hicache-size`. The filesystem tier uses SGLang's `file` option and the `FuriosaHiCacheFile` adapter:
+The plugin connects SGLang's HiCache page selection and lifecycle to engine-pinned host slots. Choose a host-tier size with `--hicache-ratio` or `--hicache-size`; the [serving task guide](index.md#offload-the-kv-cache-to-host-memory) has the filesystem launch command.
 
-```bash
-python -m sglang.launch_server --model-path Qwen/Qwen3-1.7B \
-  --enable-hierarchical-cache --hicache-ratio 2 --hicache-storage-backend file \
-  --hicache-storage-backend-extra-config '{"file_storage_path":"/mnt/kv-cache"}'
-```
-
-Set `--hicache-host-memory-mode cache`, `--hicache-io-backend kernel` and `--hicache-mem-layout page_first`. The storage backend must be unset or `file`; other backends need their own host-buffer integration. Automatic sizing from free host memory is available only for pools SGLang allocates itself.
+The filesystem tier uses SGLang's `file` option and `FuriosaHiCacheFile`. Set `--hicache-host-memory-mode cache`, `--hicache-io-backend kernel` and `--hicache-mem-layout page_first`. The storage backend must be unset or `file`; other backends need their own host-buffer integration. Automatic sizing from free host memory is available only for pools SGLang allocates itself.
 
 The adapter loads through SGLang's `dynamic` storage-backend factory and preserves SGLang's cache keys and file-tier lifecycle. The [shared filesystem guide](../engine/frameworks.md#filesystem-layout-and-io) defines the file format and I/O alignment behavior.
 
 ### Coalesce page restores
 
-The Furiosa-only `coalescing` option defaults to `false`; set it beside `file_storage_path` to stage each selected all-layer page batch:
-
-```bash
-python -m sglang.launch_server --model-path Qwen/Qwen3-1.7B \
-  --enable-hierarchical-cache --hicache-ratio 2 --hicache-storage-backend file \
-  --hicache-storage-backend-extra-config '{"file_storage_path":"/mnt/kv-cache","coalescing":true}'
-```
+The Furiosa-only `coalescing` option defaults to `false`; set it to `true` beside `file_storage_path` in `--hicache-storage-backend-extra-config` to stage each selected all-layer page batch.
 
 The adapter submits one all-layer engine copy for the selected page batch when its first per-layer callback arrives. Separate restore calls remain separate.
 

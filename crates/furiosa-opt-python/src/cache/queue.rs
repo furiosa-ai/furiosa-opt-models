@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::ops::DerefMut;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak, mpsc};
 use std::time::{Duration, Instant};
 
@@ -32,7 +32,6 @@ pub(super) struct Core {
 }
 
 pub(super) struct Pool {
-    pub(super) id: u64,
     pub(super) slots: Vec<Slot>,
     pub(super) block_bytes: usize,
     pub(super) core: Weak<Core>,
@@ -125,7 +124,6 @@ pub(super) struct Chunk {
     pool: Arc<Pool>,
     loading: bool,
     coalesced: bool,
-    completion: Arc<ChunkCompletion>,
     job: Arc<Job>,
 }
 
@@ -138,7 +136,6 @@ type PageLayer = (usize, u32, usize);
 
 struct Job {
     left: AtomicUsize,
-    submit_left: AtomicUsize,
     failure: Mutex<Option<io::Error>>,
     completion: Arc<Completion>,
 }
@@ -146,26 +143,23 @@ struct Job {
 pub(super) struct Completion {
     result: Mutex<Option<Result<(), String>>>,
     changed: Condvar,
-    submission: Mutex<Option<Result<(), String>>>,
-    submission_changed: Condvar,
+    status: AtomicU8,
 }
 
-pub(super) struct ChunkCompletion {
-    // Conflict checks only need to know whether this page's DMA has finished.
-    finished: AtomicBool,
-    // Every chunk of one copy shares the error and drain result.
-    job: Arc<Completion>,
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransferStatus {
+    Pending,
+    Succeeded,
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(super) enum TransferKey {
-    Device(usize, u32),
-    Host(u64, usize),
-}
+pub(super) struct DevicePage(pub(super) usize, pub(super) u32);
 
 #[derive(Default)]
-// Each key retains only DMA chunks touching that page, not their whole framework job.
-pub(super) struct Transfers(BTreeMap<TransferKey, Vec<Arc<ChunkCompletion>>>);
+// Device-page dependencies live for the whole Copy, across all its DMA chunks.
+pub(super) struct Transfers(BTreeMap<DevicePage, Arc<Completion>>);
 
 impl Slot {
     fn acquire_dma(&self) -> io::Result<DmaSlot<'_>> {
@@ -420,7 +414,6 @@ impl Queue {
         // outside the six-worker queue used for two-page copies.
         let core = Arc::clone(&self.core);
         let mut pdma = self.core.pdma.clone();
-        let completion = Arc::clone(&chunk.completion);
         let job = Arc::clone(&chunk.job);
         let spawned = std::thread::Builder::new()
             .name("kv-copy-later".into())
@@ -433,9 +426,7 @@ impl Queue {
         match spawned {
             Ok(_) => Ok(()),
             Err(error) => {
-                let message = error.to_string();
-                completion.finish();
-                job.finish(Err(io::Error::other(message)));
+                job.finish(Err(io::Error::other(error.to_string())));
                 Err(error)
             }
         }
@@ -465,59 +456,27 @@ impl Chunk {
         loading: bool,
         coalesced: bool,
         completion: &Arc<Completion>,
-    ) -> (Vec<Self>, Vec<(TransferKey, Arc<ChunkCompletion>)>) {
+    ) -> Vec<Self> {
         let chunks = Self::partition_pages(pages, coalesced);
         if chunks.is_empty() {
-            completion.mark_submitted(Ok(()));
             completion.finish(Ok(()));
-            return (Vec::new(), Vec::new());
+            return Vec::new();
         }
-        let chunk_keys = chunks
-            .iter()
-            .map(|pages| {
-                let mut keys = Vec::new();
-                for page in pages {
-                    keys.push(TransferKey::Host(pool.id, page.slot));
-                    keys.extend(
-                        page.routes
-                            .iter()
-                            .map(|&(group, block)| TransferKey::Device(group, block)),
-                    );
-                }
-                keys.sort_unstable();
-                keys.dedup();
-                keys
-            })
-            .collect::<Vec<_>>();
-        let completions = (0..chunks.len())
-            .map(|_| Arc::new(ChunkCompletion::new(Arc::clone(completion))))
-            .collect::<Vec<_>>();
-        let pending = chunk_keys
-            .iter()
-            .zip(&completions)
-            .flat_map(|(keys, completion)| {
-                keys.iter().map(move |&key| (key, Arc::clone(completion)))
-            })
-            .collect();
         let job = Arc::new(Job {
             left: AtomicUsize::new(chunks.len()),
-            submit_left: AtomicUsize::new(chunks.len()),
             failure: Mutex::new(None),
             completion: Arc::clone(completion),
         });
-        let chunks = chunks
+        chunks
             .into_iter()
-            .zip(completions)
-            .map(|(pages, completion)| Self {
+            .map(|pages| Self {
                 pages,
                 pool: Arc::clone(pool),
                 loading,
                 coalesced,
-                completion,
                 job: Arc::clone(&job),
             })
-            .collect();
-        (chunks, pending)
+            .collect()
     }
 
     fn partition_pages(
@@ -561,12 +520,10 @@ impl Chunk {
             self.transfer(executor, core, pdma)
         }))
         .unwrap_or_else(|_| Err(io::Error::other("cache copy worker panicked")));
-        self.completion.finish();
         self.job.finish(result);
     }
 
     pub(super) fn fail(&self, error: io::Error) {
-        self.completion.finish();
         self.job.finish(Err(error));
     }
 
@@ -609,7 +566,6 @@ impl Chunk {
                 pairs.push((source, destination));
             }
             let submitted = pdma.to_hbm(pairs).submit();
-            self.job.submitted();
             executor.block_on(submitted).map_err(io::Error::other)
         } else {
             let mut pairs = Vec::with_capacity(route_count);
@@ -648,7 +604,6 @@ impl Chunk {
                 return Err(io::Error::other("cache transfer has unrouted host layers"));
             }
             let submitted = pdma.to_host(pairs).submit();
-            self.job.submitted();
             executor.block_on(submitted).map_err(io::Error::other)
         }
     }
@@ -700,7 +655,6 @@ impl Chunk {
                 }
                 pdma.to_hbm(pairs).submit()
             };
-            self.job.submitted();
             executor.block_on(submitted).map_err(io::Error::other)
         } else {
             let submitted = {
@@ -741,7 +695,6 @@ impl Chunk {
                 }
                 pdma.to_host(pairs).submit()
             };
-            self.job.submitted();
             executor.block_on(submitted).map_err(io::Error::other)
         }
     }
@@ -811,7 +764,6 @@ impl Chunk {
             .collect::<Vec<_>>();
         let mut layout = staging::Layout::new(&self.pages, &core.groups, &layers, self.loading)?;
         if layout.bytes == 0 {
-            self.job.submitted();
             return Ok(());
         }
         let mut stages = (0..core.chips)
@@ -854,7 +806,6 @@ impl Chunk {
                 }
             }
             let submitted = pdma.to_hbm(pairs).submit();
-            self.job.submitted();
             executor.block_on(submitted).map_err(io::Error::other)?;
         } else {
             let mut aliases = staging_aliases(&layout, core)?;
@@ -884,7 +835,6 @@ impl Chunk {
                 }
             }
             let submitted = pdma.to_host(pairs).submit();
-            self.job.submitted();
             executor.block_on(submitted).map_err(io::Error::other)?;
 
             for group in &slot_items {
@@ -1023,20 +973,12 @@ fn staging_aliases(
 }
 
 impl Job {
-    fn submitted(&self) {
-        if self.submit_left.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.completion.mark_submitted(Ok(()));
-        }
-    }
-
     fn finish(&self, result: io::Result<()>) {
         let mut failure = self
             .failure
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         if let Err(error) = result {
-            self.completion
-                .mark_submitted(Err(io::Error::other(error.to_string())));
             failure.get_or_insert(error);
         }
         if self.left.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -1046,48 +988,43 @@ impl Job {
 }
 
 impl Transfers {
-    pub(super) fn insert(&mut self, key: TransferKey, completion: Arc<ChunkCompletion>) {
-        // `Chunk::split` deduplicates each chunk's reservation keys before producing this list;
-        // each chunk also owns a distinct completion, so this pair is unique.
-        self.0.entry(key).or_default().push(completion);
+    pub(super) fn insert(&mut self, pages: &[DevicePage], completion: Arc<Completion>) {
+        for &page in pages {
+            self.0.insert(page, Arc::clone(&completion));
+        }
     }
 
-    pub(super) fn conflicts(&mut self, reservations: &[TransferKey]) -> bool {
+    pub(super) fn conflicts(&mut self, pages: &[DevicePage]) -> io::Result<bool> {
         let mut conflict = false;
-        for &reservation in reservations {
-            let remove = if let Some(copies) = self.0.get_mut(&reservation) {
-                copies.retain(|copy| {
-                    if copy.is_finished() {
-                        return false;
-                    }
-                    conflict = true;
-                    true
-                });
-                copies.is_empty()
-            } else {
-                false
+        let mut poisoned = false;
+        for &page in pages {
+            let Some(copy) = self.0.get(&page) else {
+                continue;
             };
-            if remove {
-                self.0.remove(&reservation);
+            match copy.status() {
+                TransferStatus::Pending => conflict = true,
+                TransferStatus::Succeeded => {
+                    self.0.remove(&page);
+                }
+                TransferStatus::Failed => poisoned = true,
             }
         }
-        conflict
-    }
-
-    pub(super) fn remove(&mut self, reservations: &[TransferKey]) {
-        for reservation in reservations {
-            self.0.remove(reservation);
+        if poisoned {
+            return Err(io::Error::other(
+                "a failed cache transfer left this device page unavailable",
+            ));
         }
+        Ok(conflict)
     }
 
     pub(super) fn drain(&mut self) -> io::Result<()> {
         let mut first_error = None;
         let mut seen = HashSet::new();
-        for copy in self.0.values().flatten() {
-            if !seen.insert(Arc::as_ptr(&copy.job) as usize) {
+        for copy in self.0.values() {
+            if !seen.insert(Arc::as_ptr(copy) as usize) {
                 continue;
             }
-            if let Err(error) = copy.wait() {
+            if let Err(error) = copy.done(None) {
                 first_error.get_or_insert(error);
             }
         }
@@ -1097,43 +1034,28 @@ impl Transfers {
 }
 
 impl Completion {
-    fn mark_submitted(&self, result: io::Result<()>) {
-        let mut submission = self
-            .submission
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if submission.is_none() {
-            *submission = Some(result.map_err(|error| error.to_string()));
-            self.submission_changed.notify_all();
-        }
-    }
-
-    pub(super) fn wait_submitted(&self) -> io::Result<()> {
-        let mut submission = self
-            .submission
-            .lock()
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        loop {
-            if let Some(result) = &*submission {
-                return result
-                    .as_ref()
-                    .map(|()| ())
-                    .map_err(|error| io::Error::other(error.clone()));
-            }
-            submission = self
-                .submission_changed
-                .wait(submission)
-                .map_err(|error| io::Error::other(error.to_string()))?;
-        }
-    }
-
     fn finish(&self, result: io::Result<()>) {
+        let status = if result.is_ok() {
+            TransferStatus::Succeeded
+        } else {
+            TransferStatus::Failed
+        };
+        self.status.store(status as u8, Ordering::Release);
         *self
             .result
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) =
             Some(result.map_err(|error| error.to_string()));
         self.changed.notify_all();
+    }
+
+    fn status(&self) -> TransferStatus {
+        match self.status.load(Ordering::Acquire) {
+            status if status == TransferStatus::Pending as u8 => TransferStatus::Pending,
+            status if status == TransferStatus::Succeeded as u8 => TransferStatus::Succeeded,
+            status if status == TransferStatus::Failed as u8 => TransferStatus::Failed,
+            _ => unreachable!("invalid cache transfer status"),
+        }
     }
 
     pub(super) fn done(&self, timeout: Option<Duration>) -> io::Result<bool> {
@@ -1177,30 +1099,8 @@ impl Default for Completion {
         Self {
             result: Mutex::new(None),
             changed: Condvar::new(),
-            submission: Mutex::new(None),
-            submission_changed: Condvar::new(),
+            status: AtomicU8::new(TransferStatus::Pending as u8),
         }
-    }
-}
-
-impl ChunkCompletion {
-    fn new(job: Arc<Completion>) -> Self {
-        Self {
-            finished: AtomicBool::new(false),
-            job,
-        }
-    }
-
-    fn finish(&self) {
-        self.finished.store(true, Ordering::Release);
-    }
-
-    fn is_finished(&self) -> bool {
-        self.finished.load(Ordering::Acquire)
-    }
-
-    pub(super) fn wait(&self) -> io::Result<()> {
-        self.job.done(None).map(|_| ())
     }
 }
 
@@ -1295,66 +1195,67 @@ mod tests {
     }
 
     #[test]
-    fn page_reservations_track_only_chunks_that_touch_them() {
+    fn page_reservations_follow_the_whole_copy_completion() {
         let pool = Arc::new(Pool {
-            id: 1,
             slots: Vec::new(),
             block_bytes: 0,
             core: Weak::new(),
             backing: None,
         });
-        let job = Arc::new(Completion::default());
-        let (chunks, reservations) = Chunk::split(
+        let completion = Arc::new(Completion::default());
+        let chunks = Chunk::split(
             vec![(0, vec![(0, 4)]), (1, vec![(0, 4)]), (2, vec![(0, 4)])],
             &pool,
             false,
             false,
-            &job,
+            &completion,
         );
         assert_eq!(chunks.len(), 2);
 
+        let page = DevicePage(0, 4);
         let mut transfers = Transfers::default();
-        for (key, completion) in reservations {
-            transfers.0.entry(key).or_default().push(completion);
-        }
-        let page = [TransferKey::Device(0, 4)];
-        assert!(transfers.conflicts(&page));
-        chunks[0].completion.finish();
-        assert!(transfers.conflicts(&page));
-        chunks[1].completion.finish();
-        assert!(!transfers.conflicts(&page));
+        transfers.insert(&[page], Arc::clone(&completion));
+
+        assert!(transfers.conflicts(&[page]).unwrap());
+        chunks[0].job.finish(Ok(()));
+        assert!(transfers.conflicts(&[page]).unwrap());
+        chunks[1].job.finish(Ok(()));
+        assert!(!transfers.conflicts(&[page]).unwrap());
     }
 
     #[test]
-    fn chunk_completion_checks_finished_without_locking_result() {
-        let completion = ChunkCompletion::new(Arc::new(Completion::default()));
+    fn completion_tracks_success_without_locking_result() {
+        let completion = Completion::default();
 
-        assert!(!completion.is_finished());
-        completion.finish();
-        assert!(completion.is_finished());
+        assert_eq!(completion.status(), TransferStatus::Pending);
+        completion.finish(Ok(()));
+        assert_eq!(completion.status(), TransferStatus::Succeeded);
     }
 
     #[test]
-    fn chunk_completion_wait_returns_the_shared_job_error() {
-        let job = Arc::new(Completion::default());
-        let chunk = ChunkCompletion::new(Arc::clone(&job));
-        chunk.finish();
-        job.finish(Err(io::Error::other("transfer failed")));
+    fn failed_copy_keeps_all_device_page_reservations() {
+        let pages = [DevicePage(0, 7), DevicePage(0, 8)];
+        let completion = Arc::new(Completion::default());
+        completion.finish(Err(io::Error::other("transfer failed")));
+        let mut transfers = Transfers::default();
+        transfers.insert(&pages, completion);
 
-        assert_eq!(chunk.wait().unwrap_err().to_string(), "transfer failed");
+        let error = transfers.conflicts(&pages).unwrap_err();
+
+        assert!(error.to_string().contains("device page unavailable"));
+        assert!(pages.iter().all(|page| transfers.0.contains_key(page)));
     }
 
     #[test]
     fn coalesced_copies_keep_all_pages_in_one_stage_batch() {
         let pool = Arc::new(Pool {
-            id: 2,
             slots: Vec::new(),
             block_bytes: 0,
             core: Weak::new(),
             backing: None,
         });
         let job = Arc::new(Completion::default());
-        let (chunks, _) = Chunk::split(
+        let chunks = Chunk::split(
             (0..7).map(|slot| (slot, vec![(0, slot as u32)])).collect(),
             &pool,
             true,

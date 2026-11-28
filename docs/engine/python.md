@@ -72,15 +72,13 @@ transfer.wait()
 
 ## Share a contiguous host cache
 
-`HostCache` normally allocates each host slot separately. Pass a pinned `HostBuffer` as `backing`
-to map its page-major host blocks onto one contiguous allocation. Its size must equal the slot count
-times the Copier's host block size. The pool retains the allocation and maps each slot to a range
-within it. Slot access and DMA keep their usual per-slot gates; backing-lock scope is documented in
-the [shared transfer guide](frameworks.md#dma-batches-and-ownership).
-`HostBuffer` falls back to pageable memory when the system cannot lock it, so check `is_pinned`
-before passing it as `backing`.
-Engine adapters that need to register the whole region can use its internal `_backing_buffer()`
-handle:
+`HostCache(backing=...)` maps its fixed-size page slots into one contiguous, pinned `HostBuffer` and
+retains that allocation. The backing size must equal the slot count times the `Copier` host-block
+size. Because `HostBuffer` can fall back to pageable memory, check `is_pinned` first. The engine's
+shared transfer guide defines slot gates and backing-lock scope.
+
+An adapter that registers the complete address range can obtain an internal handle to the same
+allocation:
 
 ```python
 backing = engine.HostBuffer(slot_bytes * slot_count)
@@ -90,24 +88,16 @@ host_cache = engine.HostCache(copier, slot_count, backing=backing)
 region = host_cache._backing_buffer()  # Same allocation and address, not a copy.
 ```
 
-Keep this internal handle only for address registration and allocation lifetime. Do not read or
-write through it: that bypasses per-slot access exclusion. Use `HostSlot.access()` for external I/O.
-Keep the handle while an external registration uses the region. After shutting down the old Copier
-and dropping its `HostCache`, pass the handle to the replacement pool to keep the address stable.
-First finish all copies and drop every `HostSlot.access()` lease from the old pool. Recreated pools
-have independent per-slot access gates even when they share the same backing:
+Use this handle only to retain or register the address; reading or writing through it bypasses slot
+exclusion. Use `HostSlot.access()` for external I/O. Keep the handle while an external registration
+uses the region. To replace the pool without moving its address, finish every copy, drop every slot
+lease, shut down the old `Copier`, then drop the old `HostCache` and pass the handle to the new pool.
+Each pool has independent slot gates, so never serve transfers through both pools at once.
 
-```python
-copier.shutdown()
-host_cache = engine.HostCache(replacement_copier, slot_count, backing=region)
-```
-
-`_backing_buffer()` raises `ValueError` for a pool created without a contiguous backing. It is a
-private adapter hook and is not supported as a general user API; its private type declaration is
-present in the stub for adapter type checking. Slot access leases serialize external I/O with
-Copier access to each slot, but do not reserve a cache value throughout coalesced DMA. Await the
-relevant `Copy` before reusing that value. The [transfer guide](frameworks.md#optional-coalescing)
-describes lock scope and shared-backing tradeoffs.
+`_backing_buffer()` raises `ValueError` when the pool has separately allocated slots. It is a private
+adapter hook, not a general user API; its private stub declaration exists for adapter type checking.
+The [shared transfer guide](frameworks.md#dma-batches-and-ownership) defines backed-slot locking;
+its [coalescing section](frameworks.md#optional-coalescing) defines cache-value reuse.
 
 ## Run requests with LoRA adapters
 
